@@ -30,9 +30,27 @@ Environment=SSL_CERTFILE=/certs/litellm/litellm.crt
 Environment=SSL_CERT_FILE=/tmp/combined-ca.crt
 Environment=REQUESTS_CA_BUNDLE=/tmp/combined-ca.crt
 Environment=CURL_CA_BUNDLE=/tmp/combined-ca.crt
-# DATABASE_URL uses $$ (not $) so systemd does NOT expand ${PGVECTOR_PASS} at the
-# host level (the var is empty there); the literal reference is passed through to
-# the container shell, which expands it from the podman-injected 'pgvector' env
-# secret. Safe to interpolate unquoted: the generated pgvector password is
-# A-Za-z0-9 only (see roles/podman/tasks/llama_cpp_setup.yml) -- no URL/@/:/ metachars.
-Exec=-c "cat /etc/ssl/certs/ca-certificates.crt /certs/ca/ca.crt > /tmp/combined-ca.crt; set -a; [ -f /run/secrets/llm_keys ] && . /run/secrets/llm_keys; set +a; export DATABASE_URL=\"postgresql://lme:$${PGVECTOR_PASS}@lme-pgvector:5432/litellm\"; exec litellm --config /app/config.yaml --port 4000 --ssl_keyfile_path /certs/litellm/litellm.key --ssl_certfile_path /certs/litellm/litellm.crt"
+# pgvector connection coordinates for the litellm UI/key-management DB. These are
+# discrete Environment= vars mirroring lme-dashboard.container (host/port/user), so
+# an operator has one override surface for the connection. NOTE: litellm's DB name is
+# deliberately 'litellm' (kept as a URL literal below), DISTINCT from the dashboard's
+# 'lme_vectors' -- do NOT introduce a shared PGVECTOR_DB var; reusing lme_vectors here
+# would point litellm at the wrong database.
+# Follow-up: these coordinates could instead be sourced from an
+# EnvironmentFile=/opt/lme/lme-environment.env override surface (as the elasticsearch/
+# fleet-server units do) once that file carries pgvector coordinates; today it holds
+# only version vars, so Environment= parity with the dashboard is the accepted minimum.
+Environment=PGVECTOR_HOST=lme-pgvector
+Environment=PGVECTOR_PORT=5432
+Environment=PGVECTOR_USER=lme
+# DATABASE_URL uses $$ (not $) for ALL FOUR interpolations so systemd does NOT expand
+# them at the host level (they are empty in the systemd *service* environment). Quadlet
+# routes [Container] Environment= and Secret=type=env to podman --env -- verified with
+# `quadlet --dryrun`: they appear as --env args and NEVER in the [Service] Environment=
+# block -- so PGVECTOR_HOST/PORT/USER/PASS live in the CONTAINER environment only. The
+# literal $${...} references pass through to the container shell (/bin/sh -c), which
+# expands them from that container env. A single $ here would make systemd expand against
+# the service env instead, silently yielding an empty host/port/user/password. Safe to
+# interpolate the password unquoted: the generated pgvector password is A-Za-z0-9 only
+# (see roles/podman/tasks/llama_cpp_setup.yml) -- no URL/@/:/ metachars.
+Exec=-c "cat /etc/ssl/certs/ca-certificates.crt /certs/ca/ca.crt > /tmp/combined-ca.crt; set -a; [ -f /run/secrets/llm_keys ] && . /run/secrets/llm_keys; set +a; export DATABASE_URL=\"postgresql://$${PGVECTOR_USER}:$${PGVECTOR_PASS}@$${PGVECTOR_HOST}:$${PGVECTOR_PORT}/litellm\"; exec litellm --config /app/config.yaml --port 4000 --ssl_keyfile_path /certs/litellm/litellm.key --ssl_certfile_path /certs/litellm/litellm.crt"
