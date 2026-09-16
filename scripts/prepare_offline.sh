@@ -450,6 +450,21 @@ DOCKERFILE
 # online install would `podman build` these in-place — impossible offline.
 # --network=host for the same reason as build_ingest_image (see above): their
 # Dockerfiles RUN apt-get + pip install, which need the host's connectivity.
+#
+# REPRODUCIBILITY CAVEAT: unlike build_ingest_image (which pins every pip dep
+# inline), these two images are NOT fully dependency-pinned, so the offline
+# bundle they produce is best-effort reproducible, not bit-for-bit. The gaps
+# live in the repo Dockerfiles and are the place to tighten if strict
+# reproducibility is required:
+#   - lme-log-analyzer/Dockerfile & lme-dashboard/Dockerfile: floating base tag
+#     (python:3.11-slim) and unpinned `apt-get install` (curl / jq / unzip /
+#     pipx — no versions).
+#   - lme-dashboard/requirements.txt: several deps use loose `>=` ranges
+#     (psycopg2-binary, pgvector, pyyaml, cryptography, requests, ...) rather
+#     than `==`, so the resolved versions can drift between builds.
+# We intentionally do NOT rewrite the Dockerfiles here: pinning apt/base to
+# exact versions is brittle across Debian point releases and can break these
+# working builds. Pin them at the source if determinism is needed.
 build_lme_images() {
     echo -e "${YELLOW}Building LME Log Analyzer image...${NC}"
     if sudo podman build --network=host -t localhost/lme-log-analyzer:LME_LATEST "$LME_ROOT/lme-log-analyzer"; then
