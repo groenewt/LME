@@ -386,12 +386,45 @@
   become: yes
   when: model_download is succeeded
 
+# litellm carries StartLimitBurst=10. On a re-run the unit may already be in a
+# start-limited/failed state (e.g. it crash-looped earlier against a not-yet-
+# created litellm DB), and `systemctl restart` on a start-limited unit errors,
+# which would fail the whole play. Clear that state first so the restart below
+# is deterministic.
+- name: Reset LiteLLM start-limit state before restart
+  command: systemctl reset-failed lme-litellm
+  become: yes
+  failed_when: false
+  changed_when: false
+  when: model_download is succeeded
+
 - name: Restart LiteLLM to pick up DATABASE_URL
   systemd:
     name: lme-litellm
     state: restarted
     daemon_reload: yes
   become: yes
+  when: model_download is succeeded
+
+# Fail loudly if litellm did not actually wire up to its database. With a
+# master_key set and DATABASE_URL exported, litellm runs its prisma migrations
+# on startup and creates its LiteLLM_* tables in the litellm DB's public schema.
+# A silent DATABASE_URL regression (empty/wrong URL, or a crash-looping unit)
+# leaves that schema empty, so the count stays 0, the retries exhaust, and the
+# play fails instead of reporting a false success. Uses the same passwordless
+# `podman exec lme-pgvector psql -U lme` path as the tasks above.
+- name: Verify LiteLLM connected to its database (DATABASE_URL wiring is live)
+  shell: |
+    podman exec lme-pgvector psql -U lme -d litellm -tAc \
+      "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
+  args:
+    executable: /bin/bash
+  become: yes
+  register: litellm_db_ready
+  changed_when: false
+  until: (litellm_db_ready.stdout | default('') | trim | int) > 0
+  retries: 30
+  delay: 5
   when: model_download is succeeded
 
 - name: Enable and start LME Dashboard service
