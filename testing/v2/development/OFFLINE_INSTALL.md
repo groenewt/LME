@@ -345,6 +345,7 @@ Then follow the `Copy offline tarball to w1`, `Extract offline tarball on w1`, `
 | `-o`, `--offline` | Enable offline mode (skip internet-dependent tasks; skips LLM unless `--llm` is also set) |
 | `-d` | Debug output |
 | `--llm` | Include LLM stack (default on non-offline; explicit on offline) |
+| `--elastic-services` | Install optional Elastic services pack (apm-server, heartbeat, metricbeat, filebeat, logstash); default off; not supported with `--offline` |
 | `NON_INTERACTIVE=true` (env) | Skip prompts |
 | `AUTO_CREATE_ENV=true` (env) | Auto-create `config/lme-environment.env` if missing |
 | `AUTO_IP=<ip>` (env) | Use this IP for `IPVAR` when auto-creating env |

@@ -17,6 +17,7 @@ OFFLINE_MODE="false"
 SKIP_PACKAGES="false"
 GRAPH_ROOT="/var/lib/containers/storage"
 INSTALL_LLM="false"
+INSTALL_ELASTIC_SERVICES="false"
 
 # Cluster mode settings
 CLUSTER_MODE=${LME_CLUSTER:-false}
@@ -40,6 +41,8 @@ usage() {
     echo "  --skip-packages               Skip package installation (for development)"
     echo "  --llm                         Install LLM stack (llama.cpp, LiteLLM, pgvector, docs ingest)."
     echo "                                Default: on for non-offline installs; off for --offline unless this flag is set."
+    echo "  --elastic-services            Install optional Elastic services pack (apm-server, heartbeat, metricbeat, filebeat, logstash)."
+    echo "                                Default: off; not supported with --offline"
     echo "  -p, --playbook PLAYBOOK_PATH  Specify path to playbook (default: ./ansible/site.yml)"
     echo "  -g, --graph-root GRAPH_ROOT   Change the graphroot directory (where volumes are stored)"
     echo "  -h, --help                    Show this help message"
@@ -82,6 +85,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --llm)
             INSTALL_LLM="true"
+            shift
+            ;;
+        --elastic-services)
+            INSTALL_ELASTIC_SERVICES="true"
             shift
             ;;
         -p|--playbook)
@@ -641,6 +648,19 @@ run_playbook() {
         EFFECTIVE_INSTALL_LLM="true"
     fi
 
+    # Compute effective install_elastic_services for Ansible.
+    # Unlike LLM (default-on), the Elastic services pack is opt-in: it is only
+    # installed when --elastic-services was explicitly requested. The pack has
+    # no offline bundle, so it is forced off (with a warning) for --offline.
+    if [ "$INSTALL_ELASTIC_SERVICES" = "true" ] && [ "$OFFLINE_MODE" != "true" ]; then
+        EFFECTIVE_INSTALL_ELASTIC_SERVICES="true"
+    else
+        EFFECTIVE_INSTALL_ELASTIC_SERVICES="false"
+        if [ "$INSTALL_ELASTIC_SERVICES" = "true" ]; then
+            echo -e "${YELLOW}⚠ --elastic-services is not supported with --offline: Elastic services pack will be skipped${NC}"
+        fi
+    fi
+
     # Run the main installation playbook
     echo -e "${YELLOW}Running main installation playbook...${NC}"
 
@@ -651,9 +671,9 @@ run_playbook() {
     sudo chown $(whoami):$(whoami) /opt/ansible-tmp
 
     if [ -f "$SCRIPT_DIR/inventory" ]; then
-        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"'}' $ANSIBLE_OPTS
+        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"'}' $ANSIBLE_OPTS
     else
-        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"'}' $ANSIBLE_OPTS
+        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"'}' $ANSIBLE_OPTS
     fi
     
     if [ $? -eq 0 ]; then

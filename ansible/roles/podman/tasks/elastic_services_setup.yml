@@ -1,0 +1,96 @@
+---
+# Elastic services pack setup tasks (apm-server, heartbeat, metricbeat,
+# filebeat, logstash). Included from main.yml only when
+# `install_elastic_services` is true (install.sh --elastic-services).
+
+# The whole-dir config copy in quadlet_setup.yml uses force=false, so modified
+# files (init-setup.sh, instances.yml) would never propagate to installed
+# hosts. Force-copy only config/setup/ so host customizations elsewhere under
+# /opt/lme/config are not clobbered.
+- name: Copy setup config files to /opt/lme/config/setup (always overwrite)
+  copy:
+    src: "{{ clone_directory }}/config/setup/"
+    dest: /opt/lme/config/setup/
+    owner: "{{ install_user }}"
+    group: "{{ install_user }}"
+    mode: '0644'
+    force: true
+  become: yes
+
+# quadlet-optional/elastic-services/ lives outside quadlet/, so the child-node
+# prune logic never sees it; gate explicitly to keep ES-only child nodes clean.
+- name: Copy Elastic services pack quadlets to /etc/containers/systemd
+  copy:
+    src: "{{ clone_directory }}/quadlet-optional/elastic-services/"
+    dest: /etc/containers/systemd/
+    owner: "root"
+    group: "root"
+    mode: '0644'
+  become: yes
+  when: not (lme_child_es_only | default(false) | bool)
+
+# Beats refuse to start when their config is not owned by root (or the beat
+# user); the whole-dir config copy forces install_user ownership, so re-own
+# the pack configs here. No mode on the recursive logstash entry: file's
+# recurse applies the mode to directories too, which would strip their
+# execute bit and make the tree untraversable for the container's logstash
+# user (the staged files are already 0644).
+- name: Set root ownership on Elastic services pack configs
+  file:
+    path: "/opt/lme/config/{{ item.path }}"
+    state: "{{ item.state | default('file') }}"
+    owner: "root"
+    group: "root"
+    mode: "{{ item.mode | default(omit) }}"
+    recurse: "{{ item.recurse | default(omit) }}"
+  loop:
+    - path: apm-server.yml
+      mode: '0644'
+    - path: heartbeat.yml
+      mode: '0644'
+    - path: metricbeat.yml
+      mode: '0644'
+    - path: filebeat.yml
+      mode: '0644'
+    - path: logstash
+      state: directory
+      recurse: true
+  become: yes
+
+# The OS-package apm-server.service (vendor-preset enabled on Debian) squats
+# on port 8200 at boot; failed_when: false because the unit may not exist.
+- name: Disable host apm-server service (conflicts with pack on port 8200)
+  systemd:
+    name: apm-server
+    state: stopped
+    enabled: no
+  failed_when: false
+  become: yes
+
+# lme-setup-certs is a RemainAfterExit oneshot: a plain re-run of install.sh
+# never re-fires it, so restart it to run the cert top-up for the pack.
+- name: Restart cert setup unit to run the cert top-up
+  systemd:
+    name: lme-setup-certs
+    state: restarted
+    daemon_reload: yes
+  become: yes
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+  become: yes
+
+# The pack quadlets are WantedBy=lme.service, but that does not start new
+# units on an already-active umbrella service, so start them explicitly.
+- name: Start Elastic services pack units
+  systemd:
+    name: "{{ item }}"
+    state: started
+  loop:
+    - lme-apm-server
+    - lme-heartbeat
+    - lme-metricbeat
+    - lme-filebeat
+    - lme-logstash
+  become: yes

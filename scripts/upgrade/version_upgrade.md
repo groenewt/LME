@@ -90,6 +90,8 @@ These versions are defined in:
 2. `config/containers.txt` for all containers
 3. `lme-environment.env` as STACK_VERSION
 
+When the optional Elastic services pack is enabled (`--elastic-services`), its images (apm-server, heartbeat, metricbeat, filebeat, logstash — all 8.18.8) are defined in `config/containers-elastic-services.txt` and are also pulled during upgrade.
+
 ## Troubleshooting
 
 If you encounter issues during the upgrade:
