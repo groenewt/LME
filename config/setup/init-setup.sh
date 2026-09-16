@@ -71,3 +71,12 @@ for svc in $(awk '/^  - name: /{ n=$3; gsub(/"/,"",n); print n }' "${INSTANCES_P
   find "${CERTS_DIR}/${svc}" -type f \( -name '*.key' -o -name '*-key.pem' \) -exec chmod 600 {} \;
 done
 
+# Final permission reconciliation, run unconditionally on every invocation (fresh
+# install and upgrade/re-run alike, since the blocks above are behind first-run
+# guards and the top-up loop skips existing certs). Lock down all private keys AND
+# the cert archives: certs.zip bundles every service private key and ca.zip bundles
+# the CA private key (ca/ca.key). ${CERTS_DIR} is the lme_certs volume, mounted :ro
+# into many containers, so a world-readable zip would let any UID in any of them
+# read all key material via `unzip -p`. Public .crt / *.chain.pem stay 0644.
+find "${CERTS_DIR}" -type f \( -name '*.key' -o -name '*-key.pem' -o -name '*.zip' \) -exec chmod 600 {} \;
+
