@@ -37,6 +37,8 @@ if [ ! -f "${CERTS_DIR}/certs.zip" ]; then
   chown -R elasticsearch:elasticsearch "${CERTS_DIR}"
   find "${CERTS_DIR}" -type d -exec chmod 755 {} \;
   find "${CERTS_DIR}" -type f -exec chmod 644 {} \;
+  # Private keys must not be world-readable (shared lme_certs volume / local users)
+  find "${CERTS_DIR}" -type f \( -name '*.key' -o -name '*-key.pem' \) -exec chmod 600 {} \;
 
   echo "Setting file permissions... data"
   chown -R elasticsearch:elasticsearch "${DATA_DIR}"
@@ -65,5 +67,7 @@ for svc in $(awk '/^  - name: /{ n=$3; gsub(/"/,"",n); print n }' "${INSTANCES_P
   chown -R elasticsearch:elasticsearch "${CERTS_DIR}/${svc}"
   chmod 755 "${CERTS_DIR}/${svc}"
   chmod 644 "${CERTS_DIR}/${svc}"/*
+  # Private keys must not be world-readable (shared lme_certs volume / local users)
+  find "${CERTS_DIR}/${svc}" -type f \( -name '*.key' -o -name '*-key.pem' \) -exec chmod 600 {} \;
 done
 
