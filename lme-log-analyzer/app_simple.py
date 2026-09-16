@@ -18,7 +18,7 @@ ES_USER = os.getenv("ELASTICSEARCH_USER", "elastic")
 ES_PASS = os.getenv("ELASTICSEARCH_PASSWORD", "")
 LITELLM_URL = os.getenv("LITELLM_URL", "https://lme-litellm:4000")
 LITELLM_KEY = os.getenv("LITELLM_API_KEY", "sk-lme-llama-proxy")
-LITELLM_MODEL = os.getenv("LITELLM_MODEL", "gemma-3-1b")
+LITELLM_MODEL = os.getenv("LITELLM_MODEL", "lfm2.5-1.2b-instruct")
 
 # Define LLM functions
 def chat_with_llm(messages):
