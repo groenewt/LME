@@ -417,6 +417,10 @@ download_llm_models() {
 # Build and save the ingest image that replaces the online flow's
 # `python:3.11-slim + inline pip install` (llama_cpp_setup.yml:318-324).
 # Pin exact package versions so offline bundles are reproducible.
+# All builds use --network=host: RUN steps (pip/apt) need internet, and the
+# container network namespace can't be assumed to have working egress (e.g.
+# Tailscale/proxy/split-DNS prep machines) — the host netns is exactly what
+# check_internet already validated. Affects build-time only, not the image.
 build_ingest_image() {
     echo -e "${YELLOW}Building LME ingest image (pinned pip deps)...${NC}"
     local dockerfile_tmp
@@ -432,7 +436,7 @@ RUN pip install --no-cache-dir \
     lxml==5.3.0
 DOCKERFILE
 
-    if sudo podman build -t localhost/lme-ingest:LME_LATEST -f "$dockerfile_tmp" "$LME_ROOT"; then
+    if sudo podman build --network=host -t localhost/lme-ingest:LME_LATEST -f "$dockerfile_tmp" "$LME_ROOT"; then
         rm -f "$dockerfile_tmp"
         save_container_tar "localhost/lme-ingest:LME_LATEST" "localhost/lme-ingest:LME_LATEST"
     else
@@ -444,9 +448,11 @@ DOCKERFILE
 
 # Build and save lme-log-analyzer and lme-dashboard images locally, since the
 # online install would `podman build` these in-place — impossible offline.
+# --network=host for the same reason as build_ingest_image (see above): their
+# Dockerfiles RUN apt-get + pip install, which need the host's connectivity.
 build_lme_images() {
     echo -e "${YELLOW}Building LME Log Analyzer image...${NC}"
-    if sudo podman build -t localhost/lme-log-analyzer:LME_LATEST "$LME_ROOT/lme-log-analyzer"; then
+    if sudo podman build --network=host -t localhost/lme-log-analyzer:LME_LATEST "$LME_ROOT/lme-log-analyzer"; then
         save_container_tar "localhost/lme-log-analyzer:LME_LATEST" "localhost/lme-log-analyzer:LME_LATEST"
     else
         echo -e "${RED}✗ Failed to build LME Log Analyzer${NC}"
@@ -454,7 +460,7 @@ build_lme_images() {
     fi
 
     echo -e "${YELLOW}Building LME Dashboard image...${NC}"
-    if sudo podman build -t localhost/lme-dashboard:LME_LATEST "$LME_ROOT/lme-dashboard"; then
+    if sudo podman build --network=host -t localhost/lme-dashboard:LME_LATEST "$LME_ROOT/lme-dashboard"; then
         save_container_tar "localhost/lme-dashboard:LME_LATEST" "localhost/lme-dashboard:LME_LATEST"
     else
         echo -e "${RED}✗ Failed to build LME Dashboard${NC}"
