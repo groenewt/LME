@@ -319,7 +319,7 @@ Key configuration is stored in `/opt/lme/lme-environment.env`:
 ### Container Management
 - Container images defined in `../config/containers.txt`
 - Optional Elastic services pack via `./install.sh --elastic-services` (default off; not supported with `--offline`): apm-server, heartbeat, metricbeat, filebeat, logstash — images defined in `../config/containers-elastic-services.txt`
-  - **Note:** enabling `--elastic-services` publishes ingest ports on all interfaces (`0.0.0.0`) so remote agents can ship data: apm-server `8200`, logstash `5044` and `8085`. This binding is required for remote ingestion — do not change it. Operators should firewall these ports to trusted source hosts/networks only.
+  - **Note (online-only):** the Elastic services pack is online-only — `--offline` forces it off (skipped with a warning). Enabling `--elastic-services` publishes the apm-server ingest port `8200` on all interfaces (`0.0.0.0`) so remote agents can ship data; this binding is required for remote ingestion — do not change it, and operators should firewall `8200` to trusted source hosts/networks only. The logstash unit also maps host ports `5044` and `8085`, but the pack currently ships Logstash **without a pipeline** (placeholder pending config) and no beat sets `output.logstash`, so nothing listens on those ports yet — they are not active ingest ports until a pipeline is configured (firewall them to trusted sources only once it is).
 - Quadlet files for systemd integration
 - Podman volumes for persistent data
 - Network configuration for service communication
