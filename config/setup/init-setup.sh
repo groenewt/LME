@@ -25,8 +25,11 @@ if [ ! -f "${CERTS_DIR}/certs.zip" ]; then
   unzip -o "${CERTS_DIR}/certs.zip" -d "${CERTS_DIR}"
   cat "${CERTS_DIR}/elasticsearch/elasticsearch.crt" "${CERTS_DIR}/ca/ca.crt" > "${CERTS_DIR}/elasticsearch/elasticsearch.chain.pem"
 
-  # Generate chain PEM files for all services that need them
-  for svc in litellm dashboard log-analyzer embeddings llama-cpp kibana fleet-server wazuh-manager logstash curator fleet-distribution; do
+  # Generate chain PEM files for all services that need them.
+  # Source of truth is instances.yml (same list the idempotent top-up loop below
+  # derives), so new services (e.g. apm-server) are covered without hand-editing a
+  # hardcoded list. Keep this awk selector in sync with the top-up loop.
+  for svc in $(awk '/^  - name: /{ n=$3; gsub(/"/,"",n); print n }' "${INSTANCES_PATH}"); do
     if [ -d "${CERTS_DIR}/${svc}" ] && [ -f "${CERTS_DIR}/${svc}/${svc}.crt" ]; then
       cat "${CERTS_DIR}/${svc}/${svc}.crt" "${CERTS_DIR}/ca/ca.crt" > "${CERTS_DIR}/${svc}/${svc}.chain.pem"
       echo "Created chain PEM for ${svc}"
@@ -50,6 +53,15 @@ trap 'rm -rf "${TOPUP_TMP}"' EXIT
 
 for svc in $(awk '/^  - name: /{ n=$3; gsub(/"/,"",n); print n }' "${INSTANCES_PATH}"); do
   if [ -f "${CERTS_DIR}/${svc}/${svc}.crt" ]; then
+    # Cert already exists; do not re-mint. But an older run (hardcoded bulk list)
+    # may have skipped this service's chain, so create it if missing. Chain files
+    # are public certs only -- no private key is touched here.
+    if [ ! -f "${CERTS_DIR}/${svc}/${svc}.chain.pem" ]; then
+      cat "${CERTS_DIR}/${svc}/${svc}.crt" "${CERTS_DIR}/ca/ca.crt" > "${CERTS_DIR}/${svc}/${svc}.chain.pem"
+      chown elasticsearch:elasticsearch "${CERTS_DIR}/${svc}/${svc}.chain.pem"
+      chmod 644 "${CERTS_DIR}/${svc}/${svc}.chain.pem"
+      echo "Top-up: created missing chain PEM for ${svc}"
+    fi
     continue
   fi
   echo "Top-up: generating missing cert for ${svc}"
