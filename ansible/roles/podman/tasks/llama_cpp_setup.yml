@@ -19,17 +19,10 @@
     mode: preserve
   become: yes
 
-- name: Create pgvector secret password
-  shell: |
-    source /root/.profile
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    if ! podman secret ls | grep -q pgvector; then
-      password=$(</dev/urandom tr -dc A-Za-z0-9 | head -c30)
-      echo -n $password | podman secret create --driver file pgvector -
-    fi
-  args:
-    executable: /bin/bash
-  become: yes
+# The pgvector podman secret is created earlier in container_setup.yml (the
+# pre-quadlet secret bootstrap) so it exists before lme.service starts the
+# pgvector/dashboard units in quadlet_setup. It is intentionally not created
+# here.
 
 - name: Pull llama.cpp container image
   shell: |
@@ -122,7 +115,42 @@
   include_tasks: load_offline_llm.yml
   when:
     - offline_mode | default(false)
-    - install_llm | default(false)
+    - install_llm | default(true)
+
+# Provision the LiteLLM database BEFORE the model download so the litellm unit
+# (already started via lme.service in quadlet_setup) has a valid DATABASE_URL
+# target independent of the model-download outcome. model_download has no
+# ignore_errors, so a hard-abort there must not strand litellm against a
+# never-created database. Gated on install_llm (this whole file only runs when
+# install_llm is true) rather than on model_download success.
+- name: Enable and start pgvector service
+  systemd:
+    name: lme-pgvector.service
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Wait for pgvector to be ready
+  shell: podman exec lme-pgvector pg_isready -U lme -d lme_vectors
+  args:
+    executable: /bin/bash
+  register: pgvector_ready
+  until: pgvector_ready.rc == 0
+  retries: 30
+  delay: 10
+  become: yes
+  when: install_llm | default(true) | bool
+
+- name: Create litellm database for LiteLLM UI/key management
+  shell: |
+    podman exec lme-pgvector psql -U lme -d lme_vectors -tc "SELECT 1 FROM pg_database WHERE datname='litellm'" | grep -q 1 || \
+    podman exec lme-pgvector psql -U lme -d lme_vectors -c "CREATE DATABASE litellm"
+  args:
+    executable: /bin/bash
+  become: yes
+  register: litellm_db_create
+  changed_when: "'CREATE DATABASE' in (litellm_db_create.stdout | default(''))"
+  when: install_llm | default(true) | bool
 
 - name: Download LFM2.5 1.2B model (Q4_K_M quantization)
   get_url:
@@ -183,14 +211,12 @@
     mode: '0644'
   become: yes
 
-- name: Copy LiteLLM quadlet file to /etc/containers/systemd
-  copy:
-    src: "{{ clone_directory }}/quadlet/lme-litellm.container"
-    dest: /etc/containers/systemd/lme-litellm.container
-    owner: "root"
-    group: "root"
-    mode: '0644'
-  become: yes
+# NOTE: the lme-litellm.container unit is rendered from
+# ansible/templates/lme-litellm.container.j2 in quadlet_setup.yml (it carries
+# the DATABASE_URL and the lme-pgvector ordering). Do NOT copy the static
+# quadlet/lme-litellm.container over it here: this task ran after quadlet_setup
+# and its force=yes copy clobbered the rendered unit, dropping the pgvector
+# persistence wiring. The rendered template is the single source of truth.
 
 - name: Build LME Log Analyzer container image
   shell: |
@@ -281,13 +307,6 @@
     daemon_reload: yes
   become: yes
 
-- name: Enable and start pgvector service
-  systemd:
-    name: lme-pgvector.service
-    enabled: yes
-    state: started
-  become: yes
-
 - name: Enable and start embeddings service
   systemd:
     name: lme-embeddings.service
@@ -367,26 +386,6 @@
     name: lme-litellm.service
     enabled: yes
     state: started
-  become: yes
-  when: model_download is succeeded
-
-- name: Wait for pgvector to be ready
-  shell: podman exec lme-pgvector pg_isready -U lme -d lme_vectors
-  args:
-    executable: /bin/bash
-  register: pgvector_ready
-  until: pgvector_ready.rc == 0
-  retries: 30
-  delay: 10
-  become: yes
-  when: model_download is succeeded
-
-- name: Create litellm database for LiteLLM UI/key management
-  shell: |
-    podman exec lme-pgvector psql -U lme -d lme_vectors -tc "SELECT 1 FROM pg_database WHERE datname='litellm'" | grep -q 1 || \
-    podman exec lme-pgvector psql -U lme -d lme_vectors -c "CREATE DATABASE litellm"
-  args:
-    executable: /bin/bash
   become: yes
   when: model_download is succeeded
 
