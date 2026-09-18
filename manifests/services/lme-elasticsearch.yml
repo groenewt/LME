@@ -1,0 +1,101 @@
+---
+# Elasticsearch -- kind: container. Exemplar for BLOCKER B1.
+#
+# B1: cgroup memory caps (MemoryHigh/MemoryMax) and the JVM heap (-Xms/-Xmx) are
+# rendered UNCONDITIONALLY (see container.j2 resources block). The current
+# template gates them behind single-node, so cluster nodes silently render with
+# no caps and a floating heap. Here heap is the single knob (default 4g) and the
+# caps DERIVE from it (mem_derive: 4g -> 6G high / 8G max).
+#
+# Fidelity target = lme-elasticsearch.container.j2 rendered single-node/localhost,
+# MINUS the broken inline `#@@TODO:OPERATOR: HARDCODED` annotations (which corrupt
+# systemd values -- `#` mid-line is not a comment).
+id: elasticsearch          # logical key: lme_services key, profile-overlay target, dependency name
+name: lme-elasticsearch    # unit basename: dest = /etc/containers/systemd/<name>.container
+kind: container
+enabled_when: [always]
+image: elasticsearch
+description: Elasticsearch Container Service
+
+dependencies:
+  requires: [network, setup-certs]
+  after: [network, setup-certs]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  timeout_start_sec: 5400
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+# Insertion order is preserved on render (one Environment= per line). Boolean-ish
+# values are quoted so YAML does not turn `true` into Python True ("True").
+environment:
+  node.name: lme-elasticsearch
+  cluster.name: LME
+  bootstrap.memory_lock: "true"
+  discovery.type: single-node
+  xpack.security.enabled: "true"
+  xpack.security.http.ssl.enabled: "true"
+  xpack.security.http.ssl.key: certs/elasticsearch/elasticsearch.key
+  xpack.security.http.ssl.certificate: certs/elasticsearch/elasticsearch.chain.pem
+  xpack.security.http.ssl.certificate_authorities: certs/ca/ca.crt
+  xpack.security.http.ssl.verification_mode: certificate
+  xpack.security.http.ssl.client_authentication: optional
+  xpack.security.transport.ssl.enabled: "true"
+  xpack.security.transport.ssl.key: certs/elasticsearch/elasticsearch.key
+  xpack.security.transport.ssl.certificate: certs/elasticsearch/elasticsearch.crt
+  xpack.security.transport.ssl.certificate_authorities: certs/ca/ca.crt
+  xpack.security.transport.ssl.verification_mode: certificate
+  xpack.security.transport.ssl.client_authentication: optional
+  xpack.license.self_generated.type: basic
+  xpack.security.autoconfiguration.enabled: "false"
+
+# B1: heap is the single knob; ES_JAVA_OPTS (-Xms/-Xmx) and MemoryHigh/MemoryMax
+# all derive from it. jvm_env names the env var that carries the heap opts.
+resources:
+  heap: 4g
+  jvm_env: ES_JAVA_OPTS
+  jvm_base: "-Des.entitlements.enabled=false"
+  memory_high_factor: 1.5
+  memory_max_factor: 2
+
+secrets:
+  - {name: elastic,       type: env, target: ELASTIC_PASSWORD}
+  - {name: kibana_system, type: env, target: ELASTICSEARCH_PASSWORD}
+  - {name: kibana_system, type: env, target: KIBANA_PASSWORD}
+environment_files: [/opt/lme/lme-environment.env]
+
+network_aliases: [lme-elasticsearch]
+podman_args: ["--health-interval=2s"]
+publish_ports:
+  - {host: 9200, container: 9200}
+ulimits:
+  memlock: "-1:-1"
+
+# ES reads the full private cert workspace (it is the TLS terminator + the
+# generator context), so it keeps the shared lme_certs mount -- it is NOT a B4
+# per-service-bundle consumer. The certs block below is metadata for the
+# cert-owner derivation (init-setup.sh / G5 chowns the workspace key to 166536);
+# it emits nothing into this unit.
+volumes:
+  - {source: lme_certs,     dest: /usr/share/elasticsearch/config/certs}
+  - {source: lme_esdata01,  dest: /usr/share/elasticsearch/data}
+  - {source: lme_backups,   dest: /usr/share/elasticsearch/backups}
+  - {source: /opt/lme/config/elasticsearch.yml, dest: /usr/share/elasticsearch/config/elasticsearch.yml, options: [ro]}
+certs:
+  slot: elasticsearch
+  in_container_uid: 1000     # derived owner = 165536 + 0*3048 + 1000 = 166536
+  needs_ca: true
+
+health:
+  notify: healthy
+  cmd: "CMD-SHELL curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'"
+
+run_as:
+  user: elasticsearch
+userns:
+  mode: auto
+  slot: elasticsearch          # base 165536, size 3048

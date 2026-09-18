@@ -16,8 +16,18 @@ DEBUG_MODE="false"
 OFFLINE_MODE="false"
 SKIP_PACKAGES="false"
 GRAPH_ROOT="/var/lib/containers/storage"
+# Whether -g/--graph-root was explicitly given. Only then do we inject an
+# lme_global_override into the Ansible extra-vars; otherwise host_vars remain
+# authoritative for lme_global.storage.graphroot (extra-vars REPLACE, not merge).
+GRAPH_ROOT_SET="false"
 INSTALL_LLM="false"
 INSTALL_ELASTIC_SERVICES="false"
+
+# Manifest deployment profile selector (default|cluster|offline|tailscale).
+# Empty = derive from the mode flags in compute_effective_flags (cluster->cluster,
+# offline->offline, else default); an explicit --profile / LME_PROFILE wins over
+# that derivation. Passed to Ansible as -e lme_profile=<name>.
+LME_PROFILE="${LME_PROFILE:-}"
 
 # Cluster mode settings
 CLUSTER_MODE=${LME_CLUSTER:-false}
@@ -45,6 +55,9 @@ usage() {
     echo "                                Default: off; not supported with --offline"
     echo "  -p, --playbook PLAYBOOK_PATH  Specify path to playbook (default: ./ansible/site.yml)"
     echo "  -g, --graph-root GRAPH_ROOT   Change the graphroot directory (where volumes are stored)"
+    echo "      --profile NAME            Select the manifest profile (default|cluster|offline|tailscale)."
+    echo "                                Default: derived from the mode flags (--cluster->cluster,"
+    echo "                                --offline->offline, else default). Passed as -e lme_profile=NAME."
     echo "  -h, --help                    Show this help message"
     echo
     echo "Cluster Options:"
@@ -97,6 +110,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         -g|--graph-root)
             GRAPH_ROOT="$2"
+            GRAPH_ROOT_SET="true"
+            shift 2
+            ;;
+        --profile)
+            LME_PROFILE="$2"
             shift 2
             ;;
         --cluster)
@@ -636,6 +654,56 @@ compute_effective_flags() {
             echo -e "${YELLOW}⚠ --elastic-services is not supported with --offline: Elastic services pack will be skipped${NC}"
         fi
     fi
+
+    # --- Effective manifest profile (single source of the ES overlay) --------
+    # Explicit --profile / LME_PROFILE wins; otherwise derive from the mode flags.
+    # Cluster mode renders the cluster profile, offline the offline profile, and
+    # everything else the default single-node profile. tailscale is opt-in only
+    # via an explicit --profile (there is no dedicated mode flag for it).
+    if [ -n "$LME_PROFILE" ]; then
+        EFFECTIVE_PROFILE="$LME_PROFILE"
+    elif [ "$CLUSTER_MODE" = "true" ]; then
+        EFFECTIVE_PROFILE="cluster"
+    elif [ "$OFFLINE_MODE" = "true" ]; then
+        EFFECTIVE_PROFILE="offline"
+    else
+        EFFECTIVE_PROFILE="default"
+    fi
+
+    # Validate against the known profiles (manifests/profiles/*.yml).
+    case "$EFFECTIVE_PROFILE" in
+        default|cluster|offline|tailscale) ;;
+        *)
+            echo -e "${RED}✗ Unknown --profile '$EFFECTIVE_PROFILE' (expected: default|cluster|offline|tailscale)${NC}"
+            exit 1
+            ;;
+    esac
+    if [ "$EFFECTIVE_PROFILE" = "cluster" ] && [ "$CLUSTER_MODE" != "true" ]; then
+        echo -e "${YELLOW}⚠ --profile cluster without --cluster: cluster ES settings will render but no per-node host_vars are applied on a single host.${NC}"
+    fi
+
+    # -g/--graph-root -> lme_global.storage.graphroot for the manifest render.
+    # ONLY inject the operator override when -g was explicitly given: Ansible
+    # extra-vars REPLACE (do not merge) across precedence levels, so an
+    # always-passed lme_global_override would clobber any host_vars example. When
+    # -g is absent this fragment is empty and host_vars stays authoritative. The
+    # flat storage_graphroot var (podman storage.conf) is passed unconditionally
+    # elsewhere and is unaffected.
+    if [ "$GRAPH_ROOT_SET" = "true" ]; then
+        EFFECTIVE_GLOBAL_OVERRIDE=',"lme_global_override":{"storage":{"graphroot":"'"${GRAPH_ROOT}"'"}}'
+    else
+        EFFECTIVE_GLOBAL_OVERRIDE=""
+    fi
+
+    # Offline + LLM coherence (per the fan-out RESOLUTION; G3 owns the matching
+    # prepare_offline.sh / container_setup tar side): an air-gapped install NEVER
+    # enables litellm without its local image + pgvector secret. The FLAG side is
+    # enforced HERE -- EFFECTIVE_INSTALL_LLM defaults OFF for --offline (above)
+    # unless --llm was given (and preflight_offline_llm() then asserts the tars are
+    # staged). The value is passed to Ansible as -e install_llm=... which wins over
+    # any profile default, so offline.yml must NOT set install_llm via profile-vars
+    # set_fact (that would clobber this operator -e precedence) -- and it does not.
+    echo -e "${GREEN}✓ Manifest profile: ${EFFECTIVE_PROFILE} (install_llm=${EFFECTIVE_INSTALL_LLM}, elastic_services=${EFFECTIVE_INSTALL_ELASTIC_SERVICES})${NC}"
 }
 
 # Function to run the playbook
@@ -680,9 +748,9 @@ run_playbook() {
     sudo chown $(whoami):$(whoami) /opt/ansible-tmp
 
     if [ -f "$SCRIPT_DIR/inventory" ]; then
-        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}' $ANSIBLE_OPTS
+        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}"'}' $ANSIBLE_OPTS
     else
-        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}' $ANSIBLE_OPTS
+        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}"'}' $ANSIBLE_OPTS
     fi
     
     if [ $? -eq 0 ]; then
@@ -835,7 +903,7 @@ run_cluster_playbooks() {
     # gates the LLM/pack includes off there regardless of these values.
     compute_effective_flags
 
-    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}'
+    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}"'}'
 
     # Phase 1: Run site.yml on master with cluster vars (unless --cluster-nodes-only)
     if [ "$CLUSTER_NODES_ONLY" != "true" ]; then
@@ -888,6 +956,19 @@ echo "    Ansible Setup and Playbook Runner"
 echo "==============================================="
 
 # Reject unsupported flag combinations
+# Validate an explicit --profile EARLY (before the long ansible/nix/podman setup),
+# so a typo fails fast rather than after the install work. Derived profiles are
+# valid by construction; this only guards an operator-supplied name.
+if [ -n "$LME_PROFILE" ]; then
+    case "$LME_PROFILE" in
+        default|cluster|offline|tailscale) ;;
+        *)
+            echo -e "${RED}✗ Unknown --profile '$LME_PROFILE' (expected: default|cluster|offline|tailscale)${NC}"
+            exit 1
+            ;;
+    esac
+fi
+
 if [ "$CLUSTER_MODE" = "true" ] && [ "$OFFLINE_MODE" = "true" ]; then
     echo -e "${RED}✗ --cluster and --offline cannot be used together.${NC}"
     echo -e "${YELLOW}Offline cluster installation is not supported at this time.${NC}"

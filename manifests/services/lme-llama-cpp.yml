@@ -1,0 +1,73 @@
+---
+# llama-cpp -- kind: container. The local llama.cpp inference server (chat model).
+# Gated with the LLM stack (enabled_when:[install_llm]). Shares NOTHING with the
+# embeddings unit except the image ref (`llama-cpp`); they are distinct services.
+# Fidelity target = static quadlet/lme-llama-cpp.container; expected diffs are
+# directive REORDER within sections plus the ONE B4 cert-mount line change below.
+#
+# B4 cert isolation (WAVE-2): this unit mounts ONLY its own published bundle
+# (cert:llama-cpp -> /opt/lme/certs/llama-cpp) at /certs, read-only, NO idmap --
+# NOT the shared lme_certs workspace (which holds ca/ca.key). ca/ca.key is now
+# mounted into NOTHING, closing the CA-MITM exposure. The published bundle mirrors
+# the workspace SUBDIR layout, so in-container paths are UNCHANGED: the exec still
+# reads /certs/llama-cpp/llama-cpp.{crt,key} (own-leaf ref -> minted by the
+# instances.yml predicate even though this unit publishes no port).
+#
+# This unit carries NO `userns:` and NO `run_as:` today (VERIFIED) -> it renders
+# no UserNS= and runs in the HOST user namespace (container-root == host-root), and
+# it already read lme_certs AS ROOT. The `,idmap` option was therefore VESTIGIAL
+# (meaningless with no userns map). So certs.host_userns:true + in_container_uid:0
+# keeps IDENTICAL read semantics (root reads a root-owned 0640 key) while isolating
+# the bundle. cert_owner => 0 (host_userns base 0 + in_container_uid 0).
+#
+# DEPLOY-TIME RE-VERIFY FLAG: the LLM images were wiped from graph. llama-cpp pulls
+# ghcr.io/ggml-org/llama.cpp:server (upstream, uid UNVERIFIED; the SAME image backs
+# lme-embeddings). If this image declares USER <non-root> (Config.User != 0),
+# in_container_uid MUST equal that uid or the 0640 bundle key is unreadable -- SAME
+# accepted risk class as G5's fleet/wazuh. Re-verify at first deploy:
+# podman inspect --format '{{.Config.User}}' <image>.
+id: llama-cpp
+name: lme-llama-cpp
+kind: container
+enabled_when: [install_llm]
+image: llama-cpp
+description: Llama.cpp Server Container Service
+
+dependencies:
+  requires: [network]
+  after: [network]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  timeout_start_sec: 300
+  start_limit_interval: 120
+  start_limit_burst: 10
+
+environment:
+  HOST: "0.0.0.0"
+  PORT: "8080"
+
+network_aliases: [lme-llama-cpp]
+volumes:
+  - {source: /opt/lme/llama-models, dest: /models, options: [Z]}
+  - {source: "cert:llama-cpp", dest: /certs, options: [ro, Z]}          # B4: per-svc bundle, no idmap; Z=SELinux relabel
+
+# B4 cert-owner metadata (consumed by the certs role / init-setup.sh, NOT emitted
+# into the unit -> zero effect on rendered fidelity). host_userns:true -> no UserNS
+# remap, so cert_owner = in_container_uid directly (0 = root).
+certs:
+  host_userns: true
+  in_container_uid: 0
+  needs_ca: true
+
+health:
+  cmd: "curl -fsk https://localhost:8080/health"
+  interval: 30s
+  timeout: 30s
+  retries: 3
+
+exec: '--host 0.0.0.0 --port 8080 --model /models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf --ssl-cert-file /certs/llama-cpp/llama-cpp.crt --ssl-key-file /certs/llama-cpp/llama-cpp.key'

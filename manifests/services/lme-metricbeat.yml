@@ -1,0 +1,64 @@
+---
+# Metricbeat -- kind: container (a beat, elastic-services pack). B4 per-svc bundle.
+#
+# B4 mount: metricbeat mounts ONLY its own published bundle
+# (cert:metricbeat -> /opt/lme/certs/metricbeat) at /certs, read-only, NO idmap,
+# instead of the shared lme_certs workspace with `,idmap`. ca/ca.key is mounted
+# into NOTHING. In-container paths unchanged: config/metricbeat.yml references only
+# /certs/ca/ca.crt (verified -- metricbeat is a pure client, presents no leaf cert),
+# which the bundle provides.
+#
+# UID DROP (reverses a documented production posture -- read before re-adding root):
+# the static unit ran User=root. Under B4 that is NOT required for the cert: the
+# bundle is not idmapped and is chowned to cert_owner = base 0 (host_userns:true) +
+# in_container_uid 1000 = 1000, i.e. the image uid, so uid 1000 reads its own
+# 0644 ca/ca.crt directly. metricbeat does bind-mount hostfs (/proc, /sys/fs/cgroup,
+# / all :ro) for the system module, but it does NOT mount the host journal, so per
+# the pack rule (only journal-readers keep host root) it drops to the image uid.
+# This is the RESOLUTIONS-ratified least-privilege posture (metricbeat named
+# explicitly in the drop-to-1000 bucket); the hostfs read paths remain world/other
+# -readable (/proc, /sys) so the demotion does not regress metric collection.
+#
+# Fidelity target = quadlet-optional/elastic-services/lme-metricbeat.container with
+# EXACTLY: (1) Volume lme_certs:/certs:ro,idmap -> /opt/lme/certs/metricbeat:/certs:ro
+# and (2) drop User=root. The three hostfs mounts are preserved verbatim.
+id: metricbeat
+name: lme-metricbeat
+kind: container
+enabled_when: [install_elastic_services]
+image: metricbeat
+description: Elastic Metricbeat Container Service
+
+dependencies:
+  requires: [elasticsearch, setup-certs]
+  after: [elasticsearch, setup-certs, kibana]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  timeout_start_sec: 300
+  start_limit_interval: 120
+  start_limit_burst: 10
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+network_aliases: [lme-metricbeat]
+volumes:
+  - {source: "cert:metricbeat", dest: /certs, options: [ro, Z]}     # B4: per-svc bundle, no idmap; Z=SELinux relabel
+  - {source: /opt/lme/config/metricbeat.yml, dest: /usr/share/metricbeat/metricbeat.yml, options: [ro]}
+  - {source: /proc, dest: /hostfs/proc, options: [ro]}
+  - {source: /sys/fs/cgroup, dest: /hostfs/sys/fs/cgroup, options: [ro]}
+  - {source: /, dest: /hostfs, options: [ro]}
+secrets:
+  - {name: elastic, type: env, target: ELASTICSEARCH_PASSWORD}
+
+# B4 cert-owner metadata (consumed by init-setup.sh / G5, NOT emitted into the
+# unit). host_userns:true -> cert_owner = base 0 + in_container_uid 1000 = 1000
+# (the image uid). metricbeat is a pure client: bundle carries ca/ca.crt only.
+certs:
+  host_userns: true
+  in_container_uid: 1000
+  needs_ca: true

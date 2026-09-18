@@ -33,33 +33,33 @@
     kibana_port: 5601
     fleet_port: 8220
     
-    # Cluster mode configuration (default: false for single-node deployment)
-    # Set to true when deploying a multi-node Elasticsearch cluster
-    # Can be enabled via: -e lme_cluster_mode=true
-    lme_cluster_mode: false
-    
-    # Elasticsearch replicas: 0 for single-node (default), 1+ for cluster
+    # --- Deployment profile (manifest overlay selector) --------------------
+    # The active manifest profile is the SINGLE SOURCE of the Elasticsearch
+    # cluster settings (discovery mode, transport port 9300, JVM heap + cgroup
+    # memory caps). The playbook only SELECTS the profile here; the values live
+    # in manifests/profiles/<name>.yml, and the per-node discovery keys
+    # (node.name, discovery.seed_hosts, cluster.initial_master_nodes,
+    # network.publish_host) live in host_vars via lme_service_overrides -- see
+    # ansible/inventory/host_vars/*.yml.
+    #
+    # `lme_profile` is deliberately NOT defined as a play var here: the form
+    # `lme_profile: "{{ lme_profile | default('default') }}"` self-references
+    # (recursive-loop template error when no -e is given) AND play vars outrank
+    # host_vars/group_vars, which would shadow a per-group/per-host profile
+    # selection. It is instead supplied by install.sh as `-e lme_profile=<name>`
+    # (or an inventory group_var) and defaulted to 'default' by
+    # load_manifests.yml's set_fact.
+
+    # Cluster mode is DERIVED from the selected profile so the profile stays the
+    # single source of truth. An explicit `-e lme_cluster_mode=true` still wins
+    # (extra-vars precedence). This flag is consumed OUTSIDE the unit render --
+    # by the cleanup/fleet roles (index replica counts) and the
+    # elasticsearch.yml config template (snapshot repo path), not by the ES
+    # quadlet (that now comes from the profile + host_vars overlay).
+    lme_cluster_mode: "{{ (lme_profile | default('default')) == 'cluster' }}"
+
+    # Elasticsearch replicas: 0 for single-node (default), 1+ for cluster.
     elasticsearch_number_of_replicas: "{{ 1 if lme_cluster_mode | default(false) else 0 }}"
-    
-    # Cluster discovery settings (only used when lme_cluster_mode=true)
-    # es_discovery_type: 'single-node' for standalone, 'cluster' for multi-node
-    es_discovery_type: "{{ 'cluster' if lme_cluster_mode | default(false) else 'single-node' }}"
-    
-    # Seed hosts for cluster discovery (used when lme_cluster_mode=true)
-    # Should include all nodes that will be part of the cluster
-    es_seed_hosts: "{{ es_cluster_seed_hosts | default([]) }}"
-    
-    # Initial master nodes for cluster bootstrap (used when lme_cluster_mode=true)
-    # Only needed for first-time cluster setup
-    es_initial_masters: "{{ es_initial_master_nodes | default(['lme-elasticsearch']) }}"
-    
-    # Whether this is the initial master node (sets cluster.initial_master_nodes)
-    es_is_initial_master: "{{ lme_cluster_mode | default(false) }}"
-    
-    # Network publish host for cluster mode - the address other nodes can reach this node at
-    # For cluster mode, should be set to the external hostname/IP of this node
-    # Can be set via: -e es_publish_host=node1
-    es_publish_host: "{{ es_master_publish_host | default(omit) }}"
     
     # Kibana version
     kibana_version: "8.18.8"
@@ -68,6 +68,22 @@
     timezone_area: "Etc"  # Change to your area: America, Europe, Asia, etc.
     timezone_zone: "UTC"  # Change to your timezone: New_York, London, Tokyo, etc.
     nix_profile_symlink_path: /nix/var/nix/profiles/default
+
+    # --- Cert-publish ordering (B0/B4 single-node + cluster-master fix) ----------
+    # The four ALWAYS-ON core services (kibana, fleet-server, fleet-distribution,
+    # wazuh-manager) mount per-service host-tree cert bundles under
+    # /opt/lme/certs/<svc>. Those bundles are PUBLISHED only by the `certs` role
+    # (real host-root chown to the manifest-derived subuid; init-setup.sh runs under
+    # UserNS=auto and cannot chown to host subuids). The `certs` role never ran in
+    # site.yml before, so on single-node AND on the cluster master the bundles were
+    # never published and those four units failed to start.
+    #
+    # Fix (mirrors ansible/elasticsearch.yml): keep the podman role from
+    # auto-starting the umbrella (lme_autostart:false -> it still renders quadlets +
+    # creates secrets), run the `certs` role to generate the workspace certs AND
+    # publish the per-service bundles, THEN start lme.service ONCE and run each app
+    # role's post-install config against the now-running, cert-published stack.
+    lme_autostart: false
   roles:
     - role: base
       tags: ['base', 'all']
@@ -75,16 +91,80 @@
       tags: ['base', 'system', 'all']
     - role: podman
       tags: ['system', 'all']
-    - role: elasticsearch
+    # Generate the workspace certs (starts lme-setup-certs) AND publish the
+    # per-service host-tree bundles to /opt/lme/certs/<svc> BEFORE any core service
+    # starts. Consumes the same shared role as the cluster data-node path.
+    - role: certs
+      tags: ['certs']
+
+  # Post-role stack bring-up. With lme_autostart:false the podman role did NOT start
+  # the umbrella, so this is the SOLE start point -- and it runs only after `certs`
+  # has published the per-service bundles that the core units bind-mount.
+  tasks:
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start the LME stack (sole start point; certs published by now)
+      ansible.builtin.systemd:
+        name: lme.service
+        state: started
+        enabled: true
+
+    # B4 ordering: the Elastic-services (beats) and LLM packs were DEFERRED out of
+    # the podman role (gated on lme_autostart) because their units bind-mount per-svc
+    # cert bundles that the certs role only just published. Run them now -- after the
+    # core stack is up and /opt/lme/certs/<svc> exists -- via the same podman role
+    # task files (facts from the earlier podman role run are still in scope). Order
+    # (core -> elastic -> llm -> app-config) matches the pre-restructure roles: list.
+    - name: Setup Elastic services pack (deferred; post cert-publish + start)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: elastic_services_setup
+      when:
+        - install_elastic_services | default(false) | bool
+        - not (lme_child_es_only | default(false) | bool)
       tags: ['system', 'all']
-    - role: kibana
+
+    - name: Setup llama.cpp / LLM pack (deferred; post cert-publish + start)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: llama_cpp_setup
+      when:
+        - install_llm | default(true) | bool
+        - not (lme_child_es_only | default(false) | bool)
       tags: ['system', 'all']
-    - role: dashboards
+
+    # Each app role's post-install config expects a RUNNING, cert-published stack
+    # (uri/wait_for against :9200, kibana/fleet APIs, etc.). Run them here, in the
+    # same order they held in the old roles: list, each keeping its original tags.
+    - name: Run Elasticsearch post-install configuration
+      ansible.builtin.include_role:
+        name: elasticsearch
       tags: ['system', 'all']
-    - role: wazuh
+
+    - name: Run Kibana post-install configuration
+      ansible.builtin.include_role:
+        name: kibana
       tags: ['system', 'all']
-    - role: fleet
+
+    - name: Run Dashboards post-install configuration
+      ansible.builtin.include_role:
+        name: dashboards
       tags: ['system', 'all']
-    - role: cleanup
+
+    - name: Run Wazuh post-install configuration
+      ansible.builtin.include_role:
+        name: wazuh
+      tags: ['system', 'all']
+
+    - name: Run Fleet post-install configuration
+      ansible.builtin.include_role:
+        name: fleet
+      tags: ['system', 'all']
+
+    - name: Run cleanup
+      ansible.builtin.include_role:
+        name: cleanup
       tags: ['cleanup', 'all']
     

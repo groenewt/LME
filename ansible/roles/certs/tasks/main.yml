@@ -10,8 +10,40 @@
 
 - name: Determine certificate source host (first elasticsearch host)
   ansible.builtin.set_fact:
-    lme_certs_source_host: "{{ groups['elasticsearch'][0] }}"
+    # Cluster path: first host in the elasticsearch inventory group. Single-node /
+    # cluster-master via site.yml run on implicit localhost (no elasticsearch group)
+    # -> degenerate to self (source==target). Undefined-group would abort this
+    # role's first task; the default() chain keeps it cluster-safe AND single-node-safe.
+    lme_certs_source_host: "{{ (groups['elasticsearch'] | default([]))[0] | default(inventory_hostname) }}"
   run_once: true
+
+# --- B4 cert-owner derivation (manifest tree is the single source of truth) ------
+# The per-service cert-bundle OWNER uids are DERIVED from the manifests by the
+# cert_owner filter (subuid_base + slot*slot_size + in_container_uid for pinned
+# userns; in_container_uid directly for host_userns consumers). NO uid literal
+# lives in this role or in init-setup.sh -- the arithmetic lives only in
+# filter_plugins/lme_manifests.py, seeded by manifests/global.yml.
+- name: Load the manifest tree (lme_global / lme_services / lme_enable_flags)
+  ansible.builtin.include_tasks: "{{ clone_directory }}/ansible/roles/podman/tasks/load_manifests.yml"
+  when: lme_services is not defined
+
+- name: "B4: derive per-service cert BUNDLE owners (enabled cert:<svc> consumers)"
+  ansible.builtin.set_fact:
+    lme_cert_bundles: "{{ lme_cert_bundles | default([]) + [ {'id': item.key, 'owner': (item.value.certs | cert_owner(lme_global))} ] }}"
+  loop: "{{ lme_services | dict2items | selectattr('value.certs', 'defined') | list }}"
+  when:
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - (item.value.volumes | default([]) | map(attribute='source') | select('match', '^cert:') | list | length) > 0
+  loop_control:
+    label: "{{ item.key }} -> owner {{ item.value.certs | cert_owner(lme_global) }}"
+
+# NOTE: services that mount the shared workspace `lme_certs` directly (Elasticsearch)
+# or via `:idmap` (the LLM pack) are OWNED INSIDE the setup-certs container by
+# init-setup.sh (userns-root), NOT here. Chowning workspace files to host subuids from
+# this real-root layer would put them outside the setup-certs userns range and make
+# init-setup.sh's next-pass chmod EPERM (set -e -> the cert oneshot fails -> ES/Kibana/
+# Fleet fail to start). So the ansible layer touches ONLY the published bundles below,
+# which live OUTSIDE the workspace.
 
 - name: Render instances.yml on cert source host
   ansible.builtin.template:
@@ -124,6 +156,60 @@
 
 - name: Extract cert bundle into lme_certs mountpoint
   ansible.builtin.command: "tar -C {{ lme_certs_mountpoint.stdout | quote }} -xzf /tmp/lme_certs.tgz"
+  become: true
+
+# --- B4 cert PUBLISHING: per-service bundles under <certs.host_tree>/<svc> --------
+# Each cert:<svc> consumer gets its OWN published bundle, mirroring the workspace
+# SUBDIRECTORY layout the consumer configs expect: <svc>/<svc>.(crt|key|chain.pem)
+# plus the PUBLIC ca/ca.crt. The CA PRIVATE key (ca/ca.key) is NEVER copied here --
+# it stays workspace-only and is mounted into nothing. A pure CA-verifying consumer
+# (the beats: no minted leaf in the workspace) receives only ca/ca.crt. Bundle
+# ownership is the manifest-DERIVED cert_owner uid (a host subuid), applied HERE by
+# real host root -- these bundles live OUTSIDE the lme_certs workspace, so this layer
+# and init-setup.sh (which owns the in-workspace material as userns-root) never chown
+# the same files. The host subuids cannot be set from inside the UserNS=auto
+# setup-certs container, which is exactly why bundle ownership lives in this layer.
+- name: "B4: publish per-service cert bundles (derived owners; ca.key never published)"
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      ws={{ lme_certs_mountpoint.stdout | quote }}
+      tree={{ lme_global.certs.host_tree | quote }}
+      svc={{ item.id | quote }}
+      owner={{ item.owner | quote }}
+      dest="${tree}/${svc}"
+      # Build the bundle in a sibling staging dir on the SAME filesystem, then swap it
+      # in with an atomic rename. On an in-place upgrade the consuming unit keeps its old
+      # bind-mounted inode until restart, and a mid-build failure never leaves the live
+      # bundle half-deleted.
+      new="${dest}.new.$$"
+      install -d -m 0755 "${tree}"
+      rm -rf "${new}"
+      install -d -m 0750 "${new}"
+      install -d -m 0755 "${new}/ca"
+      # PUBLIC CA cert ONLY -- ca/ca.key is never copied out of the workspace.
+      install -m 0644 "${ws}/ca/ca.crt" "${new}/ca/ca.crt"
+      # Leaf subdir only if this service has its own minted leaf in the workspace
+      # (a CA-only consumer such as a beat has none -> bundle is ca/ca.crt only).
+      if [ -d "${ws}/${svc}" ]; then
+        install -d -m 0755 "${new}/${svc}"
+        if [ -f "${ws}/${svc}/${svc}.crt" ]; then install -m 0644 "${ws}/${svc}/${svc}.crt" "${new}/${svc}/${svc}.crt"; fi
+        if [ -f "${ws}/${svc}/${svc}.chain.pem" ]; then install -m 0644 "${ws}/${svc}/${svc}.chain.pem" "${new}/${svc}/${svc}.chain.pem"; fi
+        if [ -f "${ws}/${svc}/${svc}.key" ]; then install -m 0640 "${ws}/${svc}/${svc}.key" "${new}/${svc}/${svc}.key"; fi
+      fi
+      # Belt-and-suspenders: guarantee no CA private key ever lands in the published tree.
+      find "${new}" -name 'ca.key' -delete
+      # Ownership = the manifest-derived cert_owner uid (host subuid); gid mirrors uid.
+      chown -R "${owner}:${owner}" "${new}"
+      # Atomic swap into place.
+      rm -rf "${dest}.old.$$"
+      if [ -e "${dest}" ]; then mv "${dest}" "${dest}.old.$$"; fi
+      mv "${new}" "${dest}"
+      rm -rf "${dest}.old.$$"
+  loop: "{{ lme_cert_bundles | default([]) }}"
+  loop_control:
+    label: "{{ item.id }} -> owner {{ item.owner }}"
   become: true
 
 - name: Remove cert bundle on target host

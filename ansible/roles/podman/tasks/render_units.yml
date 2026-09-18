@@ -1,0 +1,77 @@
+---
+# ansible/roles/podman/tasks/render_units.yml
+#
+# Renders every ENABLED service manifest to its correct destination. The rendered
+# artifact names/dests match the CURRENT files exactly:
+#   container    -> /etc/containers/systemd/<name>.container
+#   volume       -> /etc/containers/systemd/<name>.volume
+#   network      -> /etc/containers/systemd/<name>.network       (name=lme -> lme.network)
+#   target       -> /etc/systemd/system/<name>.service           (name=lme -> lme.service)
+#   path_service -> /etc/systemd/system/<name>.path AND <name>.service
+#
+# Two gates: is_enabled(enabled_when) against the active enable flags, AND the id
+# must not be in lme_child_absent_services (the manifest-derived child-prune set,
+# computed by G2 as lme_services.keys() - lme_child_active_services).
+#
+# Requires load_manifests.yml to have run (lme_global, lme_services,
+# lme_service_kinds). G1 provides this file; G2/G3 include it without editing it.
+
+- name: Render container / volume / network units
+  ansible.builtin.template:
+    src: "{{ clone_directory }}/ansible/templates/units/{{ item.value.kind }}.j2"
+    dest: "/etc/containers/systemd/{{ item.value.name }}.{{ item.value.kind }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name }}.{{ item.value.kind }}"
+  vars:
+    service: "{{ item.value }}"
+    kinds: "{{ lme_service_kinds }}"
+    flags: "{{ lme_enable_flags | default({}) }}"
+  become: true
+  when:
+    - item.value.kind in ['container', 'volume', 'network']
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - item.key not in (lme_child_absent_services | default([]))
+
+- name: Render target unit (umbrella orchestrator)
+  ansible.builtin.template:
+    src: "{{ clone_directory }}/ansible/templates/units/target.j2"
+    dest: "/etc/systemd/system/{{ item.value.name }}.service"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name }}.service"
+  vars:
+    service: "{{ item.value }}"
+    kinds: "{{ lme_service_kinds }}"
+  become: true
+  when:
+    - item.value.kind == 'target'
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - item.key not in (lme_child_absent_services | default([]))
+
+- name: Render path_service pairs (.path + .service)
+  ansible.builtin.template:
+    src: "{{ clone_directory }}/ansible/templates/units/path_service.j2"
+    dest: "/etc/systemd/system/{{ item.0.value.name }}.{{ item.1 }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: >-
+    {{ (lme_services | dict2items | selectattr('value.kind', 'equalto', 'path_service') | list)
+       | product(['path', 'service']) | list }}
+  loop_control:
+    label: "{{ item.0.value.name }}.{{ item.1 }}"
+  vars:
+    service: "{{ item.0.value }}"
+    render_part: "{{ item.1 }}"
+    kinds: "{{ lme_service_kinds }}"
+  become: true
+  when:
+    - item.0.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - item.0.key not in (lme_child_absent_services | default([]))
