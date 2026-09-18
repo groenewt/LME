@@ -711,36 +711,62 @@
         group: root
         mode: '0744'
         
-    - name: Copy updated quadlet files to /etc/containers/systemd
-      copy:
-        src: "{{ clone_directory }}/quadlet/"
-        dest: /etc/containers/systemd/
-        owner: root
-        group: root
-        mode: '0644'
-      register: quadlet_copy_result
-      
-    - name: Copy lme.service to /etc/systemd/system
-      copy:
-        src: "{{ clone_directory }}/quadlet/lme.service"
-        dest: "/etc/systemd/system/lme.service"
-        owner: root
-        group: root
-        mode: '0644'
-      register: lme_service_copy_result
-      
+    # Control-plane cutover (B0): units are no longer copied from the static
+    # quadlet/ tree. They are RENDERED from the manifest tree (manifests/) exactly
+    # as fresh install does -- load_manifests.yml builds lme_global / lme_services /
+    # lme_enable_flags, and render_units.yml renders every ENABLED service. The
+    # umbrella target lme.service is rendered to /etc/systemd/system/lme.service
+    # (manifests/services/lme.service.yml, kind: target), which replaces the old
+    # static lme.service copy. include_role brings the podman role's defaults
+    # (lme_child_es_only, lme_child_active_services) into scope, and the render
+    # facts mirror the -e vars install.sh passes on a fresh install: install_llm /
+    # install_elastic_services from this upgrade's detected enablement
+    # (lme_llm_enabled / lme_pack_enabled), offline_mode from the on-disk marker,
+    # and the profile derived offline->offline / else default (operator -e wins).
+    - name: Detect offline-mode marker for the unit render
+      stat:
+        path: /opt/lme/OFFLINE_MODE
+      register: offline_marker
+
+    # Resolve the render facts into DIFFERENTLY-NAMED intermediates first. Passing
+    # `offline_mode: "{{ offline_mode | default(...) }}"` / `lme_profile: "{{ lme_profile
+    # | default(...) }}"` directly self-references and triggers a recursive-loop
+    # template error when no -e is given (the exact trap site.yml:44-51 documents). An
+    # operator -e offline_mode / -e lme_profile still wins via the default() here.
+    - name: Resolve render facts for the manifest pipeline (mirror install.sh -e vars)
+      set_fact:
+        _render_offline_mode: "{{ offline_mode | default(offline_marker.stat.exists) | bool }}"
+        _render_lme_profile: "{{ lme_profile | default('offline' if offline_marker.stat.exists else 'default') }}"
+
+    - name: Load service manifests into facts (render pipeline; mirrors fresh install)
+      include_role:
+        name: podman
+        tasks_from: load_manifests.yml
+      vars:
+        install_llm: "{{ lme_llm_enabled }}"
+        install_elastic_services: "{{ lme_pack_enabled }}"
+        offline_mode: "{{ _render_offline_mode }}"
+        lme_profile: "{{ _render_lme_profile }}"
+
+    # render_units consumes the lme_enable_flags / lme_services facts that
+    # load_manifests just set (no vars need re-passing) and writes the units to
+    # /etc/containers/systemd and /etc/systemd/system.
+    - name: Render all enabled service units from manifests (replaces static quadlet/ copy)
+      include_role:
+        name: podman
+        tasks_from: render_units.yml
+
     - name: Reload systemd daemon
       systemd:
         daemon_reload: yes
       register: daemon_reload_result
-      
-    - name: Display quadlet update results
+
+    - name: Display unit render results
       debug:
         msg: |
-          Quadlet files updated successfully:
+          Service units re-rendered from manifests:
           - Backup location: {{ quadlet_backup_dir.path }}
-          - Quadlet files: {{ 'Updated' if quadlet_copy_result.changed else 'No changes needed' }}
-          - LME service file: {{ 'Updated' if lme_service_copy_result.changed else 'No changes needed' }}
+          - Units: rendered from manifests/services/* into /etc/containers/systemd (+ /etc/systemd/system/lme.service)
           - Systemd daemon: {{ 'Reloaded' if daemon_reload_result.changed else 'Already current' }}
         
     - name: Restart LME service
@@ -876,18 +902,23 @@
         - current_lme_version is version('2.3.0', '<')
         - lme_llm_enabled | default(true) | bool
 
-    # Re-land the Elastic services pack so pack config/quadlet changes actually
-    # deploy on upgrade. The whole-dir quadlet copy above only covers quadlet/,
-    # not quadlet-optional/elastic-services/, and never re-runs the cert top-up,
-    # so a plain upgrade previously only pulled the pack images. Reuses the
-    # podman role task file (config ownership + cert-top-up logic lives there);
-    # runs after the core services are up, matching that file's "start pack
-    # units on an already-active umbrella service" assumption.
-    - name: Re-land Elastic services pack (quadlets, configs, cert top-up)
+    # Re-land the Elastic services pack config + certs on upgrade. The pack's units
+    # themselves are now rendered by the manifest render above (render_units.yml
+    # emits every manifests/services/* whose enabled_when is [install_elastic_services]);
+    # this include remains for the non-render concerns the render does NOT do: forcing
+    # the pack config into /opt/lme/config, re-owning it to root, disabling the host
+    # apm-server, re-running the cert top-up, and starting the pack units on the
+    # already-active umbrella. Runs after the core services are up, matching that
+    # file's "start pack units on an already-active umbrella service" assumption.
+    # Guarded off on child ES-only nodes to mirror the install path
+    # (roles/podman/tasks/main.yml:250-252 and site.yml:124-126).
+    - name: Re-land Elastic services pack (configs, ownership, cert top-up, unit start)
       include_role:
         name: podman
         tasks_from: elastic_services_setup.yml
-      when: lme_pack_enabled | default(false) | bool
+      when:
+        - lme_pack_enabled | default(false) | bool
+        - not (lme_child_es_only | default(false) | bool)
 
     - name: Update LME version in environment file
       lineinfile:
@@ -917,7 +948,7 @@
           - "AI Stack (new in 2.3.0):"
           - "- llama.cpp server:      https://<host>:8080  (LFM2.5-1.2B-Instruct)"
           - "- Embeddings server:     https://<host>:8081  (nomic-embed-text-v1.5)"
-          - "- LiteLLM proxy:         https://<host>:4000  (API key: sk-lme-llama-proxy)"
+          - "- LiteLLM proxy:         https://<host>:4000"
           - "- pgvector (PostgreSQL): localhost:5432"
           - "- LME Dashboard:        https://<host>:8502"
           - "- Log Analyzer:          https://<host>:8501"
@@ -925,6 +956,6 @@
           - "Configuration updates:"
           - "- Containers file: {{ 'Updated' if containers_copied.changed else 'No changes needed' }}"
           - "- Elasticsearch config: {{ 'Updated (removed old repo path)' if elasticsearch_config_updated.changed else 'Already correct' }}"
-          - "- Quadlet files: {{ 'Updated' if quadlet_copy_result.changed else 'No changes needed' }}"
-          - "- Previous quadlet files backed up to: {{ quadlet_backup_dir.path }}"
+          - "- Service units: re-rendered from manifests/services/*"
+          - "- Previous units backed up to: {{ quadlet_backup_dir.path }}"
           - "- Systemd daemon: {{ 'Reloaded' if daemon_reload_result.changed else 'Already current' }}"

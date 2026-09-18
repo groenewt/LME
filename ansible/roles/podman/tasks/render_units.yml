@@ -75,3 +75,143 @@
   when:
     - item.0.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
     - item.0.key not in (lme_child_absent_services | default([]))
+
+# ---------------------------------------------------------------------------
+# SF-5 / SF-1 -- STALE-UNIT PRUNE (idempotent reconfigure).
+#
+# The render tasks above only WRITE enabled units and SKIP disabled / child-absent
+# ones; nothing removes a unit that a flag flip (e.g. install_llm true->false, or a
+# host re-purposed full-stack -> ES-only child) has turned off. Left behind, the
+# podman generator still processes the orphan and systemd still tries to start it
+# (now missing its secret/model/config) -> crash-loops + a dirty host.
+#
+# Fix, two sets:
+#   * EXPECTED (full paths): the units the CURRENT config renders NOW -- the SAME
+#     gates + dest formulas as the three render tasks above (deterministic; no
+#     reliance on register `dest`, absent on unchanged items).
+#   * MANAGED (exact basenames): every unit render_units OWNS, enabled or not. The
+#     prune considers ONLY these exact names, so LME units installed by OTHER roles
+#     -- e.g. the kev role's lme-kev-sync.service / lme-kev-sync.timer -- are NEVER
+#     candidates. A blanket `lme*` glob WOULD delete those; exact names must not.
+# Prune = (managed files found on disk) - (expected). Runs BEFORE the daemon-reload
+# in quadlet_setup.yml.
+
+- name: SF-5 -- initialise the prune sets (expected + managed universe)
+  ansible.builtin.set_fact:
+    lme_expected_unit_files: []
+    lme_managed_quadlet_units: []
+    lme_managed_systemd_units: []
+
+# --- EXPECTED (enabled -> full paths) --------------------------------------
+- name: SF-5 -- expected container / volume / network unit files (enabled)
+  ansible.builtin.set_fact:
+    lme_expected_unit_files: >-
+      {{ lme_expected_unit_files
+         + ['/etc/containers/systemd/' ~ item.value.name ~ '.' ~ item.value.kind] }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name }}.{{ item.value.kind }}"
+  when:
+    - item.value.kind in ['container', 'volume', 'network']
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - item.key not in (lme_child_absent_services | default([]))
+
+- name: SF-5 -- expected target unit files (enabled)
+  ansible.builtin.set_fact:
+    lme_expected_unit_files: >-
+      {{ lme_expected_unit_files
+         + ['/etc/systemd/system/' ~ item.value.name ~ '.service'] }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name }}.service"
+  when:
+    - item.value.kind == 'target'
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - item.key not in (lme_child_absent_services | default([]))
+
+- name: SF-5 -- expected path_service unit files (.path + .service, enabled)
+  ansible.builtin.set_fact:
+    lme_expected_unit_files: >-
+      {{ lme_expected_unit_files
+         + ['/etc/systemd/system/' ~ item.value.name ~ '.path',
+            '/etc/systemd/system/' ~ item.value.name ~ '.service'] }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name }}"
+  when:
+    - item.value.kind == 'path_service'
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - item.key not in (lme_child_absent_services | default([]))
+
+# --- MANAGED universe (ALL render-owned names, enabled or not -> basenames) --
+- name: SF-5 -- managed quadlet unit names (/etc/containers/systemd)
+  ansible.builtin.set_fact:
+    lme_managed_quadlet_units: >-
+      {{ lme_managed_quadlet_units + [item.value.name ~ '.' ~ item.value.kind] }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name }}.{{ item.value.kind }}"
+  when: item.value.kind in ['container', 'volume', 'network']
+
+- name: SF-5 -- managed systemd unit names (target -> .service)
+  ansible.builtin.set_fact:
+    lme_managed_systemd_units: >-
+      {{ lme_managed_systemd_units + [item.value.name ~ '.service'] }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name }}.service"
+  when: item.value.kind == 'target'
+
+- name: SF-5 -- managed systemd unit names (path_service -> .path + .service)
+  ansible.builtin.set_fact:
+    lme_managed_systemd_units: >-
+      {{ lme_managed_systemd_units
+         + [item.value.name ~ '.path', item.value.name ~ '.service'] }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name }}"
+  when: item.value.kind == 'path_service'
+
+# --- find ONLY render-managed files, then prune those not currently enabled --
+# `patterns` are EXACT basenames (no wildcards), so a non-render LME unit
+# (lme-kev-sync.*) is never matched. file_type:file + recurse:false keep the
+# .wants enable symlinks (in subdirs) safe.
+- name: SF-5 -- find existing render-managed quadlet files (/etc/containers/systemd)
+  ansible.builtin.find:
+    paths: /etc/containers/systemd
+    patterns: "{{ lme_managed_quadlet_units }}"
+    file_type: file
+    recurse: false
+  register: lme_existing_quadlet
+  become: true
+  when: (lme_managed_quadlet_units | length) > 0
+
+- name: SF-5 -- find existing render-managed target/path files (/etc/systemd/system)
+  ansible.builtin.find:
+    paths: /etc/systemd/system
+    patterns: "{{ lme_managed_systemd_units }}"
+    file_type: file
+    recurse: false
+  register: lme_existing_systemd
+  become: true
+  when: (lme_managed_systemd_units | length) > 0
+
+# GUARD (non-negotiable): only prune when BOTH lme_services and the expected set are
+# non-empty. `difference([])` returns EVERYTHING found, so an empty/partial-empty
+# expected set would otherwise delete live units. The find is already scoped to
+# render-managed names, so a stale unit is deleted ONLY when its service is
+# genuinely disabled/child-absent (present in managed, absent from expected).
+- name: SF-5 -- prune stale render-managed unit files no longer enabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ ((lme_existing_quadlet.files | default([]))
+        + (lme_existing_systemd.files | default([])))
+       | map(attribute='path') | list | difference(lme_expected_unit_files) }}
+  loop_control:
+    label: "{{ item }}"
+  become: true
+  when:
+    - (lme_services | length) > 0
+    - (lme_expected_unit_files | default([]) | length) > 0

@@ -13,6 +13,7 @@
 #   * Volume= value assembly incl. cert:<svc> host-tree expansion (render_volume)
 #   * enable/skip decision from profile flags  (is_enabled)
 #   * Elasticsearch JVM heap opts + derived cgroup memory caps (jvm_opts / mem_derive)
+#   * per-service MemoryMax resolution + SF-8 co-residency budget (service_memory_max / memory_budget)
 #
 # THE derivation fact (stored as index/step in global.yml, derived everywhere else):
 #   userns_base(svc) = subuid_base + slot(svc) * slot_size
@@ -234,6 +235,104 @@ def mem_derive(heap, factor):
     return '%s%s' % (val, unit.upper())
 
 
+def _to_bytes(value):
+    """systemd size string ('6G', '512M', '8g', bare number) -> integer bytes.
+    Binary units (1G = 1024^3) to match systemd's MemoryMax= interpretation."""
+    num, unit = _split_size(value)
+    factors = {'': 1, 'b': 1, 'k': 1024, 'm': 1024 ** 2,
+               'g': 1024 ** 3, 't': 1024 ** 4}
+    key = unit[0].lower() if unit else ''
+    if key not in factors:
+        raise ValueError('lme: unknown size unit %r in %r' % (unit, value))
+    return int(num * factors[key])
+
+
+def service_memory_max(resources):
+    """The MemoryMax a service's `resources` block resolves to, as a systemd size
+    string (or None when the service declares no cap). Mirrors container.j2's two
+    declaration forms EXACTLY so the summed budget matches what is rendered:
+      * JVM service     (resources.heap set): heap * memory_max_factor (default 2),
+        via mem_derive -- the same value the template emits.
+      * non-JVM service (no heap): resources.memory_max, declared verbatim.
+    """
+    if not resources:
+        return None
+    if resources.get('heap') is not None:
+        return mem_derive(resources['heap'], resources.get('memory_max_factor', 2))
+    if resources.get('memory_max') is not None:
+        return resources['memory_max']
+    return None
+
+
+def memory_budget(services, flags=None, lme_global=None):
+    """SF-8 co-residency budget. Sum the MemoryMax of every ENABLED container
+    service that declares a cap, and compare against the host budget declared in
+    lme_global.budget (host_ram_gb minus reserve_gb).
+
+    Args:
+      services: the lme_services map (id -> resolved manifest dict).
+      flags:    the same enable-flags dict is_enabled() consults (install_llm /
+                install_elastic_services / offline_mode). Unenabled services are
+                excluded from the sum -- so the budget reflects THIS install's set.
+      lme_global: supplies lme_global.budget {host_ram_gb, reserve_gb}.
+
+    Returns a fact dict a preflight task can consume:
+      {total_bytes, total_gb, host_ram_gb, reserve_gb, usable_gb,
+       over_budget, oversized, capped, uncapped}
+      * capped   : id -> its MemoryMax (the services that entered the sum).
+      * uncapped : enabled container services with NO cap (e.g. wazuh-manager,
+                   elastalert) -- EXCLUDED from the sum and surfaced so the total
+                   is not mistaken for the whole stack's real footprint.
+      * over_budget: total_gb > usable_gb (usable = host_ram_gb - reserve_gb).
+                   This is an OVER-COMMIT signal, NOT a fit/OOM prediction:
+                   MemoryMax is a per-service systemd KILL CEILING, not a
+                   reservation, and services rarely reach their ceilings at once.
+                   Empirically the default+llm stack (23G of ceilings: ES 8 +
+                   kibana 5 + llm 10) runs on a 14G host. So over_budget is
+                   ADVISORY -- a preflight should WARN (loud) on it, NOT hard-fail,
+                   else it false-blocks a profile the deploy pipeline proves good.
+      * oversized: enabled services whose OWN MemoryMax exceeds usable RAM. That
+                   IS a deterministic OOM-kill (e.g. kibana 5G on a 4G host), so
+                   it is the real hard gate -- a preflight asserts `oversized == []`
+                   and only WARNS on over_budget (see container_setup.yml SF-8).
+    """
+    flags = flags or {}
+    lme_global = lme_global or {}
+    budget = lme_global.get('budget', {})
+    host_ram_gb = float(budget.get('host_ram_gb', 0))
+    reserve_gb = float(budget.get('reserve_gb', 0))
+    total_bytes = 0
+    capped = {}
+    uncapped = []
+    for sid, svc in (services or {}).items():
+        if svc.get('kind') != 'container':
+            continue
+        if not is_enabled(svc.get('enabled_when'), flags):
+            continue
+        cap = service_memory_max(svc.get('resources'))
+        if cap is None:
+            uncapped.append(sid)
+            continue
+        total_bytes += _to_bytes(cap)
+        capped[sid] = cap
+    total_gb = total_bytes / float(1024 ** 3)
+    usable_gb = host_ram_gb - reserve_gb
+    usable_bytes = usable_gb * (1024 ** 3)
+    oversized = sorted([sid for sid, cap in capped.items()
+                        if usable_gb > 0 and _to_bytes(cap) > usable_bytes])
+    return {
+        'total_bytes': total_bytes,
+        'total_gb': round(total_gb, 3),
+        'host_ram_gb': host_ram_gb,
+        'reserve_gb': reserve_gb,
+        'usable_gb': usable_gb,
+        'over_budget': bool(usable_gb > 0 and total_gb > usable_gb),
+        'oversized': oversized,
+        'capped': capped,
+        'uncapped': sorted(uncapped),
+    }
+
+
 class FilterModule(object):
     def filters(self):
         return {
@@ -249,4 +348,6 @@ class FilterModule(object):
             'is_enabled': is_enabled,
             'jvm_opts': jvm_opts,
             'mem_derive': mem_derive,
+            'service_memory_max': service_memory_max,
+            'memory_budget': memory_budget,
         }

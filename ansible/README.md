@@ -280,7 +280,8 @@ ansible-playbook ansible/change_passwords.yml \
 For clusters, ensure SSH connectivity from master to all nodes before running.
 
 `llm-keys` (cloud LLM provider API keys) and the LiteLLM internal proxy key
-(`sk-lme-llama-proxy`) are managed outside this playbook. See
+(`litellm_master_key`, a per-install random secret) are managed outside this
+playbook. See
 **[PASSWORD_README.md](PASSWORD_README.md)** for those workflows and the full
 credential inventory.
 

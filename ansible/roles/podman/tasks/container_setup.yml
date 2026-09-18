@@ -20,6 +20,66 @@
     or (lme_services is not defined)
     or (lme_enable_flags is not defined)
 
+# --- SF-8 co-residency memory budget preflight (fail fast, BEFORE any pull) ----
+# Weigh the MemoryMax of every ENABLED capped container service against THIS host's
+# usable RAM (actual ansible_memtotal_mb minus reserve_gb, NOT the static
+# global.budget.host_ram_gb) -- so a roomy VM passes and a tight host is caught
+# HERE, before the multi-GB image realization below, instead of OOMing mid-deploy.
+# Two DISTINCT signals (see the memory_budget docstring):
+#   * over_budget -> ADVISORY warning only. MemoryMax is a per-service kill ceiling,
+#     not a reservation; the default+llm stack over-commits (23G of ceilings) yet
+#     ran end-to-end on a 14G host, so hard-failing it would false-block a proven-
+#     good profile. We WARN and recommend --no-llm / a roomier host.
+#   * oversized   -> HARD FAIL. A single service whose OWN MemoryMax exceeds usable
+#     RAM (e.g. kibana 5G on a 4G VM) cannot be backed by the host -- a real
+#     fail-fast with no over-commit ambiguity.
+# Skipped on ES-only child nodes (they render only ES; the whole-stack sum would
+# overcount) and when host RAM is unmeasurable (gather_facts off -> no false fail).
+- name: SF-8 preflight -- co-residency memory budget vs actual host RAM
+  ansible.builtin.set_fact:
+    lme_mem_budget: >-
+      {{ lme_services | memory_budget(
+           lme_enable_flags,
+           lme_global | combine({'budget':
+             (lme_global.budget | default({}))
+             | combine({'host_ram_gb':
+                 (ansible_memtotal_mb | default(0) | int / 1024) | round(1)})})) }}
+  when: not (lme_child_es_only | default(false) | bool)
+
+- name: SF-8 preflight -- report co-residency budget
+  ansible.builtin.debug:
+    msg: >-
+      {% if (ansible_memtotal_mb | default(0) | int) == 0 %}Co-residency budget check SKIPPED (host RAM unavailable -- gather_facts off?).{% else %}Co-residency budget on this {{ lme_mem_budget.host_ram_gb }}G host: capped MemoryMax total {{ lme_mem_budget.total_gb }}G of usable {{ lme_mem_budget.usable_gb }}G (reserve {{ lme_mem_budget.reserve_gb }}G). Uncapped (excluded from sum): {{ lme_mem_budget.uncapped }}. over_budget(advisory)={{ lme_mem_budget.over_budget }} oversized(hard-gate)={{ lme_mem_budget.oversized }}.{% endif %}
+  when: not (lme_child_es_only | default(false) | bool)
+
+- name: SF-8 preflight -- WARN when the enabled stack over-commits host RAM (advisory)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: co-residency OVER-COMMIT -- capped MemoryMax total
+      {{ lme_mem_budget.total_gb }}G exceeds usable {{ lme_mem_budget.usable_gb }}G on this
+      {{ lme_mem_budget.host_ram_gb }}G host. This is a ceiling sum, not a reservation, so the
+      stack may still run, but under load expect memory pressure / possible OOM. Consider
+      --no-llm (drops the llm pack) or a roomier host. Enabled capped services: {{ lme_mem_budget.capped }}.
+  when:
+    - not (lme_child_es_only | default(false) | bool)
+    - (ansible_memtotal_mb | default(0) | int) > 0
+    - lme_mem_budget.over_budget | bool
+
+- name: SF-8 preflight -- HARD FAIL when a single service cannot fit host RAM
+  ansible.builtin.assert:
+    that:
+      - (lme_mem_budget.oversized | default([])) | length == 0
+    fail_msg: >-
+      Service(s) {{ lme_mem_budget.oversized }} each declare a MemoryMax larger than this
+      host's usable RAM ({{ lme_mem_budget.usable_gb }}G = {{ lme_mem_budget.host_ram_gb }}G
+      - {{ lme_mem_budget.reserve_gb }}G reserve); the host cannot back them. Deploy on a
+      roomier host, lower the service's cap in its manifest, or raise
+      lme_global.budget.host_ram_gb for this host.
+    success_msg: "No single service exceeds usable host RAM."
+  when:
+    - not (lme_child_es_only | default(false) | bool)
+    - (ansible_memtotal_mb | default(0) | int) > 0
+
 # --- container image policy ---------------------------------------------------
 - name: Check if policy.json exists
   stat:
@@ -122,13 +182,13 @@
 #     important while MA1's wazuh-manager manifest (declares wazuh / wazuh_api) is
 #     not yet present in manifests/services/.
 #   * deferred secrets   -> created by llama_cpp_setup.yml with their own recipes
-#     (pgvector: random file-driver password; llm-keys: empty placeholder). Their
-#     creation is gated by the SAME install_llm flag that renders litellm, so a
-#     rendered litellm never precedes their creation permanently.
+#     (pgvector + litellm_master_key: random file-driver passwords; llm-keys: empty
+#     placeholder). Their creation is gated by the SAME install_llm flag that renders
+#     litellm, so a rendered litellm never precedes their creation permanently.
 - name: Classify the secret set (known credentials vs LLM-stack deferred)
   set_fact:
     lme_known_password_secrets: [elastic, kibana_system, wazuh, wazuh_api]
-    lme_secrets_deferred: [pgvector, llm-keys]
+    lme_secrets_deferred: [pgvector, llm-keys, litellm_master_key]
 
 # Fail-closed B3 guard: any enabled secret that is neither a known credential nor
 # LLM-deferred has NO creation recipe. Stop loudly instead of rendering a unit

@@ -21,7 +21,16 @@ GRAPH_ROOT="/var/lib/containers/storage"
 # authoritative for lme_global.storage.graphroot (extra-vars REPLACE, not merge).
 GRAPH_ROOT_SET="false"
 INSTALL_LLM="false"
+# --no-llm: opt OUT of the default-on LLM stack for an ONLINE install (reduced
+# profile). Redundant for --offline, where the LLM stack is already off unless
+# --llm is given; conflicts with an explicit --llm (validated after arg parsing).
+NO_LLM="false"
 INSTALL_ELASTIC_SERVICES="false"
+
+# --tailscale: orthogonal toggle (INDEPENDENT of --profile) that turns on the three
+# tailscale serve legs (ingress + egress + services) with ANY profile. Passed to
+# Ansible as -e tailscale_serve_ingress/egress/services=true. See compute_effective_flags.
+TAILSCALE_MODE="false"
 
 # Manifest deployment profile selector (default|cluster|offline|tailscale).
 # Empty = derive from the mode flags in compute_effective_flags (cluster->cluster,
@@ -51,6 +60,8 @@ usage() {
     echo "  --skip-packages               Skip package installation (for development)"
     echo "  --llm                         Install LLM stack (llama.cpp, LiteLLM, pgvector, docs ingest)."
     echo "                                Default: on for non-offline installs; off for --offline unless this flag is set."
+    echo "  --no-llm                      Opt out of the LLM stack for an ONLINE install (reduced profile)."
+    echo "                                Cannot be combined with --llm. No effect on --offline (LLM is already off there)."
     echo "  --elastic-services            Install optional Elastic services pack (apm-server, heartbeat, metricbeat, filebeat, logstash)."
     echo "                                Default: off; not supported with --offline"
     echo "  -p, --playbook PLAYBOOK_PATH  Specify path to playbook (default: ./ansible/site.yml)"
@@ -58,6 +69,10 @@ usage() {
     echo "      --profile NAME            Select the manifest profile (default|cluster|offline|tailscale)."
     echo "                                Default: derived from the mode flags (--cluster->cluster,"
     echo "                                --offline->offline, else default). Passed as -e lme_profile=NAME."
+    echo "      --tailscale               Turn on the tailscale serve legs (ingress + egress + services)."
+    echo "                                ORTHOGONAL to --profile: composes with ANY profile. Passes"
+    echo "                                -e tailscale_serve_ingress/egress/services=true. Note: the loopback"
+    echo "                                service-binds come only from '--profile tailscale' (see below)."
     echo "  -h, --help                    Show this help message"
     echo
     echo "Cluster Options:"
@@ -100,8 +115,16 @@ while [[ $# -gt 0 ]]; do
             INSTALL_LLM="true"
             shift
             ;;
+        --no-llm)
+            NO_LLM="true"
+            shift
+            ;;
         --elastic-services)
             INSTALL_ELASTIC_SERVICES="true"
+            shift
+            ;;
+        --tailscale)
+            TAILSCALE_MODE="true"
             shift
             ;;
         -p|--playbook)
@@ -145,6 +168,12 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# --llm and --no-llm are mutually exclusive: one opts in, the other opts out.
+if [ "$INSTALL_LLM" = "true" ] && [ "$NO_LLM" = "true" ]; then
+    echo -e "${RED}✗ --llm and --no-llm cannot be combined${NC}"
+    usage
+fi
 
 # Validate that the offline bundle contains everything --llm needs before
 # ansible runs. Every failure is collected, reported together, and fatal.
@@ -635,10 +664,15 @@ check_sudo_access() {
 compute_effective_flags() {
     # Offline installs skip LLM unless --llm was explicitly requested, because
     # the offline LLM path requires the larger `prepare_offline.sh --llm`
-    # bundle. Non-offline installs keep the current LLM-on default.
+    # bundle. Online installs default LLM on, but --no-llm opts out for a reduced
+    # profile (LLM off without needing --offline). --llm/--no-llm are validated
+    # mutually exclusive at arg-parse time, so at most one is set here.
     if [ "$OFFLINE_MODE" = "true" ] && [ "$INSTALL_LLM" != "true" ]; then
         EFFECTIVE_INSTALL_LLM="false"
         echo -e "${YELLOW}⚠ Offline install without --llm: LLM stack will be skipped${NC}"
+    elif [ "$NO_LLM" = "true" ]; then
+        EFFECTIVE_INSTALL_LLM="false"
+        echo -e "${YELLOW}⚠ --no-llm: LLM stack will be skipped (reduced online profile)${NC}"
     else
         EFFECTIVE_INSTALL_LLM="true"
     fi
@@ -695,6 +729,32 @@ compute_effective_flags() {
         EFFECTIVE_GLOBAL_OVERRIDE=""
     fi
 
+    # --tailscale -> turn on the three tailscale serve legs, ORTHOGONALLY to the
+    # single-valued --profile. The legs are read by their include gates:
+    # ingress (elastic_services_setup.yml), egress + services (podman/main.yml).
+    # Passing them as -e means they compose with ANY profile (default/cluster/
+    # offline/tailscale), which the tailscale PROFILE alone could not do.
+    #
+    # LIMITATION (deliberate; for the review round to adjudicate): this toggle does
+    # NOT apply the tailscale profile's loopback service-binds (kibana/dashboard/
+    # log-analyzer/litellm -> bind 127.0.0.1). Those are per-service publish_ports
+    # overrides that flow through lme_service_overrides, NOT lme_global_override, so
+    # inlining them here would duplicate the profile's port lists in bash (drift
+    # risk). Consequence: with a non-tailscale profile the ingress + egress legs are
+    # fully functional (ingress proxies 127.0.0.1:<port> regardless of the host bind;
+    # egress is bind-independent), but the SERVICES (VIP) leg derives its targets
+    # from loopback-bound publish_ports (tailscale_service.yml) and so publishes only
+    # logstash (5044/8085, loopback in every profile) unless the UI/API binds are also
+    # loopback. For the full tailnet-fronted posture (loopback binds + all three legs)
+    # use `--profile tailscale`. Composing the full overlay orthogonally is the
+    # documented alternative left for review.
+    if [ "$TAILSCALE_MODE" = "true" ]; then
+        EFFECTIVE_TAILSCALE_OVERRIDE=',"tailscale_serve_ingress":true,"tailscale_serve_egress":true,"tailscale_serve_services":true'
+        echo -e "${GREEN}✓ Tailscale serve legs enabled (ingress + egress + services), composed with profile ${EFFECTIVE_PROFILE}${NC}"
+    else
+        EFFECTIVE_TAILSCALE_OVERRIDE=""
+    fi
+
     # Offline + LLM coherence (per the fan-out RESOLUTION; G3 owns the matching
     # prepare_offline.sh / container_setup tar side): an air-gapped install NEVER
     # enables litellm without its local image + pgvector secret. The FLAG side is
@@ -748,9 +808,9 @@ run_playbook() {
     sudo chown $(whoami):$(whoami) /opt/ansible-tmp
 
     if [ -f "$SCRIPT_DIR/inventory" ]; then
-        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}"'}' $ANSIBLE_OPTS
+        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}' $ANSIBLE_OPTS
     else
-        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}"'}' $ANSIBLE_OPTS
+        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}' $ANSIBLE_OPTS
     fi
     
     if [ $? -eq 0 ]; then
@@ -903,7 +963,7 @@ run_cluster_playbooks() {
     # gates the LLM/pack includes off there regardless of these values.
     compute_effective_flags
 
-    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}"'}'
+    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}'
 
     # Phase 1: Run site.yml on master with cluster vars (unless --cluster-nodes-only)
     if [ "$CLUSTER_NODES_ONLY" != "true" ]; then
@@ -1234,25 +1294,9 @@ if [ "$OFFLINE_MODE" = "true" ]; then
                 echo -e "${RED}✗ Wazuh configuration file not found${NC}"
             fi
 
-            # Add CVE database volume mount to Wazuh container
-            echo -e "${YELLOW}Adding CVE database volume mount to Wazuh container...${NC}"
-            WAZUH_CONTAINER_FILE="$SCRIPT_DIR/quadlet/lme-wazuh-manager.container"
-            if [ -f "$WAZUH_CONTAINER_FILE" ]; then
-                # Create backup
-                sudo cp "$WAZUH_CONTAINER_FILE" "$WAZUH_CONTAINER_FILE.backup.$(date +%Y%m%d-%H%M%S)"
-
-                # Add CVE volume mount if not already present
-                if ! grep -q "Volume=/opt/lme/cve" "$WAZUH_CONTAINER_FILE"; then
-                    # Use awk to insert the CVE volume mount after the ca-certificates line
-                    awk '/Volume=.*ca-certificates.crt:ro/ { print; print "Volume=/opt/lme/cve:/opt/lme/cve:ro"; next } 1' "$WAZUH_CONTAINER_FILE" > /tmp/wazuh_container_temp.conf
-                    sudo mv /tmp/wazuh_container_temp.conf "$WAZUH_CONTAINER_FILE"
-                    echo -e "${GREEN}✓ CVE database volume mount added to Wazuh container${NC}"
-                else
-                    echo -e "${GREEN}✓ CVE database volume mount already present in Wazuh container${NC}"
-                fi
-            else
-                echo -e "${RED}✗ Wazuh container file not found${NC}"
-            fi
+            # The CVE-DB volume mount for the Wazuh container is emitted by the
+            # manifest/template render (manifests/services/lme-wazuh-manager.yml),
+            # not mutated into the static quadlet tree here.
         else
             echo -e "${YELLOW}⚠ CVE database not found in offline resources, skipping${NC}"
         fi
@@ -1260,28 +1304,11 @@ if [ "$OFFLINE_MODE" = "true" ]; then
         # Note: Kibana offline configuration is handled by Ansible in the fleet role
         # The fleet role will add xpack.fleet.registryUrl and xpack.fleet.isAirGapped
         # to /opt/lme/config/kibana.yml after it's copied from the source
-
-        # Configure Kibana container to use only local CA in offline mode
-        echo -e "${YELLOW}Configuring Kibana container for offline CA trust...${NC}"
-        KIBANA_CONTAINER_FILE="$SCRIPT_DIR/quadlet/lme-kibana.container"
-
-        if [ -f "$KIBANA_CONTAINER_FILE" ]; then
-            # Replace NODE_EXTRA_CA_CERTS to use only local CA
-            sed -i 's|NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt|NODE_EXTRA_CA_CERTS=/usr/share/kibana/config/certs/ca/ca.crt|g' "$KIBANA_CONTAINER_FILE"
-            echo -e "${GREEN}✓ Kibana container configured to trust only local CA${NC}"
-        else
-            echo -e "${RED}✗ Kibana container file not found${NC}"
-        fi
-
-        # Configure all container files for offline mode (add Pull=never)
-        echo -e "${YELLOW}Configuring container files for offline mode...${NC}"
-        for container_file in "$SCRIPT_DIR/quadlet"/*.container; do
-            if [ -f "$container_file" ] && ! grep -q "Pull=never" "$container_file"; then
-                # Add Pull=never after the Image= line
-                sed -i '/^Image=/a Pull=never' "$container_file"
-                echo -e "${GREEN}✓ Configured $(basename "$container_file") for offline mode${NC}"
-            fi
-        done
+        #
+        # The Kibana offline CA trust (NODE_EXTRA_CA_CERTS) and the per-container
+        # Pull=never for air-gapped installs are now emitted by the manifest/template
+        # render (manifests/services/lme-kibana.yml; container.j2 on flags.offline_mode),
+        # not mutated into the static quadlet tree here.
 
         # Create offline mode marker files
         echo -e "${YELLOW}Creating offline mode marker files...${NC}"

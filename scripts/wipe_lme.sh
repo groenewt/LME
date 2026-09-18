@@ -23,6 +23,27 @@ set -uo pipefail
 PODMAN="sudo -i podman"
 
 # --------------------------------------------------------------------------
+# LME-OWNED tailscale serve identity (Finding A). The teardown must reset ONLY
+# serve/Service entries LME itself created and must NEVER touch a co-tenant's
+# serves on a shared node -- e.g. the operator's own svc:windows11 /
+# svc:vncserverwindow. BOTH the reset (step 4) and the residue self-verify
+# (step 6d) read THESE arrays, so "what LME owns" is defined in exactly one place
+# and the two lists cannot drift apart (the drift is how this bug came back).
+#
+#   * Node-scoped ingress serves (ansible/roles/podman/tasks/tailscale_ingress.yml):
+#     apm-server :8200 (https), litellm :4000 (https) and logstash beats :5044
+#     (raw --tcp). These are the ONLY node-scoped serves LME publishes.
+#   * VIP Services (tailscale_service.yml): svc:<id> for each enabled host-facing
+#     LME service, the id derived from lme_services. Matched by EXACT name, so a
+#     non-LME svc:<name> is never reset or counted as residue.
+LME_SERVE_HTTPS_PORTS=(8200 4000)            # node-scoped HTTPS ingress fronts
+LME_SERVE_TCP_PORTS=(5044)                   # node-scoped raw-TCP ingress front
+LME_SERVE_NODE_PORTS=(8200 4000 5044)        # every node-scoped LME serve port
+# svc:<name> VIPs LME may publish (host-facing lme_services ids). This list NEVER
+# contains the operator's own svc names (svc:windows11 / svc:vncserverwindow).
+LME_SVC_NAMES=(kibana litellm dashboard log-analyzer apm-server logstash fleet-server elasticsearch)
+
+# --------------------------------------------------------------------------
 # 1. Stop AND disable every lme unit -- enumerated robustly (cwd-independent).
 #    We DO NOT use a bare shell glob (`systemctl stop lme*`); from the repo
 #    root that expands against directory names and stops almost nothing. The
@@ -109,20 +130,75 @@ for _rc in /root/.profile /root/.bashrc; do
 done
 
 # --------------------------------------------------------------------------
-# 4. Reset tailscale serve/ingress so host-facing proxy state does not persist
-#    across teardown. Guarded on the binary being present.
+# 4. Reset ONLY LME-owned tailscale serve/ingress state (Finding A). A blanket
+#    `tailscale serve reset` would also wipe a co-tenant's serve/Service config on
+#    a shared node, so LME removes its specific node-scoped ports and its own
+#    svc:<name> VIPs by exact identity. A blanket reset is used ONLY as a last
+#    resort, and only on a host that has NO non-LME serve config to protect.
+#    Guarded on the binary being present.
 # --------------------------------------------------------------------------
 if command -v tailscale >/dev/null 2>&1; then
-  echo "Resetting tailscale serve/ingress config..."
-  sudo tailscale serve reset 2>/dev/null || true
-  # Best-effort clear of any Tailscale Service-scoped serves. The repo uses
-  # node-scoped serve only (tailscale_ingress.yml), so this is purely defensive
-  # for `--service=` setups -- no version detection, just reset whatever shows.
-  if svc_names=$(sudo tailscale serve status 2>/dev/null \
-                 | grep -oE 'svc:[A-Za-z0-9._-]+' | sort -u); then
-    for svc in $svc_names; do
-      sudo tailscale serve --service="$svc" reset 2>/dev/null || true
+  echo "Resetting LME-owned tailscale serve/ingress config (co-tenant serves left intact)..."
+
+  # 4a. Remove LME node-scoped serve handlers by EXACT port. `--https/--tcp <port>
+  #     off` targets just that handler; it never touches svc:* Services or a non-LME
+  #     node handler bound to a different port.
+  for _p in "${LME_SERVE_HTTPS_PORTS[@]}"; do
+    sudo tailscale serve --https="$_p" off 2>/dev/null || true
+  done
+  for _p in "${LME_SERVE_TCP_PORTS[@]}"; do
+    sudo tailscale serve --tcp="$_p" off 2>/dev/null || true
+  done
+
+  # 4b. Remove ONLY LME-owned Tailscale Service VIPs. Enumerate what is actually
+  #     advertised, intersect with the LME name set, and clear JUST those. We never
+  #     iterate-and-reset every svc:* (that is exactly what used to destroy the
+  #     operator's svc:windows11). `clear` removes all handlers for the service; the
+  #     older per-service `reset` spelling is a fallback for builds without `clear`.
+  if _present_svcs=$(sudo tailscale serve status 2>/dev/null \
+                     | grep -oE 'svc:[A-Za-z0-9._-]+' | sort -u); then
+    for _svc in $_present_svcs; do
+      _name=${_svc#svc:}
+      for _lme in "${LME_SVC_NAMES[@]}"; do
+        if [ "$_name" = "$_lme" ]; then
+          # `clear` arg form varies (svc:<name> vs bare <name>); try both, then the
+          # older per-service `reset` spelling, so a scoped removal actually lands.
+          sudo tailscale serve clear "$_svc" 2>/dev/null \
+            || sudo tailscale serve clear "$_name" 2>/dev/null \
+            || sudo tailscale serve --service="$_svc" reset 2>/dev/null || true
+          break
+        fi
+      done
     done
+  fi
+
+  # 4c. Last-resort blanket reset, ONLY on a host with nothing else to lose. If LME
+  #     node serves survived 4a (e.g. a tailscale build whose serve has no `... off`
+  #     target) AND the node advertises NO non-LME serve entry at all, a blanket
+  #     reset is provably harmless and keeps the B2 teardown gate passable. If ANY
+  #     non-LME entry is present we NEVER reset -- surviving LME node residue is left
+  #     to the fail-closed self-verify (6d) rather than risk a co-tenant's config.
+  if _serve_now=$(sudo tailscale serve status 2>/dev/null); then
+    _lme_node_left=""
+    for _p in "${LME_SERVE_NODE_PORTS[@]}"; do
+      printf '%s\n' "$_serve_now" | grep -qE "127\.0\.0\.1:${_p}([^0-9]|$)" \
+        && _lme_node_left="yes"
+    done
+    # Foreign = any svc:<name> still present (LME-owned ones were just cleared in 4b,
+    # so a remainder is a co-tenant's) OR a node backend on a port LME does not own.
+    _foreign=""
+    printf '%s\n' "$_serve_now" | grep -qE 'svc:[A-Za-z0-9._-]+' && _foreign="yes"
+    while IFS= read -r _bport; do
+      _own=""
+      for _p in "${LME_SERVE_NODE_PORTS[@]}"; do [ "$_bport" = "$_p" ] && _own="yes"; done
+      [ -z "$_own" ] && _foreign="yes"
+    done < <(printf '%s\n' "$_serve_now" | grep -oE '127\.0\.0\.1:[0-9]+' \
+             | grep -oE '[0-9]+$' | sort -u)
+
+    if [ -n "$_lme_node_left" ] && [ -z "$_foreign" ]; then
+      echo "  LME node serves survived scoped '... off' and no co-tenant serve is present; blanket reset (safe on a dedicated host)."
+      sudo tailscale serve reset 2>/dev/null || true
+    fi
   fi
 fi
 
@@ -133,8 +209,15 @@ echo "Reloading systemd and clearing failed states..."
 sudo systemctl daemon-reload 2>/dev/null || true
 sudo systemctl reset-failed 2>/dev/null || true
 
-echo "Cleaning up container config..."
-rm -rf ~/.config/containers
+# `sudo -i podman` runs with HOME=/root, so podman reads
+# /root/.config/containers/{storage,containers}.conf -- written by setup_passwords.yml
+# as user_storage_conf (the RELOCATED graphroot) and user_secrets_conf (the shell-
+# driver secrets config pointing at /etc/lme/vault, just deleted). The old
+# `rm -rf ~/.config/containers` (un-sudo'd) targeted the INVOKING user's home, which
+# on this rootful install is the WRONG store -- so the load-bearing root config
+# survived a "full" wipe and the next install inherited a stale graphroot pointer.
+echo "Cleaning up rootful container config (/root/.config/containers)..."
+sudo rm -rf /root/.config/containers
 sudo rm -f /etc/containers/storage.conf
 
 # --------------------------------------------------------------------------
@@ -200,6 +283,10 @@ fi
 # --- 6c. filesystem residue ------------------------------------------------
 [ -e /opt/lme ] && RESIDUE+=("/opt/lme still exists")
 [ -e /etc/lme ] && RESIDUE+=("/etc/lme still exists")
+# SF-8: the rootful podman config `sudo -i podman` actually reads. The dir holds
+# storage.conf (relocated graphroot) AND containers.conf (shell-secrets driver);
+# one dir assertion covers both. storage.conf is named so the check is self-evident.
+[ -e /root/.config/containers ] && RESIDUE+=("/root/.config/containers still exists (rootful storage.conf/containers.conf residue)")
 
 # Unit-file residue in the quadlet dir. `nullglob` so an empty match does NOT
 # leave the literal pattern (which would false-fail a clean host).
@@ -210,15 +297,31 @@ if [ "${#quadlet_leftover[@]}" -gt 0 ]; then
   RESIDUE+=("quadlet file(s) still present:"$'\n'"$(printf '%s\n' "${quadlet_leftover[@]}")")
 fi
 
-# --- 6d. tailscale serve config -------------------------------------------
-# Positive-match actual serve config lines (version-independent); do NOT
-# negative-match the "No serve config" banner. Present-but-unqueryable
-# (tailscaled down) is indeterminate -> residue, because the serve config
-# persists in state and returns when tailscaled restarts.
+# --- 6d. tailscale serve config (LME-owned ONLY -- Finding A) ---------------
+# Count ONLY LME-owned serve config as residue. A co-tenant's serve/Service on a
+# shared node (svc:windows11, svc:vncserverwindow, or a node backend on a non-LME
+# port) is deliberately NOT asserted -- it is not ours to remove and must never
+# fail our wipe. LME-owned residue still fails closed (any survivor -> exit 1), so
+# the B2 teardown contract is preserved. Present-but-unqueryable (tailscaled down)
+# is indeterminate -> residue, because serve config persists and returns on restart.
 if command -v tailscale >/dev/null 2>&1; then
   if serve_status=$(sudo tailscale serve status 2>/dev/null); then
-    serve_cfg=$(printf '%s\n' "$serve_status" | grep -E '127\.0\.0\.1:|proxy|tcp://|svc:' || true)
-    [ -n "$serve_cfg" ] && RESIDUE+=("tailscale serve config still present:"$'\n'"$serve_cfg")
+    lme_serve_residue=""
+    # LME-owned svc:<name> VIPs (exact-name match; foreign svc:* ignored).
+    while IFS= read -r _svc; do
+      _name=${_svc#svc:}
+      for _lme in "${LME_SVC_NAMES[@]}"; do
+        [ "$_name" = "$_lme" ] && lme_serve_residue+="${_svc}"$'\n'
+      done
+    done < <(printf '%s\n' "$serve_status" | grep -oE 'svc:[A-Za-z0-9._-]+' | sort -u)
+    # LME node-scoped serves (ingress ports). Anchored so :50441 cannot match :5044.
+    for _p in "${LME_SERVE_NODE_PORTS[@]}"; do
+      printf '%s\n' "$serve_status" | grep -qE "127\.0\.0\.1:${_p}([^0-9]|$)" \
+        && lme_serve_residue+="127.0.0.1:${_p} (LME node serve)"$'\n'
+    done
+    lme_serve_residue=$(printf '%s' "$lme_serve_residue" | grep -v '^[[:space:]]*$' || true)
+    [ -n "$lme_serve_residue" ] \
+      && RESIDUE+=("LME tailscale serve config still present:"$'\n'"$lme_serve_residue")
   else
     RESIDUE+=("tailscale serve status query failed -- cannot verify clean (indeterminate)")
   fi

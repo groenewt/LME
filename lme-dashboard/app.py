@@ -35,7 +35,15 @@ ES_USER = os.getenv("ELASTICSEARCH_USER", "elastic")
 ES_PASS = os.getenv("ELASTICSEARCH_PASSWORD", "")
 KIBANA_URL = os.getenv("KIBANA_URL", "https://lme-kibana:5601")
 LITELLM_URL = os.getenv("LITELLM_URL", "https://lme-litellm:4000")
-LITELLM_KEY = os.getenv("LITELLM_API_KEY", "sk-lme-llama-proxy")
+LITELLM_KEY = os.getenv("LITELLM_API_KEY")
+if not LITELLM_KEY:
+    # Fail closed: never fall back to a hardcoded proxy key. LITELLM_API_KEY is
+    # injected from the per-install podman secret `litellm_master_key`.
+    raise RuntimeError(
+        "LITELLM_API_KEY is not set. The dashboard requires the LiteLLM proxy "
+        "master key (podman secret 'litellm_master_key') to be injected as "
+        "LITELLM_API_KEY. Refusing to start without proxy credentials."
+    )
 LITELLM_MDL = os.getenv("LITELLM_MODEL", "lfm2.5-1.2b-instruct")
 
 # Path to LiteLLM config YAML — writable so the UI can manage models
@@ -1506,7 +1514,9 @@ def _read_litellm_config() -> dict:
         with open(LITELLM_CONFIG_PATH, "r") as f:
             return yaml.safe_load(f) or {}
     except FileNotFoundError:
-        return {"model_list": [], "general_settings": {"master_key": LITELLM_KEY},
+        # Write env indirection, never a literal secret: litellm resolves
+        # `os.environ/LITELLM_MASTER_KEY` from the injected environment at load time.
+        return {"model_list": [], "general_settings": {"master_key": "os.environ/LITELLM_MASTER_KEY"},
                 "litellm_settings": {"drop_params": True, "success_callback": [], "failure_callback": []}}
 
 

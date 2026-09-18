@@ -17,7 +17,15 @@ ES_URL = os.getenv("ELASTICSEARCH_URL", "https://lme-elasticsearch:9200")
 ES_USER = os.getenv("ELASTICSEARCH_USER", "elastic")
 ES_PASS = os.getenv("ELASTICSEARCH_PASSWORD", "")
 LITELLM_URL = os.getenv("LITELLM_URL", "https://lme-litellm:4000")
-LITELLM_KEY = os.getenv("LITELLM_API_KEY", "sk-lme-llama-proxy")
+LITELLM_KEY = os.getenv("LITELLM_API_KEY")
+if not LITELLM_KEY:
+    # Fail closed: never fall back to a hardcoded proxy key. LITELLM_API_KEY is
+    # injected from the per-install podman secret `litellm_master_key`.
+    raise RuntimeError(
+        "LITELLM_API_KEY is not set. The log analyzer requires the LiteLLM proxy "
+        "master key (podman secret 'litellm_master_key') to be injected as "
+        "LITELLM_API_KEY. Refusing to start without proxy credentials."
+    )
 LITELLM_MODEL = os.getenv("LITELLM_MODEL", "lfm2.5-1.2b-instruct")
 
 # Define LLM functions

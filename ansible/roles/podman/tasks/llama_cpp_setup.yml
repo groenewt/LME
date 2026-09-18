@@ -5,9 +5,10 @@
 # lme-dashboard, lme-log-analyzer) now happens ONCE in container_setup.yml, driven
 # by manifests/global.yml (group: llm). The quadlet/systemd unit files for this
 # stack are rendered by render_units.yml from manifests/services/*, not copied
-# here. What remains below is genuinely non-render work: the pgvector/llm-keys
-# secrets (their creation recipes are stack-specific, so they are DEFERRED here
-# rather than created by container_setup's credential loop), model downloads,
+# here. What remains below is genuinely non-render work: the pgvector/llm-keys/
+# litellm_master_key secrets (their creation recipes are stack-specific, so they
+# are DEFERRED here rather than created by container_setup's credential loop),
+# model downloads,
 # config templating, and runtime activation/DB/ingestion of the rendered units.
 
 - name: Ensure /opt/lme/lme-dashboard directory exists
@@ -43,6 +44,30 @@
     fi
   args:
     executable: /bin/bash
+  become: yes
+
+# DEFERRED secret (see container_setup.yml lme_secrets_deferred): litellm_master_key
+# is the LiteLLM proxy master key -- the sole auth boundary of the proxy. Like
+# pgvector it needs a random file-driver password (NOT a shell-driver credential),
+# so it is created here rather than by container_setup's credential loop. The
+# rendered lme-litellm unit consumes it as env LITELLM_MASTER_KEY (config
+# resolves `os.environ/LITELLM_MASTER_KEY`); the two UI units consume it as env
+# LITELLM_API_KEY. This whole file runs only when install_llm, so the secret
+# exists before those units start below.
+# NOTE (cross-owner): container_setup.yml `lme_secrets_deferred` MUST list
+# `litellm_master_key`, or the B3 fail-closed guard aborts once a manifest
+# declares this secret. That list is not owned by this file.
+- name: Create litellm_master_key secret password
+  shell: |
+    source /root/.profile
+    export PATH=$PATH:/nix/var/nix/profiles/default/bin
+    if ! podman secret ls | grep -q litellm_master_key; then
+      password=$(</dev/urandom tr -dc A-Za-z0-9 | head -c30)
+      echo -n $password | podman secret create --driver file litellm_master_key -
+    fi
+  args:
+    executable: /bin/bash
+  no_log: true
   become: yes
 
 - name: Create llama models directory
@@ -296,7 +321,7 @@
       LiteLLM Proxy (HTTPS):         https://{{ (ansible_default_ipv4.address if (ansible_default_ipv4 is defined and ansible_default_ipv4.address is defined) else 'localhost') }}:{{ lme_global.ports.litellm.host }}
       Direct llama.cpp (HTTP only):  http://{{ (ansible_default_ipv4.address if (ansible_default_ipv4 is defined and ansible_default_ipv4.address is defined) else 'localhost') }}:8080
 
-      API Key for LiteLLM: sk-lme-llama-proxy
+      API Key for LiteLLM: stored in podman secret `litellm_master_key` (per-install random; not printed)
       Model name: lfm2.5-1.2b
       Model file: LiquidAI/LFM2.5-1.2B-Instruct-GGUF (pulled from HuggingFace at startup)
   when: model_download is succeeded
