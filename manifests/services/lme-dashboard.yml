@@ -1,0 +1,109 @@
+---
+# dashboard -- kind: container. The LME Security Dashboard (FastAPI + Alpine.js).
+# LOCALLY BUILT: image ref `lme-dashboard` in global.images carries a `build:`
+# (lme-dashboard/Dockerfile), no upstream pull. Gated with the LLM stack
+# (enabled_when:[install_llm]).
+#
+# DISEASE CURE: the static quadlet/lme-dashboard.container is riddled with
+# `#@@TODO:OPERATOR: HARDCODED` annotations APPENDED to nearly every directive --
+# and two of them are glued directly onto the VALUE with no separating space,
+# corrupting it:
+#   LLAMA_MODEL_TRIGGER=/opt/lme/config/.llama-model-updated#@@TODO...
+#   SSL_KEYFILE=/certs/dashboard/dashboard.key#@@TODO...
+# The clean values are declared below (the trigger path and the ssl key path).
+# Every hardcoded value is legitimate DATA and lives here in the manifest.
+# PublishPort=8502 is a SINGLE port (checked: no comma-join bug).
+#
+# B4 cert isolation (WAVE-2): this unit mounts ONLY its own published bundle
+# (cert:dashboard -> /opt/lme/certs/dashboard) at /certs, read-only, NO idmap --
+# NOT the shared lme_certs workspace (which holds ca/ca.key). ca/ca.key is now
+# mounted into NOTHING, closing the CA-MITM exposure. The published bundle mirrors
+# the workspace SUBDIR layout, so in-container paths are UNCHANGED: the exec/env
+# still read /certs/dashboard/dashboard.{key,crt}. needs_ca:true records that this
+# UI needs the CA (it is a TLS client to https ES/litellm/embeddings); the certs-role
+# publisher copies ca/ca.crt into every bundle unconditionally, ca.key into none.
+#
+# This unit carries NO `userns:` and NO `run_as:` today (VERIFIED) -> it renders
+# no UserNS= and runs in the HOST user namespace (container-root == host-root), and
+# it already read lme_certs AS ROOT. The `,idmap` option was therefore VESTIGIAL
+# (meaningless with no userns map). So certs.host_userns:true + in_container_uid:0
+# keeps IDENTICAL read semantics (root reads a root-owned 0640 key) while isolating
+# the bundle. cert_owner => 0 (host_userns base 0 + in_container_uid 0).
+#
+# DEPLOY-TIME RE-VERIFY FLAG: images were wiped from graph. This image is BUILT
+# in-repo (lme-dashboard/Dockerfile: FROM python:3.11-slim, no USER -> runs root),
+# so in_container_uid:0 is expected-correct; still confirm at first deploy that no
+# USER <non-root> was introduced (Config.User != 0 would make the 0640 bundle key
+# unreadable -- SAME accepted risk class as G5's fleet/wazuh). Re-verify:
+# podman inspect --format '{{.Config.User}}' <image>.
+id: dashboard
+name: lme-dashboard
+kind: container
+enabled_when: [install_llm]
+image: lme-dashboard
+description: LME Security Dashboard - FastAPI + Alpine.js UI
+
+dependencies:
+  requires: [elasticsearch, litellm, pgvector, embeddings]
+  after: [elasticsearch, litellm, pgvector, embeddings]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  timeout_start_sec: 5400
+  start_limit_interval: 120
+  start_limit_burst: 10
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+environment:
+  ELASTICSEARCH_URL: "https://lme-elasticsearch:9200"
+  ELASTICSEARCH_USER: elastic
+  LITELLM_URL: "https://lme-litellm:4000"
+  LITELLM_API_KEY: sk-lme-llama-proxy
+  LITELLM_MODEL: lfm2.5-1.2b-instruct
+  PGVECTOR_HOST: lme-pgvector
+  PGVECTOR_PORT: "5432"
+  PGVECTOR_DB: lme_vectors
+  PGVECTOR_USER: lme
+  EMBED_URL: "https://lme-embeddings:8081"
+  LLAMA_MODELS_DIR: /opt/lme/llama-models
+  LLAMA_MODEL_CONFIG: /opt/lme/config/llama-cpp-model.json
+  LLAMA_MODEL_TRIGGER: /opt/lme/config/.llama-model-updated
+  LLAMA_MODEL_STATUS: /opt/lme/config/llama-cpp-status.json
+  SSL_KEYFILE: /certs/dashboard/dashboard.key
+  SSL_CERTFILE: /certs/dashboard/dashboard.crt
+  LITELLM_CONFIG_PATH: /opt/lme/config/litellm_config.yaml
+  LLM_KEYS_PATH: /opt/lme/config/llm_keys.enc
+  LLM_KEYS_TRIGGER: /opt/lme/config/.llm-keys-updated
+  VAULT_PASS_FILE: /etc/lme/pass.sh
+
+secrets:
+  - {name: elastic,  type: env, target: ELASTICSEARCH_PASSWORD}
+  - {name: pgvector, type: env, target: PGVECTOR_PASS}
+
+network_aliases: [lme-dashboard]
+publish_ports:
+  - {host: 8502, container: 8502}
+volumes:
+  - {source: /opt/lme/lme-dashboard/app.py, dest: /app/app.py, options: [ro]}
+  - {source: /opt/lme/lme-dashboard/static, dest: /app/static, options: [ro]}
+  - {source: /opt/lme/config, dest: /opt/lme/config, options: [rw]}
+  - {source: /opt/lme/llama-models, dest: /opt/lme/llama-models, options: [rw]}
+  - {source: /opt/lme/scripts/sigma, dest: /opt/lme/scripts/sigma, options: [rw]}
+  - {source: /etc/lme/pass.sh, dest: /etc/lme/pass.sh, options: [ro]}
+  - {source: "cert:dashboard", dest: /certs, options: [ro, Z]}          # B4: per-svc bundle, no idmap; Z=SELinux relabel
+
+# B4 cert-owner metadata (consumed by the certs role / init-setup.sh, NOT emitted
+# into the unit -> zero effect on rendered fidelity). host_userns:true -> no UserNS
+# remap, so cert_owner = in_container_uid directly (0 = root). needs_ca:true records
+# that this consumer needs the CA (TLS client to internal https endpoints).
+certs:
+  host_userns: true
+  in_container_uid: 0
+  needs_ca: true
+
+exec: 'uvicorn app:app --host 0.0.0.0 --port 8502 --ssl-keyfile /certs/dashboard/dashboard.key --ssl-certfile /certs/dashboard/dashboard.crt'

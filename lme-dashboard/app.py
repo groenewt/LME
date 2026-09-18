@@ -78,7 +78,7 @@ def _sync_active_model_from_litellm(retries: int = 5, delay: float = 5.0):
             r = _httpx.get(
                 f"{LITELLM_URL}/v1/models",
                 headers={"Authorization": f"Bearer {LITELLM_KEY}"},
-                verify=False,
+                verify="/certs/ca/ca.crt",
                 timeout=5,
             )
             if r.status_code == 200:

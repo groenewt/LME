@@ -1,0 +1,90 @@
+---
+# Wazuh Manager -- kind: container. B4 per-service cert consumer.
+#
+# Fidelity target = quadlet/lme-wazuh-manager.container with exactly these
+# INTENDED changes:
+#   * FIX #2 (wazuh): `lme_wazuh_logs:/var/ossec/logs` was mounted TWICE (static
+#     lines 40 and 42). Modeled ONCE here. NOTE: a set-based semantic diff cannot
+#     see this (the duplicate collapses); the render harness asserts the rendered
+#     unit contains the `Volume=lme_wazuh_logs:/var/ossec/logs` line exactly once.
+#   * B4: `lme_certs:/etc/wazuh-manager/certs:ro` -> the per-service bundle
+#     `cert:wazuh-manager` (-> /opt/lme/certs/wazuh-manager) at the SAME dest,
+#     read-only. SSL_* env paths under /etc/wazuh-manager/certs are unchanged.
+#   * the whitespace-joined `Environment=` line becomes one Environment= per key.
+# HostName is `wazuh-manager` (NOT lme-wazuh-manager) -- preserved faithfully.
+id: wazuh-manager
+name: lme-wazuh-manager
+kind: container
+enabled_when: [always]
+image: wazuh-manager
+description: Wazuh Container Service
+
+dependencies:
+  requires: [elasticsearch]
+  after: [elasticsearch]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  limit_nofile: 655360
+  timeout_start_sec: 5400
+  start_limit_interval: 120
+  start_limit_burst: 10
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+environment:
+  INDEXER_URL: https://lme-elasticsearch:9200
+  FILEBEAT_SSL_VERIFICATION_MODE: full
+  SSL_CERTIFICATE_AUTHORITIES: /etc/wazuh-manager/certs/ca/ca.crt
+  SSL_CERTIFICATE: /etc/wazuh-manager/certs/wazuh-manager/wazuh-manager.crt
+  SSL_KEY: /etc/wazuh-manager/certs/wazuh-manager/wazuh-manager.key
+
+secrets:
+  - {name: wazuh, type: env, target: WAZUH_PASSWORD}
+  - {name: wazuh_api, type: env, target: API_PASSWORD}
+  - {name: elastic, type: env, target: INDEXER_PASSWORD}
+environment_files: [/opt/lme/lme-environment.env]
+
+hostname: wazuh-manager
+network_aliases: [lme-wazuh-manager]
+podman_args: ["--health-interval=30s", "--health-timeout=10s", "--health-retries=5", "--health-start-period=120s"]
+publish_ports:
+  - {host: 1514, container: 1514}
+  - {host: 1515, container: 1515}
+  - {host: 514, container: 514, protocol: udp}
+  - {host: 55000, container: 55000}
+ulimits:
+  memlock: "-1:-1"
+
+volumes:
+  - {source: lme_wazuh_api_configuration, dest: /var/ossec/api/configuration}
+  - {source: lme_wazuh_etc, dest: /var/ossec/etc}
+  - {source: lme_wazuh_logs, dest: /var/ossec/logs}                       # FIX #2: mounted ONCE (static duplicated this)
+  - {source: lme_wazuh_queue, dest: /var/ossec/queue}
+  - {source: lme_wazuh_var_multigroups, dest: /var/ossec/var/multigroups}
+  - {source: lme_wazuh_integrations, dest: /var/ossec/integrations}
+  - {source: lme_wazuh_active_response, dest: /var/ossec/active-response/bin}
+  - {source: lme_wazuh_agentless, dest: /var/ossec/agentless}
+  - {source: lme_wazuh_wodles, dest: /var/ossec/wodles}
+  - {source: lme_filebeat_etc, dest: /etc/filebeat}
+  - {source: lme_filebeat_var, dest: /var/lib/filebeat}
+  - {source: /opt/lme/config/wazuh_cluster/wazuh_manager.conf, dest: /wazuh-config-mount/etc/ossec.conf}
+  - {source: "cert:wazuh-manager", dest: /etc/wazuh-manager/certs, options: [ro, Z]}   # B4 bundle (was lme_certs); Z=SELinux relabel
+  - {source: /etc/ssl/certs/ca-certificates.crt, dest: /etc/ssl/certs/ca-certificates.crt, options: [ro]}
+# B4 cert-owner metadata (G5 chown input; emits nothing into the unit).
+certs:
+  slot: wazuh-manager
+  in_container_uid: 0        # wazuh runs as root inside its pinned userns; owner = 174680 (UNVERIFIED image uid -- G5 to confirm)
+  needs_ca: true
+
+health:
+  notify: healthy
+  cmd: 'CMD-SHELL curl -k -s -o /dev/null -w "%{http_code}" https://localhost:55000 | grep 401'
+
+userns:
+  mode: auto
+  slot: wazuh-manager        # base 174680, size 3048

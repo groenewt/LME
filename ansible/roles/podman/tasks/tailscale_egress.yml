@@ -1,0 +1,116 @@
+---
+# Tailnet EGRESS leg (OPT-IN, additive) — the LME host as a tailnet *client*.
+#
+# This task set is included ONLY when `tailscale_serve_egress` is true (enable at
+# deploy time with `-e tailscale_serve_egress=true`; the include that pulls this
+# file is gated on that var — see the wiring note at the bottom of this file). It
+# is disabled by default and changes nothing about the internal container<->
+# container service mesh or the host-facing ingress (tailscale_ingress.yml).
+#
+# WHAT "EGRESS" MEANS HERE — the mirror image of ingress:
+#   * Ingress (tailscale_ingress.yml) makes THIS node's published ports reachable
+#     FROM the tailnet (`tailscale serve` fronts them with the node's ts.net cert).
+#   * Egress is the opposite direction: it lets the LME host reach OUT to services
+#     that live on OTHER tailnet nodes, as a plain tailnet client. Two client-side
+#     capabilities, both declarative and both idempotent:
+#       - accept-routes: install the subnet routes that other tailnet nodes
+#         advertise, so LME can reach a service that sits behind a tailnet subnet
+#         router (e.g. a DB or API on a remote LAN it fronts). On Linux this
+#         defaults OFF, so this leg turns it ON when enabled.
+#       - exit-node (OPTIONAL, operator opt-in via `tailscale_exit_node`): route
+#         the host's OUTBOUND traffic through a chosen tailnet exit node. This is
+#         OFF unless an operator names an exit node — turning it on unasked would
+#         reroute ALL host egress, so it is never a default.
+#
+# Idempotent: current preferences are read first and each `tailscale set` runs
+# only when the desired value is not already in effect. `tailscale set` is itself
+# a no-op when the value is unchanged, so a re-run never churns the daemon.
+
+# GUARD 1 (only-when-present): the include is already gated on the enable var; this
+# is the in-file guard that the CLI actually exists. `command -v` is a POSIX shell
+# builtin, so it must run under the shell module (the command module has no shell).
+- name: Check the tailscale CLI is present
+  ansible.builtin.shell: command -v tailscale
+  register: ts_cli
+  changed_when: false
+  failed_when: false
+
+- name: Fail clearly if tailscale is unavailable
+  ansible.builtin.fail:
+    msg: >-
+      tailscale_serve_egress is enabled but the `tailscale` CLI was not found on
+      PATH. Install tailscale and make sure tailscaled is running and this node is
+      logged in to the tailnet before enabling the egress leg.
+  when: ts_cli.rc != 0
+
+# GUARD 2 (only-when-logged-in): mirror the ingress file's login check.
+- name: Read current tailscale node status
+  ansible.builtin.command: tailscale status --json
+  register: ts_status
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Fail clearly if tailscale is not logged in to the tailnet
+  ansible.builtin.fail:
+    msg: >-
+      tailscale_serve_egress is enabled but `tailscale status` failed
+      (rc={{ ts_status.rc }}). Ensure tailscaled is running and this node is
+      logged in to the tailnet.
+  when: ts_status.rc != 0
+
+# Read the daemon preferences once, so every `tailscale set` below is gated on the
+# CURRENT value rather than run blindly. RouteAll is the daemon field behind
+# --accept-routes; ExitNodeIP/ExitNodeID carry the exit node.
+- name: Read current tailscale preferences (egress idempotency)
+  ansible.builtin.command: tailscale debug prefs
+  register: ts_prefs
+  changed_when: false
+  failed_when: false
+  become: true
+
+# accept-routes: gate on a shape-tolerant text match — the prefs JSON has emitted
+# RouteAll flat as `"RouteAll": true`. If a version emits it differently the worst
+# case is a single idempotent `tailscale set` (a no-op when already accepting
+# routes), so this can never misconfigure, only over-report `changed` once.
+- name: Accept subnet routes advertised by other tailnet nodes (egress reachability)
+  ansible.builtin.command: tailscale set --accept-routes=true
+  when: >-
+    ('"RouteAll": true' not in (ts_prefs.stdout | default('')))
+    and ('"RouteAll":true' not in (ts_prefs.stdout | default('')))
+  changed_when: true
+  become: true
+
+# exit-node: OPTIONAL. Only acts when an operator names an exit node; otherwise the
+# host keeps its direct egress. --exit-node-allow-lan-access keeps the host's own
+# LAN reachable while its internet egress goes via the exit node. Gated on the
+# named node not already being present in the current prefs.
+- name: Route host egress through a tailnet exit node (opt-in)
+  ansible.builtin.command: >-
+    tailscale set
+    --exit-node={{ tailscale_exit_node }}
+    --exit-node-allow-lan-access={{ 'true' if (tailscale_exit_node_lan | default(true) | bool) else 'false' }}
+  when:
+    - tailscale_exit_node is defined
+    - (tailscale_exit_node | default('') | string | length) > 0
+    - (tailscale_exit_node | string) not in (ts_prefs.stdout | default(''))
+  changed_when: true
+  become: true
+
+- name: Show the tailnet egress configuration applied
+  ansible.builtin.debug:
+    msg:
+      - "accept-routes -> enabled (LME can reach services behind tailnet subnet routers)"
+      - "exit-node     -> {{ tailscale_exit_node | default('(none — direct egress)') }}"
+
+# ── WIRING (for G2/G6 — do NOT edit their files from here) ───────────────────────
+# Include this leg AFTER tailscaled is confirmed up, gated on the enable var, e.g.
+# in ansible/roles/podman/tasks/main.yml (egress has NO manifest dependency):
+#
+#   - name: Configure tailnet egress (opt-in)
+#     ansible.builtin.include_tasks: tailscale_egress.yml
+#     when: tailscale_serve_egress | default(false) | bool
+#
+# G6 should also add `tailscale_serve_egress: true` (and optionally
+# `tailscale_exit_node`) to profiles/tailscale.yml `vars:` so the profile enables
+# it without a manual -e.

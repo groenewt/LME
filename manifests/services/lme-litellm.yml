@@ -1,0 +1,91 @@
+---
+# LiteLLM proxy -- kind: container. Exemplar for BLOCKER B3.
+#
+# B3: enabled_when:[install_llm] means the unit is NOT RENDERED at all when the
+# LLM stack is off (render_units.yml gates on is_enabled) -- so a rendered unit
+# can never reference an uncreated secret. The raw Exec block below carries the
+# systemd `$$`-escaped shell expansion verbatim (DATABASE_URL assembled at
+# runtime from the pgvector secret). Fidelity target = lme-litellm.container.j2,
+# which is byte-identical to the static quadlet/lme-litellm.container (no
+# annotations to strip); expected raw-diffs are directive REORDER within
+# [Container] (semantically neutral -- quadlet ignores directive order) plus the
+# ONE B4 cert-mount line change described next.
+#
+# B4 cert isolation (WAVE-2): this unit mounts ONLY its own published bundle
+# (cert:litellm -> /opt/lme/certs/litellm) at /certs, read-only, NO idmap -- NOT
+# the shared lme_certs workspace (which holds ca/ca.key). ca/ca.key is now mounted
+# into NOTHING, closing the CA-MITM exposure. The published bundle mirrors the
+# workspace SUBDIR layout, so in-container paths are UNCHANGED: /certs/litellm/
+# litellm.{key,crt} and /certs/ca/ca.crt (the exec cat's the CA) -- all referenced
+# above, all provided by the bundle.
+#
+# This unit carries NO `userns:` and NO `run_as:` today (VERIFIED) -> it renders
+# no UserNS= and runs in the HOST user namespace (container-root == host-root), and
+# it already read lme_certs AS ROOT. The `,idmap` option was therefore VESTIGIAL
+# (meaningless with no userns map). So certs.host_userns:true + in_container_uid:0
+# keeps IDENTICAL read semantics (root reads a root-owned 0640 key) while isolating
+# the bundle. cert_owner => 0 (host_userns base 0 + in_container_uid 0).
+#
+# DEPLOY-TIME RE-VERIFY FLAG: the LLM images were wiped from graph. litellm pulls
+# ghcr.io/berriai/litellm (upstream, uid UNVERIFIED). If this image declares
+# USER <non-root> (Config.User != 0), in_container_uid MUST equal that uid or the
+# 0640 bundle key is unreadable -- SAME accepted risk class as G5's fleet/wazuh.
+# Re-verify at first deploy: podman inspect --format '{{.Config.User}}' <image>.
+id: litellm
+name: lme-litellm
+kind: container
+enabled_when: [install_llm]
+image: litellm
+description: LiteLLM Proxy Server Container Service
+
+dependencies:
+  requires: [network, llama-cpp]
+  after: [lme, network, llama-cpp]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  start_limit_interval: 120
+  start_limit_burst: 10
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+environment:
+  SSL_KEYFILE: /certs/litellm/litellm.key
+  SSL_CERTFILE: /certs/litellm/litellm.crt
+  SSL_CERT_FILE: /tmp/combined-ca.crt
+  REQUESTS_CA_BUNDLE: /tmp/combined-ca.crt
+  CURL_CA_BUNDLE: /tmp/combined-ca.crt
+  PGVECTOR_HOST: lme-pgvector
+  PGVECTOR_PORT: "5432"
+  PGVECTOR_DB: litellm
+  PGVECTOR_USER: lme
+
+secrets:
+  - {name: llm-keys,  type: mount, target: /run/secrets/llm_keys}
+  - {name: pgvector,  type: env,   target: PGVECTOR_PASS}
+
+network_aliases: [lme-litellm]
+podman_args: ["--entrypoint /bin/sh"]
+publish_ports:
+  - {host: 4000, container: 4000}
+volumes:
+  - {source: /opt/lme/config/litellm_config.yaml, dest: /app/config.yaml, options: [ro]}
+  - {source: "cert:litellm", dest: /certs, options: [ro, Z]}          # B4: per-svc bundle, no idmap; Z=SELinux relabel
+
+# B4 cert-owner metadata (consumed by the certs role / init-setup.sh, NOT emitted
+# into the unit -> zero effect on rendered fidelity). host_userns:true -> no UserNS
+# remap, so cert_owner = in_container_uid directly (0 = root). needs_ca:true records
+# that this consumer needs the CA (the exec reads /certs/ca/ca.crt); the certs-role
+# publisher copies ca/ca.crt into every bundle unconditionally and ca.key into none.
+certs:
+  host_userns: true
+  in_container_uid: 0
+  needs_ca: true
+
+# Rendered verbatim. `$$` is the systemd escape for a literal `$` (podman expands
+# ${...} in the container shell); Jinja passes it through untouched.
+exec: '-c "cat /etc/ssl/certs/ca-certificates.crt /certs/ca/ca.crt > /tmp/combined-ca.crt; set -a; [ -f /run/secrets/llm_keys ] && . /run/secrets/llm_keys; set +a; export DATABASE_URL=postgresql://$${PGVECTOR_USER}:$${PGVECTOR_PASS}@$${PGVECTOR_HOST}:$${PGVECTOR_PORT}/$${PGVECTOR_DB}; exec litellm --config /app/config.yaml --port 4000 --ssl_keyfile_path /certs/litellm/litellm.key --ssl_certfile_path /certs/litellm/litellm.crt"'

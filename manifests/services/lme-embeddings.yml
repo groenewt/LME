@@ -1,0 +1,76 @@
+---
+# embeddings -- kind: container. A SECOND llama.cpp server, embeddings-only
+# (nomic-embed-text-v1.5). Shares the `llama-cpp` image (global.images has no
+# separate `embeddings` key -- the dot->dash llama-cpp image backs both). Gated
+# with the LLM stack (enabled_when:[install_llm]).
+#
+# DISEASE CURE: the static quadlet/lme-embeddings.container carries a stray
+# `#@TODO; im not bothering...` comment line under [Unit]; not reproduced here.
+# Fidelity target otherwise = the static unit (only diff is that comment removal +
+# directive REORDER). PublishPort=8081 is a SINGLE port (no comma-join bug).
+#
+# Unlike llama-cpp, no HOST/PORT env -- host/port are passed via Exec (verbatim).
+#
+# B4 cert isolation (WAVE-2): this unit mounts ONLY its own published bundle
+# (cert:embeddings -> /opt/lme/certs/embeddings) at /certs, read-only, NO idmap --
+# NOT the shared lme_certs workspace (which holds ca/ca.key). ca/ca.key is now
+# mounted into NOTHING, closing the CA-MITM exposure. The published bundle mirrors
+# the workspace SUBDIR layout, so in-container paths are UNCHANGED: the exec still
+# reads /certs/embeddings/embeddings.{crt,key}.
+#
+# This unit carries NO `userns:` and NO `run_as:` today (VERIFIED) -> it renders
+# no UserNS= and runs in the HOST user namespace (container-root == host-root), and
+# it already read lme_certs AS ROOT. The `,idmap` option was therefore VESTIGIAL
+# (meaningless with no userns map). So certs.host_userns:true + in_container_uid:0
+# keeps IDENTICAL read semantics (root reads a root-owned 0640 key) while isolating
+# the bundle. cert_owner => 0 (host_userns base 0 + in_container_uid 0).
+#
+# DEPLOY-TIME RE-VERIFY FLAG: the LLM images were wiped from graph. embeddings runs
+# the SAME upstream image as llama-cpp (ghcr.io/ggml-org/llama.cpp:server, uid
+# UNVERIFIED). If this image declares USER <non-root> (Config.User != 0),
+# in_container_uid MUST equal that uid or the 0640 bundle key is unreadable -- SAME
+# accepted risk class as G5's fleet/wazuh. Re-verify at first deploy:
+# podman inspect --format '{{.Config.User}}' <image>.
+id: embeddings
+name: lme-embeddings
+kind: container
+enabled_when: [install_llm]
+image: llama-cpp
+description: Llama.cpp Embeddings Server (nomic-embed-text-v1.5)
+
+dependencies:
+  requires: [network]
+  after: [network]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  timeout_start_sec: 120
+  start_limit_interval: 120
+  start_limit_burst: 10
+
+network_aliases: [lme-embeddings]
+publish_ports:
+  - {host: 8081, container: 8081}
+volumes:
+  - {source: /opt/lme/llama-models, dest: /models, options: [Z]}
+  - {source: "cert:embeddings", dest: /certs, options: [ro, Z]}          # B4: per-svc bundle, no idmap; Z=SELinux relabel
+
+# B4 cert-owner metadata (consumed by the certs role / init-setup.sh, NOT emitted
+# into the unit -> zero effect on rendered fidelity). host_userns:true -> no UserNS
+# remap, so cert_owner = in_container_uid directly (0 = root).
+certs:
+  host_userns: true
+  in_container_uid: 0
+  needs_ca: true
+
+health:
+  cmd: "curl -kf https://localhost:8081/health"
+  interval: 30s
+  timeout: 10s
+  retries: 3
+
+exec: '--host 0.0.0.0 --port 8081 --model /models/nomic-embed-text-v1.5.Q4_K_M.gguf --embeddings -c 2048 -b 512 --rope-scaling yarn --rope-freq-scale .75 --ssl-cert-file /certs/embeddings/embeddings.crt --ssl-key-file /certs/embeddings/embeddings.key'

@@ -1,0 +1,186 @@
+---
+# Tailnet SERVICES / VIP leg (OPT-IN, additive) — publish LME service VIPs.
+#
+# Included ONLY when `tailscale_serve_services` is true (enable at deploy time with
+# `-e tailscale_serve_services=true`; the include is gated on that var — see the
+# wiring note at the bottom). Disabled by default; the internal ES-CA service mesh
+# and the host publish binds are untouched either way.
+#
+# WHAT THIS DOES:
+#   Publishes each ENABLED, host-facing LME service as a Tailscale Service (a VIP
+#   with its own tailnet identity, `svc:<name>`) via
+#     `tailscale serve --service=svc:<name> --https=<port> https+insecure://127.0.0.1:<port>`
+#   Unlike the ingress leg (which fronts ports on THIS node's ts.net name), a VIP
+#   Service has its own address and can move/replicate across hosts.
+#
+# EVERYTHING IS DERIVED FROM THE MANIFESTS — no port or service name is hardcoded:
+#   * which services exist + are enabled -> lme_services + is_enabled(lme_enable_flags)
+#     (both facts come from load_manifests.yml — see the wiring note re: order)
+#   * which of their ports are host-facing -> publish_ports with bind: 127.0.0.1.
+#     The tailscale profile (manifests/profiles/tailscale.yml) flips the UI/API
+#     binds to loopback EXACTLY so they are fronted here and NOT exposed on the LAN;
+#     a loopback bind is therefore the manifest's own "front me on the tailnet"
+#     signal. (kibana_https, litellm, dashboard, log-analyzer are the current set.)
+#   * the VIP name -> the service's optional `tailnet_service`, else its logical id.
+#   * the front port -> the LOWEST-numbered loopback host port (canonical/privileged:
+#     e.g. kibana's 443 is chosen over 5601).
+#   * the serve mode -> the port's optional `serve` key (default `https`).
+#
+# ── CONTRACT for raw-TLS backends (READ THIS, MA2) ──────────────────────────────
+# A port whose backend terminates TLS itself (a raw-TLS listener, NOT plain HTTPS)
+# MUST declare `serve: tcp` on its publish_port, so this leg fronts it as a raw TCP
+# passthrough (`--tcp`) instead of `--https`. Terminating TLS at tailscale in front
+# of such a listener would hand it plaintext — the exact hazard the ingress file
+# calls out for logstash beats. KNOWN CASES to mark when their manifests land:
+# `logstash_beats` (5044) and `logstash_http` (8085) are `bind: 127.0.0.1` in
+# global.yml in EVERY profile (they are NOT a tailscale-profile signal); their
+# publish_ports must carry `serve: tcp` or they will be mis-fronted as HTTPS. The
+# per-target debug at the end prints the chosen mode so a wrong mode is visible at
+# run time rather than silent.
+#
+# ACL / VIP allocation: a `svc:<name>` must be defined + granted in the tailnet
+# policy (VIP allocation) before it can be advertised. That policy is out of scope
+# here (the permissive dev grant is left untouched); if advertising is rejected the
+# serve command surfaces the error. The svc names this leg uses are the manifest
+# ids above, so the policy entries and these names stay in lock-step.
+#
+# Idempotent: `tailscale serve status` and `tailscale serve get-config --all`
+# surface different views, so BOTH are read and a VIP is treated as already-present
+# if EITHER shows it; a re-run then re-publishes nothing.
+
+# GUARD (only-when-present): in-file CLI check (the include is gated on the enable
+# var). `command -v` is a shell builtin -> shell module.
+- name: Check the tailscale CLI is present
+  ansible.builtin.shell: command -v tailscale
+  register: ts_cli
+  changed_when: false
+  failed_when: false
+
+- name: Fail clearly if tailscale is unavailable
+  ansible.builtin.fail:
+    msg: >-
+      tailscale_serve_services is enabled but the `tailscale` CLI was not found on
+      PATH. Install tailscale and make sure tailscaled is running and this node is
+      logged in to the tailnet before enabling the VIP services leg.
+  when: ts_cli.rc != 0
+
+# --- Derive the VIP targets purely from the manifests -----------------------------
+# Initialise so the fact always exists even when nothing is enabled/host-facing.
+- name: Initialise the derived VIP target list
+  ansible.builtin.set_fact:
+    ts_svc_targets: []
+
+- name: Derive one tailnet VIP target per enabled host-facing (loopback-bound) service
+  ansible.builtin.set_fact:
+    ts_svc_targets: >-
+      {{ ts_svc_targets + [ {
+           'service': (item.value.tailnet_service | default(item.value.id)),
+           'port':    ((_ts_lo | first).host),
+           'scheme':  ((_ts_lo | first).serve | default('https')),
+         } ] }}
+  vars:
+    # This service's host-facing loopback publish_ports.
+    _ts_loop: >-
+      {{ item.value.publish_ports | default([])
+         | selectattr('bind', 'defined')
+         | selectattr('bind', 'equalto', '127.0.0.1')
+         | list }}
+    # Same, minus any UDP port (e.g. wazuh syslog), lowest host port first. The
+    # UDP exclusion is done as a UNION of (ports with no `protocol` key) + (ports
+    # whose `protocol` is set and != udp) so a missing key never raises — rejectattr
+    # on a value tests the attribute, which errors on dicts that lack it.
+    _ts_lo: >-
+      {{ ((_ts_loop | selectattr('protocol', 'undefined') | list)
+          + (_ts_loop | rejectattr('protocol', 'undefined') | rejectattr('protocol', 'equalto', 'udp') | list))
+         | sort(attribute='host') }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.id }}"
+  when:
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - (_ts_lo | length) > 0
+
+# --- Confirm the node is on the tailnet, then publish -----------------------------
+- name: Read current tailscale node status
+  ansible.builtin.command: tailscale status --json
+  register: ts_status
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Fail clearly if tailscale is not logged in to the tailnet
+  ansible.builtin.fail:
+    msg: >-
+      tailscale_serve_services is enabled but `tailscale status` failed
+      (rc={{ ts_status.rc }}). Ensure tailscaled is running and this node is
+      logged in to the tailnet with MagicDNS + HTTPS certs enabled.
+  when: ts_status.rc != 0
+
+- name: Determine this node's MagicDNS (ts.net) name
+  ansible.builtin.set_fact:
+    ts_magicdns_name: "{{ (ts_status.stdout | from_json).Self.DNSName | regex_replace('\\.$', '') }}"
+  when: ts_status.rc == 0 and (ts_status.stdout | default('')) | length > 0
+
+- name: Read current tailscale serve config (VIP idempotency)
+  ansible.builtin.command: tailscale serve status
+  register: ts_serve_status
+  changed_when: false
+  failed_when: false
+  become: true
+
+# get-config --all surfaces service entries that `serve status` may omit; reading
+# both makes the idempotency gate below robust across the two views.
+- name: Read full tailscale serve/service config (VIP idempotency, all views)
+  ansible.builtin.command: tailscale serve get-config --all
+  register: ts_serve_cfg
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Publish enabled LME service VIPs as HTTPS (svc:<name>, ts.net-terminated)
+  ansible.builtin.command: >-
+    tailscale serve --bg --service=svc:{{ item.service }}
+    --https={{ item.port }} https+insecure://127.0.0.1:{{ item.port }}
+  loop: "{{ ts_svc_targets | selectattr('scheme', 'equalto', 'https') | list }}"
+  loop_control:
+    label: "svc:{{ item.service }} --https={{ item.port }}"
+  when:
+    - ('svc:' ~ item.service) not in (ts_serve_status.stdout | default(''))
+    - ('svc:' ~ item.service) not in (ts_serve_cfg.stdout | default(''))
+  changed_when: true
+  become: true
+
+- name: Publish enabled LME service VIPs as raw TCP passthrough (raw-TLS backends)
+  ansible.builtin.command: >-
+    tailscale serve --bg --service=svc:{{ item.service }}
+    --tcp={{ item.port }} tcp://127.0.0.1:{{ item.port }}
+  loop: "{{ ts_svc_targets | selectattr('scheme', 'equalto', 'tcp') | list }}"
+  loop_control:
+    label: "svc:{{ item.service }} --tcp={{ item.port }}"
+  when:
+    - ('svc:' ~ item.service) not in (ts_serve_status.stdout | default(''))
+    - ('svc:' ~ item.service) not in (ts_serve_cfg.stdout | default(''))
+  changed_when: true
+  become: true
+
+- name: Show the derived tailnet VIP endpoints and their serve mode
+  ansible.builtin.debug:
+    msg: >-
+      svc:{{ item.service }} -> {{ item.scheme }} 127.0.0.1:{{ item.port }}
+      (advertised on the tailnet as svc:{{ item.service }} from
+      {{ ts_magicdns_name | default('this node') }})
+  loop: "{{ ts_svc_targets }}"
+  loop_control:
+    label: "svc:{{ item.service }}"
+
+# ── WIRING (for G2/G6 — do NOT edit their files from here) ───────────────────────
+# This leg needs `lme_services` + `lme_enable_flags`, so it must run AFTER G2 wires
+# load_manifests.yml into the live path. Include it (gated on the enable var) right
+# after render_units.yml, e.g. in ansible/roles/podman/tasks/main.yml:
+#
+#   - name: Publish tailnet VIP services (opt-in)
+#     ansible.builtin.include_tasks: tailscale_service.yml
+#     when: tailscale_serve_services | default(false) | bool
+#
+# G6 should also add `tailscale_serve_services: true` to profiles/tailscale.yml
+# `vars:` so the tailscale profile turns it on without a manual -e.

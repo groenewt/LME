@@ -1,0 +1,166 @@
+---
+# ansible/roles/podman/tasks/load_manifests.yml
+#
+# Loads the manifest tree into facts. The merge contract is provable by reading
+# THIS FILE ALONE, and the operator override always wins LAST:
+#
+#   lme_global      = global.yml.lme_global
+#                   | combine(<active profile>.lme_global, recursive=True)
+#                   | combine(lme_global_override | default({}), recursive=True)   # operator LAST
+#
+#   lme_services[<id>] = <service.yml>
+#                   | combine(<active profile>.services[<id>], recursive=True)
+#                   | combine(_lme_service_overrides_eff[<id>], recursive=True)  # operator LAST
+#
+#   lme_service_kinds[<id>] = <service.yml>.kind   (feeds the svc_unit/unit_refs filters)
+#
+# LEGACY CLUSTER-INVENTORY SHIM (G6 reconciliation #9). The tree's own cluster
+# inventory generators (scripts/create_cluster_inventory.sh, the escluster CI, the
+# testing/ + docker/lib/ installers) emit per-node discovery as the FLAT legacy
+# vars es_node_name / es_publish_host / es_cluster_seed_hosts (+ es_is_initial_master
+# on the master), NOT as lme_service_overrides. install.sh forwards them with -e but
+# nothing mapped them, so a true generator-driven cluster run got no node.name /
+# seed_hosts / publish_host into the rendered ES unit. This file bridges them:
+#
+#   _lme_service_overrides_eff =
+#       { elasticsearch: { environment: <es_* -> ES settings> } }   # legacy shim BASE
+#       | combine(lme_service_overrides | default({}), recursive=True)   # operator LAST
+#
+#   The shim reproduces lme-elasticsearch.container.j2's four discovery branches
+#   1:1 from identical legacy inputs (node.name<-es_node_name; discovery.seed_hosts
+#   <-es_cluster_seed_hosts normalised + comma-joined; cluster.initial_master_nodes
+#   <-es_initial_master_nodes|default(['lme-elasticsearch']) comma-joined, GATED on
+#   es_is_initial_master like the .j2; network.publish_host<-es_publish_host with the
+#   .j2's truthiness/omit guard). It is a BASE only: the operator's own
+#   lme_service_overrides is READ, never shadowed (an -e extra-var outranks set_fact,
+#   so re-binding it would be silently ignored), and combines OVER the shim so the
+#   operator still wins LAST. When es_node_name is undefined the shim is inert by
+#   construction: _lme_service_overrides_eff == lme_service_overrides | default({}).
+#
+# G1 provides this file; G2/G3 include it. It is NOT wired into the live install
+# path yet (that is G2's quadlet_setup.yml cutover).
+
+- name: Resolve manifests dir and active profile
+  ansible.builtin.set_fact:
+    lme_manifests_dir: "{{ lme_manifests_dir | default(clone_directory ~ '/manifests') }}"
+    lme_profile: "{{ lme_profile | default('default') }}"
+
+- name: Load global manifest
+  ansible.builtin.include_vars:
+    file: "{{ lme_manifests_dir }}/global.yml"
+    name: _lme_global_file
+
+- name: Load active profile overlay
+  ansible.builtin.include_vars:
+    file: "{{ lme_manifests_dir }}/profiles/{{ lme_profile }}.yml"
+    name: _lme_profile_file
+
+- name: Compose lme_global (global | profile | operator override LAST)
+  ansible.builtin.set_fact:
+    lme_global: >-
+      {{ _lme_global_file.lme_global
+         | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)
+         | combine(lme_global_override | default({}), recursive=True) }}
+
+- name: Apply profile vars as facts (enable flags such as install_llm/offline_mode)
+  ansible.builtin.set_fact:
+    "{{ item.key }}": "{{ item.value }}"
+  loop: "{{ (_lme_profile_file.profile_overlay.vars | default({})) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# Assemble the flags dict that render_units.yml's is_enabled() consults. Defaults
+# recovered from the current role (install_llm default true; elastic-services and
+# offline default false). Runs AFTER the profile-vars set_fact so a profile (or an
+# operator -e) override flows in. is_enabled treats the 'always' sentinel as a
+# no-op, so unlisted flags never need an entry here.
+- name: Assemble enable flags for is_enabled()
+  ansible.builtin.set_fact:
+    lme_enable_flags:
+      install_llm: "{{ install_llm | default(true) | bool }}"
+      install_elastic_services: "{{ install_elastic_services | default(false) | bool }}"
+      offline_mode: "{{ offline_mode | default(false) | bool }}"
+
+# Legacy cluster-inventory shim (see header). Builds the elasticsearch environment
+# override BASE from the flat es_* vars the tree's own generators emit, matching
+# lme-elasticsearch.container.j2 branch-for-branch. Fires ONLY when es_node_name is
+# defined; otherwise _lme_es_legacy_overrides stays unset and the effective-override
+# task below degenerates to the operator's own lme_service_overrides (fully inert).
+- name: Build legacy es_* elasticsearch override base (inert unless es_node_name defined)
+  ansible.builtin.set_fact:
+    _lme_es_legacy_overrides: >-
+      {{ {'elasticsearch': {'environment':
+           {'node.name': es_node_name}
+           | combine({'network.publish_host': es_publish_host}
+                     if (es_publish_host is defined and es_publish_host
+                         and '__omit_place_holder__' not in (es_publish_host | string))
+                     else {})
+           | combine({'discovery.seed_hosts': _lme_es_seed_join}
+                     if ((_lme_es_seed_join | length) > 0)
+                     else {})
+           | combine({'cluster.initial_master_nodes': _lme_es_masters_join}
+                     if (es_is_initial_master | default(false) | bool)
+                     else {})
+         }} }}
+  vars:
+    # es_cluster_seed_hosts arrives as a real YAML list (inventory all.vars) OR as a
+    # string via -e (incl. the bracketed "[a, b]" form -e can produce) -- normalise
+    # both to a trimmed, comma-joined bare-host string (NO :9300; the generators emit
+    # bare IPs and the .j2 join(',')s them). Same regex_replace spelling as
+    # convert_to_cluster.yml. Leaf is a string, so no native-type dependency.
+    _lme_es_seed_join: >-
+      {{ (es_cluster_seed_hosts | regex_replace('\\[|\\]', '') | split(',') | map('trim') | select | join(','))
+         if (es_cluster_seed_hosts is defined and es_cluster_seed_hosts is string)
+         else (es_cluster_seed_hosts | map('string') | map('trim') | join(','))
+         if (es_cluster_seed_hosts is defined)
+         else '' }}
+    # cluster.initial_master_nodes takes NODE NAMES (match node.name), NOT hosts --
+    # confirmed by ansible/spec/CLUSTER_ELASTICSEARCH_SPEC.md and the .j2. Value +
+    # default mirror convert_to_cluster.yml: es_initial_master_nodes|default(['lme-elasticsearch']).
+    _lme_es_masters_join: >-
+      {{ (es_initial_master_nodes | regex_replace('\\[|\\]', '') | split(',') | map('trim') | select | join(','))
+         if (es_initial_master_nodes is defined and es_initial_master_nodes is string)
+         else (es_initial_master_nodes | map('string') | map('trim') | join(','))
+         if (es_initial_master_nodes is defined)
+         else 'lme-elasticsearch' }}
+  when: es_node_name is defined
+
+# Effective service overrides = legacy shim BASE, with the operator's own
+# lme_service_overrides combined OVER it (operator wins LAST). Computed
+# UNCONDITIONALLY so it always exists; degenerates to the operator layer when the
+# shim did not fire. The operator var is only READ here (never re-bound), so an -e
+# lme_service_overrides keeps its precedence and still overrides the shim.
+- name: Resolve effective service overrides (legacy shim base | operator override LAST)
+  ansible.builtin.set_fact:
+    _lme_service_overrides_eff: >-
+      {{ _lme_es_legacy_overrides | default({})
+         | combine(lme_service_overrides | default({}), recursive=True) }}
+
+- name: Enumerate service manifests
+  ansible.builtin.find:
+    paths: "{{ lme_manifests_dir }}/services"
+    patterns: "*.yml"
+    file_type: file
+  delegate_to: localhost
+  connection: local
+  run_once: true
+  become: false
+  register: _lme_service_files
+
+- name: Build lme_services map (service | profile.services[id] | operator override[id] LAST)
+  ansible.builtin.set_fact:
+    lme_services: >-
+      {{ lme_services | default({}) | combine({
+           (lookup('file', item.path) | from_yaml).id:
+             (lookup('file', item.path) | from_yaml)
+             | combine(_lme_profile_file.profile_overlay.services[(lookup('file', item.path) | from_yaml).id] | default({}), recursive=True)
+             | combine(_lme_service_overrides_eff[(lookup('file', item.path) | from_yaml).id] | default({}), recursive=True)
+         }) }}
+  loop: "{{ _lme_service_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+- name: Build lme_service_kinds map (id -> kind) for dependency-name resolution
+  ansible.builtin.set_fact:
+    lme_service_kinds: >-
+      {{ dict(lme_services.keys() | zip(lme_services.values() | map(attribute='kind'))) }}

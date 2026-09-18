@@ -143,6 +143,29 @@
       debug:
         msg: "Using podman from: {{ podman_cmd }}"
         
+    - name: Detect whether the optional Elastic services pack is installed
+      stat:
+        path: /etc/containers/systemd/lme-apm-server.container
+      register: elastic_pack_quadlet
+
+    # Respect an explicit extra-var override (-e install_elastic_services=... /
+    # -e install_llm=...); otherwise infer the pack from what is already
+    # installed. Distinct facts are used because extra-vars outrank set_fact, so
+    # a self-referential "install_elastic_services: {{ install_elastic_services |
+    # default(...) }}" would silently no-op whenever the operator passes the var.
+    # The LLM stack is new in 2.3.0 (no pre-upgrade quadlet to detect), so it
+    # follows the site.yml default-on unless explicitly disabled.
+    - name: Resolve optional-stack enablement for this upgrade
+      set_fact:
+        lme_pack_enabled: "{{ install_elastic_services | default(elastic_pack_quadlet.stat.exists) | bool }}"
+        lme_llm_enabled: "{{ install_llm | default(true) | bool }}"
+
+    - name: Display detected optional-stack enablement
+      debug:
+        msg: >-
+          Elastic services pack: {{ 'enabled' if lme_pack_enabled else 'disabled' }};
+          LLM stack: {{ 'enabled' if lme_llm_enabled else 'disabled' }}
+
     - name: Extract container versions
       set_fact:
         elasticsearch_image: "{{ container_versions | select('search', 'elasticsearch') | first }}"
@@ -396,7 +419,7 @@
       delay: 5
       until: pull_elastic_result is not failed
       ignore_errors: yes
-      when: install_elastic_services | default(false) | bool
+      when: lme_pack_enabled | default(false) | bool
 
     - name: Display elastic services container pull errors
       debug:
@@ -417,7 +440,7 @@
       delay: 5
       until: tag_elastic_result is not failed
       ignore_errors: yes
-      when: install_elastic_services | default(false) | bool
+      when: lme_pack_enabled | default(false) | bool
 
     - name: Display elastic services container tag errors
       debug:
@@ -646,7 +669,9 @@
               - Certificates: certs.zip removed, will regenerate via lme-setup-certs container on restart
               - Configs: litellm_config.yaml, llama-cpp-model.json
               - Systemd units: lme-llm-keys.service/path, lme-llama-model.service/path
-      when: current_lme_version is version('2.3.0', '<')
+      when:
+        - current_lme_version is version('2.3.0', '<')
+        - lme_llm_enabled | default(true) | bool
 
     - name: Skip AI stack (already at 2.3.0+)
       debug:
@@ -847,7 +872,22 @@
         - name: Display doc ingestion result
           debug:
             msg: "{{ 'Documentation ingestion completed successfully' if ingest_result.rc == 0 else 'Documentation ingestion failed (non-fatal) — can be re-run manually' }}"
-      when: current_lme_version is version('2.3.0', '<')
+      when:
+        - current_lme_version is version('2.3.0', '<')
+        - lme_llm_enabled | default(true) | bool
+
+    # Re-land the Elastic services pack so pack config/quadlet changes actually
+    # deploy on upgrade. The whole-dir quadlet copy above only covers quadlet/,
+    # not quadlet-optional/elastic-services/, and never re-runs the cert top-up,
+    # so a plain upgrade previously only pulled the pack images. Reuses the
+    # podman role task file (config ownership + cert-top-up logic lives there);
+    # runs after the core services are up, matching that file's "start pack
+    # units on an already-active umbrella service" assumption.
+    - name: Re-land Elastic services pack (quadlets, configs, cert top-up)
+      include_role:
+        name: podman
+        tasks_from: elastic_services_setup.yml
+      when: lme_pack_enabled | default(false) | bool
 
     - name: Update LME version in environment file
       lineinfile:

@@ -1,5 +1,14 @@
 ---
-# Llama.cpp setup tasks for podman role
+# Llama.cpp / LLM-stack setup tasks for podman role.
+#
+# Image realization (pull/build/retag for pgvector, llama-cpp, litellm, embeddings,
+# lme-dashboard, lme-log-analyzer) now happens ONCE in container_setup.yml, driven
+# by manifests/global.yml (group: llm). The quadlet/systemd unit files for this
+# stack are rendered by render_units.yml from manifests/services/*, not copied
+# here. What remains below is genuinely non-render work: the pgvector/llm-keys
+# secrets (their creation recipes are stack-specific, so they are DEFERRED here
+# rather than created by container_setup's credential loop), model downloads,
+# config templating, and runtime activation/DB/ingestion of the rendered units.
 
 - name: Ensure /opt/lme/lme-dashboard directory exists
   file:
@@ -19,6 +28,11 @@
     mode: preserve
   become: yes
 
+# DEFERRED secret (see container_setup.yml lme_secrets_deferred): pgvector needs a
+# random file-driver password, not the shell-driver credential recipe. Gated with
+# the LLM stack (this whole file runs only when install_llm), which is the same
+# flag that renders lme-litellm / lme-pgvector, so the secret exists before those
+# rendered units are started below.
 - name: Create pgvector secret password
   shell: |
     source /root/.profile
@@ -30,84 +44,6 @@
   args:
     executable: /bin/bash
   become: yes
-
-- name: Pull llama.cpp container image
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman pull ghcr.io/ggml-org/llama.cpp:server
-  args:
-    executable: /bin/bash
-  register: pull_llama_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: pull_llama_result is not failed
-  when: not (offline_mode | default(false))
-
-- name: Tag llama.cpp container image
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman image tag ghcr.io/ggml-org/llama.cpp:server localhost/llama-cpp:LME_LATEST
-  args:
-    executable: /bin/bash
-  register: tag_llama_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: tag_llama_result is not failed
-  when: not (offline_mode | default(false))
-
-- name: Pull LiteLLM container image
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman pull ghcr.io/berriai/litellm:main-latest
-  args:
-    executable: /bin/bash
-  register: pull_litellm_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: pull_litellm_result is not failed
-  when: not (offline_mode | default(false))
-
-- name: Tag LiteLLM container image
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman image tag ghcr.io/berriai/litellm:main-latest localhost/litellm:LME_LATEST
-  args:
-    executable: /bin/bash
-  register: tag_litellm_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: tag_litellm_result is not failed
-  when: not (offline_mode | default(false))
-
-- name: Pull pgvector container image
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman pull docker.io/pgvector/pgvector:pg17
-  args:
-    executable: /bin/bash
-  register: pull_pgvector_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: pull_pgvector_result is not failed
-  when: not (offline_mode | default(false))
-
-- name: Tag pgvector container image
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman image tag docker.io/pgvector/pgvector:pg17 localhost/pgvector:LME_LATEST
-  args:
-    executable: /bin/bash
-  register: tag_pgvector_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: tag_pgvector_result is not failed
-  when: not (offline_mode | default(false))
 
 - name: Create llama models directory
   file:
@@ -154,6 +90,9 @@
   delay: 10
   until: embed_model_download is not failed
 
+# DEFERRED secret (see container_setup.yml lme_secrets_deferred): llm-keys is an
+# EMPTY placeholder that the key-sync path unit later overwrites; it must NOT be a
+# random password, so it is created here rather than by the credential loop.
 - name: Create initial llm-keys podman secret (empty placeholder for fresh installs)
   shell: |
     source /root/.profile
@@ -165,15 +104,6 @@
     executable: /bin/bash
   become: yes
 
-- name: Copy llama.cpp quadlet file to /etc/containers/systemd
-  copy:
-    src: "{{ clone_directory }}/quadlet/lme-llama-cpp.container"
-    dest: /etc/containers/systemd/lme-llama-cpp.container
-    owner: "root"
-    group: "root"
-    mode: '0644'
-  become: yes
-
 - name: Copy LiteLLM config file to /opt/lme/config
   copy:
     src: "{{ clone_directory }}/config/litellm_config.yaml"
@@ -183,98 +113,8 @@
     mode: '0644'
   become: yes
 
-- name: Copy LiteLLM quadlet file to /etc/containers/systemd
-  copy:
-    src: "{{ clone_directory }}/quadlet/lme-litellm.container"
-    dest: /etc/containers/systemd/lme-litellm.container
-    owner: "root"
-    group: "root"
-    mode: '0644'
-  become: yes
-
-- name: Build LME Log Analyzer container image
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    cd {{ clone_directory }}/lme-log-analyzer
-    podman build -t localhost/lme-log-analyzer:LME_LATEST .
-  args:
-    executable: /bin/bash
-  register: build_log_analyzer_result
-  become: yes
-  when: not (offline_mode | default(false))
-
-- name: Copy Log Analyzer quadlet file to /etc/containers/systemd
-  copy:
-    src: "{{ clone_directory }}/quadlet/lme-log-analyzer.container"
-    dest: /etc/containers/systemd/lme-log-analyzer.container
-    owner: "root"
-    group: "root"
-    mode: '0644'
-  become: yes
-
-- name: Build LME Dashboard container image
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    cd {{ clone_directory }}/lme-dashboard
-    podman build -t localhost/lme-dashboard:LME_LATEST .
-  args:
-    executable: /bin/bash
-  register: build_dashboard_result
-  become: yes
-  when: not (offline_mode | default(false))
-
-- name: Copy Dashboard quadlet file to /etc/containers/systemd
-  copy:
-    src: "{{ clone_directory }}/quadlet/lme-dashboard.container"
-    dest: /etc/containers/systemd/lme-dashboard.container
-    owner: "root"
-    group: "root"
-    mode: '0644'
-  become: yes
-
-- name: Copy pgvector quadlet file to /etc/containers/systemd
-  copy:
-    src: "{{ clone_directory }}/quadlet/lme-pgvector.container"
-    dest: /etc/containers/systemd/lme-pgvector.container
-    owner: "root"
-    group: "root"
-    mode: '0644'
-  become: yes
-
-- name: Copy pgvector data volume to /etc/containers/systemd
-  copy:
-    src: "{{ clone_directory }}/quadlet/lme-pgvectordata.volume"
-    dest: /etc/containers/systemd/lme-pgvectordata.volume
-    owner: "root"
-    group: "root"
-    mode: '0644'
-  become: yes
-
-- name: Copy embeddings quadlet file to /etc/containers/systemd
-  copy:
-    src: "{{ clone_directory }}/quadlet/lme-embeddings.container"
-    dest: /etc/containers/systemd/lme-embeddings.container
-    owner: "root"
-    group: "root"
-    mode: '0644'
-  become: yes
-
 - name: Ensure /opt/lme/scripts is populated with the latest helper scripts
   ansible.builtin.include_tasks: ../../tasks/setup_lme_scripts.yml
-
-- name: Copy LLM keys systemd service and path units
-  copy:
-    src: "{{ clone_directory }}/systemd/{{ item }}"
-    dest: /etc/systemd/system/{{ item }}
-    owner: root
-    group: root
-    mode: '0644'
-  loop:
-    - lme-llm-keys.service
-    - lme-llm-keys.path
-    - lme-llama-model.service
-    - lme-llama-model.path
-  become: yes
 
 - name: Reload systemd daemon for llama.cpp and LiteLLM
   systemd:
@@ -287,6 +127,31 @@
     enabled: yes
     state: started
   become: yes
+
+# litellm's PGVECTOR_DB is a SEPARATE `litellm` database (pgvector only
+# initialises POSTGRES_DB=lme_vectors), so provision it out-of-band here -- as
+# soon as pgvector is up and BEFORE litellm is started below -- otherwise
+# litellm's first start cannot connect (compounds B3). pg_isready needs the
+# pgvector container running, which the task above just did.
+- name: Wait for pgvector to be ready
+  shell: podman exec lme-pgvector pg_isready -U lme -d lme_vectors
+  args:
+    executable: /bin/bash
+  register: pgvector_ready
+  until: pgvector_ready.rc == 0
+  retries: 30
+  delay: 10
+  become: yes
+  when: model_download is succeeded
+
+- name: Create litellm database for LiteLLM UI/key management
+  shell: |
+    podman exec lme-pgvector psql -U lme -d lme_vectors -tc "SELECT 1 FROM pg_database WHERE datname='litellm'" | grep -q 1 || \
+    podman exec lme-pgvector psql -U lme -d lme_vectors -c "CREATE DATABASE litellm"
+  args:
+    executable: /bin/bash
+  become: yes
+  when: model_download is succeeded
 
 - name: Enable and start embeddings service
   systemd:
@@ -334,7 +199,7 @@
       --secret pgvector,type=env,target=PGVECTOR_PASS \
       -v {{ clone_directory }}/scripts:/scripts:z \
       -v {{ clone_directory }}/offline_resources/docs/lme-docs-scrape:/docs:z \
-      localhost/lme-ingest:LME_LATEST \
+      localhost/lme-ingest:{{ lme_global.image_tag }} \
       python /scripts/ingest_docs.py --reset --source-dir /docs
   args:
     executable: /bin/bash
@@ -370,27 +235,11 @@
   become: yes
   when: model_download is succeeded
 
-- name: Wait for pgvector to be ready
-  shell: podman exec lme-pgvector pg_isready -U lme -d lme_vectors
-  args:
-    executable: /bin/bash
-  register: pgvector_ready
-  until: pgvector_ready.rc == 0
-  retries: 30
-  delay: 10
-  become: yes
-  when: model_download is succeeded
-
-- name: Create litellm database for LiteLLM UI/key management
-  shell: |
-    podman exec lme-pgvector psql -U lme -d lme_vectors -tc "SELECT 1 FROM pg_database WHERE datname='litellm'" | grep -q 1 || \
-    podman exec lme-pgvector psql -U lme -d lme_vectors -c "CREATE DATABASE litellm"
-  args:
-    executable: /bin/bash
-  become: yes
-  when: model_download is succeeded
-
-- name: Restart LiteLLM to pick up DATABASE_URL
+# The `litellm` database was provisioned right after pgvector came up (above), so
+# litellm's first start already has it. This restart is a daemon-reload safety net
+# after the full unit set is in place; litellm re-assembles DATABASE_URL from its
+# secret/env on every start.
+- name: Restart LiteLLM (daemon-reload safety net)
   systemd:
     name: lme-litellm
     state: restarted
@@ -443,12 +292,11 @@
     msg: |
       Llama.cpp server with LFM2.5 1.2B model has been installed and started!
 
-      LME Security Dashboard:        http://{{ (ansible_default_ipv4.address if (ansible_default_ipv4 is defined and ansible_default_ipv4.address is defined) else 'localhost') }}:8502
-      LiteLLM Proxy (HTTPS):         https://{{ (ansible_default_ipv4.address if (ansible_default_ipv4 is defined and ansible_default_ipv4.address is defined) else 'localhost') }}:4000
+      LME Security Dashboard:        http://{{ (ansible_default_ipv4.address if (ansible_default_ipv4 is defined and ansible_default_ipv4.address is defined) else 'localhost') }}:{{ lme_global.ports.dashboard.host }}
+      LiteLLM Proxy (HTTPS):         https://{{ (ansible_default_ipv4.address if (ansible_default_ipv4 is defined and ansible_default_ipv4.address is defined) else 'localhost') }}:{{ lme_global.ports.litellm.host }}
       Direct llama.cpp (HTTP only):  http://{{ (ansible_default_ipv4.address if (ansible_default_ipv4 is defined and ansible_default_ipv4.address is defined) else 'localhost') }}:8080
 
       API Key for LiteLLM: sk-lme-llama-proxy
       Model name: lfm2.5-1.2b
       Model file: LiquidAI/LFM2.5-1.2B-Instruct-GGUF (pulled from HuggingFace at startup)
   when: model_download is succeeded
-

@@ -1,0 +1,78 @@
+---
+# Kibana -- kind: container. B4 per-service cert-bundle consumer.
+#
+# Fidelity target = quadlet/lme-kibana.container with exactly these INTENDED
+# changes:
+#   * FIX #1 (kibana): the invalid `PublishPort=5601:5601,443:5601` comma form is
+#     split into TWO valid PublishPort= directives (5601:5601 and 443:5601).
+#   * B4: the shared workspace mount `lme_certs:/usr/share/kibana/config/certs`
+#     becomes the per-service published bundle `cert:kibana` (-> /opt/lme/certs/
+#     kibana) read-only. ca.key is no longer in the mount. kibana's SSL env vars
+#     use relative `config/certs/...` paths, which resolve under the SAME dest, so
+#     in-container paths are unchanged. `:ro` is added deliberately: the bundle is
+#     a PUBLISHED HOST tree and kibana (uid 1000 -> host 169584) must not mutate it.
+#   * the whitespace-joined `Environment=` line becomes one Environment= per key
+#     and the `#@@TODO` annotations are dropped.
+id: kibana
+name: lme-kibana
+kind: container
+enabled_when: [always]
+image: kibana
+description: Kibana Container Service
+
+dependencies:
+  requires: [setup-accts, elasticsearch, kibanadata]
+  after: [setup-accts, elasticsearch, kibanadata]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  timeout_start_sec: 5400
+  start_limit_interval: 120
+  start_limit_burst: 10
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+environment:
+  SERVER_NAME: lme-kibana
+  ELASTICSEARCH_HOSTS: https://lme-elasticsearch:9200
+  ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES: config/certs/ca/ca.crt
+  SERVER_SSL_ENABLED: "true"
+  SERVER_SSL_CERTIFICATE: config/certs/kibana/kibana.crt
+  SERVER_SSL_KEY: config/certs/kibana/kibana.key
+  SERVER_SSL_CERTIFICATEAUTHORITIES: config/certs/ca/ca.crt
+  NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+  NODE_OPTIONS: --max-old-space-size=4096
+
+secrets:
+  - {name: kibana_system, type: env, target: ELASTICSEARCH_PASSWORD}
+environment_files: [/opt/lme/lme-environment.env]
+
+network_aliases: [lme-kibana]
+podman_args: ["--requires lme-elasticsearch", "--health-interval=2s"]
+# FIX #1: was the invalid comma-joined PublishPort=5601:5601,443:5601
+publish_ports:
+  - {host: 5601, container: 5601}
+  - {host: 443, container: 5601}
+
+volumes:
+  - {source: "cert:kibana", dest: /usr/share/kibana/config/certs, options: [ro, Z]}   # B4 bundle (was lme_certs, rw); Z=SELinux relabel
+  - {source: lme_kibanadata, dest: /usr/share/kibana/data}
+  - {source: /opt/lme/config/kibana.yml, dest: /usr/share/kibana/config/kibana.yml}
+  - {source: /etc/ssl/certs/ca-certificates.crt, dest: /etc/ssl/certs/ca-certificates.crt, options: [ro]}
+# B4 cert-owner metadata (G5 chown input; emits nothing into the unit).
+certs:
+  slot: kibana
+  in_container_uid: 1000     # kibana image uid; owner = 169584 (corroborated by kibanadata volume)
+  needs_ca: true
+
+health:
+  notify: healthy
+  cmd: "CMD-SHELL curl -I -s --cacert config/certs/ca/ca.crt https://localhost:5601 | grep -q 'HTTP/1.1 302 Found'"
+
+userns:
+  mode: auto
+  slot: kibana               # base 168584, size 3048

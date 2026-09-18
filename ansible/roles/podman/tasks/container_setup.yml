@@ -1,68 +1,26 @@
 ---
-# Container setup tasks for podman role
+# Container setup tasks for podman role.
+#
+# Images AND the podman-secret set are BOTH derived from the manifest tree
+# (manifests/global.yml images map + manifests/services/*), never from
+# config/containers*.txt (removed) or a hand-maintained list here. The rendered
+# units reference lme_global.images[<key>].local (see ansible/templates/units/
+# container.j2), so realizing every image to that exact `local` tag here is what
+# makes the units startable.
 
-- name: Check if containers.txt exists on Ansible controller
-  stat:
-    path: "{{ clone_directory }}/config/containers.txt"
-  register: containers_file
-  delegate_to: localhost
-  run_once: true
-  # Note: This check runs on localhost because lookup('file', ...) reads from the controller.
-  # The file must exist on the Ansible controller where the repository is cloned.
+# container_setup runs BEFORE quadlet_setup (main.yml), which is where G2 wires
+# load_manifests. Load it here defensively so lme_global / lme_services /
+# lme_enable_flags exist for the image + secret derivations below. The facts are
+# idempotent set_facts, so a later re-include (quadlet_setup) simply recomputes
+# them; the guard avoids a redundant pass when they are already present.
+- name: Ensure manifest facts are loaded (idempotent)
+  ansible.builtin.include_tasks: load_manifests.yml
+  when: >-
+    (lme_global is not defined)
+    or (lme_services is not defined)
+    or (lme_enable_flags is not defined)
 
-- name: Fail if containers.txt doesn't exist on controller
-  fail:
-    msg: |
-      containers.txt file not found on Ansible controller at {{ clone_directory }}/config/containers.txt
-      
-      This file must exist on the Ansible controller (localhost) because the playbook uses
-      lookup('file', ...) to read it. The file will be copied to target hosts later in the playbook.
-      
-      Please ensure:
-      1. The LME repository is cloned on the Ansible controller
-      2. The clone_directory variable points to the repository root on the controller
-      3. The config/containers.txt file exists in the repository
-  when: not containers_file.stat.exists
-
-# Skip secret creation on cluster nodes - secrets will be copied from master via secrets_distribution role.
-# Set lme_skip_secret_creation=true in elasticsearch.yml for cluster deployments.
-- name: Skip secret creation (cluster node - secrets from master)
-  debug:
-    msg: "Skipping secret creation. Secrets will be copied from master via secrets_distribution."
-  when: lme_skip_secret_creation | default(false)
-
-- name: set service user passwords
-  shell: |
-    source /root/.profile 
-    podman secret ls | grep -q elastic
-  register: result
-  become: yes
-  args:
-    executable: /bin/bash
-  ignore_errors: true
-  #only fail on a real error
-  failed_when: result.rc != 0 and (result.rc == 1 and result.changed == false)
-  when: not (lme_skip_secret_creation | default(false))
-  
-- name: Set podman secret passwords
-  shell: |
-    source /root/.profile 
-    password="$(</dev/urandom tr -dc 'A-Za-z' | head -c1)$(</dev/urandom tr -dc 'A-Za-z0-9_.-' | head -c29)"
-    while ! echo -n "$password" | grep -Eq '[_.-]+';do password="$(</dev/urandom tr -dc 'A-Za-z' | head -c1)$(</dev/urandom tr -dc 'A-Za-z0-9_.-' | head -c29)";done
-    echo -n $password | podman secret create --driver shell --replace "{{ item }}" -
-  args:
-    executable: /bin/bash
-  loop: 
-    - elastic
-    - kibana_system
-    - wazuh_api
-    - wazuh
-  become: yes
-  ## only run this when secrets don't exist and we're not skipping creation
-  when:
-    - not (lme_skip_secret_creation | default(false))
-    - result.rc == 1
-
+# --- container image policy ---------------------------------------------------
 - name: Check if policy.json exists
   stat:
     path: /etc/containers/policy.json
@@ -82,97 +40,143 @@
     dest: /etc/containers/policy.json
   become: yes
   when: not policy_file.stat.exists or policy_file.stat.size == 0
-  
-- name: Pull containers
+
+# --- podman image realization (replaces config/containers*.txt) ---------------
+# One loop over lme_global.images. `pull` images are pulled from upstream then
+# retagged to their stable `local` ref (the exact string the rendered unit
+# references); `build` images are built from their Dockerfile. The group gate
+# mirrors main.yml's include gating: `core` always; `llm` / `elastic_services`
+# only when their enable flag is on and this is not an ES-only child node.
+#
+# Fail-closed by design (NO ignore_errors, unlike the old containers.txt loop):
+# a missing/unbuildable image must stop the install, not leave a rendered unit
+# that can never start (definition-of-done: no false success). Transient pull
+# flakiness is still absorbed by retries/until. Offline installs skip this loop
+# and load from the prepared tars via load_offline_containers.yml.
+- name: Realize container images from global.images (pull|build then retag to local)
   shell: |
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman pull {{ item }}
+    {% if item.value.pull is defined %}
+    podman pull {{ item.value.pull | quote }}
+    podman image tag {{ item.value.pull | quote }} {{ item.value.local | quote }}
+    {% else %}
+    podman build -t {{ item.value.local | quote }} \
+      -f {{ (clone_directory ~ '/' ~ item.value.build) | quote }} \
+      {{ (clone_directory ~ '/' ~ (item.value.build | dirname)) | quote }}
+    {% endif %}
   args:
     executable: /bin/bash
-  loop: "{{ lookup('file', clone_directory + '/config/containers.txt').splitlines() | select('match', '^[^#].*') | reject('match', '^\\s*$') | list }}"
-  register: pull_result
+  loop: "{{ lme_global.images | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} ({{ item.value.group | default('core') }})"
+  register: image_realize_result
   become: yes
   retries: 3
   delay: 5
-  until: pull_result is not failed
-  ignore_errors: yes
-  when: not (offline_mode | default(false))
-
-- name: Display container pull errors
-  debug:
-    msg: "Failed to pull container: {{ item.item }}"
-  loop: "{{ pull_result.results }}"
-  when: item is failed and not (offline_mode | default(false))
-  loop_control:
-    label: "{{ item.item }}"
+  until: image_realize_result is not failed
+  when:
+    - not (offline_mode | default(false))
+    - >-
+      (item.value.group | default('core')) == 'core'
+      or ((item.value.group | default('core')) == 'llm'
+          and (install_llm | default(true) | bool)
+          and not (lme_child_es_only | default(false) | bool))
+      or ((item.value.group | default('core')) == 'elastic_services'
+          and (install_elastic_services | default(false) | bool)
+          and not (lme_child_es_only | default(false) | bool))
 
 - name: Load and tag containers from offline resources
   include_tasks: load_offline_containers.yml
   when: offline_mode | default(false)
 
-- name: Tag containers (online mode only)
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman image tag {{ item }} {{ item.split('/')[-1].split(':')[0] }}:LME_LATEST
-  args:
-    executable: /bin/bash
-  loop: "{{ lookup('file', clone_directory + '/config/containers.txt').splitlines() | select('match', '^[^#].*') | reject('match', '^\\s*$') | list }}"
-  register: tag_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: tag_result is not failed
-  ignore_errors: yes
-  when: not (offline_mode | default(false))
-
-- name: Display container tag errors (online mode only)
+# --- podman secret set (B3: derived from ENABLED services) --------------------
+# Skip on cluster data nodes: secrets are copied from the master by the
+# secrets_distribution role. lme_skip_secret_creation=true is set on that path.
+- name: Skip secret creation (cluster node - secrets from master)
   debug:
-    msg: "Failed to tag container: {{ item.item }}"
-  loop: "{{ tag_result.results }}"
-  when:
-    - not (offline_mode | default(false))
-    - item is failed
-  loop_control:
-    label: "{{ item.item }}"
+    msg: "Skipping secret creation. Secrets will be copied from master via secrets_distribution."
+  when: lme_skip_secret_creation | default(false)
 
-- name: Display container tag errors
-  debug:
-    msg: "Failed to tag container: {{ item.item }}"
-  loop: "{{ tag_result.results }}"
-  when: item is failed
-  loop_control:
-    label: "{{ item.item }}"
+# The B3 union: the set of podman secrets that ENABLED service manifests declare.
+# render_units renders a unit ONLY when is_enabled(enabled_when) is true, so a
+# secret in this union is exactly a secret some rendered unit will reference.
+- name: Reset required-secret accumulator
+  set_fact:
+    lme_required_secrets: []
 
-- name: Pull Elastic services containers
+- name: Derive required podman secrets from enabled services (B3 union)
+  set_fact:
+    lme_required_secrets: >-
+      {{ (lme_required_secrets
+          + (item.value.secrets | default([]) | map(attribute='name') | list)) | unique }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name | default(item.key) }}"
+  when: item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+
+# Two secret-creation recipes exist:
+#   * known credentials  -> created HERE with the shell-driver random-password
+#     recipe below. This list is ALSO the credential floor: it is exactly the four
+#     names setup_secrets.yml hard-requires (setup_secrets.yml:126-129), so union
+#     | this can only ADD to, never regress below, the pre-manifest behavior --
+#     important while MA1's wazuh-manager manifest (declares wazuh / wazuh_api) is
+#     not yet present in manifests/services/.
+#   * deferred secrets   -> created by llama_cpp_setup.yml with their own recipes
+#     (pgvector: random file-driver password; llm-keys: empty placeholder). Their
+#     creation is gated by the SAME install_llm flag that renders litellm, so a
+#     rendered litellm never precedes their creation permanently.
+- name: Classify the secret set (known credentials vs LLM-stack deferred)
+  set_fact:
+    lme_known_password_secrets: [elastic, kibana_system, wazuh, wazuh_api]
+    lme_secrets_deferred: [pgvector, llm-keys]
+
+# Fail-closed B3 guard: any enabled secret that is neither a known credential nor
+# LLM-deferred has NO creation recipe. Stop loudly instead of rendering a unit
+# that references an uncreated secret. This catches a future/renamed manifest
+# secret (e.g. MA3 declaring `pgvector_pass` instead of `pgvector`).
+- name: B3 guard -- every enabled-service secret has a creation recipe
+  assert:
+    that:
+      - (lme_required_secrets | difference(lme_known_password_secrets) | difference(lme_secrets_deferred)) | length == 0
+    fail_msg: >-
+      Enabled service(s) declare podman secret(s) with no creation recipe:
+      {{ lme_required_secrets | difference(lme_known_password_secrets) | difference(lme_secrets_deferred) }}.
+      Add each to lme_known_password_secrets (here, shell-driver password) or to
+      the llama_cpp_setup.yml deferred set, so no rendered unit references an
+      uncreated secret (B3).
+    success_msg: "All enabled-service secrets have a creation recipe."
+
+# Credentials to create = (enabled union + floor) minus the LLM-deferred set.
+- name: Compute credential secrets to create
+  set_fact:
+    lme_password_secrets: >-
+      {{ ((lme_required_secrets + lme_known_password_secrets) | unique)
+         | difference(lme_secrets_deferred) }}
+
+- name: Check whether service-credential secrets already exist
   shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman pull {{ item }}
+    source /root/.profile
+    podman secret ls | grep -q elastic
+  register: result
+  become: yes
   args:
     executable: /bin/bash
-  loop: "{{ lookup('file', clone_directory + '/config/containers-elastic-services.txt').splitlines() | select('match', '^[^#].*') | reject('match', '^\\s*$') | list }}"
-  register: pull_elastic_services_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: pull_elastic_services_result is not failed
-  ignore_errors: yes
-  when:
-    - not (offline_mode | default(false))
-    - install_elastic_services | default(false) | bool
+  ignore_errors: true
+  # only fail on a real error
+  failed_when: result.rc != 0 and (result.rc == 1 and result.changed == false)
+  when: not (lme_skip_secret_creation | default(false))
 
-- name: Tag Elastic services containers (online mode only)
+- name: Set podman secret passwords (derived credential set)
   shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman image tag {{ item }} {{ item.split('/')[-1].split(':')[0] }}:LME_LATEST
+    source /root/.profile
+    password="$(</dev/urandom tr -dc 'A-Za-z' | head -c1)$(</dev/urandom tr -dc 'A-Za-z0-9_.-' | head -c29)"
+    while ! echo -n "$password" | grep -Eq '[_.-]+';do password="$(</dev/urandom tr -dc 'A-Za-z' | head -c1)$(</dev/urandom tr -dc 'A-Za-z0-9_.-' | head -c29)";done
+    echo -n $password | podman secret create --driver shell --replace "{{ item }}" -
   args:
     executable: /bin/bash
-  loop: "{{ lookup('file', clone_directory + '/config/containers-elastic-services.txt').splitlines() | select('match', '^[^#].*') | reject('match', '^\\s*$') | list }}"
-  register: tag_elastic_services_result
+  loop: "{{ lme_password_secrets }}"
   become: yes
-  retries: 3
-  delay: 5
-  until: tag_elastic_services_result is not failed
-  ignore_errors: yes
+  ## only run this when secrets don't exist and we're not skipping creation
   when:
-    - not (offline_mode | default(false))
-    - install_elastic_services | default(false) | bool
+    - not (lme_skip_secret_creation | default(false))
+    - result.rc == 1

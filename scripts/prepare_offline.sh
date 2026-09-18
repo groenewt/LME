@@ -11,11 +11,13 @@ NC='\033[0m' # No Color
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 LME_ROOT="$(dirname "$SCRIPT_DIR")"
-CONTAINERS_FILE="$LME_ROOT/config/containers.txt"
-LLM_CONTAINERS_FILE="$LME_ROOT/config/containers-llm.txt"
+GLOBAL_MANIFEST="$LME_ROOT/manifests/global.yml"
 OUTPUT_DIR="$LME_ROOT/offline_resources"
 INCLUDE_LLM="false"
 TARGET_ARCH="$(uname -m)"
+# Populated from manifests/global.yml (lme_global.image_tag) in main(), so the
+# retag sentinel is never a literal in this script.
+IMAGE_TAG=""
 
 # Load environment variables from example.env if it exists
 ENV_FILE="$LME_ROOT/config/example.env"
@@ -276,13 +278,75 @@ create_output_dir() {
     fi
 }
 
-# Derive target tag localhost/<last-path-seg>:LME_LATEST from an image ref.
-# Matches container_setup.yml:116 derivation, with explicit localhost/ prefix.
+# --- manifest-driven image list ------------------------------------------------
+# The image set AND the retag targets come from manifests/global.yml (the single
+# source of truth), NOT config/containers*.txt. These helpers read it with PyYAML,
+# so this script never hard-codes an upstream ref, a local ref, or the tag.
+
+# Verify the manifest + PyYAML are present before anything relies on them.
+require_manifest_tooling() {
+    if [ ! -f "$GLOBAL_MANIFEST" ]; then
+        echo -e "${RED}✗ Manifest not found: $GLOBAL_MANIFEST${NC}"
+        exit 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${RED}✗ python3 is required to read $GLOBAL_MANIFEST${NC}"
+        exit 1
+    fi
+    if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+        echo -e "${RED}✗ Python PyYAML is required to read $GLOBAL_MANIFEST${NC}"
+        echo -e "${YELLOW}  Install it: apt-get install -y python3-yaml  (or: pip3 install pyyaml)${NC}"
+        exit 1
+    fi
+}
+
+# Print lme_global.image_tag (the retag sentinel).
+manifest_image_tag() {
+    python3 - "$GLOBAL_MANIFEST" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as fh:
+    g = yaml.safe_load(fh)["lme_global"]
+tag = g.get("image_tag")
+if not tag:
+    sys.exit("global.yml lme_global.image_tag is missing")
+print(tag)
+PY
+}
+
+# Print "<pull_ref>\t<local_ref>" for each image in <group> that has a pull source.
+manifest_pull_images() {
+    python3 - "$GLOBAL_MANIFEST" "$1" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as fh:
+    images = yaml.safe_load(fh)["lme_global"]["images"]
+group = sys.argv[2]
+for name, spec in images.items():
+    if spec.get("group", "core") == group and spec.get("pull"):
+        print("%s\t%s" % (spec["pull"], spec["local"]))
+PY
+}
+
+# Print "<dockerfile_rel>\t<local_ref>" for each image in <group> built locally.
+manifest_build_images() {
+    python3 - "$GLOBAL_MANIFEST" "$1" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as fh:
+    images = yaml.safe_load(fh)["lme_global"]["images"]
+group = sys.argv[2]
+for name, spec in images.items():
+    if spec.get("group", "core") == group and spec.get("build"):
+        print("%s\t%s" % (spec["build"], spec["local"]))
+PY
+}
+
+# Derive target tag localhost/<last-path-seg>:<image_tag> from an image ref.
+# Fallback only: the manifest-driven callers pass the manifest `local` ref
+# directly, so the tag never appears as a literal.
 derive_target_tag() {
     local image_ref="$1"
     local last_seg="${image_ref##*/}"
     local name="${last_seg%%:*}"
-    echo "localhost/${name}:LME_LATEST"
+    echo "localhost/${name}:${IMAGE_TAG}"
 }
 
 # Save a container image to a tar and append an entry to image_manifest.tsv.
@@ -332,44 +396,31 @@ pull_and_save_container() {
     echo
 }
 
-# Download and save container images from config/containers.txt
+# Download and save the CORE container images (manifests/global.yml group: core).
+# Retag target is each image's manifest `local` ref.
 download_containers() {
-    echo -e "${YELLOW}Downloading and saving container images...${NC}"
+    echo -e "${YELLOW}Downloading and saving core container images...${NC}"
 
-    if [ ! -f "$CONTAINERS_FILE" ]; then
-        echo -e "${RED}✗ Containers file not found: $CONTAINERS_FILE${NC}"
-        exit 1
-    fi
-
-    while IFS= read -r container; do
-        if [ -n "$container" ] && [[ ! "$container" =~ ^[[:space:]]*# ]]; then
-            pull_and_save_container "$container" ""
-        fi
-    done < "$CONTAINERS_FILE"
+    while IFS=$'\t' read -r pull_ref local_ref; do
+        [ -z "$pull_ref" ] && continue
+        pull_and_save_container "$pull_ref" "$local_ref"
+    done < <(manifest_pull_images core)
 }
 
 
 
-# Download and save the LLM container images listed in containers-llm.txt.
-# A small override map handles the llama.cpp dot-to-dash rename that
-# quadlet/lme-llama-cpp.container and quadlet/lme-embeddings.container expect.
+# Download and save the LLM pull-images (manifests/global.yml group: llm). The
+# manifest `local` ref is the retag target, so the old llama.cpp dot-to-dash
+# override map is gone -- global.yml already carries localhost/llama-cpp. The two
+# build-type llm images (lme-dashboard, lme-log-analyzer) have no upstream pull
+# source and are handled by build_lme_images().
 download_llm_containers() {
     echo -e "${YELLOW}Downloading LLM container images...${NC}"
 
-    if [ ! -f "$LLM_CONTAINERS_FILE" ]; then
-        echo -e "${RED}✗ LLM containers file not found: $LLM_CONTAINERS_FILE${NC}"
-        exit 1
-    fi
-
-    declare -A LLM_TAG_OVERRIDES=(
-        ["ghcr.io/ggml-org/llama.cpp:server"]="localhost/llama-cpp:LME_LATEST"
-    )
-
-    while IFS= read -r container; do
-        if [ -n "$container" ] && [[ ! "$container" =~ ^[[:space:]]*# ]]; then
-            pull_and_save_container "$container" "${LLM_TAG_OVERRIDES[$container]:-}"
-        fi
-    done < "$LLM_CONTAINERS_FILE"
+    while IFS=$'\t' read -r pull_ref local_ref; do
+        [ -z "$pull_ref" ] && continue
+        pull_and_save_container "$pull_ref" "$local_ref"
+    done < <(manifest_pull_images llm)
 }
 
 # Download the two GGUFs that llama_cpp_setup.yml would otherwise fetch
@@ -417,6 +468,10 @@ download_llm_models() {
 # Build and save the ingest image that replaces the online flow's
 # `python:3.11-slim + inline pip install` (llama_cpp_setup.yml:318-324).
 # Pin exact package versions so offline bundles are reproducible.
+# All builds use --network=host: RUN steps (pip/apt) need internet, and the
+# container network namespace can't be assumed to have working egress (e.g.
+# Tailscale/proxy/split-DNS prep machines) — the host netns is exactly what
+# check_internet already validated. Affects build-time only, not the image.
 build_ingest_image() {
     echo -e "${YELLOW}Building LME ingest image (pinned pip deps)...${NC}"
     local dockerfile_tmp
@@ -432,9 +487,9 @@ RUN pip install --no-cache-dir \
     lxml==5.3.0
 DOCKERFILE
 
-    if sudo podman build -t localhost/lme-ingest:LME_LATEST -f "$dockerfile_tmp" "$LME_ROOT"; then
+    if sudo podman build --network=host -t "localhost/lme-ingest:${IMAGE_TAG}" -f "$dockerfile_tmp" "$LME_ROOT"; then
         rm -f "$dockerfile_tmp"
-        save_container_tar "localhost/lme-ingest:LME_LATEST" "localhost/lme-ingest:LME_LATEST"
+        save_container_tar "localhost/lme-ingest:${IMAGE_TAG}" "localhost/lme-ingest:${IMAGE_TAG}"
     else
         rm -f "$dockerfile_tmp"
         echo -e "${RED}✗ Failed to build LME ingest image${NC}"
@@ -444,22 +499,24 @@ DOCKERFILE
 
 # Build and save lme-log-analyzer and lme-dashboard images locally, since the
 # online install would `podman build` these in-place — impossible offline.
+# --network=host for the same reason as build_ingest_image (see above): their
+# Dockerfiles RUN apt-get + pip install, which need the host's connectivity.
 build_lme_images() {
-    echo -e "${YELLOW}Building LME Log Analyzer image...${NC}"
-    if sudo podman build -t localhost/lme-log-analyzer:LME_LATEST "$LME_ROOT/lme-log-analyzer"; then
-        save_container_tar "localhost/lme-log-analyzer:LME_LATEST" "localhost/lme-log-analyzer:LME_LATEST"
-    else
-        echo -e "${RED}✗ Failed to build LME Log Analyzer${NC}"
-        exit 1
-    fi
-
-    echo -e "${YELLOW}Building LME Dashboard image...${NC}"
-    if sudo podman build -t localhost/lme-dashboard:LME_LATEST "$LME_ROOT/lme-dashboard"; then
-        save_container_tar "localhost/lme-dashboard:LME_LATEST" "localhost/lme-dashboard:LME_LATEST"
-    else
-        echo -e "${RED}✗ Failed to build LME Dashboard${NC}"
-        exit 1
-    fi
+    # Build the llm-group build-type images (lme-log-analyzer, lme-dashboard)
+    # straight from manifests/global.yml. Build context = the Dockerfile's dir;
+    # --network=host for the same reason as build_ingest_image (RUN needs egress).
+    while IFS=$'\t' read -r dockerfile_rel local_ref; do
+        [ -z "$dockerfile_rel" ] && continue
+        local context_dir
+        context_dir="$LME_ROOT/$(dirname "$dockerfile_rel")"
+        echo -e "${YELLOW}Building $local_ref (from $dockerfile_rel)...${NC}"
+        if sudo podman build --network=host -t "$local_ref" -f "$LME_ROOT/$dockerfile_rel" "$context_dir"; then
+            save_container_tar "$local_ref" "$local_ref"
+        else
+            echo -e "${RED}✗ Failed to build $local_ref${NC}"
+            exit 1
+        fi
+    done < <(manifest_build_images llm)
 }
 
 # Captured by scrape_lme_docs, read by write_manifest.
@@ -483,7 +540,7 @@ scrape_lme_docs() {
         -v "$scrape_out":/out:Z \
         -v "$LME_ROOT/scripts":/scripts:z \
         -v "$repo_tmp":/repo:z \
-        localhost/lme-ingest:LME_LATEST \
+        "localhost/lme-ingest:${IMAGE_TAG}" \
         python /scripts/ingest_docs.py --scrape-only --docs-repo /repo --output-dir /out; then
         sudo chown -R "$USER:$USER" "$scrape_out"
         DOCS_PAGES=$(cat "$scrape_out/count" 2>/dev/null || echo 0)
@@ -1388,6 +1445,8 @@ main() {
     check_internet
     check_podman
     ensure_nix_daemon_access
+    require_manifest_tooling
+    IMAGE_TAG="$(manifest_image_tag)"
     create_output_dir
     download_containers
     if [ "$INCLUDE_LLM" = "true" ]; then
