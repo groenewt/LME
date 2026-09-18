@@ -1,0 +1,77 @@
+---
+# manifests/profiles/multinode.yml -- multi-node FLEET profile (value overlay).
+#
+# Opts a SINGLE all-in-one LME box into enrolling REMOTE elastic-agents across a
+# tailnet (opt-in "multinode fleet"). This is NOT an Elasticsearch cluster (see
+# cluster.yml for that): it is one ES/Kibana/Fleet-server node whose fleet-server
+# (8220) and elasticsearch client API (9200) are reachable by agents on OTHER hosts.
+#
+# SELECTED with `-e lme_profile=multinode`. load_manifests.yml loads
+# profiles/<lme_profile>.yml by filename (include_vars) -- there is NO registry or
+# discovery step, the filename IS the selector -- so this file needs no registration.
+# The default profile stays single-node / CLOSED; nothing here fires unless the
+# operator explicitly asks for it.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS STATIC PROFILE DOES (host-independent, safe to commit):
+#   Re-opens the two ports remote agents must reach, to bind:0.0.0.0. Default
+#   posture is CLOSED (global.yml + each service manifest bind every published port
+#   to 127.0.0.1). combine(recursive=True) REPLACES lists, so each service's FULL
+#   publish_ports list is re-declared with an EXPLICIT bind on every entry; "open"
+#   is a PRESENT bind:0.0.0.0, never an absent bind (so an audit greps bind:0.0.0.0).
+#     * fleet-server 8220  -> 0.0.0.0  (remote agents enroll / check in here)
+#     * elasticsearch 9200 -> 0.0.0.0  (fleet default output; agents ship data here.
+#       This leg runs ssl.verification_mode: certificate -- CA-only, no hostname
+#       check -- so it needs REACHABILITY, not an ES cert SAN.)
+#   The ES TRANSPORT port (9300) is a CLUSTER concern and is intentionally NOT
+#   opened here (see cluster.yml).
+#
+# ---------------------------------------------------------------------------
+# WHAT THE OPERATOR MUST SUPPLY PER DEPLOY (per-host tailnet values -- these are
+# NOT hardcodable in a committed static profile, so they are DOCUMENTED here, not
+# set here):
+#
+#   1) -e fleet_advertise_host=<this node's tailnet MagicDNS name or IP>
+#      Feeds the fleet role (ansible/roles/fleet/tasks/main.yml): it becomes the
+#      host in the registered fleet-server URL (POST /api/fleet/fleet_server_hosts)
+#      AND in the fleet default-output ES URL. Defaults to `ipvar` when unset, so a
+#      single-node install is byte-identical.
+#
+#   2) lme_service_overrides.fleet-server.certs.san_dns / .san_ip = the SAME tailnet
+#      name / IP, so the fleet-server LEAF cert covers the advertised host (agents
+#      validate the fleet-server cert by hostname). The SAN mechanism already exists
+#      (ansible/roles/certs/templates/instances.yml.j2 lines ~38-40 / ~52-54) and
+#      merges via load_manifests.yml combine(recursive=True). Default [] => the
+#      single-node cert is byte-identical. Example -e (JSON extra-vars):
+#        -e '{"lme_service_overrides": {"fleet-server": {"certs":
+#             {"san_dns": ["lme-fleet.tailXXXX.ts.net"], "san_ip": ["100.x.y.z"]}}}}'
+#
+#   3) When re-SAN-ing a host whose leaf was ALREADY minted, also pass
+#      -e lme_force_cert_regen=true and restart lme-fleet-server so the new leaf
+#      (carrying the tailnet SAN) is picked up.
+#
+# NOTE (host registration is POST-then-409, not upsert): the fleet role registers
+# the advertised URL with POST .../fleet_server_hosts (id: lme-fleet-server) and
+# ACCEPTS 409 (already-exists) idempotently. A 409 does NOT update an existing
+# registration -- if you change fleet_advertise_host on a host that was already
+# enrolled, delete (or re-point) the old fleet_server_hosts entry in Kibana so the
+# new URL takes effect.
+# ---------------------------------------------------------------------------
+profile_overlay:
+  lme_global: {}
+  services:
+    fleet-server:
+      # FULL list re-declared (combine REPLACES lists); 8220 opened to the LAN so
+      # remote agents can enroll / check in. Base manifest carries only this entry.
+      publish_ports:
+        - {host: 8220, container: 8220, bind: 0.0.0.0}   # LAN opt-in (remote agents)
+    elasticsearch:
+      # FULL list re-declared; 9200 (client API) opened so agents can ship to the
+      # fleet default output. Base manifest carries only this entry (9300 transport
+      # is a CLUSTER concern -- see cluster.yml -- and stays absent here).
+      publish_ports:
+        - {host: 9200, container: 9200, bind: 0.0.0.0}   # LAN opt-in (fleet output target)
+  vars:
+    # One ES node with remote agents -- NOT an ES cluster. Mirrors default.yml so any
+    # task reading es_discovery sees a defined value (no task currently requires it).
+    es_discovery: single-node

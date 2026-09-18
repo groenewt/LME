@@ -5,6 +5,13 @@
 - name: Set playbook variables
   ansible.builtin.set_fact:
     ipvar: "{{ env_dict.IPVAR | default('') }}"
+    # Advertised host for remote fleet enrollment (multinode opt-in, item 1+3).
+    # Defaults to ipvar's own source (env_dict.IPVAR) so a single-node install is
+    # byte-identical; override with -e fleet_advertise_host=<tailnet MagicDNS name/IP>
+    # under the multinode profile. (Defaulting to env_dict.IPVAR rather than the
+    # sibling `ipvar` fact avoids relying on intra-set_fact evaluation order; the
+    # resolved value is identical.)
+    fleet_advertise_host: "{{ fleet_advertise_host | default(env_dict.IPVAR | default('')) }}"
     local_kbn_url: "{{ env_dict.LOCAL_KBN_URL | default('') }}"
     local_es_url: "{{ env_dict.LOCAL_ES_URL | default('') }}"
     stack_version: "{{ env_dict.STACK_VERSION | default('') }}"
@@ -249,6 +256,11 @@
     var: ca_fingerprint
   when: debug_mode | bool
 
+# Item 1 (DEPRECATED / NO-OP in Fleet 8.x): settings.fleet_server_hosts is a
+# deprecated field -- this PUT returns 200 but does NOT populate the live
+# fleet_server_hosts collection (the live probe found that collection empty despite
+# a 200). Kept inert for backwards visibility; the REAL registration is the POST to
+# /api/fleet/fleet_server_hosts (task below).
 - name: Set Fleet server hosts
   uri:
     url: "{{ local_kbn_url }}/api/fleet/settings"
@@ -276,6 +288,45 @@
     msg: "Fleet server hosts successfully set to {{ fleet_server_hosts_result.json.item.fleet_server_hosts }}"
   when: debug_mode | bool
 
+# Item 1 (LIVE registration): in Fleet 8.x the fleet_server_hosts live in their own
+# collection, NOT in settings. This POST is the REAL host registration. It is
+# IDEMPOTENT (explicit id -> a re-run returns 409, which is accepted) and NON-FATAL
+# (a benign/wrong-schema 4xx must NEVER break the install -- this is the single-node
+# safety net). On single-node fleet_advertise_host == ipvar, so the registered URL
+# is identical to the legacy PUT above. NOTE: the endpoint path + body field names
+# (host_urls, is_default) are the recon's best read of the Kibana 8.18 Fleet API and
+# should be confirmed against it; a wrong-schema response is guarded non-fatal below.
+- name: Register Fleet server host (live fleet_server_hosts collection)
+  uri:
+    url: "{{ local_kbn_url }}/api/fleet/fleet_server_hosts"
+    method: POST
+    user: "{{ elastic_username }}"
+    password: "{{ elastic_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    headers:
+      kbn-version: "{{ kibana_version }}"
+      kbn-xsrf: "kibana"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      id: "lme-fleet-server"
+      name: "lme-fleet-server"
+      host_urls: ["https://{{ fleet_advertise_host }}:{{ fleet_port }}"]
+      is_default: true
+    status_code: [200, 409]
+  register: fleet_server_host_reg
+  until: fleet_server_host_reg.status is defined and fleet_server_host_reg.status in [200, 409]
+  retries: 3
+  delay: 10
+  no_log: "{{ not debug_mode }}"
+  ignore_errors: yes
+
+- name: Debug Fleet server host registration result
+  debug:
+    msg: "Fleet server host registration status: {{ fleet_server_host_reg.status | default('n/a') }} (advertise_host={{ fleet_advertise_host }})"
+  when: debug_mode | bool
+
 - name: Set Fleet default output hosts
   uri:
     url: "{{ local_kbn_url }}/api/fleet/outputs/fleet-default-output"
@@ -290,7 +341,11 @@
       Content-Type: "application/json"
     body_format: json
     body:
-      hosts: ["https://{{ ipvar }}:9200"]
+      # Item 3: advertise the ES output at fleet_advertise_host (== ipvar on
+      # single-node, so byte-identical there; the tailnet name/IP under multinode).
+      # This leg runs ssl.verification_mode: certificate (CA-only, no hostname check),
+      # so only reachability matters here -- no ES cert SAN is required for it.
+      hosts: ["https://{{ fleet_advertise_host }}:9200"]
   register: fleet_output_hosts_result
   until: fleet_output_hosts_result.status == 200
   retries: 12

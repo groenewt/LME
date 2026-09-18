@@ -89,6 +89,14 @@ run_remote() { "${SSH[@]}" "$@" 2>&1 | tee -a "$LOG"; return "${PIPESTATUS[0]}";
 do_rsync() {
   say "RSYNC $SRC/ -> root@${HOST}:${REMOTE_DIR}/"
   "${SSH[@]}" "mkdir -p '$REMOTE_DIR'" 2>&1 | tee -a "$LOG"
+  # rsync must exist on BOTH ends -- it spawns a remote rsync over ssh. Stock
+  # Debian-13 cloud images ship WITHOUT rsync (noble preinstalls it), so ensure
+  # it on the target before the transfer. Idempotent: no-op where present. On an
+  # AIRGAPPED target apt-get cannot reach a mirror -> nonzero rc -> this stage
+  # FAILS loudly (airgapped images must pre-bake rsync); we never mask it.
+  "${SSH[@]}" "command -v rsync >/dev/null 2>&1 || { apt-get update && apt-get install -y rsync; }" 2>&1 | tee -a "$LOG"
+  local ensure_rc="${PIPESTATUS[0]}"
+  if [ "$ensure_rc" -ne 0 ]; then say "RSYNC ensure-rsync-on-target FAILED rc=$ensure_rc"; return "$ensure_rc"; fi
   # Keep manifests/, ansible/inventory/, filter_plugins/ (ESSENTIAL to render).
   # Drop dev-only tooling + VM images + the env file (install.sh auto-creates it).
   rsync -e "ssh ${SSH_OPTS[*]}" -a --delete \

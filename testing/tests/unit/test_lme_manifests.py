@@ -380,6 +380,43 @@ def test_cluster_profile_opens_only_the_transport_port():
     assert render_port(by_host[9300]) == "0.0.0.0:9300:9300"
 
 
+def test_multinode_profile_opens_fleet_and_es_client_ports():
+    # multinode is the opt-in "multinode fleet" profile: it opens the two ports
+    # remote agents must reach -- fleet-server 8220 (enroll / check-in) and
+    # elasticsearch 9200 (fleet default output) -- to bind:0.0.0.0, and NOTHING else.
+    # "Open" is a PRESENT bind:0.0.0.0. It does NOT open the ES transport port (9300
+    # is a CLUSTER concern -- that is cluster.yml's job, not this profile's).
+    overlay = _load_profile("multinode.yml")["profile_overlay"]
+    fleet_by_host = {p["host"]: p
+                     for p in overlay["services"]["fleet-server"]["publish_ports"]}
+    es_by_host = {p["host"]: p
+                  for p in overlay["services"]["elasticsearch"]["publish_ports"]}
+    assert fleet_by_host[8220]["bind"] == "0.0.0.0"
+    assert render_port(fleet_by_host[8220]) == "0.0.0.0:8220:8220"
+    assert es_by_host[9200]["bind"] == "0.0.0.0"
+    assert render_port(es_by_host[9200]) == "0.0.0.0:9200:9200"
+    # one ES node with remote agents, not a cluster: no transport port opened.
+    assert 9300 not in es_by_host
+
+
+def test_default_profile_keeps_fleet_and_es_client_ports_loopback():
+    # Regression guard for the single-node default: the fleet-server (8220) and
+    # elasticsearch (9200) client ports stay loopback. Two halves are load-bearing:
+    #   (1) the service manifests supply the loopback bind, AND
+    #   (2) default.yml's overlay is SILENT on these services (no publish_ports), so
+    #       combine() never replaces the loopback list. If a future edit opened either
+    #       port in the base manifest OR added an override to default.yml, this fails.
+    fleet = _load_service("lme-fleet-server.yml")
+    es = _load_service("lme-elasticsearch.yml")
+    fleet_by_host = {p["host"]: p for p in fleet["publish_ports"]}
+    es_by_host = {p["host"]: p for p in es["publish_ports"]}
+    assert render_port(fleet_by_host[8220]) == "127.0.0.1:8220:8220"
+    assert render_port(es_by_host[9200]) == "127.0.0.1:9200:9200"
+    default_services = _load_profile("default.yml")["profile_overlay"].get("services") or {}
+    assert "publish_ports" not in (default_services.get("fleet-server") or {})
+    assert "publish_ports" not in (default_services.get("elasticsearch") or {})
+
+
 def test_webui_auth_secret_wired_into_both_uis():
     # CONTRACT: both web UIs receive the webui_api_key podman secret as env
     # WEBUI_API_KEY, wired exactly like litellm_master_key -> LITELLM_MASTER_KEY.
