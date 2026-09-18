@@ -32,6 +32,7 @@ RESOLVER_PATH = os.path.join(
 )
 GLOBAL_YML = os.path.join(REPO_ROOT, "manifests", "global.yml")
 SERVICES_DIR = os.path.join(REPO_ROOT, "manifests", "services")
+PROFILES_DIR = os.path.join(REPO_ROOT, "manifests", "profiles")
 
 # Fail legibly if the directory depth is wrong (a moved test file), rather than
 # with an opaque ImportError deep in the loader.
@@ -273,9 +274,17 @@ def test_wanted_by_passes_raw_targets_and_resolves_logical_names():
 @pytest.mark.parametrize(
     "port,expected",
     [
+        # No-bind is now the EXCEPTION form (default posture is CLOSED, so every
+        # real host-published port carries bind:127.0.0.1). render_port still emits
+        # the bare host:container when no bind is present -- which is exactly what a
+        # bind:0.0.0.0 (the LAN opt-in) also produces the wide-open publish for.
         ({"host": 9200, "container": 9200}, "9200:9200"),
+        ({"host": 9200, "container": 9200, "bind": "127.0.0.1"}, "127.0.0.1:9200:9200"),
+        ({"host": 9300, "container": 9300, "bind": "0.0.0.0"}, "0.0.0.0:9300:9300"),
         ({"host": 5044, "container": 5044, "bind": "127.0.0.1"}, "127.0.0.1:5044:5044"),
         ({"host": 514, "container": 514, "protocol": "udp"}, "514:514/udp"),
+        ({"host": 514, "container": 514, "protocol": "udp", "bind": "127.0.0.1"},
+         "127.0.0.1:514:514/udp"),
         # unknown 'serve' key is silently dropped (logstash carries serve:tcp).
         ({"host": 5044, "container": 5044, "bind": "127.0.0.1", "serve": "tcp"},
          "127.0.0.1:5044:5044"),
@@ -286,13 +295,100 @@ def test_render_port(port, expected):
 
 
 def test_render_port_from_real_manifests():
+    # Default posture is CLOSED: the ES client port now binds to loopback.
     es = _load_service("lme-elasticsearch.yml")
-    assert render_port(es["publish_ports"][0]) == "9200:9200"
+    assert render_port(es["publish_ports"][0]) == "127.0.0.1:9200:9200"
     logstash = _load_service("lme-logstash.yml")
     # loopback beats port stays bound to 127.0.0.1 (the isolation invariant).
     assert render_port(logstash["publish_ports"][0]) == "127.0.0.1:5044:5044"
-    # UDP syslog port comes from the global ports table.
-    assert render_port(LME_GLOBAL["ports"]["wazuh_syslog"]) == "514:514/udp"
+    # UDP syslog port comes from the global ports table -- now loopback-bound too.
+    assert render_port(LME_GLOBAL["ports"]["wazuh_syslog"]) == "127.0.0.1:514:514/udp"
+
+
+# ===========================================================================
+# DEFAULT NETWORK POSTURE = CLOSED (exposure-binds fix). The baseline manifests
+# must publish NOTHING to the LAN: every host-published port binds to loopback,
+# and LAN exposure is an EXPLICIT profile opt-in (a present bind:0.0.0.0), never
+# an absent bind. These sweeps are the enforcement the data-only approach needs:
+# without them, the next manifest anyone adds is wide open and nothing catches it.
+# ===========================================================================
+def test_every_service_published_port_is_loopback_by_default():
+    # Every publish_ports entry in every service manifest must carry an EXPLICIT
+    # bind of 127.0.0.1. render_port emits 0.0.0.0 (wide open) for any entry with
+    # no bind, so a missing bind here IS a LAN exposure -- this fails loudly on it.
+    offenders = []
+    for name, doc in _MANIFESTS:
+        if not doc:
+            continue
+        for port in doc.get("publish_ports", []) or []:
+            if port.get("bind") != "127.0.0.1":
+                offenders.append("%s -> %r" % (name, port))
+    assert offenders == [], (
+        "host-published ports not bound to loopback (default posture is CLOSED; "
+        "open a port via a profile bind:0.0.0.0, not in the service manifest): %s"
+        % offenders
+    )
+    # And each one actually renders as a loopback publish.
+    for _name, doc in _MANIFESTS:
+        if not doc:
+            continue
+        for port in doc.get("publish_ports", []) or []:
+            assert render_port(port).startswith("127.0.0.1:")
+
+
+def test_every_global_canonical_port_is_loopback_by_default():
+    # The canonical global.ports table mirrors the same closed posture.
+    for key, port in LME_GLOBAL["ports"].items():
+        assert port.get("bind") == "127.0.0.1", "%s not loopback-bound" % key
+
+
+def _load_profile(basename):
+    with open(os.path.join(PROFILES_DIR, basename), "r") as fh:
+        return yaml.safe_load(fh)
+
+
+def test_default_and_offline_profiles_open_no_ports():
+    # The default and offline profiles must NOT re-open any service to the LAN:
+    # they carry no publish_ports override at all, so the loopback service binds
+    # stand -- a fresh single-node / air-gapped install exposes nothing off-box.
+    for prof in ("default.yml", "offline.yml"):
+        overlay = _load_profile(prof)["profile_overlay"]
+        for _svc, body in (overlay.get("services") or {}).items():
+            assert "publish_ports" not in (body or {}), (
+                "%s overrides publish_ports -- must stay fully loopback" % prof
+            )
+
+
+def test_tailscale_profile_stays_loopback():
+    # tailscale fronts services via `tailscale serve`, so every port it re-declares
+    # must remain loopback-bound (the ingress reaches them on 127.0.0.1).
+    overlay = _load_profile("tailscale.yml")["profile_overlay"]
+    for _svc, body in (overlay.get("services") or {}).items():
+        for port in (body or {}).get("publish_ports", []) or []:
+            assert port.get("bind") == "127.0.0.1", "tailscale %s not loopback" % _svc
+
+
+def test_cluster_profile_opens_only_the_transport_port():
+    # cluster is the one baseline profile that opts a port back open: ONLY the ES
+    # transport port (9300, which must cross hosts to form a cluster). The client
+    # HTTP API (9200) stays loopback. "Open" is a present bind:0.0.0.0.
+    overlay = _load_profile("cluster.yml")["profile_overlay"]
+    ports = overlay["services"]["elasticsearch"]["publish_ports"]
+    by_host = {p["host"]: p for p in ports}
+    assert by_host[9200]["bind"] == "127.0.0.1"
+    assert by_host[9300]["bind"] == "0.0.0.0"
+    assert render_port(by_host[9300]) == "0.0.0.0:9300:9300"
+
+
+def test_webui_auth_secret_wired_into_both_uis():
+    # CONTRACT: both web UIs receive the webui_api_key podman secret as env
+    # WEBUI_API_KEY, wired exactly like litellm_master_key -> LITELLM_MASTER_KEY.
+    for svc in ("lme-dashboard.yml", "lme-log-analyzer.yml"):
+        doc = _load_service(svc)
+        webui = [s for s in doc["secrets"]
+                 if s.get("name") == "webui_api_key"]
+        assert webui == [{"name": "webui_api_key", "type": "env",
+                          "target": "WEBUI_API_KEY"}], svc
 
 
 # ===========================================================================
@@ -510,6 +606,30 @@ def test_memory_budget_service_that_fits_is_not_oversized():
     b = memory_budget(services, {}, g)
     assert b["oversized"] == []
     assert b["over_budget"] is False
+
+
+def test_cluster_profile_budget_prevents_oversized_hard_fail():
+    # A cluster ES node runs heap 8g -> MemoryMax 16G. On the DEFAULT 16G host
+    # budget (usable 14G) that single service is `oversized` and the SF-8 preflight
+    # hard-fails. cluster.yml raises budget.host_ram_gb to 32 (usable 30G > 16G),
+    # so ES is NOT oversized. This models the profile's effective budget (global
+    # budget overlaid by the cluster override, as load_manifests.yml combine()s it).
+    cluster = _load_profile("cluster.yml")["profile_overlay"]["lme_global"]
+    eff = dict(LME_GLOBAL)
+    eff_budget = dict(LME_GLOBAL["budget"])
+    eff_budget.update(cluster.get("budget", {}))
+    eff["budget"] = eff_budget
+    # cluster ES data node: heap 8g (as the cluster profile sets it).
+    services = {"elasticsearch": _svc("elasticsearch", heap="8g")}
+    b = memory_budget(services, {}, eff)
+    assert eff_budget["host_ram_gb"] == 32
+    assert b["capped"]["elasticsearch"] == "16G"
+    assert b["oversized"] == []   # 16G fits under usable 30G -> install proceeds
+
+    # Guard the regression: on the un-raised default budget the same node WOULD
+    # be oversized (proving the profile fix is load-bearing, not cosmetic).
+    d = memory_budget(services, {}, LME_GLOBAL)
+    assert d["oversized"] == ["elasticsearch"]
 
 
 def test_memory_budget_excludes_disabled_and_uncapped():

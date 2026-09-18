@@ -28,6 +28,25 @@
 #   deploy          = rsync -> wipe -> install -> health, HOLD before teardown.
 #   all             = rsync -> wipe -> install -> health -> teardown (full leg).
 # Override LOGDIR / SRC / REMOTE_DIR via the environment.
+#
+# --strict : make an install that RESCUED any task (PLAY RECAP rescued>0) FAIL
+#            instead of only WARN.
+#
+# HEALTH is a REAL gate (see do_health). Its pass contract, all on the target:
+#   * no `lme*` systemd unit in the `failed` state;
+#   * >= EXPECT_MIN running containers (default 11 for default+llm; auto-lowered
+#     for --no-llm/--offline, raised for --elastic-services; override with env
+#     LME_GATE_MIN_CONTAINERS);
+#   * EXPOSURE: every host-published port that should be loopback-only
+#     (9200/5601/443/8220, plus llm 5432/8081/8502/8501/4000) is bound to
+#     127.0.0.1/::1 and NOT LAN-open. Ports intentionally opened to the LAN
+#     (expose_lan opt-in) are listed in env LME_GATE_LAN_OK="8502 5601 ...".
+#   * SERVICE: ES :9200 -> 401/200, Kibana :5601 -> 200/302/401, and (llm)
+#     dashboard /livez :8502 -> 200, log-analyzer :8501 reachable.
+#   * AUTH: dashboard /api/health :8502 with NO key -> 401/403 (webui auth
+#     enforced). Log-analyzer (streamlit) gates in-app at HTTP 200, so its auth
+#     is not asserted at the HTTP layer here.
+# Any check that cannot run (e.g. `ss` missing) is a FAIL, not a skip.
 # ----------------------------------------------------------------------------
 set -uo pipefail
 
@@ -38,7 +57,7 @@ set -uo pipefail
 _SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SRC:-$(cd "$_SELF_DIR/../.." && pwd)}"
 REMOTE_DIR="${REMOTE_DIR:-/root/LME-gate}"     # tree lands here on the target
-HOST=""; IP=""; GRAPHROOT=""; FLAGS=""; LABEL=""; STAGE="all"
+HOST=""; IP=""; GRAPHROOT=""; FLAGS=""; LABEL=""; STAGE="all"; STRICT=0
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
 LOGDIR="${LOGDIR:-/tmp/lme-gate-logs}"
 
@@ -50,8 +69,10 @@ while [ $# -gt 0 ]; do
     --flags) FLAGS="$2"; shift 2;;
     --label) LABEL="$2"; shift 2;;
     --stage) STAGE="$2"; shift 2;;
+    --ssh-key) SSH_OPTS+=(-i "$2"); shift 2;;
     --src) SRC="$2"; shift 2;;
     --remote-dir) REMOTE_DIR="$2"; shift 2;;
+    --strict) STRICT=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -94,30 +115,156 @@ do_install() {
   local g=""; [ -n "$GRAPHROOT" ] && g="-g '$GRAPHROOT'"
   local i=""; [ -n "$IP" ] && i="-i '$IP'"
   say "INSTALL via tree's own install.sh  flags=[$FLAGS] ip=[$IP] graphroot=[$GRAPHROOT]"
-  run_remote "cd '$REMOTE_DIR' && NON_INTERACTIVE=true AUTO_CREATE_ENV=true ./install.sh $i $g $FLAGS"
-  local rc=$?
-  say "INSTALL rc=$rc"; return "$rc"
+  # Capture THIS invocation's output to its own file (LOGDIR persists across
+  # runs, so grepping the shared $LOG would match a prior leg's `rescued=`).
+  local ilog="$LOGDIR/${LABEL}.install.$(date -u +%s).log"
+  "${SSH[@]}" "cd '$REMOTE_DIR' && NON_INTERACTIVE=true AUTO_CREATE_ENV=true ./install.sh $i $g $FLAGS" \
+    2>&1 | tee -a "$LOG" | tee "$ilog"
+  local rc="${PIPESTATUS[0]}"
+  # RESCUE surfacing: Ansible PLAY RECAP emits `rescued=N` per host; a rescued
+  # task means a rescue block masked a failure (the live graph run hit
+  # rescued=2 that the gate never surfaced). Sum across recap lines.
+  local rescued
+  rescued=$(grep -oE 'rescued=[0-9]+' "$ilog" 2>/dev/null | grep -oE '[0-9]+' \
+            | awk '{s+=$1} END{print s+0}')
+  rescued="${rescued:-0}"
+  if [ "$rescued" -gt 0 ]; then
+    say "INSTALL WARN: rescued=$rescued task(s) recovered via an Ansible rescue block (PLAY RECAP)"
+    if [ "$STRICT" = 1 ] && [ "$rc" = 0 ]; then
+      say "INSTALL: --strict set and rescued>0 => treating install as FAIL"
+      rc=1
+    fi
+  fi
+  say "INSTALL rc=$rc (rescued=$rescued)"; return "$rc"
 }
 
 # ---- stage: health probe ---------------------------------------------------
 do_health() {
-  say "HEALTH probe"
-  run_remote '
-    set -o pipefail
-    echo "== lme.service ==";        systemctl is-active lme.service || true
-    echo "== running lme units ==";  systemctl list-units --plain --no-legend "lme*" --state=running | awk "{print \$1}" || true
-    echo "== podman ps ==";          sudo -i podman ps --format "{{.Names}} {{.Status}}" || true
-    echo "== ES :9200 TLS (expect 401 or 200) ==";
-    code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 20 https://127.0.0.1:9200 || echo 000)
-    echo "  ES http_code=$code"
-    echo "== Kibana :5601 (expect 200/302/401) ==";
-    kb=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 20 https://127.0.0.1:5601 || curl -s -o /dev/null -w "%{http_code}" --max-time 20 http://127.0.0.1:5601 || echo 000)
-    echo "  Kibana http_code=$kb"
-    # ES up (TLS handshake + auth challenge) is the pass gate; 000 => down.
-    [ "$code" = "401" ] || [ "$code" = "200" ]
-  '
+  say "HEALTH probe (deep gate)"
+
+  # ---- controller-side: derive the expected sets from the install flags ------
+  # The LLM stack (group: llm in manifests/global.yml -> pgvector/llama-cpp/
+  # litellm/log-analyzer/dashboard/embeddings) is present UNLESS --no-llm or
+  # --offline. --elastic-services adds the apm/heartbeat/metric/file/logstash
+  # pack. Guard the llm-only probes so the graph/trixie (default+llm) and any
+  # reduced invocation both stay valid — same shape, different expected set.
+  local llm_on=1
+  case " $FLAGS " in *" --no-llm "*|*" --offline "*) llm_on=0;; esac
+  local elastic_on=0
+  case " $FLAGS " in *" --elastic-services "*) elastic_on=1;; esac
+
+  # Loopback-only set: every host-published port that must NOT face the LAN
+  # unless expose_lan opted it in (LME_GATE_LAN_OK). Core always; llm when on.
+  local loopback_ports="9200 5601 443 8220"
+  [ "$llm_on" = 1 ] && loopback_ports="$loopback_ports 5432 8081 8502 8501 4000"
+
+  # Expected running-container floor. Default 11 (default+llm). Auto-adjust for
+  # the reduced/expanded packs; an operator override always wins.
+  local expect_min
+  if [ -n "${LME_GATE_MIN_CONTAINERS:-}" ]; then
+    expect_min="$LME_GATE_MIN_CONTAINERS"
+  else
+    if [ "$llm_on" = 1 ]; then expect_min=11; else expect_min=6; fi
+    [ "$elastic_on" = 1 ] && expect_min=$((expect_min + 5))
+  fi
+  local lan_ok="${LME_GATE_LAN_OK:-}"
+
+  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on loopback=[$loopback_ports] lan_ok=[$lan_ok]"
+
+  # ---- the remote payload ----------------------------------------------------
+  # Quoted heredoc: single quotes are legal inside (unlike the old '...' arg
+  # form) and the payload is independently `bash -n`-checkable. Values are
+  # injected as env on the `bash -s` line, NOT interpolated here.
+  local HEALTH_SH
+  read -r -d '' HEALTH_SH <<'REMOTE_EOF' || true
+set -o pipefail
+fail=0
+loopback_ok() { case "$1" in 127.0.0.1|::1|'[::1]') return 0;; *) return 1;; esac; }
+
+echo "== lme.service =="
+systemctl is-active lme.service || true
+
+echo "== failed lme units (must be empty) =="
+failed=$(systemctl list-units --plain --no-legend 'lme*' --state=failed 2>/dev/null | awk '{print $1}')
+if [ -n "$failed" ]; then
+  echo "  FAIL: lme units in failed state: $(echo $failed)"; fail=1
+else
+  echo "  ok: no failed lme units"
+fi
+
+echo "== running containers (expect >= $EXPECT_MIN) =="
+running=$(sudo -i podman ps --format '{{.Names}}' 2>/dev/null | sed '/^$/d' | wc -l)
+echo "  running=$running"
+if [ "$running" -lt "$EXPECT_MIN" ]; then
+  echo "  FAIL: only $running running container(s), expected >= $EXPECT_MIN"; fail=1
+else
+  echo "  ok: $running >= $EXPECT_MIN"
+fi
+
+echo "== exposure: loopback-only binds ($LOOPBACK_PORTS) =="
+if ! command -v ss >/dev/null 2>&1; then
+  echo "  FAIL: ss unavailable — cannot assert exposure"; fail=1
+else
+  # port<space>addr per listening socket (addr = local addr with the port
+  # stripped): 0.0.0.0:9200->'9200 0.0.0.0', [::]:5601->'5601 [::]', *:5432->'5432 *'.
+  listen_tbl=$(ss -ltnH 2>/dev/null | awk '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a}')
+  # A live host always has listeners (sshd at minimum). Empty => the probe
+  # broke (e.g. `ss` too old for -H), NOT a closed host: fail, don't pass green.
+  if [ -z "$listen_tbl" ]; then
+    echo "  FAIL: no listening sockets parsed from ss — cannot assert exposure"; fail=1
+  fi
+  for p in $LOOPBACK_PORTS; do
+    case " $LAN_OK " in *" $p "*) echo "  port $p: LAN opt-in (expose_lan) — skip"; continue;; esac
+    addrs=$(printf '%s\n' "$listen_tbl" | awk -v pp="$p" '$1==pp {print $2}')
+    if [ -z "$addrs" ]; then
+      echo "  port $p: not listening (service down or not in this profile)"
+      continue
+    fi
+    bad=""
+    for a in $addrs; do loopback_ok "$a" || bad="$bad $a"; done
+    if [ -n "$bad" ]; then
+      echo "  FAIL: port $p LAN-open on$bad — expected 127.0.0.1 (bind-inversion/expose_lan?)"; fail=1
+    else
+      echo "  ok: port $p loopback-only [$(echo $addrs)]"
+    fi
+  done
+fi
+
+echo "== service: ES :9200 (expect 401/200) =="
+code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:9200 || echo 000)
+echo "  ES http_code=$code"
+case "$code" in 401|200) echo "  ok";; *) echo "  FAIL: ES not up behind TLS"; fail=1;; esac
+
+echo "== service: Kibana :5601 (expect 200/302/401) =="
+kb=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:5601 || echo 000)
+echo "  Kibana http_code=$kb"
+case "$kb" in 200|302|401) echo "  ok";; *) echo "  FAIL: Kibana not up"; fail=1;; esac
+
+if [ "$LLM_ON" = 1 ]; then
+  echo "== service: dashboard /livez :8502 (expect 200; unauthenticated liveness) =="
+  dl=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/livez || echo 000)
+  echo "  dashboard /livez http_code=$dl"
+  case "$dl" in 200) echo "  ok";; *) echo "  FAIL: dashboard /livez not reachable on loopback"; fail=1;; esac
+
+  echo "== auth: dashboard /api/health with NO key (expect 401/403) =="
+  da=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/api/health || echo 000)
+  echo "  dashboard /api/health (unauth) http_code=$da"
+  case "$da" in 401|403) echo "  ok: webui auth enforced";;
+    *) echo "  FAIL: /api/* served unauthenticated ($da) — webui-auth not enforced"; fail=1;; esac
+
+  echo "== service: log-analyzer :8501 reachable (streamlit gates in-app at 200) =="
+  la=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8501 || echo 000)
+  echo "  log-analyzer http_code=$la"
+  case "$la" in 200|302|401|403) echo "  ok";; *) echo "  FAIL: log-analyzer unreachable"; fail=1;; esac
+fi
+
+echo "== HEALTH result: fail=$fail =="
+exit "$fail"
+REMOTE_EOF
+
+  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' bash -s" <<<"$HEALTH_SH"
   local rc=$?
-  say "HEALTH rc=$rc  (0 => ES up behind TLS)"; return "$rc"
+  say "HEALTH rc=$rc  (0 => all gate checks passed)"; return "$rc"
 }
 
 # ---- stage: teardown (final) ----------------------------------------------

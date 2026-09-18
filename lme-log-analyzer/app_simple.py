@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import os
+import hmac
 import urllib3
 import json
 
@@ -27,6 +28,44 @@ if not LITELLM_KEY:
         "LITELLM_API_KEY. Refusing to start without proxy credentials."
     )
 LITELLM_MODEL = os.getenv("LITELLM_MODEL", "lfm2.5-1.2b-instruct")
+
+# ── Inbound auth (WebUI API key) ─────────────────────────────────────────────
+# Mirror of the outbound LiteLLM master-key guard above: production injects
+# WEBUI_API_KEY from the per-install podman secret `webui_api_key`. This is a
+# real viewer gate (not the server-side ES password check below): when the key
+# is set, raw alert _source data is never served until the viewer presents it.
+WEBUI_API_KEY = os.getenv("WEBUI_API_KEY")
+
+
+def require_webui_auth():
+    """Gate the whole app on WEBUI_API_KEY before any alert data is rendered.
+
+    Fail-closed when the key is set (always, in production): the viewer must
+    enter it at the password prompt. Unset (local dev) leaves the app open,
+    mirroring the dashboard middleware. The key is deliberately NOT accepted
+    via a URL query parameter -- a `?api_key=` GET leaks the secret into
+    browser history, the Referer header, and reverse-proxy/access logs
+    (flagged by the automated security review). The prompt keeps it in
+    server-side st.session_state only.
+    """
+    if not WEBUI_API_KEY:
+        return
+    if st.session_state.get("_webui_authed"):
+        return
+
+    st.title("🔒 LME Security Alerts")
+    entered = st.text_input(
+        "API key", type="password", help="Enter the WebUI API key to continue"
+    )
+    if entered and hmac.compare_digest(entered.encode(), WEBUI_API_KEY.encode()):
+        st.session_state["_webui_authed"] = True
+        st.rerun()
+    elif entered:
+        st.error("Invalid API key")
+    st.stop()
+
+
+require_webui_auth()
 
 # Define LLM functions
 def chat_with_llm(messages):

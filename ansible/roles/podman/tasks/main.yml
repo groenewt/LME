@@ -240,6 +240,20 @@
 - name: Setup quadlets for podman
   include_tasks: quadlet_setup.yml
 
+# Install + bring up the tailscale daemon whenever ANY tailscale leg is enabled.
+# MUST run BEFORE elastic_services_setup.yml: that pack still nests the ingress
+# leg (tailscale_ingress.yml), which hard-fails on `tailscale status` when the
+# daemon is absent -- so the daemon has to exist first. Placed AFTER quadlet_setup
+# so load_manifests (invoked there) has applied the tailscale profile's
+# tailscale_serve_* vars that this guard reads. The install has no manifest
+# dependency itself; only the service leg (at the bottom) needs lme_services.
+- name: Install the tailscale daemon (opt-in, prerequisite for the legs)
+  include_tasks: tailscale_install.yml
+  when: >-
+    (tailscale_serve_ingress | default(false) | bool)
+    or (tailscale_serve_egress | default(false) | bool)
+    or (tailscale_serve_services | default(false) | bool)
+
 # Include Elastic services pack tasks (conditional)
 # `install_elastic_services` is provided by install.sh --elastic-services (and
 # defaulted false in site.yml); offline installs force it false. Cluster data
@@ -273,20 +287,37 @@
     # site.yml re-invokes this file after cert publish + lme.service start; skip inline.
     - lme_autostart | default(true) | bool
 
+# ── Tailscale legs (opt-in, orthogonal to the elastic-services pack) ─────────────
+# Each leg is enabled independently via its own tailscale_serve_* var (set by the
+# tailscale profile or `-e ...`). None of this is gated on install_elastic_services.
+# The daemon install is hoisted ABOVE elastic_services_setup.yml (see the include
+# earlier) because that pack still nests the ingress leg and would hard-fail on a
+# fresh host before the daemon existed. The egress / ingress / services legs below
+# only CONFIGURE the already-running daemon.
+
 # Configure tailnet egress (opt-in). Independent of the manifest render (it only
-# sets accept-routes / opt-in exit-node), so it has no ordering dependency; placed
-# here so the tailscale profile's vars (applied by load_manifests via quadlet_setup)
-# are in scope. Enable with the tailscale profile or `-e tailscale_serve_egress=true`.
+# sets accept-routes / opt-in exit-node), so it has no ordering dependency beyond
+# the daemon install above. Enable with the tailscale profile or
+# `-e tailscale_serve_egress=true`.
 - name: Configure tailnet egress (opt-in)
   include_tasks: tailscale_egress.yml
   when:
     - tailscale_serve_egress | default(false) | bool
 
+# Host-facing tailscale ingress (opt-in). Fronts this node's loopback-bound
+# published ports with the node's ts.net cert. Wired here (NOT behind
+# install_elastic_services) so it is reachable on its own; it runs whenever
+# tailscale_serve_ingress is true, after the daemon install above. Idempotent, so
+# it is a no-op if the elastic-services pack also invoked it.
+- name: Set up host-facing tailscale serve ingress (opt-in)
+  include_tasks: tailscale_ingress.yml
+  when:
+    - tailscale_serve_ingress | default(false) | bool
+
 # Publish tailnet VIP services (opt-in). MUST run AFTER quadlet_setup.yml so
 # lme_services / lme_enable_flags exist (the service leg iterates them to derive
 # one VIP per enabled loopback-bound service). Enable with the tailscale profile or
-# `-e tailscale_serve_services=true`. The host-facing ingress leg is separate and
-# already wired in elastic_services_setup.yml (tailscale_serve_ingress).
+# `-e tailscale_serve_services=true`.
 - name: Publish tailnet VIP services (opt-in)
   include_tasks: tailscale_service.yml
   when:

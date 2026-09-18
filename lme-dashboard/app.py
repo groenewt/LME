@@ -12,6 +12,7 @@ import logging
 import socket
 import base64
 import hashlib
+import hmac
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -21,8 +22,8 @@ import httpx
 import psycopg2
 import yaml
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -45,6 +46,15 @@ if not LITELLM_KEY:
         "LITELLM_API_KEY. Refusing to start without proxy credentials."
     )
 LITELLM_MDL = os.getenv("LITELLM_MODEL", "lfm2.5-1.2b-instruct")
+
+# ── Inbound auth (WebUI API key) ─────────────────────────────────────────────
+# Mirror of the outbound LiteLLM master-key guard above: production injects
+# WEBUI_API_KEY from the per-install podman secret `webui_api_key`. When it is
+# set (always, in production) every /api/* route is fail-closed — a request must
+# present the key as `X-API-Key: <key>` or `Authorization: Bearer <key>`. When
+# it is unset (local dev / bare liveness) the gate is inert so /livez and the
+# SPA still work.
+WEBUI_API_KEY = os.getenv("WEBUI_API_KEY")
 
 # Path to LiteLLM config YAML — writable so the UI can manage models
 LITELLM_CONFIG_PATH = os.getenv("LITELLM_CONFIG_PATH", "/opt/lme/config/litellm_config.yaml")
@@ -188,6 +198,49 @@ ES_AUTH = (ES_USER, ES_PASS)
 VERIFY_SSL = False          # internal self-signed certs
 
 app = FastAPI(title="LME Dashboard", docs_url=None, redoc_url=None)
+
+# ── Inbound auth gate ─────────────────────────────────────────────────────────
+
+
+def _extract_api_key(request: Request) -> str:
+    """Pull the presented key from `X-API-Key` or `Authorization: Bearer <key>`."""
+    key = request.headers.get("x-api-key")
+    if key:
+        return key.strip()
+    authz = request.headers.get("authorization", "")
+    if authz[:7].lower() == "bearer ":
+        return authz[7:].strip()
+    return ""
+
+
+@app.middleware("http")
+async def require_webui_api_key(request: Request, call_next):
+    """App-wide inbound auth gate.
+
+    Every /api/* route — including /api/health, which leaks cluster status and
+    es_password_set, and every mutating route (rules toggle/delete, models,
+    docs/ingest, local-models/download, kev/pull, sigma) — is fail-closed
+    whenever WEBUI_API_KEY is set. The unauthenticated liveness probe lives at
+    /livez, and the SPA shell (`/`, `/static`) stays reachable so the browser
+    can load and then call the API with the key.
+    """
+    if WEBUI_API_KEY and request.url.path.startswith("/api/"):
+        provided = _extract_api_key(request)
+        if not provided or not hmac.compare_digest(provided.encode(), WEBUI_API_KEY.encode()):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing or invalid API key. Provide 'X-API-Key: <key>' "
+                                   "or 'Authorization: Bearer <key>'."},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await call_next(request)
+
+
+@app.get("/livez")
+async def livez():
+    """Unauthenticated liveness probe — returns only status, no ES/cluster leak."""
+    return {"status": "ok"}
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
