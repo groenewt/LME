@@ -33,6 +33,19 @@ if [ ! -f "${CERTS_DIR}/certs.zip" ]; then
     fi
   done
 
+  echo "Setting file permissions... data"
+  chown -R elasticsearch:elasticsearch "${DATA_DIR}"
+fi
+
+# --- Cert permission hardening: runs on EVERY setup pass (fresh install AND upgrade) ---
+# This block previously lived INSIDE the `if [ ! -f certs.zip ]` fresh-install guard
+# above. An in-place upgrade keeps certs.zip, so the guard skipped the block and left an
+# already-installed host's `ca/ca.key` WORLD-READABLE (0644) — the CA-signing-key MITM
+# vector was closed for fresh installs but never for the installed base (the population
+# most likely to have it). Hoisted out of the guard so the tightening self-heals existing
+# hosts on the next setup/upgrade pass. Idempotent: re-applying fixed modes/owner to the
+# same files is safe to repeat, and the top-up loop below only (re)mints missing certs.
+if [ -d "${CERTS_DIR}" ]; then
   echo "Setting file permissions... certs"
   chown -R elasticsearch:elasticsearch "${CERTS_DIR}"
   find "${CERTS_DIR}" -type d -exec chmod 755 {} \;
@@ -44,9 +57,6 @@ if [ ! -f "${CERTS_DIR}/certs.zip" ]; then
   if [ -f "${CERTS_DIR}/ca/ca.key" ]; then
     chmod 600 "${CERTS_DIR}/ca/ca.key"
   fi
-
-  echo "Setting file permissions... data"
-  chown -R elasticsearch:elasticsearch "${DATA_DIR}"
 fi
 
 # Idempotent top-up: mint certs for instances.yml entries whose cert dir is missing
