@@ -183,9 +183,73 @@ check_podman() {
     fi
 }
 
-# Install Nix for package preparation
+# Install Nix for package preparation.
+# Debian 13+ ships a recent nix-bin, and the single-user `curl … | sh` installer
+# fails there (it tries to create the nixbld group/users that the distro packages
+# own). download_apt_packages has already fetched nix-bin + nix-setup-systemd
+# (plus deps) into $OUTPUT_DIR/packages/debs, so install Nix from those debs and
+# bring the nix-daemon up — mirroring ansible/roles/nix/tasks/debian-13.yml.
+# Ubuntu and Debian <= 12 keep the official single-user installer.
 install_nix_for_preparation() {
     echo -e "${YELLOW}Installing Nix for package preparation...${NC}"
+
+    # Detect distro + major version. Normalize ${VERSION_ID%%.*} to an integer
+    # (unset/empty -> 0) before the numeric comparison.
+    local os_id="" version_major
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        os_id="$ID"
+    fi
+    version_major="${VERSION_ID%%.*}"
+    [[ "$version_major" =~ ^[0-9]+$ ]] || version_major=0
+
+    if [ "$os_id" = "debian" ] && [ "$version_major" -ge 13 ]; then
+        echo -e "${YELLOW}Debian ${VERSION_ID}: installing Nix from apt debs (nix-bin + nix-setup-systemd)...${NC}"
+        local debs_dir="$OUTPUT_DIR/packages/debs"
+
+        if ls "$debs_dir"/nix-bin_*.deb >/dev/null 2>&1 \
+           && ls "$debs_dir"/nix-setup-systemd_*.deb >/dev/null 2>&1; then
+            # Install the already-downloaded debs; apt-get -f resolves any deps
+            # not captured in the debs dir (check_internet guaranteed the network).
+            sudo dpkg -i "$debs_dir"/nix-bin_*.deb "$debs_dir"/nix-setup-systemd_*.deb \
+                || sudo apt-get install -f -y
+        else
+            # Either deb absent (download_apt_packages swallows per-package
+            # failures) — fall back to the online apt repo, which pulls both.
+            sudo apt-get install -y nix-bin nix-setup-systemd
+        fi
+
+        # nix-setup-systemd ships the multi-user nix-daemon unit; start it now so
+        # the unprivileged nix-build below can reach the daemon. Start the service
+        # (which owns the socket path), not the .socket unit — mirrors the
+        # "Start/enable nix-daemon" step in ansible/roles/podman/tasks/main.yml.
+        if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now nix-daemon
+        fi
+
+        # The daemon-socket dir is group-gated to nix-users (which we are not in);
+        # widen it so unprivileged nix-build (~line 891) doesn't die mid-run after
+        # the container tars are written. Reuses the repo's own helper (no-op when
+        # already reachable; exits with a usermod hint if it cannot be opened).
+        ensure_nix_daemon_access
+
+        # Mark this as an apt-managed Nix living in /nix: cleanup_temp_podman must
+        # NOT `rm -rf /nix` for it (that would destroy the operator's real Nix).
+        NIX_PREP_VIA_APT=true
+
+        hash -r 2>/dev/null || true
+        export PATH="/nix/var/nix/profiles/default/bin:$PATH"
+        if ! command -v nix-build >/dev/null 2>&1; then
+            echo -e "${RED}✗ Failed to install Nix from apt debs${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}✓ Nix installed from apt debs${NC}"
+        return 0
+    fi
+
+    # Ubuntu / Debian <= 12 / other: official single-user installer.
+    NIX_PREP_VIA_APT=false
 
     # Download and run the Nix installer
     curl -L https://nixos.org/nix/install | sh
@@ -228,8 +292,11 @@ cleanup_temp_podman() {
         echo -e "${YELLOW}Note: LME installation will use Nix-managed Podman${NC}"
     fi
 
-    # Cleanup temporary Nix installation
-    if [ "$TEMP_NIX_INSTALLED" = true ]; then
+    # Cleanup temporary Nix installation.
+    # Skip entirely when Nix was installed from apt debs (Debian 13+): that is a
+    # persistent, apt-managed install in /nix, so `rm -rf /nix` would destroy the
+    # operator's real Nix. Only the single-user `curl | sh` install is disposable.
+    if [ "$TEMP_NIX_INSTALLED" = true ] && [ "${NIX_PREP_VIA_APT:-false}" != true ]; then
         echo -e "${YELLOW}Cleaning up temporary Nix installation...${NC}"
 
         # Remove Nix installation
@@ -259,6 +326,9 @@ cleanup_temp_podman() {
         sudo rm -f /etc/bash.bashrc.backup-before-nix 2>/dev/null || true
 
         echo -e "${GREEN}✓ Temporary Nix installation cleaned up${NC}"
+    elif [ "$TEMP_NIX_INSTALLED" = true ]; then
+        # apt/deb path (Debian 13+): Nix is apt-managed and persistent — keep it.
+        echo -e "${GREEN}✓ Nix was installed from apt debs — leaving it in place (apt-managed, not removed)${NC}"
     fi
 }
 

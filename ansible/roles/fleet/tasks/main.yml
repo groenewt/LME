@@ -282,11 +282,17 @@
   delay: 10
   until: fleet_server_hosts_result.status == 200
   no_log: "{{ not debug_mode }}"
+  # De-fang the inverted polarity: this is an inert no-op (see comment above), so a
+  # non-200 here must NOT abort the install. The fail-hard belongs on the REAL POST
+  # (fleet_server_hosts collection), which is gated below on multinode.
+  ignore_errors: yes
 
 - name: Debug Fleet server hosts result
   debug:
     msg: "Fleet server hosts successfully set to {{ fleet_server_hosts_result.json.item.fleet_server_hosts }}"
-  when: debug_mode | bool
+  # Guard the .json.item deref: now the PUT is ignore_errors, a non-200 leaves .item
+  # unset. debug_mode-only, but keep it from tracebacking on a failed no-op.
+  when: debug_mode | bool and fleet_server_hosts_result.status | default(0) == 200
 
 # Item 1 (LIVE registration): in Fleet 8.x the fleet_server_hosts live in their own
 # collection, NOT in settings. This POST is the REAL host registration. It is
@@ -326,6 +332,85 @@
   debug:
     msg: "Fleet server host registration status: {{ fleet_server_host_reg.status | default('n/a') }} (advertise_host={{ fleet_advertise_host }})"
   when: debug_mode | bool
+
+# Multinode gate for the REAL registration. On single-node fleet_advertise_host == ipvar
+# and the POST above stays a lenient safety net (byte-identical legacy behavior). On
+# multinode the advertised host is a distinct tailnet name/IP, so a masked 4xx would ship
+# a broken enrollment URL -- fail loudly. Separate, un-no_log'd gate so the operator sees
+# the status (the POST itself carries elastic_password and must stay no_log).
+- name: Fail if Fleet server host registration did not succeed (multinode)
+  fail:
+    msg: >-
+      Fleet server host registration (POST /api/fleet/fleet_server_hosts) returned status
+      {{ fleet_server_host_reg.status | default('undefined') }} for advertised host
+      https://{{ fleet_advertise_host }}:{{ fleet_port }}; expected 200 or 409.
+  when:
+    - fleet_advertise_host != ipvar
+    - fleet_server_host_reg.status is not defined or fleet_server_host_reg.status not in [200, 409]
+
+# Proof-3 readback discriminator: read the live fleet_server_hosts collection back and
+# confirm lme-fleet-server actually carries the advertised URL. Advisory on single-node
+# (advertise == ipvar); a hard discriminator on multinode, where a stale/empty collection
+# means enrolling agents would be pointed at the wrong host.
+- name: Read back live Fleet server hosts collection
+  uri:
+    url: "{{ local_kbn_url }}/api/fleet/fleet_server_hosts"
+    method: GET
+    user: "{{ elastic_username }}"
+    password: "{{ elastic_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    headers:
+      kbn-version: "{{ kibana_version }}"
+      kbn-xsrf: "kibana"
+      Content-Type: "application/json"
+    status_code: [200]
+  register: fleet_server_hosts_readback
+  # Fold the discriminator into the retry loop: on multinode the collection can lag the
+  # POST's saved-object write, so retry until lme-fleet-server actually appears (not just
+  # HTTP 200), else an immediate GET could 200-with-empty and hard-fail a good deploy.
+  # retries=0 on single-node keeps this a single attempt (byte-identical timing; the
+  # assert below is skipped there anyway).
+  until: >-
+    fleet_server_hosts_readback.status is defined and
+    fleet_server_hosts_readback.status == 200 and
+    ((fleet_server_hosts_readback.json | default({})).get('items', [])
+     | selectattr('id', 'defined')
+     | selectattr('id', 'equalto', 'lme-fleet-server') | list | length > 0)
+  retries: "{{ 3 if fleet_advertise_host != ipvar else 0 }}"
+  delay: 10
+  no_log: "{{ not debug_mode }}"
+  ignore_errors: yes
+
+- name: Debug Fleet server hosts readback
+  debug:
+    var: fleet_server_hosts_readback
+  when: debug_mode | bool
+
+- name: Assert advertised Fleet server host is registered (multinode discriminator)
+  vars:
+    advertised_fleet_url: "https://{{ fleet_advertise_host }}:{{ fleet_port }}"
+    # .get('items', []) not ['items'] / .items: Jinja getitem falls back to getattr on a
+    # missing key and would bind the dict.items method; .get with a list default fails
+    # closed. Schema matches the POST body above (items[].id, items[].host_urls). A
+    # missing/mismatched schema yields [] -> the multinode assert fails, the desired
+    # polarity. selectattr('id','defined') skips items without an id; map default=[]
+    # tolerates a matched item that lacks host_urls.
+    registered_fleet_host_urls: >-
+      {{ (fleet_server_hosts_readback.json | default({})).get('items', [])
+         | selectattr('id', 'defined')
+         | selectattr('id', 'equalto', 'lme-fleet-server')
+         | map(attribute='host_urls', default=[]) | flatten | list }}
+  assert:
+    that:
+      - registered_fleet_host_urls | length > 0
+      - advertised_fleet_url in registered_fleet_host_urls
+    fail_msg: >-
+      Fleet server host 'lme-fleet-server' is not registered with advertised URL
+      {{ advertised_fleet_url }}. Readback host_urls: {{ registered_fleet_host_urls }}.
+    success_msg: >-
+      Fleet server host 'lme-fleet-server' registered with {{ advertised_fleet_url }}.
+  when: fleet_advertise_host != ipvar
 
 - name: Set Fleet default output hosts
   uri:

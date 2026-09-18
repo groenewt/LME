@@ -769,22 +769,70 @@
           - Units: rendered from manifests/services/* into /etc/containers/systemd (+ /etc/systemd/system/lme.service)
           - Systemd daemon: {{ 'Reloaded' if daemon_reload_result.changed else 'Already current' }}
         
+    # ============================================================
+    # Mint the AI web-UI auth secrets BEFORE the umbrella restart.
+    #
+    # render_units.yml (above) renders lme-dashboard / lme-log-analyzer / lme-litellm
+    # on install_llm ALONE (the load_manifests include passes only
+    # install_llm: lme_llm_enabled -- no version gate), and those units consume the
+    # podman secrets litellm_master_key (litellm: env LITELLM_MASTER_KEY; both UIs:
+    # env LITELLM_API_KEY) and webui_api_key (both UIs: env WEBUI_API_KEY). The
+    # pre-2.3.0 AI-stack block above mints only pgvector + llm-keys, so without the
+    # two mints below podman refuses to start the UIs on the restart -- a fail-closed
+    # brick that the old loose wait then masked as green. Gating here on
+    # lme_llm_enabled (the SAME flag render_units used) instead of the AI-stack
+    # block's version('2.3.0','<') gate closes the mismatch: a host that installed
+    # 2.3.0 with install_llm=false and later upgrades with install_llm=true still gets
+    # the keys. if-absent keeps them a free no-op (and STABLE) when they already
+    # exist. Mirrors the canonical file-driver recipe in
+    # roles/podman/tasks/llama_cpp_setup.yml (webui_api_key uses --replace inside the
+    # if-absent guard to admit a missing/partial record without rotating a live key;
+    # litellm_master_key does not); no_log guards the generated passwords.
+    - name: Mint litellm_master_key secret before restart (fail-closed brick fix)
+      shell: |
+        {{ podman_cmd }} secret ls | grep -q litellm_master_key && exit 0
+        password=$(</dev/urandom tr -dc A-Za-z0-9 | head -c30)
+        echo -n "$password" | {{ podman_cmd }} secret create --driver file litellm_master_key -
+      args:
+        executable: /bin/bash
+      no_log: true
+      when: lme_llm_enabled | default(true) | bool
+
+    - name: Mint webui_api_key secret before restart (fail-closed brick fix)
+      shell: |
+        {{ podman_cmd }} secret ls | grep -q webui_api_key && exit 0
+        password=$(</dev/urandom tr -dc A-Za-z0-9 | head -c30)
+        echo -n "$password" | {{ podman_cmd }} secret create --driver file --replace webui_api_key -
+      args:
+        executable: /bin/bash
+      no_log: true
+      when: lme_llm_enabled | default(true) | bool
+
     - name: Restart LME service
       systemd:
         name: "lme"
         state: restarted
       tags: ['system']
       
-    - name: Wait for containers to start
-      shell: |
-        {{ podman_cmd }} ps --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "lme" || true
-      args:
-        executable: /bin/bash
-      register: started_containers
-      until: started_containers.stdout_lines | length > 0
-      retries: 12
-      delay: 5
-      ignore_errors: yes
+    # Fail-closed brick guard (replaces the former `podman ps | grep lme` +
+    # ignore_errors wait, which went green as long as ANY core container was up and
+    # thus MASKED a UI that podman refused to start -- e.g. a missing webui_api_key /
+    # litellm_master_key secret bricks lme-dashboard / lme-log-analyzer). This asserts
+    # the enabled UI units are actually active; NO ignore_errors, so a brick surfaces
+    # as a task failure instead of a false success. Gated on lme_llm_enabled because
+    # the units are rendered (and thus expected active) only when the LLM stack is on;
+    # no profile overlay disables them (only tailscale rebinds their ports). The
+    # generous retry ceiling tolerates the full ES -> litellm/pgvector/embeddings ->
+    # UI startup cascade on a slow upgrade without flipping a healthy-but-slow host to
+    # a false red -- the poll exits the instant both units report active.
+    - name: Assert enabled AI web-UI units are active after restart (fail-closed)
+      command: systemctl is-active lme-dashboard.service lme-log-analyzer.service
+      register: ai_ui_units_active
+      changed_when: false
+      until: ai_ui_units_active.rc == 0
+      retries: 60
+      delay: 10
+      when: lme_llm_enabled | default(true) | bool
       
     - name: Wait for services to be ready
       pause:

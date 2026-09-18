@@ -280,8 +280,8 @@ def memory_budget(services, flags=None, lme_global=None):
       {total_bytes, total_gb, host_ram_gb, reserve_gb, usable_gb,
        over_budget, oversized, capped, uncapped}
       * capped   : id -> its MemoryMax (the services that entered the sum).
-      * uncapped : enabled container services with NO cap (e.g. wazuh-manager,
-                   elastalert) -- EXCLUDED from the sum and surfaced so the total
+      * uncapped : enabled container services with NO cap (e.g. fleet-server,
+                   logstash) -- EXCLUDED from the sum and surfaced so the total
                    is not mistaken for the whole stack's real footprint.
       * over_budget: total_gb > usable_gb (usable = host_ram_gb - reserve_gb).
                    This is an OVER-COMMIT signal, NOT a fit/OOM prediction:
