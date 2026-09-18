@@ -38,6 +38,14 @@ TAILSCALE_MODE="false"
 # that derivation. Passed to Ansible as -e lme_profile=<name>.
 LME_PROFILE="${LME_PROFILE:-}"
 
+# Raw Ansible extra-vars passthrough (--extra-vars '<json|k=v>'). Appended as a
+# SECOND --extra-vars AFTER the harness-built base JSON, so its top-level keys win
+# last (ansible extra-vars precedence). Empty by default => single-node/default path
+# is byte-identical. Carries per-deploy values that have no dedicated flag (e.g. the
+# multinode fleet_advertise_host / lme_service_overrides). Forwarded by
+# testing/e2e/deploy_gate.sh --extra-vars.
+EXTRA_VARS_PASSTHROUGH="${EXTRA_VARS_PASSTHROUGH:-}"
+
 # Cluster mode settings
 CLUSTER_MODE=${LME_CLUSTER:-false}
 CLUSTER_INVENTORY=""
@@ -138,6 +146,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --profile)
             LME_PROFILE="$2"
+            shift 2
+            ;;
+        --extra-vars)
+            EXTRA_VARS_PASSTHROUGH="$2"
             shift 2
             ;;
         --cluster)
@@ -706,9 +718,9 @@ compute_effective_flags() {
 
     # Validate against the known profiles (manifests/profiles/*.yml).
     case "$EFFECTIVE_PROFILE" in
-        default|cluster|offline|tailscale) ;;
+        default|cluster|offline|tailscale|multinode) ;;
         *)
-            echo -e "${RED}✗ Unknown --profile '$EFFECTIVE_PROFILE' (expected: default|cluster|offline|tailscale)${NC}"
+            echo -e "${RED}✗ Unknown --profile '$EFFECTIVE_PROFILE' (expected: default|cluster|offline|tailscale|multinode)${NC}"
             exit 1
             ;;
     esac
@@ -807,10 +819,19 @@ run_playbook() {
     sudo mkdir -p /opt/ansible-tmp
     sudo chown $(whoami):$(whoami) /opt/ansible-tmp
 
+    # Operator extra-vars passthrough (--extra-vars): appended as a SECOND -e AFTER
+    # the base JSON so its top-level keys win last. Empty => no-op (default path
+    # unchanged). Quoted array expansion keeps a JSON value a single argv element.
+    local EXTRA_VARS_ARGS=()
+    if [ -n "$EXTRA_VARS_PASSTHROUGH" ]; then
+        EXTRA_VARS_ARGS=(--extra-vars "$EXTRA_VARS_PASSTHROUGH")
+        echo -e "${GREEN}✓ Passthrough extra-vars: ${EXTRA_VARS_PASSTHROUGH}${NC}"
+    fi
+
     if [ -f "$SCRIPT_DIR/inventory" ]; then
-        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}' $ANSIBLE_OPTS
+        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}' "${EXTRA_VARS_ARGS[@]}" $ANSIBLE_OPTS
     else
-        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}' $ANSIBLE_OPTS
+        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}' "${EXTRA_VARS_ARGS[@]}" $ANSIBLE_OPTS
     fi
     
     if [ $? -eq 0 ]; then
@@ -1021,9 +1042,9 @@ echo "==============================================="
 # valid by construction; this only guards an operator-supplied name.
 if [ -n "$LME_PROFILE" ]; then
     case "$LME_PROFILE" in
-        default|cluster|offline|tailscale) ;;
+        default|cluster|offline|tailscale|multinode) ;;
         *)
-            echo -e "${RED}✗ Unknown --profile '$LME_PROFILE' (expected: default|cluster|offline|tailscale)${NC}"
+            echo -e "${RED}✗ Unknown --profile '$LME_PROFILE' (expected: default|cluster|offline|tailscale|multinode)${NC}"
             exit 1
             ;;
     esac

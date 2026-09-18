@@ -58,6 +58,10 @@ _SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SRC:-$(cd "$_SELF_DIR/../.." && pwd)}"
 REMOTE_DIR="${REMOTE_DIR:-/root/LME-gate}"     # tree lands here on the target
 HOST=""; IP=""; GRAPHROOT=""; FLAGS=""; LABEL=""; STAGE="all"; STRICT=0
+# Raw ansible extra-vars (JSON/k=v) forwarded verbatim to the target's install.sh
+# --extra-vars, which appends it as a last-winning -e. Carries per-deploy values
+# with no dedicated flag (e.g. multinode fleet_advertise_host / lme_service_overrides).
+EXTRA_VARS=""
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
 LOGDIR="${LOGDIR:-/tmp/lme-gate-logs}"
 
@@ -67,6 +71,7 @@ while [ $# -gt 0 ]; do
     --ip) IP="$2"; shift 2;;
     --graphroot) GRAPHROOT="$2"; shift 2;;
     --flags) FLAGS="$2"; shift 2;;
+    --extra-vars) EXTRA_VARS="$2"; shift 2;;
     --label) LABEL="$2"; shift 2;;
     --stage) STAGE="$2"; shift 2;;
     --ssh-key) SSH_OPTS+=(-i "$2"); shift 2;;
@@ -122,11 +127,15 @@ do_wipe() {
 do_install() {
   local g=""; [ -n "$GRAPHROOT" ] && g="-g '$GRAPHROOT'"
   local i=""; [ -n "$IP" ] && i="-i '$IP'"
-  say "INSTALL via tree's own install.sh  flags=[$FLAGS] ip=[$IP] graphroot=[$GRAPHROOT]"
+  # Extra-vars ride through as a single-quoted argv element: the remote sh strips
+  # the outer quotes and install.sh's --extra-vars receives the JSON as one arg.
+  # (JSON must be single-quote-free -- it is, being all double-quoted.)
+  local ev=""; [ -n "$EXTRA_VARS" ] && ev="--extra-vars '$EXTRA_VARS'"
+  say "INSTALL via tree's own install.sh  flags=[$FLAGS] ip=[$IP] graphroot=[$GRAPHROOT] extra_vars=[$EXTRA_VARS]"
   # Capture THIS invocation's output to its own file (LOGDIR persists across
   # runs, so grepping the shared $LOG would match a prior leg's `rescued=`).
   local ilog="$LOGDIR/${LABEL}.install.$(date -u +%s).log"
-  "${SSH[@]}" "cd '$REMOTE_DIR' && NON_INTERACTIVE=true AUTO_CREATE_ENV=true ./install.sh $i $g $FLAGS" \
+  "${SSH[@]}" "cd '$REMOTE_DIR' && NON_INTERACTIVE=true AUTO_CREATE_ENV=true ./install.sh $i $g $FLAGS $ev" \
     2>&1 | tee -a "$LOG" | tee "$ilog"
   local rc="${PIPESTATUS[0]}"
   # RESCUE surfacing: Ansible PLAY RECAP emits `rescued=N` per host; a rescued
