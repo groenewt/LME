@@ -318,6 +318,7 @@ Key configuration is stored in `/opt/lme/lme-environment.env`:
 
 ### Container Management
 - Container images defined in `../config/containers.txt`
+- Optional Elastic services pack via `./install.sh --elastic-services` (default off; not supported with `--offline`): apm-server, heartbeat, metricbeat, filebeat, logstash — images defined in `../config/containers-elastic-services.txt`
 - Quadlet files for systemd integration
 - Podman volumes for persistent data
 - Network configuration for service communication

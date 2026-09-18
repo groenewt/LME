@@ -22,8 +22,8 @@ fi
 
 sudo ln -sf "$LATEST_PODMAN_PATH/lib/systemd/system-generators/podman-system-generator" /usr/lib/systemd/system-generators/podman-system-generator
 sudo ln -sf "$LATEST_PODMAN_PATH/lib/systemd/user-generators/podman-user-generator" /usr/lib/systemd/user-generators/
-sudo ln -sf -t /usr/lib/systemd/system/ /nix/store/$LATEST_PODMAN_PATH/lib/systemd/system/*
-sudo ln -sf -t /usr/lib/systemd/user/ /nix/store/$LATEST_PODMAN_PATH/lib/systemd/user/*
+sudo ln -sf -t /usr/lib/systemd/system/ "$LATEST_PODMAN_PATH"/lib/systemd/system/*
+sudo ln -sf -t /usr/lib/systemd/user/ "$LATEST_PODMAN_PATH"/lib/systemd/user/*
 
 echo "Linked the files in systemd"
 

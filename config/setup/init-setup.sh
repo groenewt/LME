@@ -42,3 +42,28 @@ if [ ! -f "${CERTS_DIR}/certs.zip" ]; then
   chown -R elasticsearch:elasticsearch "${DATA_DIR}"
 fi
 
+# Idempotent top-up: mint certs for instances.yml entries whose cert dir is missing
+TOPUP_TMP="$(mktemp -d)"
+trap 'rm -rf "${TOPUP_TMP}"' EXIT
+
+for svc in $(awk '/^  - name: /{ n=$3; gsub(/"/,"",n); print n }' "${INSTANCES_PATH}"); do
+  if [ -f "${CERTS_DIR}/${svc}/${svc}.crt" ]; then
+    continue
+  fi
+  echo "Top-up: generating missing cert for ${svc}"
+  awk -v name="${svc}" '
+    /^instances:/ { print; next }
+    /^  - name: / { inblock = ($0 ~ "- name: \"" name "\"") }
+    inblock { print }
+  ' "${INSTANCES_PATH}" > "${TOPUP_TMP}/${svc}.yml"
+  elasticsearch-certutil cert --silent --pem \
+    --in "${TOPUP_TMP}/${svc}.yml" \
+    --out "${TOPUP_TMP}/${svc}.zip" \
+    --ca-cert "${CERTS_DIR}/ca/ca.crt" --ca-key "${CERTS_DIR}/ca/ca.key"
+  unzip -o "${TOPUP_TMP}/${svc}.zip" -d "${CERTS_DIR}"
+  cat "${CERTS_DIR}/${svc}/${svc}.crt" "${CERTS_DIR}/ca/ca.crt" > "${CERTS_DIR}/${svc}/${svc}.chain.pem"
+  chown -R elasticsearch:elasticsearch "${CERTS_DIR}/${svc}"
+  chmod 755 "${CERTS_DIR}/${svc}"
+  chmod 644 "${CERTS_DIR}/${svc}"/*
+done
+

@@ -184,6 +184,8 @@ If you skip backup:
 - Fleet Server
 - ElastAlert2
 
+When the optional Elastic services pack is enabled (`--elastic-services`), the upgrade also pulls the pack images (apm-server, heartbeat, metricbeat, filebeat, logstash).
+
 ### 2. Configuration Files
 - `lme-environment.env` (version numbers updated)
 - `containers.txt` (new image references)

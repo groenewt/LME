@@ -27,6 +27,10 @@
   set_fact:
     selinux_available: "{{ selinux_tooling.rc == 0 }}"
 
+- name: Set SELinux policy management support fact
+  set_fact:
+    selinux_policy_managed: "{{ ansible_os_family == 'RedHat' and selinux_tooling.rc == 0 }}"
+
 - name: Get current SELinux mode
   command: getenforce
   register: getenforce_out
@@ -50,6 +54,20 @@
   stat:
     path: /nix/var/nix/profiles/default/bin/nix
   register: nix_binary_stat
+  when: not (offline_mode | default(false) and ansible_os_family == "RedHat")
+
+- name: Check if Nix is available on PATH (e.g. distro package)
+  shell: command -v nix
+  args:
+    executable: /bin/bash
+  register: nix_on_path
+  changed_when: false
+  failed_when: false
+  when: not (offline_mode | default(false) and ansible_os_family == "RedHat")
+
+- name: Set Nix presence fact
+  set_fact:
+    nix_present: "{{ nix_binary_stat.stat.exists or (nix_on_path.rc | default(1)) == 0 }}"
   when: not (offline_mode | default(false) and ansible_os_family == "RedHat")
 
 - name: Ensure Nix daemon is running
@@ -82,7 +100,7 @@
   when:
     - not (offline_mode | default(false) and ansible_os_family == "RedHat")
     - nix_daemon_unit_check.rc == 0
-    - nix_binary_stat.stat.exists
+    - nix_present | default(false)
 
 - name: Skip Nix daemon management (unit not present)
   debug:
@@ -97,7 +115,7 @@
   when:
     - not (offline_mode | default(false) and ansible_os_family == "RedHat")
     - nix_daemon_unit_check.rc == 0
-    - not nix_binary_stat.stat.exists
+    - not (nix_present | default(false))
 
 - name: Skip all Nix daemon management (RHEL offline mode)
   debug:
@@ -114,6 +132,13 @@
 # ---------------------------------------------------------------------------
 # Deploy and load Podman SELinux policy BEFORE installation
 # ---------------------------------------------------------------------------
+- name: Skip Podman SELinux policy management (not applicable on this OS)
+  debug:
+    msg: "Skipping Podman SELinux policy setup - LME SELinux policies target RHEL container-selinux and are not applicable on {{ ansible_os_family }} hosts."
+  when:
+    - selinux_available | default(false)
+    - not (selinux_policy_managed | default(false))
+
 - name: Deploy Podman SELinux policy files (pre-install)
   copy:
     src: "{{ clone_directory | default(playbook_dir + '/../..') }}/ansible/roles/base/files/selinux/podman_policy.te"
@@ -124,6 +149,7 @@
   become: yes
   when:
     - selinux_available | default(false)
+    - selinux_policy_managed | default(false)
 
 - name: Deploy Podman SELinux file contexts (pre-install)
   copy:
@@ -135,6 +161,7 @@
   become: yes
   when:
     - selinux_available | default(false)
+    - selinux_policy_managed | default(false)
 
 - name: Compile Podman SELinux module (pre-install)
   shell: |
@@ -147,6 +174,7 @@
   become: yes
   when:
     - selinux_available | default(false)
+    - selinux_policy_managed | default(false)
     - (getenforce_out.stdout | default('') | trim) != 'Disabled'
 
 - name: Load Podman SELinux module (pre-install)
@@ -154,6 +182,7 @@
   become: yes
   when:
     - selinux_available | default(false)
+    - selinux_policy_managed | default(false)
     - (getenforce_out.stdout | default('') | trim) != 'Disabled'
 
 - name: Ensure Podman SELinux module enabled (pre-install)
@@ -161,6 +190,7 @@
   become: yes
   when:
     - selinux_available | default(false)
+    - selinux_policy_managed | default(false)
     - (getenforce_out.stdout | default('') | trim) != 'Disabled'
 
 - name: Install Podman using Nix (online mode only)
@@ -209,6 +239,17 @@
 # Include quadlet setup tasks
 - name: Setup quadlets for podman
   include_tasks: quadlet_setup.yml
+
+# Include Elastic services pack tasks (conditional)
+# `install_elastic_services` is provided by install.sh --elastic-services (and
+# defaulted false in site.yml); offline installs force it false. Cluster data
+# nodes (lme_child_es_only) do not run the pack: quadlets are pruned on those
+# hosts and the repo is not present at clone_directory for SSH installs.
+- name: Setup Elastic services pack for podman
+  include_tasks: elastic_services_setup.yml
+  when:
+    - install_elastic_services | default(false) | bool
+    - not (lme_child_es_only | default(false) | bool)
 
 # Include llama.cpp setup tasks (conditional)
 # `install_llm` is provided by install.sh (and defaulted in site.yml). Offline

@@ -67,23 +67,31 @@ KEV_SYNC_SCRIPT = os.getenv("KEV_SYNC_SCRIPT", "/opt/lme/scripts/kev_sync.py")
 _active_model = {"name": LITELLM_MDL}
 
 
-def _sync_active_model_from_litellm():
+def _sync_active_model_from_litellm(retries: int = 5, delay: float = 5.0):
     """On startup, sync _active_model with what LiteLLM actually has registered."""
+    import time
+
     import httpx as _httpx
-    try:
-        r = _httpx.get(
-            f"{LITELLM_URL}/v1/models",
-            headers={"Authorization": f"Bearer {LITELLM_KEY}"},
-            verify=False,
-            timeout=5,
-        )
-        if r.status_code == 200:
-            models = [m["id"] for m in r.json().get("data", [])]
-            if models and _active_model["name"] not in models:
-                _active_model["name"] = models[0]
-                logger.info("Synced active model to '%s' (from LiteLLM)", models[0])
-    except Exception as e:
-        logger.warning("Could not sync active model from LiteLLM: %s", e)
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = _httpx.get(
+                f"{LITELLM_URL}/v1/models",
+                headers={"Authorization": f"Bearer {LITELLM_KEY}"},
+                verify=False,
+                timeout=5,
+            )
+            if r.status_code == 200:
+                models = [m["id"] for m in r.json().get("data", [])]
+                if models and _active_model["name"] not in models:
+                    _active_model["name"] = models[0]
+                    logger.info("Synced active model to '%s' (from LiteLLM)", models[0])
+                return
+        except Exception as e:
+            if attempt == retries:
+                logger.warning("Could not sync active model from LiteLLM: %s", e)
+            else:
+                time.sleep(delay)
 
 
 _sync_active_model_from_litellm()

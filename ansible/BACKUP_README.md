@@ -245,6 +245,7 @@ All LME-related volumes are backed up:
 - `lme_wazuh_*` - Wazuh data and configurations
 - `lme_fleet_data` - Fleet server data
 - `lme_filebeat_*` - Filebeat configurations
+- `lme_filebeatdata` - Filebeat registry data (optional Elastic services pack)
 - `lme_elastalert2_logs` - ElastAlert logs
 - `lme_backups` - Internal backup storage
 - `lme_pgvectordata` - pgvector PostgreSQL data for LME doc embeddings
