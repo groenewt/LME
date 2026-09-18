@@ -184,7 +184,7 @@ If you skip backup:
 - Fleet Server
 - ElastAlert2
 
-When the optional Elastic services pack is enabled (`--elastic-services`), the upgrade also pulls the pack images (apm-server, heartbeat, metricbeat, filebeat, logstash).
+If the optional Elastic services pack is already installed, the upgrade auto-detects it from the installed pack quadlets and re-lands the pack: it pulls the pack images (apm-server, heartbeat, metricbeat, filebeat, logstash), re-copies the pack quadlets and configs, and re-runs the certificate top-up, so pack config changes actually deploy — not just the images. If auto-detection misses a pack you know is installed, force the re-land with `-e install_elastic_services=true`. To add the pack to an install that does not already have it, re-run `install.sh --elastic-services` (the upgrade re-lands an existing pack; it does not install a new one, since the pack configs it re-owns are only staged by a fresh install).
 
 ### 2. Configuration Files
 - `lme-environment.env` (version numbers updated)

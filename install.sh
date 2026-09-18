@@ -609,6 +609,35 @@ check_sudo_access() {
     fi
 }
 
+# Compute effective install_llm / install_elastic_services for Ansible.
+# Shared by both install entrypoints (run_playbook and run_cluster_playbooks)
+# so a flag means the same thing regardless of entrypoint. Sets the global
+# vars EFFECTIVE_INSTALL_LLM / EFFECTIVE_INSTALL_ELASTIC_SERVICES (must NOT be
+# declared local — callers read them after this returns).
+compute_effective_flags() {
+    # Offline installs skip LLM unless --llm was explicitly requested, because
+    # the offline LLM path requires the larger `prepare_offline.sh --llm`
+    # bundle. Non-offline installs keep the current LLM-on default.
+    if [ "$OFFLINE_MODE" = "true" ] && [ "$INSTALL_LLM" != "true" ]; then
+        EFFECTIVE_INSTALL_LLM="false"
+        echo -e "${YELLOW}⚠ Offline install without --llm: LLM stack will be skipped${NC}"
+    else
+        EFFECTIVE_INSTALL_LLM="true"
+    fi
+
+    # Unlike LLM (default-on), the Elastic services pack is opt-in: it is only
+    # installed when --elastic-services was explicitly requested. The pack has
+    # no offline bundle, so it is forced off (with a warning) for --offline.
+    if [ "$INSTALL_ELASTIC_SERVICES" = "true" ] && [ "$OFFLINE_MODE" != "true" ]; then
+        EFFECTIVE_INSTALL_ELASTIC_SERVICES="true"
+    else
+        EFFECTIVE_INSTALL_ELASTIC_SERVICES="false"
+        if [ "$INSTALL_ELASTIC_SERVICES" = "true" ]; then
+            echo -e "${YELLOW}⚠ --elastic-services is not supported with --offline: Elastic services pack will be skipped${NC}"
+        fi
+    fi
+}
+
 # Function to run the playbook
 run_playbook() {
     echo -e "${YELLOW}Running Ansible playbook...${NC}"
@@ -637,29 +666,9 @@ run_playbook() {
         echo -e "${YELLOW}⚠ Running in offline mode - skipping internet-dependent tasks${NC}"
     fi
 
-    # Compute effective install_llm for Ansible.
-    # Offline installs skip LLM unless --llm was explicitly requested, because
-    # the offline LLM path requires the larger `prepare_offline.sh --llm`
-    # bundle. Non-offline installs keep the current LLM-on default.
-    if [ "$OFFLINE_MODE" = "true" ] && [ "$INSTALL_LLM" != "true" ]; then
-        EFFECTIVE_INSTALL_LLM="false"
-        echo -e "${YELLOW}⚠ Offline install without --llm: LLM stack will be skipped${NC}"
-    else
-        EFFECTIVE_INSTALL_LLM="true"
-    fi
-
-    # Compute effective install_elastic_services for Ansible.
-    # Unlike LLM (default-on), the Elastic services pack is opt-in: it is only
-    # installed when --elastic-services was explicitly requested. The pack has
-    # no offline bundle, so it is forced off (with a warning) for --offline.
-    if [ "$INSTALL_ELASTIC_SERVICES" = "true" ] && [ "$OFFLINE_MODE" != "true" ]; then
-        EFFECTIVE_INSTALL_ELASTIC_SERVICES="true"
-    else
-        EFFECTIVE_INSTALL_ELASTIC_SERVICES="false"
-        if [ "$INSTALL_ELASTIC_SERVICES" = "true" ]; then
-            echo -e "${YELLOW}⚠ --elastic-services is not supported with --offline: Elastic services pack will be skipped${NC}"
-        fi
-    fi
+    # Compute effective install_llm / install_elastic_services (shared with the
+    # cluster entrypoint so a flag behaves identically regardless of path).
+    compute_effective_flags
 
     # Run the main installation playbook
     echo -e "${YELLOW}Running main installation playbook...${NC}"
@@ -671,9 +680,9 @@ run_playbook() {
     sudo chown $(whoami):$(whoami) /opt/ansible-tmp
 
     if [ -f "$SCRIPT_DIR/inventory" ]; then
-        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"'}' $ANSIBLE_OPTS
+        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}' $ANSIBLE_OPTS
     else
-        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"'}' $ANSIBLE_OPTS
+        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}' $ANSIBLE_OPTS
     fi
     
     if [ $? -eq 0 ]; then
@@ -819,7 +828,14 @@ run_cluster_playbooks() {
     export ANSIBLE_REMOTE_TEMP="${ANSIBLE_REMOTE_TEMP:-/tmp/ansible-tmp}"
     mkdir -p "$ANSIBLE_LOCAL_TEMP"
 
-    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}'
+    # Same effective-flag computation as the single-node path so --llm and
+    # --elastic-services behave identically in cluster mode. (Cluster rejects
+    # --offline earlier, so LLM stays default-on and the pack follows the flag.)
+    # Phase 2 data nodes set lme_child_es_only=true (elasticsearch.yml) which
+    # gates the LLM/pack includes off there regardless of these values.
+    compute_effective_flags
+
+    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}'
 
     # Phase 1: Run site.yml on master with cluster vars (unless --cluster-nodes-only)
     if [ "$CLUSTER_NODES_ONLY" != "true" ]; then

@@ -1,0 +1,85 @@
+---
+# Host-facing Tailscale ingress (OPT-IN, additive) — the "IPC/SVCS" layer.
+#
+# This task set is included from elastic_services_setup.yml ONLY when
+# `tailscale_serve_ingress` is true (enable at deploy time with
+# `-e tailscale_serve_ingress=true`). It is disabled by default and changes
+# nothing about the internal service mesh.
+#
+# WHY THIS EXISTS — the internal-CA vs ts.net split:
+#   * The internal container<->container mesh uses the Elasticsearch
+#     `elasticsearch-certutil` CA with container-alias SANs (lme-elasticsearch,
+#     lme-logstash, lme-litellm, ...). That CA is CORRECT and REQUIRED for the
+#     mesh and is left completely untouched here.
+#   * A `tailscale cert` / `tailscale serve` LE leaf has SAN = this node's
+#     `*.ts.net` MagicDNS name ONLY. It can therefore serve host-facing
+#     published ports but CANNOT stand in for the internal alias SANs.
+#
+# So we front only the host-facing, loopback-bound published ports:
+#   * apm-server (local 8200) and litellm (local 4000) are HTTPS services:
+#     tailscale TERMINATES TLS with the node's ts.net LE cert (auto-obtained,
+#     auto-renewed) and re-encrypts to the local self-signed backend
+#     (https+insecure://127.0.0.1:<port>).
+#   * logstash beats (local 5044) is a raw TCP passthrough (`--tcp`), NOT
+#     TLS-terminated: logstash terminates the beats TLS itself. CONSEQUENCE for
+#     operators wiring external beats: the beat receives logstash's INTERNAL-CA
+#     leaf (SAN: lme-logstash, logstash, localhost, 127.0.0.1 — NO ts.net SAN),
+#     so the beat must trust the LME CA and must NOT do ts.net hostname
+#     verification for the 5044 endpoint (e.g. ssl.verification_mode: certificate).
+#     Terminating at tailscale here would hand plaintext to a TLS listener, so
+#     `--tcp` (passthrough) is used deliberately instead of `--tls-terminated-tcp`.
+#
+# Idempotent: each `tailscale serve` line is added only if the same backend is
+# not already present in `tailscale serve status`.
+
+- name: Read current tailscale node status
+  command: tailscale status --json
+  register: ts_status
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Fail clearly if tailscale is unavailable or the node is not logged in
+  fail:
+    msg: >-
+      tailscale_serve_ingress is enabled but `tailscale status` failed
+      (rc={{ ts_status.rc }}). Ensure tailscaled is running and this node is
+      logged in to the tailnet with MagicDNS + HTTPS certs enabled.
+  when: ts_status.rc != 0
+
+# Discover the node's MagicDNS name from status rather than hardcoding it; the
+# trailing dot from the FQDN is stripped for display.
+- name: Determine this node's MagicDNS (ts.net) name
+  set_fact:
+    ts_magicdns_name: "{{ (ts_status.stdout | from_json).Self.DNSName | regex_replace('\\.$', '') }}"
+
+- name: Read current tailscale serve config (for idempotency)
+  command: tailscale serve status
+  register: ts_serve_status
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Front host-facing HTTPS services with the node's ts.net cert
+  command: "tailscale serve --bg --https={{ item.port }} https+insecure://127.0.0.1:{{ item.port }}"
+  loop:
+    - { name: "apm-server", port: 8200 }
+    - { name: "litellm", port: 4000 }
+  loop_control:
+    label: "{{ item.name }} (:{{ item.port }})"
+  when: ('127.0.0.1:' ~ item.port) not in (ts_serve_status.stdout | default(''))
+  changed_when: true
+  become: yes
+
+- name: Front host-facing logstash beats port as a raw TCP passthrough
+  command: "tailscale serve --bg --tcp=5044 tcp://127.0.0.1:5044"
+  when: "'127.0.0.1:5044' not in (ts_serve_status.stdout | default(''))"
+  changed_when: true
+  become: yes
+
+- name: Show the host-facing tailscale ingress endpoints
+  debug:
+    msg:
+      - "apm-server  -> https://{{ ts_magicdns_name }}:8200 (ts.net LE cert; proxies 127.0.0.1:8200)"
+      - "litellm     -> https://{{ ts_magicdns_name }}:4000 (ts.net LE cert; proxies 127.0.0.1:4000)"
+      - "logstash    -> {{ ts_magicdns_name }}:5044 (raw TCP passthrough; beats see the LME internal-CA leaf)"
