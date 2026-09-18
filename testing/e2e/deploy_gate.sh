@@ -41,6 +41,12 @@
 #     (9200/5601/443/8220, plus llm 5432/8081/8502/8501/4000) is bound to
 #     127.0.0.1/::1 and NOT LAN-open. Ports intentionally opened to the LAN
 #     (expose_lan opt-in) are listed in env LME_GATE_LAN_OK="8502 5601 ...".
+#     When the tailscale ingress leg is on for this run (--tailscale / --profile
+#     tailscale / -e tailscale_serve_ingress=true), the ports it fronts
+#     (8200/4000/5044) may ALSO bind this node's own tailnet IP (CGNAT
+#     100.64.0.0/10 or ULA fd7a:115c:a1e0::/48) BY DESIGN; that tailnet-only bind
+#     is accepted for exactly those ports, while a real 0.0.0.0/LAN bind still
+#     FAILS. Override the fronted set with env LME_GATE_TAILNET_OK="4000 ...".
 #   * SERVICE: ES :9200 -> 401/200, Kibana :5601 -> 200/302/401, and (llm)
 #     dashboard /livez :8502 -> 200, log-analyzer :8501 reachable.
 #   * AUTH: dashboard /api/health :8502 with NO key -> 401/403 (webui auth
@@ -104,11 +110,18 @@ do_rsync() {
   if [ "$ensure_rc" -ne 0 ]; then say "RSYNC ensure-rsync-on-target FAILED rc=$ensure_rc"; return "$ensure_rc"; fi
   # Keep manifests/, ansible/inventory/, filter_plugins/ (ESSENTIAL to render).
   # Drop dev-only tooling + VM images + the env file (install.sh auto-creates it).
+  # offline_resources/ holds the airgapped bundle (~21G, built ON the target by
+  # scripts/prepare_offline.sh -- it needs network, so it CANNOT be rebuilt on an
+  # airgapped box). The controller's source tree does NOT carry it, so without this
+  # exclude `--delete` would wipe the on-target bundle and brick every subsequent
+  # offline install. An --exclude also protects the target path from --delete, so
+  # the bundle survives. Inert for networked targets (they have no such dir).
   rsync -e "ssh ${SSH_OPTS[*]}" -a --delete \
     --exclude='.git/' --exclude='scratchpad/' --exclude='_ocr_wt/' \
     --exclude='.ocr/' --exclude='.cursor/' --exclude='.opencode/' \
     --exclude='node_modules/' --exclude='__pycache__/' --exclude='*.pyc' \
     --exclude='*.qcow2' --exclude='*.iso' --exclude='*.img' \
+    --exclude='offline_resources/' \
     --exclude='config/lme-environment.env' \
     "$SRC/" "root@${HOST}:${REMOTE_DIR}/" 2>&1 | tee -a "$LOG"
   local rc="${PIPESTATUS[0]}"
@@ -186,7 +199,39 @@ do_health() {
   fi
   local lan_ok="${LME_GATE_LAN_OK:-}"
 
-  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on loopback=[$loopback_ports] lan_ok=[$lan_ok]"
+  # ---- narrow tailnet-ingress exposure allowance -----------------------------
+  # `tailscale serve --https=<port>` (ansible/roles/podman/tasks/tailscale_ingress.yml)
+  # makes tailscaled bind THIS node's own tailnet IP for each fronted port BY
+  # DESIGN (Leg A saw litellm:4000 on 100.73.170.86 + fd7a:115c:a1e0::...). That
+  # is a tailnet-only exposure, NOT a LAN opening — but legitimate ONLY for the
+  # ports the ingress leg fronts and ONLY when that leg is enabled for THIS run.
+  # We pass the remote payload an allow-list (tailnet_ports); it is EMPTY unless
+  # ingress is on, so when off the exposure check is byte-identical to a plain
+  # deploy and a real 0.0.0.0/LAN bind on any port still FAILS.
+  #
+  # Ports fronted by tailscale_ingress.yml: apm-server 8200, litellm 4000,
+  # logstash-beats 5044 (of these only 4000 is in the checked loopback set today;
+  # the rest are harmless no-ops if not listening). Operator-overridable via env
+  # LME_GATE_TAILNET_OK (a port list), which also turns the allowance on — an
+  # explicit escape hatch mirroring LME_GATE_LAN_OK.
+  local tailnet_ports="8200 4000 5044"
+  local tailnet_on=0
+  # Enabled for this run when the ingress leg is turned on: --tailscale (install.sh
+  # sets tailscale_serve_ingress=true), --profile tailscale (profile sets it), or
+  # an explicit tailscale_serve_ingress=true in the forwarded install extra-vars.
+  # Match the profile name exactly (space-anchored) — install.sh validates it
+  # against a fixed enum, so a prefix like `tailscale-x` must NOT trip this.
+  case " $FLAGS " in *" --tailscale "*) tailnet_on=1;; esac
+  case " $FLAGS " in *" --profile tailscale "*|*" --profile=tailscale "*) tailnet_on=1;; esac
+  case "$EXTRA_VARS" in
+    *'"tailscale_serve_ingress":true'*|*'"tailscale_serve_ingress": true'*|*'tailscale_serve_ingress=true'*) tailnet_on=1;;
+  esac
+  # Explicit operator override always wins and enables the allowance for its set.
+  if [ -n "${LME_GATE_TAILNET_OK:-}" ]; then tailnet_on=1; tailnet_ports="$LME_GATE_TAILNET_OK"; fi
+  # OFF => empty allow-list => the remote per-port clause never matches (inert).
+  [ "$tailnet_on" = 1 ] || tailnet_ports=""
+
+  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on loopback=[$loopback_ports] lan_ok=[$lan_ok] tailnet_ports=[$tailnet_ports]"
 
   # ---- the remote payload ----------------------------------------------------
   # Quoted heredoc: single quotes are legal inside (unlike the old '...' arg
@@ -197,6 +242,19 @@ do_health() {
 set -o pipefail
 fail=0
 loopback_ok() { case "$1" in 127.0.0.1|::1|'[::1]') return 0;; *) return 1;; esac; }
+# This node's OWN tailnet address: Tailscale CGNAT 100.64.0.0/10 (IPv4) or the
+# global Tailscale ULA fd7a:115c:a1e0::/48 (IPv6). `ss` prints IPv6 bracketed and
+# may zero-compress the 4th group (e.g. [fd7a:115c:a1e0::439:8d1a]); strip the
+# brackets and prefix-match the fixed /48. A tailnet-fronted ingress port binds
+# here BY DESIGN — accepted ONLY for the ports in $TAILNET_PORTS (see caller).
+tailnet_ok() {
+  local a="${1#"["}"; a="${a%"]"}"
+  case "$a" in
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0;;
+    fd7a:115c:a1e0:*) return 0;;
+    *) return 1;;
+  esac
+}
 
 echo "== lme.service =="
 systemctl is-active lme.service || true
@@ -237,10 +295,21 @@ else
       echo "  port $p: not listening (service down or not in this profile)"
       continue
     fi
+    # A bind on this node's tailnet IP is acceptable ONLY for a port the ingress
+    # leg fronts this run ($TAILNET_PORTS; EMPTY when ingress is off => this clause
+    # is inert and the check is byte-identical to a non-tailscale deploy).
+    tailnet_port=0
+    case " $TAILNET_PORTS " in *" $p "*) tailnet_port=1;; esac
     bad=""
-    for a in $addrs; do loopback_ok "$a" || bad="$bad $a"; done
+    for a in $addrs; do
+      loopback_ok "$a" && continue
+      [ "$tailnet_port" = 1 ] && tailnet_ok "$a" && continue
+      bad="$bad $a"
+    done
     if [ -n "$bad" ]; then
       echo "  FAIL: port $p LAN-open on$bad — expected 127.0.0.1 (bind-inversion/expose_lan?)"; fail=1
+    elif [ "$tailnet_port" = 1 ]; then
+      echo "  ok: port $p loopback/tailnet-ingress [$(echo $addrs)]"
     else
       echo "  ok: port $p loopback-only [$(echo $addrs)]"
     fi
@@ -279,7 +348,7 @@ echo "== HEALTH result: fail=$fail =="
 exit "$fail"
 REMOTE_EOF
 
-  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' bash -s" <<<"$HEALTH_SH"
+  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' TAILNET_PORTS='$tailnet_ports' bash -s" <<<"$HEALTH_SH"
   local rc=$?
   say "HEALTH rc=$rc  (0 => all gate checks passed)"; return "$rc"
 }

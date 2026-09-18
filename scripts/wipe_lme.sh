@@ -33,15 +33,55 @@ PODMAN="sudo -i podman"
 #   * Node-scoped ingress serves (ansible/roles/podman/tasks/tailscale_ingress.yml):
 #     apm-server :8200 (https), litellm :4000 (https) and logstash beats :5044
 #     (raw --tcp). These are the ONLY node-scoped serves LME publishes.
-#   * VIP Services (tailscale_service.yml): svc:<id> for each enabled host-facing
-#     LME service, the id derived from lme_services. Matched by EXACT name, so a
+#   * VIP Services (tailscale_service.yml): svc:<name> for each enabled host-facing
+#     LME service. That leg DERIVES the name from each manifest (its optional
+#     `tailnet_service`, else its `id`) and publishes one only for a service that
+#     declares a loopback (bind:127.0.0.1) publish_port. Matched by EXACT name, so a
 #     non-LME svc:<name> is never reset or counted as residue.
 LME_SERVE_HTTPS_PORTS=(8200 4000)            # node-scoped HTTPS ingress fronts
 LME_SERVE_TCP_PORTS=(5044)                   # node-scoped raw-TCP ingress front
 LME_SERVE_NODE_PORTS=(8200 4000 5044)        # every node-scoped LME serve port
-# svc:<name> VIPs LME may publish (host-facing lme_services ids). This list NEVER
-# contains the operator's own svc names (svc:windows11 / svc:vncserverwindow).
-LME_SVC_NAMES=(kibana litellm dashboard log-analyzer apm-server logstash fleet-server elasticsearch)
+
+# svc:<name> VIPs LME may publish. DERIVED at runtime from the SAME source the
+# publisher (ansible/roles/podman/tasks/tailscale_service.yml) reads -- never a
+# hand-maintained list. A hardcoded copy DRIFTS from the manifests, and it did:
+# embeddings / fleet-distribution / pgvector / wazuh-manager were published as VIPs
+# but absent from the old static list, so teardown orphaned them yet reported clean.
+# We reproduce the publisher's derivation straight from manifests/services/*.yml:
+# svc name = the manifest's `tailnet_service` (else its `id`); "host-facing" = it
+# declares at least one loopback (bind:127.0.0.1) publish_port. The set therefore
+# contains ONLY LME service ids by construction -- a co-tenant's svc:<name>
+# (svc:windows11 / svc:vncserverwindow / svc:webui) can never appear in it and is
+# never cleared. Teardown is deliberately inclusive of every service that COULD
+# carry a loopback VIP under any profile (we do NOT re-apply the per-profile enable
+# gate): clearing an svc that was never advertised is a safe no-op, whereas missing
+# one leaves an orphaned VIP -- the exact bug this fixes. BOTH the reset (step 4b)
+# and the residue self-verify (step 6d) read this one array, so the two can never
+# drift from each other, and now neither can drift from the manifests.
+#
+# LME_MANIFESTS_DIR mirrors the ansible `lme_manifests_dir` var; it defaults to the
+# manifests tree beside this script's repo checkout (scripts/ and manifests/ are
+# siblings at the repo root, and wipe_lme.sh is always invoked from that checkout).
+_wipe_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+LME_MANIFESTS_DIR="${LME_MANIFESTS_DIR:-${_wipe_script_dir}/../manifests}"
+LME_SVC_NAMES=()
+if [ -d "${LME_MANIFESTS_DIR}/services" ]; then
+  for _mf in "${LME_MANIFESTS_DIR}"/services/*.yml; do
+    [ -e "$_mf" ] || continue
+    # host-facing == advertises at least one loopback publish_port. Match the
+    # flow-style publish_ports entry ( `- {host: N, ..., bind: 127.0.0.1}` ) so a
+    # stray comment that merely mentions 127.0.0.1 cannot false-positive a service
+    # that publishes nothing on loopback.
+    grep -qE '^[[:space:]]*-[[:space:]]*\{.*bind:[[:space:]]*127\.0\.0\.1' "$_mf" || continue
+    # svc name = top-level `tailnet_service` if the manifest sets one, else its
+    # top-level `id`. Anchored at column 0 (top-level key) and stripped of any
+    # inline `# comment` so e.g. `id: elasticsearch  # logical key` yields exactly
+    # `elasticsearch`.
+    _svc=$(sed -nE 's/^tailnet_service:[[:space:]]*([^[:space:]#]+).*/\1/p' "$_mf" | head -n1)
+    [ -n "$_svc" ] || _svc=$(sed -nE 's/^id:[[:space:]]*([^[:space:]#]+).*/\1/p' "$_mf" | head -n1)
+    [ -n "$_svc" ] && LME_SVC_NAMES+=("$_svc")
+  done
+fi
 
 # --------------------------------------------------------------------------
 # 1. Stop AND disable every lme unit -- enumerated robustly (cwd-independent).
@@ -200,6 +240,20 @@ if command -v tailscale >/dev/null 2>&1; then
       sudo tailscale serve reset 2>/dev/null || true
     fi
   fi
+
+  # 4d. Revert the EGRESS leg's client preference (Finding C). tailscale_egress.yml
+  #     runs `tailscale set --accept-routes=true` (daemon pref RouteAll:true) so LME
+  #     can reach services behind tailnet subnet routers; a wipe that leaves it on
+  #     keeps the host pulling every advertised subnet route after LME is gone. Revert
+  #     it. `tailscale set` is idempotent (a no-op when already false), so we run it
+  #     unconditionally rather than add a `debug prefs` read (another failure surface)
+  #     just to gate it. NOTE: unlike the serve clears above -- which are scoped to
+  #     LME's EXACT svc/port identities -- RouteAll is a HOST-GLOBAL pref, not
+  #     LME-scoped; reverting it is correct for LME's own egress teardown but would
+  #     also drop a co-tenant's accept-routes on a shared node. The optional exit-node
+  #     (operator opt-in) is deliberately NOT touched.
+  echo "Reverting tailnet egress accept-routes (RouteAll -> false)..."
+  sudo tailscale set --accept-routes=false 2>/dev/null || true
 fi
 
 # --------------------------------------------------------------------------
@@ -305,6 +359,16 @@ fi
 # the B2 teardown contract is preserved. Present-but-unqueryable (tailscaled down)
 # is indeterminate -> residue, because serve config persists and returns on restart.
 if command -v tailscale >/dev/null 2>&1; then
+  # Fail-closed: tailscale is present but we derived NO LME svc names (manifests tree
+  # missing/unreadable, or empty). We then cannot have cleared any VIP in 4b nor can
+  # we recognise one as residue below -- an empty set would silently report clean with
+  # orphaned VIPs still advertised, the very failure this finding fixes. Treat an
+  # underivable set as INDETERMINATE residue, matching 6d's "present but unqueryable"
+  # rule. (When tailscale is absent this is skipped, so a non-tailscale wipe is
+  # unaffected.)
+  if [ "${#LME_SVC_NAMES[@]}" -eq 0 ]; then
+    RESIDUE+=("cannot derive the LME svc set from ${LME_MANIFESTS_DIR}/services -- tailnet VIP teardown unverifiable (indeterminate)")
+  fi
   if serve_status=$(sudo tailscale serve status 2>/dev/null); then
     lme_serve_residue=""
     # LME-owned svc:<name> VIPs (exact-name match; foreign svc:* ignored).

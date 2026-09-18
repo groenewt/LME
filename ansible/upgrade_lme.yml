@@ -808,6 +808,43 @@
       no_log: true
       when: lme_llm_enabled | default(true) | bool
 
+    # ============================================================
+    # Publish the per-service host-tree cert bundles BEFORE the umbrella restart.
+    #
+    # The re-rendered AI web-UI units (lme-dashboard / lme-log-analyzer) -- like the
+    # always-on core units -- mount cert:<svc>, which render_volume() expands to the
+    # HOST tree /opt/lme/certs/<svc> (lme_global.certs.host_tree), NOT the shared
+    # lme_certs workspace. Those per-service bundles are PUBLISHED only by the certs
+    # role's B4 step (real host-root chown to the manifest-derived subuid; the
+    # UserNS=auto lme-setup-certs container cannot chown to host subuids -- init-setup.sh
+    # disclaims it in its own comment). upgrade_lme.yml never ran that role, so on a
+    # pre-2.3.0 -> 2.3.0 upgrade the AI leaf dirs deleted above (litellm/dashboard/
+    # log-analyzer/embeddings/llama-cpp) are never re-published to /opt/lme/certs/<svc>
+    # and the UIs crash-loop on a missing SSL cert/key -- EVEN with the secrets minted.
+    # That is exactly the fail-closed brick the is-active assert below now reds on.
+    #
+    # The certs role is the SAME mechanism site.yml uses on fresh install: it starts
+    # lme-setup-certs (a Type=oneshot/RemainAfterExit unit that is PartOf=lme.service,
+    # so the earlier "Stop LME service" left it INACTIVE -> `state: started` re-executes
+    # it and, with certs.zip removed above, re-mints every leaf into the lme_certs
+    # workspace) and then publishes each ENABLED cert:<svc> bundle to the host tree. It
+    # MUST run before the restart because the UIs bind the host-tree bundle at start.
+    # Gated on lme_llm_enabled (same as the two mints) to scope this to the AI-UI defect
+    # this slice addresses; on the default LLM-on upgrade the role also republishes the
+    # always-on core bundles as a free side effect. The PATH env mirrors this file's
+    # podman-resolution tasks so the role's bare `podman` calls find the nix-profile
+    # binary (roles/certs carries no environment of its own).
+    # `environment` is not a valid attribute on include_role, so the PATH is set on
+    # the enclosing block (which propagates it to the dynamically-included role tasks).
+    - name: Publish per-service cert bundles before restart (certs role; fail-closed brick fix)
+      when: lme_llm_enabled | default(true) | bool
+      environment:
+        PATH: "{{ ansible_env.PATH }}:/nix/var/nix/profiles/default/bin"
+      block:
+        - name: Publish per-service cert bundles via certs role
+          ansible.builtin.include_role:
+            name: certs
+
     - name: Restart LME service
       systemd:
         name: "lme"
