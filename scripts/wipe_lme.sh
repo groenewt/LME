@@ -26,9 +26,13 @@ PODMAN="sudo -i podman"
 # LME-OWNED tailscale serve identity (Finding A). The teardown must reset ONLY
 # serve/Service entries LME itself created and must NEVER touch a co-tenant's
 # serves on a shared node -- e.g. the operator's own svc:windows11 /
-# svc:vncserverwindow. BOTH the reset (step 4) and the residue self-verify
-# (step 6d) read THESE arrays, so "what LME owns" is defined in exactly one place
-# and the two lists cannot drift apart (the drift is how this bug came back).
+# svc:vncserverwindow. The reset (step 4) and the residue self-verify (step 6d)
+# share the node-scoped port arrays below, so "what LME owns" at the node level is
+# defined in exactly one place. The VIP name sets are DERIVED from the manifests
+# (see the LME_SVC_NAMES / LME_MANIFEST_NAMES block further down): rather than
+# ASSERT the derivation can never go stale -- the overclaim that let the last
+# regression hide -- 6d independently cross-checks advertised VIPs against every
+# manifest name, so a stale derivation fails closed instead of orphaning silently.
 #
 #   * Node-scoped ingress serves (ansible/roles/podman/tasks/tailscale_ingress.yml):
 #     apm-server :8200 (https), litellm :4000 (https) and logstash beats :5044
@@ -49,37 +53,125 @@ LME_SERVE_NODE_PORTS=(8200 4000 5044)        # every node-scoped LME serve port
 # but absent from the old static list, so teardown orphaned them yet reported clean.
 # We reproduce the publisher's derivation straight from manifests/services/*.yml:
 # svc name = the manifest's `tailnet_service` (else its `id`); "host-facing" = it
-# declares at least one loopback (bind:127.0.0.1) publish_port. The set therefore
-# contains ONLY LME service ids by construction -- a co-tenant's svc:<name>
-# (svc:windows11 / svc:vncserverwindow / svc:webui) can never appear in it and is
-# never cleared. Teardown is deliberately inclusive of every service that COULD
-# carry a loopback VIP under any profile (we do NOT re-apply the per-profile enable
-# gate): clearing an svc that was never advertised is a safe no-op, whereas missing
-# one leaves an orphaned VIP -- the exact bug this fixes. BOTH the reset (step 4b)
-# and the residue self-verify (step 6d) read this one array, so the two can never
-# drift from each other, and now neither can drift from the manifests.
+# declares at least one loopback (bind:127.0.0.1), non-UDP publish_port -- exactly
+# the publisher's `_ts_loop`/`_ts_lo` selection (tailscale_service.yml:82-95). The
+# set therefore contains ONLY LME service ids by construction -- a co-tenant's
+# svc:<name> (svc:windows11 / svc:vncserverwindow / svc:webui) can never appear in
+# it and is never cleared. Teardown is deliberately inclusive of every service that
+# COULD carry a loopback VIP under any profile (we do NOT re-apply the per-profile
+# enable gate, and we read the BASE manifests, which are a superset of every
+# profile's published set -- the tailscale profile only re-declares binds already
+# loopback in base): clearing an svc that was never advertised is a safe no-op,
+# whereas missing one leaves an orphaned VIP -- the exact bug this fixes.
+#
+# NOT "cannot drift" -- that overclaim is what let the last regression hide. What is
+# actually true: (1) the derivation is a REAL YAML parse (PyYAML, the same path the
+# rest of the repo reads manifests from bash -- scripts/prepare_offline.sh,
+# scripts/convert_to_cluster.sh), so it is FORMAT-AGNOSTIC: a publish_ports list
+# written flow-style (`- {..., bind: 127.0.0.1}`) or block-style (`- bind:` on its
+# own line) parses IDENTICALLY, unlike the old flow-only grep this replaces. On a
+# host without PyYAML we DEGRADE (never gate the teardown) to a block-SCOPED grep
+# that is also format-agnostic and inclusive-safe. (2) The reset (step 4b) and the
+# VIP residue self-verify (step 6d) do NOT blindly trust that one derivation: 6d
+# ALSO cross-checks every advertised svc:<name> against LME_MANIFEST_NAMES (every
+# manifest's top-level id/tailnet_service -- a column-0 scalar immune to the
+# flow/block hazard, which lives in the nested list). So a host-facing derivation
+# that goes stale surfaces as a NAMED residue failure at teardown time, instead of a
+# silent orphan we merely assume impossible.
 #
 # LME_MANIFESTS_DIR mirrors the ansible `lme_manifests_dir` var; it defaults to the
 # manifests tree beside this script's repo checkout (scripts/ and manifests/ are
 # siblings at the repo root, and wipe_lme.sh is always invoked from that checkout).
 _wipe_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 LME_MANIFESTS_DIR="${LME_MANIFESTS_DIR:-${_wipe_script_dir}/../manifests}"
+
+# LME_SVC_NAMES  -- host-facing (loopback-VIP) services; SCOPES the reset in 4b and
+#                   is cleared there. Derived to match the publisher exactly.
+# LME_MANIFEST_NAMES -- EVERY service manifest's VIP name; used ONLY by the 6d
+#                   residue cross-check (never to reset), so a derivation miss cannot
+#                   silently orphan a VIP.
 LME_SVC_NAMES=()
+LME_MANIFEST_NAMES=()
+
+# Top-level VIP name of a manifest: `tailnet_service` if set, else `id`. Anchored at
+# column 0 (top-level key) and stripped of any inline `# comment`, so e.g.
+# `id: elasticsearch  # logical key` yields exactly `elasticsearch`. Format-immune
+# (a top-level scalar, not the nested publish_ports list).
+_wipe_manifest_name() {
+  local _n
+  _n=$(sed -nE 's/^tailnet_service:[[:space:]]*([^[:space:]#]+).*/\1/p' "$1" | head -n1)
+  [ -n "$_n" ] || _n=$(sed -nE 's/^id:[[:space:]]*([^[:space:]#]+).*/\1/p' "$1" | head -n1)
+  printf '%s' "$_n"
+}
+
 if [ -d "${LME_MANIFESTS_DIR}/services" ]; then
+  # Same PyYAML-on-PATH convention the rest of the repo uses to read manifests.
+  export PATH="$PATH:/nix/var/nix/profiles/default/bin"
+
+  # --- Host-facing set (LME_SVC_NAMES) -------------------------------------------
+  # PRIMARY: a real YAML parse. ATOMIC -- any unreadable/malformed manifest aborts
+  # the whole derivation (non-zero exit) so we fall back rather than emit a partial
+  # (silently incomplete) set. Reproduces the publisher's host-facing filter.
+  _svc_out=""
+  # stderr suppressed: a malformed manifest makes this exit non-zero and we DEGRADE
+  # to the fallback below (quiet by design -- a stray parse traceback mid-teardown
+  # would read like a wipe error; the fallback + 6d cross-check still guard it).
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1 \
+     && _svc_out=$(python3 - "${LME_MANIFESTS_DIR}/services" 2>/dev/null <<'PY'
+import glob, os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(3)
+seen, out = set(), []
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yml"))):
+    with open(path) as fh:
+        doc = yaml.safe_load(fh)
+    if not isinstance(doc, dict):
+        continue
+    ports = doc.get("publish_ports") or []
+    # host-facing == >=1 loopback (bind 127.0.0.1), non-UDP publish_port. Mirrors
+    # tailscale_service.yml's _ts_loop (bind==127.0.0.1) + _ts_lo (protocol!=udp).
+    if not any(isinstance(p, dict) and p.get("bind") == "127.0.0.1"
+               and p.get("protocol") != "udp" for p in ports):
+        continue
+    name = doc.get("tailnet_service") or doc.get("id")
+    if name and name not in seen:
+        seen.add(name)
+        out.append(str(name))
+print("\n".join(out))
+PY
+     ); then
+    mapfile -t LME_SVC_NAMES < <(printf '%s\n' "$_svc_out" | grep -v '^[[:space:]]*$' || true)
+  else
+    # FALLBACK (no PyYAML): scope to the top-level `publish_ports:` block and test for
+    # a loopback bind INSIDE it. Format-agnostic (flow AND block) and inclusive-safe
+    # (an over-match only clears an svc that was never advertised -- a no-op). The
+    # block scope replaces the old flow-anchor's job of not false-positiving a stray
+    # 127.0.0.1 comment elsewhere in the file.
+    for _mf in "${LME_MANIFESTS_DIR}"/services/*.yml; do
+      [ -e "$_mf" ] || continue
+      # In-block == after the top-level `publish_ports:` key and before the next
+      # top-level MAPPING key. A leading `-` is a list-item marker, NOT a block end
+      # (block-style entries can sit at column 0, e.g. `- host: 9200`), so the end
+      # pattern excludes `-` as well as spaces and `#`.
+      awk '/^publish_ports:/{inb=1;next} inb && /^[^[:space:]#-]/{inb=0} inb' "$_mf" \
+        | grep -q '127\.0\.0\.1' || continue
+      _svc=$(_wipe_manifest_name "$_mf")
+      [ -n "$_svc" ] && LME_SVC_NAMES+=("$_svc")
+    done
+  fi
+
+  # --- Full manifest-name set (LME_MANIFEST_NAMES) -------------------------------
+  # EVERY manifest's top-level VIP name -- the weaker, format-immune predicate the 6d
+  # residue check uses so an advertised svc:<name> the host-facing derivation MISSED
+  # is still recognised as LME-owned and fails closed. NEVER used to reset: a generic
+  # id (network/lme) could collide with a co-tenant, and here a collision only prints
+  # a residue FAILURE, never a destructive reset.
   for _mf in "${LME_MANIFESTS_DIR}"/services/*.yml; do
     [ -e "$_mf" ] || continue
-    # host-facing == advertises at least one loopback publish_port. Match the
-    # flow-style publish_ports entry ( `- {host: N, ..., bind: 127.0.0.1}` ) so a
-    # stray comment that merely mentions 127.0.0.1 cannot false-positive a service
-    # that publishes nothing on loopback.
-    grep -qE '^[[:space:]]*-[[:space:]]*\{.*bind:[[:space:]]*127\.0\.0\.1' "$_mf" || continue
-    # svc name = top-level `tailnet_service` if the manifest sets one, else its
-    # top-level `id`. Anchored at column 0 (top-level key) and stripped of any
-    # inline `# comment` so e.g. `id: elasticsearch  # logical key` yields exactly
-    # `elasticsearch`.
-    _svc=$(sed -nE 's/^tailnet_service:[[:space:]]*([^[:space:]#]+).*/\1/p' "$_mf" | head -n1)
-    [ -n "$_svc" ] || _svc=$(sed -nE 's/^id:[[:space:]]*([^[:space:]#]+).*/\1/p' "$_mf" | head -n1)
-    [ -n "$_svc" ] && LME_SVC_NAMES+=("$_svc")
+    _mn=$(_wipe_manifest_name "$_mf")
+    [ -n "$_mn" ] && LME_MANIFEST_NAMES+=("$_mn")
   done
 fi
 
@@ -359,24 +451,40 @@ fi
 # the B2 teardown contract is preserved. Present-but-unqueryable (tailscaled down)
 # is indeterminate -> residue, because serve config persists and returns on restart.
 if command -v tailscale >/dev/null 2>&1; then
-  # Fail-closed: tailscale is present but we derived NO LME svc names (manifests tree
-  # missing/unreadable, or empty). We then cannot have cleared any VIP in 4b nor can
-  # we recognise one as residue below -- an empty set would silently report clean with
-  # orphaned VIPs still advertised, the very failure this finding fixes. Treat an
-  # underivable set as INDETERMINATE residue, matching 6d's "present but unqueryable"
-  # rule. (When tailscale is absent this is skipped, so a non-tailscale wipe is
-  # unaffected.)
-  if [ "${#LME_SVC_NAMES[@]}" -eq 0 ]; then
-    RESIDUE+=("cannot derive the LME svc set from ${LME_MANIFESTS_DIR}/services -- tailnet VIP teardown unverifiable (indeterminate)")
+  # Fail-closed: tailscale is present but we derived NO manifest names at all
+  # (manifests tree missing/unreadable). The cross-check below then has nothing to
+  # recognise an LME VIP by, so an orphan would silently report clean -- the very
+  # failure this finding fixes. Treat an underivable NAME set as INDETERMINATE
+  # residue, matching 6d's "present but unqueryable" rule. (When tailscale is absent
+  # this whole block is skipped, so a non-tailscale wipe is unaffected.)
+  if [ "${#LME_MANIFEST_NAMES[@]}" -eq 0 ]; then
+    RESIDUE+=("cannot derive the LME svc name set from ${LME_MANIFESTS_DIR}/services -- tailnet VIP teardown unverifiable (indeterminate)")
   fi
   if serve_status=$(sudo tailscale serve status 2>/dev/null); then
     lme_serve_residue=""
-    # LME-owned svc:<name> VIPs (exact-name match; foreign svc:* ignored).
+    # LME-owned svc:<name> VIPs. Match each advertised svc against LME_MANIFEST_NAMES
+    # (every manifest id/tailnet_service), NOT just the host-facing reset set: that is
+    # what turns a stale/incomplete host-facing derivation from a silent orphan into a
+    # NAMED teardown failure. A foreign svc:* (svc:windows11 / svc:vncserverwindow /
+    # svc:webui -- no manifest declares them) matches nothing and is ignored, so
+    # co-tenant safety holds. A survivor that WAS in the reset set is reported
+    # distinctly from one the host-facing derivation missed.
     while IFS= read -r _svc; do
       _name=${_svc#svc:}
-      for _lme in "${LME_SVC_NAMES[@]}"; do
-        [ "$_name" = "$_lme" ] && lme_serve_residue+="${_svc}"$'\n'
+      _is_lme=""
+      for _mn in "${LME_MANIFEST_NAMES[@]}"; do
+        [ "$_name" = "$_mn" ] && { _is_lme="yes"; break; }
       done
+      [ -n "$_is_lme" ] || continue
+      _in_reset=""
+      for _lme in "${LME_SVC_NAMES[@]}"; do
+        [ "$_name" = "$_lme" ] && { _in_reset="yes"; break; }
+      done
+      if [ -n "$_in_reset" ]; then
+        lme_serve_residue+="${_svc} (survived scoped reset)"$'\n'
+      else
+        lme_serve_residue+="${_svc} (orphaned LME VIP -- matches a manifest id/tailnet_service the host-facing derivation missed)"$'\n'
+      fi
     done < <(printf '%s\n' "$serve_status" | grep -oE 'svc:[A-Za-z0-9._-]+' | sort -u)
     # LME node-scoped serves (ingress ports). Anchored so :50441 cannot match :5044.
     for _p in "${LME_SERVE_NODE_PORTS[@]}"; do
