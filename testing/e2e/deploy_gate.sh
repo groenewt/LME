@@ -34,8 +34,9 @@
 #
 # HEALTH is a REAL gate (see do_health). Its pass contract, all on the target:
 #   * no `lme*` systemd unit in the `failed` state;
-#   * >= EXPECT_MIN running containers (default 11 for default+llm; auto-lowered
-#     for --no-llm/--offline, raised for --elastic-services; override with env
+#   * >= EXPECT_MIN running containers (default 11 for default+llm; lowered to the
+#     5-core floor for --no-llm and to 6 for bare --offline, but `--offline --llm`
+#     KEEPS the LLM pack (floor 12); raised for --elastic-services; override with env
 #     LME_GATE_MIN_CONTAINERS);
 #   * EXPOSURE (DENY-BY-DEFAULT, over TCP *and* UDP): the checked set is the
 #     COMPLETE list of host-published ports, DERIVED from the manifests (the union
@@ -361,10 +362,11 @@ do_health() {
 
   # ---- controller-side: derive the expected sets from the install flags ------
   # The LLM stack (group: llm in manifests/global.yml -> pgvector/llama-cpp/
-  # litellm/log-analyzer/dashboard/embeddings) is present UNLESS --no-llm or
-  # --offline. --elastic-services adds the apm/heartbeat/metric/file/logstash
-  # pack. Guard the llm-only probes so the graph/trixie (default+llm) and any
-  # reduced invocation both stay valid — same shape, different expected set.
+  # litellm/log-analyzer/dashboard/embeddings) is present UNLESS --no-llm, or
+  # --offline WITHOUT --llm (a supported `--offline --llm` install KEEPS it -- see
+  # the offline_on block below). --elastic-services adds the apm/heartbeat/metric/
+  # file/logstash pack. Guard the llm-only probes so the graph/trixie (default+llm)
+  # and any reduced invocation both stay valid — same shape, different expected set.
   local llm_on=1
   case " $FLAGS " in *" --no-llm "*) llm_on=0;; esac
   local elastic_on=0
