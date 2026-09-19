@@ -254,24 +254,40 @@ PY
   } | grep -oE 'host:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | sort -un
 }
 
-# explicit_profile(): the manifest profile IFF it was EXPLICITLY named for this run
-# -- `--profile NAME` in the install flags, or an lme_profile forwarded verbatim
-# through --extra-vars (JSON or k=v). Returns EMPTY otherwise. We deliberately do
-# NOT infer a profile from the mode flags (--cluster/--offline) here: a profile's
-# bind:0.0.0.0 entries widen the accepted-LAN set, so an inference that misfired
-# would silently unlock a LAN allowance on the primary exposure evidence. An
-# operator running cluster/multinode names the profile; default/offline/tailscale
-# open nothing anyway, so the un-inferred path costs nothing.
+# explicit_profile(): the manifest profile install.sh will actually RENDER for this
+# run, resolved in the SAME precedence install.sh + ansible produce (so the gate's
+# accepted-LAN set matches the real render). Precedence, highest first:
+#   1. lme_profile forwarded through --extra-vars (JSON or k=v). This WINS: install.sh
+#      injects lme_profile=<EFFECTIVE_PROFILE> into its own --extra-vars FIRST and then
+#      appends the operator's -e (install.sh:832/834), and ansible's LAST -e for a key
+#      wins -- so a forwarded lme_profile overrides install's mode-derived profile.
+#   2. `--profile NAME` in the flags (-> LME_PROFILE -> EFFECTIVE_PROFILE, install.sh:147/710).
+#   3. derived from the mode flags exactly as install.sh:711-716 (compute_effective_flags):
+#      --cluster -> cluster, --offline -> offline. (default/tailscale open no LAN port,
+#      so an empty result is correct for them; tailscale ingress is handled separately.)
+# Deriving from the mode flags is FAIL-SAFE: the gate forwards these IDENTICAL flags to
+# install.sh, so profile_lan_ports() reads the very manifest install.sh renders. A profile
+# opens a LAN port ONLY via an explicit bind:0.0.0.0 entry, so a derivation can only ADMIT
+# a port the profile genuinely binds wide, never invent an allowance; and a mismatch can at
+# worst false-FAIL (narrower than rendered) -- the exposure check FAILs only on an actual
+# 0.0.0.0 bind, so it can never false-PASS. Without derivation a bare `--cluster` leg
+# false-FAILs its own transport port (9300), blocking the mandated cluster seal leg.
 explicit_profile() {
   local p=""
-  case " $FLAGS " in
-    *" --profile "*) p="${FLAGS##*--profile }"; p="${p%% *}";;
-    *" --profile="*) p="${FLAGS##*--profile=}"; p="${p%% *}";;
-  esac
+  p=$(printf '%s' "$EXTRA_VARS" \
+      | grep -oE '"?lme_profile"?[[:space:]]*[=:][[:space:]]*"?[a-z0-9_-]+' \
+      | grep -oE '[a-z0-9_-]+$' | head -1)
   if [ -z "$p" ]; then
-    p=$(printf '%s' "$EXTRA_VARS" \
-        | grep -oE '"?lme_profile"?[[:space:]]*[=:][[:space:]]*"?[a-z]+' \
-        | grep -oE '[a-z]+$' | head -1)
+    case " $FLAGS " in
+      *" --profile "*) p="${FLAGS##*--profile }"; p="${p%% *}";;
+      *" --profile="*) p="${FLAGS##*--profile=}"; p="${p%% *}";;
+    esac
+  fi
+  if [ -z "$p" ]; then
+    case " $FLAGS " in
+      *" --cluster "*) p="cluster";;
+      *" --offline "*|*" -o "*) p="offline";;
+    esac
   fi
   printf '%s' "$p"
 }
@@ -338,17 +354,24 @@ do_health() {
   # pack. Guard the llm-only probes so the graph/trixie (default+llm) and any
   # reduced invocation both stay valid — same shape, different expected set.
   local llm_on=1
-  case " $FLAGS " in *" --no-llm "*|*" --offline "*|*" -o "*) llm_on=0;; esac
+  case " $FLAGS " in *" --no-llm "*) llm_on=0;; esac
   local elastic_on=0
   case " $FLAGS " in *" --elastic-services "*) elastic_on=1;; esac
-  # --offline (== -o, install.sh:114) forces BOTH the llm and elastic packs OFF
-  # (install.sh:276 llm, :695 elastic -- no offline bundle for either), so neither
-  # pack's containers count toward the floor on an offline run even when the flags
-  # are also present. Match -o too: here a MISSED offline detection would LOWER the
-  # floor (fail-unsafe), unlike the llm_on match above where a miss raises it.
+  # --offline (== -o, install.sh:114) forces the ELASTIC pack OFF UNCONDITIONALLY
+  # (install.sh:695 -- no offline bundle for it) but forces the LLM pack off ONLY
+  # WHEN --llm is absent: install.sh:682 (compute_effective_flags) keeps the LLM
+  # stack ON for a supported `--offline --llm` install. Mirror both exactly so an
+  # `--offline --llm` leg counts its 6 LLM containers in the floor AND runs the LLM
+  # probes (LLM_ON is set from llm_on on the run_remote line below). Match -o too:
+  # a MISSED offline detection would mis-size the floor by a pack (fail-unsafe).
+  # Bare `--offline` (every banked airgapped leg) has no --llm, so both packs go
+  # off exactly as before -- a byte-identical outcome, no airgapped-leg regression.
   local offline_on=0
   case " $FLAGS " in *" --offline "*|*" -o "*) offline_on=1;; esac
-  [ "$offline_on" = 1 ] && { llm_on=0; elastic_on=0; }
+  if [ "$offline_on" = 1 ]; then
+    elastic_on=0
+    case " $FLAGS " in *" --llm "*) : ;; *) llm_on=0;; esac
+  fi
 
   # Loopback-only set = DENY-BY-DEFAULT over the COMPLETE set of host-published
   # ports, DERIVED from the manifests (see derive_published_ports) rather than the
