@@ -667,11 +667,13 @@ def test_memory_budget_service_that_fits_is_not_oversized():
 
 
 def test_cluster_profile_budget_prevents_oversized_hard_fail():
-    # A cluster ES node runs heap 8g -> MemoryMax 16G. On the DEFAULT 16G host
-    # budget (usable 14G) that single service is `oversized` and the SF-8 preflight
-    # hard-fails. cluster.yml raises budget.host_ram_gb to 32 (usable 30G > 16G),
-    # so ES is NOT oversized. This models the profile's effective budget (global
-    # budget overlaid by the cluster override, as load_manifests.yml combine()s it).
+    # UNIT-LEVEL math only: given a budget dict declaring host_ram_gb=32, an 8g-heap
+    # ES (capped MemoryMax 16G) is NOT `oversized` (16G < usable 30G). This proves the
+    # pure memory_budget() arithmetic when it is HANDED the cluster override budget
+    # (line below feeds the declared 32 directly). It does NOT model a real deploy: the
+    # live SF-8 preflight (container_setup.yml:38-46) OVERRIDES host_ram_gb with
+    # ansible_memtotal_mb (facts win), so on a real <=16G node the declared 32 is dead
+    # and the node's ACTUAL RAM governs -- do NOT read this test as "install proceeds".
     cluster = _load_profile("cluster.yml")["profile_overlay"]["lme_global"]
     eff = dict(LME_GLOBAL)
     eff_budget = dict(LME_GLOBAL["budget"])
@@ -682,7 +684,7 @@ def test_cluster_profile_budget_prevents_oversized_hard_fail():
     b = memory_budget(services, {}, eff)
     assert eff_budget["host_ram_gb"] == 32
     assert b["capped"]["elasticsearch"] == "16G"
-    assert b["oversized"] == []   # 16G fits under usable 30G -> install proceeds
+    assert b["oversized"] == []   # given the 32G budget, 16G is not oversized (math only)
 
     # Guard the regression: on the un-raised default budget the same node WOULD
     # be oversized (proving the profile fix is load-bearing, not cosmetic).
