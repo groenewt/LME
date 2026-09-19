@@ -182,15 +182,61 @@ def podman_args(network_aliases=None, extra=None):
     return ' '.join(parts)
 
 
-def is_enabled(enabled_when, flags=None):
+# The 'always' sentinel is a no-op (an always-on unit), NOT a flag lookup.
+ALWAYS = 'always'
+
+# Canonical enable-flag names. This MIRRORS the flags dict that load_manifests.yml
+# assembles for is_enabled() to consult (ansible/roles/podman/tasks/load_manifests.yml:77-82
+# -- install_llm / install_elastic_services / offline_mode), which is the single
+# constructor of lme_enable_flags. The 'always' sentinel is deliberately NOT a
+# member (it means "always render", not a variable). Kept inline with this
+# citation for the same reason the B3 secret guard hardcodes its known-set inline
+# (container_setup.yml:190-209): the resolver has no ansible runtime to read the
+# task var from. An enabled_when token that is neither 'always' nor one of these
+# is a typo (e.g. 'install_lmm'); is_enabled() rejects it LOUDLY rather than
+# silently evaluating it False and dropping the unit from the render.
+KNOWN_ENABLE_FLAGS = frozenset((
+    'install_llm',
+    'install_elastic_services',
+    'offline_mode',
+))
+
+
+def is_enabled(enabled_when, flags=None, context=None):
     """True iff every flag in enabled_when is truthy in `flags`. The sentinel
     'always' is a no-op (an always-on unit), NOT a variable lookup -- so
-    enabled_when:[always] renders, and an empty/omitted list also renders."""
+    enabled_when:[always] renders, and an empty/omitted list also renders.
+
+    Fail-closed on typos (symmetric with the B3 secret guard, which validates the
+    enabled-secret set against a known set before creating anything): every
+    non-sentinel token MUST be a known enable flag (KNOWN_ENABLE_FLAGS, mirroring
+    load_manifests.yml). A misspelled flag -- e.g. enabled_when:[install_lmm] --
+    would otherwise resolve False and SILENTLY drop the service from the render
+    with no error; instead it raises ValueError (this file's error idiom; the
+    resolver is imported with no ansible runtime, so AnsibleFilterError is not
+    available) naming the offending token, and `context` (the service id) when a
+    caller supplies it. A KNOWN flag merely ABSENT from `flags` is NOT an error:
+    an unset gate is off, so it evaluates False (the [install_llm] + {} -> False
+    contract). Validation runs over the WHOLE list first, so an earlier
+    False-evaluating gate can never short-circuit past a later typo."""
     flags = flags or {}
     if not enabled_when:
         return True
+    # Pass 1: validate every token before evaluating any gate, so a legitimately
+    # unmet gate earlier in the list cannot mask a misspelled flag later in it.
     for f in enabled_when:
-        if f == 'always':
+        if f == ALWAYS:
+            continue
+        if f not in KNOWN_ENABLE_FLAGS:
+            where = ' for service %r' % (context,) if context else ''
+            raise ValueError(
+                'lme: unknown enabled_when flag %r%s -- not the %r sentinel and '
+                'not a known enable flag %s. Fix the typo, or add the flag to '
+                'load_manifests.yml and KNOWN_ENABLE_FLAGS.'
+                % (f, where, ALWAYS, sorted(KNOWN_ENABLE_FLAGS)))
+    # Pass 2: AND over the (now validated) gates.
+    for f in enabled_when:
+        if f == ALWAYS:
             continue
         if not flags.get(f, False):
             return False
@@ -307,7 +353,7 @@ def memory_budget(services, flags=None, lme_global=None):
     for sid, svc in (services or {}).items():
         if svc.get('kind') != 'container':
             continue
-        if not is_enabled(svc.get('enabled_when'), flags):
+        if not is_enabled(svc.get('enabled_when'), flags, context=sid):
             continue
         cap = service_memory_max(svc.get('resources'))
         if cap is None:

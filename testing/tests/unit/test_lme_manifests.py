@@ -486,6 +486,27 @@ def test_is_enabled_table(enabled_when, flags, expected):
     assert is_enabled(enabled_when, flags) is expected
 
 
+def test_is_enabled_rejects_misspelled_flag_but_allows_known_absent_flag():
+    # CRUX distinction (OCR quality-1): a KNOWN flag merely ABSENT from the passed
+    # dict is an unset gate -> False, NEVER an error (the (["install_llm"], {}, False)
+    # contract that the table above also asserts, restated here beside the raise).
+    assert is_enabled(["install_llm"], {}) is False
+    # A MISSPELLED / unknown flag would otherwise resolve False and SILENTLY drop
+    # the service from the render; it must raise loudly instead, naming the token.
+    with pytest.raises(ValueError) as exc:
+        is_enabled(["install_lmm"], {"install_llm": True})
+    assert "install_lmm" in str(exc.value)
+    # The typo must be caught even when an EARLIER gate is legitimately unmet: a
+    # two-pass validate-then-evaluate means the unmet gate cannot short-circuit
+    # past the misspelled flag (which is exactly the silent-drop this guard exists
+    # to prevent -- the raise, not a quiet False, is the required behaviour).
+    with pytest.raises(ValueError):
+        is_enabled(["install_elastic_services", "install_lmm"],
+                   {"install_elastic_services": False})
+    # The 'always' sentinel is still a no-op, not a flag -> never raises.
+    assert is_enabled(["always"], {}) is True
+
+
 def test_is_enabled_always_service_renders_and_gated_service_skips():
     # At least one 'always' service IS enabled and one disabled gated service is NOT.
     es = _load_service("lme-elasticsearch.yml")          # enabled_when: [always]
