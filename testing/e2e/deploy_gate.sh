@@ -35,7 +35,7 @@
 # HEALTH is a REAL gate (see do_health). Its pass contract, all on the target:
 #   * no `lme*` systemd unit in the `failed` state;
 #   * >= EXPECT_MIN running containers (default 11 for default+llm; lowered to the
-#     5-core floor for --no-llm and to 6 for bare --offline, but `--offline --llm`
+#     5-core floor for online --no-llm and to 6 for bare --offline, but `--offline --llm`
 #     KEEPS the LLM pack (floor 12); raised for --elastic-services; override with env
 #     LME_GATE_MIN_CONTAINERS);
 #   * EXPOSURE (DENY-BY-DEFAULT, over TCP *and* UDP): the checked set is the
