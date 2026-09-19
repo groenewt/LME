@@ -42,14 +42,24 @@
 # run time rather than silent.
 #
 # ACL / VIP allocation: a `svc:<name>` must be defined + granted in the tailnet
-# policy (VIP allocation) before it can be advertised. That policy is out of scope
-# here (the permissive dev grant is left untouched); if advertising is rejected the
-# serve command surfaces the error. The svc names this leg uses are the manifest
-# ids above, so the policy entries and these names stay in lock-step.
+# policy (VIP allocation) before a real VIP is allocated. That policy is out of scope
+# here (the permissive dev grant is left untouched).
+# EMPIRICAL CAVEAT (round-9 multi-host e2e): `tailscale serve --service=svc:<name>` for
+# a name the tailnet policy does NOT define SUCCEEDS SILENTLY -- exit 0, no error, no VIP
+# allocated (Self.CapMap has no `services/<name>` key; MagicDNS returns NXDOMAIN for the
+# name). Advertising rejection is NOT surfaced by the serve command, so a green run here
+# does NOT prove a live VIP. A post-publish liveness assert against
+# Self.CapMap["services/<name>"] would turn that silent dead VIP into a typed failure; it
+# is deliberately NOT added yet (fail-loud-vs-warn is an operator decision, and the
+# positive case needs a known-good VIP-backend host to validate). The svc names this leg
+# uses are the manifest ids above, so the policy entries and these names stay in lock-step.
 #
-# Idempotent: `tailscale serve status` and `tailscale serve get-config --all`
-# surface different views, so BOTH are read and a VIP is treated as already-present
-# if EITHER shows it; a re-run then re-publishes nothing.
+# Idempotent: `tailscale serve status` and `tailscale serve get-config --all` surface
+# different views, so BOTH are read and a VIP is treated as already-present if EITHER
+# shows it; a re-run then re-publishes nothing. NOTE: both are LOCAL serve-intent surfaces
+# -- they show a name that was published even if its VIP is dead, so a VIP that failed to
+# allocate on an earlier run is skipped FOREVER (the skip-guard cannot self-heal a dead
+# VIP; only a CapMap-keyed liveness check could).
 
 # GUARD (only-when-present): in-file CLI check (the include is gated on the enable
 # var). `command -v` is a shell builtin -> shell module.
@@ -166,12 +176,14 @@
   changed_when: true
   become: true
 
-- name: Show the derived tailnet VIP endpoints and their serve mode
+- name: Show the derived tailnet serve intents and their mode (VIP liveness unverified)
   ansible.builtin.debug:
     msg: >-
       svc:{{ item.service }} -> {{ item.scheme }} 127.0.0.1:{{ item.port }}
-      (advertised on the tailnet as svc:{{ item.service }} from
-      {{ ts_magicdns_name | default('this node') }})
+      (serve publish ISSUED for svc:{{ item.service }} from
+      {{ ts_magicdns_name | default('this node') }}; VIP liveness NOT verified here -- a
+      green publish does not prove an allocated VIP, see header; a CapMap-keyed liveness
+      check is a separate, deferred change)
   loop: "{{ ts_svc_targets }}"
   loop_control:
     label: "svc:{{ item.service }}"
