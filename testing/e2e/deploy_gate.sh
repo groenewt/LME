@@ -79,7 +79,12 @@ SRC="${SRC:-$(cd "$_SELF_DIR/../.." && pwd)}"
 REMOTE_DIR="${REMOTE_DIR:-/root/LME-gate}"     # tree lands here on the target
 HOST=""; IP=""; GRAPHROOT=""; FLAGS=""; LABEL=""; STAGE="all"; STRICT=0
 # Raw ansible extra-vars (JSON/k=v) forwarded verbatim to the target's install.sh
-# --extra-vars, which appends it as a last-winning -e. Carries per-deploy values
+# --extra-vars. In the SINGLE-NODE install path install.sh appends it as a
+# last-winning -e (install.sh:832/834). In --cluster mode it is currently DROPPED:
+# the cluster Phase-1 (site.yml, install.sh:1006) and Phase-2 (elasticsearch.yml,
+# install.sh:1020) invocations do NOT forward EXTRA_VARS_ARGS, so a -e passed
+# alongside --cluster is INERT until that asymmetry is fixed -- size a cluster node
+# via its ansible/inventory/host_vars/es*.yml instead. Carries per-deploy values
 # with no dedicated flag (e.g. multinode fleet_advertise_host / lme_service_overrides).
 EXTRA_VARS=""
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
@@ -257,10 +262,13 @@ PY
 # explicit_profile(): the manifest profile install.sh will actually RENDER for this
 # run, resolved in the SAME precedence install.sh + ansible produce (so the gate's
 # accepted-LAN set matches the real render). Precedence, highest first:
-#   1. lme_profile forwarded through --extra-vars (JSON or k=v). This WINS: install.sh
-#      injects lme_profile=<EFFECTIVE_PROFILE> into its own --extra-vars FIRST and then
-#      appends the operator's -e (install.sh:832/834), and ansible's LAST -e for a key
-#      wins -- so a forwarded lme_profile overrides install's mode-derived profile.
+#   1. lme_profile forwarded through --extra-vars (JSON or k=v). SINGLE-NODE path only:
+#      install.sh injects lme_profile=<EFFECTIVE_PROFILE> into its own --extra-vars FIRST
+#      then appends the operator's -e (install.sh:832/834), and ansible's LAST -e for a
+#      key wins -- so a forwarded lme_profile overrides install's mode-derived profile.
+#      NOTE: in --cluster mode install.sh DROPS the operator -e (Phase-1/2 at :1006/:1020
+#      omit EXTRA_VARS_ARGS), so a forwarded lme_profile is ignored there and the profile
+#      is purely --cluster-derived (branch 3) -- which is what this gate predicts anyway.
 #   2. `--profile NAME` in the flags (-> LME_PROFILE -> EFFECTIVE_PROFILE, install.sh:147/710).
 #   3. derived from the mode flags exactly as install.sh:711-716 (compute_effective_flags):
 #      --cluster -> cluster, --offline -> offline. (default/tailscale open no LAN port,
@@ -270,8 +278,12 @@ PY
 # opens a LAN port ONLY via an explicit bind:0.0.0.0 entry, so a derivation can only ADMIT
 # a port the profile genuinely binds wide, never invent an allowance; and a mismatch can at
 # worst false-FAIL (narrower than rendered) -- the exposure check FAILs only on an actual
-# 0.0.0.0 bind, so it can never false-PASS. Without derivation a bare `--cluster` leg
-# false-FAILs its own transport port (9300), blocking the mandated cluster seal leg.
+# 0.0.0.0 bind, so it can never false-PASS. Without derivation a bare `--cluster` gate leg
+# would false-FAIL its own transport port (9300); this derivation removes that gate-side
+# false-FAIL. (A leg that actually COMPLETES a cluster seal additionally needs an
+# operator-supplied ansible/inventory/cluster.yml and a master roomy enough for the
+# profile-default heap -- or the install.sh cluster -e-drop above fixed; those are
+# install.sh/fleet limits surfaced as review findings, not gate limits.)
 explicit_profile() {
   local p=""
   p=$(printf '%s' "$EXTRA_VARS" \
