@@ -666,7 +666,7 @@ def test_memory_budget_service_that_fits_is_not_oversized():
     assert b["over_budget"] is False
 
 
-def test_cluster_profile_budget_prevents_oversized_hard_fail():
+def test_memory_budget_math_with_cluster_override():
     # UNIT-LEVEL math only: given a budget dict declaring host_ram_gb=32, an 8g-heap
     # ES (capped MemoryMax 16G) is NOT `oversized` (16G < usable 30G). This proves the
     # pure memory_budget() arithmetic when it is HANDED the cluster override budget
