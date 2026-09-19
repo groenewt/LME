@@ -829,15 +829,24 @@
     # it and, with certs.zip removed above, re-mints every leaf into the lme_certs
     # workspace) and then publishes each ENABLED cert:<svc> bundle to the host tree. It
     # MUST run before the restart because the UIs bind the host-tree bundle at start.
-    # Gated on lme_llm_enabled (same as the two mints) to scope this to the AI-UI defect
-    # this slice addresses; on the default LLM-on upgrade the role also republishes the
-    # always-on core bundles as a free side effect. The PATH env mirrors this file's
+    # Runs UNCONDITIONALLY (round-6 blocker fix). The certs role publishes each ENABLED
+    # cert:<svc> bundle, and its own resolver filter (is_enabled over lme_enable_flags,
+    # roles/certs/tasks/main.yml:30-36) already scopes the AI-UI bundles to install_llm.
+    # So on an LLM-off upgrade the role republishes ONLY the always-on CORE bundles
+    # (kibana / fleet-server / fleet-distribution / wazuh-manager), which those core units
+    # mount from the host tree regardless of LLM; the AI-UI leaves are excluded by is_enabled,
+    # not by this task. It was FORMERLY gated on lme_llm_enabled to "scope to the AI-UI defect,"
+    # but that left the core bundles unpublished on a pre-2.3.0 -> 2.3.0 LLM-off upgrade and
+    # silently crash-looped core kibana (the fail-closed AI-UI assert below is co-gated on the
+    # SAME flag, so it never caught it -- see the LLM-independent core assert added after restart).
+    # load_manifests/render_units above are unconditional and set lme_enable_flags with
+    # install_llm=false on this path, so lme-setup-certs (enabled_when:[always]) is present for
+    # the role's `state: started` re-exec. The PATH env mirrors this file's
     # podman-resolution tasks so the role's bare `podman` calls find the nix-profile
     # binary (roles/certs carries no environment of its own).
     # `environment` is not a valid attribute on include_role, so the PATH is set on
     # the enclosing block (which propagates it to the dynamically-included role tasks).
-    - name: Publish per-service cert bundles before restart (certs role; fail-closed brick fix)
-      when: lme_llm_enabled | default(true) | bool
+    - name: Publish per-service cert bundles before restart (certs role; core+AI-UI brick fix)
       environment:
         PATH: "{{ ansible_env.PATH }}:/nix/var/nix/profiles/default/bin"
       block:
@@ -850,7 +859,24 @@
         name: "lme"
         state: restarted
       tags: ['system']
-      
+
+    # Fail-closed CORE brick guard (round-6), runs REGARDLESS of lme_llm_enabled.
+    # The always-on core web unit lme-kibana mounts the host-tree cert:kibana bundle that
+    # the now-unconditional certs publish above fills; a missing/half-published bundle
+    # crash-loops it. The AI-UI assert below is LLM-gated, so before this task NOTHING
+    # covered a core brick on an LLM-off upgrade -- exactly the gap that made the former
+    # co-gated publish a silent blocker. Kibana is the canonical long-running cert:kibana
+    # consumer; asserting is-active here converts a core brick into a task failure instead
+    # of a false success. Retry ceiling mirrors the AI-UI assert to tolerate the ES->kibana
+    # startup cascade on a slow upgrade; the poll exits the instant kibana reports active.
+    - name: Assert core kibana unit is active after restart (fail-closed, LLM-independent)
+      command: systemctl is-active lme-kibana.service
+      register: core_kibana_active
+      changed_when: false
+      until: core_kibana_active.rc == 0
+      retries: 60
+      delay: 10
+
     # Fail-closed brick guard (replaces the former `podman ps | grep lme` +
     # ignore_errors wait, which went green as long as ANY core container was up and
     # thus MASKED a UI that podman refused to start -- e.g. a missing webui_api_key /

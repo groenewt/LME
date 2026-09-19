@@ -732,3 +732,60 @@ def test_every_manifest_block_resolves():
         if "resources" in doc and "heap" in doc["resources"]:
             opts = jvm_opts(doc["resources"])
             assert opts.startswith('"') and opts.endswith('"'), "%s jvm_opts" % name
+
+
+# ===========================================================================
+# cert BUNDLE owners under LLM-off  (round-6 blocker regression guard)
+# ---------------------------------------------------------------------------
+# Faithful in-Python mirror of the certs role's owner derivation
+# (ansible/roles/certs/tasks/main.yml:30-36): a service is a per-service
+# cert:<svc> BUNDLE owner iff it carries a top-level `certs:` key AND its
+# enabled_when passes is_enabled(flags) AND it mounts at least one `cert:`
+# volume. The last condition is what excludes Elasticsearch, which owns a
+# `certs:` key but mounts the shared lme_certs WORKSPACE (not a cert:<svc>
+# bundle). upgrade_lme.yml now runs that role UNCONDITIONALLY (the publish
+# was formerly gated on lme_llm_enabled, which left these core bundles
+# unpublished on a pre-2.3.0 -> 2.3.0 LLM-off upgrade and crash-looped kibana).
+# ===========================================================================
+def _derive_cert_bundle_owners(flags):
+    owners = set()
+    for _name, doc in _MANIFESTS:
+        if not doc or "certs" not in doc:
+            continue
+        if not is_enabled(doc.get("enabled_when", ["always"]), flags):
+            continue
+        vol_sources = [
+            (v or {}).get("source", "") for v in (doc.get("volumes") or [])
+        ]
+        if any(str(s).startswith("cert:") for s in vol_sources):
+            owners.add(doc["id"])
+    return owners
+
+
+def test_llm_off_upgrade_still_publishes_core_cert_bundles():
+    # install_llm=false is a first-class upgrade path (install.sh compute_effective_flags);
+    # the always-on core cert:<svc> consumers MUST still be published, or core kibana bricks.
+    no_llm = {"install_llm": False, "install_elastic_services": False}
+    owners = _derive_cert_bundle_owners(no_llm)
+    for core in ("kibana", "fleet-server", "fleet-distribution", "wazuh-manager"):
+        assert core in owners, (
+            "core cert bundle owner %s missing on LLM-off upgrade -> core brick" % core
+        )
+    # AI-UI bundles are excluded by is_enabled (NOT by the removed task gate), so they
+    # must NOT appear when LLM is off -- publishing them would target deleted AI leaves.
+    for ai in ("dashboard", "log-analyzer", "litellm", "embeddings", "llama-cpp"):
+        assert ai not in owners, (
+            "AI-UI cert bundle owner %s leaked into the LLM-off publish set" % ai
+        )
+    # ES owns a certs: key but mounts the shared lme_certs workspace, not a cert:<svc>
+    # bundle -- guards the second (cert-volume) derivation condition against drift.
+    assert "elasticsearch" not in owners
+
+
+def test_llm_on_upgrade_publishes_both_core_and_ai_ui_cert_bundles():
+    # Ungating the publish must NOT change the LLM-on set: both core and AI-UI owners present.
+    llm_on = {"install_llm": True, "install_elastic_services": False}
+    owners = _derive_cert_bundle_owners(llm_on)
+    for svc in ("kibana", "fleet-server", "fleet-distribution", "wazuh-manager",
+                "dashboard", "log-analyzer", "litellm"):
+        assert svc in owners, "%s missing from LLM-on cert bundle owners" % svc
