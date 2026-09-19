@@ -37,22 +37,36 @@
 #   * >= EXPECT_MIN running containers (default 11 for default+llm; auto-lowered
 #     for --no-llm/--offline, raised for --elastic-services; override with env
 #     LME_GATE_MIN_CONTAINERS);
-#   * EXPOSURE: every host-published port that should be loopback-only
-#     (9200/5601/443/8220, plus llm 5432/8081/8502/8501/4000) is bound to
-#     127.0.0.1/::1 and NOT LAN-open. Ports intentionally opened to the LAN
-#     (expose_lan opt-in) are listed in env LME_GATE_LAN_OK="8502 5601 ...".
-#     When the tailscale ingress leg is on for this run (--tailscale / --profile
-#     tailscale / -e tailscale_serve_ingress=true), the ports it fronts
-#     (8200/4000/5044) may ALSO bind this node's own tailnet IP (CGNAT
-#     100.64.0.0/10 or ULA fd7a:115c:a1e0::/48) BY DESIGN; that tailnet-only bind
-#     is accepted for exactly those ports, while a real 0.0.0.0/LAN bind still
-#     FAILS. Override the fronted set with env LME_GATE_TAILNET_OK="4000 ...".
+#   * EXPOSURE (DENY-BY-DEFAULT, over TCP *and* UDP): the checked set is the
+#     COMPLETE list of host-published ports, DERIVED from the manifests (the union
+#     of manifests/global.yml's canonical `ports:` table, manifests/services/*.yml
+#     publish_ports, and manifests/profiles/*.yml overlays) -- NOT a hand-kept
+#     subset. So NO service port is silently unchecked: wazuh 1514/1515/55000, the
+#     udp syslog 514, fleet-distribution 8080, apm 8200, logstash 5044/8085 and the
+#     ES transport 9300 are all covered now. EVERY such port must bind
+#     127.0.0.1/::1; ANY non-loopback (0.0.0.0/LAN) bind on ANY of them, TCP OR UDP,
+#     FAILS the gate. The only accepted non-loopback binds are:
+#       - expose_lan operator opt-in, env LME_GATE_LAN_OK="8502 5601 ...";
+#       - a port the ACTIVE manifest PROFILE deliberately opens (bind:0.0.0.0 in
+#         manifests/profiles/<profile>.yml), derived ONLY when the profile is
+#         explicitly named (--profile NAME or -e lme_profile=NAME) so a misfired
+#         inference can never silently unlock a LAN bind (cluster->9300,
+#         multinode->8220/9200; default/offline/tailscale open none);
+#       - when the tailscale ingress leg is on for this run (--tailscale / --profile
+#         tailscale / -e tailscale_serve_ingress=true), the ports it fronts
+#         (8200/4000/5044) may ALSO bind this node's own tailnet IP (CGNAT
+#         100.64.0.0/10 or ULA fd7a:115c:a1e0::/48) BY DESIGN. Override that fronted
+#         set with env LME_GATE_TAILNET_OK="4000 ...".
+#     A real 0.0.0.0/LAN bind still FAILS even on a tailnet-fronted port. Each
+#     allowed non-loopback port logs WHICH rule admitted it (expose_lan / profile /
+#     tailnet-ingress).
 #   * SERVICE: ES :9200 -> 401/200, Kibana :5601 -> 200/302/401, and (llm)
 #     dashboard /livez :8502 -> 200, log-analyzer :8501 reachable.
 #   * AUTH: dashboard /api/health :8502 with NO key -> 401/403 (webui auth
 #     enforced). Log-analyzer (streamlit) gates in-app at HTTP 200, so its auth
 #     is not asserted at the HTTP layer here.
-# Any check that cannot run (e.g. `ss` missing) is a FAIL, not a skip.
+# Any check that cannot run (e.g. `ss` missing, the manifest port-set failing to
+# derive, or ss returning no TCP listeners) is a FAIL, not a skip.
 # ----------------------------------------------------------------------------
 set -uo pipefail
 
@@ -168,6 +182,58 @@ do_install() {
   say "INSTALL rc=$rc (rescued=$rescued)"; return "$rc"
 }
 
+# ---- manifest-derived exposure sets (controller-side) ----------------------
+# The exposure gate is DENY-BY-DEFAULT over the COMPLETE set of host-published
+# ports. That set is NOT hand-maintained here: it is derived from the manifests so
+# a port added to a service manifest is checked automatically (no blind spot).
+# derive_published_ports() unions every `{host: N ...}` publish entry across the
+# canonical global table, the per-service manifests, AND the profile overlays --
+# grepping all three (not just global.yml) keeps "no service port silently
+# unchecked" true even if the canonical table ever drifts from a service manifest.
+# `protocol: udp` entries (e.g. wazuh syslog 514) are included by number; the udp
+# listener table catches the bind. Emits unique host port NUMBERS, one per line.
+derive_published_ports() {
+  local root="$SRC/manifests"
+  [ -d "$root" ] || return 1
+  {
+    [ -f "$root/global.yml" ] && grep -hE '\{[[:space:]]*host:' "$root/global.yml"
+    grep -rhE '\{[[:space:]]*host:' "$root/services/" 2>/dev/null
+    grep -rhE '\{[[:space:]]*host:' "$root/profiles/" 2>/dev/null
+  } | grep -oE 'host:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | sort -un
+}
+
+# explicit_profile(): the manifest profile IFF it was EXPLICITLY named for this run
+# -- `--profile NAME` in the install flags, or an lme_profile forwarded verbatim
+# through --extra-vars (JSON or k=v). Returns EMPTY otherwise. We deliberately do
+# NOT infer a profile from the mode flags (--cluster/--offline) here: a profile's
+# bind:0.0.0.0 entries widen the accepted-LAN set, so an inference that misfired
+# would silently unlock a LAN allowance on the primary exposure evidence. An
+# operator running cluster/multinode names the profile; default/offline/tailscale
+# open nothing anyway, so the un-inferred path costs nothing.
+explicit_profile() {
+  local p=""
+  case " $FLAGS " in
+    *" --profile "*) p="${FLAGS##*--profile }"; p="${p%% *}";;
+    *" --profile="*) p="${FLAGS##*--profile=}"; p="${p%% *}";;
+  esac
+  if [ -z "$p" ]; then
+    p=$(printf '%s' "$EXTRA_VARS" \
+        | grep -oE '"?lme_profile"?[[:space:]]*[=:][[:space:]]*"?[a-z]+' \
+        | grep -oE '[a-z]+$' | head -1)
+  fi
+  printf '%s' "$p"
+}
+
+# profile_lan_ports(): the host ports the named profile deliberately opens to the
+# LAN. A profile opens a port ONLY by re-declaring publish_ports with bind:0.0.0.0
+# on that entry (default posture is loopback), so we pull exactly those host ports.
+profile_lan_ports() {
+  local prof="$1" pf="$SRC/manifests/profiles/${1}.yml"
+  [ -n "$prof" ] && [ -f "$pf" ] || return 0
+  grep -E '\{[[:space:]]*host:.*bind:[[:space:]]*0\.0\.0\.0' "$pf" \
+    | grep -oE 'host:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | sort -un
+}
+
 # ---- stage: health probe ---------------------------------------------------
 do_health() {
   say "HEALTH probe (deep gate)"
@@ -183,10 +249,21 @@ do_health() {
   local elastic_on=0
   case " $FLAGS " in *" --elastic-services "*) elastic_on=1;; esac
 
-  # Loopback-only set: every host-published port that must NOT face the LAN
-  # unless expose_lan opted it in (LME_GATE_LAN_OK). Core always; llm when on.
-  local loopback_ports="9200 5601 443 8220"
-  [ "$llm_on" = 1 ] && loopback_ports="$loopback_ports 5432 8081 8502 8501 4000"
+  # Loopback-only set = DENY-BY-DEFAULT over the COMPLETE set of host-published
+  # ports, DERIVED from the manifests (see derive_published_ports) rather than the
+  # old fixed 9-port literal, which left wazuh 1514/1515/55000, udp syslog 514,
+  # fleet-distribution 8080, apm 8200, logstash 5044/8085 and ES transport 9300
+  # UNCHECKED. Every port here must bind loopback UNLESS opted open (LME_GATE_LAN_OK
+  # or a named profile's bind:0.0.0.0). Ports for services not installed in this
+  # profile simply won't be listening (=> reported "not listening", never a FAIL).
+  # A missing/unparsable manifest => FAIL, never a blind green (matches the doctrine
+  # "a check that can't run = FAIL").
+  local loopback_ports
+  loopback_ports="$(derive_published_ports | xargs)"   # newline list -> trimmed single-spaced
+  if [ -z "$loopback_ports" ]; then
+    say "HEALTH FATAL: could not derive host-published port set from $SRC/manifests -- refusing to run a blind exposure gate"
+    return 1
+  fi
 
   # Expected running-container floor. Default 11 (default+llm). Auto-adjust for
   # the reduced/expanded packs; an operator override always wins.
@@ -197,7 +274,15 @@ do_health() {
     if [ "$llm_on" = 1 ]; then expect_min=11; else expect_min=6; fi
     [ "$elastic_on" = 1 ] && expect_min=$((expect_min + 5))
   fi
+  # Accepted non-loopback binds come from two DISTINCT, separately-labelled rules:
+  #   * expose_lan operator opt-in       -> LME_GATE_LAN_OK  (env, unchanged)
+  #   * a NAMED profile's bind:0.0.0.0   -> profile_open      (derived; cluster->9300,
+  #     multinode->8220/9200). Kept SEPARATE from lan_ok so the remote log states
+  #     WHICH rule admitted each allowed port. Empty unless a profile is explicitly
+  #     named, so single-node/default deploys are byte-identical to before here.
   local lan_ok="${LME_GATE_LAN_OK:-}"
+  local profile; profile="$(explicit_profile)"
+  local profile_open; profile_open="$(profile_lan_ports "$profile" | xargs)"
 
   # ---- narrow tailnet-ingress exposure allowance -----------------------------
   # `tailscale serve --https=<port>` (ansible/roles/podman/tasks/tailscale_ingress.yml)
@@ -210,10 +295,11 @@ do_health() {
   # deploy and a real 0.0.0.0/LAN bind on any port still FAILS.
   #
   # Ports fronted by tailscale_ingress.yml: apm-server 8200, litellm 4000,
-  # logstash-beats 5044 (of these only 4000 is in the checked loopback set today;
-  # the rest are harmless no-ops if not listening). Operator-overridable via env
-  # LME_GATE_TAILNET_OK (a port list), which also turns the allowance on — an
-  # explicit escape hatch mirroring LME_GATE_LAN_OK.
+  # logstash-beats 5044 -- ALL THREE are in the checked set now that the loopback
+  # set is the complete manifest-derived list (they were unchecked no-ops under the
+  # old 9-port literal), so a tailnet-fronted bind on any of them is now actively
+  # validated. Operator-overridable via env LME_GATE_TAILNET_OK (a port list), which
+  # also turns the allowance on — an explicit escape hatch mirroring LME_GATE_LAN_OK.
   local tailnet_ports="8200 4000 5044"
   local tailnet_on=0
   # Enabled for this run when the ingress leg is turned on: --tailscale (install.sh
@@ -231,7 +317,7 @@ do_health() {
   # OFF => empty allow-list => the remote per-port clause never matches (inert).
   [ "$tailnet_on" = 1 ] || tailnet_ports=""
 
-  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on loopback=[$loopback_ports] lan_ok=[$lan_ok] tailnet_ports=[$tailnet_ports]"
+  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on profile=[${profile:-none}] loopback=[$loopback_ports] lan_ok=[$lan_ok] profile_open=[$profile_open] tailnet_ports=[$tailnet_ports]"
 
   # ---- the remote payload ----------------------------------------------------
   # Quoted heredoc: single quotes are legal inside (unlike the old '...' arg
@@ -280,16 +366,33 @@ echo "== exposure: loopback-only binds ($LOOPBACK_PORTS) =="
 if ! command -v ss >/dev/null 2>&1; then
   echo "  FAIL: ss unavailable — cannot assert exposure"; fail=1
 else
-  # port<space>addr per listening socket (addr = local addr with the port
-  # stripped): 0.0.0.0:9200->'9200 0.0.0.0', [::]:5601->'5601 [::]', *:5432->'5432 *'.
-  listen_tbl=$(ss -ltnH 2>/dev/null | awk '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a}')
-  # A live host always has listeners (sshd at minimum). Empty => the probe
-  # broke (e.g. `ss` too old for -H), NOT a closed host: fail, don't pass green.
+  # port<space>addr<space>proto per LISTENING socket, over BOTH tcp AND udp -- the
+  # deny-by-default gate must see udp too (e.g. wazuh syslog 514, which the old
+  # tcp-only probe was blind to). TWO single-proto calls (NOT one `ss -tuln`): with
+  # a single proto the Local-Address column is $4 in both -- the exact parse that
+  # produced the live 0.0.0.0 finding on graph -- so no new column assumption is
+  # introduced (a dual-proto call shifts Local to $5, and a mis-parse would degrade
+  # to a silent green, the very blindness we are closing). addr = local addr with
+  # the port stripped: 0.0.0.0:9200->'9200 0.0.0.0 tcp', [::]:5601->'5601 [::] tcp',
+  # *:5432->'5432 * tcp', udp 127.0.0.1:514->'514 127.0.0.1 udp'.
+  listen_tbl=$( { ss -ltnH 2>/dev/null | awk -v pr=tcp '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a" "pr}'
+                  ss -lunH 2>/dev/null | awk -v pr=udp '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a" "pr}'; } )
+  # A live host always has listeners (sshd at minimum). Empty => the probe broke
+  # (e.g. `ss` too old for -H), NOT a closed host: fail, don't pass green.
   if [ -z "$listen_tbl" ]; then
     echo "  FAIL: no listening sockets parsed from ss — cannot assert exposure"; fail=1
+  # Complementary guard: a working probe on any live host ALWAYS sees >=1 tcp
+  # listener (sshd:22). Zero tcp rows => the tcp leg of the probe silently broke
+  # (only udp parsed); refuse to certify exposure off a half-blind table.
+  elif ! printf '%s\n' "$listen_tbl" | awk '$3=="tcp"{f=1} END{exit f?0:1}'; then
+    echo "  FAIL: no TCP listeners parsed from ss (sshd:22 expected) — exposure probe broken, refusing green"; fail=1
   fi
   for p in $LOOPBACK_PORTS; do
+    # Two DISTINCT accepted-open rules, each self-identifying in the log so a
+    # reviewer can tell WHICH rule admitted a non-loopback port: expose_lan operator
+    # opt-in ($LAN_OK) vs a named profile's bind:0.0.0.0 ($PROFILE_OPEN).
     case " $LAN_OK " in *" $p "*) echo "  port $p: LAN opt-in (expose_lan) — skip"; continue;; esac
+    case " ${PROFILE_OPEN:-} " in *" $p "*) echo "  port $p: LAN opt-in (profile ${PROFILE_NAME:-?}) — skip"; continue;; esac
     addrs=$(printf '%s\n' "$listen_tbl" | awk -v pp="$p" '$1==pp {print $2}')
     if [ -z "$addrs" ]; then
       echo "  port $p: not listening (service down or not in this profile)"
@@ -348,7 +451,7 @@ echo "== HEALTH result: fail=$fail =="
 exit "$fail"
 REMOTE_EOF
 
-  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' TAILNET_PORTS='$tailnet_ports' bash -s" <<<"$HEALTH_SH"
+  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' PROFILE_OPEN='$profile_open' PROFILE_NAME='${profile:-}' TAILNET_PORTS='$tailnet_ports' bash -s" <<<"$HEALTH_SH"
   local rc=$?
   say "HEALTH rc=$rc  (0 => all gate checks passed)"; return "$rc"
 }
