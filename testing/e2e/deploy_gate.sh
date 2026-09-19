@@ -186,15 +186,67 @@ do_install() {
 # The exposure gate is DENY-BY-DEFAULT over the COMPLETE set of host-published
 # ports. That set is NOT hand-maintained here: it is derived from the manifests so
 # a port added to a service manifest is checked automatically (no blind spot).
-# derive_published_ports() unions every `{host: N ...}` publish entry across the
+# derive_published_ports() unions every port-mapping (`{host: N ...}`) across the
 # canonical global table, the per-service manifests, AND the profile overlays --
-# grepping all three (not just global.yml) keeps "no service port silently
-# unchecked" true even if the canonical table ever drifts from a service manifest.
-# `protocol: udp` entries (e.g. wazuh syslog 514) are included by number; the udp
-# listener table catches the bind. Emits unique host port NUMBERS, one per line.
+# reading all three (not just global.yml) keeps "no service port silently unchecked"
+# true even if the canonical table ever drifts from a service manifest. `protocol:
+# udp` entries (e.g. wazuh syslog 514) are included by number; the udp listener table
+# catches the bind. Emits unique host port NUMBERS, one per line.
+# PRIMARY = a real PyYAML walk (this runs CONTROLLER-side, where python3+PyYAML is
+# present -- the same convention wipe_lme.sh uses), so it is FORMAT-AGNOSTIC: a
+# publish_ports entry written flow-style (`{host: N, ...}`) or block-style (`- host:`
+# on its own line) is collected identically. FALLBACK (no python3/PyYAML on the
+# controller) = the flow-style grep, valid for today's flow-style manifests. A python
+# parse that errors or yields nothing degrades to the fallback rather than a partial.
 derive_published_ports() {
-  local root="$SRC/manifests"
+  local root="$SRC/manifests" out=""
   [ -d "$root" ] || return 1
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
+    if out=$(python3 - "$root" 2>/dev/null <<'PY'
+import glob, os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(3)
+root = sys.argv[1]
+ports = set()
+def add(h):
+    if isinstance(h, bool):
+        return
+    if isinstance(h, int):
+        ports.add(h)
+    elif isinstance(h, str) and h.strip().isdigit():
+        ports.add(int(h.strip()))
+def walk(n):
+    if isinstance(n, dict):
+        if 'host' in n:
+            add(n['host'])
+        for v in n.values():
+            walk(v)
+    elif isinstance(n, list):
+        for v in n:
+            walk(v)
+files = []
+gp = os.path.join(root, 'global.yml')
+if os.path.isfile(gp):
+    files.append(gp)
+files += sorted(glob.glob(os.path.join(root, 'services', '*.yml')))
+files += sorted(glob.glob(os.path.join(root, 'profiles', '*.yml')))
+for f in files:
+    try:
+        with open(f) as fh:
+            walk(yaml.safe_load(fh))
+    except Exception:
+        sys.exit(3)   # malformed manifest -> abort -> caller falls back
+for p in sorted(ports):
+    print(p)
+PY
+    ) && [ -n "$out" ]; then
+      printf '%s\n' "$out"
+      return
+    fi
+  fi
+  # FALLBACK: flow-style grep across all three sources.
   {
     [ -f "$root/global.yml" ] && grep -hE '\{[[:space:]]*host:' "$root/global.yml"
     grep -rhE '\{[[:space:]]*host:' "$root/services/" 2>/dev/null
@@ -225,11 +277,52 @@ explicit_profile() {
 }
 
 # profile_lan_ports(): the host ports the named profile deliberately opens to the
-# LAN. A profile opens a port ONLY by re-declaring publish_ports with bind:0.0.0.0
-# on that entry (default posture is loopback), so we pull exactly those host ports.
+# LAN. A profile opens a port ONLY by re-declaring a publish_ports entry with
+# bind:0.0.0.0 (default posture is loopback), so we pull exactly those host ports.
+# Format-agnostic PyYAML walk (a port dict with bind==0.0.0.0), grep fallback. An
+# EMPTY result is VALID (default/offline/tailscale open nothing), so a SUCCESSFUL
+# python parse is authoritative even when empty; only a parse error/absence falls back.
 profile_lan_ports() {
-  local prof="$1" pf="$SRC/manifests/profiles/${1}.yml"
+  local prof="$1" pf="$SRC/manifests/profiles/${1}.yml" out=""
   [ -n "$prof" ] && [ -f "$pf" ] || return 0
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
+    if out=$(python3 - "$pf" 2>/dev/null <<'PY'
+import sys
+try:
+    import yaml
+except Exception:
+    sys.exit(3)
+ports = set()
+def add(h):
+    if isinstance(h, bool):
+        return
+    if isinstance(h, int):
+        ports.add(h)
+    elif isinstance(h, str) and h.strip().isdigit():
+        ports.add(int(h.strip()))
+def walk(n):
+    if isinstance(n, dict):
+        if 'host' in n and str(n.get('bind')) == '0.0.0.0':
+            add(n['host'])
+        for v in n.values():
+            walk(v)
+    elif isinstance(n, list):
+        for v in n:
+            walk(v)
+try:
+    with open(sys.argv[1]) as fh:
+        walk(yaml.safe_load(fh))
+except Exception:
+    sys.exit(3)
+for p in sorted(ports):
+    print(p)
+PY
+    ); then
+      printf '%s\n' "$out" | grep -v '^[[:space:]]*$' || true
+      return
+    fi
+  fi
+  # FALLBACK: flow-style grep.
   grep -E '\{[[:space:]]*host:.*bind:[[:space:]]*0\.0\.0\.0' "$pf" \
     | grep -oE 'host:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | sort -un
 }
