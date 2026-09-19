@@ -338,9 +338,17 @@ do_health() {
   # pack. Guard the llm-only probes so the graph/trixie (default+llm) and any
   # reduced invocation both stay valid — same shape, different expected set.
   local llm_on=1
-  case " $FLAGS " in *" --no-llm "*|*" --offline "*) llm_on=0;; esac
+  case " $FLAGS " in *" --no-llm "*|*" --offline "*|*" -o "*) llm_on=0;; esac
   local elastic_on=0
   case " $FLAGS " in *" --elastic-services "*) elastic_on=1;; esac
+  # --offline (== -o, install.sh:114) forces BOTH the llm and elastic packs OFF
+  # (install.sh:276 llm, :695 elastic -- no offline bundle for either), so neither
+  # pack's containers count toward the floor on an offline run even when the flags
+  # are also present. Match -o too: here a MISSED offline detection would LOWER the
+  # floor (fail-unsafe), unlike the llm_on match above where a miss raises it.
+  local offline_on=0
+  case " $FLAGS " in *" --offline "*|*" -o "*) offline_on=1;; esac
+  [ "$offline_on" = 1 ] && { llm_on=0; elastic_on=0; }
 
   # Loopback-only set = DENY-BY-DEFAULT over the COMPLETE set of host-published
   # ports, DERIVED from the manifests (see derive_published_ports) rather than the
@@ -358,14 +366,27 @@ do_health() {
     return 1
   fi
 
-  # Expected running-container floor. Default 11 (default+llm). Auto-adjust for
-  # the reduced/expanded packs; an operator override always wins.
+  # Expected running-container floor, from the EFFECTIVE install flags. Long-running
+  # containers only (setup/oneshot units and volumes excluded):
+  #   core    = elasticsearch,kibana,fleet-server,wazuh-manager,elastalert2   (5)
+  #             + fleet-distribution, which starts ONLY in offline mode
+  #             (roles/fleet/tasks/main.yml:66 `when: offline_mode`) -- online
+  #             agents pull the installer from Elastic direct -> +1 IFF offline.
+  #   llm     = litellm,dashboard,log-analyzer,embeddings,llama-cpp,pgvector   (6)
+  #   elastic = apm-server,filebeat,logstash,metricbeat,heartbeat             (5)
+  # Observed: online+llm 5+6=11 (tailscale leg), online+elastic 5+5=10 (this leg's
+  # 5-core roster observed directly), offline core 6 (airgapped leg). The online
+  # core-only --no-llm floor (5) is DERIVED from that same 5-core roster, not
+  # separately exercised. An operator override always wins.
   local expect_min
   if [ -n "${LME_GATE_MIN_CONTAINERS:-}" ]; then
     expect_min="$LME_GATE_MIN_CONTAINERS"
   else
-    if [ "$llm_on" = 1 ]; then expect_min=11; else expect_min=6; fi
-    [ "$elastic_on" = 1 ] && expect_min=$((expect_min + 5))
+    local core_floor=5
+    [ "$offline_on" = 1 ] && core_floor=6            # fleet-distribution: offline-only
+    if [ "$llm_on" = 1 ]; then expect_min=$((core_floor + 6))   # + llm pack
+    else expect_min="$core_floor"; fi
+    [ "$elastic_on" = 1 ] && expect_min=$((expect_min + 5))     # + elastic pack
   fi
   # Accepted non-loopback binds come from two DISTINCT, separately-labelled rules:
   #   * expose_lan operator opt-in       -> LME_GATE_LAN_OK  (env, unchanged)
