@@ -16,15 +16,16 @@
 # EVERYTHING IS DERIVED FROM THE MANIFESTS — no port or service name is hardcoded:
 #   * which services exist + are enabled -> lme_services + is_enabled(lme_enable_flags)
 #     (both facts come from load_manifests.yml — see the wiring note re: order)
-#   * which of their ports are host-facing -> publish_ports with bind: 127.0.0.1.
-#     The tailscale profile (manifests/profiles/tailscale.yml) flips the UI/API
-#     binds to loopback EXACTLY so they are fronted here and NOT exposed on the LAN;
-#     a loopback bind is therefore the manifest's own "front me on the tailnet"
-#     signal. (With the default flags the derived set is 10 bare service ids --
-#     kibana, elasticsearch, wazuh-manager, fleet-server, fleet-distribution [always]
-#     + dashboard, embeddings, litellm, log-analyzer, pgvector [install_llm] -- not
-#     just the UI/API four.)
-#   * the VIP name -> the service's optional `tailnet_service`, else its logical id.
+#   * which services are VIP-fronted -> ONLY those whose manifest declares a top-level
+#     `tailnet_service:` OPT-IN key. That key's value is the svc name published+approved,
+#     so today the set is svc:lme-kibana, svc:lme-dashboard, svc:lme-log-analyzer and
+#     svc:lme-litellm -- NOT every loopback-bound service; internal DBs like pgvector and
+#     backends like fleet-distribution are deliberately excluded.
+#   * which of their ports are host-facing -> publish_ports with bind: 127.0.0.1. The
+#     tailscale profile (manifests/profiles/tailscale.yml) flips the UI/API binds to
+#     loopback so they are fronted here and NOT exposed on the LAN; the loopback bind
+#     selects WHICH port/scheme to front (it does not by itself opt a service in).
+#   * the VIP name -> the service's `tailnet_service` key (the opt-in marker; no fallback).
 #   * the front port -> the LOWEST-numbered loopback host port (canonical/privileged:
 #     e.g. kibana's 443 is chosen over 5601).
 #   * the serve mode -> the port's optional `serve` key (default `https`).
@@ -95,11 +96,11 @@
   ansible.builtin.set_fact:
     ts_svc_targets: []
 
-- name: Derive one tailnet VIP target per enabled host-facing (loopback-bound) service
+- name: Derive one tailnet VIP target per opt-in (tailnet_service-marked) host-facing service
   ansible.builtin.set_fact:
     ts_svc_targets: >-
       {{ ts_svc_targets + [ {
-           'service': (item.value.tailnet_service | default(item.value.id)),
+           'service': item.value.tailnet_service,
            'port':    ((_ts_lo | first).host),
            'scheme':  ((_ts_lo | first).serve | default('https')),
          } ] }}
@@ -122,6 +123,10 @@
   loop_control:
     label: "{{ item.value.id }}"
   when:
+    # OPT-IN gate (round-11): VIP-front ONLY services whose manifest declares a
+    # top-level `tailnet_service:` key -- NOT every loopback-bound service. This cheap
+    # first clause short-circuits the _ts_lo templating for the non-opted-in services.
+    - item.value.tailnet_service is defined
     - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
     - (_ts_lo | length) > 0
 
