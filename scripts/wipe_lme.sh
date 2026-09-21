@@ -37,11 +37,11 @@ PODMAN="sudo -i podman"
 #   * Node-scoped ingress serves (ansible/roles/podman/tasks/tailscale_ingress.yml):
 #     apm-server :8200 (https), litellm :4000 (https) and logstash beats :5044
 #     (raw --tcp). These are the ONLY node-scoped serves LME publishes.
-#   * VIP Services (tailscale_service.yml): svc:<name> for each enabled host-facing
-#     LME service. That leg DERIVES the name from each manifest (its optional
-#     `tailnet_service`, else its `id`) and publishes one only for a service that
-#     declares a loopback (bind:127.0.0.1) publish_port. Matched by EXACT name, so a
-#     non-LME svc:<name> is never reset or counted as residue.
+#   * VIP Services (tailscale_service.yml): svc:<name> for each host-facing LME service
+#     that OPTS IN via a top-level `tailnet_service:` key. That leg names the VIP from
+#     `tailnet_service` (NO id fallback) and publishes one only for an opt-in service
+#     that also declares a loopback (bind:127.0.0.1) publish_port. Matched by EXACT
+#     name, so a non-LME svc:<name> is never reset or counted as residue.
 LME_SERVE_HTTPS_PORTS=(8200 4000)            # node-scoped HTTPS ingress fronts
 LME_SERVE_TCP_PORTS=(5044)                   # node-scoped raw-TCP ingress front
 LME_SERVE_NODE_PORTS=(8200 4000 5044)        # every node-scoped LME serve port
@@ -52,13 +52,16 @@ LME_SERVE_NODE_PORTS=(8200 4000 5044)        # every node-scoped LME serve port
 # embeddings / fleet-distribution / pgvector / wazuh-manager were published as VIPs
 # but absent from the old static list, so teardown orphaned them yet reported clean.
 # We reproduce the publisher's derivation straight from manifests/services/*.yml:
-# svc name = the manifest's `tailnet_service` (else its `id`); "host-facing" = it
-# declares at least one loopback (bind:127.0.0.1), non-UDP publish_port -- exactly
-# the publisher's `_ts_loop`/`_ts_lo` selection (tailscale_service.yml:82-95). The
-# set therefore contains ONLY LME service ids by construction -- a co-tenant's
+# svc name = the manifest's `tailnet_service` OPT-IN key (NO id fallback); a service
+# is fronted ONLY when it BOTH carries a top-level `tailnet_service:` key AND declares
+# at least one loopback (bind:127.0.0.1), non-UDP publish_port -- exactly the
+# publisher's gate (`when: item.value.tailnet_service is defined` AND `_ts_lo|length>0`)
+# over its `_ts_loop`/`_ts_lo` selection (tailscale_service.yml:98-130). The set is
+# therefore exactly the opt-in VIP names (currently the 4 GO services: lme-kibana /
+# lme-dashboard / lme-log-analyzer / lme-litellm) by construction -- a co-tenant's
 # svc:<name> (svc:windows11 / svc:vncserverwindow / svc:webui) can never appear in
-# it and is never cleared. Teardown is deliberately inclusive of every service that
-# COULD carry a loopback VIP under any profile (we do NOT re-apply the per-profile
+# it and is never cleared. Teardown is deliberately inclusive of every OPT-IN service
+# that COULD carry a loopback VIP under any profile (we do NOT re-apply the per-profile
 # enable gate, and we read the BASE manifests, which are a superset of every
 # profile's published set -- the tailscale profile only re-declares binds already
 # loopback in base): clearing an svc that was never advertised is a safe no-op,
@@ -85,8 +88,9 @@ LME_SERVE_NODE_PORTS=(8200 4000 5044)        # every node-scoped LME serve port
 _wipe_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 LME_MANIFESTS_DIR="${LME_MANIFESTS_DIR:-${_wipe_script_dir}/../manifests}"
 
-# LME_SVC_NAMES  -- host-facing (loopback-VIP) services; SCOPES the reset in 4b and
-#                   is cleared there. Derived to match the publisher exactly.
+# LME_SVC_NAMES  -- the `tailnet_service:` OPT-IN VIP services (host-facing loopback
+#                   VIPs that also carry the opt-in key); SCOPES the reset in 4b and is
+#                   cleared there. Derived to match the publisher's opt-in gate exactly.
 # LME_MANIFEST_NAMES -- EVERY service manifest's VIP name; used ONLY by the 6d
 #                   residue cross-check (never to reset), so a derivation miss cannot
 #                   silently orphan a VIP.
@@ -108,10 +112,11 @@ if [ -d "${LME_MANIFESTS_DIR}/services" ]; then
   # Same PyYAML-on-PATH convention the rest of the repo uses to read manifests.
   export PATH="$PATH:/nix/var/nix/profiles/default/bin"
 
-  # --- Host-facing set (LME_SVC_NAMES) -------------------------------------------
+  # --- Opt-in VIP set (LME_SVC_NAMES) --------------------------------------------
   # PRIMARY: a real YAML parse. ATOMIC -- any unreadable/malformed manifest aborts
   # the whole derivation (non-zero exit) so we fall back rather than emit a partial
-  # (silently incomplete) set. Reproduces the publisher's host-facing filter.
+  # (silently incomplete) set. Reproduces the publisher's opt-in gate: a top-level
+  # `tailnet_service:` key AND a loopback (bind:127.0.0.1) non-UDP publish_port.
   _svc_out=""
   # stderr suppressed: a malformed manifest makes this exit non-zero and we DEGRADE
   # to the fallback below (quiet by design -- a stray parse traceback mid-teardown
@@ -135,7 +140,12 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yml"))):
     if not any(isinstance(p, dict) and p.get("bind") == "127.0.0.1"
                and p.get("protocol") != "udp" for p in ports):
         continue
-    name = doc.get("tailnet_service") or doc.get("id")
+    # Opt-in ONLY: mirror the publisher's `when: item.value.tailnet_service is
+    # defined` gate and its NO-id-fallback naming -- a service without the key is
+    # NOT fronted as a VIP, so skip it here too (never fall back to the bare id).
+    name = doc.get("tailnet_service")
+    if not name:
+        continue
     if name and name not in seen:
         seen.add(name)
         out.append(str(name))
@@ -145,7 +155,8 @@ PY
     mapfile -t LME_SVC_NAMES < <(printf '%s\n' "$_svc_out" | grep -v '^[[:space:]]*$' || true)
   else
     # FALLBACK (no PyYAML): scope to the top-level `publish_ports:` block and test for
-    # a loopback bind INSIDE it. Format-agnostic (flow AND block) and inclusive-safe
+    # a loopback bind INSIDE it, then require the `tailnet_service:` opt-in key (same
+    # two-part gate as PRIMARY). Format-agnostic (flow AND block) and inclusive-safe
     # (an over-match only clears an svc that was never advertised -- a no-op). The
     # block scope replaces the old flow-anchor's job of not false-positiving a stray
     # 127.0.0.1 comment elsewhere in the file.
@@ -157,7 +168,12 @@ PY
       # pattern excludes `-` as well as spaces and `#`.
       awk '/^publish_ports:/{inb=1;next} inb && /^[^[:space:]#-]/{inb=0} inb' "$_mf" \
         | grep -q '127\.0\.0\.1' || continue
-      _svc=$(_wipe_manifest_name "$_mf")
+      # Opt-in ONLY: read the top-level `tailnet_service:` scalar directly and skip a
+      # manifest that lacks it -- mirrors the publisher's `tailnet_service is defined`
+      # gate + NO-id-fallback naming. Deliberately NOT _wipe_manifest_name(): that
+      # helper still falls back to `id` for LME_MANIFEST_NAMES (the 6d residue set),
+      # which is correct there but would re-leak the bare-id services here.
+      _svc=$(sed -nE 's/^tailnet_service:[[:space:]]*([^[:space:]#]+).*/\1/p' "$_mf" | head -n1)
       [ -n "$_svc" ] && LME_SVC_NAMES+=("$_svc")
     done
   fi
