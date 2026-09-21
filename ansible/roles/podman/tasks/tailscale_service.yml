@@ -51,18 +51,19 @@
 # whether a VIP was actually allocated. Advertising rejection is NOT surfaced by the serve
 # command, so a green publish does NOT prove a live VIP.
 #
-# VIP LIVENESS ASSERT (IMPLEMENTED below, post-publish): the authoritative liveness signal
-# is Self.CapMap["services/<name>"], present ONLY when the service is defined+approved in
-# the tailnet policy AND this node is an approved host. Validated LIVE 2026-09-21 on
-# silmaril: `services/vncserverwindow` present <=> live VIP; `svc:webui` served-but-absent
-# <=> dead VIP; `service-host` is a HOST-level flag, NOT a per-service discriminator (do
-# not key liveness on it). The post-publish block re-reads `tailscale status --json`, waits
-# (bounded) for auto-approval to propagate, derives LIVE vs DEAD from CapMap, reports both,
-# and on any DEAD VIP FAILS LOUD when `tailscale_require_vip_live` is true (set it in the
-# tailscale profile / -e once the svc names are defined+approved in policy) else emits a
-# loud WARN. Defining+approving these svc names in the tailnet policy is what makes the
-# VIPs allocate; the svc names are the manifest ids above, so policy and code stay in
-# lock-step.
+# VIP LIVENESS ASSERT (IMPLEMENTED below, post-publish): the authoritative per-VIP liveness
+# signal is Self.CapMap["services/<name>"] -- one key per allocated+approved VIP, present
+# ONLY when the service is defined+approved in the tailnet policy AND this node is an
+# approved host. Validated LIVE 2026-09-21 on silmaril with a positive AND negative control:
+# `services/vncserverwindow` present <=> live VIP; `svc:webui` served-but-absent-from-CapMap
+# <=> dead VIP. (Liveness keys on `services/<name>` only; other Self flags are not used as a
+# discriminator.) The post-publish block does a SINGLE `tailscale status --json` read (no
+# retry-until -- see the block below for why an until would hard-fail the play), derives
+# LIVE vs DEAD from CapMap, reports both, and on any DEAD VIP FAILS LOUD when
+# `tailscale_require_vip_live` is true (set it in the tailscale profile / -e once the svc
+# names are defined+approved in policy) else emits a loud WARN. Defining+approving these svc
+# names in the tailnet policy is what makes the VIPs allocate; the svc names are the manifest
+# ids above, so policy and code stay in lock-step.
 #
 # Idempotent: `tailscale serve status` and `tailscale serve get-config --all` surface
 # different views, so BOTH are read and a VIP is treated as already-present if EITHER
@@ -188,27 +189,37 @@
   become: true
 
 # --- Post-publish VIP liveness verification (CapMap-keyed, see header) -------------
-# Re-read status, giving auto-approval a bounded window to propagate into CapMap. The
-# `until` succeeds as soon as every published svc appears live; a genuinely undefined
-# svc never appears, so this exhausts retries (~30s) then falls through to the typed
-# report + fail/warn below. `become: true` because CapMap detail needs the operator.
-- name: Wait (bounded) for published VIPs to appear live in Self.CapMap
+# SINGLE status read -- deliberately NO `until:`/`retries:`. An `until` keyed on VIP
+# liveness would NEVER satisfy for a genuinely-dead VIP, and Ansible force-sets
+# `failed=True` on retry exhaustion (task_executor for-else), OVERRIDING `failed_when:
+# false` -- that would hard-abort the play on exactly the all-dead state and make the
+# default-warn path below unreachable dead code (round-11 B1). The tailnet-policy POST
+# that defines+approves these svc names lands BEFORE this deploy, so the VIPs are already
+# live here -- there is nothing to wait for. (A window keyed on `rc == 0` would satisfy on
+# attempt 1 regardless of liveness, i.e. buy nothing; and an `ignore_errors`/`rescue`
+# wait leaves a permanent ignored=1/rescued=1 that fails `deploy_gate --strict`.)
+- name: Re-read tailscale status for post-publish VIP liveness
   ansible.builtin.command: tailscale status --json
   register: ts_status_post
   changed_when: false
   failed_when: false
   become: true
-  retries: 6
-  delay: 5
-  until: >-
-    ts_status_post.rc == 0
-    and (ts_status_post.stdout | default('')) | length > 0
-    and (ts_svc_targets | map(attribute='service')
-         | reject('in', ((ts_status_post.stdout | from_json).Self.CapMap | default({})
-                          | list | select('match', '^services/')
-                          | map('regex_replace', '^services/', '') | list))
-         | list | length) == 0
   when: ts_svc_targets | length > 0
+
+# If the status read itself failed we cannot judge liveness. Under enforcement, fail loud
+# (hostile rejection of false success) rather than let the gated Derive/Report below be
+# skipped and silently print an all-clear (round-11 S1: the rc!=0 report hole).
+- name: Fail if post-publish status read failed under liveness enforcement
+  ansible.builtin.fail:
+    msg: >-
+      Post-publish `tailscale status --json` failed (rc={{ ts_status_post.rc | default('n/a') }},
+      stdout_len={{ (ts_status_post.stdout | default('')) | length }}) so tailnet VIP
+      liveness cannot be verified. tailscale_require_vip_live is set, so this is a typed
+      failure rather than a false all-clear.
+  when:
+    - ts_svc_targets | length > 0
+    - tailscale_require_vip_live | default(false) | bool
+    - (ts_status_post.rc | default(1)) != 0 or (ts_status_post.stdout | default('')) | length == 0
 
 - name: Derive LIVE vs DEAD tailnet VIPs from Self.CapMap
   ansible.builtin.set_fact:
@@ -216,14 +227,15 @@
     ts_dead_vips: "{{ ts_svc_targets | map(attribute='service') | reject('in', _ts_capmap_services) | list }}"
   vars:
     # CapMap keys look like "services/<name>"; strip the prefix to bare service names.
-    # `| default({})` guards a node whose CapMap is absent/null (same crash class the
-    # ingress leg's unguarded from_json risks).
+    # `or {}` coerces BOTH an absent (Undefined) and a JSON-null CapMap to an empty map
+    # (`| default({})` only replaces Undefined, not null -- round-11 S2). The when-gate
+    # (rc==0 + non-empty stdout) keeps from_json off the empty/failed-read path.
     _ts_capmap_services: >-
-      {{ (ts_status_post.stdout | from_json).Self.CapMap | default({})
+      {{ ((ts_status_post.stdout | from_json).Self.CapMap or {})
          | list | select('match', '^services/') | map('regex_replace', '^services/', '') | list }}
   when:
     - ts_svc_targets | length > 0
-    - ts_status_post.rc == 0
+    - (ts_status_post.rc | default(1)) == 0
     - (ts_status_post.stdout | default('')) | length > 0
 
 - name: Report tailnet VIP liveness (CapMap-verified, not serve-intent)
