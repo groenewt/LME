@@ -1,0 +1,50 @@
+---
+- name: Resolve actual domain backup owner uid
+  ansible.builtin.command:
+    argv: [id, -u, "{{ postgresql_platform_owners[postgresql_platform_domain].name }}"]
+  register: postgresql_platform_backup_uid
+  changed_when: false
+
+- name: Read current primary state before initial backup
+  ansible.builtin.command:
+    argv:
+      - podman
+      - exec
+      - --env
+      - PGSERVICEFILE=/run/secrets/pg_service.conf
+      - "pg-{{ postgresql_platform_domain }}"
+      - psql
+      - -X
+      - -A
+      - -t
+      - -v
+      - ON_ERROR_STOP=1
+      - "service={{ postgresql_platform_domain }}_candidate_{{ postgresql_platform_config.node }} sslmode=verify-full"
+      - -c
+      - SELECT NOT pg_is_in_recovery()
+  become: true
+  become_user: "{{ postgresql_platform_owners[postgresql_platform_domain].name }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ postgresql_platform_backup_uid.stdout }}"
+  register: postgresql_platform_backup_primary
+  changed_when: false
+
+- name: Require the initial primary before repository mutation
+  ansible.builtin.assert:
+    that: postgresql_platform_backup_primary.stdout | trim == 't'
+
+- name: Initialize only this domain's TLS repository stanza
+  ansible.builtin.command:
+    argv: [podman, exec, "pg-{{ postgresql_platform_domain }}", pgbackrest, "--stanza={{ postgresql_platform_domain }}", stanza-create]
+  become: true
+  become_user: "{{ postgresql_platform_owners[postgresql_platform_domain].name }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ postgresql_platform_backup_uid.stdout }}"
+
+- name: Verify WAL archiving and create the initial full physical backup
+  ansible.builtin.command:
+    argv: [podman, exec, "pg-{{ postgresql_platform_domain }}", python3, -m, scripts.postgresql_platform, backup, --domain, "{{ postgresql_platform_domain }}", --type, full]
+  become: true
+  become_user: "{{ postgresql_platform_owners[postgresql_platform_domain].name }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ postgresql_platform_backup_uid.stdout }}"

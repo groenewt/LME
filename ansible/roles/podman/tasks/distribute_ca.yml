@@ -6,13 +6,10 @@
 # WHY: every LME install mints its OWN internal CA. A cross-host consumer (e.g. the
 # dashboard / log-analyzer running on `trixie`) that dials the PRODUCER's Elasticsearch
 # over TLS receives the producer's internal-CA leaf -- so it must trust the PRODUCER's
-# ca/ca.crt, NOT its own. The consumer's TLS client reads that CA from its published
-# bundle: lme-dashboard/app.py:99 -> verify="/certs/ca/ca.crt", and cert:<svc> mounts
-# <certs.host_tree>/<svc> at /certs (roles/podman/filter_plugins/lme_manifests.py:166),
-# so the on-host file is <certs.host_tree>/<svc>/ca/ca.crt. The certs role publishes that
-# path from the LOCAL workspace (roles/certs/tasks/main.yml:192) -> on the consumer it is
-# the CONSUMER's own CA, which does NOT verify the producer's leaf. This task OVERLAYS the
-# producer's CA there.
+# ca/ca.crt, NOT its own. The consumer's Elasticsearch client reads the dedicated
+# /certs/ca/elasticsearch-ca.crt path. A cert:<svc> mount exposes the host-tree bundle
+# at /certs, so this task replaces only that Elasticsearch trust anchor. The sibling
+# /certs/ca/ca.crt remains the local CA used by LiteLLM and other local backends.
 #
 # THIRD ARTIFACT / SEPARATE TRANSPORT: ca/ca.crt is NOT in the secrets_distribution tar
 # (that tar carries pass.sh + vault + containers.conf + secrets.json only -- verified).
@@ -27,11 +24,9 @@
 # is an EXPLICIT operator var `lme_ca_consumers` (list of service ids), never a manifest
 # auto-select, and every named id is validated as an ENABLED cert:<svc> bundle on this host.
 #
-# OVERLAY (override), not append: the only reader is the ES client above; its backend is
-# on the producer, so the producer CA is the whole trust anchor for that client path (the
-# consumer's OWN server identity uses its leaf .crt/.key, not this ca.crt). Override is
-# content-idempotent. Append/supplement would only matter for a host with mixed local +
-# remote TLS backends -- none exist today; see the wave report residuals.
+# OVERLAY (override), not append: the producer CA is the whole trust anchor for the
+# dedicated Elasticsearch path. The local ca/ca.crt and the consumer's own leaf/key
+# remain untouched. The copy is content-idempotent.
 #
 # GATING/ORDERING: included from site.yml gated on lme_distribute_ca (default false ->
 # NO-OP for every single-host deploy), AFTER the certs role published this node's bundles
@@ -47,7 +42,8 @@
     # onto itself) that reports 'changed' and closes NOTHING -- the exact false-success
     # class GAP-2 warns about. The self-overlay guard below rejects it. Operator supplies
     # -e lme_ca_source_host=<producer> (or -e lme_secrets_source_host=<producer>).
-    lme_ca_source_host: "{{ lme_ca_source_host | default(lme_secrets_source_host | default('localhost')) }}"
+    lme_ca_effective_source_host: >-
+      {{ lme_ca_source_host | default(lme_secrets_source_host | default('localhost'), true) }}
   run_once: true
 
 # Fail LOUD on a self-overlay (operator opted in but forgot the source host, or aimed it
@@ -57,9 +53,9 @@
 - name: "GAP-2: refuse a self-overlay (producer must differ from this consumer host)"
   ansible.builtin.assert:
     that:
-      - lme_ca_source_host not in ['localhost', '127.0.0.1', inventory_hostname]
+      - lme_ca_effective_source_host not in ['localhost', '127.0.0.1', inventory_hostname]
     fail_msg: >-
-      lme_ca_source_host resolved to '{{ lme_ca_source_host }}', which is THIS host. A
+      lme_ca_source_host resolved to '{{ lme_ca_effective_source_host }}', which is THIS host. A
       self-overlay copies the consumer's own CA onto itself and silently closes nothing.
       Set -e lme_ca_source_host=<producer> (e.g. the graph node) or -e lme_secrets_source_host=<producer>.
     quiet: true
@@ -105,12 +101,12 @@
       mount a cert:<svc> bundle. Fix the list or the host's enable flags.
     success_msg: >-
       CA consumers {{ lme_ca_consumer_bundles | default([]) | map(attribute='id') | list }} will
-      trust the producer CA slurped from {{ lme_ca_source_host }}.
+      trust the producer CA slurped from {{ lme_ca_effective_source_host }}.
 
 # --- slurp the PUBLIC producer CA once, from the source host --------------------
 - name: "GAP-2: resolve lme_certs volume mountpoint on the producer"
   ansible.builtin.command: "podman volume inspect -f '{{ '{{' }} .Mountpoint {{ '}}' }}' lme_certs"
-  delegate_to: "{{ lme_ca_source_host }}"
+  delegate_to: "{{ lme_ca_effective_source_host }}"
   run_once: true
   become: true
   register: lme_ca_src_mountpoint
@@ -120,7 +116,7 @@
   ansible.builtin.slurp:
     src: "{{ lme_ca_src_mountpoint.stdout }}/ca/ca.crt"
   register: lme_ca_bundle_raw
-  delegate_to: "{{ lme_ca_source_host }}"
+  delegate_to: "{{ lme_ca_effective_source_host }}"
   run_once: true
   become: true
 
@@ -135,7 +131,7 @@
     that:
       - "'BEGIN CERTIFICATE' in lme_ca_producer_content"
     fail_msg: >-
-      {{ lme_ca_src_mountpoint.stdout }}/ca/ca.crt on {{ lme_ca_source_host }} is not a PEM
+      {{ lme_ca_src_mountpoint.stdout }}/ca/ca.crt on {{ lme_ca_effective_source_host }} is not a PEM
       certificate -- refusing to overlay a non-CA artifact onto the consumer trust path.
     quiet: true
 
@@ -152,14 +148,40 @@
     label: "{{ item.id }}"
   become: true
 
-- name: "GAP-2: overlay the producer CA onto the consumer bundle ca/ca.crt (override; idempotent)"
+- name: "GAP-2: install the producer CA at the dedicated Elasticsearch trust path"
   ansible.builtin.copy:
     content: "{{ lme_ca_producer_content }}"
-    dest: "{{ lme_global.certs.host_tree }}/{{ item.id }}/ca/ca.crt"
+    dest: "{{ lme_global.certs.host_tree }}/{{ item.id }}/ca/elasticsearch-ca.crt"
     owner: "{{ item.owner | string }}"
     group: "{{ item.owner | string }}"
     mode: '0644'
   loop: "{{ lme_ca_consumer_bundles | default([]) }}"
   loop_control:
-    label: "{{ item.id }} -> {{ lme_global.certs.host_tree }}/{{ item.id }}/ca/ca.crt"
+    label: "{{ item.id }} -> {{ lme_global.certs.host_tree }}/{{ item.id }}/ca/elasticsearch-ca.crt"
+  become: true
+  register: lme_ca_install_results
+
+# On a fresh install these units are inactive and the normal site.yml start occurs
+# later. On a re-run, restart only running consumers whose CA changed, after the
+# readable replacement is fully installed, so cached SSL contexts pick it up.
+- name: "GAP-2: inspect changed CA consumers before restart"
+  ansible.builtin.command: "systemctl is-active lme-{{ item.item.id }}.service"
+  loop: "{{ lme_ca_install_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.id }}"
+  when: item.changed | default(false)
+  register: lme_ca_active_consumers
+  changed_when: false
+  failed_when: false
+
+- name: "GAP-2: restart running consumers after their CA change"
+  ansible.builtin.systemd:
+    name: "lme-{{ item.item.item.id }}.service"
+    state: restarted
+  loop: "{{ lme_ca_active_consumers.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.id }}"
+  when:
+    - not (item.skipped | default(false))
+    - item.rc | default(1) == 0
   become: true

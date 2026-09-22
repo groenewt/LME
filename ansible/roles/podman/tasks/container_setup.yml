@@ -179,13 +179,9 @@
     # the roster (empty/undefined roster -> full host, backward-compat).
     - (lme_host_services | default([]) | length == 0) or (item.key in (lme_host_services | default([])))
 
-# Two secret-creation recipes exist:
+# Two secret-creation recipes exist (the classes live in role defaults):
 #   * known credentials  -> created HERE with the shell-driver random-password
-#     recipe below. This list is ALSO the credential floor: it is exactly the four
-#     names setup_secrets.yml hard-requires (setup_secrets.yml:126-129), so union
-#     | this can only ADD to, never regress below, the pre-manifest behavior --
-#     important while MA1's wazuh-manager manifest (declares wazuh / wazuh_api) is
-#     not yet present in manifests/services/.
+#     recipe below when creation is local.
 #   * deferred secrets   -> created by llama_cpp_setup.yml with their own recipes
 #     (pgvector + litellm_master_key + webui_api_key: random file-driver passwords;
 #     llm-keys: empty placeholder). GAP-5 host-scopes llama_cpp_setup to hosts that
@@ -199,11 +195,6 @@
 #     (The prior claim here -- "a rendered consumer never precedes their creation" -- was
 #     the same false premise GAP-5 corrected in trixie.yml/site.yml; it assumed the mint
 #     rode install_llm, but GAP-5 re-gates it on the pgvector RENDER.)
-- name: Classify the secret set (known credentials vs LLM-stack deferred)
-  set_fact:
-    lme_known_password_secrets: [elastic, kibana_system, wazuh, wazuh_api]
-    lme_secrets_deferred: [pgvector, llm-keys, litellm_master_key, webui_api_key]
-
 # Fail-closed: the two sets MUST stay disjoint. lme_password_secrets (below) strips the
 # deferred set from the shell-driver mint, so a deferred name ALSO listed as a known password
 # would satisfy the recipe guard (it is in known) yet never be minted here -> the very
@@ -223,25 +214,23 @@
       an LLM host or arrives via cross-host distribution, never by the shell loop.
     success_msg: "known-password and deferred secret sets are disjoint."
 
-# GAP-5: the deferred recipe (llama_cpp_setup) is HOST-CONDITIONAL now -- it runs only
+# GAP-5: the deferred local recipe (llama_cpp_setup) is HOST-CONDITIONAL -- it runs only
 # where this host renders the LLM backend (lme_llm_backing_service='pgvector' in
 # lme_host_rendered_services). So "deferred" is a valid creation recipe HERE only on such
 # a host; on a cross-host consumer the deferred secrets can only arrive via armed
-# distribution (lme_distribute_secrets + lme_cross_host_file_secrets, GAP-4). Compute the
-# secret names THIS host actually has a create/arrive recipe for. Note this is a
-# DECLARATIVE roster check (not `podman secret ls`), so a dangling/payload-less secret a
-# prior run persisted cannot mask a missing recipe.
+# distribution. When local creation is skipped, ONLY the authorized distribution roster
+# is a recipe; known local-password names must not accidentally satisfy B3. Note this is a
+# declarative check, so a dangling/payload-less persisted entry cannot mask a missing recipe.
 - name: Compute the secrets THIS host has a creation recipe for (GAP-5 host-scoped)
   set_fact:
     lme_secrets_recipe_here: >-
-      {{ (lme_known_password_secrets
-          + (lme_secrets_deferred
-             if ((lme_llm_backing_service | default('')) in (lme_host_rendered_services | default([])))
-             else [])
-          + ((lme_cross_host_file_secrets | default([]))
-             if (lme_distribute_secrets | default(false) | bool)
-             else [])
-         ) | unique }}
+      {{ ((lme_cross_host_file_secrets | default([]))
+          if (lme_skip_secret_creation | default(false) | bool)
+          else
+            (lme_known_password_secrets
+             + (lme_secrets_deferred
+                if ((lme_llm_backing_service | default('')) in (lme_host_rendered_services | default([])))
+                else []))) | unique }}
 
 # Fail-closed B3 guard: any enabled+rendered secret with no creation recipe ON THIS HOST
 # has no way to exist -> a rendered unit would reference an uncreated secret. Stop loudly

@@ -9,7 +9,7 @@ Serves the SPA and provides API endpoints for:
 import os
 import json
 import logging
-import socket
+import re
 import ssl
 import base64
 import hashlib
@@ -23,10 +23,12 @@ import httpx
 import psycopg2
 import yaml
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from ai_views import router as ai_router
+from telemetry_views import router as telemetry_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,15 +40,46 @@ ES_PASS = os.getenv("ELASTICSEARCH_PASSWORD", "")
 KIBANA_URL = os.getenv("KIBANA_URL", "https://lme-kibana:5601")
 LITELLM_URL = os.getenv("LITELLM_URL", "https://lme-litellm:4000")
 LITELLM_KEY = os.getenv("LITELLM_API_KEY")
-if not LITELLM_KEY:
-    # Fail closed: never fall back to a hardcoded proxy key. LITELLM_API_KEY is
-    # injected from the per-install podman secret `litellm_master_key`.
-    raise RuntimeError(
-        "LITELLM_API_KEY is not set. The dashboard requires the LiteLLM proxy "
-        "master key (podman secret 'litellm_master_key') to be injected as "
-        "LITELLM_API_KEY. Refusing to start without proxy credentials."
-    )
 LITELLM_MDL = os.getenv("LITELLM_MODEL", "lfm2.5-1.2b-instruct")
+
+# Outbound TLS is fail-closed by default. Each backend has a dedicated trust
+# anchor so cross-host producer CAs can rotate independently.
+ES_SSL_VERIFY = os.getenv("ELASTICSEARCH_SSL_VERIFY", "true")
+ES_CA_CERT = os.getenv("ELASTICSEARCH_CA_CERT", "/certs/ca/elasticsearch-ca.crt")
+LITELLM_SSL_VERIFY = os.getenv("LITELLM_SSL_VERIFY", "true")
+LITELLM_CA_CERT = os.getenv("LITELLM_CA_CERT", "/certs/ca/litellm-ca.crt")
+EMBEDDINGS_SSL_VERIFY = os.getenv("EMBEDDINGS_SSL_VERIFY", "true")
+EMBEDDINGS_CA_CERT = os.getenv("EMBEDDINGS_CA_CERT", "/certs/ca/embeddings-ca.crt")
+_TLS_TRUTHY = {"1", "true", "yes", "on"}
+_TLS_FALSY = {"0", "false", "no", "off"}
+
+
+def _strict_bool(name, raw) -> bool:
+    """Parse a configured boolean without silently weakening TLS on a typo."""
+    value = str(raw).strip().lower()
+    if value in _TLS_TRUTHY:
+        return True
+    if value in _TLS_FALSY:
+        return False
+    raise ValueError(
+        f"{name} must be one of true/false, 1/0, yes/no, or on/off; got {raw!r}"
+    )
+
+
+def _tls_verify(name: str, raw, ca_path: str):
+    """Build an httpx verify value with CA-chain and hostname verification."""
+    if not _strict_bool(name, raw):
+        return False
+    # create_default_context fails at startup if the configured CA is absent or
+    # unreadable. Its default check_hostname=True is intentionally preserved.
+    return ssl.create_default_context(cafile=ca_path)
+
+
+# Contexts are built by the route-specific clients. This keeps telemetry and
+# liveness available when an unrelated AI/embedding trust file is unavailable.
+ES_VERIFY = None
+LITELLM_VERIFY = None
+EMBEDDINGS_VERIFY = None
 
 # ── Inbound auth (WebUI API key) ─────────────────────────────────────────────
 # Mirror of the outbound LiteLLM master-key guard above: production injects
@@ -86,18 +119,33 @@ KEV_SYNC_SCRIPT = os.getenv("KEV_SYNC_SCRIPT", "/opt/lme/scripts/kev_sync.py")
 _active_model = {"name": LITELLM_MDL}
 
 
+def _active_model_revision() -> str:
+    """Read the deployed local-model artifact revision without inventing one."""
+    try:
+        config = json.loads(Path(LLAMA_MODEL_CONFIG).read_text())
+    except (OSError, ValueError, TypeError):
+        return ""
+    revision = config.get("sha256") if isinstance(config, dict) else None
+    return revision if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{64}", revision) else ""
+
+
 def _sync_active_model_from_litellm(retries: int = 5, delay: float = 5.0):
     """On startup, sync _active_model with what LiteLLM actually has registered."""
     import time
 
     import httpx as _httpx
 
+    if not LITELLM_KEY:
+        logger.warning("LiteLLM model sync skipped: LITELLM_API_KEY is unavailable")
+        return
+    verify = (LITELLM_VERIFY if LITELLM_VERIFY is not None else
+              _tls_verify("LITELLM_SSL_VERIFY", LITELLM_SSL_VERIFY, LITELLM_CA_CERT))
     for attempt in range(1, retries + 1):
         try:
             r = _httpx.get(
                 f"{LITELLM_URL}/v1/models",
                 headers={"Authorization": f"Bearer {LITELLM_KEY}"},
-                verify="/certs/ca/ca.crt",
+                verify=verify,
                 timeout=5,
             )
             if r.status_code == 200:
@@ -111,9 +159,6 @@ def _sync_active_model_from_litellm(retries: int = 5, delay: float = 5.0):
                 logger.warning("Could not sync active model from LiteLLM: %s", e)
             else:
                 time.sleep(delay)
-
-
-_sync_active_model_from_litellm()
 
 
 # ── Encrypted key storage ────────────────────────────────────────────────────
@@ -184,71 +229,33 @@ def _env_var_name(provider: str) -> str:
     return f"LME_LLM_KEY_{provider.upper()}"
 
 
-# httpx clients — both ES and LiteLLM use self-signed certs
-PGVECTOR_HOST = os.getenv("PGVECTOR_HOST", "lme-pgvector")
+# Backend clients
+PGVECTOR_HOST = os.getenv("PGVECTOR_HOST", "pg-vector-rw")
 PGVECTOR_PORT = int(os.getenv("PGVECTOR_PORT", "5432"))
 PGVECTOR_DB = os.getenv("PGVECTOR_DB", "lme_vectors")
-PGVECTOR_USER = os.getenv("PGVECTOR_USER", "lme")
-PGVECTOR_PASS = os.getenv("PGVECTOR_PASS", "")
+PGVECTOR_USER = os.getenv("PGVECTOR_USER", "lme_vectors_app")
+PGVECTOR_SSLMODE = os.getenv("PGVECTOR_SSLMODE", "verify-full")
+PGVECTOR_SSLROOTCERT = os.getenv(
+    "PGVECTOR_SSLROOTCERT", "/run/secrets/postgresql/ca.crt"
+)
+PGVECTOR_SSLCERT = os.getenv("PGVECTOR_SSLCERT", "/run/secrets/postgresql/tls.crt")
+PGVECTOR_SSLKEY = os.getenv("PGVECTOR_SSLKEY", "/run/secrets/postgresql/tls.key")
+PGVECTOR_PASSFILE = os.getenv("PGVECTOR_PASSFILE", "/run/secrets/postgresql/.pgpass")
 EMBED_URL = os.getenv("EMBED_URL", "https://lme-embeddings:8081")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "10"))
 RAG_MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.55"))  # drop chunks below this similarity
 RAG_MIN_CHARS = int(os.getenv("RAG_MIN_CHARS", "200"))   # drop stub/redirect chunks
 
 ES_AUTH = (ES_USER, ES_PASS)
-VERIFY_SSL = False          # internal self-signed certs (LiteLLM + embeddings clients)
-
-# ── Elasticsearch TLS verification (env-gated; manifest-declared) ─────────────
-# The ES client's verify posture is a manifest-declared toggle, not a baked-in
-# literal. DEFAULT ("false") preserves today's behavior (verify=False). When
-# ELASTICSEARCH_SSL_VERIFY is enabled the ES client verifies the certificate
-# chain against ELASTICSEARCH_CA_CERT but SKIPS hostname matching (Path-1: the
-# cross-host consumer dials a ts.net FQDN absent from the internal-CA leaf SAN).
-# The CA-path VALUE is manifest-declared and lands in-container at
-# /certs/ca/ca.crt -- the same literal the litellm-sync call above already reads.
-ES_SSL_VERIFY = os.getenv("ELASTICSEARCH_SSL_VERIFY", "false")
-ES_CA_CERT = os.getenv("ELASTICSEARCH_CA_CERT", "/certs/ca/ca.crt")
-_ES_TRUTHY = {"1", "true", "yes", "on"}
-_ES_FALSY = {"0", "false", "no", "off", ""}
-
-
-def _es_verify_enabled(raw) -> bool:
-    """Interpret ELASTICSEARCH_SSL_VERIFY. Allowlist-truthy: a typo degrades to
-    today's behavior (verification OFF) rather than silently claiming a
-    verification that did not happen. A non-empty *unrecognized* value warns and
-    still defaults OFF (avoids the insecure-success failure class)."""
-    val = str(raw).strip().lower()
-    if val in _ES_TRUTHY:
-        return True
-    if val in _ES_FALSY:
-        return False
-    logger.warning(
-        "ELASTICSEARCH_SSL_VERIFY=%r not recognized; Elasticsearch TLS "
-        "verification defaulting to OFF", raw,
-    )
-    return False
-
-
-def _es_verify():
-    """Return the ES-client verify= value: False, or a skip-hostname SSLContext.
-
-    ON path builds an ssl.SSLContext that verifies the chain against ES_CA_CERT
-    with check_hostname disabled (Path-1). httpx accepts an SSLContext as verify=.
-    """
-    if not _es_verify_enabled(ES_SSL_VERIFY):
-        return False
-    ctx = ssl.create_default_context(cafile=ES_CA_CERT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    return ctx
-
-
-# Built once at import. When the toggle is ON and the CA is missing this raises
-# at startup -- fail-closed (uvicorn won't start), the correct signal when the
-# operator explicitly asked for verification. The OFF default builds no context.
-ES_VERIFY = _es_verify()
-
 app = FastAPI(title="LME Dashboard", docs_url=None, redoc_url=None)
+app.include_router(telemetry_router)
+app.include_router(ai_router)
+
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; "
+    "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+)
 
 # ── Inbound auth gate ─────────────────────────────────────────────────────────
 
@@ -275,16 +282,20 @@ async def require_webui_api_key(request: Request, call_next):
     /livez, and the SPA shell (`/`, `/static`) stays reachable so the browser
     can load and then call the API with the key.
     """
+    response = None
     if WEBUI_API_KEY and request.url.path.startswith("/api/"):
         provided = _extract_api_key(request)
         if not provided or not hmac.compare_digest(provided.encode(), WEBUI_API_KEY.encode()):
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=401,
                 content={"detail": "Missing or invalid API key. Provide 'X-API-Key: <key>' "
                                    "or 'Authorization: Bearer <key>'."},
                 headers={"WWW-Authenticate": "Bearer"},
             )
-    return await call_next(request)
+    if response is None:
+        response = await call_next(request)
+    response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+    return response
 
 
 @app.get("/livez")
@@ -293,15 +304,53 @@ async def livez():
     return {"status": "ok"}
 
 
+@app.websocket("/api/stream/status")
+async def stream_status(websocket: WebSocket):
+    """Authenticated operational status channel used by the browser proxy."""
+    provided = _extract_api_key(websocket)
+    if (not WEBUI_API_KEY or not provided
+            or not hmac.compare_digest(provided.encode(), WEBUI_API_KEY.encode())):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    try:
+        message = await websocket.receive_json()
+        nonce = message.get("nonce") if isinstance(message, dict) else None
+        if (message.get("operation") != "status" or not isinstance(nonce, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", nonce)):
+            await websocket.close(code=1008)
+            return
+        await websocket.send_json({
+            "nonce": nonce,
+            "active_model": _active_model["name"],
+            "authenticated_login": websocket.headers.get("x-lme-authenticated-login", ""),
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        })
+    finally:
+        await websocket.close()
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
 def es_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(verify=ES_VERIFY, timeout=15)
+    verify = (ES_VERIFY if ES_VERIFY is not None else
+              _tls_verify("ELASTICSEARCH_SSL_VERIFY", ES_SSL_VERIFY, ES_CA_CERT))
+    return httpx.AsyncClient(verify=verify, timeout=15)
 
 
 def llm_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(verify=VERIFY_SSL, timeout=300)
+    if not LITELLM_KEY:
+        raise RuntimeError("LITELLM_API_KEY is unavailable")
+    verify = (LITELLM_VERIFY if LITELLM_VERIFY is not None else
+              _tls_verify("LITELLM_SSL_VERIFY", LITELLM_SSL_VERIFY, LITELLM_CA_CERT))
+    return httpx.AsyncClient(verify=verify, timeout=300)
+
+
+def embedding_client() -> httpx.AsyncClient:
+    verify = (EMBEDDINGS_VERIFY if EMBEDDINGS_VERIFY is not None else
+              _tls_verify("EMBEDDINGS_SSL_VERIFY", EMBEDDINGS_SSL_VERIFY, EMBEDDINGS_CA_CERT))
+    return httpx.AsyncClient(verify=verify, timeout=30)
 
 
 def _severity_order(s: str) -> int:
@@ -334,24 +383,23 @@ def _build_search_should(q: str, fields: list[str], ip_fields: list[str] | None 
 async def health():
     """Quick connectivity check for both ES and LiteLLM."""
     status = {"elasticsearch": "unknown", "litellm": "unknown", "es_password_set": bool(ES_PASS)}
-    async with es_client() as c:
-        try:
+    try:
+        async with es_client() as c:
             r = await c.get(f"{ES_URL}/_cluster/health", auth=ES_AUTH)
             status["elasticsearch"] = r.json().get("status", "error")
-        except Exception as e:
-            status["elasticsearch"] = f"error: {e}"
-    async with llm_client() as c:
-        try:
+    except Exception as e:
+        status["elasticsearch"] = f"error: {e}"
+    try:
+        async with llm_client() as c:
             r = await c.get(f"{LITELLM_URL}/health",
                             headers={"Authorization": f"Bearer {LITELLM_KEY}"})
             status["litellm"] = "ok" if r.status_code < 400 else f"http {r.status_code}"
-        except Exception as e:
-            status["litellm"] = f"error: {e}"
-    # pgvector — TCP reachability check (no extra deps needed)
+    except Exception as e:
+        status["litellm"] = f"error: {e}"
+    # Authenticate and complete a TLS-protected query. A listening socket alone
+    # does not prove that the client identity, trust chain, or database grants work.
     try:
-        sock = socket.create_connection((PGVECTOR_HOST, PGVECTOR_PORT), timeout=3)
-        sock.close()
-        status["pgvector"] = "ok"
+        status["pgvector"] = "ok" if _pg_ready() else "error: SELECT 1 returned no row"
     except Exception as e:
         status["pgvector"] = f"error: {e}"
     return status
@@ -1144,8 +1192,8 @@ async def chat(req: ChatRequest):
         "temperature": 0.7,
         "max_tokens": 800,
     }
-    async with llm_client() as c:
-        try:
+    try:
+        async with llm_client() as c:
             r = await c.post(
                 f"{LITELLM_URL}/v1/chat/completions",
                 headers={"Authorization": f"Bearer {LITELLM_KEY}",
@@ -1153,10 +1201,16 @@ async def chat(req: ChatRequest):
                 json=payload,
             )
             r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(e.response.status_code, f"LLM error: {e.response.text[:300]}")
-        except Exception as e:
-            raise HTTPException(502, f"LLM unreachable: {e}")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(e.response.status_code, detail={
+            "state": "model_unavailable",
+            "message": f"LLM error: {e.response.text[:300]}",
+        })
+    except Exception as e:
+        raise HTTPException(502, detail={
+            "state": "model_unavailable",
+            "message": f"LLM unreachable: {e}",
+        })
 
     result = r.json()
     return {"content": result["choices"][0]["message"]["content"]}
@@ -1234,8 +1288,8 @@ Reply with exactly three sections (be brief, 1-2 sentences each):
         "temperature": 0.3,
         "max_tokens": 400,
     }
-    async with llm_client() as c:
-        try:
+    try:
+        async with llm_client() as c:
             r = await c.post(
                 f"{LITELLM_URL}/v1/chat/completions",
                 headers={"Authorization": f"Bearer {LITELLM_KEY}",
@@ -1243,10 +1297,16 @@ Reply with exactly three sections (be brief, 1-2 sentences each):
                 json=payload,
             )
             r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(e.response.status_code, f"LLM error: {e.response.text[:300]}")
-        except Exception as e:
-            raise HTTPException(502, f"LLM unreachable: {e}")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(e.response.status_code, detail={
+            "state": "model_unavailable",
+            "message": f"LLM error: {e.response.text[:300]}",
+        })
+    except Exception as e:
+        raise HTTPException(502, detail={
+            "state": "model_unavailable",
+            "message": f"LLM unreachable: {e}",
+        })
 
     result = r.json()
     return {"analysis": result["choices"][0]["message"]["content"]}
@@ -1254,17 +1314,61 @@ Reply with exactly three sections (be brief, 1-2 sentences each):
 
 # ── RAG helpers ──────────────────────────────────────────────────────────────
 
+def _pg_connection_kwargs(validate_files: bool = True) -> dict:
+    """Return a fail-closed libpq mTLS connection contract.
+
+    Authentication comes from a libpq passfile and the client certificate/key.
+    The password is deliberately absent from process arguments and environment.
+    """
+    if PGVECTOR_SSLMODE != "verify-full":
+        raise RuntimeError("PGVECTOR_SSLMODE must be exactly 'verify-full'")
+
+    credential_files = {
+        "PGVECTOR_SSLROOTCERT": PGVECTOR_SSLROOTCERT,
+        "PGVECTOR_SSLCERT": PGVECTOR_SSLCERT,
+        "PGVECTOR_SSLKEY": PGVECTOR_SSLKEY,
+        "PGVECTOR_PASSFILE": PGVECTOR_PASSFILE,
+    }
+    if validate_files:
+        for name, path in credential_files.items():
+            if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                raise RuntimeError(f"{name} is missing or unreadable: {path}")
+        for name in ("PGVECTOR_SSLKEY", "PGVECTOR_PASSFILE"):
+            path = credential_files[name]
+            if os.stat(path).st_mode & 0o077:
+                raise RuntimeError(f"{name} must not be accessible by group or other: {path}")
+
+    return {
+        "host": PGVECTOR_HOST,
+        "port": PGVECTOR_PORT,
+        "dbname": PGVECTOR_DB,
+        "user": PGVECTOR_USER,
+        "sslmode": PGVECTOR_SSLMODE,
+        "sslrootcert": PGVECTOR_SSLROOTCERT,
+        "sslcert": PGVECTOR_SSLCERT,
+        "sslkey": PGVECTOR_SSLKEY,
+        "passfile": PGVECTOR_PASSFILE,
+        "connect_timeout": 5,
+    }
+
+
 def _pg_conn():
-    return psycopg2.connect(
-        host=PGVECTOR_HOST, port=PGVECTOR_PORT, dbname=PGVECTOR_DB,
-        user=PGVECTOR_USER, password=PGVECTOR_PASS,
-        connect_timeout=5,
-    )
+    return psycopg2.connect(**_pg_connection_kwargs())
+
+
+def _pg_ready() -> bool:
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            return cur.fetchone() == (1,)
+    finally:
+        conn.close()
 
 
 async def _embed_query(query: str) -> list[float]:
     """Embed a single query string via the lme-embeddings llama.cpp server."""
-    async with httpx.AsyncClient(verify=VERIFY_SSL, timeout=30) as c:
+    async with embedding_client() as c:
         r = await c.post(
             f"{EMBED_URL}/v1/embeddings",
             json={"model": "nomic-embed-text", "input": query},
@@ -1287,8 +1391,8 @@ async def _retrieve_context(query: str, top_k: int = RAG_TOP_K) -> list[dict]:
     # Fetch 5x top_k candidates so filtering still leaves enough good chunks
     fetch_k = top_k * 5
 
+    conn = _pg_conn()
     try:
-        conn = _pg_conn()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -1301,10 +1405,8 @@ async def _retrieve_context(query: str, top_k: int = RAG_TOP_K) -> list[dict]:
                 (vec_str, vec_str, fetch_k),
             )
             rows = cur.fetchall()
+    finally:
         conn.close()
-    except Exception as e:
-        logger.warning(f"RAG retrieval failed: {e}")
-        return []
 
     seen = {}
     filtered = []
@@ -1379,7 +1481,22 @@ async def chat_rag(req: RagChatRequest):
         (m.content for m in reversed(req.messages) if m.role == "user"), ""
     )
 
-    chunks = await _retrieve_context(user_query, top_k=req.top_k)
+    try:
+        chunks = await _retrieve_context(user_query, top_k=req.top_k)
+    except Exception:
+        return JSONResponse(status_code=503, content={
+            "state": "retrieval_unavailable",
+            "content": "Documentation retrieval is currently unavailable.",
+            "sources": [],
+            "provenance": None,
+        })
+    if not chunks:
+        return {
+            "state": "no_match",
+            "content": "I could not find that in the LME documentation.",
+            "sources": [],
+            "provenance": None,
+        }
     system_prompt = _build_rag_system_prompt(chunks)
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -1392,8 +1509,8 @@ async def chat_rag(req: RagChatRequest):
         "max_tokens": 250,
     }
 
-    async with llm_client() as c:
-        try:
+    try:
+        async with llm_client() as c:
             r = await c.post(
                 f"{LITELLM_URL}/v1/chat/completions",
                 headers={"Authorization": f"Bearer {LITELLM_KEY}",
@@ -1401,14 +1518,26 @@ async def chat_rag(req: RagChatRequest):
                 json=payload,
             )
             r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(e.response.status_code, f"LLM error: {e.response.text[:300]}")
-        except Exception as e:
-            raise HTTPException(502, f"LLM unreachable: {e}")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(e.response.status_code, detail={
+            "state": "model_unavailable",
+            "message": f"LLM error: {e.response.text[:300]}",
+        })
+    except Exception as e:
+        raise HTTPException(502, detail={
+            "state": "model_unavailable",
+            "message": f"LLM unreachable: {e}",
+        })
 
     result = r.json()
     return {
+        "state": "complete",
         "content": result["choices"][0]["message"]["content"],
+        "provenance": {
+            "requested_model": payload["model"],
+            "response_model": result.get("model", ""),
+            "model_revision": _active_model_revision(),
+        },
         "sources": [
             {"url": c["url"], "title": c["title"],
              "section": c["section"], "similarity": c["similarity"],
@@ -1425,12 +1554,18 @@ async def chat_rag_stream(req: RagChatRequest):
         (m.content for m in reversed(req.messages) if m.role == "user"), ""
     )
 
-    chunks = await _retrieve_context(user_query, top_k=req.top_k)
+    try:
+        chunks = await _retrieve_context(user_query, top_k=req.top_k)
+    except Exception:
+        async def retrieval_unavailable():
+            yield f"data: {json.dumps({'state': 'retrieval_unavailable', 'sources': []})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(retrieval_unavailable(), media_type="text/event-stream", status_code=503)
 
     # If no relevant chunks found, skip the LLM entirely
     if not chunks:
         async def not_found():
-            yield f"data: {json.dumps({'sources': []})}\n\n"
+            yield f"data: {json.dumps({'state': 'no_match', 'sources': []})}\n\n"
             yield f"data: {json.dumps({'content': 'I could not find that in the LME documentation. '})}\n\n"
             yield f"data: {json.dumps({'content': 'Read more: https://cisagov.github.io/lme-docs/'})}\n\n"
             yield "data: [DONE]\n\n"
@@ -1466,8 +1601,9 @@ async def chat_rag_stream(req: RagChatRequest):
 
         # Buffer full response, then clean and emit
         full_text = ""
-        async with llm_client() as c:
-            try:
+        response_model = ""
+        try:
+            async with llm_client() as c:
                 async with c.stream(
                     "POST",
                     f"{LITELLM_URL}/v1/chat/completions",
@@ -1483,7 +1619,7 @@ async def chat_rag_stream(req: RagChatRequest):
                                 detail = detail.get("message", str(detail))
                         except Exception:
                             detail = body.decode(errors="replace")
-                        yield f"data: {json.dumps({'error': f'LLM error ({resp.status_code}): {detail}'})}\n\n"
+                        yield f"data: {json.dumps({'state': 'model_unavailable', 'error': f'LLM error ({resp.status_code}): {detail}'})}\n\n"
                         return
                     async for line in resp.aiter_lines():
                         if line.startswith("data: "):
@@ -1492,23 +1628,52 @@ async def chat_rag_stream(req: RagChatRequest):
                                 break
                             try:
                                 obj = json.loads(chunk_data)
+                                if isinstance(obj.get("model"), str) and obj["model"]:
+                                    response_model = obj["model"]
                                 delta = obj["choices"][0].get("delta", {})
                                 if "content" in delta and delta["content"]:
                                     full_text += delta["content"]
                             except Exception:
                                 pass
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-                return
+        except Exception as e:
+            yield f"data: {json.dumps({'state': 'model_unavailable', 'error': str(e)})}\n\n"
+            return
 
         cleaned = _clean_rag_response(full_text, best_url)
         yield f"data: {json.dumps({'content': cleaned})}\n\n"
+        provenance_event = {"provenance": {
+            "requested_model": payload["model"],
+            "response_model": response_model,
+            "model_revision": _active_model_revision(),
+        }}
+        yield "data: " + json.dumps(provenance_event) + "\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 # ── Documentation ingestion ──────────────────────────────────────────────────
+
+def _ingest_environment() -> dict[str, str]:
+    """Build the ingester environment without propagating password secrets."""
+    env = os.environ.copy()
+    env.pop("PGVECTOR_PASS", None)
+    env.update({
+        "PGVECTOR_HOST": PGVECTOR_HOST,
+        "PGVECTOR_PORT": str(PGVECTOR_PORT),
+        "PGVECTOR_DB": PGVECTOR_DB,
+        "PGVECTOR_USER": PGVECTOR_USER,
+        "PGVECTOR_SSLMODE": PGVECTOR_SSLMODE,
+        "PGVECTOR_SSLROOTCERT": PGVECTOR_SSLROOTCERT,
+        "PGVECTOR_SSLCERT": PGVECTOR_SSLCERT,
+        "PGVECTOR_SSLKEY": PGVECTOR_SSLKEY,
+        "PGVECTOR_PASSFILE": PGVECTOR_PASSFILE,
+        "EMBED_URL": EMBED_URL,
+        "EMBEDDINGS_SSL_VERIFY": EMBEDDINGS_SSL_VERIFY,
+        "EMBEDDINGS_CA_CERT": EMBEDDINGS_CA_CERT,
+    })
+    return env
+
 
 @app.get("/api/docs/status")
 async def docs_status():
@@ -1540,13 +1705,7 @@ async def ingest_docs():
     if not os.path.isfile(script):
         raise HTTPException(404, "ingest_docs.py not found in container")
 
-    env = os.environ.copy()
-    env["PGVECTOR_PASS"] = PGVECTOR_PASS
-    env["PGVECTOR_HOST"] = PGVECTOR_HOST
-    env["PGVECTOR_PORT"] = str(PGVECTOR_PORT)
-    env["PGVECTOR_DB"] = PGVECTOR_DB
-    env["PGVECTOR_USER"] = PGVECTOR_USER
-    env["EMBED_URL"] = EMBED_URL
+    env = _ingest_environment()
 
     try:
         result = subprocess.run(

@@ -8,13 +8,15 @@
 # This role uses a "push" pattern: the bundle is read from the source host via slurp
 # and pushed directly to targets with become: true, ensuring files arrive root-owned.
 
-- name: Determine certificate source host (first elasticsearch host)
+- name: Resolve certificate source host without overwriting an explicit selection
   ansible.builtin.set_fact:
     # Cluster path: first host in the elasticsearch inventory group. Single-node /
     # cluster-master via site.yml run on implicit localhost (no elasticsearch group)
     # -> degenerate to self (source==target). Undefined-group would abort this
     # role's first task; the default() chain keeps it cluster-safe AND single-node-safe.
-    lme_certs_source_host: "{{ (groups['elasticsearch'] | default([]))[0] | default(inventory_hostname) }}"
+    lme_certs_effective_source_host: >-
+      {{ lme_certs_source_host
+         | default((groups['elasticsearch'] | default([]))[0] | default(inventory_hostname), true) }}
   run_once: true
 
 # --- B4 cert-owner derivation (manifest tree is the single source of truth) ------
@@ -52,13 +54,13 @@
     owner: root
     group: root
     mode: '0644'
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
 
 - name: Ensure lme_certs volume exists (source host)
   ansible.builtin.command: podman volume inspect lme_certs
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
   register: lme_certs_inspect_source
@@ -67,7 +69,7 @@
 
 - name: Create lme_certs volume if missing (source host)
   ansible.builtin.command: podman volume create lme_certs
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
   when: lme_certs_inspect_source.rc != 0
@@ -79,7 +81,7 @@
     echo "Removed certs.zip from $MOUNT to force leaf cert regeneration"
   args:
     executable: /bin/bash
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
   when: lme_force_cert_regen | default(false) | bool
@@ -91,7 +93,7 @@
     echo "Removed ca.zip from $MOUNT to force CA regeneration"
   args:
     executable: /bin/bash
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
   when: lme_force_ca_regen | default(false) | bool
@@ -101,13 +103,13 @@
     name: lme-setup-certs
     state: started
     daemon_reload: true
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
 
 - name: Get lme_certs mountpoint on source host
   ansible.builtin.command: "podman volume inspect -f '{{ '{{' }} .Mountpoint {{ '}}' }}' lme_certs"
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
   register: lme_certs_mountpoint_source
@@ -115,7 +117,7 @@
 
 - name: Create tarball of lme_certs volume contents on source host
   ansible.builtin.command: "tar -C {{ lme_certs_mountpoint_source.stdout | quote }} -czf /tmp/lme_certs.tgz ."
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
 
@@ -123,7 +125,7 @@
   ansible.builtin.slurp:
     src: /tmp/lme_certs.tgz
   register: certs_bundle
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
   no_log: true
@@ -161,7 +163,8 @@
 # --- B4 cert PUBLISHING: per-service bundles under <certs.host_tree>/<svc> --------
 # Each cert:<svc> consumer gets its OWN published bundle, mirroring the workspace
 # SUBDIRECTORY layout the consumer configs expect: <svc>/<svc>.(crt|key|chain.pem)
-# plus the PUBLIC ca/ca.crt. The CA PRIVATE key (ca/ca.key) is NEVER copied here --
+# plus the PUBLIC ca/ca.crt and initial identical per-backend trust anchors for
+# Elasticsearch, LiteLLM, and embeddings. The CA PRIVATE key (ca/ca.key) is NEVER copied here --
 # it stays workspace-only and is mounted into nothing. A pure CA-verifying consumer
 # (the beats: no minted leaf in the workspace) receives only ca/ca.crt. Bundle
 # ownership is the manifest-DERIVED cert_owner uid (a host subuid), applied HERE by
@@ -190,6 +193,11 @@
       install -d -m 0755 "${new}/ca"
       # PUBLIC CA cert ONLY -- ca/ca.key is never copied out of the workspace.
       install -m 0644 "${ws}/ca/ca.crt" "${new}/ca/ca.crt"
+      # Application clients use a distinct Elasticsearch trust path so a remote
+      # producer CA can replace this copy without disturbing local backend trust.
+      install -m 0644 "${ws}/ca/ca.crt" "${new}/ca/elasticsearch-ca.crt"
+      install -m 0644 "${ws}/ca/ca.crt" "${new}/ca/litellm-ca.crt"
+      install -m 0644 "${ws}/ca/ca.crt" "${new}/ca/embeddings-ca.crt"
       # Leaf subdir only if this service has its own minted leaf in the workspace
       # (a CA-only consumer such as a beat has none -> bundle is ca/ca.crt only).
       if [ -d "${ws}/${svc}" ]; then
@@ -222,7 +230,7 @@
   ansible.builtin.file:
     path: /tmp/lme_certs.tgz
     state: absent
-  delegate_to: "{{ lme_certs_source_host }}"
+  delegate_to: "{{ lme_certs_effective_source_host }}"
   run_once: true
   become: true
   failed_when: false

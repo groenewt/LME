@@ -1,0 +1,237 @@
+---
+- name: Require the exact physical trixie run-scoped backup contract
+  ansible.builtin.assert:
+    that:
+      - postgresql_backup_config.node == 'trixie'
+      - postgresql_backup_config.owner == 'lmebackup'
+      - postgresql_backup_config.root == '/home/lme-backups/' ~ postgresql_backup_config.run_id
+      - postgresql_backup_config.capacity_bytes == 107374182400
+      - postgresql_backup_config.reserve_bytes == 107374182400
+
+- name: Verify exact-path prerequisites before physical changes
+  ansible.builtin.script:
+    cmd: "preflight.py {{ postgresql_backup_config.run_id }} {{ postgresql_backup_config.capacity_bytes }} {{ postgresql_backup_config.reserve_bytes + postgresql_backup_config.runtime_overhead_bytes + postgresql_backup_config.existing_commit_bytes }} {{ postgresql_backup_config.publish_address }}"
+    executable: python3
+  become: true
+  changed_when: false
+
+- name: Create the dedicated backup group
+  ansible.builtin.group:
+    name: lmebackup
+    gid: 2400
+    state: present
+  become: true
+
+- name: Create the dedicated rootless backup identity
+  ansible.builtin.user:
+    name: lmebackup
+    uid: 2400
+    group: lmebackup
+    home: /home/lmebackup
+    shell: /usr/sbin/nologin
+    create_home: true
+    password_lock: true
+    state: present
+  become: true
+
+- name: Allocate only the checked backup subordinate identity range
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    line: lmebackup:20000000:65536
+    create: false
+  loop: [/etc/subuid, /etc/subgid]
+  become: true
+
+- name: Create root-controlled run and configuration directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: lmebackup
+    mode: '0750'
+  loop:
+    - /home/lme-backups
+    - "{{ postgresql_backup_config.root }}"
+    - "{{ postgresql_backup_config.root }}/config"
+  become: true
+
+- name: Create only an absent mountpoint without changing an active repository owner
+  ansible.builtin.file:
+    path: "{{ postgresql_backup_config.mount_path }}"
+    state: directory
+  become: true
+
+- name: Record the exact run-owned filesystem identity before allocation
+  ansible.builtin.copy:
+    content: "{{ {'run_id': postgresql_backup_config.run_id, 'capacity_bytes': postgresql_backup_config.capacity_bytes, 'owner': 'lmebackup'} | to_json }}"
+    dest: "{{ postgresql_backup_config.root }}/ownership.json"
+    owner: root
+    group: root
+    mode: '0600'
+    force: false
+  become: true
+
+- name: Inspect only this run's backing image
+  ansible.builtin.stat:
+    path: "{{ postgresql_backup_config.root }}/repository.img"
+    follow: false
+  register: postgresql_backup_image
+  become: true
+
+- name: Allocate the actual bounded 100GiB image
+  ansible.builtin.command:
+    argv: [fallocate, --length, '107374182400', "{{ postgresql_backup_config.root }}/repository.img"]
+  when: not postgresql_backup_image.stat.exists
+  become: true
+
+- name: Create ext4 only in the image created by this invocation
+  ansible.builtin.command:
+    argv: [mkfs.ext4, -F, -m, '0', "{{ postgresql_backup_config.root }}/repository.img"]
+  when: not postgresql_backup_image.stat.exists
+  become: true
+
+- name: Protect the backing image from direct service-owner access
+  ansible.builtin.file:
+    path: "{{ postgresql_backup_config.root }}/repository.img"
+    owner: root
+    group: root
+    mode: '0600'
+  become: true
+
+- name: Stage the exact persistent file-backed mount
+  ansible.builtin.copy:
+    content: "{{ postgresql_backup_config.mount_unit }}"
+    dest: "/etc/systemd/system/{{ postgresql_backup_config.mount_name }}"
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+
+- name: Mount only the run-owned bounded repository filesystem
+  ansible.builtin.systemd_service:
+    name: "{{ postgresql_backup_config.mount_name }}"
+    daemon_reload: true
+    enabled: true
+    state: started
+  become: true
+
+- name: Grant the backup owner only the mounted repository contents
+  ansible.builtin.file:
+    path: "{{ postgresql_backup_config.mount_path }}"
+    owner: lmebackup
+    group: lmebackup
+    mode: '0700'
+    state: directory
+  become: true
+
+- name: Stage exact backup TLS grants without logging contents
+  ansible.builtin.copy:
+    src: "{{ item.source_path }}"
+    dest: "{{ item.destination }}"
+    owner: root
+    group: lmebackup
+    mode: '0640'
+  loop: "{{ postgresql_backup_config.credential_grants }}"
+  no_log: true
+  become: true
+
+- name: Stage stanza-restricted TLS server configuration
+  ansible.builtin.copy:
+    content: "{{ postgresql_backup_config.server_config }}"
+    dest: "{{ postgresql_backup_config.root }}/config/pgbackrest.conf"
+    owner: root
+    group: lmebackup
+    mode: '0640'
+  become: true
+
+- name: Create the owner Quadlet directory
+  ansible.builtin.file:
+    path: /home/lmebackup/.config/containers/systemd
+    owner: lmebackup
+    group: lmebackup
+    mode: '0700'
+    state: directory
+  become: true
+
+- name: Stage qualified image archive for this rootless owner
+  ansible.builtin.copy:
+    src: "{{ postgresql_backup_config.image.archive }}"
+    dest: "{{ postgresql_backup_config.root }}/image.oci.tar"
+    owner: lmebackup
+    group: lmebackup
+    mode: '0400'
+  become: true
+
+- name: Verify the copied immutable archive
+  ansible.builtin.stat:
+    path: "{{ postgresql_backup_config.root }}/image.oci.tar"
+    checksum_algorithm: sha256
+  register: postgresql_backup_archive
+  become: true
+
+- name: Require the qualified archive hash
+  ansible.builtin.assert:
+    that: postgresql_backup_archive.stat.checksum == postgresql_backup_config.image.archive_sha256
+
+- name: Enable only the dedicated backup user manager
+  ansible.builtin.command:
+    argv: [loginctl, enable-linger, lmebackup]
+  become: true
+
+- name: Load the qualified image into the backup owner's store
+  ansible.builtin.command:
+    argv: [podman, load, --input, "{{ postgresql_backup_config.root }}/image.oci.tar"]
+  become: true
+  become_user: lmebackup
+  environment:
+    XDG_RUNTIME_DIR: /run/user/2400
+
+- name: Stage the pgBackRest-only rootless service
+  ansible.builtin.copy:
+    content: "{{ postgresql_backup_config.container }}"
+    dest: "/home/lmebackup/.config/containers/systemd/pgbackrest-{{ postgresql_backup_config.run_id }}.container"
+    owner: lmebackup
+    group: lmebackup
+    mode: '0600'
+  become: true
+
+- name: Stage the narrowly scoped root-owned backup retirement helper
+  ansible.builtin.copy:
+    src: retire.py
+    dest: "{{ postgresql_backup_config.root }}/config/retire.py"
+    owner: root
+    group: root
+    mode: '0700'
+  become: true
+
+- name: Start the TLS repository with a hard filesystem capacity boundary
+  ansible.builtin.systemd_service:
+    name: "pgbackrest-{{ postgresql_backup_config.run_id }}.service"
+    scope: user
+    daemon_reload: true
+    state: started
+  become: true
+  become_user: lmebackup
+  environment:
+    XDG_RUNTIME_DIR: /run/user/2400
+
+
+- name: Read the exact newly installed backup container identity
+  ansible.builtin.command:
+    argv: [podman, inspect, --type, container, "pgbackrest-{{ postgresql_backup_config.run_id }}"]
+  register: postgresql_backup_native_identity
+  changed_when: false
+  no_log: true
+  become: true
+  become_user: lmebackup
+  environment:
+    XDG_RUNTIME_DIR: /run/user/2400
+
+- name: Record only the run-owned runtime identity for bounded retirement
+  ansible.builtin.copy:
+    content: "{{ {'run_id': postgresql_backup_config.run_id, 'owner': 'lmebackup', 'root': postgresql_backup_config.root, 'unit': 'pgbackrest-' ~ postgresql_backup_config.run_id ~ '.service', 'container_name': 'pgbackrest-' ~ postgresql_backup_config.run_id, 'image_id': postgresql_backup_config.image.reference, 'initial_container_id': (postgresql_backup_native_identity.stdout | from_json)[0].Id, 'quadlet_sha256': postgresql_backup_config.container | hash('sha256')} | to_nice_json }}"
+    dest: "{{ postgresql_backup_config.root }}/runtime-identity.json"
+    owner: root
+    group: root
+    mode: '0600'
+  become: true

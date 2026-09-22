@@ -5,12 +5,9 @@
 - name: Set playbook variables
   ansible.builtin.set_fact:
     ipvar: "{{ env_dict.IPVAR | default('') }}"
-    # Advertised host for remote fleet enrollment (multinode opt-in, item 1+3).
-    # Defaults to ipvar's own source (env_dict.IPVAR) so a single-node install is
-    # byte-identical; override with -e fleet_advertise_host=<tailnet MagicDNS name/IP>
-    # under the multinode profile. (Defaulting to env_dict.IPVAR rather than the
-    # sibling `ipvar` fact avoids relying on intra-set_fact evaluation order; the
-    # resolved value is identical.)
+    # Backward-compatibility input only.  Enrollment and output resolve to separate
+    # hosts below; an existing caller that supplies only fleet_advertise_host keeps
+    # the historical same-host behavior.
     fleet_advertise_host: "{{ fleet_advertise_host | default(env_dict.IPVAR | default('')) }}"
     local_kbn_url: "{{ env_dict.LOCAL_KBN_URL | default('') }}"
     local_es_url: "{{ env_dict.LOCAL_ES_URL | default('') }}"
@@ -30,6 +27,57 @@
     wazuh_password: "{{ global_secrets.wazuh | default('') }}"
     kibana_system_password: "{{ global_secrets.kibana_system | default('') }}"
     wazuh_api_password: "{{ global_secrets.wazuh_api | default('') }}"
+  no_log: true
+  diff: false
+
+- name: Resolve separate Fleet enrollment and output hosts
+  ansible.builtin.set_fact:
+    fleet_enrollment_host: "{{ fleet_enrollment_host | default(fleet_advertise_host | default(ipvar)) }}"
+    fleet_output_host: "{{ fleet_output_host | default(fleet_advertise_host | default(ipvar)) }}"
+
+- name: Resolve separate Fleet enrollment and output URLs
+  ansible.builtin.set_fact:
+    fleet_enrollment_url: "{{ fleet_enrollment_url | default('https://' ~ fleet_enrollment_host ~ ':' ~ fleet_port) }}"
+    fleet_output_url: "{{ fleet_output_url | default('https://' ~ fleet_output_host ~ ':9200') }}"
+
+- name: Assert Fleet endpoint contracts are valid HTTPS authorities
+  ansible.builtin.assert:
+    that:
+      - fleet_enrollment_host | length > 0
+      - fleet_output_host | length > 0
+      - (fleet_enrollment_url | urlsplit('scheme')) == 'https'
+      - (fleet_output_url | urlsplit('scheme')) == 'https'
+      - (fleet_enrollment_url | urlsplit('hostname')) == fleet_enrollment_host
+      - (fleet_output_url | urlsplit('hostname')) == fleet_output_host
+      - (fleet_enrollment_url | urlsplit('port') | int) == (fleet_port | int)
+      - (fleet_output_url | urlsplit('port') | int) == 9200
+      - (fleet_enrollment_url | urlsplit('path')) in ['', '/']
+      - (fleet_output_url | urlsplit('path')) in ['', '/']
+      - (fleet_enrollment_url | urlsplit('query')) | length == 0
+      - (fleet_output_url | urlsplit('query')) | length == 0
+    fail_msg: >-
+      Fleet endpoint resolution is invalid. Enrollment and output must be separate,
+      absolute HTTPS authority URLs with no query/path payload: enrollment={{ fleet_enrollment_url }},
+      output={{ fleet_output_url }}.
+    quiet: true
+
+- name: Assert admitted lab multinode endpoints never use wildcard binds
+  ansible.builtin.assert:
+    that:
+      - fleet_enrollment_bind_address | default('') | length > 0
+      - fleet_enrollment_bind_address not in ['0.0.0.0', '::']
+      - >-
+        (tailscale_serve_services | default(false) | bool)
+        or (fleet_output_bind_address | default('') | length > 0
+            and fleet_output_bind_address not in ['0.0.0.0', '::'])
+    fail_msg: >-
+      Admitted lab multinode Fleet routes require explicit tailnet bind addresses.
+      Enrollment may not use a wildcard, and direct output mode may not publish
+      Elasticsearch on 0.0.0.0/::.
+    quiet: true
+  when:
+    - lme_lab_mode | default(false) | bool
+    - lme_profile | default('default') == 'multinode'
 
 - name: Debug - Display set variables (sensitive information redacted)
   debug:
@@ -106,7 +154,7 @@
     kibana_status.json.status.overall.level == "available"
   retries: 60
   delay: 20
-  no_log: "{{ not debug_mode }}"
+  no_log: true
 
 - name: Debug Kibana status
   debug:
@@ -129,7 +177,7 @@
     es_health.json.status in ["green", "yellow"]
   retries: 60
   delay: 20
-  no_log: "{{ not debug_mode }}"
+  no_log: true
 
 - name: Debug Elasticsearch health
   debug:
@@ -150,7 +198,7 @@
   until: fleet_api_check.status == 200
   retries: 30
   delay: 20
-  no_log: "{{ not debug_mode }}"
+  no_log: true
 
 - name: Debug Fleet API check
   debug:
@@ -176,7 +224,7 @@
   until: fleet_setup.status in [200]
   retries: 48
   delay: 120 
-  no_log: "{{ not debug_mode }}"
+  no_log: true
 
 - name: Debug Fleet setup response
   debug:
@@ -203,7 +251,7 @@
             number_of_replicas: "{{ elasticsearch_number_of_replicas }}"
     status_code: [200, 201]
   register: logs_custom_update
-  no_log: "{{ not debug_mode }}"
+  no_log: true
   ignore_errors: yes
 
 - name: Update metrics@custom component template for zero replicas
@@ -222,7 +270,7 @@
             number_of_replicas: "{{ elasticsearch_number_of_replicas }}"
     status_code: [200, 201]
   register: metrics_settings_update
-  no_log: "{{ not debug_mode }}"
+  no_log: true
   ignore_errors: yes
 
 - name: Get CA fingerprint (Nix podman)
@@ -236,7 +284,7 @@
   register: ca_fingerprint_nix
   changed_when: false
   become: yes
-  no_log: "{{ not debug_mode }}"
+  no_log: true
   when: not (offline_mode | default(false) and ansible_os_family == "RedHat")
 
 - name: Get CA fingerprint (System podman - RHEL offline)
@@ -250,7 +298,7 @@
   register: ca_fingerprint_system
   changed_when: false
   become: yes
-  no_log: "{{ not debug_mode }}"
+  no_log: true
   when: offline_mode | default(false) and ansible_os_family == "RedHat"
 
 - name: Set CA fingerprint fact
@@ -281,13 +329,13 @@
       Content-Type: "application/json"
     body_format: json
     body:
-      fleet_server_hosts: ["https://{{ ipvar }}:{{ fleet_port }}"]
+      fleet_server_hosts: ["{{ fleet_enrollment_url }}"]
     status_code: [200]
   register: fleet_server_hosts_result
   retries: 3
   delay: 10
   until: fleet_server_hosts_result.status == 200
-  no_log: "{{ not debug_mode }}"
+  no_log: true
   # De-fang the inverted polarity: this is an inert no-op (see comment above), so a
   # non-200 here must NOT abort the install. The fail-hard belongs on the REAL POST
   # (fleet_server_hosts collection), which is gated below on multinode.
@@ -302,12 +350,10 @@
 
 # Item 1 (LIVE registration): in Fleet 8.x the fleet_server_hosts live in their own
 # collection, NOT in settings. This POST is the REAL host registration. It is
-# IDEMPOTENT (explicit id -> a re-run returns 409, which is accepted) and NON-FATAL
-# (a benign/wrong-schema 4xx must NEVER break the install -- this is the single-node
-# safety net). On single-node fleet_advertise_host == ipvar, so the registered URL
-# is identical to the legacy PUT above. NOTE: the endpoint path + body field names
-# (host_urls, is_default) are the recon's best read of the Kibana 8.18 Fleet API and
-# should be confirmed against it; a wrong-schema response is guarded non-fatal below.
+# idempotent (explicit id -> a re-run returns 409, which is accepted), but the
+# exact persisted object is mandatory below. The enrollment URL is resolved
+# independently from the Elasticsearch output URL and defaults through the
+# legacy fleet_advertise_host for compatibility.
 - name: Register Fleet server host (live fleet_server_hosts collection)
   uri:
     url: "{{ local_kbn_url }}/api/fleet/fleet_server_hosts"
@@ -324,34 +370,28 @@
     body:
       id: "lme-fleet-server"
       name: "lme-fleet-server"
-      host_urls: ["https://{{ fleet_advertise_host }}:{{ fleet_port }}"]
+      host_urls: ["{{ fleet_enrollment_url }}"]
       is_default: true
     status_code: [200, 409]
   register: fleet_server_host_reg
   until: fleet_server_host_reg.status is defined and fleet_server_host_reg.status in [200, 409]
   retries: 3
   delay: 10
-  no_log: "{{ not debug_mode }}"
-  ignore_errors: yes
+  no_log: true
 
 - name: Debug Fleet server host registration result
   debug:
-    msg: "Fleet server host registration status: {{ fleet_server_host_reg.status | default('n/a') }} (advertise_host={{ fleet_advertise_host }})"
+    msg: "Fleet server host registration status: {{ fleet_server_host_reg.status | default('n/a') }} (enrollment_url={{ fleet_enrollment_url }})"
   when: debug_mode | bool
 
-# Multinode gate for the REAL registration. On single-node fleet_advertise_host == ipvar
-# and the POST above stays a lenient safety net (byte-identical legacy behavior). On
-# multinode the advertised host is a distinct tailnet name/IP, so a masked 4xx would ship
-# a broken enrollment URL -- fail loudly. Separate, un-no_log'd gate so the operator sees
-# the status (the POST itself carries elastic_password and must stay no_log).
-- name: Fail if Fleet server host registration did not succeed (multinode)
+# The registration is a required persisted endpoint contract in every profile.
+- name: Fail if Fleet server host registration did not succeed
   fail:
     msg: >-
       Fleet server host registration (POST /api/fleet/fleet_server_hosts) returned status
       {{ fleet_server_host_reg.status | default('undefined') }} for advertised host
-      https://{{ fleet_advertise_host }}:{{ fleet_port }}; expected 200 or 409.
+      {{ fleet_enrollment_url }}; expected 200 or 409.
   when:
-    - fleet_advertise_host != ipvar
     - fleet_server_host_reg.status is not defined or fleet_server_host_reg.status not in [200, 409]
 
 # Proof-3 readback discriminator: read the live fleet_server_hosts collection back and
@@ -372,54 +412,54 @@
       Content-Type: "application/json"
     status_code: [200]
   register: fleet_server_hosts_readback
-  # Fold the discriminator into the retry loop: on multinode the collection can lag the
-  # POST's saved-object write, so retry until lme-fleet-server actually appears (not just
-  # HTTP 200), else an immediate GET could 200-with-empty and hard-fail a good deploy.
-  # retries=0 on single-node keeps this a single attempt (byte-identical timing; the
-  # assert below is skipped there anyway).
+  # Fold the exact URL discriminator into the retry loop: the saved-object write can
+  # lag the POST and a 409 can represent a stale object, which is not success.
   until: >-
     fleet_server_hosts_readback.status is defined and
     fleet_server_hosts_readback.status == 200 and
-    ((fleet_server_hosts_readback.json | default({})).get('items', [])
-     | selectattr('id', 'defined')
-     | selectattr('id', 'equalto', 'lme-fleet-server') | list | length > 0)
-  retries: "{{ 3 if fleet_advertise_host != ipvar else 0 }}"
+    (((fleet_server_hosts_readback.json | default({})).get('items', [])
+      | selectattr('id', 'defined')
+      | selectattr('id', 'equalto', 'lme-fleet-server')
+      | list | length) == 1) and
+    ((((fleet_server_hosts_readback.json | default({})).get('items', [])
+      | selectattr('id', 'defined')
+      | selectattr('id', 'equalto', 'lme-fleet-server')
+      | first | default({})).get('host_urls', [])) == [fleet_enrollment_url])
+  retries: 3
   delay: 10
-  no_log: "{{ not debug_mode }}"
-  ignore_errors: yes
+  no_log: true
 
 - name: Debug Fleet server hosts readback
   debug:
     var: fleet_server_hosts_readback
   when: debug_mode | bool
 
-- name: Assert advertised Fleet server host is registered (multinode discriminator)
+- name: Assert persisted Fleet enrollment endpoint contract
   vars:
-    advertised_fleet_url: "https://{{ fleet_advertise_host }}:{{ fleet_port }}"
     # .get('items', []) not ['items'] / .items: Jinja getitem falls back to getattr on a
     # missing key and would bind the dict.items method; .get with a list default fails
     # closed. Schema matches the POST body above (items[].id, items[].host_urls). A
-    # missing/mismatched schema yields [] -> the multinode assert fails, the desired
-    # polarity. selectattr('id','defined') skips items without an id; map default=[]
-    # tolerates a matched item that lacks host_urls.
-    registered_fleet_host_urls: >-
+    # missing/mismatched schema yields [] and fails closed. Exactly one object
+    # with exactly one configured URL is required; stale or duplicate objects fail.
+    registered_fleet_host_objects: >-
       {{ (fleet_server_hosts_readback.json | default({})).get('items', [])
          | selectattr('id', 'defined')
          | selectattr('id', 'equalto', 'lme-fleet-server')
-         | map(attribute='host_urls', default=[]) | flatten | list }}
+         | list }}
+    registered_fleet_host_urls: >-
+      {{ (registered_fleet_host_objects | first | default({})).get('host_urls', []) }}
   assert:
     that:
-      - registered_fleet_host_urls | length > 0
-      - advertised_fleet_url in registered_fleet_host_urls
+      - registered_fleet_host_objects | length == 1
+      - registered_fleet_host_urls == [fleet_enrollment_url]
     fail_msg: >-
       Fleet server host 'lme-fleet-server' is not registered with advertised URL
-      {{ advertised_fleet_url }}. Readback host_urls: {{ registered_fleet_host_urls }}.
+      {{ fleet_enrollment_url }}. Readback host_urls: {{ registered_fleet_host_urls }}.
     success_msg: >-
-      Fleet server host 'lme-fleet-server' registered with {{ advertised_fleet_url }}.
-  when: fleet_advertise_host != ipvar
+      Fleet server host 'lme-fleet-server' registered with {{ fleet_enrollment_url }}.
 
-- name: Set Fleet default output hosts
-  uri:
+- name: Set Fleet default output endpoint contract
+  ansible.builtin.uri:
     url: "{{ local_kbn_url }}/api/fleet/outputs/fleet-default-output"
     method: PUT
     user: "{{ elastic_username }}"
@@ -432,27 +472,26 @@
       Content-Type: "application/json"
     body_format: json
     body:
-      # Item 3: advertise the ES output at fleet_advertise_host (== ipvar on
-      # single-node, so byte-identical there; the tailnet name/IP under multinode).
-      # This leg runs ssl.verification_mode: certificate (CA-only, no hostname check),
-      # so only reachability matters here -- no ES cert SAN is required for it.
-      hosts: ["https://{{ fleet_advertise_host }}:9200"]
-  register: fleet_output_hosts_result
-  until: fleet_output_hosts_result.status == 200
+      hosts: ["{{ fleet_output_url }}"]
+      ca_trusted_fingerprint: "{{ ca_fingerprint }}"
+      config_yaml: |
+        ssl.verification_mode: full
+    status_code: [200]
+  register: fleet_output_contract_result
+  until: fleet_output_contract_result.status == 200
   retries: 12
   delay: 30
-  no_log: "{{ not debug_mode }}"
-  ignore_errors: yes
+  no_log: true
 
-- name: Debug Fleet output hosts result
+- name: Debug Fleet output endpoint contract result
   debug:
-    var: fleet_output_hosts_result
+    var: fleet_output_contract_result
   when: debug_mode | bool
 
-- name: Set Fleet default output CA trusted fingerprint
-  uri:
+- name: Read back Fleet default output endpoint contract
+  ansible.builtin.uri:
     url: "{{ local_kbn_url }}/api/fleet/outputs/fleet-default-output"
-    method: PUT
+    method: GET
     user: "{{ elastic_username }}"
     password: "{{ elastic_password }}"
     force_basic_auth: yes
@@ -461,32 +500,29 @@
       kbn-version: "{{ kibana_version }}"
       kbn-xsrf: "kibana"
       Content-Type: "application/json"
-    body_format: json
-    body:
-      ca_trusted_fingerprint: "{{ ca_fingerprint }}"
-  register: fleet_output_fingerprint_result
-  until: fleet_output_fingerprint_result.status == 200
+    status_code: [200]
+  register: fleet_output_readback
+  until: >-
+    fleet_output_readback.status == 200 and
+    (fleet_output_readback.json | default({})).get('item', {}).get('hosts', []) == [fleet_output_url] and
+    (fleet_output_readback.json | default({})).get('item', {}).get('ca_trusted_fingerprint', '') == ca_fingerprint and
+    ((fleet_output_readback.json | default({})).get('item', {}).get('config_yaml', '') | trim)
+      == 'ssl.verification_mode: full'
   retries: 12
   delay: 30
-  no_log: "{{ not debug_mode }}"
+  no_log: true
 
-- name: Set Fleet default output SSL verification mode
-  uri:
-    url: "{{ local_kbn_url }}/api/fleet/outputs/fleet-default-output"
-    method: PUT
-    user: "{{ elastic_username }}"
-    password: "{{ elastic_password }}"
-    force_basic_auth: yes
-    validate_certs: no
-    headers:
-      kbn-version: "{{ kibana_version }}"
-      kbn-xsrf: "kibana"
-      Content-Type: "application/json"
-    body_format: json
-    body:
-      config_yaml: "ssl.verification_mode: certificate"
-  register: fleet_output_ssl_result
-  no_log: "{{ not debug_mode }}"
+- name: Assert persisted Fleet output endpoint contract
+  ansible.builtin.assert:
+    that:
+      - fleet_output_readback.status | default(0) == 200
+      - (fleet_output_readback.json | default({})).get('item', {}).get('hosts', []) == [fleet_output_url]
+      - (fleet_output_readback.json | default({})).get('item', {}).get('ca_trusted_fingerprint', '') == ca_fingerprint
+      - "((fleet_output_readback.json | default({})).get('item', {}).get('config_yaml', '') | trim) == 'ssl.verification_mode: full'"
+    fail_msg: >-
+      Fleet default output did not persist the exact authenticated endpoint contract
+      (URL, CA fingerprint, and hostname-verifying TLS mode): expected {{ fleet_output_url }}.
+    quiet: true
 
 # Create Endpoint Policy
 - name: Create Endpoint Policy
@@ -504,6 +540,7 @@
     body_format: json
     body:
       name: "Endpoint Policy"
+      id: "{{ fleet_endpoint_policy_id | default(omit) }}"
       description: ""
       namespace: "default"
       monitoring_enabled: ["logs", "metrics"]
@@ -514,20 +551,15 @@
   until: endpoint_policy_result.status in [200, 409]
   retries: 12
   delay: 30
-  no_log: "{{ not debug_mode }}"
+  no_log: true
 
 - name: Debug endpoint_policy_result
   debug:
     var: endpoint_policy_result
   when: debug_mode | bool
 
-- name: Set policy ID fact for new policy
-  set_fact:
-    policy_id: "{{ endpoint_policy_result.json.item.id }}"
-  when: endpoint_policy_result.status == 200
-
-- name: Get existing policy ID if creation failed
-  uri:
+- name: Read Fleet agent policies for exact configured selection
+  ansible.builtin.uri:
     url: "{{ local_kbn_url }}/api/fleet/agent_policies"
     method: GET
     user: "{{ elastic_username }}"
@@ -539,21 +571,39 @@
       kbn-xsrf: "kibana"
       Content-Type: "application/json"
   register: existing_policies
-  when: endpoint_policy_result.status == 409
-  no_log: "{{ not debug_mode }}"
+  no_log: true
 
 - name: Debug existing_policies
   debug:
     var: existing_policies
   when: debug_mode | bool
 
-- name: Set policy ID fact for existing policy
-  set_fact:
-    policy_id: "{{ item.id }}"
-  when:
-    - endpoint_policy_result.status == 409
-    - item.name == 'Endpoint Policy'
-  loop: "{{ existing_policies.json['items'] | list }}"
+- name: Select only the configured Fleet endpoint policy
+  ansible.builtin.set_fact:
+    policy_id: >-
+      {{ fleet_endpoint_policy_id
+         if (fleet_endpoint_policy_id | default('') | length > 0)
+         else ((existing_policies.json | default({})).get('items', [])
+               | selectattr('name', 'defined')
+               | selectattr('name', 'equalto', 'Endpoint Policy')
+               | map(attribute='id') | unique | list | first | default('')) }}
+
+- name: Assert configured Fleet endpoint policy exists uniquely
+  vars:
+    configured_policy_matches: >-
+      {{ (existing_policies.json | default({})).get('items', [])
+         | selectattr('id', 'defined')
+         | selectattr('id', 'equalto', policy_id)
+         | list }}
+  ansible.builtin.assert:
+    that:
+      - policy_id | default('') | length > 0
+      - configured_policy_matches | length == 1
+    fail_msg: >-
+      The configured Fleet endpoint policy '{{ policy_id | default('missing') }}'
+      was not found exactly once. Refusing to select an arbitrary active or
+      first-returned policy.
+    quiet: true
 
 - name: Debug policy ID
   debug:
@@ -578,7 +628,7 @@
       kbn-xsrf: "kibana"
       Content-Type: "application/json"
   register: endpoint_package_result
-  no_log: "{{ not debug_mode }}"
+  no_log: true
 
 - name: Create Elastic Defend package policy
   uri:
@@ -619,7 +669,7 @@
   until: elastic_defend_policy_result.status in [200, 409]
   retries: 12
   delay: 30
-  no_log: "{{ not debug_mode }}"
+  no_log: true
   ignore_errors: yes
 
 - name: Display results
@@ -627,12 +677,22 @@
     var: "{{ item }}"
   loop:
     - fleet_server_hosts_result
-    - fleet_output_hosts_result
-    - fleet_output_fingerprint_result
-    - fleet_output_ssl_result
+    - fleet_output_contract_result
+    - fleet_output_readback
     - endpoint_policy_result
     - elastic_defend_policy_result
   when: debug_mode | bool
+
+- name: Assert Wave 0 completed before lab Fleet enrollment
+  ansible.builtin.assert:
+    that:
+      - lme_wave0_complete | default(false) | bool
+    fail_msg: >-
+      Lab Fleet enrollment is blocked until the root Wave 0 remediation barrier
+      is explicitly complete. Endpoint configuration may be rendered and reviewed,
+      but no credential-bearing enrollment may start yet.
+    quiet: true
+  when: lme_lab_mode | default(false) | bool
 
 - name: Set FLEET_ENROLL=1 for initial enrollment
   lineinfile:
@@ -685,6 +745,7 @@
 
 - name: Wait for fleet-server to be ready
   wait_for:
+    host: "{{ fleet_enrollment_probe_host | default(fleet_enrollment_bind_address | default('127.0.0.1')) }}"
     port: 8220
     timeout: 300
   become: yes
@@ -710,7 +771,7 @@
 
 - name: Check Fleet agents endpoint contents
   uri:
-    url: "{{ local_kbn_url }}/api/fleet/agents?page=1&perPage=20&kuery=status%3Aonline%20or%20(status%3Aerror%20or%20status%3Adegraded)%20or%20(status%3Aupdating%20or%20status%3Aunenrolling%20or%20status%3Aenrolling)%20or%20status%3Aoffline&showInactive=false&showUpgradeable=false&getStatusSummary=true&withMetrics=true"
+    url: "{{ local_kbn_url }}/api/fleet/agents?page=1&perPage=1000&kuery=status%3Aonline%20or%20(status%3Aerror%20or%20status%3Adegraded)%20or%20(status%3Aupdating%20or%20status%3Aunenrolling%20or%20status%3Aenrolling)%20or%20status%3Aoffline&showInactive=false&showUpgradeable=false&getStatusSummary=true&withMetrics=true"
     method: GET
     user: "{{ elastic_username }}"
     password: "{{ elastic_password }}"
@@ -724,15 +785,78 @@
       x-elastic-internal-origin: "Kibana"
     status_code: 200
   register: fleet_agents_result
-  until: fleet_agents_result.status == 200 and fleet_agents_result.json.total > 0 and fleet_agents_result.json.statusSummary.online > 0
+  vars:
+    _fleet_online_configured_hosts: >-
+      {{ (fleet_agents_result.json | default({})).get('items', [])
+         | selectattr('status', 'defined')
+         | selectattr('status', 'equalto', 'online')
+         | selectattr('policy_id', 'defined')
+         | selectattr('policy_id', 'equalto', policy_id)
+         | map(attribute='local_metadata.host.hostname', default='')
+         | reject('equalto', '') | list }}
+  until: >-
+    fleet_agents_result.status == 200 and
+    (
+      ((lme_lab_mode | default(false) | bool) and
+       (fleet_expected_agent_hostnames | default([]) | difference(_fleet_online_configured_hosts) | length == 0))
+      or
+      (not (lme_lab_mode | default(false) | bool) and
+       fleet_agents_result.json.total > 0 and
+       fleet_agents_result.json.statusSummary.online > 0)
+    )
   retries: 60
   delay: 20
-  no_log: "{{ not debug_mode }}"
+  no_log: true
+  when:
+    - not (lme_lab_mode | default(false) | bool) or (lme_verify_collection | default(false) | bool)
+
+- name: Report deferred lab Fleet collection verification
+  ansible.builtin.debug:
+    msg: >-
+      PENDING: lab Fleet collection verification is deferred until native agent
+      enrollment completes and lme_verify_collection=true. This pending state is
+      not an acceptance pass.
+  when: (lme_lab_mode | default(false) | bool) and not (lme_verify_collection | default(false) | bool)
+
+- name: Derive online Fleet agent hostnames on the configured policy
+  ansible.builtin.set_fact:
+    fleet_verified_agent_hostnames: >-
+      {{ (fleet_agents_result.json | default({})).get('items', [])
+         | selectattr('status', 'defined')
+         | selectattr('status', 'equalto', 'online')
+         | selectattr('policy_id', 'defined')
+         | selectattr('policy_id', 'equalto', fleet_endpoint_policy_id)
+         | map(attribute='local_metadata.host.hostname', default='')
+         | reject('equalto', '') | list }}
+  when:
+    - lme_lab_mode | default(false) | bool
+    - lme_verify_collection | default(false) | bool
+
+- name: Assert every expected lab source is uniquely online on the configured policy
+  ansible.builtin.assert:
+    that:
+      - fleet_endpoint_policy_id | default('') | length > 0
+      - fleet_expected_agent_hostnames | default([]) | length > 0
+      - fleet_expected_agent_hostnames | unique | list | length == fleet_expected_agent_hostnames | length
+      - fleet_verified_agent_hostnames | unique | list | length == fleet_verified_agent_hostnames | length
+      - fleet_verified_agent_hostnames | sort == fleet_expected_agent_hostnames | sort
+    fail_msg: >-
+      Fleet source verification did not match the independent lab roster exactly
+      on policy '{{ fleet_endpoint_policy_id | default('missing') }}'. Expected
+      {{ fleet_expected_agent_hostnames | default([]) | sort }}, observed online
+      {{ fleet_verified_agent_hostnames | default([]) | sort }}. Duplicate host
+      identities, missing sources, extra sources, and wrong-policy agents all fail.
+    quiet: true
+  when:
+    - lme_lab_mode | default(false) | bool
+    - lme_verify_collection | default(false) | bool
 
 - name: Debug Fleet agents result
   debug:
     var: fleet_agents_result
-  when: debug_mode | bool
+  when:
+    - debug_mode | bool
+    - not (lme_lab_mode | default(false) | bool) or (lme_verify_collection | default(false) | bool)
 
 - name: Verify Fleet agents response structure
   assert:
@@ -742,11 +866,15 @@
       - fleet_agents_result.json.total is defined
     fail_msg: "Fleet agents endpoint did not return the expected response structure"
   register: fleet_agents_verification
+  when:
+    - not (lme_lab_mode | default(false) | bool) or (lme_verify_collection | default(false) | bool)
 
 - name: Display Fleet agents summary
   debug:
     msg: "Fleet agents endpoint returned {{ fleet_agents_result.json.total }} total agents"
-  when: fleet_agents_verification is success
+  when:
+    - not (lme_lab_mode | default(false) | bool) or (lme_verify_collection | default(false) | bool)
+    - fleet_agents_verification is success
 
 - name: Fail if Fleet is not ready
   fail:
@@ -798,8 +926,7 @@
     metrics_indices_result.json | map(attribute='index') | select('match', '.*logs-elastic_agent.*') | list | length > 0
   retries: 30
   delay: 20
-  no_log: "{{ not debug_mode }}"
-  ignore_errors: yes
+  no_log: true
 
 - name: Debug metrics indices result
   debug:
@@ -811,16 +938,5 @@
   when: debug_mode | bool and metrics_indices_result.status == 200
 
 
-- name: Debug - Display secret variables
-  debug:
-    msg:
-      - "elastic={{ elastic_password }}"
-      - "wazuh={{ wazuh_password }}"
-      - "kibana_system={{ kibana_system_password }}"
-      - "wazuh_api={{ wazuh_api_password }}"
-  when: debug_mode | bool
-  no_log: "{{ not debug_mode }}"
-
 # Note: Kibana offline mode configuration now happens in podman role
 # (before Kibana starts) instead of here
-

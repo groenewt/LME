@@ -257,6 +257,8 @@ ALWAYS = 'always'
 KNOWN_ENABLE_FLAGS = frozenset((
     'install_llm',
     'install_elastic_services',
+    'install_otel',
+    'install_legacy_beats',
     'offline_mode',
 ))
 
@@ -297,7 +299,13 @@ def is_enabled(enabled_when, flags=None, context=None):
     for f in enabled_when:
         if f == ALWAYS:
             continue
-        if not flags.get(f, False):
+        value = flags.get(f, f == 'install_legacy_beats')
+        if type(value) is not bool:
+            if isinstance(value, str) and value.lower() in ('true', 'false'):
+                value = value.lower() == 'true'
+            else:
+                raise ValueError('lme: enable flag %s must be true or false' % f)
+        if not value:
             return False
     return True
 
@@ -452,9 +460,19 @@ def memory_budget(services, flags=None, lme_global=None, host_services=None):
     }
 
 
+def strict_enable_bool(value):
+    if type(value) is bool:
+        return value
+    if isinstance(value, str) and value.lower() in ('true', 'false'):
+        return value.lower() == 'true'
+    raise ValueError('lme: enable flag must be true or false')
+
+
+
 class FilterModule(object):
     def filters(self):
         return {
+            'strict_enable_bool': strict_enable_bool,
             'render_userns': render_userns,
             'userns_base': userns_base,
             'cert_owner': cert_owner,

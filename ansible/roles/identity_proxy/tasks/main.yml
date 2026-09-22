@@ -1,0 +1,165 @@
+---
+- name: Read the topology-created identity proxy owner
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ identity_proxy_user }}"
+    fail_key: false
+
+- name: Read the topology-created identity proxy group
+  ansible.builtin.getent:
+    database: group
+    key: "{{ identity_proxy_group }}"
+    fail_key: false
+
+- name: Refuse an absent or drifted runtime owner
+  ansible.builtin.assert:
+    that:
+      - identity_proxy_user == 'lmeui'
+      - identity_proxy_group == identity_proxy_user
+      - identity_proxy_expected_uid | int > 0
+      - identity_proxy_expected_gid | int > 0
+      - identity_proxy_user in ansible_facts.getent_passwd
+      - identity_proxy_group in ansible_facts.getent_group
+      - ansible_facts.getent_passwd[identity_proxy_user][1] | int == identity_proxy_expected_uid | int
+      - ansible_facts.getent_passwd[identity_proxy_user][2] | int == identity_proxy_expected_gid | int
+      - ansible_facts.getent_group[identity_proxy_group][1] | int == identity_proxy_expected_gid | int
+    fail_msg: "Identity proxy owner must already match resolved runtime inventory"
+
+- name: Create identity policy directory
+  ansible.builtin.file:
+    path: /etc/lme/identity
+    state: directory
+    owner: root
+    group: "{{ identity_proxy_group }}"
+    mode: '0750'
+
+- name: Require a TLS backend whose hostname matches its certificate
+  ansible.builtin.assert:
+    that:
+      - identity_proxy_backend_url is match('^https://[^/]+(:[0-9]+)?$')
+      - identity_proxy_public_origin is match('^https://[a-z0-9][a-z0-9.-]*[.]ts[.]net$')
+      - identity_proxy_required_capability == 'cisa.gov/cap/lme-observer'
+      - identity_proxy_operator_login is match('^[^@[:space:]]+@[^@[:space:]]+$')
+    fail_msg: "Set identity_proxy_backend_url to the dashboard HTTPS origin with a certificate-matching hostname"
+
+- name: Verify dashboard backend CA exists
+  ansible.builtin.stat:
+    path: "{{ identity_proxy_backend_ca_file }}"
+  register: identity_proxy_backend_ca
+
+- name: Refuse to start without dashboard backend trust
+  ansible.builtin.assert:
+    that:
+      - identity_proxy_backend_ca.stat.exists
+      - identity_proxy_backend_ca.stat.isreg
+    fail_msg: "Provision identity_proxy_backend_ca_file before enabling browser access"
+
+- name: Verify dashboard backend API credential exists
+  ansible.builtin.stat:
+    path: "{{ identity_proxy_backend_api_key_source_file }}"
+  register: identity_proxy_backend_api_key_source
+
+- name: Refuse to start without the dashboard backend API credential
+  ansible.builtin.assert:
+    that:
+      - identity_proxy_backend_api_key_source.stat.exists
+      - identity_proxy_backend_api_key_source.stat.isreg
+      - not identity_proxy_backend_api_key_source.stat.roth
+      - not identity_proxy_backend_api_key_source.stat.woth
+    fail_msg: "Provision a private identity_proxy_backend_api_key_source_file before enabling browser access"
+
+- name: Install the selected manifest operator identity
+  ansible.builtin.copy:
+    content: "{{ identity_proxy_operator_login }}\n"
+    dest: "{{ identity_proxy_operator_login_file }}"
+    owner: root
+    group: "{{ identity_proxy_group }}"
+    mode: '0640'
+  no_log: true
+  notify: Restart identity proxy
+
+- name: Create identity proxy installation directory
+  ansible.builtin.file:
+    path: "{{ identity_proxy_install_dir }}"
+    state: directory
+    owner: root
+    group: "{{ identity_proxy_group }}"
+    mode: '0750'
+
+- name: Create root-owned identity proxy package directory
+  ansible.builtin.file:
+    path: "{{ identity_proxy_install_dir }}/lme_identity"
+    state: directory
+    owner: root
+    group: "{{ identity_proxy_group }}"
+    mode: '0755'
+
+- name: Install declared identity proxy Python sources
+  ansible.builtin.copy:
+    src: "{{ identity_proxy_source_dir }}/{{ item }}"
+    dest: "{{ identity_proxy_install_dir }}/lme_identity/{{ item }}"
+    owner: root
+    group: "{{ identity_proxy_group }}"
+    mode: '0644'
+  loop:
+    - __init__.py
+    - config.py
+    - proxy.py
+    - requirements.txt
+  notify: Restart identity proxy
+
+- name: Create identity proxy virtual environment
+  ansible.builtin.command:
+    cmd: "{{ ansible_python.executable }} -m venv {{ identity_proxy_install_dir }}/venv"
+    creates: "{{ identity_proxy_install_dir }}/venv/bin/python"
+
+- name: Install identity proxy Python requirements
+  ansible.builtin.pip:
+    requirements: "{{ identity_proxy_install_dir }}/lme_identity/requirements.txt"
+    virtualenv: "{{ identity_proxy_install_dir }}/venv"
+  notify: Restart identity proxy
+
+- name: Install identity proxy unit
+  ansible.builtin.template:
+    src: lme-identity-proxy.service.j2
+    dest: /etc/systemd/system/lme-identity-proxy.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart identity proxy
+
+- name: Install Tailscale Serve unit
+  ansible.builtin.template:
+    src: lme-identity-serve.service.j2
+    dest: /etc/systemd/system/lme-identity-serve.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart identity Serve
+
+- name: Start or refresh the identity proxy credential snapshot
+  ansible.builtin.systemd:
+    name: lme-identity-proxy.service
+    enabled: true
+    state: restarted
+    daemon_reload: true
+
+- name: Wait for identity proxy socket
+  ansible.builtin.wait_for:
+    path: "{{ identity_proxy_socket }}"
+    state: present
+    timeout: 30
+
+- name: Restrict identity proxy socket to the Serve boundary
+  ansible.builtin.file:
+    path: "{{ identity_proxy_socket }}"
+    owner: "{{ identity_proxy_user }}"
+    group: "{{ identity_proxy_group }}"
+    mode: '0660'
+
+- name: Enable Tailscale Serve identity ingress
+  ansible.builtin.systemd:
+    name: lme-identity-serve.service
+    enabled: true
+    state: started
+    daemon_reload: true

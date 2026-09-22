@@ -37,6 +37,10 @@ TAILSCALE_MODE="false"
 # offline->offline, else default); an explicit --profile / LME_PROFILE wins over
 # that derivation. Passed to Ansible as -e lme_profile=<name>.
 LME_PROFILE="${LME_PROFILE:-}"
+LME_DATABASE_PROFILE=""
+LME_TELEMETRY_PROFILE=""
+LME_TELEMETRY_DESTINATIONS=""
+declare -A LME_SELECTOR_SEEN=()
 
 # Raw Ansible extra-vars passthrough (--extra-vars '<json|k=v>'). Appended as a
 # SECOND --extra-vars AFTER the harness-built base JSON, so its top-level keys win
@@ -77,6 +81,9 @@ usage() {
     echo "      --profile NAME            Select the manifest profile (default|cluster|offline|tailscale)."
     echo "                                Default: derived from the mode flags (--cluster->cluster,"
     echo "                                --offline->offline, else default). Passed as -e lme_profile=NAME."
+    echo "      --database-profile NAME   dual-owned-ha|shared-ha (independent of deployment profile)."
+    echo "      --telemetry-profile NAME  elastic-only|elastic-plus-hertzbeat|full-mirror."
+    echo "      --telemetry-destinations LIST  Explicit supported destinations; requires telemetry profile."
     echo "      --tailscale               Turn on the tailscale serve legs (ingress + egress + services)."
     echo "                                ORTHOGONAL to --profile: composes with ANY profile. Passes"
     echo "                                -e tailscale_serve_ingress/egress/services=true. Note: the loopback"
@@ -144,8 +151,18 @@ while [[ $# -gt 0 ]]; do
             GRAPH_ROOT_SET="true"
             shift 2
             ;;
-        --profile)
-            LME_PROFILE="$2"
+        --profile|--database-profile|--telemetry-profile|--telemetry-destinations)
+            if [[ $# -lt 2 || -z "$2" || "$2" == --* || -n "${LME_SELECTOR_SEEN[$1]:-}" ]]; then
+                echo "Invalid, empty, or duplicate selector: $1" >&2
+                exit 2
+            fi
+            LME_SELECTOR_SEEN[$1]=true
+            case "$1" in
+                --profile) LME_PROFILE="$2" ;;
+                --database-profile) LME_DATABASE_PROFILE="$2" ;;
+                --telemetry-profile) LME_TELEMETRY_PROFILE="$2" ;;
+                --telemetry-destinations) LME_TELEMETRY_DESTINATIONS="$2" ;;
+            esac
             shift 2
             ;;
         --extra-vars)
@@ -718,9 +735,9 @@ compute_effective_flags() {
 
     # Validate against the known profiles (manifests/profiles/*.yml).
     case "$EFFECTIVE_PROFILE" in
-        default|cluster|offline|tailscale|multinode) ;;
+        default|cluster|offline|tailscale|multinode|consumer) ;;
         *)
-            echo -e "${RED}✗ Unknown --profile '$EFFECTIVE_PROFILE' (expected: default|cluster|offline|tailscale|multinode)${NC}"
+            echo -e "${RED}✗ Unknown --profile '$EFFECTIVE_PROFILE' (expected: default|cluster|offline|tailscale|multinode|consumer)${NC}"
             exit 1
             ;;
     esac
@@ -829,9 +846,9 @@ run_playbook() {
     fi
 
     if [ -f "$SCRIPT_DIR/inventory" ]; then
-        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}' "${EXTRA_VARS_ARGS[@]}" $ANSIBLE_OPTS
+        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"""'}' "${EXTRA_VARS_ARGS[@]}" $ANSIBLE_OPTS
     else
-        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}' "${EXTRA_VARS_ARGS[@]}" $ANSIBLE_OPTS
+        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"""'}' "${EXTRA_VARS_ARGS[@]}" $ANSIBLE_OPTS
     fi
     
     if [ $? -eq 0 ]; then
@@ -984,7 +1001,7 @@ run_cluster_playbooks() {
     # gates the LLM/pack includes off there regardless of these values.
     compute_effective_flags
 
-    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"'}'
+    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"""'}'
 
     # Phase 1: Run site.yml on master with cluster vars (unless --cluster-nodes-only)
     if [ "$CLUSTER_NODES_ONLY" != "true" ]; then
@@ -1036,15 +1053,24 @@ echo "==============================================="
 echo "    Ansible Setup and Playbook Runner"
 echo "==============================================="
 
+# Keep incomplete selector integration from mutating a host during reconciliation.
+# The canonical installer owns these selectors; there is no alternate backend.
+if [[ -n "$LME_DATABASE_PROFILE$LME_TELEMETRY_PROFILE$LME_TELEMETRY_DESTINATIONS" ]]; then
+    printf '%s\n' \
+        "Database and telemetry composition is not yet integrated into the existing manifest engine." \
+        "Deployment cannot satisfy the selected requirements; no installation work was started." >&2
+    exit 2
+fi
+
 # Reject unsupported flag combinations
 # Validate an explicit --profile EARLY (before the long ansible/nix/podman setup),
 # so a typo fails fast rather than after the install work. Derived profiles are
 # valid by construction; this only guards an operator-supplied name.
 if [ -n "$LME_PROFILE" ]; then
     case "$LME_PROFILE" in
-        default|cluster|offline|tailscale|multinode) ;;
+        default|cluster|offline|tailscale|multinode|consumer) ;;
         *)
-            echo -e "${RED}✗ Unknown --profile '$LME_PROFILE' (expected: default|cluster|offline|tailscale|multinode)${NC}"
+            echo -e "${RED}✗ Unknown --profile '$LME_PROFILE' (expected: default|cluster|offline|tailscale|multinode|consumer)${NC}"
             exit 1
             ;;
     esac

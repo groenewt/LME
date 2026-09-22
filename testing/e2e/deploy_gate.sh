@@ -22,15 +22,18 @@
 #       --graphroot /data/lme-storage --flags "--elastic-services" \
 #       --label graph-some --stage all
 #
-# Stages (--stage): all | rsync | wipe | install | health | vip-probe | deploy | teardown
+# Stages (--stage): all | rsync | wipe | install | health | vip-probe | telemetry | deploy | teardown
 #   wipe            = rsync + pre-install teardown+self-verify (cheapest smoke:
 #                     validates transport + exec + a CLEAN host).
-#   vip-probe       = A1 consumer-node VIP reachability (post-health; DEFAULT OFF --
-#                     no-op unless LME_GATE_PROBE_FROM / LME_GATE_REQUIRE_VIP_REACHABLE
-#                     are set; see do_vip_probe). Also runs after health in the
-#                     health / deploy / all stages (a no-op there when unarmed).
+#   vip-probe       = A1 consumer-node VIP reachability. Applicability comes from
+#                     the selected route contract; optional selected routes may be
+#                     SKIPPED, and required selected routes must execute and pass.
+#                     Also runs after health in the health/deploy/all stages.
 #   deploy          = rsync -> wipe -> install -> health -> vip-probe, HOLD before teardown.
-#   all             = rsync -> wipe -> install -> health -> vip-probe -> teardown (full leg).
+#   all             = rsync -> wipe -> install -> health -> vip-probe -> evidence
+#                     retention -> teardown. It does not claim collection/readback.
+#   telemetry       = fails until collection acceptance consumes the canonical
+#                     resolved configuration; quarantined verification cannot pass it.
 # Override LOGDIR / SRC / REMOTE_DIR via the environment.
 #
 # --strict : make an install that RESCUED any task (PLAY RECAP rescued>0) FAIL
@@ -38,10 +41,10 @@
 #
 # HEALTH is a REAL gate (see do_health). Its pass contract, all on the target:
 #   * no `lme*` systemd unit in the `failed` state;
-#   * >= EXPECT_MIN running containers (default 11 for default+llm; lowered to the
-#     5-core floor for online --no-llm and to 6 for bare --offline, but `--offline --llm`
-#     KEEPS the LLM pack (floor 12); raised for --elastic-services; override with env
-#     LME_GATE_MIN_CONTAINERS);
+#   * exact manifest-derived persistent container names under their declared
+#     runtime owners, plus separately verified completed initialization jobs;
+#   * the legacy EXPECT_MIN arithmetic remains as a compatibility floor, but an
+#     unrelated same-count container set cannot satisfy the exact roster;
 #   * EXPOSURE (DENY-BY-DEFAULT, over TCP *and* UDP): the checked set is the
 #     COMPLETE list of host-published ports, DERIVED from the manifests (the union
 #     of manifests/global.yml's canonical `ports:` table, manifests/services/*.yml
@@ -73,8 +76,6 @@
 # Any check that cannot run (e.g. `ss` missing, the manifest port-set failing to
 # derive, or ss returning no TCP listeners) is a FAIL, not a skip.
 # ----------------------------------------------------------------------------
-set -uo pipefail
-
 # ---- defaults --------------------------------------------------------------
 # SRC defaults to the repo root discovered from this script's location
 # (testing/e2e/deploy_gate.sh -> repo root two levels up), so the harness is
@@ -94,30 +95,84 @@ HOST=""; IP=""; GRAPHROOT=""; FLAGS=""; LABEL=""; STAGE="all"; STRICT=0
 EXTRA_VARS=""
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
 LOGDIR="${LOGDIR:-/tmp/lme-gate-logs}"
+LOG="${LOG:-}"
+RESULTS="${RESULTS:-}"
+SSH=()
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --host) HOST="$2"; shift 2;;
-    --ip) IP="$2"; shift 2;;
-    --graphroot) GRAPHROOT="$2"; shift 2;;
-    --flags) FLAGS="$2"; shift 2;;
-    --extra-vars) EXTRA_VARS="$2"; shift 2;;
-    --label) LABEL="$2"; shift 2;;
-    --stage) STAGE="$2"; shift 2;;
-    --ssh-key) SSH_OPTS+=(-i "$2"); shift 2;;
-    --src) SRC="$2"; shift 2;;
-    --remote-dir) REMOTE_DIR="$2"; shift 2;;
-    --strict) STRICT=1; shift;;
-    *) echo "unknown arg: $1" >&2; exit 2;;
+require_arg_value() {
+  local opt="$1" value="${2-}"
+  if [ -z "$value" ] || [[ "$value" == --* ]]; then
+    echo "FATAL: $opt requires a non-empty value" >&2
+    return 2
+  fi
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --host|--ip|--graphroot|--flags|--extra-vars|--label|--stage|--ssh-key|--src|--remote-dir)
+        require_arg_value "$1" "${2-}" || return $?
+        case "$1" in
+          --host) HOST="$2";;
+          --ip) IP="$2";;
+          --graphroot) GRAPHROOT="$2";;
+          --flags) FLAGS="$2";;
+          --extra-vars) EXTRA_VARS="$2";;
+          --label) LABEL="$2";;
+          --stage) STAGE="$2";;
+          --ssh-key) SSH_OPTS+=(-i "$2");;
+          --src) SRC="$2";;
+          --remote-dir) REMOTE_DIR="$2";;
+        esac
+        shift 2
+        ;;
+      --strict) STRICT=1; shift;;
+      *) echo "unknown arg: $1" >&2; return 2;;
+    esac
+  done
+}
+
+init_gate_run() {
+  case "$STAGE" in
+    all|rsync|wipe|install|health|vip-probe|telemetry|deploy|teardown) ;;
+    *) echo "unknown --stage $STAGE" >&2; return 2;;
   esac
-done
-[ -n "$HOST" ] || { echo "FATAL: --host required" >&2; exit 2; }
-LABEL="${LABEL:-$HOST}"
-mkdir -p "$LOGDIR"
-LOG="$LOGDIR/${LABEL}.log"
-SSH=(ssh "${SSH_OPTS[@]}" "root@${HOST}")
+  if [ "$STAGE" != telemetry ] && [ -z "$HOST" ]; then
+    echo "FATAL: --host required" >&2
+    return 2
+  fi
+  LABEL="${LABEL:-${HOST:-lab}}"
+  mkdir -p "$LOGDIR"
+  LOG="${LOG:-$LOGDIR/${LABEL}.log}"
+  RESULTS="${RESULTS:-$LOGDIR/${LABEL}.gate-results.jsonl}"
+  SSH=(ssh "${SSH_OPTS[@]}" "root@${HOST}")
+}
 
-say() { echo "[$(date -u +%FT%TZ)] [$LABEL] $*" | tee -a "$LOG"; }
+say() {
+  local line
+  line="[$(date -u +%FT%TZ)] [${LABEL:-gate}] $*"
+  if [ -n "${LOG:-}" ]; then printf '%s\n' "$line" | tee -a "$LOG"; else printf '%s\n' "$line"; fi
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+# Machine-readable result contract. Required/applicable/executed are independent;
+# a skipped or inapplicable check never appears as PASS.
+emit_gate_result() {
+  local check="$1" required="$2" applicable="$3" executed="$4" status="$5" evidence="$6" reason="$7"
+  local line
+  line=$(printf 'GATE_RESULT {"check":"%s","required":%s,"applicable":%s,"executed":%s,"status":"%s","evidence":"%s","reason":"%s"}' \
+    "$(json_escape "$check")" "$required" "$applicable" "$executed" \
+    "$(json_escape "$status")" "$(json_escape "$evidence")" "$(json_escape "$reason")")
+  printf '%s\n' "$line"
+  [ -z "${LOG:-}" ] || printf '%s\n' "$line" >>"$LOG"
+  [ -z "${RESULTS:-}" ] || printf '%s\n' "${line#GATE_RESULT }" >>"$RESULTS"
+}
+
 run_remote() { "${SSH[@]}" "$@" 2>&1 | tee -a "$LOG"; return "${PIPESTATUS[0]}"; }
 
 # ---- stage: rsync ----------------------------------------------------------
@@ -143,6 +198,7 @@ do_rsync() {
   rsync -e "ssh ${SSH_OPTS[*]}" -a --delete \
     --exclude='.git/' --exclude='scratchpad/' --exclude='_ocr_wt/' \
     --exclude='.ocr/' --exclude='.cursor/' --exclude='.opencode/' \
+    --exclude='.quarantine/' --exclude='.superpowers/' \
     --exclude='node_modules/' --exclude='__pycache__/' --exclude='*.pyc' \
     --exclude='*.qcow2' --exclude='*.iso' --exclude='*.img' \
     --exclude='offline_resources/' \
@@ -153,7 +209,16 @@ do_rsync() {
 }
 
 # ---- stage: wipe (pre teardown + self-verify; cheapest smoke) ---------------
+refuse_physical_silmaril_wipe() {
+  if [ "${HOST%%.*}" = silmaril ]; then
+    say "WIPE FAIL: blanket wipe forbidden on physical silmaril; target an exact recorded guest resource instead"
+    emit_gate_result cleanup true true false BLOCKED none physical_silmaril_blanket_wipe_forbidden
+    return 1
+  fi
+}
+
 do_wipe() {
+  refuse_physical_silmaril_wipe || return $?
   say "WIPE (teardown + self-verify clean) via tree's own scripts/wipe_lme.sh"
   run_remote "cd '$REMOTE_DIR' && bash scripts/wipe_lme.sh"
   local rc=$?
@@ -171,7 +236,8 @@ do_install() {
   say "INSTALL via tree's own install.sh  flags=[$FLAGS] ip=[$IP] graphroot=[$GRAPHROOT] extra_vars=[$EXTRA_VARS]"
   # Capture THIS invocation's output to its own file (LOGDIR persists across
   # runs, so grepping the shared $LOG would match a prior leg's `rescued=`).
-  local ilog="$LOGDIR/${LABEL}.install.$(date -u +%s).log"
+  local ilog
+  ilog="$LOGDIR/${LABEL}.install.$(date -u +%s).log"
   "${SSH[@]}" "cd '$REMOTE_DIR' && NON_INTERACTIVE=true AUTO_CREATE_ENV=true ./install.sh $i $g $FLAGS $ev" \
     2>&1 | tee -a "$LOG" | tee "$ilog"
   local rc="${PIPESTATUS[0]}"
@@ -644,6 +710,91 @@ print(count)
 PY
 }
 
+# derive_host_runtime_rosters(): emit the exact expected runtime roster as
+# `<class>\t<owner>\t<name>`. Persistent containers and completed initialization
+# jobs are deliberately separate: a successful oneshot is never counted as a
+# running container, while an unrelated running container cannot satisfy a
+# missing expected service. `runtime_owner` is optional for legacy manifests and
+# defaults to root; the lab resolved inventory supplies explicit owners for the
+# new multi-owner topology and verifies them through the telemetry stage.
+derive_host_runtime_rosters() {
+  local hv="$1" root="$SRC/manifests"
+  [ -d "$root/services" ] || return 1
+  command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1 || return 1
+  python3 - "$hv" "$root/services" "$2" "$3" "$4" <<'PY'
+import glob, os, re, sys
+import yaml
+
+hv_path, svc_dir = sys.argv[1], sys.argv[2]
+flags = {
+    "install_llm": sys.argv[3] == "1",
+    "install_elastic_services": sys.argv[4] == "1",
+    "offline_mode": sys.argv[5] == "1",
+}
+known = set(flags)
+
+try:
+    with open(hv_path) as fh:
+        host_vars = yaml.safe_load(fh) or {}
+except FileNotFoundError:
+    host_vars = {}
+except Exception:
+    sys.exit(3)
+if not isinstance(host_vars, dict):
+    sys.exit(3)
+roster = host_vars.get("lme_host_services")
+if roster in (None, []):
+    roster = None
+elif not isinstance(roster, list) or not all(isinstance(item, str) for item in roster):
+    sys.exit(4)
+
+def enabled(tokens):
+    tokens = tokens or ["always"]
+    if not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens):
+        sys.exit(5)
+    if any(token != "always" and token not in known for token in tokens):
+        sys.exit(5)
+    return all(token == "always" or flags[token] for token in tokens)
+
+services = {}
+for path in sorted(glob.glob(os.path.join(svc_dir, "*.yml"))):
+    try:
+        with open(path) as fh:
+            doc = yaml.safe_load(fh)
+    except Exception:
+        sys.exit(3)
+    if isinstance(doc, dict) and doc.get("id") is not None:
+        services[str(doc["id"])] = doc
+if roster is not None and any(item not in services for item in roster):
+    sys.exit(6)
+
+persistent, init_jobs = [], []
+for sid, doc in services.items():
+    if doc.get("kind") != "container" or not enabled(doc.get("enabled_when")):
+        continue
+    if roster is not None and sid not in roster:
+        continue
+    conditions = (doc.get("dependencies") or {}).get("condition_path_exists") or []
+    if any("/opt/lme/OFFLINE_MODE" in str(item) for item in conditions) and not flags["offline_mode"]:
+        continue
+    owner = str(doc.get("runtime_owner") or "root")
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", owner):
+        sys.exit(7)
+    name = str(doc.get("container_name") or doc.get("name") or "")
+    if not name or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        sys.exit(7)
+    if (doc.get("behavior") or {}).get("type") == "oneshot":
+        init_jobs.append((owner, str(doc.get("name") or name) + ".service"))
+    else:
+        persistent.append((owner, name))
+
+for owner, name in sorted(persistent):
+    print("persistent\t%s\t%s" % (owner, name))
+for owner, name in sorted(init_jobs):
+    print("init\t%s\t%s" % (owner, name))
+PY
+}
+
 # resolve_expect_min(): the expected running-container floor for THIS leg. Precedence:
 #   1. LME_GATE_MIN_CONTAINERS  operator override (wins outright, unchanged).
 #   2. host-scoped floor        when this host's host_vars declares lme_host_services
@@ -745,6 +896,194 @@ if not isinstance(roster, list) or not all(isinstance(x, str) for x in roster):
     print(1); sys.exit(0)          # malformed roster -> default local (do not scope OUT on junk)
 print(1 if sys.argv[2] in roster else 0)
 PY
+}
+
+# Shared by both remote payloads. curl writes `000` for %{http_code} before
+# returning a transport failure, so appending `echo 000` produces the false-pass
+# token `000000`. Preserve curl's return code and normalize output exactly once.
+remote_http_helper() {
+  cat <<'REMOTE_HTTP_EOF'
+gate_http_code() {
+  local code rc
+  code=$(curl -sk -o /dev/null -w '%{http_code}' "$@")
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! [[ "$code" =~ ^[0-9]{3}$ ]]; then
+    printf '000'
+    [ "$rc" -ne 0 ] && return "$rc"
+    return 1
+  fi
+  printf '%s' "$code"
+}
+REMOTE_HTTP_EOF
+}
+
+health_remote_payload() {
+  remote_http_helper
+  cat <<'REMOTE_EOF'
+set -o pipefail
+fail=0
+loopback_ok() { case "$1" in 127.0.0.1|::1|'[::1]') return 0;; *) return 1;; esac; }
+tailnet_ok() {
+  local a="${1#"["}"; a="${a%"]"}"
+  case "$a" in
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0;;
+    fd7a:115c:a1e0:*) return 0;;
+    *) return 1;;
+  esac
+}
+
+echo "== lme.service =="
+systemctl is-active lme.service || true
+
+echo "== failed lme units (must be empty) =="
+failed=$(systemctl list-units --plain --no-legend 'lme*' --state=failed 2>/dev/null | awk '{print $1}')
+if [ -n "$failed" ]; then
+  echo "  FAIL: lme units in failed state: $(echo "$failed")"; fail=1
+else
+  echo "  ok: no failed lme units"
+fi
+
+echo "== exact owned persistent container roster =="
+expected=$(printf '%s\n' $EXPECTED_PERSISTENT | sed '/^$/d' | sort -u)
+owners=$(printf '%s\n' $EXPECTED_PERSISTENT | sed '/^$/d;s/:.*//' | sort -u)
+[ -n "$owners" ] || owners=root
+actual=""
+for owner in $owners; do
+  if [ "$owner" = root ]; then
+    if ! names=$(sudo -i podman ps --format '{{.Names}}' 2>/dev/null); then
+      echo "  FAIL: cannot enumerate persistent containers for owner=root"; fail=1; continue
+    fi
+  else
+    if ! names=$(runuser -u "$owner" -- podman ps --format '{{.Names}}' 2>/dev/null); then
+      echo "  FAIL: cannot enumerate persistent containers for owner=$owner"; fail=1; continue
+    fi
+  fi
+  while IFS= read -r name; do
+    [ -z "$name" ] || actual="${actual}${owner}:${name}"$'\n'
+  done <<<"$names"
+done
+actual=$(printf '%s' "$actual" | sed '/^$/d' | sort -u)
+missing=$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
+unexpected=$(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
+if [ -n "$missing" ] || [ -n "$unexpected" ]; then
+  echo "  FAIL: persistent container roster mismatch"
+  [ -z "$missing" ] || echo "  missing=$(printf '%s' "$missing" | xargs)"
+  [ -z "$unexpected" ] || echo "  unexpected=$(printf '%s' "$unexpected" | xargs)"
+  fail=1
+else
+  echo "  ok: exact persistent roster=[$(printf '%s' "$actual" | xargs)]"
+fi
+
+echo "== initialization jobs (separate from persistent roster) =="
+for entry in $EXPECTED_INIT_JOBS; do
+  owner="${entry%%:*}"; unit="${entry#*:}"
+  if [ "$owner" = root ]; then
+    state=$(systemctl show "$unit" -p ActiveState -p SubState -p Result 2>/dev/null)
+    state_rc=$?
+  else
+    state=$(runuser -u "$owner" -- systemctl --user show "$unit" -p ActiveState -p SubState -p Result 2>/dev/null)
+    state_rc=$?
+  fi
+  if [ "$state_rc" -ne 0 ] || ! grep -qx 'ActiveState=active' <<<"$state" || \
+     ! grep -qx 'SubState=exited' <<<"$state" || ! grep -qx 'Result=success' <<<"$state"; then
+    echo "  FAIL: init job $entry not completed successfully"; fail=1
+  else
+    echo "  ok: init job $entry active/exited result=success"
+  fi
+done
+
+echo "== running containers (compatibility floor >= $EXPECT_MIN) =="
+running=$(printf '%s\n' "$actual" | sed '/^$/d' | wc -l)
+echo "  running=$running"
+if [ "$running" -lt "$EXPECT_MIN" ]; then
+  echo "  FAIL: only $running expected persistent container(s), floor is $EXPECT_MIN"; fail=1
+else
+  echo "  ok: $running >= $EXPECT_MIN"
+fi
+
+echo "== exposure: loopback-only binds ($LOOPBACK_PORTS) =="
+if ! command -v ss >/dev/null 2>&1; then
+  echo "  FAIL: ss unavailable — cannot assert exposure"; fail=1
+else
+  listen_tbl=$( { ss -ltnH 2>/dev/null | awk -v pr=tcp '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a" "pr}'
+                  ss -lunH 2>/dev/null | awk -v pr=udp '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a" "pr}'; } )
+  if [ -z "$listen_tbl" ]; then
+    echo "  FAIL: no listening sockets parsed from ss — cannot assert exposure"; fail=1
+  elif ! printf '%s\n' "$listen_tbl" | awk '$3=="tcp"{f=1} END{exit f?0:1}'; then
+    echo "  FAIL: no TCP listeners parsed from ss (sshd:22 expected) — exposure probe broken, refusing green"; fail=1
+  fi
+  for p in $LOOPBACK_PORTS; do
+    case " $LAN_OK " in *" $p "*) echo "  port $p: LAN opt-in (expose_lan) — skip"; continue;; esac
+    case " ${PROFILE_OPEN:-} " in *" $p "*) echo "  port $p: LAN opt-in (profile ${PROFILE_NAME:-?}) — skip"; continue;; esac
+    addrs=$(printf '%s\n' "$listen_tbl" | awk -v pp="$p" '$1==pp {print $2}')
+    if [ -z "$addrs" ]; then
+      echo "  port $p: not listening (service down or not in this profile)"
+      continue
+    fi
+    tailnet_port=0
+    case " $TAILNET_PORTS " in *" $p "*) tailnet_port=1;; esac
+    bad=""
+    for a in $addrs; do
+      loopback_ok "$a" && continue
+      [ "$tailnet_port" = 1 ] && tailnet_ok "$a" && continue
+      bad="$bad $a"
+    done
+    if [ -n "$bad" ]; then
+      echo "  FAIL: port $p LAN-open on$bad — expected 127.0.0.1 (bind-inversion/expose_lan?)"; fail=1
+    elif [ "$tailnet_port" = 1 ]; then
+      echo "  ok: port $p loopback/tailnet-ingress [$(echo "$addrs")]"
+    else
+      echo "  ok: port $p loopback-only [$(echo "$addrs")]"
+    fi
+  done
+fi
+
+if [ "$ES_LOCAL" = 1 ]; then
+  echo "== service: ES :9200 (expect 401/200) =="
+  if ! code=$(gate_http_code --max-time 20 https://127.0.0.1:9200); then :; fi
+  echo "  ES http_code=$code"
+  case "$code" in 401|200) echo "  ok";; *) echo "  FAIL: ES not up behind TLS"; fail=1;; esac
+else
+  echo "== service: ES :9200 — SKIP (not host-local; consumer reaches it via tailnet VIP) =="
+fi
+
+if [ "$KIBANA_LOCAL" = 1 ]; then
+  echo "== service: Kibana :5601 (expect 200/302/401) =="
+  if ! kb=$(gate_http_code --max-time 20 https://127.0.0.1:5601); then :; fi
+  echo "  Kibana http_code=$kb"
+  case "$kb" in 200|302|401) echo "  ok";; *) echo "  FAIL: Kibana not up"; fail=1;; esac
+else
+  echo "== service: Kibana :5601 — SKIP (not host-local; consumer reaches it via tailnet VIP) =="
+fi
+
+if [ "$LLM_ON" = 1 ]; then
+  if [ "$DASHBOARD_LOCAL" = 1 ]; then
+    echo "== service: dashboard /livez :8502 (expect 200; unauthenticated liveness) =="
+    if ! dl=$(gate_http_code --max-time 20 https://127.0.0.1:8502/livez); then :; fi
+    echo "  dashboard /livez http_code=$dl"
+    case "$dl" in 200) echo "  ok";; *) echo "  FAIL: dashboard /livez not reachable on loopback"; fail=1;; esac
+
+    echo "== auth: dashboard /api/health with NO key (expect 401/403) =="
+    if ! da=$(gate_http_code --max-time 20 https://127.0.0.1:8502/api/health); then :; fi
+    echo "  dashboard /api/health (unauth) http_code=$da"
+    case "$da" in 401|403) echo "  ok: webui auth enforced";;
+      *) echo "  FAIL: /api/* served unauthenticated ($da) — webui-auth not enforced"; fail=1;; esac
+  else
+    echo "== service: dashboard :8502 — SKIP (not host-local; scoped out of this roster) =="
+  fi
+  if [ "$LOG_ANALYZER_LOCAL" = 1 ]; then
+    echo "== service: log-analyzer :8501 reachable (streamlit gates in-app at 200) =="
+    if ! la=$(gate_http_code --max-time 20 https://127.0.0.1:8501); then :; fi
+    echo "  log-analyzer http_code=$la"
+    case "$la" in 200|302|401|403) echo "  ok";; *) echo "  FAIL: log-analyzer unreachable"; fail=1;; esac
+  else
+    echo "== service: log-analyzer :8501 — SKIP (not host-local; scoped out of this roster) =="
+  fi
+fi
+
+echo "== HEALTH result: fail=$fail =="
+exit "$fail"
+REMOTE_EOF
 }
 
 # ---- stage: health probe ---------------------------------------------------
@@ -893,169 +1232,39 @@ do_health() {
   case "$dashboard_local"    in 0) ;; *) dashboard_local=1;;    esac
   case "$log_analyzer_local" in 0) ;; *) log_analyzer_local=1;; esac
 
-  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on profile=[${profile:-none}] loopback=[$loopback_ports] lan_ok=[$lan_ok] profile_open=[$profile_open] tailnet_ports=[$tailnet_ports] es_local=$es_local kibana_local=$kibana_local dashboard_local=$dashboard_local log_analyzer_local=$log_analyzer_local"
+  local runtime_rosters expected_persistent expected_init_jobs
+  if ! runtime_rosters="$(derive_host_runtime_rosters "$probe_hv" "$llm_on" "$elastic_on" "$offline_on")"; then
+    say "HEALTH FATAL: could not derive exact owned persistent/init rosters from manifests"
+    emit_gate_result runtime_health true true false BLOCKED none runtime_roster_unresolvable
+    return 1
+  fi
+  expected_persistent=$(printf '%s\n' "$runtime_rosters" | awk -F '\t' '$1=="persistent" {print $2 ":" $3}' | xargs)
+  expected_init_jobs=$(printf '%s\n' "$runtime_rosters" | awk -F '\t' '$1=="init" {print $2 ":" $3}' | xargs)
 
-  # ---- the remote payload ----------------------------------------------------
-  # Quoted heredoc: single quotes are legal inside (unlike the old '...' arg
-  # form) and the payload is independently `bash -n`-checkable. Values are
-  # injected as env on the `bash -s` line, NOT interpolated here.
+  say "HEALTH expects: persistent=[$expected_persistent] init=[$expected_init_jobs] compatibility_floor=$expect_min llm_on=$llm_on profile=[${profile:-none}] loopback=[$loopback_ports] lan_ok=[$lan_ok] profile_open=[$profile_open] tailnet_ports=[$tailnet_ports] es_local=$es_local kibana_local=$kibana_local dashboard_local=$dashboard_local log_analyzer_local=$log_analyzer_local"
+
+  # Sourceable so unit tests execute this exact payload with mocked commands.
   local HEALTH_SH
-  read -r -d '' HEALTH_SH <<'REMOTE_EOF' || true
-set -o pipefail
-fail=0
-loopback_ok() { case "$1" in 127.0.0.1|::1|'[::1]') return 0;; *) return 1;; esac; }
-# This node's OWN tailnet address: Tailscale CGNAT 100.64.0.0/10 (IPv4) or the
-# global Tailscale ULA fd7a:115c:a1e0::/48 (IPv6). `ss` prints IPv6 bracketed and
-# may zero-compress the 4th group (e.g. [fd7a:115c:a1e0::439:8d1a]); strip the
-# brackets and prefix-match the fixed /48. A tailnet-fronted ingress port binds
-# here BY DESIGN — accepted ONLY for the ports in $TAILNET_PORTS (see caller).
-tailnet_ok() {
-  local a="${1#"["}"; a="${a%"]"}"
-  case "$a" in
-    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0;;
-    fd7a:115c:a1e0:*) return 0;;
-    *) return 1;;
-  esac
-}
+  HEALTH_SH="$(health_remote_payload)"
 
-echo "== lme.service =="
-systemctl is-active lme.service || true
-
-echo "== failed lme units (must be empty) =="
-failed=$(systemctl list-units --plain --no-legend 'lme*' --state=failed 2>/dev/null | awk '{print $1}')
-if [ -n "$failed" ]; then
-  echo "  FAIL: lme units in failed state: $(echo $failed)"; fail=1
-else
-  echo "  ok: no failed lme units"
-fi
-
-echo "== running containers (expect >= $EXPECT_MIN) =="
-running=$(sudo -i podman ps --format '{{.Names}}' 2>/dev/null | sed '/^$/d' | wc -l)
-echo "  running=$running"
-if [ "$running" -lt "$EXPECT_MIN" ]; then
-  echo "  FAIL: only $running running container(s), expected >= $EXPECT_MIN"; fail=1
-else
-  echo "  ok: $running >= $EXPECT_MIN"
-fi
-
-echo "== exposure: loopback-only binds ($LOOPBACK_PORTS) =="
-if ! command -v ss >/dev/null 2>&1; then
-  echo "  FAIL: ss unavailable — cannot assert exposure"; fail=1
-else
-  # port<space>addr<space>proto per LISTENING socket, over BOTH tcp AND udp -- the
-  # deny-by-default gate must see udp too (e.g. wazuh syslog 514, which the old
-  # tcp-only probe was blind to). TWO single-proto calls (NOT one `ss -tuln`): with
-  # a single proto the Local-Address column is $4 in both -- the exact parse that
-  # produced the live 0.0.0.0 finding on graph -- so no new column assumption is
-  # introduced (a dual-proto call shifts Local to $5, and a mis-parse would degrade
-  # to a silent green, the very blindness we are closing). addr = local addr with
-  # the port stripped: 0.0.0.0:9200->'9200 0.0.0.0 tcp', [::]:5601->'5601 [::] tcp',
-  # *:5432->'5432 * tcp', udp 127.0.0.1:514->'514 127.0.0.1 udp'.
-  listen_tbl=$( { ss -ltnH 2>/dev/null | awk -v pr=tcp '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a" "pr}'
-                  ss -lunH 2>/dev/null | awk -v pr=udp '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a" "pr}'; } )
-  # A live host always has listeners (sshd at minimum). Empty => the probe broke
-  # (e.g. `ss` too old for -H), NOT a closed host: fail, don't pass green.
-  if [ -z "$listen_tbl" ]; then
-    echo "  FAIL: no listening sockets parsed from ss — cannot assert exposure"; fail=1
-  # Complementary guard: a working probe on any live host ALWAYS sees >=1 tcp
-  # listener (sshd:22). Zero tcp rows => the tcp leg of the probe silently broke
-  # (only udp parsed); refuse to certify exposure off a half-blind table.
-  elif ! printf '%s\n' "$listen_tbl" | awk '$3=="tcp"{f=1} END{exit f?0:1}'; then
-    echo "  FAIL: no TCP listeners parsed from ss (sshd:22 expected) — exposure probe broken, refusing green"; fail=1
-  fi
-  for p in $LOOPBACK_PORTS; do
-    # Two DISTINCT accepted-open rules, each self-identifying in the log so a
-    # reviewer can tell WHICH rule admitted a non-loopback port: expose_lan operator
-    # opt-in ($LAN_OK) vs a named profile's bind:0.0.0.0 ($PROFILE_OPEN).
-    case " $LAN_OK " in *" $p "*) echo "  port $p: LAN opt-in (expose_lan) — skip"; continue;; esac
-    case " ${PROFILE_OPEN:-} " in *" $p "*) echo "  port $p: LAN opt-in (profile ${PROFILE_NAME:-?}) — skip"; continue;; esac
-    addrs=$(printf '%s\n' "$listen_tbl" | awk -v pp="$p" '$1==pp {print $2}')
-    if [ -z "$addrs" ]; then
-      echo "  port $p: not listening (service down or not in this profile)"
-      continue
-    fi
-    # A bind on this node's tailnet IP is acceptable ONLY for a port the ingress
-    # leg fronts this run ($TAILNET_PORTS; EMPTY when ingress is off => this clause
-    # is inert and the check is byte-identical to a non-tailscale deploy).
-    tailnet_port=0
-    case " $TAILNET_PORTS " in *" $p "*) tailnet_port=1;; esac
-    bad=""
-    for a in $addrs; do
-      loopback_ok "$a" && continue
-      [ "$tailnet_port" = 1 ] && tailnet_ok "$a" && continue
-      bad="$bad $a"
-    done
-    if [ -n "$bad" ]; then
-      echo "  FAIL: port $p LAN-open on$bad — expected 127.0.0.1 (bind-inversion/expose_lan?)"; fail=1
-    elif [ "$tailnet_port" = 1 ]; then
-      echo "  ok: port $p loopback/tailnet-ingress [$(echo $addrs)]"
-    else
-      echo "  ok: port $p loopback-only [$(echo $addrs)]"
-    fi
-  done
-fi
-
-if [ "$ES_LOCAL" = 1 ]; then
-  echo "== service: ES :9200 (expect 401/200) =="
-  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:9200 || echo 000)
-  echo "  ES http_code=$code"
-  case "$code" in 401|200) echo "  ok";; *) echo "  FAIL: ES not up behind TLS"; fail=1;; esac
-else
-  echo "== service: ES :9200 — SKIP (not host-local; consumer reaches it via tailnet VIP) =="
-fi
-
-if [ "$KIBANA_LOCAL" = 1 ]; then
-  echo "== service: Kibana :5601 (expect 200/302/401) =="
-  kb=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:5601 || echo 000)
-  echo "  Kibana http_code=$kb"
-  case "$kb" in 200|302|401) echo "  ok";; *) echo "  FAIL: Kibana not up"; fail=1;; esac
-else
-  echo "== service: Kibana :5601 — SKIP (not host-local; consumer reaches it via tailnet VIP) =="
-fi
-
-if [ "$LLM_ON" = 1 ]; then
-  if [ "$DASHBOARD_LOCAL" = 1 ]; then
-    echo "== service: dashboard /livez :8502 (expect 200; unauthenticated liveness) =="
-    dl=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/livez || echo 000)
-    echo "  dashboard /livez http_code=$dl"
-    case "$dl" in 200) echo "  ok";; *) echo "  FAIL: dashboard /livez not reachable on loopback"; fail=1;; esac
-
-    echo "== auth: dashboard /api/health with NO key (expect 401/403) =="
-    da=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/api/health || echo 000)
-    echo "  dashboard /api/health (unauth) http_code=$da"
-    case "$da" in 401|403) echo "  ok: webui auth enforced";;
-      *) echo "  FAIL: /api/* served unauthenticated ($da) — webui-auth not enforced"; fail=1;; esac
-  else
-    echo "== service: dashboard :8502 — SKIP (not host-local; scoped out of this roster) =="
-  fi
-
-  if [ "$LOG_ANALYZER_LOCAL" = 1 ]; then
-    echo "== service: log-analyzer :8501 reachable (streamlit gates in-app at 200) =="
-    la=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8501 || echo 000)
-    echo "  log-analyzer http_code=$la"
-    case "$la" in 200|302|401|403) echo "  ok";; *) echo "  FAIL: log-analyzer unreachable"; fail=1;; esac
-  else
-    echo "== service: log-analyzer :8501 — SKIP (not host-local; scoped out of this roster) =="
-  fi
-fi
-
-echo "== HEALTH result: fail=$fail =="
-exit "$fail"
-REMOTE_EOF
-
-  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' ES_LOCAL='$es_local' KIBANA_LOCAL='$kibana_local' DASHBOARD_LOCAL='$dashboard_local' LOG_ANALYZER_LOCAL='$log_analyzer_local' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' PROFILE_OPEN='$profile_open' PROFILE_NAME='${profile:-}' TAILNET_PORTS='$tailnet_ports' bash -s" <<<"$HEALTH_SH"
+  run_remote "EXPECT_MIN='$expect_min' EXPECTED_PERSISTENT='$expected_persistent' EXPECTED_INIT_JOBS='$expected_init_jobs' LLM_ON='$llm_on' ES_LOCAL='$es_local' KIBANA_LOCAL='$kibana_local' DASHBOARD_LOCAL='$dashboard_local' LOG_ANALYZER_LOCAL='$log_analyzer_local' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' PROFILE_OPEN='$profile_open' PROFILE_NAME='${profile:-}' TAILNET_PORTS='$tailnet_ports' bash -s" <<<"$HEALTH_SH"
   local rc=$?
-  say "HEALTH rc=$rc  (0 => all gate checks passed)"; return "$rc"
+  if [ "$rc" -eq 0 ]; then
+    emit_gate_result runtime_health true true true PASS "$LOG" runtime_readiness_verified
+  else
+    emit_gate_result runtime_health true true true FAIL "$LOG" runtime_readiness_failed
+  fi
+  emit_gate_result collection false false false NOT_APPLICABLE none legacy_health_does_not_evaluate_collection
+  say "HEALTH rc=$rc (runtime readiness only; collection/readback not evaluated)"; return "$rc"
 }
 
-# ---- stage: vip-probe (A1 consumer-node VIP reachability; post-health; DEFAULT OFF) --
+# ---- stage: vip-probe (A1 consumer-node VIP reachability; post-health) --------
 # The CapMap liveness assert in tailscale_service.yml proves a VIP was ALLOCATED and
 # APPROVED, NOT that a consumer can actually REACH it end-to-end. This stage closes
 # that A1 gap: it curls each manifest-declared VIP endpoint FROM A SECOND inventory
 # host (never a self-curl on the advertiser -- a node's own VIP is expected-unreachable).
 #
-# TWO INDEPENDENT KNOBS (both unset by default => this stage is a NO-OP and every
-# existing invocation is byte-identical -- no existing caller passes either):
+# Applicability is resolved independently from these two control inputs:
 #   LME_GATE_PROBE_FROM=<host>          the SECOND (consumer) inventory host to probe
 #                                       FROM -- a tailnet node that is NOT --host.
 #   LME_GATE_REQUIRE_VIP_REACHABLE=1    ARM enforcement -- THIS env knob IS the arming
@@ -1065,11 +1274,12 @@ REMOTE_EOF
 #   (optional) LME_GATE_TAILNET_DOMAIN  MagicDNS suffix, e.g. tail6c2eb6.ts.net; default
 #                                       bare (the svc name resolves via the search domain).
 #   (optional) LME_GATE_VIP_TIMEOUT     per-endpoint curl/connect timeout (default 15s).
-# States (mirrors the ansible var choosing fail-vs-warn, not whether the check exists):
-#   neither set        -> no-op, rc 0                        (existing runs unchanged)
-#   probe-from only    -> probe runs; unreachable = WARN, rc 0
-#   require only       -> typed FAIL: a required probe with no consumer node cannot run
-#   both set           -> probe runs; unreachable = typed FAIL
+# States for a selected VIP route:
+#   neither set        -> SKIPPED, executed:false (optional, non-blocking)
+#   probe-from only    -> executes; unreachable is recorded FAIL but non-blocking
+#   require only       -> BLOCKED: required check cannot execute without a consumer
+#   both set           -> executes; unreachable is a blocking FAIL
+# With no selected VIP route the check is NOT_APPLICABLE; requiring it is invalid.
 # Single-shot per endpoint (NO until/retries -- an until keyed on liveness hard-fails
 # on retry-exhaustion, round-11 B1). Composable: probes whatever the manifests declare.
 #
@@ -1077,60 +1287,83 @@ REMOTE_EOF
 # the tailnet ROUTE is live: the VIP name resolved, the tailnet path carried the
 # connection, and the backend answered (a raw-tcp connect, or ANY http_code). It does
 # NOT prove GAP-2 end-to-end TLS closure. TLS closure is a SEPARATE, independent signal,
-# proven ONLY by the consumer app's own `verify=True` Elasticsearch client call from the
-# trixie consumer (2c Path-1: check_hostname=False + CERT_REQUIRED against the internal
-# CA). The curl below is `-sk` (insecure) BY DESIGN, so it can say NOTHING about chain
+# proven ONLY by the consumer application's verify-full connection (trusted chain plus
+# endpoint identity). The curl below is `-sk` (insecure) BY DESIGN, so it says nothing about chain
 # validation -- a green vip-probe MUST NEVER be cited as evidence of TLS/CA closure. This
 # is also why this stage builds NO `openssl s_client -verify_hostname` probe: a hostname-
-# verifying probe would assert the OPPOSITE of the shipped 2c path (which sets
-# check_hostname=False), so it would either fail the code we shipped or pass for an
-# unrelated reason. Routing here + verify=True there are two REQUIRED, non-substitutable signals.
-do_vip_probe() {
-  local armed=0 from="${LME_GATE_PROBE_FROM:-}"
-  case "${LME_GATE_REQUIRE_VIP_REACHABLE:-0}" in 1|true|TRUE|yes|on) armed=1;; esac
-  # DEFAULT OFF: neither knob set => nothing to do, existing runs byte-identical
-  # (return BEFORE any say/network so the log is unchanged too).
-  if [ "$armed" = 0 ] && [ -z "$from" ]; then return 0; fi
+# verifying administrator-shell probe could still pass outside the application runtime
+# namespace. Routing here and application verify-full are non-substitutable signals.
+normalize_bool() {
+  case "$1" in
+    1|true|TRUE|yes|on) printf '1\n';;
+    0|false|FALSE|no|off|'') printf '0\n';;
+    *) return 2;;
+  esac
+}
 
-  say "VIP-PROBE (consumer-node reachability; armed=$armed from=[${from:-none}])"
-  say "VIP-PROBE ACCEPTANCE RULE: a green probe proves tailnet ROUTING only (name resolves, route live, backend answered over an insecure -sk connect). It does NOT prove GAP-2 TLS closure -- that is proven ONLY by the consumer app's own verify=True ES client call from ${from:-the consumer node} (2c Path-1: CERT_REQUIRED vs the internal CA), and MUST NEVER be cited from this probe."
-  # Armed but no consumer node => a required check that cannot run. Gate doctrine: a
-  # check that can't run = FAIL. Self-curl is forbidden (self-VIP expected-unreachable),
-  # so it can never substitute for a real second node.
-  if [ -z "$from" ]; then
-    say "VIP-PROBE FAIL: LME_GATE_REQUIRE_VIP_REACHABLE armed but LME_GATE_PROBE_FROM unset -- no consumer node to probe FROM (a self-curl on the advertiser is not a valid substitute)"
-    return 1
-  fi
-  # Never self-curl: the probe-from node must NOT be the advertiser. Compare SHORT
-  # names so `graph` and `graph.tail6c2eb6.ts.net` are recognised as the same node.
-  local from_short="${from%%.*}" host_short="${HOST%%.*}"
-  if [ "$from_short" = "$host_short" ]; then
-    say "VIP-PROBE FAIL: LME_GATE_PROBE_FROM ($from) is the advertiser ($HOST) -- a self-VIP curl is expected-unreachable and cannot verify reachability; name a DIFFERENT inventory host"
-    return 1
-  fi
+extra_var_value() {
+  local key="$1"
+  [ -n "$EXTRA_VARS" ] || return 1
+  python3 - "$key" "$EXTRA_VARS" <<'PY'
+import json, re, sys
+key, raw = sys.argv[1:]
+try:
+    if raw.lstrip().startswith("{"):
+        value = json.loads(raw)
+        if not isinstance(value, dict) or key not in value:
+            sys.exit(1)
+        value = value[key]
+        if isinstance(value, bool):
+            print("true" if value else "false")
+        else:
+            print(str(value))
+        sys.exit(0)
+except Exception:
+    sys.exit(2)
+match = re.search(r"(?:^|\s)" + re.escape(key) + r"=([^\s]+)", raw)
+if not match:
+    sys.exit(1)
+print(match.group(1))
+PY
+}
 
-  # Effective pack flags (post-offline adjustment) so a disabled VIP is not probed.
-  local llm_on elastic_on offline_on
-  read -r llm_on elastic_on offline_on < <(effective_pack_flags)
-  local endpoints
-  if ! endpoints="$(derive_vip_endpoints "$llm_on" "$elastic_on" "$offline_on")"; then
-    say "VIP-PROBE FAIL: could not derive the VIP endpoint set from $SRC/manifests"
-    return 1
+# Applicability comes from the selected route contract, not from whether a probe
+# host happened to be supplied. Operator extra-vars are last-winning, matching
+# install.sh, and invalid boolean values fail instead of silently disabling a check.
+vip_route_selected() {
+  local selected=0 profile value
+  profile="$(explicit_profile)"
+  if [ -n "$profile" ] && [ -f "$SRC/manifests/profiles/${profile}.yml" ]; then
+    value=$(python3 - "$SRC/manifests/profiles/${profile}.yml" <<'PY'
+import sys, yaml
+try:
+    with open(sys.argv[1]) as fh:
+        doc = yaml.safe_load(fh) or {}
+    value = (((doc.get("profile_overlay") or {}).get("vars") or {})
+             .get("tailscale_serve_services"))
+except Exception:
+    sys.exit(2)
+if value is None:
+    sys.exit(1)
+if not isinstance(value, bool):
+    sys.exit(2)
+print("1" if value else "0")
+PY
+    )
+    case $? in 0) selected="$value";; 1) :;; *) return 2;; esac
   fi
-  endpoints="$(printf '%s' "$endpoints" | grep -v '^[[:space:]]*$' || true)"
-  if [ -z "$endpoints" ]; then
-    say "VIP-PROBE WARN: no enabled VIP endpoints derived from manifests -- nothing to probe for this roster"
-    return 0
+  case " $FLAGS " in *" --tailscale "*) selected=1;; esac
+  if value=$(extra_var_value tailscale_serve_services); then
+    selected=$(normalize_bool "$value") || return 2
+  else
+    case $? in 1) :;; *) return 2;; esac
   fi
-  local domain="${LME_GATE_TAILNET_DOMAIN:-}"
-  local timeout="${LME_GATE_VIP_TIMEOUT:-15}"
-  local endpoints_line; endpoints_line="$(printf '%s' "$endpoints" | xargs)"
-  say "VIP-PROBE endpoints (svc:port:scheme)=[$endpoints_line] from=$from domain=[${domain:-magicdns}] timeout=${timeout}s armed=$armed"
+  printf '%s\n' "$selected"
+}
 
-  # Remote payload: runs ON the consumer node ($from). Values injected as env on the
-  # `bash -s` line (NOT interpolated). Quoted heredoc => independently bash -n-checkable.
-  local PROBE_SH
-  read -r -d '' PROBE_SH <<'REMOTE_EOF' || true
+vip_probe_remote_payload() {
+  remote_http_helper
+  cat <<'REMOTE_EOF'
 set -o pipefail
 fail=0
 dead=""
@@ -1139,50 +1372,151 @@ for ep in $VIP_ENDPOINTS; do
   fqdn="$name"; [ -n "$DOMAIN" ] && fqdn="${name}.${DOMAIN}"
   case "$scheme" in
     tcp|raw-tcp)
-      # raw-TLS passthrough VIP: a bare TCP connect (no HTTP verdict possible). A
-      # connect proves the VIP routes to the backend listener.
       if timeout "$TIMEOUT" bash -c "exec 3<>/dev/tcp/${fqdn}/${port}" 2>/dev/null; then
         echo "  ok: svc:$name $fqdn:$port (raw-tcp connect)"
       else
         echo "  UNREACHABLE: svc:$name $fqdn:$port (raw-tcp connect failed)"; dead="$dead svc:$name"
       fi
       ;;
-    *)
-      # https VIP: ANY HTTP response (even 401/403/5xx) proves the VIP name resolved,
-      # the tailnet route is live and the backend answered. 000 => no response
-      # (NXDOMAIN / no route / TLS handshake failure) => unreachable.
-      code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time "$TIMEOUT" "https://${fqdn}:${port}/" 2>/dev/null || echo 000)
+    https)
+      if ! code=$(gate_http_code --max-time "$TIMEOUT" "https://${fqdn}:${port}/" 2>/dev/null); then :; fi
       case "$code" in
         000) echo "  UNREACHABLE: svc:$name https://$fqdn:$port/ (no response -- DNS/route/TLS)"; dead="$dead svc:$name";;
-        *)   echo "  ok: svc:$name https://$fqdn:$port/ -> HTTP $code (VIP routes; backend answered)";;
+        *) echo "  ok: svc:$name https://$fqdn:$port/ -> HTTP $code (VIP routes; backend answered)";;
       esac
+      ;;
+    *)
+      echo "  INVALID: svc:$name unsupported scheme=$scheme"; dead="$dead svc:$name"
       ;;
   esac
 done
 if [ -n "$dead" ]; then
-  echo "== VIP-PROBE: unreachable ->$dead =="
+  echo "== VIP-PROBE: unreachable/invalid ->$dead =="
   exit 1
 fi
 echo "== VIP-PROBE: all derived VIP endpoints reachable =="
 exit 0
 REMOTE_EOF
+}
 
-  # Probe FROM the consumer node (never the advertiser). Same BatchMode /
-  # tailnet-intercepted ssh transport as the rest of the harness.
+validate_vip_endpoints() {
+  local endpoints="$1" ep name port scheme extra seen=" "
+  while IFS= read -r ep; do
+    [ -n "$ep" ] || continue
+    IFS=: read -r name port scheme extra <<<"$ep"
+    [ -z "${extra:-}" ] || return 1
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || return 1
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] || return 1
+    [ "$port" -le 65535 ] || return 1
+    case "$scheme" in https|tcp|raw-tcp) ;; *) return 1;; esac
+    case "$seen" in *" $ep "*) return 1;; esac
+    seen="$seen$ep "
+  done <<<"$endpoints"
+}
+
+do_vip_probe() {
+  local required route_selected from="${LME_GATE_PROBE_FROM:-}"
+  if ! required=$(normalize_bool "${LME_GATE_REQUIRE_VIP_REACHABLE:-0}"); then
+    say "VIP-PROBE FAIL: LME_GATE_REQUIRE_VIP_REACHABLE must be a strict boolean"
+    emit_gate_result vip_reachability true false false FAIL none invalid_required_boolean
+    return 2
+  fi
+  if ! route_selected=$(vip_route_selected); then
+    say "VIP-PROBE FAIL: selected route contract has an invalid tailscale_serve_services value"
+    emit_gate_result vip_reachability "$([ "$required" = 1 ] && printf true || printf false)" false false FAIL none invalid_route_boolean
+    return 2
+  fi
+
+  local required_json=false
+  [ "$required" = 1 ] && required_json=true
+  if [ "$route_selected" = 0 ]; then
+    if [ "$required" = 1 ]; then
+      say "VIP-PROBE FAIL: reachability is required but no VIP route is selected"
+      emit_gate_result vip_reachability true false false BLOCKED none required_vip_route_not_selected
+      return 1
+    fi
+    say "VIP-PROBE NOT_APPLICABLE: resolved route contract does not select VIP services"
+    emit_gate_result vip_reachability false false false NOT_APPLICABLE none vip_route_not_selected
+    return 0
+  fi
+
+  local llm_on elastic_on offline_on endpoints endpoints_line
+  read -r llm_on elastic_on offline_on < <(effective_pack_flags)
+  if ! endpoints="$(derive_vip_endpoints "$llm_on" "$elastic_on" "$offline_on")"; then
+    say "VIP-PROBE FAIL: could not derive the selected VIP endpoint set"
+    emit_gate_result vip_reachability "$required_json" true false BLOCKED none endpoint_derivation_failed
+    return 1
+  fi
+  endpoints="$(printf '%s\n' "$endpoints" | sed '/^[[:space:]]*$/d')"
+  if [ -z "$endpoints" ]; then
+    say "VIP-PROBE FAIL: selected VIP route derived zero endpoints"
+    emit_gate_result vip_reachability "$required_json" true false BLOCKED none selected_route_has_no_endpoints
+    return 1
+  fi
+  if ! validate_vip_endpoints "$endpoints"; then
+    say "VIP-PROBE FAIL: derived endpoint does not satisfy name:port:https|tcp|raw-tcp contract"
+    emit_gate_result vip_reachability "$required_json" true false FAIL none invalid_endpoint_contract
+    return 2
+  fi
+  if [ -z "$from" ]; then
+    if [ "$required" = 1 ]; then
+      say "VIP-PROBE FAIL: required selected route has no consumer probe host"
+      emit_gate_result vip_reachability true true false BLOCKED none probe_from_required
+      return 1
+    fi
+    say "VIP-PROBE SKIPPED: selected route is optional and LME_GATE_PROBE_FROM is unset"
+    emit_gate_result vip_reachability false true false SKIPPED none optional_probe_disabled
+    return 0
+  fi
+  if [ "${from%%.*}" = "${HOST%%.*}" ]; then
+    say "VIP-PROBE FAIL: probe source is the advertiser; self-VIP curl is invalid"
+    emit_gate_result vip_reachability "$required_json" true false FAIL none self_probe_forbidden
+    return 1
+  fi
+
+  local timeout="${LME_GATE_VIP_TIMEOUT:-15}" domain="${LME_GATE_TAILNET_DOMAIN:-}"
+  if ! [[ "$timeout" =~ ^[1-9][0-9]*$ ]]; then
+    say "VIP-PROBE FAIL: LME_GATE_VIP_TIMEOUT must be a positive integer"
+    emit_gate_result vip_reachability "$required_json" true false FAIL none invalid_timeout
+    return 2
+  fi
+  if [ -n "$domain" ] && ! [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+    say "VIP-PROBE FAIL: LME_GATE_TAILNET_DOMAIN contains invalid characters"
+    emit_gate_result vip_reachability "$required_json" true false FAIL none invalid_tailnet_domain
+    return 2
+  fi
+  endpoints_line="$(printf '%s\n' "$endpoints" | xargs)"
+  say "VIP-PROBE applicable=true required=$required endpoints=[$endpoints_line] from=$from"
+  local probe_sh rc
+  probe_sh="$(vip_probe_remote_payload)"
+  # shellcheck disable=SC2029 # validated values intentionally populate the remote env.
   ssh "${SSH_OPTS[@]}" "root@${from}" \
-    "VIP_ENDPOINTS='$endpoints_line' DOMAIN='$domain' TIMEOUT='$timeout' bash -s" <<<"$PROBE_SH" 2>&1 | tee -a "$LOG"
-  local rc="${PIPESTATUS[0]}"
-  if [ "$rc" = 0 ]; then
-    say "VIP-PROBE rc=0 (all derived VIP endpoints reachable from $from)"; return 0
+    "VIP_ENDPOINTS='$endpoints_line' DOMAIN='$domain' TIMEOUT='$timeout' bash -s" \
+    <<<"$probe_sh" 2>&1 | tee -a "$LOG"
+  rc="${PIPESTATUS[0]}"
+  if [ "$rc" -eq 0 ]; then
+    emit_gate_result vip_reachability "$required_json" true true PASS "$LOG" endpoints_reachable
+    return 0
   fi
-  if [ "$armed" = 1 ]; then
-    say "VIP-PROBE FAIL rc=$rc: one or more VIPs unreachable from $from (enforcement armed)"; return 1
-  fi
-  say "VIP-PROBE WARN rc=$rc: one or more VIPs unreachable from $from (enforcement OFF -> non-fatal warning)"; return 0
+  emit_gate_result vip_reachability "$required_json" true true FAIL "$LOG" endpoint_unreachable
+  if [ "$required" = 1 ]; then return 1; fi
+  say "VIP-PROBE WARN: optional executed probe failed; aggregate gate remains non-blocking"
+  return 0
+}
+
+# Manifest-driven source-to-destination verification extension. The verifier is
+# implemented by the lab runner and consumes its pre-deployment resolved inventory;
+# deploy_gate only supplies the stable invocation and refuses to synthesize success
+# when the module, result artifact, or required arguments are absent.
+do_telemetry() {
+  say "TELEMETRY FAIL: collection acceptance is not yet integrated with the canonical resolved configuration"
+  emit_gate_result telemetry_collection true true false FAIL none collection_engine_not_integrated
+  return 2
 }
 
 # ---- stage: teardown (final) ----------------------------------------------
 do_teardown() {
+  refuse_physical_silmaril_wipe || return $?
   say "TEARDOWN (final) via tree's own scripts/wipe_lme.sh"
   run_remote "cd '$REMOTE_DIR' && bash scripts/wipe_lme.sh"
   local rc=$?
@@ -1190,32 +1524,67 @@ do_teardown() {
 }
 
 # ---- driver ----------------------------------------------------------------
-say "=== LEG START stage=$STAGE host=$HOST label=$LABEL ==="
-rc=0
-case "$STAGE" in
-  rsync)    do_rsync; rc=$?;;
-  wipe)     do_rsync && do_wipe; rc=$?;;
-  install)  do_install; rc=$?;;
-  health)   do_health && do_vip_probe; rc=$?;;   # probe is a no-op unless armed => unarmed --stage health is byte-identical
-  vip-probe) do_vip_probe; rc=$?;;
-  teardown) do_teardown; rc=$?;;
-  deploy)   # setup -> deploy -> health -> (opt) vip-probe, HOLD before teardown
-    do_rsync    || { rc=$?; say "LEG FAIL at rsync";     exit $rc; }
-    do_wipe     || { rc=$?; say "LEG FAIL at pre-wipe";  exit $rc; }
-    do_install  || { rc=$?; say "LEG FAIL at install";   exit $rc; }
-    do_health   || { rc=$?; say "LEG FAIL at health";    exit $rc; }
-    do_vip_probe || { rc=$?; say "LEG FAIL at vip-probe"; exit $rc; }
-    say "DEPLOY+HEALTH OK — stack HELD up for inspection (run --stage teardown to finish)"
-    ;;
-  all)
-    do_rsync     || { rc=$?; say "LEG FAIL at rsync";     exit $rc; }
-    do_wipe      || { rc=$?; say "LEG FAIL at pre-wipe";  exit $rc; }
-    do_install   || { rc=$?; say "LEG FAIL at install";   do_teardown || true; exit $rc; }
-    do_health    || { rc=$?; say "LEG FAIL at health";    do_teardown || true; exit $rc; }
-    do_vip_probe || { rc=$?; say "LEG FAIL at vip-probe"; do_teardown || true; exit $rc; }
-    do_teardown  || { rc=$?; say "LEG FAIL at teardown";  exit $rc; }
-    ;;
-  *) echo "unknown --stage $STAGE" >&2; exit 2;;
-esac
-say "=== LEG END stage=$STAGE rc=$rc ==="
-exit "$rc"
+retain_failed_state() {
+  local stage="$1" rc="$2"
+  say "LEG FAIL at $stage rc=$rc; failed state retained for inspection; evidence=$LOG results=$RESULTS"
+  emit_gate_result cleanup false true false SKIPPED "$LOG" failed_state_retained
+  return "$rc"
+}
+
+preserve_evidence_before_cleanup() {
+  say "EVIDENCE retained before cleanup: log=$LOG results=$RESULTS"
+  emit_gate_result evidence_retention true true true PASS "$LOG" evidence_persisted_before_cleanup
+}
+
+run_stage() {
+  local stage="$1" rc=0
+  case "$stage" in
+    rsync) do_rsync || { rc=$?; retain_failed_state rsync "$rc"; return $?; };;
+    wipe)
+      do_rsync || { rc=$?; retain_failed_state rsync "$rc"; return $?; }
+      do_wipe || { rc=$?; retain_failed_state wipe "$rc"; return $?; }
+      ;;
+    install) do_install || { rc=$?; retain_failed_state install "$rc"; return $?; };;
+    health)
+      do_health || { rc=$?; retain_failed_state health "$rc"; return $?; }
+      do_vip_probe || { rc=$?; retain_failed_state vip-probe "$rc"; return $?; }
+      ;;
+    vip-probe) do_vip_probe || { rc=$?; retain_failed_state vip-probe "$rc"; return $?; };;
+    telemetry) do_telemetry || { rc=$?; retain_failed_state telemetry "$rc"; return $?; };;
+    teardown) preserve_evidence_before_cleanup && do_teardown;;
+    deploy)
+      do_rsync || { rc=$?; retain_failed_state rsync "$rc"; return $?; }
+      do_wipe || { rc=$?; retain_failed_state pre-wipe "$rc"; return $?; }
+      do_install || { rc=$?; retain_failed_state install "$rc"; return $?; }
+      do_health || { rc=$?; retain_failed_state health "$rc"; return $?; }
+      do_vip_probe || { rc=$?; retain_failed_state vip-probe "$rc"; return $?; }
+      say "DEPLOY+HEALTH OK — stack HELD up for inspection; collection/readback requires --stage telemetry"
+      ;;
+    all)
+      do_rsync || { rc=$?; retain_failed_state rsync "$rc"; return $?; }
+      do_wipe || { rc=$?; retain_failed_state pre-wipe "$rc"; return $?; }
+      do_install || { rc=$?; retain_failed_state install "$rc"; return $?; }
+      do_health || { rc=$?; retain_failed_state health "$rc"; return $?; }
+      do_vip_probe || { rc=$?; retain_failed_state vip-probe "$rc"; return $?; }
+      preserve_evidence_before_cleanup || return $?
+      do_teardown || { rc=$?; retain_failed_state teardown "$rc"; return $?; }
+      ;;
+    *) echo "unknown --stage $stage" >&2; return 2;;
+  esac
+}
+
+main() {
+  set -uo pipefail
+  parse_args "$@" || return $?
+  init_gate_run || return $?
+  say "=== LEG START stage=$STAGE host=${HOST:-none} label=$LABEL ==="
+  run_stage "$STAGE"
+  local rc=$?
+  say "=== LEG END stage=$STAGE rc=$rc ==="
+  return "$rc"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+  exit $?
+fi

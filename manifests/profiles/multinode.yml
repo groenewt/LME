@@ -14,15 +14,14 @@
 #
 # ---------------------------------------------------------------------------
 # WHAT THIS STATIC PROFILE DOES (host-independent, safe to commit):
-#   Re-opens the two ports remote agents must reach, to bind:0.0.0.0. Default
-#   posture is CLOSED (global.yml + each service manifest bind every published port
-#   to 127.0.0.1). combine(recursive=True) REPLACES lists, so each service's FULL
-#   publish_ports list is re-declared with an EXPLICIT bind on every entry; "open"
-#   is a PRESENT bind:0.0.0.0, never an absent bind (so an audit greps bind:0.0.0.0).
-#     * fleet-server 8220  -> 0.0.0.0  (remote agents enroll / check in here)
-#     * elasticsearch 9200 -> 0.0.0.0  (fleet default output; agents ship data here.
-#       This leg runs ssl.verification_mode: certificate -- CA-only, no hostname
-#       check -- so it needs REACHABILITY, not an ES cert SAN.)
+#   Publishes the two distinct remote-agent contracts on explicitly resolved
+#   tailnet addresses.  Enrollment uses fleet_enrollment_bind_address:8220.
+#   Elasticsearch output either binds fleet_output_bind_address:9200 directly or,
+#   when Tailscale Services are enabled, uses the isolated route
+#   frontend :9200 -> 127.0.0.1:19200 -> container :9200.  The latter avoids the
+#   impossible 0.0.0.0:9200 plus 127.0.0.1:9200 overlap while retaining guard 1b.
+#   Legacy non-lab callers that omit the bind values retain the old wildcard
+#   defaults; admitted lab inventory supplies concrete tailnet addresses.
 #   The ES TRANSPORT port (9300) is a CLUSTER concern and is intentionally NOT
 #   opened here (see cluster.yml).
 #
@@ -31,11 +30,9 @@
 # NOT hardcodable in a committed static profile, so they are DOCUMENTED here, not
 # set here):
 #
-#   1) -e fleet_advertise_host=<this node's tailnet MagicDNS name or IP>
-#      Feeds the fleet role (ansible/roles/fleet/tasks/main.yml): it becomes the
-#      host in the registered fleet-server URL (POST /api/fleet/fleet_server_hosts)
-#      AND in the fleet default-output ES URL. Defaults to `ipvar` when unset, so a
-#      single-node install is byte-identical.
+#   1) fleet_enrollment_host / fleet_output_host and their corresponding bind
+#      addresses.  Enrollment and output are independent contracts.  The Fleet
+#      role backward-defaults both hosts through fleet_advertise_host then ipvar.
 #
 #   2) lme_service_overrides.fleet-server.certs.san_dns / .san_ip = the SAME tailnet
 #      name / IP, so the fleet-server LEAF cert covers the advertised host (agents
@@ -53,7 +50,7 @@
 # NOTE (host registration is POST-then-409, not upsert): the fleet role registers
 # the advertised URL with POST .../fleet_server_hosts (id: lme-fleet-server) and
 # ACCEPTS 409 (already-exists) idempotently. A 409 does NOT update an existing
-# registration -- if you change fleet_advertise_host on a host that was already
+# registration -- if you change fleet_enrollment_host on a host that was already
 # enrolled, delete (or re-point) the old fleet_server_hosts entry in Kibana so the
 # new URL takes effect.
 # ---------------------------------------------------------------------------
@@ -61,16 +58,19 @@ profile_overlay:
   lme_global: {}
   services:
     fleet-server:
-      # FULL list re-declared (combine REPLACES lists); 8220 opened to the LAN so
-      # remote agents can enroll / check in. Base manifest carries only this entry.
+      # FULL list re-declared (combine REPLACES lists).  The resolved address is a
+      # tailnet address in admitted lab topology, never a wildcard.
       publish_ports:
-        - {host: 8220, container: 8220, bind: 0.0.0.0}   # LAN opt-in (remote agents)
+        - {host: 8220, container: 8220, bind: "{{ fleet_enrollment_bind_address | default('0.0.0.0') }}"}
     elasticsearch:
-      # FULL list re-declared; 9200 (client API) opened so agents can ship to the
-      # fleet default output. Base manifest carries only this entry (9300 transport
-      # is a CLUSTER concern -- see cluster.yml -- and stays absent here).
+      # FULL list re-declared.  `tailnet_port` is the advertised Serve frontend;
+      # `host` is the independently selected local backend port.
       publish_ports:
-        - {host: 9200, container: 9200, bind: 0.0.0.0, serve: tcp}   # LAN opt-in (fleet output target); serve:tcp for parity (INERT here: bind:0.0.0.0 has no loopback front -> tailnet_service ES fails 1b LOUD on multinode+tailscale; keep 9200 loopback or drop the opt-in for that combo)
+        - host: "{{ ((tailscale_serve_services | default(false) | bool) | ternary(19200, 9200)) }}"
+          container: 9200
+          bind: "{{ ((tailscale_serve_services | default(false) | bool) | ternary('127.0.0.1', (fleet_output_bind_address | default('0.0.0.0')))) }}"
+          tailnet_port: 9200
+          serve: tcp
   vars:
     # One ES node with remote agents -- NOT an ES cluster. Mirrors default.yml so any
     # task reading es_discovery sees a defined value (no task currently requires it).

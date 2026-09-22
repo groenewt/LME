@@ -380,13 +380,23 @@ def test_cluster_profile_opens_only_the_transport_port():
     assert render_port(by_host[9300]) == "0.0.0.0:9300:9300"
 
 
-def test_multinode_profile_opens_fleet_and_es_client_ports():
-    # multinode is the opt-in "multinode fleet" profile: it opens the two ports
-    # remote agents must reach -- fleet-server 8220 (enroll / check-in) and
-    # elasticsearch 9200 (fleet default output) -- to bind:0.0.0.0, and NOTHING else.
-    # "Open" is a PRESENT bind:0.0.0.0. It does NOT open the ES transport port (9300
-    # is a CLUSTER concern -- that is cluster.yml's job, not this profile's).
-    overlay = _load_profile("multinode.yml")["profile_overlay"]
+def test_multinode_profile_opens_fleet_and_es_client_ports(tmp_path, monkeypatch):
+    # Preserve the legacy direct-publication contract after resolving its
+    # defaults. Tailscale composition tests additionally exercise explicit node
+    # binds and frontend 9200 -> private backend 19200.
+    monkeypatch.setenv('ANSIBLE_LOCAL_TEMP', str(tmp_path))
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.template import Templar, trust_as_template
+    def trusted(value):
+        if isinstance(value, str):
+            return trust_as_template(value)
+        if isinstance(value, list):
+            return [trusted(item) for item in value]
+        if isinstance(value, dict):
+            return {key: trusted(item) for key, item in value.items()}
+        return value
+    overlay = Templar(loader=DataLoader(), variables={}).template(
+        trusted(_load_profile("multinode.yml")["profile_overlay"]), fail_on_undefined=True)
     fleet_by_host = {p["host"]: p
                      for p in overlay["services"]["fleet-server"]["publish_ports"]}
     es_by_host = {p["host"]: p
