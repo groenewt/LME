@@ -878,13 +878,22 @@ do_health() {
   # clamp makes 0 the ONLY value that can skip a probe: any empty/garbled read collapses
   # to 1 (fail-SAFE -- a broken locality read keeps the probe ON, never silently off).
   local probe_hv="$SRC/ansible/inventory/host_vars/${HOST%%.*}.yml"
-  local es_local kibana_local
+  local es_local kibana_local dashboard_local log_analyzer_local
   es_local="$(host_runs_service "$probe_hv" elasticsearch)"
   kibana_local="$(host_runs_service "$probe_hv" kibana)"
-  case "$es_local"     in 0) ;; *) es_local=1;;     esac
-  case "$kibana_local" in 0) ;; *) kibana_local=1;; esac
+  # The LLM-gated dashboard/log-analyzer probes below are host-facing UIs that can
+  # ALSO be scoped out on a cross-host consumer roster (e.g. a log-analyzer-only
+  # trixie leg drops dashboard). Gate each on the SAME roster + clamp so a roster
+  # that excludes it skips its probe; DEFAULT-LOCAL (no host_vars / no roster / etc)
+  # -> 1 -> byte-identical on every full-host leg.
+  dashboard_local="$(host_runs_service "$probe_hv" dashboard)"
+  log_analyzer_local="$(host_runs_service "$probe_hv" log-analyzer)"
+  case "$es_local"           in 0) ;; *) es_local=1;;           esac
+  case "$kibana_local"       in 0) ;; *) kibana_local=1;;       esac
+  case "$dashboard_local"    in 0) ;; *) dashboard_local=1;;    esac
+  case "$log_analyzer_local" in 0) ;; *) log_analyzer_local=1;; esac
 
-  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on profile=[${profile:-none}] loopback=[$loopback_ports] lan_ok=[$lan_ok] profile_open=[$profile_open] tailnet_ports=[$tailnet_ports] es_local=$es_local kibana_local=$kibana_local"
+  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on profile=[${profile:-none}] loopback=[$loopback_ports] lan_ok=[$lan_ok] profile_open=[$profile_open] tailnet_ports=[$tailnet_ports] es_local=$es_local kibana_local=$kibana_local dashboard_local=$dashboard_local log_analyzer_local=$log_analyzer_local"
 
   # ---- the remote payload ----------------------------------------------------
   # Quoted heredoc: single quotes are legal inside (unlike the old '...' arg
@@ -1005,28 +1014,36 @@ else
 fi
 
 if [ "$LLM_ON" = 1 ]; then
-  echo "== service: dashboard /livez :8502 (expect 200; unauthenticated liveness) =="
-  dl=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/livez || echo 000)
-  echo "  dashboard /livez http_code=$dl"
-  case "$dl" in 200) echo "  ok";; *) echo "  FAIL: dashboard /livez not reachable on loopback"; fail=1;; esac
+  if [ "$DASHBOARD_LOCAL" = 1 ]; then
+    echo "== service: dashboard /livez :8502 (expect 200; unauthenticated liveness) =="
+    dl=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/livez || echo 000)
+    echo "  dashboard /livez http_code=$dl"
+    case "$dl" in 200) echo "  ok";; *) echo "  FAIL: dashboard /livez not reachable on loopback"; fail=1;; esac
 
-  echo "== auth: dashboard /api/health with NO key (expect 401/403) =="
-  da=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/api/health || echo 000)
-  echo "  dashboard /api/health (unauth) http_code=$da"
-  case "$da" in 401|403) echo "  ok: webui auth enforced";;
-    *) echo "  FAIL: /api/* served unauthenticated ($da) — webui-auth not enforced"; fail=1;; esac
+    echo "== auth: dashboard /api/health with NO key (expect 401/403) =="
+    da=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/api/health || echo 000)
+    echo "  dashboard /api/health (unauth) http_code=$da"
+    case "$da" in 401|403) echo "  ok: webui auth enforced";;
+      *) echo "  FAIL: /api/* served unauthenticated ($da) — webui-auth not enforced"; fail=1;; esac
+  else
+    echo "== service: dashboard :8502 — SKIP (not host-local; scoped out of this roster) =="
+  fi
 
-  echo "== service: log-analyzer :8501 reachable (streamlit gates in-app at 200) =="
-  la=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8501 || echo 000)
-  echo "  log-analyzer http_code=$la"
-  case "$la" in 200|302|401|403) echo "  ok";; *) echo "  FAIL: log-analyzer unreachable"; fail=1;; esac
+  if [ "$LOG_ANALYZER_LOCAL" = 1 ]; then
+    echo "== service: log-analyzer :8501 reachable (streamlit gates in-app at 200) =="
+    la=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8501 || echo 000)
+    echo "  log-analyzer http_code=$la"
+    case "$la" in 200|302|401|403) echo "  ok";; *) echo "  FAIL: log-analyzer unreachable"; fail=1;; esac
+  else
+    echo "== service: log-analyzer :8501 — SKIP (not host-local; scoped out of this roster) =="
+  fi
 fi
 
 echo "== HEALTH result: fail=$fail =="
 exit "$fail"
 REMOTE_EOF
 
-  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' ES_LOCAL='$es_local' KIBANA_LOCAL='$kibana_local' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' PROFILE_OPEN='$profile_open' PROFILE_NAME='${profile:-}' TAILNET_PORTS='$tailnet_ports' bash -s" <<<"$HEALTH_SH"
+  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' ES_LOCAL='$es_local' KIBANA_LOCAL='$kibana_local' DASHBOARD_LOCAL='$dashboard_local' LOG_ANALYZER_LOCAL='$log_analyzer_local' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' PROFILE_OPEN='$profile_open' PROFILE_NAME='${profile:-}' TAILNET_PORTS='$tailnet_ports' bash -s" <<<"$HEALTH_SH"
   local rc=$?
   say "HEALTH rc=$rc  (0 => all gate checks passed)"; return "$rc"
 }
