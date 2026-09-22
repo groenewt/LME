@@ -521,6 +521,181 @@ for line in out:
 PY
 }
 
+# derive_host_scoped_min(): the GAP-3 host-scoped container floor -- the number of
+# LONG-RUNNING podman containers THIS host SHOULD run, derived PURELY from DECLARED
+# INTENT (manifest kinds ∧ effective pack flags ∧ the host's `lme_host_services`
+# roster), NEVER by counting rendered `.container` units or `podman ps` on the target.
+# That anti-tautology is the whole point: if the floor were "whatever the renderer
+# produced", a SHORT render -- exactly the GAP-3 render-miss bug class -- would become
+# invisible and the gate self-confirming. Here the gate encodes what the host SHOULD
+# have INDEPENDENTLY, so a render that drops a scoped-in unit FAILS the floor check.
+# Mirrors the ansible render decision EXACTLY -- a service is a counted container iff:
+#     kind == container                 (targets/networks/volumes/path_services are not
+#                                        `podman ps` containers -- e.g. trixie's `lme`
+#                                        target + `network` count 0, matching do_health)
+#     AND is_enabled(enabled_when, flags)   (the SAME is_enabled the renderer applies)
+#     AND behavior.type != oneshot       (setup-certs/setup-accts run then EXIT -> never
+#                                        in `podman ps`; the remote counts RUNNING only)
+#     AND (no ConditionPathExists=/opt/lme/OFFLINE_MODE OR offline_mode on)
+#                                        (fleet-distribution starts ONLY offline: the +1)
+#     AND (roster empty/undefined OR id in roster)          (GAP-3 host scoping)
+# Roster source = the SAME ansible/inventory/host_vars/<host>.yml the renderer reads.
+# CONTRACT (must stay in lockstep with the Jinja host-scope clause + is_enabled):
+#   * host_vars ABSENT, or present with NO `lme_host_services`, or `[]`
+#       -> print NOTHING, exit 0  => caller keeps the full-host pack floor. GAP-3
+#          HAZARD-1 empty-safe: undefined/[] == full stack, byte-identical to pre-GAP-3.
+#   * a NON-EMPTY roster -> print the scoped integer (may be 0), exit 0.
+#   * host_vars UNPARSABLE, roster MALFORMED (not a string list), a roster id naming NO
+#     manifest service (GAP-3 4e typo class -- a scoped-out id silently lowers the floor
+#     to match a short render), an unknown enabled_when flag, or a broken/absent
+#     manifest tree -> exit NON-ZERO (fail CLOSED): the caller refuses a blind floor.
+# Args: <host_vars_path> <install_llm 0|1> <install_elastic_services 0|1> <offline_mode 0|1>
+derive_host_scoped_min() {
+  local hv="$1" root="$SRC/manifests"
+  [ -d "$root/services" ] || return 1
+  # No-python graceful degrade (mirrors derive_published_ports' fallback philosophy in
+  # this file): if this host_vars declares NO `lme_host_services` key at all, there is no
+  # roster to resolve -> print nothing, succeed -> the caller keeps the full-host floor
+  # WITHOUT touching python3, so a controller lacking python3 stays byte-identical on
+  # every un-rostered host (incl. the es*.yml cluster-sizing files). Only a host that
+  # ACTUALLY declares a roster falls through to the python parse -- and fails CLOSED
+  # there if python is absent, since a scoped floor cannot be honestly derived without
+  # it. The grep tests KEY PRESENCE only: comment lines (`# lme_host_services ...`) start
+  # with `#` so the anchored regex skips them, and the python pass owns the value
+  # decision -- a rare false-positive here costs only one harmless python re-check (which
+  # then finds no roster), never a wrong floor.
+  if ! grep -qE '^[[:space:]]*lme_host_services[[:space:]]*:' "$hv" 2>/dev/null; then
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1 || return 1
+  python3 - "$hv" "$root/services" "$2" "$3" "$4" <<'PY'
+import glob, os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(3)
+hv_path, svc_dir = sys.argv[1], sys.argv[2]
+flags = {'install_llm': sys.argv[3] == '1',
+         'install_elastic_services': sys.argv[4] == '1',
+         'offline_mode': sys.argv[5] == '1'}
+KNOWN = {'install_llm', 'install_elastic_services', 'offline_mode'}
+# --- roster from host_vars (the SAME declaration the ansible renderer reads) --------
+try:
+    with open(hv_path) as fh:
+        hv = yaml.safe_load(fh)
+except Exception:
+    sys.exit(3)                     # host_vars exists but unparsable -> fail closed
+if hv is None:
+    hv = {}
+if not isinstance(hv, dict):
+    sys.exit(3)
+roster = hv.get('lme_host_services', None)
+if roster is None or roster == []:
+    sys.exit(0)                     # undefined/empty -> print nothing -> full-host floor
+if not isinstance(roster, list) or not all(isinstance(x, str) for x in roster):
+    sys.exit(5)                     # malformed roster -> fail closed
+def is_enabled(ew):
+    # Mirror filter_plugins/lme_manifests.py:is_enabled -- AND over flags; 'always' is a
+    # no-op; an unknown token is a typo -> fail closed (never silently evaluate False).
+    # Validate the WHOLE list before evaluating so an earlier unmet gate cannot mask a
+    # later typo (identical two-pass shape to this file's other is_enabled mirrors).
+    if not ew:
+        return True
+    for f in ew:
+        if f != 'always' and f not in KNOWN:
+            sys.exit(4)
+    for f in ew:
+        if f == 'always':
+            continue
+        if not flags.get(f, False):
+            return False
+    return True
+services = {}
+for path in sorted(glob.glob(os.path.join(svc_dir, "*.yml"))):
+    try:
+        with open(path) as fh:
+            doc = yaml.safe_load(fh)
+    except Exception:
+        sys.exit(3)                 # malformed manifest -> fail closed
+    if isinstance(doc, dict) and doc.get('id') is not None:
+        services[str(doc['id'])] = doc
+# GAP-3 4e typo class: every roster id MUST name a real manifest service (ANY kind, so
+# infra ids like `lme`/`network` are valid), else a typo'd/absent id would silently
+# lower the floor to match a short render. Fail closed -- do not certify off a guess.
+unknown = [r for r in roster if r not in services]
+if unknown:
+    sys.exit(6)
+roster_set = set(roster)
+count = 0
+for sid, doc in services.items():
+    if doc.get('kind') != 'container':
+        continue
+    if not is_enabled(doc.get('enabled_when') or ['always']):
+        continue
+    if (doc.get('behavior') or {}).get('type') == 'oneshot':
+        continue
+    cpe = (doc.get('dependencies') or {}).get('condition_path_exists') or []
+    if any('/opt/lme/OFFLINE_MODE' in str(x) for x in cpe) and not flags['offline_mode']:
+        continue
+    if sid not in roster_set:
+        continue
+    count += 1
+print(count)
+PY
+}
+
+# resolve_expect_min(): the expected running-container floor for THIS leg. Precedence:
+#   1. LME_GATE_MIN_CONTAINERS  operator override (wins outright, unchanged).
+#   2. host-scoped floor        when this host's host_vars declares lme_host_services
+#                               (GAP-3): re-derived from declared intent, not the render.
+#   3. full-host pack floor     otherwise -- the PRE-GAP-3 arithmetic kept VERBATIM, so
+#                               every host without a roster (all of them today) is
+#                               byte-identical. Long-running containers only (setup/
+#                               oneshot units and volumes excluded):
+#     core    = elasticsearch,kibana,fleet-server,wazuh-manager,elastalert2   (5)
+#               + fleet-distribution, which starts ONLY in offline mode (its
+#               ConditionPathExists=/opt/lme/OFFLINE_MODE) -> +1 IFF offline.
+#     llm     = litellm,dashboard,log-analyzer,embeddings,llama-cpp,pgvector   (6)
+#     elastic = apm-server,filebeat,logstash,metricbeat,heartbeat             (5)
+#   Observed full-host: online+llm 5+6=11, online+elastic 5+5=10, offline core 6. The
+#   host-scoped re-derivation (2) counts these SAME container-kind services filtered by
+#   the roster, so a FULL roster reproduces the pack arithmetic exactly and a scoped
+#   host (trixie roster -> log-analyzer+dashboard = 2) drops to its declared count.
+# Echoes the integer on stdout (nothing else -- keep it log-free so callers can capture
+# it); returns NON-ZERO (caller must FAIL) only when a DECLARED roster cannot be
+# resolved. Args: <llm_on> <elastic_on> <offline_on>. Reads HOST and SRC from env.
+resolve_expect_min() {
+  local llm_on="$1" elastic_on="$2" offline_on="$3"
+  if [ -n "${LME_GATE_MIN_CONTAINERS:-}" ]; then
+    printf '%s\n' "$LME_GATE_MIN_CONTAINERS"; return 0
+  fi
+  local core_floor=5
+  [ "$offline_on" = 1 ] && core_floor=6            # fleet-distribution: offline-only
+  local full_floor
+  if [ "$llm_on" = 1 ]; then full_floor=$((core_floor + 6))   # + llm pack
+  else full_floor="$core_floor"; fi
+  [ "$elastic_on" = 1 ] && full_floor=$((full_floor + 5))     # + elastic pack
+  # GAP-3 host scoping: a host whose host_vars declares `lme_host_services` renders only
+  # that subset, so the full floor FALSE-FAILS it. Re-derive from DECLARED INTENT; the
+  # roster comes from the SAME host_vars file the renderer reads. Empty-safe (no file /
+  # no roster / [] -> full floor) and fail-CLOSED (a declared-but-unresolvable roster ->
+  # non-zero -> the caller refuses a blind floor). Short host name so an FQDN --host
+  # (graph.tail...ts.net) still finds host_vars/graph.yml (mirrors the self-curl guard).
+  local host_short="${HOST%%.*}"
+  local hv="$SRC/ansible/inventory/host_vars/${host_short}.yml"
+  if [ -f "$hv" ]; then
+    local scoped
+    if scoped="$(derive_host_scoped_min "$hv" "$llm_on" "$elastic_on" "$offline_on")"; then
+      # non-empty stdout = a roster is declared (scoped integer, possibly 0);
+      # empty stdout = no/empty roster -> keep the full-host floor.
+      if [ -n "$scoped" ]; then printf '%s\n' "$scoped"; else printf '%s\n' "$full_floor"; fi
+      return 0
+    fi
+    return 1   # declared roster could not be resolved -> caller FAILS closed
+  fi
+  printf '%s\n' "$full_floor"; return 0
+}
+
 # ---- stage: health probe ---------------------------------------------------
 do_health() {
   say "HEALTH probe (deep gate)"
@@ -568,27 +743,17 @@ do_health() {
     return 1
   fi
 
-  # Expected running-container floor, from the EFFECTIVE install flags. Long-running
-  # containers only (setup/oneshot units and volumes excluded):
-  #   core    = elasticsearch,kibana,fleet-server,wazuh-manager,elastalert2   (5)
-  #             + fleet-distribution, which starts ONLY in offline mode
-  #             (roles/fleet/tasks/main.yml:66 `when: offline_mode`) -- online
-  #             agents pull the installer from Elastic direct -> +1 IFF offline.
-  #   llm     = litellm,dashboard,log-analyzer,embeddings,llama-cpp,pgvector   (6)
-  #   elastic = apm-server,filebeat,logstash,metricbeat,heartbeat             (5)
-  # Observed: online+llm 5+6=11 (tailscale leg), online+elastic 5+5=10 (this leg's
-  # 5-core roster observed directly), offline core 6 (airgapped leg). The online
-  # core-only --no-llm floor (5) is DERIVED from that same 5-core roster, not
-  # separately exercised. An operator override always wins.
+  # Expected running-container floor. An operator override (LME_GATE_MIN_CONTAINERS)
+  # wins; otherwise the floor is the full-host pack arithmetic UNLESS this host declares
+  # a GAP-3 `lme_host_services` roster in its host_vars, in which case it is re-derived
+  # from DECLARED INTENT scoped to that roster (see resolve_expect_min / the anti-
+  # tautology contract on derive_host_scoped_min). A host_vars file that declares a
+  # roster we cannot resolve => FAIL, never a blind green (same doctrine as the exposure
+  # gate above -- "a check that can't run = FAIL").
   local expect_min
-  if [ -n "${LME_GATE_MIN_CONTAINERS:-}" ]; then
-    expect_min="$LME_GATE_MIN_CONTAINERS"
-  else
-    local core_floor=5
-    [ "$offline_on" = 1 ] && core_floor=6            # fleet-distribution: offline-only
-    if [ "$llm_on" = 1 ]; then expect_min=$((core_floor + 6))   # + llm pack
-    else expect_min="$core_floor"; fi
-    [ "$elastic_on" = 1 ] && expect_min=$((expect_min + 5))     # + elastic pack
+  if ! expect_min="$(resolve_expect_min "$llm_on" "$elastic_on" "$offline_on")"; then
+    say "HEALTH FATAL: $SRC/ansible/inventory/host_vars/${HOST%%.*}.yml declares an lme_host_services roster that could not be resolved (unparsable host_vars, malformed/typo'd roster, unknown enabled_when flag, broken manifest, or the controller cannot parse manifests -- python3/PyYAML) -- refusing to run a blind container-floor gate"
+    return 1
   fi
   # Accepted non-loopback binds come from two DISTINCT, separately-labelled rules:
   #   * expose_lan operator opt-in       -> LME_GATE_LAN_OK  (env, unchanged)
@@ -798,9 +963,10 @@ REMOTE_EOF
 # existing invocation is byte-identical -- no existing caller passes either):
 #   LME_GATE_PROBE_FROM=<host>          the SECOND (consumer) inventory host to probe
 #                                       FROM -- a tailnet node that is NOT --host.
-#   LME_GATE_REQUIRE_VIP_REACHABLE=1    ARM enforcement (mirrors the ansible var
-#                                       tailscale_require_vip_reachable): an unreachable
-#                                       VIP becomes a typed FAIL instead of a WARN.
+#   LME_GATE_REQUIRE_VIP_REACHABLE=1    ARM enforcement -- THIS env knob IS the arming
+#                                       mechanism (controller-side, SSH-threaded; there
+#                                       is no ansible var for it): an unreachable VIP
+#                                       becomes a typed FAIL instead of a WARN.
 #   (optional) LME_GATE_TAILNET_DOMAIN  MagicDNS suffix, e.g. tail6c2eb6.ts.net; default
 #                                       bare (the svc name resolves via the search domain).
 #   (optional) LME_GATE_VIP_TIMEOUT     per-endpoint curl/connect timeout (default 15s).
@@ -811,6 +977,19 @@ REMOTE_EOF
 #   both set           -> probe runs; unreachable = typed FAIL
 # Single-shot per endpoint (NO until/retries -- an until keyed on liveness hard-fails
 # on retry-exhaustion, round-11 B1). Composable: probes whatever the manifests declare.
+#
+# ACCEPTANCE RULE (routing-only; do NOT overclaim -- W-1). A green result here proves
+# the tailnet ROUTE is live: the VIP name resolved, the tailnet path carried the
+# connection, and the backend answered (a raw-tcp connect, or ANY http_code). It does
+# NOT prove GAP-2 end-to-end TLS closure. TLS closure is a SEPARATE, independent signal,
+# proven ONLY by the consumer app's own `verify=True` Elasticsearch client call from the
+# trixie consumer (2c Path-1: check_hostname=False + CERT_REQUIRED against the internal
+# CA). The curl below is `-sk` (insecure) BY DESIGN, so it can say NOTHING about chain
+# validation -- a green vip-probe MUST NEVER be cited as evidence of TLS/CA closure. This
+# is also why this stage builds NO `openssl s_client -verify_hostname` probe: a hostname-
+# verifying probe would assert the OPPOSITE of the shipped 2c path (which sets
+# check_hostname=False), so it would either fail the code we shipped or pass for an
+# unrelated reason. Routing here + verify=True there are two REQUIRED, non-substitutable signals.
 do_vip_probe() {
   local armed=0 from="${LME_GATE_PROBE_FROM:-}"
   case "${LME_GATE_REQUIRE_VIP_REACHABLE:-0}" in 1|true|TRUE|yes|on) armed=1;; esac
@@ -819,6 +998,7 @@ do_vip_probe() {
   if [ "$armed" = 0 ] && [ -z "$from" ]; then return 0; fi
 
   say "VIP-PROBE (consumer-node reachability; armed=$armed from=[${from:-none}])"
+  say "VIP-PROBE ACCEPTANCE RULE: a green probe proves tailnet ROUTING only (name resolves, route live, backend answered over an insecure -sk connect). It does NOT prove GAP-2 TLS closure -- that is proven ONLY by the consumer app's own verify=True ES client call from ${from:-the consumer node} (2c Path-1: CERT_REQUIRED vs the internal CA), and MUST NEVER be cited from this probe."
   # Armed but no consumer node => a required check that cannot run. Gate doctrine: a
   # check that can't run = FAIL. Self-curl is forbidden (self-VIP expected-unreachable),
   # so it can never substitute for a real second node.
