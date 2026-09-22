@@ -26,8 +26,11 @@
 #     loopback so they are fronted here and NOT exposed on the LAN; the loopback bind
 #     selects WHICH port/scheme to front (it does not by itself opt a service in).
 #   * the VIP name -> the service's `tailnet_service` key (the opt-in marker; no fallback).
-#   * the front port -> the LOWEST-numbered loopback host port (canonical/privileged:
-#     e.g. kibana's 443 is chosen over 5601).
+#   * the front port -> the loopback publish_port explicitly marked `tailnet_serve: true`
+#     (a composable, per-port VIP selector; K1). ONLY when NO port is marked does it fall
+#     back to the LOWEST-numbered loopback host port (unchanged for single-port services).
+#     kibana marks 5601, so 5601 is fronted and its inert 443 loopback publish is never
+#     the VIP front. (`tailnet_serve` is distinct from the per-port `serve:` transport key.)
 #   * the serve mode -> the port's optional `serve` key (default `https`).
 #
 # ── CONTRACT for raw-TLS backends (READ THIS, MA2) ──────────────────────────────
@@ -96,13 +99,43 @@
   ansible.builtin.set_fact:
     ts_svc_targets: []
 
+# Fail-closed on marker ambiguity: a single service must mark AT MOST ONE loopback
+# port as the VIP front. Two `tailnet_serve: true` ports would make the _ts_pick
+# selection order-dependent (silent wrong-port), so reject it loudly BEFORE deriving.
+# Gated exactly like the derivation (opt-in + enabled) so only opted-in services are
+# checked; an empty/single marked list passes trivially (0/1 <= 1).
+- name: Assert at most one tailnet_serve-marked VIP front port per opt-in service
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_ts_loop | selectattr('tailnet_serve', 'defined') | selectattr('tailnet_serve')
+         | list | length) <= 1
+    fail_msg: >-
+      Service '{{ item.value.id }}' marks more than one loopback publish_ports entry with
+      `tailnet_serve: true`. Exactly one port per service may be the tailnet VIP front --
+      mark only the intended front port.
+    quiet: true
+  vars:
+    # Same host-facing loopback selection the derivation uses (before the UDP/sort step).
+    _ts_loop: >-
+      {{ item.value.publish_ports | default([])
+         | selectattr('bind', 'defined')
+         | selectattr('bind', 'equalto', '127.0.0.1')
+         | list }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.id }}"
+  when:
+    - item.value.tailnet_service is defined
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+
 - name: Derive one tailnet VIP target per opt-in (tailnet_service-marked) host-facing service
   ansible.builtin.set_fact:
     ts_svc_targets: >-
       {{ ts_svc_targets + [ {
            'service': item.value.tailnet_service,
-           'port':    ((_ts_lo | first).host),
-           'scheme':  ((_ts_lo | first).serve | default('https')),
+           'port':    (_ts_pick).host,
+           'scheme':  ((_ts_pick).serve | default('https')),
          } ] }}
   vars:
     # This service's host-facing loopback publish_ports.
@@ -119,6 +152,13 @@
       {{ ((_ts_loop | selectattr('protocol', 'undefined') | list)
           + (_ts_loop | rejectattr('protocol', 'undefined') | rejectattr('protocol', 'equalto', 'udp') | list))
          | sort(attribute='host') }}
+    # Ports on THIS service explicitly marked as the tailnet VIP front (composable
+    # selector; supersedes lowest-port-wins which mis-picked kibana 443 over 5601 = K1).
+    _ts_marked: >-
+      {{ _ts_lo | selectattr('tailnet_serve', 'defined') | selectattr('tailnet_serve') | list }}
+    # The chosen front entry: the marked one if present, else the deterministic
+    # lowest-port fallback (unchanged behaviour for single-port services).
+    _ts_pick: "{{ (_ts_marked | first) if (_ts_marked | length) > 0 else (_ts_lo | first) }}"
   loop: "{{ lme_services | dict2items }}"
   loop_control:
     label: "{{ item.value.id }}"
@@ -167,6 +207,69 @@
   failed_when: false
   become: true
 
+# --- Port-aware clear-on-drift reconcile (BLOCKING; makes the derived port take effect)
+# The publish gate below is NAME-keyed: once `svc:<name>` is present in serve config it
+# never re-publishes. AND `tailscale serve` is ADDITIVE -- a bare republish on a new port
+# leaves the OLD handler in place too, giving a 2-port Service that reads
+# partially-configured and has its VIP route withheld (= K1). So when the derived front
+# port has DRIFTED from what the daemon currently serves, the stale handler must be
+# CLEARED first. Drift is detected format-robustly via the port-bearing serve TARGET
+# string (the target URL embeds the port): a svc is correctly served ONLY when its
+# derived-port target (`https+insecure://127.0.0.1:<port>`, or the raw
+# `tcp://127.0.0.1:<port>`) is present in the serve config. Same clear idiom
+# scripts/wipe_lme.sh uses for VIP teardown (`tailscale serve clear svc:<name>`, with the
+# bare-name / `--service=... reset` fallbacks for CLI builds that spell it differently).
+# Idempotent: no drift -> this clear skips AND the name-keyed publish gate skips (no-op).
+- name: Clear a VIP's stale serve config when its served port has drifted from the derived front port
+  ansible.builtin.shell: >-
+    tailscale serve clear svc:{{ item.service }}
+    || tailscale serve clear {{ item.service }}
+    || tailscale serve --service=svc:{{ item.service }} reset
+  register: ts_drift_clear
+  loop: "{{ ts_svc_targets }}"
+  loop_control:
+    label: "svc:{{ item.service }} (served != derived :{{ item.port }})"
+  when:
+    # (1) the svc name is already registered in EITHER serve-intent view ...
+    - >-
+      ('svc:' ~ item.service) in (ts_serve_status.stdout | default(''))
+      or ('svc:' ~ item.service) in (ts_serve_cfg.stdout | default(''))
+    # (2) ... but its derived-port target is NOT what is served -> the served port drifted.
+    - >-
+      (((item.scheme == 'tcp') | ternary('tcp://127.0.0.1:', 'https+insecure://127.0.0.1:'))
+        ~ item.port) not in (ts_serve_cfg.stdout | default(''))
+  changed_when: true
+  become: true
+
+# The publish gate keys on the ts_serve_status/ts_serve_cfg SNAPSHOTS captured above; a
+# clear does NOT refresh them in memory. So WHEN a stale handler was just cleared we must
+# re-read, or the name-keyed gate would still see the (now-removed) name and SKIP the
+# derived-port publish -- leaving the svc with ZERO handlers (a strictly worse false-green
+# than the one this closes). Only needed on the drift path: on the fresh / no-drift path
+# the original snapshots already hold the correct answer, so gate the re-read on the clear
+# having changed.
+- name: Re-read tailscale serve status after clear-on-drift
+  ansible.builtin.command: tailscale serve status
+  register: ts_serve_status
+  changed_when: false
+  failed_when: false
+  become: true
+  when: ts_drift_clear.changed | default(false)
+
+- name: Re-read full tailscale serve/service config after clear-on-drift
+  ansible.builtin.command: tailscale serve get-config --all
+  register: ts_serve_cfg
+  changed_when: false
+  failed_when: false
+  become: true
+  when: ts_drift_clear.changed | default(false)
+
+# --- Publish the derived VIP front port -------------------------------------------
+# NAME-keyed publish gate: publish a svc:<name> only when it is not already present in
+# serve status/cfg (re-publishing an already-registered svc is a no-op). This gate
+# cannot see a PORT change by itself -- the clear-on-drift task above is what makes a
+# port change take effect (it removes the stale handler and the re-reads refresh these
+# snapshots, so the name goes absent here and the derived port is (re)published cleanly).
 - name: Publish enabled LME service VIPs as HTTPS (svc:<name>, ts.net-terminated)
   ansible.builtin.command: >-
     tailscale serve --bg --service=svc:{{ item.service }}
@@ -226,6 +329,15 @@
     - tailscale_require_vip_live | default(false) | bool
     - (ts_status_post.rc | default(1)) != 0 or (ts_status_post.stdout | default('')) | length == 0
 
+# A1 HONESTY (allocation != reachability): the LIVE/DEAD split below is derived PURELY
+# from Self.CapMap["services/<name>"], which proves the VIP is ALLOCATED + policy-APPROVED
+# with this node an approved host -- it does NOT prove a consumer can actually reach the
+# backend. A VIP can be allocated yet route-withheld (exactly K1: kibana's
+# partially-configured Service was CapMap-present here yet timed out from the consumer
+# node). End-to-end reachability is a SEPARATE, independent gate: the consumer-node probe
+# in testing/e2e/deploy_gate.sh (run FROM a 2nd inventory host, never a self-curl on the
+# advertiser), gated on `tailscale_require_vip_reachable` (default-off). Treat allocation
+# and reachability as two required signals; a green CapMap assert is necessary, not sufficient.
 - name: Derive LIVE vs DEAD tailnet VIPs from Self.CapMap
   ansible.builtin.set_fact:
     ts_live_vips: "{{ ts_svc_targets | map(attribute='service') | select('in', _ts_capmap_services) | list }}"
