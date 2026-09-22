@@ -22,11 +22,15 @@
 #       --graphroot /data/lme-storage --flags "--elastic-services" \
 #       --label graph-some --stage all
 #
-# Stages (--stage): all | rsync | wipe | install | health | deploy | teardown
+# Stages (--stage): all | rsync | wipe | install | health | vip-probe | deploy | teardown
 #   wipe            = rsync + pre-install teardown+self-verify (cheapest smoke:
 #                     validates transport + exec + a CLEAN host).
-#   deploy          = rsync -> wipe -> install -> health, HOLD before teardown.
-#   all             = rsync -> wipe -> install -> health -> teardown (full leg).
+#   vip-probe       = A1 consumer-node VIP reachability (post-health; DEFAULT OFF --
+#                     no-op unless LME_GATE_PROBE_FROM / LME_GATE_REQUIRE_VIP_REACHABLE
+#                     are set; see do_vip_probe). Also runs after health in the
+#                     health / deploy / all stages (a no-op there when unarmed).
+#   deploy          = rsync -> wipe -> install -> health -> vip-probe, HOLD before teardown.
+#   all             = rsync -> wipe -> install -> health -> vip-probe -> teardown (full leg).
 # Override LOGDIR / SRC / REMOTE_DIR via the environment.
 #
 # --strict : make an install that RESCUED any task (PLAY RECAP rescued>0) FAIL
@@ -356,6 +360,167 @@ PY
     | grep -oE 'host:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | sort -un
 }
 
+# effective_pack_flags(): echo "<install_llm> <install_elastic_services> <offline_mode>"
+# (each 0/1) EXACTLY as do_health derives them from FLAGS, AFTER the --offline
+# adjustment (offline forces elastic off, and llm off unless --llm). This is the same
+# roster install.sh renders, so a manifest enable-filter keyed on these three matches
+# the real deploy. Used by the VIP-probe stage (do_health computes them inline).
+effective_pack_flags() {
+  local llm_on=1 elastic_on=0 offline_on=0
+  case " $FLAGS " in *" --no-llm "*) llm_on=0;; esac
+  case " $FLAGS " in *" --elastic-services "*) elastic_on=1;; esac
+  case " $FLAGS " in *" --offline "*|*" -o "*) offline_on=1;; esac
+  if [ "$offline_on" = 1 ]; then
+    elastic_on=0
+    case " $FLAGS " in *" --llm "*) : ;; *) llm_on=0;; esac
+  fi
+  printf '%s %s %s\n' "$llm_on" "$elastic_on" "$offline_on"
+}
+
+# derive_tailnet_ingress_ports(): the ENABLED host ports the tailscale ingress leg
+# (ansible/roles/podman/tasks/tailscale_ingress.yml) fronts THIS run -- each service's
+# `tailnet_ingress:`-marked publish_ports entry, but ONLY when that service is enabled
+# under the effective pack flags, mirroring the leg's own `enabled_when |
+# is_enabled(lme_enable_flags)` gate. This REPLACES the literal `8200 4000 5044`.
+# Emits unique host port NUMBERS, one per line (mode-agnostic: the exposure allowance
+# is port-based). FAIL-CLOSED, deliberately with NO grep fallback (this runs
+# CONTROLLER-side where python3+PyYAML is present, and a security allow-set must never
+# be built from a degraded parse): a missing manifests tree, a parse error, an unknown
+# enabled_when flag, or a malformed `tailnet_ingress` value (not https/raw-tcp) all
+# return non-zero so the caller refuses to run a blind exposure gate rather than
+# silently pass an empty allow-set. An EMPTY result from a SUCCESSFUL parse is
+# LEGITIMATE (e.g. --tailscale --no-llm fronts nothing) and returns 0.
+# Args: <install_llm 0|1> <install_elastic_services 0|1> <offline_mode 0|1>
+derive_tailnet_ingress_ports() {
+  local root="$SRC/manifests"
+  [ -d "$root/services" ] || return 1
+  command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1 || return 1
+  python3 - "$root/services" "$1" "$2" "$3" <<'PY'
+import glob, os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(3)
+svc_dir = sys.argv[1]
+flags = {'install_llm': sys.argv[2] == '1',
+         'install_elastic_services': sys.argv[3] == '1',
+         'offline_mode': sys.argv[4] == '1'}
+KNOWN = {'install_llm', 'install_elastic_services', 'offline_mode'}
+VALID_MODES = {'https', 'raw-tcp'}
+def is_enabled(ew):
+    # Mirror filter_plugins/lme_manifests.py:is_enabled -- AND over flags, 'always'
+    # is a no-op, an unknown token is a typo -> fail closed (non-zero) rather than
+    # silently evaluate False.
+    if not ew:
+        return True
+    for f in ew:
+        if f != 'always' and f not in KNOWN:
+            sys.exit(4)
+    for f in ew:
+        if f == 'always':
+            continue
+        if not flags.get(f, False):
+            return False
+    return True
+ports = set()
+for path in sorted(glob.glob(os.path.join(svc_dir, "*.yml"))):
+    try:
+        with open(path) as fh:
+            doc = yaml.safe_load(fh)
+    except Exception:
+        sys.exit(3)   # malformed manifest -> fail closed
+    if not isinstance(doc, dict):
+        continue
+    marked = []
+    for p in doc.get("publish_ports") or []:
+        if not isinstance(p, dict) or p.get("tailnet_ingress") is None:
+            continue
+        if p.get("tailnet_ingress") not in VALID_MODES:
+            sys.exit(5)   # malformed marker value -> fail closed
+        try:
+            marked.append(int(str(p.get("host")).strip()))
+        except Exception:
+            sys.exit(5)
+    if not marked:
+        continue
+    if not is_enabled(doc.get("enabled_when") or ['always']):
+        continue
+    ports.update(marked)
+for p in sorted(ports):
+    print(p)
+PY
+}
+
+# derive_vip_endpoints(): one consumer-probe endpoint per ENABLED opt-in VIP service,
+# mirroring the VIP publisher (tailscale_service.yml). A service opts in with a
+# top-level `tailnet_service:` key; among its loopback (bind 127.0.0.1), non-UDP
+# publish_ports the fronted entry is the `tailnet_serve: true`-marked one, else the
+# LOWEST host port (subagent A's _ts_pick); port = that entry's host, scheme = its
+# `serve` key (default https). Enable-filtered by the effective pack flags so a
+# disabled VIP is not probed (a false-fail). Emits `<tailnet_service>:<port>:<scheme>`
+# per line. FAIL-CLOSED (non-zero) on a missing tree / parse error / unknown
+# enabled_when flag; an empty result from a clean parse is valid (no opted-in VIPs).
+# Args: <install_llm 0|1> <install_elastic_services 0|1> <offline_mode 0|1>
+derive_vip_endpoints() {
+  local root="$SRC/manifests"
+  [ -d "$root/services" ] || return 1
+  command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1 || return 1
+  python3 - "$root/services" "$1" "$2" "$3" <<'PY'
+import glob, os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(3)
+svc_dir = sys.argv[1]
+flags = {'install_llm': sys.argv[2] == '1',
+         'install_elastic_services': sys.argv[3] == '1',
+         'offline_mode': sys.argv[4] == '1'}
+KNOWN = {'install_llm', 'install_elastic_services', 'offline_mode'}
+def is_enabled(ew):
+    if not ew:
+        return True
+    for f in ew:
+        if f != 'always' and f not in KNOWN:
+            sys.exit(4)
+    for f in ew:
+        if f == 'always':
+            continue
+        if not flags.get(f, False):
+            return False
+    return True
+def hostnum(p):
+    try:
+        return int(str(p.get("host")).strip())
+    except Exception:
+        return None
+out = []
+for path in sorted(glob.glob(os.path.join(svc_dir, "*.yml"))):
+    try:
+        with open(path) as fh:
+            doc = yaml.safe_load(fh)
+    except Exception:
+        sys.exit(3)
+    if not isinstance(doc, dict):
+        continue
+    name = doc.get("tailnet_service")
+    if not name:
+        continue
+    if not is_enabled(doc.get("enabled_when") or ['always']):
+        continue
+    loop = [p for p in (doc.get("publish_ports") or [])
+            if isinstance(p, dict) and p.get("bind") == "127.0.0.1"
+            and p.get("protocol") != "udp" and hostnum(p) is not None]
+    if not loop:
+        continue
+    marked = [p for p in loop if p.get("tailnet_serve")]
+    pick = marked[0] if marked else sorted(loop, key=hostnum)[0]
+    scheme = pick.get("serve") or "https"
+    out.append("%s:%s:%s" % (str(name), hostnum(pick), str(scheme)))
+for line in out:
+    print(line)
+PY
+}
+
 # ---- stage: health probe ---------------------------------------------------
 do_health() {
   say "HEALTH probe (deep gate)"
@@ -445,13 +610,14 @@ do_health() {
   # ingress is on, so when off the exposure check is byte-identical to a plain
   # deploy and a real 0.0.0.0/LAN bind on any port still FAILS.
   #
-  # Ports fronted by tailscale_ingress.yml: apm-server 8200, litellm 4000,
-  # logstash-beats 5044 -- ALL THREE are in the checked set now that the loopback
-  # set is the complete manifest-derived list (they were unchecked no-ops under the
-  # old 9-port literal), so a tailnet-fronted bind on any of them is now actively
-  # validated. Operator-overridable via env LME_GATE_TAILNET_OK (a port list), which
-  # also turns the allowance on — an explicit escape hatch mirroring LME_GATE_LAN_OK.
-  local tailnet_ports="8200 4000 5044"
+  # The fronted set is DERIVED from the manifests (was the literal `8200 4000 5044`):
+  # each service's `tailnet_ingress:`-marked port, ENABLED under this run's pack flags
+  # -- exactly the set tailscale_ingress.yml fronts (marker + enabled_when). So apm
+  # 8200 / logstash 5044 count only with --elastic-services and litellm 4000 only with
+  # the LLM stack, matching the real ingress leg instead of a fixed literal. Empty
+  # unless ingress is on, so when off the exposure check is byte-identical to a plain
+  # deploy and a real 0.0.0.0/LAN bind on any port still FAILS.
+  local tailnet_ports=""
   local tailnet_on=0
   # Enabled for this run when the ingress leg is turned on: --tailscale (install.sh
   # sets tailscale_serve_ingress=true), --profile tailscale (profile sets it), or
@@ -463,10 +629,25 @@ do_health() {
   case "$EXTRA_VARS" in
     *'"tailscale_serve_ingress":true'*|*'"tailscale_serve_ingress": true'*|*'tailscale_serve_ingress=true'*) tailnet_on=1;;
   esac
-  # Explicit operator override always wins and enables the allowance for its set.
-  if [ -n "${LME_GATE_TAILNET_OK:-}" ]; then tailnet_on=1; tailnet_ports="$LME_GATE_TAILNET_OK"; fi
-  # OFF => empty allow-list => the remote per-port clause never matches (inert).
-  [ "$tailnet_on" = 1 ] || tailnet_ports=""
+  # Resolve the allow-set. The explicit operator override (LME_GATE_TAILNET_OK) is a
+  # FULL escape hatch: it wins and enables the allowance WITHOUT parsing manifests
+  # (mirrors LME_GATE_LAN_OK). Otherwise, ONLY when the ingress leg is on, derive the
+  # enabled marked set from the manifests and FAIL CLOSED on any parse/marker failure
+  # -- an empty set from a CLEAN parse is legitimate (nothing fronted this roster) and
+  # is honoured; a broken parse must never silently pass an empty allow-list.
+  if [ -n "${LME_GATE_TAILNET_OK:-}" ]; then
+    tailnet_on=1; tailnet_ports="$LME_GATE_TAILNET_OK"
+  elif [ "$tailnet_on" = 1 ]; then
+    if tailnet_ports="$(derive_tailnet_ingress_ports "$llm_on" "$elastic_on" "$offline_on")"; then
+      tailnet_ports="$(printf '%s' "$tailnet_ports" | xargs)"   # newline list -> trimmed single-spaced
+    else
+      say "HEALTH FATAL: could not derive the tailnet-ingress fronted port set from $SRC/manifests -- refusing to run a blind exposure gate"
+      return 1
+    fi
+  fi
+  # An empty tailnet_ports (ingress off, or a clean parse that fronts nothing this
+  # roster) => the remote per-port allow clause never matches (inert), so a real
+  # 0.0.0.0/LAN bind on any port still FAILS.
 
   say "HEALTH expects: containers>=$expect_min llm_on=$llm_on profile=[${profile:-none}] loopback=[$loopback_ports] lan_ok=[$lan_ok] profile_open=[$profile_open] tailnet_ports=[$tailnet_ports]"
 
@@ -607,6 +788,124 @@ REMOTE_EOF
   say "HEALTH rc=$rc  (0 => all gate checks passed)"; return "$rc"
 }
 
+# ---- stage: vip-probe (A1 consumer-node VIP reachability; post-health; DEFAULT OFF) --
+# The CapMap liveness assert in tailscale_service.yml proves a VIP was ALLOCATED and
+# APPROVED, NOT that a consumer can actually REACH it end-to-end. This stage closes
+# that A1 gap: it curls each manifest-declared VIP endpoint FROM A SECOND inventory
+# host (never a self-curl on the advertiser -- a node's own VIP is expected-unreachable).
+#
+# TWO INDEPENDENT KNOBS (both unset by default => this stage is a NO-OP and every
+# existing invocation is byte-identical -- no existing caller passes either):
+#   LME_GATE_PROBE_FROM=<host>          the SECOND (consumer) inventory host to probe
+#                                       FROM -- a tailnet node that is NOT --host.
+#   LME_GATE_REQUIRE_VIP_REACHABLE=1    ARM enforcement (mirrors the ansible var
+#                                       tailscale_require_vip_reachable): an unreachable
+#                                       VIP becomes a typed FAIL instead of a WARN.
+#   (optional) LME_GATE_TAILNET_DOMAIN  MagicDNS suffix, e.g. tail6c2eb6.ts.net; default
+#                                       bare (the svc name resolves via the search domain).
+#   (optional) LME_GATE_VIP_TIMEOUT     per-endpoint curl/connect timeout (default 15s).
+# States (mirrors the ansible var choosing fail-vs-warn, not whether the check exists):
+#   neither set        -> no-op, rc 0                        (existing runs unchanged)
+#   probe-from only    -> probe runs; unreachable = WARN, rc 0
+#   require only       -> typed FAIL: a required probe with no consumer node cannot run
+#   both set           -> probe runs; unreachable = typed FAIL
+# Single-shot per endpoint (NO until/retries -- an until keyed on liveness hard-fails
+# on retry-exhaustion, round-11 B1). Composable: probes whatever the manifests declare.
+do_vip_probe() {
+  local armed=0 from="${LME_GATE_PROBE_FROM:-}"
+  case "${LME_GATE_REQUIRE_VIP_REACHABLE:-0}" in 1|true|TRUE|yes|on) armed=1;; esac
+  # DEFAULT OFF: neither knob set => nothing to do, existing runs byte-identical
+  # (return BEFORE any say/network so the log is unchanged too).
+  if [ "$armed" = 0 ] && [ -z "$from" ]; then return 0; fi
+
+  say "VIP-PROBE (consumer-node reachability; armed=$armed from=[${from:-none}])"
+  # Armed but no consumer node => a required check that cannot run. Gate doctrine: a
+  # check that can't run = FAIL. Self-curl is forbidden (self-VIP expected-unreachable),
+  # so it can never substitute for a real second node.
+  if [ -z "$from" ]; then
+    say "VIP-PROBE FAIL: LME_GATE_REQUIRE_VIP_REACHABLE armed but LME_GATE_PROBE_FROM unset -- no consumer node to probe FROM (a self-curl on the advertiser is not a valid substitute)"
+    return 1
+  fi
+  # Never self-curl: the probe-from node must NOT be the advertiser. Compare SHORT
+  # names so `graph` and `graph.tail6c2eb6.ts.net` are recognised as the same node.
+  local from_short="${from%%.*}" host_short="${HOST%%.*}"
+  if [ "$from_short" = "$host_short" ]; then
+    say "VIP-PROBE FAIL: LME_GATE_PROBE_FROM ($from) is the advertiser ($HOST) -- a self-VIP curl is expected-unreachable and cannot verify reachability; name a DIFFERENT inventory host"
+    return 1
+  fi
+
+  # Effective pack flags (post-offline adjustment) so a disabled VIP is not probed.
+  local llm_on elastic_on offline_on
+  read -r llm_on elastic_on offline_on < <(effective_pack_flags)
+  local endpoints
+  if ! endpoints="$(derive_vip_endpoints "$llm_on" "$elastic_on" "$offline_on")"; then
+    say "VIP-PROBE FAIL: could not derive the VIP endpoint set from $SRC/manifests"
+    return 1
+  fi
+  endpoints="$(printf '%s' "$endpoints" | grep -v '^[[:space:]]*$' || true)"
+  if [ -z "$endpoints" ]; then
+    say "VIP-PROBE WARN: no enabled VIP endpoints derived from manifests -- nothing to probe for this roster"
+    return 0
+  fi
+  local domain="${LME_GATE_TAILNET_DOMAIN:-}"
+  local timeout="${LME_GATE_VIP_TIMEOUT:-15}"
+  local endpoints_line; endpoints_line="$(printf '%s' "$endpoints" | xargs)"
+  say "VIP-PROBE endpoints (svc:port:scheme)=[$endpoints_line] from=$from domain=[${domain:-magicdns}] timeout=${timeout}s armed=$armed"
+
+  # Remote payload: runs ON the consumer node ($from). Values injected as env on the
+  # `bash -s` line (NOT interpolated). Quoted heredoc => independently bash -n-checkable.
+  local PROBE_SH
+  read -r -d '' PROBE_SH <<'REMOTE_EOF' || true
+set -o pipefail
+fail=0
+dead=""
+for ep in $VIP_ENDPOINTS; do
+  name="${ep%%:*}"; rest="${ep#*:}"; port="${rest%%:*}"; scheme="${rest##*:}"
+  fqdn="$name"; [ -n "$DOMAIN" ] && fqdn="${name}.${DOMAIN}"
+  case "$scheme" in
+    tcp|raw-tcp)
+      # raw-TLS passthrough VIP: a bare TCP connect (no HTTP verdict possible). A
+      # connect proves the VIP routes to the backend listener.
+      if timeout "$TIMEOUT" bash -c "exec 3<>/dev/tcp/${fqdn}/${port}" 2>/dev/null; then
+        echo "  ok: svc:$name $fqdn:$port (raw-tcp connect)"
+      else
+        echo "  UNREACHABLE: svc:$name $fqdn:$port (raw-tcp connect failed)"; dead="$dead svc:$name"
+      fi
+      ;;
+    *)
+      # https VIP: ANY HTTP response (even 401/403/5xx) proves the VIP name resolved,
+      # the tailnet route is live and the backend answered. 000 => no response
+      # (NXDOMAIN / no route / TLS handshake failure) => unreachable.
+      code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time "$TIMEOUT" "https://${fqdn}:${port}/" 2>/dev/null || echo 000)
+      case "$code" in
+        000) echo "  UNREACHABLE: svc:$name https://$fqdn:$port/ (no response -- DNS/route/TLS)"; dead="$dead svc:$name";;
+        *)   echo "  ok: svc:$name https://$fqdn:$port/ -> HTTP $code (VIP routes; backend answered)";;
+      esac
+      ;;
+  esac
+done
+if [ -n "$dead" ]; then
+  echo "== VIP-PROBE: unreachable ->$dead =="
+  exit 1
+fi
+echo "== VIP-PROBE: all derived VIP endpoints reachable =="
+exit 0
+REMOTE_EOF
+
+  # Probe FROM the consumer node (never the advertiser). Same BatchMode /
+  # tailnet-intercepted ssh transport as the rest of the harness.
+  ssh "${SSH_OPTS[@]}" "root@${from}" \
+    "VIP_ENDPOINTS='$endpoints_line' DOMAIN='$domain' TIMEOUT='$timeout' bash -s" <<<"$PROBE_SH" 2>&1 | tee -a "$LOG"
+  local rc="${PIPESTATUS[0]}"
+  if [ "$rc" = 0 ]; then
+    say "VIP-PROBE rc=0 (all derived VIP endpoints reachable from $from)"; return 0
+  fi
+  if [ "$armed" = 1 ]; then
+    say "VIP-PROBE FAIL rc=$rc: one or more VIPs unreachable from $from (enforcement armed)"; return 1
+  fi
+  say "VIP-PROBE WARN rc=$rc: one or more VIPs unreachable from $from (enforcement OFF -> non-fatal warning)"; return 0
+}
+
 # ---- stage: teardown (final) ----------------------------------------------
 do_teardown() {
   say "TEARDOWN (final) via tree's own scripts/wipe_lme.sh"
@@ -622,21 +921,24 @@ case "$STAGE" in
   rsync)    do_rsync; rc=$?;;
   wipe)     do_rsync && do_wipe; rc=$?;;
   install)  do_install; rc=$?;;
-  health)   do_health; rc=$?;;
+  health)   do_health && do_vip_probe; rc=$?;;   # probe is a no-op unless armed => unarmed --stage health is byte-identical
+  vip-probe) do_vip_probe; rc=$?;;
   teardown) do_teardown; rc=$?;;
-  deploy)   # setup -> deploy -> health, HOLD before teardown (first-leg inspect)
-    do_rsync   || { rc=$?; say "LEG FAIL at rsync";   exit $rc; }
-    do_wipe    || { rc=$?; say "LEG FAIL at pre-wipe"; exit $rc; }
-    do_install || { rc=$?; say "LEG FAIL at install"; exit $rc; }
-    do_health  || { rc=$?; say "LEG FAIL at health";  exit $rc; }
+  deploy)   # setup -> deploy -> health -> (opt) vip-probe, HOLD before teardown
+    do_rsync    || { rc=$?; say "LEG FAIL at rsync";     exit $rc; }
+    do_wipe     || { rc=$?; say "LEG FAIL at pre-wipe";  exit $rc; }
+    do_install  || { rc=$?; say "LEG FAIL at install";   exit $rc; }
+    do_health   || { rc=$?; say "LEG FAIL at health";    exit $rc; }
+    do_vip_probe || { rc=$?; say "LEG FAIL at vip-probe"; exit $rc; }
     say "DEPLOY+HEALTH OK — stack HELD up for inspection (run --stage teardown to finish)"
     ;;
   all)
-    do_rsync    || { rc=$?; say "LEG FAIL at rsync";    exit $rc; }
-    do_wipe     || { rc=$?; say "LEG FAIL at pre-wipe"; exit $rc; }
-    do_install  || { rc=$?; say "LEG FAIL at install";  do_teardown || true; exit $rc; }
-    do_health   || { rc=$?; say "LEG FAIL at health";   do_teardown || true; exit $rc; }
-    do_teardown || { rc=$?; say "LEG FAIL at teardown"; exit $rc; }
+    do_rsync     || { rc=$?; say "LEG FAIL at rsync";     exit $rc; }
+    do_wipe      || { rc=$?; say "LEG FAIL at pre-wipe";  exit $rc; }
+    do_install   || { rc=$?; say "LEG FAIL at install";   do_teardown || true; exit $rc; }
+    do_health    || { rc=$?; say "LEG FAIL at health";    do_teardown || true; exit $rc; }
+    do_vip_probe || { rc=$?; say "LEG FAIL at vip-probe"; do_teardown || true; exit $rc; }
+    do_teardown  || { rc=$?; say "LEG FAIL at teardown";  exit $rc; }
     ;;
   *) echo "unknown --stage $STAGE" >&2; exit 2;;
 esac

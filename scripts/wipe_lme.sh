@@ -35,16 +35,23 @@ PODMAN="sudo -i podman"
 # manifest name, so a stale derivation fails closed instead of orphaning silently.
 #
 #   * Node-scoped ingress serves (ansible/roles/podman/tasks/tailscale_ingress.yml):
-#     apm-server :8200 (https), litellm :4000 (https) and logstash beats :5044
-#     (raw --tcp). These are the ONLY node-scoped serves LME publishes.
+#     the host-facing ports each service marks with `tailnet_ingress:` on a loopback
+#     publish_ports entry (`https` -> fronted with `tailscale serve --https`;
+#     `raw-tcp` -> `--tcp`). DERIVED from the manifests below into LME_SERVE_*_PORTS,
+#     never a hand-kept literal (the old 8200/4000/5044 literal DRIFTED the same way
+#     the VIP list did): a port added to / removed from a service manifest is torn
+#     down automatically. INCLUSIVE SUPERSET -- every marked port across ALL base
+#     manifests regardless of enable-flag (mirrors how LME_MANIFEST_NAMES is built),
+#     so a service disabled in the active profile but served on a prior deploy is
+#     still torn down.
 #   * VIP Services (tailscale_service.yml): svc:<name> for each host-facing LME service
 #     that OPTS IN via a top-level `tailnet_service:` key. That leg names the VIP from
 #     `tailnet_service` (NO id fallback) and publishes one only for an opt-in service
 #     that also declares a loopback (bind:127.0.0.1) publish_port. Matched by EXACT
 #     name, so a non-LME svc:<name> is never reset or counted as residue.
-LME_SERVE_HTTPS_PORTS=(8200 4000)            # node-scoped HTTPS ingress fronts
-LME_SERVE_TCP_PORTS=(5044)                   # node-scoped raw-TCP ingress front
-LME_SERVE_NODE_PORTS=(8200 4000 5044)        # every node-scoped LME serve port
+LME_SERVE_HTTPS_PORTS=()   # node-scoped HTTPS (`tailnet_ingress: https`) fronts -- derived below
+LME_SERVE_TCP_PORTS=()     # node-scoped raw-TCP (`tailnet_ingress: raw-tcp`) front -- derived below
+LME_SERVE_NODE_PORTS=()    # union of the two (every node-scoped LME serve port) -- derived below
 
 # svc:<name> VIPs LME may publish. DERIVED at runtime from the SAME source the
 # publisher (ansible/roles/podman/tasks/tailscale_service.yml) reads -- never a
@@ -189,6 +196,75 @@ PY
     _mn=$(_wipe_manifest_name "$_mf")
     [ -n "$_mn" ] && LME_MANIFEST_NAMES+=("$_mn")
   done
+
+  # --- Node-scoped ingress port SUPERSET (LME_SERVE_*_PORTS) ---------------------
+  # The host ports the tailscale ingress leg fronts, DERIVED from the manifests'
+  # `tailnet_ingress:` markers (was the hardcoded 8200/4000/5044 literal). INCLUSIVE
+  # SUPERSET, exactly like LME_MANIFEST_NAMES: EVERY marked port across ALL base
+  # manifests, NO enable-flag filter -- so a service disabled in the active profile
+  # but served on a prior deploy is still torn down (4a) and still checked as residue
+  # (6d). `raw-tcp` -> TCP set (`--tcp=<p> off`); `https` (or any other/unknown mode)
+  # -> HTTPS set (`--https=<p> off`, the default serve mode); every marked port is
+  # ALSO counted in NODE_PORTS so teardown+residue cover it whichever the mode.
+  # PyYAML primary (format-agnostic, same convention as LME_SVC_NAMES); flow-style
+  # grep fallback on a host without PyYAML.
+  _ing_out=""
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1 \
+     && _ing_out=$(python3 - "${LME_MANIFESTS_DIR}/services" 2>/dev/null <<'PY'
+import glob, os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(3)
+out = []
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yml"))):
+    with open(path) as fh:
+        doc = yaml.safe_load(fh)
+    if not isinstance(doc, dict):
+        continue
+    # Every publish_ports entry carrying a `tailnet_ingress:` marker -- SUPERSET, so
+    # NO enabled_when / bind filter here (teardown is inclusive by design).
+    for p in doc.get("publish_ports") or []:
+        if not isinstance(p, dict):
+            continue
+        mode = p.get("tailnet_ingress")
+        if mode is None:
+            continue
+        try:
+            port = int(str(p.get("host")).strip())
+        except Exception:
+            continue
+        out.append("%s %d" % (str(mode), port))
+print("\n".join(out))
+PY
+     ); then
+    while IFS=' ' read -r _mode _port; do
+      [ -n "$_port" ] || continue
+      case "$_mode" in
+        raw-tcp) LME_SERVE_TCP_PORTS+=("$_port");;
+        *)       LME_SERVE_HTTPS_PORTS+=("$_port");;
+      esac
+      LME_SERVE_NODE_PORTS+=("$_port")
+    done < <(printf '%s\n' "$_ing_out" | grep -v '^[[:space:]]*$' || true)
+  else
+    # FALLBACK (no PyYAML): flow-style scan. The `tailnet_ingress:` marker is added
+    # flow-style on the SAME line as `host:` (matching the repo's flow-style
+    # publish_ports entries), so a per-line grep recovers (host, mode) without a YAML
+    # parser. Inclusive-safe: tearing down a port that was never served is a no-op.
+    for _mf in "${LME_MANIFESTS_DIR}"/services/*.yml; do
+      [ -e "$_mf" ] || continue
+      while IFS= read -r _line; do
+        _port=$(printf '%s' "$_line" | sed -nE 's/.*host:[[:space:]]*([0-9]+).*/\1/p')
+        _mode=$(printf '%s' "$_line" | sed -nE 's/.*tailnet_ingress:[[:space:]]*([A-Za-z][A-Za-z-]*).*/\1/p')
+        [ -n "$_port" ] || continue
+        case "$_mode" in
+          raw-tcp) LME_SERVE_TCP_PORTS+=("$_port");;
+          *)       LME_SERVE_HTTPS_PORTS+=("$_port");;
+        esac
+        LME_SERVE_NODE_PORTS+=("$_port")
+      done < <(grep -E 'tailnet_ingress:' "$_mf" 2>/dev/null || true)
+    done
+  fi
 fi
 
 # --------------------------------------------------------------------------
@@ -475,6 +551,16 @@ if command -v tailscale >/dev/null 2>&1; then
   # this whole block is skipped, so a non-tailscale wipe is unaffected.)
   if [ "${#LME_MANIFEST_NAMES[@]}" -eq 0 ]; then
     RESIDUE+=("cannot derive the LME svc name set from ${LME_MANIFESTS_DIR}/services -- tailnet VIP teardown unverifiable (indeterminate)")
+  fi
+  # Fail-closed (mirror of the check above, for the node-scoped ingress ports). The
+  # LME_SERVE_NODE_PORTS set is DERIVED from the same manifests; B marks these ports
+  # UNCONDITIONALLY in the base manifests, so an EMPTY set means the derivation is
+  # missing/broke -- NOT that LME fronts no ingress ports. Left unguarded, an empty
+  # set makes the 4a `... off` loop tear down nothing AND the 6d node-serve loop
+  # below check nothing -> a false "clean" on a host still holding the ingress
+  # serves. Treat empty as INDETERMINATE residue, the same rule as the svc-name set.
+  if [ "${#LME_SERVE_NODE_PORTS[@]}" -eq 0 ]; then
+    RESIDUE+=("cannot derive the LME node-scoped ingress port set from ${LME_MANIFESTS_DIR}/services -- node serve teardown unverifiable (indeterminate)")
   fi
   if serve_status=$(sudo tailscale serve status 2>/dev/null); then
     lme_serve_residue=""
