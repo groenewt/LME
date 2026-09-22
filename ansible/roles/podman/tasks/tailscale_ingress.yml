@@ -9,6 +9,20 @@
 # and changes nothing about the internal service mesh. (The daemon install
 # guarantees tailscaled is up; the status check below only reports/fails.)
 #
+# EVERYTHING IS DERIVED FROM THE MANIFESTS — no service name or port is hardcoded
+# here (mirrors the VIP leg in tailscale_service.yml). A host-facing published port
+# is fronted on the tailnet IFF its `publish_ports` entry carries the opt-in marker
+# `tailnet_ingress: <mode>`, AND the owning service is enabled in this install
+# (enabled_when | is_enabled(lme_enable_flags)). The marker VALUE is the serve mode:
+#   * `tailnet_ingress: https`   -> HTTPS service; tailscale TERMINATES TLS with the
+#     node's ts.net LE cert (auto-obtained/renewed) and re-encrypts to the local
+#     self-signed backend (https+insecure://127.0.0.1:<port>).
+#   * `tailnet_ingress: raw-tcp` -> raw TCP passthrough (`--tcp`), NOT TLS-terminated:
+#     the backend terminates TLS itself.
+# The set the base manifests mark TODAY is apm-server :8200 (https), litellm :4000
+# (https) and logstash beats :5044 (raw-tcp) — but that is DATA in the manifests, not
+# a literal list in this file; add/remove a marker to change what is fronted.
+#
 # WHY THIS EXISTS — the internal-CA vs ts.net split:
 #   * The internal container<->container mesh uses the Elasticsearch
 #     `elasticsearch-certutil` CA with container-alias SANs (lme-elasticsearch,
@@ -18,16 +32,16 @@
 #     `*.ts.net` MagicDNS name ONLY. It can therefore serve host-facing
 #     published ports but CANNOT stand in for the internal alias SANs.
 #
-# So we front only the host-facing, loopback-bound published ports:
-#   * apm-server (local 8200) and litellm (local 4000) are HTTPS services:
-#     tailscale TERMINATES TLS with the node's ts.net LE cert (auto-obtained,
-#     auto-renewed) and re-encrypts to the local self-signed backend
-#     (https+insecure://127.0.0.1:<port>).
-#   * logstash beats (local 5044) is a raw TCP passthrough (`--tcp`), NOT
-#     TLS-terminated: logstash terminates the beats TLS itself. CONSEQUENCE for
-#     operators wiring external beats: the beat receives logstash's INTERNAL-CA
-#     leaf (SAN: lme-logstash, logstash, localhost, 127.0.0.1 — NO ts.net SAN),
-#     so the beat must trust the LME CA and must NOT do ts.net hostname
+# So we front only the host-facing, loopback-bound published ports the manifests
+# mark, and only the ones whose service is enabled:
+#   * An HTTPS-marked port (e.g. apm-server :8200, litellm :4000): tailscale
+#     TERMINATES TLS with the node's ts.net LE cert (auto-obtained, auto-renewed)
+#     and re-encrypts to the local self-signed backend (https+insecure://127.0.0.1:<port>).
+#   * A raw-tcp-marked port (e.g. logstash beats :5044) is a raw TCP passthrough
+#     (`--tcp`), NOT TLS-terminated: the backend terminates the TLS itself.
+#     CONSEQUENCE for operators wiring external beats: the beat receives logstash's
+#     INTERNAL-CA leaf (SAN: lme-logstash, logstash, localhost, 127.0.0.1 — NO ts.net
+#     SAN), so the beat must trust the LME CA and must NOT do ts.net hostname
 #     verification for the 5044 endpoint (e.g. ssl.verification_mode: certificate).
 #     Terminating at tailscale here would hand plaintext to a TLS listener, so
 #     `--tcp` (passthrough) is used deliberately instead of `--tls-terminated-tcp`.
@@ -63,26 +77,78 @@
   failed_when: false
   become: yes
 
-- name: Front host-facing HTTPS services with the node's ts.net cert
+# --- Derive the host ingress targets purely from the manifests --------------------
+# One (name, port, mode) target per `tailnet_ingress`-marked publish_ports entry on
+# an ENABLED service. subelements(..., skip_missing=True) walks service x
+# publish_ports and SKIPS services with no publish_ports key (so they never raise).
+# The marker lives on the PORT entry (unlike the VIP leg's top-level
+# `tailnet_service`), so port + mode come straight from the marked entry -- no
+# lowest-port convention. Initialise first so the fact always exists.
+- name: Initialise the derived host ingress target list
+  set_fact:
+    ts_ingress_targets: []
+
+- name: Derive one host ingress target per tailnet_ingress-marked publish_port (enabled services only)
+  set_fact:
+    ts_ingress_targets: >-
+      {{ ts_ingress_targets + [ {
+           'name': item.0.value.id,
+           'port': item.1.host,
+           'mode': item.1.tailnet_ingress,
+         } ] }}
+  loop: "{{ lme_services | dict2items | subelements('value.publish_ports', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.value.id }} (:{{ item.1.host | default('?') }})"
+  when:
+    # OPT-IN gate: the port entry is marked for host ingress ...
+    - item.1.tailnet_ingress is defined
+    # ... AND its service is enabled in this install's flag set (mirrors the VIP leg;
+    # the old hardcoded list fronted ports regardless of the enabled roster -- B1).
+    - item.0.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+
+# Fail-closed on a malformed marker. A hardcoded list could not carry a typo; a
+# per-entry marker can (`tailnet_ingress: htps`), and such a value matches NEITHER
+# serve selector below -> the port would be SILENTLY never served (green rc=0).
+# Reject it loudly instead (the same fail-closed stance is_enabled takes on a
+# misspelled enable flag). Only `https` and `raw-tcp` are valid ingress modes.
+- name: Assert every derived ingress target declares a valid serve mode
+  assert:
+    that:
+      - item.mode in ['https', 'raw-tcp']
+    fail_msg: >-
+      Service '{{ item.name }}' publishes port {{ item.port }} with an invalid
+      tailnet_ingress mode '{{ item.mode }}'. Valid modes: https, raw-tcp. Fix the
+      marker on that publish_ports entry in the service manifest.
+    quiet: true
+  loop: "{{ ts_ingress_targets }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.port }} {{ item.mode }})"
+
+- name: Front host-facing HTTPS ingress services with the node's ts.net cert
   command: "tailscale serve --bg --https={{ item.port }} https+insecure://127.0.0.1:{{ item.port }}"
-  loop:
-    - { name: "apm-server", port: 8200 }
-    - { name: "litellm", port: 4000 }
+  loop: "{{ ts_ingress_targets | selectattr('mode', 'equalto', 'https') | list }}"
   loop_control:
     label: "{{ item.name }} (:{{ item.port }})"
   when: ('127.0.0.1:' ~ item.port) not in (ts_serve_status.stdout | default(''))
   changed_when: true
   become: yes
 
-- name: Front host-facing logstash beats port as a raw TCP passthrough
-  command: "tailscale serve --bg --tcp=5044 tcp://127.0.0.1:5044"
-  when: "'127.0.0.1:5044' not in (ts_serve_status.stdout | default(''))"
+- name: Front host-facing raw-TLS ingress ports as a raw TCP passthrough
+  command: "tailscale serve --bg --tcp={{ item.port }} tcp://127.0.0.1:{{ item.port }}"
+  loop: "{{ ts_ingress_targets | selectattr('mode', 'equalto', 'raw-tcp') | list }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.port }})"
+  when: ('127.0.0.1:' ~ item.port) not in (ts_serve_status.stdout | default(''))
   changed_when: true
   become: yes
 
 - name: Show the host-facing tailscale ingress endpoints
   debug:
-    msg:
-      - "apm-server  -> https://{{ ts_magicdns_name }}:8200 (ts.net LE cert; proxies 127.0.0.1:8200)"
-      - "litellm     -> https://{{ ts_magicdns_name }}:4000 (ts.net LE cert; proxies 127.0.0.1:4000)"
-      - "logstash    -> {{ ts_magicdns_name }}:5044 (raw TCP passthrough; beats see the LME internal-CA leaf)"
+    msg: >-
+      {{ item.name }} -> {{ ts_magicdns_name | default('this node') }}:{{ item.port }}
+      [{{ item.mode }}]
+      {{ (item.mode == 'https') | ternary('(ts.net LE cert; proxies 127.0.0.1:' ~ item.port ~ ')',
+         '(raw TCP passthrough; backend terminates TLS, client sees the LME internal-CA leaf)') }}
+  loop: "{{ ts_ingress_targets }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.port }})"
