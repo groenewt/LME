@@ -129,6 +129,75 @@
     - item.value.tailnet_service is defined
     - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
 
+# Fail-loud on a VIP-opted-in service that derives ZERO loopback front ports
+# (route-independent -- protects ANY tailnet_service, not just ES). The derivation
+# below is gated `when: (_ts_lo | length) > 0` (L171), so a service that sets a
+# top-level `tailnet_service:` (VIP opt-in) but exposes NO 127.0.0.1 front port is
+# SILENTLY DROPPED: no VIP target, no error (the K1 silent-green class). This fires
+# e.g. under `-e lme_profile=multinode`, whose overlay FULL-REPLACES
+# elasticsearch.publish_ports with 9200 bound to 0.0.0.0 (multinode.yml:73) -> a
+# tailnet_service-marked ES derives an empty loopback set -> the VIP is skipped with
+# no signal. Mirror the at-most-one-marker assert above: same dict2items loop, same
+# opt-in + enabled gate, and its OWN re-derived `_ts_loop`/`_ts_lo` (these are
+# task-LOCAL vars, not registered facts, so they are recomputed here, verbatim from
+# the derivation). We deliberately do NOT copy the derivation's third
+# `(_ts_lo | length) > 0` when-clause -- that emptiness is exactly what we assert.
+# GAP-3 4b NOTE (composability): when a host-scoped roster is threaded into this file,
+# this assert's `when:` MUST receive the SAME host-scope clause as the derivation's
+# `when:`, or it will fail-loud on a VIP service legitimately absent from THIS host.
+- name: Assert each opt-in (tailnet_service) service derives at least one loopback VIP front port
+  ansible.builtin.assert:
+    that:
+      - (_ts_lo | length) > 0
+    fail_msg: >-
+      Service '{{ item.value.id }}' declares `tailnet_service: {{ item.value.tailnet_service }}`
+      (tailnet VIP opt-in) but derives ZERO 127.0.0.1 front ports, so the VIP publish below is
+      SILENTLY SKIPPED (the derivation is gated `when: (_ts_lo | length) > 0`) -- no VIP is
+      allocated and no error is raised. A tailnet_service-marked service MUST expose at least one
+      non-UDP publish_port bound to 127.0.0.1 to front as its VIP. Likely cause: a profile overlay
+      opened this service's port to `bind: 0.0.0.0` (e.g. multinode.yml re-declares elasticsearch
+      9200 as 0.0.0.0), or its only loopback port is UDP. Fix the manifest/overlay so a loopback
+      TCP front port survives, or drop the `tailnet_service:` opt-in for this host.
+    quiet: true
+  vars:
+    # Re-derived VERBATIM from the derivation below (task-local, not facts):
+    # this service's host-facing loopback publish_ports ...
+    _ts_loop: >-
+      {{ item.value.publish_ports | default([])
+         | selectattr('bind', 'defined')
+         | selectattr('bind', 'equalto', '127.0.0.1')
+         | list }}
+    # ... minus any UDP port, lowest host port first -- the exact set the L171 guard tests.
+    _ts_lo: >-
+      {{ ((_ts_loop | selectattr('protocol', 'undefined') | list)
+          + (_ts_loop | rejectattr('protocol', 'undefined') | rejectattr('protocol', 'equalto', 'udp') | list))
+         | sort(attribute='host') }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.id }}"
+  when:
+    - item.value.tailnet_service is defined
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+
+# SERVE-SCHEME sanity (a NOTE, not a hard assert -- this is the design's own ruling,
+# not a shortcut). A raw-TLS backend (one that terminates TLS itself, e.g. ES:
+# `xpack.security.http.ssl.enabled: true`) fronted via a VIP MUST carry `serve: tcp` on
+# its front publish_port, or the derivation defaults the scheme to `--https`
+# (L138 `(_ts_pick).serve | default('https')`) and tailscale TERMINATES TLS with this
+# node's ts.net leaf -> the consumer sees the ts.net cert, NOT the internal-CA leaf ->
+# CA-pinned clients break and ES's optional client-cert auth is silently dropped. This
+# CANNOT be a mechanical assert here: `https` is a *valid* mode for the services that
+# legitimately use it (kibana/dashboard/log-analyzer/litellm), so a "must be tcp" assert
+# would false-positive on every one of them. Authority: this file's header doctrine
+# L34-44 ("publish_ports must carry `serve: tcp` or they will be mis-fronted as HTTPS"),
+# corroborated by the design (gap-designs.md L40 "No assert catches it (`https` is a
+# valid mode)"; address-targets.md GAP-1 row 3 "pairs with a serve-scheme sanity NOTE").
+# The contract is enforced by manifest authorship; the resolved mode is PRINTED at run
+# time by the publish-task loop labels (`--https=<port>` L279 / `--tcp=<port>` L292), so a
+# mis-front is visible in run output (printed, not guarded). The real exposure is
+# cluster.yml's full-list replace stripping a base `serve: tcp` marker -- fix that in the
+# OVERLAY data, not with a scheme assert that cannot tell a legitimate https VIP from a
+# stripped one.
 - name: Derive one tailnet VIP target per opt-in (tailnet_service-marked) host-facing service
   ansible.builtin.set_fact:
     ts_svc_targets: >-
