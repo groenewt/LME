@@ -1,0 +1,124 @@
+set -o pipefail
+fail=0
+loopback_ok() { case "$1" in 127.0.0.1|::1|'[::1]') return 0;; *) return 1;; esac; }
+# This node's OWN tailnet address: Tailscale CGNAT 100.64.0.0/10 (IPv4) or the
+# global Tailscale ULA fd7a:115c:a1e0::/48 (IPv6). `ss` prints IPv6 bracketed and
+# may zero-compress the 4th group (e.g. [fd7a:115c:a1e0::439:8d1a]); strip the
+# brackets and prefix-match the fixed /48. A tailnet-fronted ingress port binds
+# here BY DESIGN — accepted ONLY for the ports in $TAILNET_PORTS (see caller).
+tailnet_ok() {
+  local a="${1#"["}"; a="${a%"]"}"
+  case "$a" in
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0;;
+    fd7a:115c:a1e0:*) return 0;;
+    *) return 1;;
+  esac
+}
+
+echo "== lme.service =="
+systemctl is-active lme.service || true
+
+echo "== failed lme units (must be empty) =="
+failed=$(systemctl list-units --plain --no-legend 'lme*' --state=failed 2>/dev/null | awk '{print $1}')
+if [ -n "$failed" ]; then
+  echo "  FAIL: lme units in failed state: $(echo $failed)"; fail=1
+else
+  echo "  ok: no failed lme units"
+fi
+
+echo "== running containers (expect >= $EXPECT_MIN) =="
+running=$(sudo -i podman ps --format '{{.Names}}' 2>/dev/null | sed '/^$/d' | wc -l)
+echo "  running=$running"
+if [ "$running" -lt "$EXPECT_MIN" ]; then
+  echo "  FAIL: only $running running container(s), expected >= $EXPECT_MIN"; fail=1
+else
+  echo "  ok: $running >= $EXPECT_MIN"
+fi
+
+echo "== exposure: loopback-only binds ($LOOPBACK_PORTS) =="
+if ! command -v ss >/dev/null 2>&1; then
+  echo "  FAIL: ss unavailable — cannot assert exposure"; fail=1
+else
+  # port<space>addr<space>proto per LISTENING socket, over BOTH tcp AND udp -- the
+  # deny-by-default gate must see udp too (e.g. wazuh syslog 514, which the old
+  # tcp-only probe was blind to). TWO single-proto calls (NOT one `ss -tuln`): with
+  # a single proto the Local-Address column is $4 in both -- the exact parse that
+  # produced the live 0.0.0.0 finding on graph -- so no new column assumption is
+  # introduced (a dual-proto call shifts Local to $5, and a mis-parse would degrade
+  # to a silent green, the very blindness we are closing). addr = local addr with
+  # the port stripped: 0.0.0.0:9200->'9200 0.0.0.0 tcp', [::]:5601->'5601 [::] tcp',
+  # *:5432->'5432 * tcp', udp 127.0.0.1:514->'514 127.0.0.1 udp'.
+  listen_tbl=$( { ss -ltnH 2>/dev/null | awk -v pr=tcp '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a" "pr}'
+                  ss -lunH 2>/dev/null | awk -v pr=udp '{a=$4; p=a; sub(/:[0-9]+$/,"",a); sub(/.*:/,"",p); print p" "a" "pr}'; } )
+  # A live host always has listeners (sshd at minimum). Empty => the probe broke
+  # (e.g. `ss` too old for -H), NOT a closed host: fail, don't pass green.
+  if [ -z "$listen_tbl" ]; then
+    echo "  FAIL: no listening sockets parsed from ss — cannot assert exposure"; fail=1
+  # Complementary guard: a working probe on any live host ALWAYS sees >=1 tcp
+  # listener (sshd:22). Zero tcp rows => the tcp leg of the probe silently broke
+  # (only udp parsed); refuse to certify exposure off a half-blind table.
+  elif ! printf '%s\n' "$listen_tbl" | awk '$3=="tcp"{f=1} END{exit f?0:1}'; then
+    echo "  FAIL: no TCP listeners parsed from ss (sshd:22 expected) — exposure probe broken, refusing green"; fail=1
+  fi
+  for p in $LOOPBACK_PORTS; do
+    # Two DISTINCT accepted-open rules, each self-identifying in the log so a
+    # reviewer can tell WHICH rule admitted a non-loopback port: expose_lan operator
+    # opt-in ($LAN_OK) vs a named profile's bind:0.0.0.0 ($PROFILE_OPEN).
+    case " $LAN_OK " in *" $p "*) echo "  port $p: LAN opt-in (expose_lan) — skip"; continue;; esac
+    case " ${PROFILE_OPEN:-} " in *" $p "*) echo "  port $p: LAN opt-in (profile ${PROFILE_NAME:-?}) — skip"; continue;; esac
+    addrs=$(printf '%s\n' "$listen_tbl" | awk -v pp="$p" '$1==pp {print $2}')
+    if [ -z "$addrs" ]; then
+      echo "  port $p: not listening (service down or not in this profile)"
+      continue
+    fi
+    # A bind on this node's tailnet IP is acceptable ONLY for a port the ingress
+    # leg fronts this run ($TAILNET_PORTS; EMPTY when ingress is off => this clause
+    # is inert and the check is byte-identical to a non-tailscale deploy).
+    tailnet_port=0
+    case " $TAILNET_PORTS " in *" $p "*) tailnet_port=1;; esac
+    bad=""
+    for a in $addrs; do
+      loopback_ok "$a" && continue
+      [ "$tailnet_port" = 1 ] && tailnet_ok "$a" && continue
+      bad="$bad $a"
+    done
+    if [ -n "$bad" ]; then
+      echo "  FAIL: port $p LAN-open on$bad — expected 127.0.0.1 (bind-inversion/expose_lan?)"; fail=1
+    elif [ "$tailnet_port" = 1 ]; then
+      echo "  ok: port $p loopback/tailnet-ingress [$(echo $addrs)]"
+    else
+      echo "  ok: port $p loopback-only [$(echo $addrs)]"
+    fi
+  done
+fi
+
+echo "== service: ES :9200 (expect 401/200) =="
+code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:9200 || echo 000)
+echo "  ES http_code=$code"
+case "$code" in 401|200) echo "  ok";; *) echo "  FAIL: ES not up behind TLS"; fail=1;; esac
+
+echo "== service: Kibana :5601 (expect 200/302/401) =="
+kb=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:5601 || echo 000)
+echo "  Kibana http_code=$kb"
+case "$kb" in 200|302|401) echo "  ok";; *) echo "  FAIL: Kibana not up"; fail=1;; esac
+
+if [ "$LLM_ON" = 1 ]; then
+  echo "== service: dashboard /livez :8502 (expect 200; unauthenticated liveness) =="
+  dl=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/livez || echo 000)
+  echo "  dashboard /livez http_code=$dl"
+  case "$dl" in 200) echo "  ok";; *) echo "  FAIL: dashboard /livez not reachable on loopback"; fail=1;; esac
+
+  echo "== auth: dashboard /api/health with NO key (expect 401/403) =="
+  da=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8502/api/health || echo 000)
+  echo "  dashboard /api/health (unauth) http_code=$da"
+  case "$da" in 401|403) echo "  ok: webui auth enforced";;
+    *) echo "  FAIL: /api/* served unauthenticated ($da) — webui-auth not enforced"; fail=1;; esac
+
+  echo "== service: log-analyzer :8501 reachable (streamlit gates in-app at 200) =="
+  la=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:8501 || echo 000)
+  echo "  log-analyzer http_code=$la"
+  case "$la" in 200|302|401|403) echo "  ok";; *) echo "  FAIL: log-analyzer unreachable"; fail=1;; esac
+fi
+
+echo "== HEALTH result: fail=$fail =="
+exit "$fail"
