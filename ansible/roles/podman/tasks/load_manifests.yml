@@ -104,6 +104,19 @@
       install_elastic_services: "{{ install_elastic_services | default(false) | bool }}"
       offline_mode: "{{ offline_mode | default(false) | bool }}"
 
+# GAP-3 host-scoping roster (lme_host_services): DELIBERATELY NOT assembled into a fact
+# here. It is an operator/host_vars-supplied list of service ids (host_vars/<host>.yml);
+# default UNDEFINED -> full host (backward-compat). trixie is a PLAIN client (no tailscale
+# profile), so scoping is carried in host_vars, not a profile overlay. Every consumer reads
+# it `| default`-guarded -- the empty-safe `when:` clauses in container_setup.yml /
+# tailscale_service.yml / tailscale_ingress.yml / render_units.yml, plus container.j2's
+# `| default(None)` -- so there is nothing to normalise into a fact here.
+# HAZARD-1: do NOT add `set_fact: lme_host_services: "{{ lme_host_services | default([]) }}"`.
+# An unconditional default makes the var defined-and-empty on every existing full-host run,
+# which the design forbids (defined-and-empty must mean full host, and a naive membership
+# clause would then wipe out every unit). If a set_fact is ever needed to normalise, gate it
+# `when: lme_host_services is defined` and never default to [].
+
 # Legacy cluster-inventory shim (see header). Builds the elasticsearch environment
 # override BASE from the flat es_* vars the tree's own generators emit, matching
 # lme-elasticsearch.container.j2 branch-for-branch. Fires ONLY when es_node_name is
@@ -187,3 +200,22 @@
   ansible.builtin.set_fact:
     lme_service_kinds: >-
       {{ dict(lme_services.keys() | zip(lme_services.values() | map(attribute='kind'))) }}
+
+# GAP-3 typo guard (fail-loud; closes a silent no-render hole). `lme_host_services` is the
+# per-host render allow-list (host_vars). A roster id that names NO service (e.g. a typo
+# `dashbord`) makes every `item.key in lme_host_services` scope clause False for that id,
+# so it is silently pruned at rc=0 -- the exact silent-green class this host-scoping must
+# not introduce. `is_enabled` raises on an unknown enable FLAG; this mirrors that for an
+# unknown ROSTER id. Gated on a NON-EMPTY roster, so undefined/[] (full-host, backward
+# compat) skips it -- same empty-safe semantics as the scope clauses (default([])).
+- name: Assert every lme_host_services roster id names a known service (GAP-3 typo guard)
+  ansible.builtin.assert:
+    that:
+      - (lme_host_services | default([]) | difference(lme_services.keys() | list)) | length == 0
+    fail_msg: >-
+      lme_host_services names service id(s) absent from the manifest service set:
+      {{ lme_host_services | default([]) | difference(lme_services.keys() | list) }} --
+      every host-scope roster id must match a rendered service id (check for a typo).
+      Known service ids: {{ lme_services.keys() | list | sort }}.
+    quiet: true
+  when: lme_host_services | default([]) | length > 0
