@@ -10,6 +10,7 @@ import os
 import json
 import logging
 import socket
+import ssl
 import base64
 import hashlib
 import hmac
@@ -195,7 +196,57 @@ RAG_MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.55"))  # drop chunks below this 
 RAG_MIN_CHARS = int(os.getenv("RAG_MIN_CHARS", "200"))   # drop stub/redirect chunks
 
 ES_AUTH = (ES_USER, ES_PASS)
-VERIFY_SSL = False          # internal self-signed certs
+VERIFY_SSL = False          # internal self-signed certs (LiteLLM + embeddings clients)
+
+# ── Elasticsearch TLS verification (env-gated; manifest-declared) ─────────────
+# The ES client's verify posture is a manifest-declared toggle, not a baked-in
+# literal. DEFAULT ("false") preserves today's behavior (verify=False). When
+# ELASTICSEARCH_SSL_VERIFY is enabled the ES client verifies the certificate
+# chain against ELASTICSEARCH_CA_CERT but SKIPS hostname matching (Path-1: the
+# cross-host consumer dials a ts.net FQDN absent from the internal-CA leaf SAN).
+# The CA-path VALUE is manifest-declared and lands in-container at
+# /certs/ca/ca.crt -- the same literal the litellm-sync call above already reads.
+ES_SSL_VERIFY = os.getenv("ELASTICSEARCH_SSL_VERIFY", "false")
+ES_CA_CERT = os.getenv("ELASTICSEARCH_CA_CERT", "/certs/ca/ca.crt")
+_ES_TRUTHY = {"1", "true", "yes", "on"}
+_ES_FALSY = {"0", "false", "no", "off", ""}
+
+
+def _es_verify_enabled(raw) -> bool:
+    """Interpret ELASTICSEARCH_SSL_VERIFY. Allowlist-truthy: a typo degrades to
+    today's behavior (verification OFF) rather than silently claiming a
+    verification that did not happen. A non-empty *unrecognized* value warns and
+    still defaults OFF (avoids the insecure-success failure class)."""
+    val = str(raw).strip().lower()
+    if val in _ES_TRUTHY:
+        return True
+    if val in _ES_FALSY:
+        return False
+    logger.warning(
+        "ELASTICSEARCH_SSL_VERIFY=%r not recognized; Elasticsearch TLS "
+        "verification defaulting to OFF", raw,
+    )
+    return False
+
+
+def _es_verify():
+    """Return the ES-client verify= value: False, or a skip-hostname SSLContext.
+
+    ON path builds an ssl.SSLContext that verifies the chain against ES_CA_CERT
+    with check_hostname disabled (Path-1). httpx accepts an SSLContext as verify=.
+    """
+    if not _es_verify_enabled(ES_SSL_VERIFY):
+        return False
+    ctx = ssl.create_default_context(cafile=ES_CA_CERT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+# Built once at import. When the toggle is ON and the CA is missing this raises
+# at startup -- fail-closed (uvicorn won't start), the correct signal when the
+# operator explicitly asked for verification. The OFF default builds no context.
+ES_VERIFY = _es_verify()
 
 app = FastAPI(title="LME Dashboard", docs_url=None, redoc_url=None)
 
@@ -246,7 +297,7 @@ async def livez():
 
 
 def es_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(verify=VERIFY_SSL, timeout=15)
+    return httpx.AsyncClient(verify=ES_VERIFY, timeout=15)
 
 
 def llm_client() -> httpx.AsyncClient:
