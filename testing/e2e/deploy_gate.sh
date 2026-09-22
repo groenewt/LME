@@ -696,6 +696,57 @@ resolve_expect_min() {
   printf '%s\n' "$full_floor"; return 0
 }
 
+# host_runs_service(): does THIS host's GAP-3 roster actually run <service_id>?
+# Echoes 1 (host-local -> probe it) or 0 (scoped OUT -> skip). Reads the SAME
+# ansible/inventory/host_vars/<host>.yml `lme_host_services` roster resolve_expect_min
+# reads, and mirrors the render-side backward-compat rule (filter_plugins
+# lme_manifests.py:_requires_partition -- a FALSY host_services roster == NO scoping
+# == full host).
+#
+# ASYMMETRY vs derive_host_scoped_min (which fails CLOSED on an unresolvable roster):
+# here a missing/broken roster is the LEGITIMATE full-host default, so it must never
+# turn a probe OFF. DEFAULT-LOCAL (print 1) on: no host_vars file, no
+# `lme_host_services` key, roster undefined/[]/unparsable/malformed, or python3/PyYAML
+# absent. Prints 0 ONLY when a well-formed, non-empty roster EXISTS and does NOT
+# contain <service_id>. The caller additionally CLAMPS any non-0 output to 1, so 0 is
+# the only value that can ever skip a probe (fail-SAFE: a broken read keeps the probe
+# ON, never silently off). Args: <host_vars_path> <service_id>
+host_runs_service() {
+  local hv="$1" sid="$2"
+  # No host_vars file for this host -> full host -> service is local.
+  [ -f "$hv" ] || { printf '1\n'; return 0; }
+  # No roster KEY declared (presence only; the anchored regex skips `# ...` comment
+  # lines) -> full host. Mirrors derive_host_scoped_min's no-python graceful-degrade.
+  if ! grep -qE '^[[:space:]]*lme_host_services[[:space:]]*:' "$hv" 2>/dev/null; then
+    printf '1\n'; return 0
+  fi
+  # A roster key is present; resolve membership honestly. Without python we cannot
+  # parse the list -> DEFAULT-LOCAL (never scope a probe out on a guess). NB a
+  # python-less controller that ACTUALLY declares a roster has already failed CLOSED
+  # in resolve_expect_min (derive_host_scoped_min returns non-zero), so do_health never
+  # reaches here in that case; this stays a defensive full-host default regardless.
+  if ! { command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; }; then
+    printf '1\n'; return 0
+  fi
+  python3 - "$hv" "$sid" <<'PY'
+import sys
+try:
+    import yaml
+    with open(sys.argv[1]) as fh:
+        hv = yaml.safe_load(fh)
+except Exception:
+    print(1); sys.exit(0)          # unparsable / no PyYAML -> full-host default (asymmetry)
+if not isinstance(hv, dict):
+    print(1); sys.exit(0)
+roster = hv.get('lme_host_services', None)
+if roster is None or roster == []:
+    print(1); sys.exit(0)          # undefined/empty -> full host (pre-GAP-3 identity)
+if not isinstance(roster, list) or not all(isinstance(x, str) for x in roster):
+    print(1); sys.exit(0)          # malformed roster -> default local (do not scope OUT on junk)
+print(1 if sys.argv[2] in roster else 0)
+PY
+}
+
 # ---- stage: health probe ---------------------------------------------------
 do_health() {
   say "HEALTH probe (deep gate)"
@@ -814,7 +865,26 @@ do_health() {
   # roster) => the remote per-port allow clause never matches (inert), so a real
   # 0.0.0.0/LAN bind on any port still FAILS.
 
-  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on profile=[${profile:-none}] loopback=[$loopback_ports] lan_ok=[$lan_ok] profile_open=[$profile_open] tailnet_ports=[$tailnet_ports]"
+  # ---- ES/Kibana loopback-probe locality (GAP-5 cross-host consumer) ----------
+  # The ES :9200 and Kibana :5601 curls in the remote payload below probe loopback
+  # UNCONDITIONALLY. On a cross-host CONSUMER whose GAP-3 `lme_host_services` roster
+  # EXCLUDES those services (they run on the PRODUCER; this host reaches them over a
+  # tailnet VIP) there is no local listener, so an unconditional probe FALSE-FAILS an
+  # otherwise-healthy leg. Gate each probe on whether THIS host actually runs the
+  # service, read from the SAME host_vars roster resolve_expect_min uses (short host
+  # name so an FQDN --host still resolves host_vars/<short>.yml). DEFAULT-LOCAL: no
+  # host_vars / no roster / empty / unparsable -> 1 -> the probe runs exactly as today,
+  # so every un-rostered leg (qemu-some, graph, airgapped, es*) is byte-identical. The
+  # clamp makes 0 the ONLY value that can skip a probe: any empty/garbled read collapses
+  # to 1 (fail-SAFE -- a broken locality read keeps the probe ON, never silently off).
+  local probe_hv="$SRC/ansible/inventory/host_vars/${HOST%%.*}.yml"
+  local es_local kibana_local
+  es_local="$(host_runs_service "$probe_hv" elasticsearch)"
+  kibana_local="$(host_runs_service "$probe_hv" kibana)"
+  case "$es_local"     in 0) ;; *) es_local=1;;     esac
+  case "$kibana_local" in 0) ;; *) kibana_local=1;; esac
+
+  say "HEALTH expects: containers>=$expect_min llm_on=$llm_on profile=[${profile:-none}] loopback=[$loopback_ports] lan_ok=[$lan_ok] profile_open=[$profile_open] tailnet_ports=[$tailnet_ports] es_local=$es_local kibana_local=$kibana_local"
 
   # ---- the remote payload ----------------------------------------------------
   # Quoted heredoc: single quotes are legal inside (unlike the old '...' arg
@@ -916,15 +986,23 @@ else
   done
 fi
 
-echo "== service: ES :9200 (expect 401/200) =="
-code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:9200 || echo 000)
-echo "  ES http_code=$code"
-case "$code" in 401|200) echo "  ok";; *) echo "  FAIL: ES not up behind TLS"; fail=1;; esac
+if [ "$ES_LOCAL" = 1 ]; then
+  echo "== service: ES :9200 (expect 401/200) =="
+  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:9200 || echo 000)
+  echo "  ES http_code=$code"
+  case "$code" in 401|200) echo "  ok";; *) echo "  FAIL: ES not up behind TLS"; fail=1;; esac
+else
+  echo "== service: ES :9200 — SKIP (not host-local; consumer reaches it via tailnet VIP) =="
+fi
 
-echo "== service: Kibana :5601 (expect 200/302/401) =="
-kb=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:5601 || echo 000)
-echo "  Kibana http_code=$kb"
-case "$kb" in 200|302|401) echo "  ok";; *) echo "  FAIL: Kibana not up"; fail=1;; esac
+if [ "$KIBANA_LOCAL" = 1 ]; then
+  echo "== service: Kibana :5601 (expect 200/302/401) =="
+  kb=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://127.0.0.1:5601 || echo 000)
+  echo "  Kibana http_code=$kb"
+  case "$kb" in 200|302|401) echo "  ok";; *) echo "  FAIL: Kibana not up"; fail=1;; esac
+else
+  echo "== service: Kibana :5601 — SKIP (not host-local; consumer reaches it via tailnet VIP) =="
+fi
 
 if [ "$LLM_ON" = 1 ]; then
   echo "== service: dashboard /livez :8502 (expect 200; unauthenticated liveness) =="
@@ -948,7 +1026,7 @@ echo "== HEALTH result: fail=$fail =="
 exit "$fail"
 REMOTE_EOF
 
-  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' PROFILE_OPEN='$profile_open' PROFILE_NAME='${profile:-}' TAILNET_PORTS='$tailnet_ports' bash -s" <<<"$HEALTH_SH"
+  run_remote "EXPECT_MIN='$expect_min' LLM_ON='$llm_on' ES_LOCAL='$es_local' KIBANA_LOCAL='$kibana_local' LOOPBACK_PORTS='$loopback_ports' LAN_OK='$lan_ok' PROFILE_OPEN='$profile_open' PROFILE_NAME='${profile:-}' TAILNET_PORTS='$tailnet_ports' bash -s" <<<"$HEALTH_SH"
   local rc=$?
   say "HEALTH rc=$rc  (0 => all gate checks passed)"; return "$rc"
 }
