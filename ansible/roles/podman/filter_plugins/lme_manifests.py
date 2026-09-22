@@ -136,6 +136,65 @@ def wanted_by(items, kinds=None):
     return ' '.join(out)
 
 
+def _requires_partition(requires, host_services):
+    """Partition a service's hard `requires:` list against the local host roster.
+
+    GAP-3 host-scoping. When a consumer (e.g. dashboard) is scoped onto a host
+    that does NOT run every unit it hard-requires (its elasticsearch / litellm /
+    pgvector / embeddings targets live on the producer host), those cross-host ids
+    must NOT stay in Requires=: a hard Requires= on a unit that will never exist on
+    THIS host makes the consumer fail to start. They are RELAXED to Wants= (soft --
+    a no-op when the target is absent). Ids whose target IS in the roster stay in
+    Requires= (KEEP). This realises the design's rule "either INCLUDE or RELAX --
+    never hand-drop a unit": every input id lands in exactly one output list.
+
+    Returns (keep, relax) with input order preserved within each list, so the two
+    are a stable partition of the input and unit_refs() renders them deterministically.
+
+    BACKWARD-COMPAT (the single most important property, mirrored by the render-site
+    `when:` clause): host_services FALSY -- undefined resolves to None via the
+    template's `| default(None)`, and the empty list is the explicit full-host roster
+    -- means NO host scoping, so keep == the full input list and relax == []. Then
+    container.j2 renders exactly today's Requires= and adds nothing to Wants=:
+    byte-identical to pre-GAP-3. (None and [] MUST behave identically here because the
+    render-site clause treats `[]` as "render everything" too -- see gap3-contract.md
+    HAZARD-1; a filter that scoped on [] would disagree with the clause and brick
+    every existing full-host run.)
+    """
+    reqs = list(requires or [])
+    if not host_services:
+        return reqs, []
+    roster = set(host_services)
+    keep = [r for r in reqs if r in roster]
+    relax = [r for r in reqs if r not in roster]
+    return keep, relax
+
+
+def requires_keep(requires, host_services=None):
+    """GAP-3: the `requires:` ids to KEEP as a hard Requires= on this host -- those
+    whose target unit IS in the host roster. host_services None/empty -> the full
+    input list (backward-compat identity). Composes BEFORE unit_refs, which does not
+    prune (it maps every id to a unit ref), so the pruning must happen here:
+      Requires = service.dependencies.requires | requires_keep(lme_host_services) | unit_refs(kinds)
+    """
+    keep, _relax = _requires_partition(requires, host_services)
+    return keep
+
+
+def requires_relax(requires, host_services=None):
+    """GAP-3: the `requires:` ids to RELAX to a soft Wants= on this host -- those
+    whose target unit is NOT in the host roster (it runs on another host).
+    host_services None/empty -> [] (nothing relaxed; backward-compat identity). Fed
+    into Wants= alongside the service's own declared wants:
+      Wants = (wants | default([]) + requires | requires_relax(lme_host_services)) | unit_refs(kinds)
+    Relax applies ONLY to `requires` (the hard gate). `after`/`partof`/`binds_to` are
+    left untouched: After= on an absent unit is a harmless ordering no-op, and PartOf=
+    targets the always-listed `lme` umbrella (infra floor -- see gap3-contract.md).
+    """
+    _keep, relax = _requires_partition(requires, host_services)
+    return relax
+
+
 def render_port(p):
     """{host, container, bind?, protocol?} -> a PublishPort= value.
       {host:9200,container:9200}                       -> 9200:9200
@@ -310,7 +369,7 @@ def service_memory_max(resources):
     return None
 
 
-def memory_budget(services, flags=None, lme_global=None):
+def memory_budget(services, flags=None, lme_global=None, host_services=None):
     """SF-8 co-residency budget. Sum the MemoryMax of every ENABLED container
     service that declares a cap, and compare against the host budget declared in
     lme_global.budget (host_ram_gb minus reserve_gb).
@@ -321,6 +380,14 @@ def memory_budget(services, flags=None, lme_global=None):
                 install_elastic_services / offline_mode). Unenabled services are
                 excluded from the sum -- so the budget reflects THIS install's set.
       lme_global: supplies lme_global.budget {host_ram_gb, reserve_gb}.
+      host_services: OPTIONAL GAP-3 host roster (list of service ids). When
+                supplied and non-empty, only services whose id is in the roster
+                enter the sum -- so a host scoped to a couple of consumers is not
+                charged co-residency for the whole stack it does not run. Checked
+                AFTER is_enabled() so is_enabled()'s fail-loud typo guard still
+                fires for every manifest, scoped-in or not. host_services
+                None/empty -> no host filtering -> byte-identical to the pre-GAP-3
+                budget (the render-site `when:` clause treats `[]` as full-host too).
 
     Returns a fact dict a preflight task can consume:
       {total_bytes, total_gb, host_ram_gb, reserve_gb, usable_gb,
@@ -355,6 +422,12 @@ def memory_budget(services, flags=None, lme_global=None):
             continue
         if not is_enabled(svc.get('enabled_when'), flags, context=sid):
             continue
+        # GAP-3 host-scoping (optional): with a roster, budget only what THIS host
+        # runs. AFTER is_enabled so a scoped-OUT service with a misspelled
+        # enabled_when is still caught loudly (never a silently narrowed guard).
+        # host_services None/empty -> no filtering -> byte-identical to pre-GAP-3.
+        if host_services and sid not in host_services:
+            continue
         cap = service_memory_max(svc.get('resources'))
         if cap is None:
             uncapped.append(sid)
@@ -388,6 +461,8 @@ class FilterModule(object):
             'svc_unit': svc_unit,
             'unit_refs': unit_refs,
             'wanted_by': wanted_by,
+            'requires_keep': requires_keep,
+            'requires_relax': requires_relax,
             'render_port': render_port,
             'render_volume': render_volume,
             'podman_args': podman_args,
