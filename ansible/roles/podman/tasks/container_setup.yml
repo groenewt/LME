@@ -204,6 +204,25 @@
     lme_known_password_secrets: [elastic, kibana_system, wazuh, wazuh_api]
     lme_secrets_deferred: [pgvector, llm-keys, litellm_master_key, webui_api_key]
 
+# Fail-closed: the two sets MUST stay disjoint. lme_password_secrets (below) strips the
+# deferred set from the shell-driver mint, so a deferred name ALSO listed as a known password
+# would satisfy the recipe guard (it is in known) yet never be minted here -> the very
+# silent-green this guard prevents. No default config trips this; it catches a bad
+# `-e lme_known_password_secrets=[...]` override (extra-vars outrank the set_fact above) or a
+# future edit -- and it makes the guard's own remedy (3) safe.
+- name: B3 guard -- known-password and deferred secret sets must be disjoint
+  ansible.builtin.assert:
+    that:
+      - (lme_known_password_secrets | intersect(lme_secrets_deferred)) | length == 0
+    fail_msg: >-
+      Secret name(s) {{ lme_known_password_secrets | intersect(lme_secrets_deferred) }} appear in
+      BOTH lme_known_password_secrets and lme_secrets_deferred. A deferred name is stripped from
+      the shell-driver mint (lme_password_secrets = ... | difference(lme_secrets_deferred)), so
+      listing it as a known password makes the recipe guard PASS while the secret is never created.
+      Remove it from lme_known_password_secrets: a deferred secret is minted by llama_cpp_setup on
+      an LLM host or arrives via cross-host distribution, never by the shell loop.
+    success_msg: "known-password and deferred secret sets are disjoint."
+
 # GAP-5: the deferred recipe (llama_cpp_setup) is HOST-CONDITIONAL now -- it runs only
 # where this host renders the LLM backend (lme_llm_backing_service='pgvector' in
 # lme_host_rendered_services). So "deferred" is a valid creation recipe HERE only on such
@@ -217,7 +236,7 @@
     lme_secrets_recipe_here: >-
       {{ (lme_known_password_secrets
           + (lme_secrets_deferred
-             if (lme_llm_backing_service in (lme_host_rendered_services | default([])))
+             if ((lme_llm_backing_service | default('')) in (lme_host_rendered_services | default([])))
              else [])
           + ((lme_cross_host_file_secrets | default([]))
              if (lme_distribute_secrets | default(false) | bool)
@@ -240,13 +259,15 @@
       Rendered service(s) on this host declare podman secret(s) with no creation recipe
       here: {{ lme_required_secrets | difference(lme_secrets_recipe_here) }}.
       Fix ONE of: (1) run the LLM stack on this host so lme_llm_backing_service
-      ({{ lme_llm_backing_service }}) renders (currently
-      {{ 'rendered' if (lme_llm_backing_service in (lme_host_rendered_services | default([]))) else 'NOT rendered' }}
+      ({{ lme_llm_backing_service | default('') }}) renders (currently
+      {{ 'rendered' if ((lme_llm_backing_service | default('')) in (lme_host_rendered_services | default([]))) else 'NOT rendered' }}
       here); (2) for a cross-host consumer, arm lme_distribute_secrets=true AND add each
       missing name to lme_cross_host_file_secrets (currently
       {{ lme_cross_host_file_secrets | default([]) }}) so the producer distributes it;
-      (3) add a shell-driver name to lme_known_password_secrets. No rendered unit may
-      reference an uncreated secret (B3).
+      (3) ONLY if a missing name is a NEW manifest secret NOT in the deferred set
+      ({{ lme_secrets_deferred }}), add it to lme_known_password_secrets for a shell-driver mint
+      -- a deferred name added there is rejected by the disjoint-set guard above and would stay
+      uncreated. No rendered unit may reference an uncreated secret (B3).
     success_msg: "All rendered-service secrets have a creation recipe on this host."
 
 # Credentials to create = (enabled union + floor) minus the LLM-deferred set.
