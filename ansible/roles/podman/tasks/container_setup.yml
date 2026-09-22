@@ -188,30 +188,66 @@
 #     not yet present in manifests/services/.
 #   * deferred secrets   -> created by llama_cpp_setup.yml with their own recipes
 #     (pgvector + litellm_master_key + webui_api_key: random file-driver passwords;
-#     llm-keys: empty placeholder). Their creation is gated by the SAME install_llm
-#     flag that renders litellm and the two web UIs (dashboard/log-analyzer, both
-#     enabled_when:[install_llm]), so a rendered consumer never precedes their
-#     creation permanently.
+#     llm-keys: empty placeholder). GAP-5 host-scopes llama_cpp_setup to hosts that
+#     RENDER the LLM backend (lme_llm_backing_service='pgvector' in
+#     lme_host_rendered_services). So on a cross-host consumer that renders the two web
+#     UIs (dashboard/log-analyzer, enabled_when:[install_llm]) but NOT pgvector, these
+#     are minted by neither llama_cpp_setup (gated off) nor the shell loop (they are
+#     deferred) -- they must instead arrive via armed cross-host distribution (GAP-4).
+#     The B3 guard below enforces that PER HOST: an unarmed/incomplete consumer fails
+#     LOUD, rather than deploying silent-green with UIs that crash on the missing secret.
+#     (The prior claim here -- "a rendered consumer never precedes their creation" -- was
+#     the same false premise GAP-5 corrected in trixie.yml/site.yml; it assumed the mint
+#     rode install_llm, but GAP-5 re-gates it on the pgvector RENDER.)
 - name: Classify the secret set (known credentials vs LLM-stack deferred)
   set_fact:
     lme_known_password_secrets: [elastic, kibana_system, wazuh, wazuh_api]
     lme_secrets_deferred: [pgvector, llm-keys, litellm_master_key, webui_api_key]
 
-# Fail-closed B3 guard: any enabled secret that is neither a known credential nor
-# LLM-deferred has NO creation recipe. Stop loudly instead of rendering a unit
-# that references an uncreated secret. This catches a future/renamed manifest
-# secret (e.g. MA3 declaring `pgvector_pass` instead of `pgvector`).
-- name: B3 guard -- every enabled-service secret has a creation recipe
+# GAP-5: the deferred recipe (llama_cpp_setup) is HOST-CONDITIONAL now -- it runs only
+# where this host renders the LLM backend (lme_llm_backing_service='pgvector' in
+# lme_host_rendered_services). So "deferred" is a valid creation recipe HERE only on such
+# a host; on a cross-host consumer the deferred secrets can only arrive via armed
+# distribution (lme_distribute_secrets + lme_cross_host_file_secrets, GAP-4). Compute the
+# secret names THIS host actually has a create/arrive recipe for. Note this is a
+# DECLARATIVE roster check (not `podman secret ls`), so a dangling/payload-less secret a
+# prior run persisted cannot mask a missing recipe.
+- name: Compute the secrets THIS host has a creation recipe for (GAP-5 host-scoped)
+  set_fact:
+    lme_secrets_recipe_here: >-
+      {{ (lme_known_password_secrets
+          + (lme_secrets_deferred
+             if (lme_llm_backing_service in (lme_host_rendered_services | default([])))
+             else [])
+          + ((lme_cross_host_file_secrets | default([]))
+             if (lme_distribute_secrets | default(false) | bool)
+             else [])
+         ) | unique }}
+
+# Fail-closed B3 guard: any enabled+rendered secret with no creation recipe ON THIS HOST
+# has no way to exist -> a rendered unit would reference an uncreated secret. Stop loudly
+# instead of proceeding to a SILENT-GREEN deploy whose units crash on the missing secret.
+# Catches (a) a future/renamed manifest secret (e.g. `pgvector_pass`); (b) GAP-5's
+# cross-host consumer where the deferred UI secrets (pgvector/litellm_master_key/
+# webui_api_key) are gated off llama_cpp_setup AND distribution is unarmed/incomplete.
+# A full / no-roster host renders pgvector (install_llm) -> deferred is a recipe -> reduces
+# to the pre-GAP-5 check -> byte-unchanged.
+- name: B3 guard -- every enabled-service secret has a creation recipe on THIS host
   assert:
     that:
-      - (lme_required_secrets | difference(lme_known_password_secrets) | difference(lme_secrets_deferred)) | length == 0
+      - (lme_required_secrets | difference(lme_secrets_recipe_here)) | length == 0
     fail_msg: >-
-      Enabled service(s) declare podman secret(s) with no creation recipe:
-      {{ lme_required_secrets | difference(lme_known_password_secrets) | difference(lme_secrets_deferred) }}.
-      Add each to lme_known_password_secrets (here, shell-driver password) or to
-      the llama_cpp_setup.yml deferred set, so no rendered unit references an
-      uncreated secret (B3).
-    success_msg: "All enabled-service secrets have a creation recipe."
+      Rendered service(s) on this host declare podman secret(s) with no creation recipe
+      here: {{ lme_required_secrets | difference(lme_secrets_recipe_here) }}.
+      Fix ONE of: (1) run the LLM stack on this host so lme_llm_backing_service
+      ({{ lme_llm_backing_service }}) renders (currently
+      {{ 'rendered' if (lme_llm_backing_service in (lme_host_rendered_services | default([]))) else 'NOT rendered' }}
+      here); (2) for a cross-host consumer, arm lme_distribute_secrets=true AND add each
+      missing name to lme_cross_host_file_secrets (currently
+      {{ lme_cross_host_file_secrets | default([]) }}) so the producer distributes it;
+      (3) add a shell-driver name to lme_known_password_secrets. No rendered unit may
+      reference an uncreated secret (B3).
+    success_msg: "All rendered-service secrets have a creation recipe on this host."
 
 # Credentials to create = (enabled union + floor) minus the LLM-deferred set.
 - name: Compute credential secrets to create
