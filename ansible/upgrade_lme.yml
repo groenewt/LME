@@ -143,6 +143,29 @@
       debug:
         msg: "Using podman from: {{ podman_cmd }}"
         
+    - name: Detect whether the optional Elastic services pack is installed
+      stat:
+        path: /etc/containers/systemd/lme-apm-server.container
+      register: elastic_pack_quadlet
+
+    # Respect an explicit extra-var override (-e install_elastic_services=... /
+    # -e install_llm=...); otherwise infer the pack from what is already
+    # installed. Distinct facts are used because extra-vars outrank set_fact, so
+    # a self-referential "install_elastic_services: {{ install_elastic_services |
+    # default(...) }}" would silently no-op whenever the operator passes the var.
+    # The LLM stack is new in 2.3.0 (no pre-upgrade quadlet to detect), so it
+    # follows the site.yml default-on unless explicitly disabled.
+    - name: Resolve optional-stack enablement for this upgrade
+      set_fact:
+        lme_pack_enabled: "{{ install_elastic_services | default(elastic_pack_quadlet.stat.exists) | bool }}"
+        lme_llm_enabled: "{{ install_llm | default(true) | bool }}"
+
+    - name: Display detected optional-stack enablement
+      debug:
+        msg: >-
+          Elastic services pack: {{ 'enabled' if lme_pack_enabled else 'disabled' }};
+          LLM stack: {{ 'enabled' if lme_llm_enabled else 'disabled' }}
+
     - name: Extract container versions
       set_fact:
         elasticsearch_image: "{{ container_versions | select('search', 'elasticsearch') | first }}"
@@ -396,7 +419,7 @@
       delay: 5
       until: pull_elastic_result is not failed
       ignore_errors: yes
-      when: install_elastic_services | default(false) | bool
+      when: lme_pack_enabled | default(false) | bool
 
     - name: Display elastic services container pull errors
       debug:
@@ -417,7 +440,7 @@
       delay: 5
       until: tag_elastic_result is not failed
       ignore_errors: yes
-      when: install_elastic_services | default(false) | bool
+      when: lme_pack_enabled | default(false) | bool
 
     - name: Display elastic services container tag errors
       debug:
@@ -646,7 +669,9 @@
               - Certificates: certs.zip removed, will regenerate via lme-setup-certs container on restart
               - Configs: litellm_config.yaml, llama-cpp-model.json
               - Systemd units: lme-llm-keys.service/path, lme-llama-model.service/path
-      when: current_lme_version is version('2.3.0', '<')
+      when:
+        - current_lme_version is version('2.3.0', '<')
+        - lme_llm_enabled | default(true) | bool
 
     - name: Skip AI stack (already at 2.3.0+)
       debug:
@@ -686,54 +711,191 @@
         group: root
         mode: '0744'
         
-    - name: Copy updated quadlet files to /etc/containers/systemd
-      copy:
-        src: "{{ clone_directory }}/quadlet/"
-        dest: /etc/containers/systemd/
-        owner: root
-        group: root
-        mode: '0644'
-      register: quadlet_copy_result
-      
-    - name: Copy lme.service to /etc/systemd/system
-      copy:
-        src: "{{ clone_directory }}/quadlet/lme.service"
-        dest: "/etc/systemd/system/lme.service"
-        owner: root
-        group: root
-        mode: '0644'
-      register: lme_service_copy_result
-      
+    # Control-plane cutover (B0): units are no longer copied from the static
+    # quadlet/ tree. They are RENDERED from the manifest tree (manifests/) exactly
+    # as fresh install does -- load_manifests.yml builds lme_global / lme_services /
+    # lme_enable_flags, and render_units.yml renders every ENABLED service. The
+    # umbrella target lme.service is rendered to /etc/systemd/system/lme.service
+    # (manifests/services/lme.service.yml, kind: target), which replaces the old
+    # static lme.service copy. include_role brings the podman role's defaults
+    # (lme_child_es_only, lme_child_active_services) into scope, and the render
+    # facts mirror the -e vars install.sh passes on a fresh install: install_llm /
+    # install_elastic_services from this upgrade's detected enablement
+    # (lme_llm_enabled / lme_pack_enabled), offline_mode from the on-disk marker,
+    # and the profile derived offline->offline / else default (operator -e wins).
+    - name: Detect offline-mode marker for the unit render
+      stat:
+        path: /opt/lme/OFFLINE_MODE
+      register: offline_marker
+
+    # Resolve the render facts into DIFFERENTLY-NAMED intermediates first. Passing
+    # `offline_mode: "{{ offline_mode | default(...) }}"` / `lme_profile: "{{ lme_profile
+    # | default(...) }}"` directly self-references and triggers a recursive-loop
+    # template error when no -e is given (the exact trap site.yml:44-51 documents). An
+    # operator -e offline_mode / -e lme_profile still wins via the default() here.
+    - name: Resolve render facts for the manifest pipeline (mirror install.sh -e vars)
+      set_fact:
+        _render_offline_mode: "{{ offline_mode | default(offline_marker.stat.exists) | bool }}"
+        _render_lme_profile: "{{ lme_profile | default('offline' if offline_marker.stat.exists else 'default') }}"
+
+    - name: Load service manifests into facts (render pipeline; mirrors fresh install)
+      include_role:
+        name: podman
+        tasks_from: load_manifests.yml
+      vars:
+        install_llm: "{{ lme_llm_enabled }}"
+        install_elastic_services: "{{ lme_pack_enabled }}"
+        offline_mode: "{{ _render_offline_mode }}"
+        lme_profile: "{{ _render_lme_profile }}"
+
+    # render_units consumes the lme_enable_flags / lme_services facts that
+    # load_manifests just set (no vars need re-passing) and writes the units to
+    # /etc/containers/systemd and /etc/systemd/system.
+    - name: Render all enabled service units from manifests (replaces static quadlet/ copy)
+      include_role:
+        name: podman
+        tasks_from: render_units.yml
+
     - name: Reload systemd daemon
       systemd:
         daemon_reload: yes
       register: daemon_reload_result
-      
-    - name: Display quadlet update results
+
+    - name: Display unit render results
       debug:
         msg: |
-          Quadlet files updated successfully:
+          Service units re-rendered from manifests:
           - Backup location: {{ quadlet_backup_dir.path }}
-          - Quadlet files: {{ 'Updated' if quadlet_copy_result.changed else 'No changes needed' }}
-          - LME service file: {{ 'Updated' if lme_service_copy_result.changed else 'No changes needed' }}
+          - Units: rendered from manifests/services/* into /etc/containers/systemd (+ /etc/systemd/system/lme.service)
           - Systemd daemon: {{ 'Reloaded' if daemon_reload_result.changed else 'Already current' }}
         
+    # ============================================================
+    # Mint the AI web-UI auth secrets BEFORE the umbrella restart.
+    #
+    # render_units.yml (above) renders lme-dashboard / lme-log-analyzer / lme-litellm
+    # on install_llm ALONE (the load_manifests include passes only
+    # install_llm: lme_llm_enabled -- no version gate), and those units consume the
+    # podman secrets litellm_master_key (litellm: env LITELLM_MASTER_KEY; both UIs:
+    # env LITELLM_API_KEY) and webui_api_key (both UIs: env WEBUI_API_KEY). The
+    # pre-2.3.0 AI-stack block above mints only pgvector + llm-keys, so without the
+    # two mints below podman refuses to start the UIs on the restart -- a fail-closed
+    # brick that the old loose wait then masked as green. Gating here on
+    # lme_llm_enabled (the SAME flag render_units used) instead of the AI-stack
+    # block's version('2.3.0','<') gate closes the mismatch: a host that installed
+    # 2.3.0 with install_llm=false and later upgrades with install_llm=true still gets
+    # the keys. if-absent keeps them a free no-op (and STABLE) when they already
+    # exist. Mirrors the canonical file-driver recipe in
+    # roles/podman/tasks/llama_cpp_setup.yml (webui_api_key uses --replace inside the
+    # if-absent guard to admit a missing/partial record without rotating a live key;
+    # litellm_master_key does not); no_log guards the generated passwords.
+    - name: Mint litellm_master_key secret before restart (fail-closed brick fix)
+      shell: |
+        {{ podman_cmd }} secret ls | grep -q litellm_master_key && exit 0
+        password=$(</dev/urandom tr -dc A-Za-z0-9 | head -c30)
+        echo -n "$password" | {{ podman_cmd }} secret create --driver file litellm_master_key -
+      args:
+        executable: /bin/bash
+      no_log: true
+      when: lme_llm_enabled | default(true) | bool
+
+    - name: Mint webui_api_key secret before restart (fail-closed brick fix)
+      shell: |
+        {{ podman_cmd }} secret ls | grep -q webui_api_key && exit 0
+        password=$(</dev/urandom tr -dc A-Za-z0-9 | head -c30)
+        echo -n "$password" | {{ podman_cmd }} secret create --driver file --replace webui_api_key -
+      args:
+        executable: /bin/bash
+      no_log: true
+      when: lme_llm_enabled | default(true) | bool
+
+    # ============================================================
+    # Publish the per-service host-tree cert bundles BEFORE the umbrella restart.
+    #
+    # The re-rendered AI web-UI units (lme-dashboard / lme-log-analyzer) -- like the
+    # always-on core units -- mount cert:<svc>, which render_volume() expands to the
+    # HOST tree /opt/lme/certs/<svc> (lme_global.certs.host_tree), NOT the shared
+    # lme_certs workspace. Those per-service bundles are PUBLISHED only by the certs
+    # role's B4 step (real host-root chown to the manifest-derived subuid; the
+    # UserNS=auto lme-setup-certs container cannot chown to host subuids -- init-setup.sh
+    # disclaims it in its own comment). upgrade_lme.yml never ran that role, so on a
+    # pre-2.3.0 -> 2.3.0 upgrade the AI leaf dirs deleted above (litellm/dashboard/
+    # log-analyzer/embeddings/llama-cpp) are never re-published to /opt/lme/certs/<svc>
+    # and the UIs crash-loop on a missing SSL cert/key -- EVEN with the secrets minted.
+    # That is exactly the fail-closed brick the is-active assert below now reds on.
+    #
+    # The certs role is the SAME mechanism site.yml uses on fresh install: it starts
+    # lme-setup-certs (a Type=oneshot/RemainAfterExit unit that is PartOf=lme.service,
+    # so the earlier "Stop LME service" left it INACTIVE -> `state: started` re-executes
+    # it and, with certs.zip removed above, re-mints every leaf into the lme_certs
+    # workspace) and then publishes each ENABLED cert:<svc> bundle to the host tree. It
+    # MUST run before the restart because the UIs bind the host-tree bundle at start.
+    # Runs UNCONDITIONALLY (round-6 blocker fix). The certs role publishes each ENABLED
+    # cert:<svc> bundle, and its own resolver filter (is_enabled over lme_enable_flags,
+    # roles/certs/tasks/main.yml:30-36) already scopes the AI-UI bundles to install_llm.
+    # So on an LLM-off upgrade the role republishes ONLY the always-on CORE bundles
+    # (kibana / fleet-server / fleet-distribution / wazuh-manager), which those core units
+    # mount from the host tree regardless of LLM; the AI-UI leaves are excluded by is_enabled,
+    # not by this task. It was FORMERLY gated on lme_llm_enabled to "scope to the AI-UI defect,"
+    # but that left the core bundles unpublished on a pre-2.3.0 -> 2.3.0 LLM-off upgrade and
+    # silently crash-looped core kibana (the fail-closed AI-UI assert below is co-gated on the
+    # SAME flag, so it never caught it -- see the LLM-independent core assert added after restart).
+    # load_manifests/render_units above are unconditional and set lme_enable_flags with
+    # install_llm=false on this path, so lme-setup-certs (enabled_when:[always]) is present for
+    # the role's `state: started` re-exec. The PATH env mirrors this file's
+    # podman-resolution tasks so the role's bare `podman` calls find the nix-profile
+    # binary (roles/certs carries no environment of its own).
+    # `environment` is not a valid attribute on include_role, so the PATH is set on
+    # the enclosing block (which propagates it to the dynamically-included role tasks).
+    - name: Publish per-service cert bundles before restart (certs role; core+AI-UI brick fix)
+      environment:
+        PATH: "{{ ansible_env.PATH }}:/nix/var/nix/profiles/default/bin"
+      block:
+        - name: Publish per-service cert bundles via certs role
+          ansible.builtin.include_role:
+            name: certs
+
     - name: Restart LME service
       systemd:
         name: "lme"
         state: restarted
       tags: ['system']
-      
-    - name: Wait for containers to start
-      shell: |
-        {{ podman_cmd }} ps --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "lme" || true
-      args:
-        executable: /bin/bash
-      register: started_containers
-      until: started_containers.stdout_lines | length > 0
-      retries: 12
-      delay: 5
-      ignore_errors: yes
+
+    # Fail-closed CORE brick guard (round-6), runs REGARDLESS of lme_llm_enabled.
+    # The always-on core web unit lme-kibana mounts the host-tree cert:kibana bundle that
+    # the now-unconditional certs publish above fills; a missing/half-published bundle
+    # crash-loops it. The AI-UI assert below is LLM-gated, so before this task NOTHING
+    # covered a core brick on an LLM-off upgrade -- exactly the gap that made the former
+    # co-gated publish a silent blocker. Kibana is the canonical long-running cert:kibana
+    # consumer; asserting is-active here converts a core brick into a task failure instead
+    # of a false success. Retry ceiling mirrors the AI-UI assert to tolerate the ES->kibana
+    # startup cascade on a slow upgrade; the poll exits the instant kibana reports active.
+    - name: Assert core kibana unit is active after restart (fail-closed, LLM-independent)
+      command: systemctl is-active lme-kibana.service
+      register: core_kibana_active
+      changed_when: false
+      until: core_kibana_active.rc == 0
+      retries: 60
+      delay: 10
+
+    # Fail-closed brick guard (replaces the former `podman ps | grep lme` +
+    # ignore_errors wait, which went green as long as ANY core container was up and
+    # thus MASKED a UI that podman refused to start -- e.g. a missing webui_api_key /
+    # litellm_master_key secret bricks lme-dashboard / lme-log-analyzer). This asserts
+    # the enabled UI units are actually active; NO ignore_errors, so a brick surfaces
+    # as a task failure instead of a false success. Gated on lme_llm_enabled because
+    # the units are rendered (and thus expected active) only when the LLM stack is on;
+    # no profile overlay disables them (only tailscale rebinds their ports). The
+    # generous retry ceiling tolerates the full ES -> litellm/pgvector/embeddings ->
+    # UI startup cascade on a slow upgrade without flipping a healthy-but-slow host to
+    # a false red -- the poll exits the instant both units report active.
+    - name: Assert enabled AI web-UI units are active after restart (fail-closed)
+      command: systemctl is-active lme-dashboard.service lme-log-analyzer.service
+      register: ai_ui_units_active
+      changed_when: false
+      until: ai_ui_units_active.rc == 0
+      retries: 60
+      delay: 10
+      when: lme_llm_enabled | default(true) | bool
       
     - name: Wait for services to be ready
       pause:
@@ -847,7 +1009,27 @@
         - name: Display doc ingestion result
           debug:
             msg: "{{ 'Documentation ingestion completed successfully' if ingest_result.rc == 0 else 'Documentation ingestion failed (non-fatal) — can be re-run manually' }}"
-      when: current_lme_version is version('2.3.0', '<')
+      when:
+        - current_lme_version is version('2.3.0', '<')
+        - lme_llm_enabled | default(true) | bool
+
+    # Re-land the Elastic services pack config + certs on upgrade. The pack's units
+    # themselves are now rendered by the manifest render above (render_units.yml
+    # emits every manifests/services/* whose enabled_when is [install_elastic_services]);
+    # this include remains for the non-render concerns the render does NOT do: forcing
+    # the pack config into /opt/lme/config, re-owning it to root, disabling the host
+    # apm-server, re-running the cert top-up, and starting the pack units on the
+    # already-active umbrella. Runs after the core services are up, matching that
+    # file's "start pack units on an already-active umbrella service" assumption.
+    # Guarded off on child ES-only nodes to mirror the install path
+    # (roles/podman/tasks/main.yml:250-252 and site.yml:124-126).
+    - name: Re-land Elastic services pack (configs, ownership, cert top-up, unit start)
+      include_role:
+        name: podman
+        tasks_from: elastic_services_setup.yml
+      when:
+        - lme_pack_enabled | default(false) | bool
+        - not (lme_child_es_only | default(false) | bool)
 
     - name: Update LME version in environment file
       lineinfile:
@@ -877,7 +1059,7 @@
           - "AI Stack (new in 2.3.0):"
           - "- llama.cpp server:      https://<host>:8080  (LFM2.5-1.2B-Instruct)"
           - "- Embeddings server:     https://<host>:8081  (nomic-embed-text-v1.5)"
-          - "- LiteLLM proxy:         https://<host>:4000  (API key: sk-lme-llama-proxy)"
+          - "- LiteLLM proxy:         https://<host>:4000"
           - "- pgvector (PostgreSQL): localhost:5432"
           - "- LME Dashboard:        https://<host>:8502"
           - "- Log Analyzer:          https://<host>:8501"
@@ -885,6 +1067,6 @@
           - "Configuration updates:"
           - "- Containers file: {{ 'Updated' if containers_copied.changed else 'No changes needed' }}"
           - "- Elasticsearch config: {{ 'Updated (removed old repo path)' if elasticsearch_config_updated.changed else 'Already correct' }}"
-          - "- Quadlet files: {{ 'Updated' if quadlet_copy_result.changed else 'No changes needed' }}"
-          - "- Previous quadlet files backed up to: {{ quadlet_backup_dir.path }}"
+          - "- Service units: re-rendered from manifests/services/*"
+          - "- Previous units backed up to: {{ quadlet_backup_dir.path }}"
           - "- Systemd daemon: {{ 'Reloaded' if daemon_reload_result.changed else 'Already current' }}"

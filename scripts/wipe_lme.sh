@@ -1,40 +1,627 @@
 #!/bin/bash
-# Fully uninstall LME: stop services, remove containers, volumes, images, and config.
-# Safe to run before a fresh install.
+# Fully uninstall LME from THIS host: stop/disable units, remove containers,
+# volumes, secrets, images, unit files, /opt/lme, /etc/lme, and tailscale serve
+# ingress state -- then SELF-VERIFY the host is clean and FAIL if any residue
+# remains. Safe to run before a fresh install (a host with nothing installed
+# verifies clean and exits 0).
+#
+# SCOPE: single-node, host-local teardown only. Multi-node / inventory-wide
+# teardown (iterating an Ansible inventory to wipe every cluster member) is NOT
+# implemented here -- follow-up if cluster-wide wipe is needed. This script only
+# touches the machine it runs on.
+#
+# WHY NOT `set -e`: the previous version set `set -e` but suffixed every op with
+# `|| true`, so `-e` was inert and the script printed "Wipe complete" / exited 0
+# even on a dirty host. Teardown is DELIBERATELY tolerant (a unit that was never
+# loaded, an already-absent path, etc. are expected and non-fatal). Correctness
+# is enforced by the strict SELF-VERIFY block at the very end -- that is the
+# authoritative gate and the only thing that decides the exit code. `set -u`
+# catches unset-var bugs; `pipefail` keeps piped probes honest; `-e` is
+# intentionally omitted so an expected no-op cannot abort the teardown.
+set -uo pipefail
 
-set -e
+PODMAN="sudo -i podman"
 
-echo "Stopping all LME services..."
-sudo systemctl stop lme* 2>/dev/null || true
+# --------------------------------------------------------------------------
+# LME-OWNED tailscale serve identity (Finding A). The teardown must reset ONLY
+# serve/Service entries LME itself created and must NEVER touch a co-tenant's
+# serves on a shared node -- e.g. the operator's own svc:windows11 /
+# svc:vncserverwindow. The reset (step 4) and the residue self-verify (step 6d)
+# share the node-scoped port arrays below, so "what LME owns" at the node level is
+# defined in exactly one place. The VIP name sets are DERIVED from the manifests
+# (see the LME_SVC_NAMES / LME_MANIFEST_NAMES block further down): rather than
+# ASSERT the derivation can never go stale -- the overclaim that let the last
+# regression hide -- 6d independently cross-checks advertised VIPs against every
+# manifest name, so a stale derivation fails closed instead of orphaning silently.
+#
+#   * Node-scoped ingress serves (ansible/roles/podman/tasks/tailscale_ingress.yml):
+#     the host-facing ports each service marks with `tailnet_ingress:` on a loopback
+#     publish_ports entry (`https` -> fronted with `tailscale serve --https`;
+#     `raw-tcp` -> `--tcp`). DERIVED from the manifests below into LME_SERVE_*_PORTS,
+#     never a hand-kept literal (the old 8200/4000/5044 literal DRIFTED the same way
+#     the VIP list did): a port added to / removed from a service manifest is torn
+#     down automatically. INCLUSIVE SUPERSET -- every marked port across ALL base
+#     manifests regardless of enable-flag (mirrors how LME_MANIFEST_NAMES is built),
+#     so a service disabled in the active profile but served on a prior deploy is
+#     still torn down.
+#   * VIP Services (tailscale_service.yml): svc:<name> for each host-facing LME service
+#     that OPTS IN via a top-level `tailnet_service:` key. That leg names the VIP from
+#     `tailnet_service` (NO id fallback) and publishes one only for an opt-in service
+#     that also declares a loopback (bind:127.0.0.1) publish_port. Matched by EXACT
+#     name, so a non-LME svc:<name> is never reset or counted as residue.
+LME_SERVE_HTTPS_PORTS=()   # node-scoped HTTPS (`tailnet_ingress: https`) fronts -- derived below
+LME_SERVE_TCP_PORTS=()     # node-scoped raw-TCP (`tailnet_ingress: raw-tcp`) front -- derived below
+LME_SERVE_NODE_PORTS=()    # union of the two (every node-scoped LME serve port) -- derived below
 
+# svc:<name> VIPs LME may publish. DERIVED at runtime from the SAME source the
+# publisher (ansible/roles/podman/tasks/tailscale_service.yml) reads -- never a
+# hand-maintained list. A hardcoded copy DRIFTS from the manifests, and it did:
+# embeddings / fleet-distribution / pgvector / wazuh-manager were published as VIPs
+# but absent from the old static list, so teardown orphaned them yet reported clean.
+# We reproduce the publisher's derivation straight from manifests/services/*.yml:
+# svc name = the manifest's `tailnet_service` OPT-IN key (NO id fallback); a service
+# is fronted ONLY when it BOTH carries a top-level `tailnet_service:` key AND declares
+# at least one loopback (bind:127.0.0.1), non-UDP publish_port -- exactly the
+# publisher's gate (`when: item.value.tailnet_service is defined` AND `_ts_lo|length>0`)
+# over its `_ts_loop`/`_ts_lo` selection (tailscale_service.yml:98-130). The set is
+# therefore exactly the opt-in VIP names (currently the 4 GO services: lme-kibana /
+# lme-dashboard / lme-log-analyzer / lme-litellm) by construction -- a co-tenant's
+# svc:<name> (svc:windows11 / svc:vncserverwindow / svc:webui) can never appear in
+# it and is never cleared. Teardown is deliberately inclusive of every OPT-IN service
+# that COULD carry a loopback VIP under any profile (we do NOT re-apply the per-profile
+# enable gate, and we read the BASE manifests, which are a superset of every
+# profile's published set -- the tailscale profile only re-declares binds already
+# loopback in base): clearing an svc that was never advertised is a safe no-op,
+# whereas missing one leaves an orphaned VIP -- the exact bug this fixes.
+#
+# NOT "cannot drift" -- that overclaim is what let the last regression hide. What is
+# actually true: (1) the derivation is a REAL YAML parse (PyYAML, the same path the
+# rest of the repo reads manifests from bash -- scripts/prepare_offline.sh,
+# scripts/convert_to_cluster.sh), so it is FORMAT-AGNOSTIC: a publish_ports list
+# written flow-style (`- {..., bind: 127.0.0.1}`) or block-style (`- bind:` on its
+# own line) parses IDENTICALLY, unlike the old flow-only grep this replaces. On a
+# host without PyYAML we DEGRADE (never gate the teardown) to a block-SCOPED grep
+# that is also format-agnostic and inclusive-safe. (2) The reset (step 4b) and the
+# VIP residue self-verify (step 6d) do NOT blindly trust that one derivation: 6d
+# ALSO cross-checks every advertised svc:<name> against LME_MANIFEST_NAMES (every
+# manifest's top-level id/tailnet_service -- a column-0 scalar immune to the
+# flow/block hazard, which lives in the nested list). So a host-facing derivation
+# that goes stale surfaces as a NAMED residue failure at teardown time, instead of a
+# silent orphan we merely assume impossible.
+#
+# LME_MANIFESTS_DIR mirrors the ansible `lme_manifests_dir` var; it defaults to the
+# manifests tree beside this script's repo checkout (scripts/ and manifests/ are
+# siblings at the repo root, and wipe_lme.sh is always invoked from that checkout).
+_wipe_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+LME_MANIFESTS_DIR="${LME_MANIFESTS_DIR:-${_wipe_script_dir}/../manifests}"
+
+# LME_SVC_NAMES  -- the `tailnet_service:` OPT-IN VIP services (host-facing loopback
+#                   VIPs that also carry the opt-in key); SCOPES the reset in 4b and is
+#                   cleared there. Derived to match the publisher's opt-in gate exactly.
+# LME_MANIFEST_NAMES -- EVERY service manifest's VIP name; used ONLY by the 6d
+#                   residue cross-check (never to reset), so a derivation miss cannot
+#                   silently orphan a VIP.
+LME_SVC_NAMES=()
+LME_MANIFEST_NAMES=()
+
+# Top-level VIP name of a manifest: `tailnet_service` if set, else `id`. Anchored at
+# column 0 (top-level key) and stripped of any inline `# comment`, so e.g.
+# `id: elasticsearch  # logical key` yields exactly `elasticsearch`. Format-immune
+# (a top-level scalar, not the nested publish_ports list).
+_wipe_manifest_name() {
+  local _n
+  _n=$(sed -nE 's/^tailnet_service:[[:space:]]*([^[:space:]#]+).*/\1/p' "$1" | head -n1)
+  [ -n "$_n" ] || _n=$(sed -nE 's/^id:[[:space:]]*([^[:space:]#]+).*/\1/p' "$1" | head -n1)
+  printf '%s' "$_n"
+}
+
+if [ -d "${LME_MANIFESTS_DIR}/services" ]; then
+  # Same PyYAML-on-PATH convention the rest of the repo uses to read manifests.
+  export PATH="$PATH:/nix/var/nix/profiles/default/bin"
+
+  # --- Opt-in VIP set (LME_SVC_NAMES) --------------------------------------------
+  # PRIMARY: a real YAML parse. ATOMIC -- any unreadable/malformed manifest aborts
+  # the whole derivation (non-zero exit) so we fall back rather than emit a partial
+  # (silently incomplete) set. Reproduces the publisher's opt-in gate: a top-level
+  # `tailnet_service:` key AND a loopback (bind:127.0.0.1) non-UDP publish_port.
+  _svc_out=""
+  # stderr suppressed: a malformed manifest makes this exit non-zero and we DEGRADE
+  # to the fallback below (quiet by design -- a stray parse traceback mid-teardown
+  # would read like a wipe error; the fallback + 6d cross-check still guard it).
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1 \
+     && _svc_out=$(python3 - "${LME_MANIFESTS_DIR}/services" 2>/dev/null <<'PY'
+import glob, os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(3)
+seen, out = set(), []
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yml"))):
+    with open(path) as fh:
+        doc = yaml.safe_load(fh)
+    if not isinstance(doc, dict):
+        continue
+    ports = doc.get("publish_ports") or []
+    # host-facing == >=1 loopback (bind 127.0.0.1), non-UDP publish_port. Mirrors
+    # tailscale_service.yml's _ts_loop (bind==127.0.0.1) + _ts_lo (protocol!=udp).
+    if not any(isinstance(p, dict) and p.get("bind") == "127.0.0.1"
+               and p.get("protocol") != "udp" for p in ports):
+        continue
+    # Opt-in ONLY: mirror the publisher's `when: item.value.tailnet_service is
+    # defined` gate and its NO-id-fallback naming -- a service without the key is
+    # NOT fronted as a VIP, so skip it here too (never fall back to the bare id).
+    name = doc.get("tailnet_service")
+    if not name:
+        continue
+    if name and name not in seen:
+        seen.add(name)
+        out.append(str(name))
+print("\n".join(out))
+PY
+     ); then
+    mapfile -t LME_SVC_NAMES < <(printf '%s\n' "$_svc_out" | grep -v '^[[:space:]]*$' || true)
+  else
+    # FALLBACK (no PyYAML): scope to the top-level `publish_ports:` block and test for
+    # a loopback bind INSIDE it, then require the `tailnet_service:` opt-in key (same
+    # two-part gate as PRIMARY). Format-agnostic (flow AND block) and inclusive-safe
+    # (an over-match only clears an svc that was never advertised -- a no-op). The
+    # block scope replaces the old flow-anchor's job of not false-positiving a stray
+    # 127.0.0.1 comment elsewhere in the file.
+    for _mf in "${LME_MANIFESTS_DIR}"/services/*.yml; do
+      [ -e "$_mf" ] || continue
+      # In-block == after the top-level `publish_ports:` key and before the next
+      # top-level MAPPING key. A leading `-` is a list-item marker, NOT a block end
+      # (block-style entries can sit at column 0, e.g. `- host: 9200`), so the end
+      # pattern excludes `-` as well as spaces and `#`.
+      awk '/^publish_ports:/{inb=1;next} inb && /^[^[:space:]#-]/{inb=0} inb' "$_mf" \
+        | grep -q '127\.0\.0\.1' || continue
+      # Opt-in ONLY: read the top-level `tailnet_service:` scalar directly and skip a
+      # manifest that lacks it -- mirrors the publisher's `tailnet_service is defined`
+      # gate + NO-id-fallback naming. Deliberately NOT _wipe_manifest_name(): that
+      # helper still falls back to `id` for LME_MANIFEST_NAMES (the 6d residue set),
+      # which is correct there but would re-leak the bare-id services here.
+      _svc=$(sed -nE 's/^tailnet_service:[[:space:]]*([^[:space:]#]+).*/\1/p' "$_mf" | head -n1)
+      [ -n "$_svc" ] && LME_SVC_NAMES+=("$_svc")
+    done
+  fi
+
+  # --- Full manifest-name set (LME_MANIFEST_NAMES) -------------------------------
+  # EVERY manifest's top-level VIP name -- the weaker, format-immune predicate the 6d
+  # residue check uses so an advertised svc:<name> the host-facing derivation MISSED
+  # is still recognised as LME-owned and fails closed. NEVER used to reset: a generic
+  # id (network/lme) could collide with a co-tenant, and here a collision only prints
+  # a residue FAILURE, never a destructive reset.
+  for _mf in "${LME_MANIFESTS_DIR}"/services/*.yml; do
+    [ -e "$_mf" ] || continue
+    _mn=$(_wipe_manifest_name "$_mf")
+    [ -n "$_mn" ] && LME_MANIFEST_NAMES+=("$_mn")
+  done
+
+  # --- Node-scoped ingress port SUPERSET (LME_SERVE_*_PORTS) ---------------------
+  # The host ports the tailscale ingress leg fronts, DERIVED from the manifests'
+  # `tailnet_ingress:` markers (was the hardcoded 8200/4000/5044 literal). INCLUSIVE
+  # SUPERSET, exactly like LME_MANIFEST_NAMES: EVERY marked port across ALL base
+  # manifests, NO enable-flag filter -- so a service disabled in the active profile
+  # but served on a prior deploy is still torn down (4a) and still checked as residue
+  # (6d). `raw-tcp` -> TCP set (`--tcp=<p> off`); `https` (or any other/unknown mode)
+  # -> HTTPS set (`--https=<p> off`, the default serve mode); every marked port is
+  # ALSO counted in NODE_PORTS so teardown+residue cover it whichever the mode.
+  # PyYAML primary (format-agnostic, same convention as LME_SVC_NAMES); flow-style
+  # grep fallback on a host without PyYAML.
+  _ing_out=""
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1 \
+     && _ing_out=$(python3 - "${LME_MANIFESTS_DIR}/services" 2>/dev/null <<'PY'
+import glob, os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(3)
+out = []
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yml"))):
+    with open(path) as fh:
+        doc = yaml.safe_load(fh)
+    if not isinstance(doc, dict):
+        continue
+    # Every publish_ports entry carrying a `tailnet_ingress:` marker -- SUPERSET, so
+    # NO enabled_when / bind filter here (teardown is inclusive by design).
+    for p in doc.get("publish_ports") or []:
+        if not isinstance(p, dict):
+            continue
+        mode = p.get("tailnet_ingress")
+        if mode is None:
+            continue
+        try:
+            port = int(str(p.get("host")).strip())
+        except Exception:
+            continue
+        out.append("%s %d" % (str(mode), port))
+print("\n".join(out))
+PY
+     ); then
+    while IFS=' ' read -r _mode _port; do
+      [ -n "$_port" ] || continue
+      case "$_mode" in
+        raw-tcp) LME_SERVE_TCP_PORTS+=("$_port");;
+        *)       LME_SERVE_HTTPS_PORTS+=("$_port");;
+      esac
+      LME_SERVE_NODE_PORTS+=("$_port")
+    done < <(printf '%s\n' "$_ing_out" | grep -v '^[[:space:]]*$' || true)
+  else
+    # FALLBACK (no PyYAML): flow-style scan. The `tailnet_ingress:` marker is added
+    # flow-style on the SAME line as `host:` (matching the repo's flow-style
+    # publish_ports entries), so a per-line grep recovers (host, mode) without a YAML
+    # parser. Inclusive-safe: tearing down a port that was never served is a no-op.
+    for _mf in "${LME_MANIFESTS_DIR}"/services/*.yml; do
+      [ -e "$_mf" ] || continue
+      while IFS= read -r _line; do
+        _port=$(printf '%s' "$_line" | sed -nE 's/.*host:[[:space:]]*([0-9]+).*/\1/p')
+        _mode=$(printf '%s' "$_line" | sed -nE 's/.*tailnet_ingress:[[:space:]]*([A-Za-z][A-Za-z-]*).*/\1/p')
+        [ -n "$_port" ] || continue
+        case "$_mode" in
+          raw-tcp) LME_SERVE_TCP_PORTS+=("$_port");;
+          *)       LME_SERVE_HTTPS_PORTS+=("$_port");;
+        esac
+        LME_SERVE_NODE_PORTS+=("$_port")
+      done < <(grep -E 'tailnet_ingress:' "$_mf" 2>/dev/null || true)
+    done
+  fi
+fi
+
+# --------------------------------------------------------------------------
+# 1. Stop AND disable every lme unit -- enumerated robustly (cwd-independent).
+#    We DO NOT use a bare shell glob (`systemctl stop lme*`); from the repo
+#    root that expands against directory names and stops almost nothing. The
+#    'lme*' pattern below is QUOTED and matched by systemd itself, not the
+#    shell, so it works from any working directory. We union three sources:
+#      - loaded units          (systemctl list-units)
+#      - installed unit files  (systemctl list-unit-files, catches .path/.timer)
+#      - an explicit safety net (the .path watchers + their services, the
+#        network-generated service, and the hand-written lme.service)
+# --------------------------------------------------------------------------
+if command -v systemctl >/dev/null 2>&1; then
+  mapfile -t LME_UNITS < <(
+    {
+      systemctl list-units --all --plain --no-legend 'lme*' 2>/dev/null | awk '{print $1}'
+      systemctl list-unit-files --no-legend 'lme*' 2>/dev/null | awk '{print $1}'
+      printf '%s\n' \
+        lme-llm-keys.path      lme-llm-keys.service \
+        lme-llama-model.path   lme-llama-model.service \
+        lme.service            lme-network.service    lme.network
+    } | sort -u
+  )
+
+  if [ "${#LME_UNITS[@]}" -gt 0 ]; then
+    echo "Stopping ${#LME_UNITS[@]} lme unit(s) (path watchers first, then services)..."
+    # Stop .path watchers before their .service so a watcher cannot re-trigger
+    # a service we are tearing down. Stopping everything covers both.
+    for u in "${LME_UNITS[@]}"; do
+      sudo systemctl stop "$u" 2>/dev/null || true
+    done
+    echo "Disabling lme unit(s) (removes .wants symlinks)..."
+    for u in "${LME_UNITS[@]}"; do
+      sudo systemctl disable "$u" 2>/dev/null || true
+    done
+  fi
+fi
+
+# --------------------------------------------------------------------------
+# 2. Stop/remove all containers, then remove volumes, secrets, images.
+#    (Keep the aggressive `rm -a` steps: LME secrets are NOT lme-prefixed --
+#    they are named elastic/wazuh/wazuh_api/kibana_system/pgvector/llm-keys
+#    plus per-user names -- so they can only be cleared wholesale.)
+# --------------------------------------------------------------------------
 echo "Stopping and removing all containers..."
-sudo -i podman stop -a 2>/dev/null || true
-sudo -i podman rm -af 2>/dev/null || true
+$PODMAN stop -a 2>/dev/null || true
+$PODMAN rm -af 2>/dev/null || true
 
 echo "Removing volumes, secrets, and images..."
-sudo -i podman volume rm -a 2>/dev/null || true
-sudo -i podman secret rm -a 2>/dev/null || true
-sudo -i podman image prune -af 2>/dev/null || true
+$PODMAN volume rm -a 2>/dev/null || true
+$PODMAN secret rm -a 2>/dev/null || true
+$PODMAN image prune -af 2>/dev/null || true
 
+# --------------------------------------------------------------------------
+# 3. Remove quadlet/systemd unit files AND both config trees.
+# --------------------------------------------------------------------------
 echo "Removing LME quadlet and systemd unit files..."
 sudo rm -f /etc/containers/systemd/lme-*.container
 sudo rm -f /etc/containers/systemd/lme-*.volume
+sudo rm -f /etc/containers/systemd/lme-*.network
 sudo rm -f /etc/containers/systemd/lme.network
 sudo rm -f /etc/containers/systemd/lme.service
 sudo rm -f /etc/containers/networks/lme.json
 sudo rm -f /etc/systemd/system/lme-*.service
 sudo rm -f /etc/systemd/system/lme-*.path
+sudo rm -f /etc/systemd/system/lme-*.timer
 sudo rm -f /etc/systemd/system/lme.service
+# Enable symlinks under */.wants are removed by the `systemctl disable` loop in
+# step 1; any that survive are caught by the list-unit-files probe in 6a.
 
-echo "Reloading systemd and clearing failed states..."
-sudo systemctl daemon-reload
-sudo systemctl reset-failed
-
-echo "Removing /opt/lme..."
+echo "Removing /opt/lme and /etc/lme..."
 sudo rm -rf /opt/lme
+# /etc/lme holds the Ansible vault, pass.sh (0700) and version file -- the old
+# script never removed it, so secrets survived a "full" wipe. Remove it.
+sudo rm -rf /etc/lme
 
-echo "Cleaning up container config..."
-rm -rf ~/.config/containers
+# 3b. Remove the ANSIBLE_VAULT_PASSWORD_FILE export that setup_passwords.yml
+#     appends to /root/.profile AND /root/.bashrc. It points at /etc/lme/pass.sh
+#     (just deleted). Left behind, the NEXT fresh install inherits it from the
+#     shell env and ansible-playbook aborts at STARTUP -- "The vault password file
+#     /etc/lme/pass.sh was not found" -- before the base role can recreate it. So a
+#     wipe that skipped this silently broke every teardown->reinstall on the host.
+echo "Removing ANSIBLE_VAULT_PASSWORD_FILE export from root shell profiles..."
+for _rc in /root/.profile /root/.bashrc; do
+  [ -f "$_rc" ] && sudo sed -i '/export ANSIBLE_VAULT_PASSWORD_FILE=/d' "$_rc" 2>/dev/null || true
+done
+
+# --------------------------------------------------------------------------
+# 4. Reset ONLY LME-owned tailscale serve/ingress state (Finding A). A blanket
+#    `tailscale serve reset` would also wipe a co-tenant's serve/Service config on
+#    a shared node, so LME removes its specific node-scoped ports and its own
+#    svc:<name> VIPs by exact identity. A blanket reset is used ONLY as a last
+#    resort, and only on a host that has NO non-LME serve config to protect.
+#    Guarded on the binary being present.
+# --------------------------------------------------------------------------
+if command -v tailscale >/dev/null 2>&1; then
+  echo "Resetting LME-owned tailscale serve/ingress config (co-tenant serves left intact)..."
+
+  # 4a. Remove LME node-scoped serve handlers by EXACT port. `--https/--tcp <port>
+  #     off` targets just that handler; it never touches svc:* Services or a non-LME
+  #     node handler bound to a different port.
+  for _p in "${LME_SERVE_HTTPS_PORTS[@]}"; do
+    sudo tailscale serve --https="$_p" off 2>/dev/null || true
+  done
+  for _p in "${LME_SERVE_TCP_PORTS[@]}"; do
+    sudo tailscale serve --tcp="$_p" off 2>/dev/null || true
+  done
+
+  # 4b. Remove ONLY LME-owned Tailscale Service VIPs. Enumerate what is actually
+  #     advertised, intersect with the LME name set, and clear JUST those. We never
+  #     iterate-and-reset every svc:* (that is exactly what used to destroy the
+  #     operator's svc:windows11). `clear` removes all handlers for the service; the
+  #     older per-service `reset` spelling is a fallback for builds without `clear`.
+  if _present_svcs=$(sudo tailscale serve status 2>/dev/null \
+                     | grep -oE 'svc:[A-Za-z0-9._-]+' | sort -u); then
+    for _svc in $_present_svcs; do
+      _name=${_svc#svc:}
+      for _lme in "${LME_SVC_NAMES[@]}"; do
+        if [ "$_name" = "$_lme" ]; then
+          # `clear` arg form varies (svc:<name> vs bare <name>); try both, then the
+          # older per-service `reset` spelling, so a scoped removal actually lands.
+          sudo tailscale serve clear "$_svc" 2>/dev/null \
+            || sudo tailscale serve clear "$_name" 2>/dev/null \
+            || sudo tailscale serve --service="$_svc" reset 2>/dev/null || true
+          break
+        fi
+      done
+    done
+  fi
+
+  # 4c. Last-resort blanket reset, ONLY on a host with nothing else to lose. If LME
+  #     node serves survived 4a (e.g. a tailscale build whose serve has no `... off`
+  #     target) AND the node advertises NO non-LME serve entry at all, a blanket
+  #     reset is provably harmless and keeps the B2 teardown gate passable. If ANY
+  #     non-LME entry is present we NEVER reset -- surviving LME node residue is left
+  #     to the fail-closed self-verify (6d) rather than risk a co-tenant's config.
+  if _serve_now=$(sudo tailscale serve status 2>/dev/null); then
+    _lme_node_left=""
+    for _p in "${LME_SERVE_NODE_PORTS[@]}"; do
+      printf '%s\n' "$_serve_now" | grep -qE "127\.0\.0\.1:${_p}([^0-9]|$)" \
+        && _lme_node_left="yes"
+    done
+    # Foreign = any svc:<name> still present (LME-owned ones were just cleared in 4b,
+    # so a remainder is a co-tenant's) OR a node backend on a port LME does not own.
+    _foreign=""
+    printf '%s\n' "$_serve_now" | grep -qE 'svc:[A-Za-z0-9._-]+' && _foreign="yes"
+    while IFS= read -r _bport; do
+      _own=""
+      for _p in "${LME_SERVE_NODE_PORTS[@]}"; do [ "$_bport" = "$_p" ] && _own="yes"; done
+      [ -z "$_own" ] && _foreign="yes"
+    done < <(printf '%s\n' "$_serve_now" | grep -oE '127\.0\.0\.1:[0-9]+' \
+             | grep -oE '[0-9]+$' | sort -u)
+
+    if [ -n "$_lme_node_left" ] && [ -z "$_foreign" ]; then
+      echo "  LME node serves survived scoped '... off' and no co-tenant serve is present; blanket reset (safe on a dedicated host)."
+      sudo tailscale serve reset 2>/dev/null || true
+    fi
+  fi
+
+  # 4d. Revert the EGRESS leg's client preference (Finding C). tailscale_egress.yml
+  #     runs `tailscale set --accept-routes=true` (daemon pref RouteAll:true) so LME
+  #     can reach services behind tailnet subnet routers; a wipe that leaves it on
+  #     keeps the host pulling every advertised subnet route after LME is gone. Revert
+  #     it. `tailscale set` is idempotent (a no-op when already false), so we run it
+  #     unconditionally rather than add a `debug prefs` read (another failure surface)
+  #     just to gate it. NOTE: unlike the serve clears above -- which are scoped to
+  #     LME's EXACT svc/port identities -- RouteAll is a HOST-GLOBAL pref, not
+  #     LME-scoped; reverting it is correct for LME's own egress teardown but would
+  #     also drop a co-tenant's accept-routes on a shared node. The optional exit-node
+  #     (operator opt-in) is deliberately NOT touched.
+  echo "Reverting tailnet egress accept-routes (RouteAll -> false)..."
+  sudo tailscale set --accept-routes=false 2>/dev/null || true
+fi
+
+# --------------------------------------------------------------------------
+# 5. Reload systemd (drops now-source-less generated units) and clear failures.
+# --------------------------------------------------------------------------
+echo "Reloading systemd and clearing failed states..."
+sudo systemctl daemon-reload 2>/dev/null || true
+sudo systemctl reset-failed 2>/dev/null || true
+
+# `sudo -i podman` runs with HOME=/root, so podman reads
+# /root/.config/containers/{storage,containers}.conf -- written by setup_passwords.yml
+# as user_storage_conf (the RELOCATED graphroot) and user_secrets_conf (the shell-
+# driver secrets config pointing at /etc/lme/vault, just deleted). The old
+# `rm -rf ~/.config/containers` (un-sudo'd) targeted the INVOKING user's home, which
+# on this rootful install is the WRONG store -- so the load-bearing root config
+# survived a "full" wipe and the next install inherited a stale graphroot pointer.
+echo "Cleaning up rootful container config (/root/.config/containers)..."
+sudo rm -rf /root/.config/containers
 sudo rm -f /etc/containers/storage.conf
 
-echo "Wipe complete. Ready for fresh install."
+# --------------------------------------------------------------------------
+# 6. SELF-VERIFY -- the authoritative gate. Assert NONE of the residue classes
+#    remain. Anything found is printed and forces exit 1. Only a verifiably
+#    clean host prints success and exits 0.
+#
+#    FAIL-CLOSED probing: a tool that is ABSENT means that residue class cannot
+#    exist -> skip it. A tool that is PRESENT but whose query ERRORS is
+#    INDETERMINATE -> we cannot prove clean -> treat as residue. We never print
+#    success on an unqueryable probe.
+# --------------------------------------------------------------------------
+RESIDUE=()
+
+echo "Verifying host is clean..."
+
+# --- 6a. systemd units (loaded units + installed unit files) ---------------
+# `--plain --no-legend` columns: $1=UNIT $2=LOAD. Count a loaded unit as
+# residue ONLY when LOAD == "loaded"; `not-found` stubs left mid-teardown are
+# not residue and must not false-fail a clean wipe. list-unit-files is a second,
+# independent probe for any lingering unit FILE or dangling .wants symlink.
+if command -v systemctl >/dev/null 2>&1; then
+  loaded_units=$(systemctl list-units --all --plain --no-legend 'lme*' 2>/dev/null \
+                 | awk '$2 == "loaded" {print $1}')
+  if [ -n "$loaded_units" ]; then
+    RESIDUE+=("loaded systemd unit(s) still present:"$'\n'"$loaded_units")
+  fi
+  unit_files=$(systemctl list-unit-files --no-legend 'lme*' 2>/dev/null | awk '{print $1}')
+  if [ -n "$unit_files" ]; then
+    RESIDUE+=("installed unit file(s) still present:"$'\n'"$unit_files")
+  fi
+fi
+
+# --- 6b. podman containers / volumes / secrets -----------------------------
+# NOTE the template-field asymmetry: containers use {{.Names}} (plural),
+# volumes and secrets use {{.Name}} (singular). Each probe's exit status is
+# checked: a failed query is indeterminate -> residue (never silent-clean).
+if $PODMAN --version >/dev/null 2>&1; then
+  if names=$($PODMAN ps -a --format '{{.Names}}' 2>/dev/null); then
+    lme_containers=$(printf '%s\n' "$names" | grep -i '^lme' || true)
+    [ -n "$lme_containers" ] && RESIDUE+=("lme container(s) still present:"$'\n'"$lme_containers")
+  else
+    RESIDUE+=("podman container query failed -- cannot verify clean (indeterminate)")
+  fi
+
+  if vols=$($PODMAN volume ls --format '{{.Name}}' 2>/dev/null); then
+    lme_volumes=$(printf '%s\n' "$vols" | grep -i '^lme' || true)
+    [ -n "$lme_volumes" ] && RESIDUE+=("lme volume(s) still present:"$'\n'"$lme_volumes")
+  else
+    RESIDUE+=("podman volume query failed -- cannot verify clean (indeterminate)")
+  fi
+
+  # Secrets are not lme-prefixed and `secret rm -a` above removes them all, so
+  # ANY remaining secret means the wipe did not complete -> residue.
+  if secs=$($PODMAN secret ls --format '{{.Name}}' 2>/dev/null); then
+    leftover_secrets=$(printf '%s\n' "$secs" | grep -v '^[[:space:]]*$' || true)
+    [ -n "$leftover_secrets" ] && RESIDUE+=("podman secret(s) still present:"$'\n'"$leftover_secrets")
+  else
+    RESIDUE+=("podman secret query failed -- cannot verify clean (indeterminate)")
+  fi
+fi
+
+# --- 6c. filesystem residue ------------------------------------------------
+[ -e /opt/lme ] && RESIDUE+=("/opt/lme still exists")
+[ -e /etc/lme ] && RESIDUE+=("/etc/lme still exists")
+# SF-8: the rootful podman config `sudo -i podman` actually reads. The dir holds
+# storage.conf (relocated graphroot) AND containers.conf (shell-secrets driver);
+# one dir assertion covers both. storage.conf is named so the check is self-evident.
+[ -e /root/.config/containers ] && RESIDUE+=("/root/.config/containers still exists (rootful storage.conf/containers.conf residue)")
+
+# Unit-file residue in the quadlet dir. `nullglob` so an empty match does NOT
+# leave the literal pattern (which would false-fail a clean host).
+shopt -s nullglob
+quadlet_leftover=(/etc/containers/systemd/lme*)
+shopt -u nullglob
+if [ "${#quadlet_leftover[@]}" -gt 0 ]; then
+  RESIDUE+=("quadlet file(s) still present:"$'\n'"$(printf '%s\n' "${quadlet_leftover[@]}")")
+fi
+
+# --- 6d. tailscale serve config (LME-owned ONLY -- Finding A) ---------------
+# Count ONLY LME-owned serve config as residue. A co-tenant's serve/Service on a
+# shared node (svc:windows11, svc:vncserverwindow, or a node backend on a non-LME
+# port) is deliberately NOT asserted -- it is not ours to remove and must never
+# fail our wipe. LME-owned residue still fails closed (any survivor -> exit 1), so
+# the B2 teardown contract is preserved. Present-but-unqueryable (tailscaled down)
+# is indeterminate -> residue, because serve config persists and returns on restart.
+if command -v tailscale >/dev/null 2>&1; then
+  # Fail-closed: tailscale is present but we derived NO manifest names at all
+  # (manifests tree missing/unreadable). The cross-check below then has nothing to
+  # recognise an LME VIP by, so an orphan would silently report clean -- the very
+  # failure this finding fixes. Treat an underivable NAME set as INDETERMINATE
+  # residue, matching 6d's "present but unqueryable" rule. (When tailscale is absent
+  # this whole block is skipped, so a non-tailscale wipe is unaffected.)
+  if [ "${#LME_MANIFEST_NAMES[@]}" -eq 0 ]; then
+    RESIDUE+=("cannot derive the LME svc name set from ${LME_MANIFESTS_DIR}/services -- tailnet VIP teardown unverifiable (indeterminate)")
+  fi
+  # Fail-closed (mirror of the check above, for the node-scoped ingress ports). The
+  # LME_SERVE_NODE_PORTS set is DERIVED from the same manifests; B marks these ports
+  # UNCONDITIONALLY in the base manifests, so an EMPTY set means the derivation is
+  # missing/broke -- NOT that LME fronts no ingress ports. Left unguarded, an empty
+  # set makes the 4a `... off` loop tear down nothing AND the 6d node-serve loop
+  # below check nothing -> a false "clean" on a host still holding the ingress
+  # serves. Treat empty as INDETERMINATE residue, the same rule as the svc-name set.
+  if [ "${#LME_SERVE_NODE_PORTS[@]}" -eq 0 ]; then
+    RESIDUE+=("cannot derive the LME node-scoped ingress port set from ${LME_MANIFESTS_DIR}/services -- node serve teardown unverifiable (indeterminate)")
+  fi
+  if serve_status=$(sudo tailscale serve status 2>/dev/null); then
+    lme_serve_residue=""
+    # LME-owned svc:<name> VIPs. Match each advertised svc against LME_MANIFEST_NAMES
+    # (every manifest id/tailnet_service), NOT just the host-facing reset set: that is
+    # what turns a stale/incomplete host-facing derivation from a silent orphan into a
+    # NAMED teardown failure. A foreign svc:* (svc:windows11 / svc:vncserverwindow /
+    # svc:webui -- no manifest declares them) matches nothing and is ignored, so
+    # co-tenant safety holds. A survivor that WAS in the reset set is reported
+    # distinctly from one the host-facing derivation missed.
+    while IFS= read -r _svc; do
+      _name=${_svc#svc:}
+      _is_lme=""
+      for _mn in "${LME_MANIFEST_NAMES[@]}"; do
+        [ "$_name" = "$_mn" ] && { _is_lme="yes"; break; }
+      done
+      [ -n "$_is_lme" ] || continue
+      _in_reset=""
+      for _lme in "${LME_SVC_NAMES[@]}"; do
+        [ "$_name" = "$_lme" ] && { _in_reset="yes"; break; }
+      done
+      if [ -n "$_in_reset" ]; then
+        lme_serve_residue+="${_svc} (survived scoped reset)"$'\n'
+      else
+        lme_serve_residue+="${_svc} (orphaned LME VIP -- matches a manifest id/tailnet_service the host-facing derivation missed)"$'\n'
+      fi
+    done < <(printf '%s\n' "$serve_status" | grep -oE 'svc:[A-Za-z0-9._-]+' | sort -u)
+    # LME node-scoped serves (ingress ports). Anchored so :50441 cannot match :5044.
+    for _p in "${LME_SERVE_NODE_PORTS[@]}"; do
+      printf '%s\n' "$serve_status" | grep -qE "127\.0\.0\.1:${_p}([^0-9]|$)" \
+        && lme_serve_residue+="127.0.0.1:${_p} (LME node serve)"$'\n'
+    done
+    lme_serve_residue=$(printf '%s' "$lme_serve_residue" | grep -v '^[[:space:]]*$' || true)
+    [ -n "$lme_serve_residue" ] \
+      && RESIDUE+=("LME tailscale serve config still present:"$'\n'"$lme_serve_residue")
+  else
+    RESIDUE+=("tailscale serve status query failed -- cannot verify clean (indeterminate)")
+  fi
+fi
+
+# --- 6f. shell-profile residue --------------------------------------------
+# The ANSIBLE_VAULT_PASSWORD_FILE export setup_passwords.yml injects into
+# /root/.profile + /root/.bashrc. If it survives, the next fresh install's
+# ansible-playbook aborts at startup pointing at the now-deleted pass.sh.
+for _rc in /root/.profile /root/.bashrc; do
+  if [ -f "$_rc" ] && grep -q 'ANSIBLE_VAULT_PASSWORD_FILE' "$_rc" 2>/dev/null; then
+    RESIDUE+=("ANSIBLE_VAULT_PASSWORD_FILE export still present in $_rc")
+  fi
+done
+
+# --- 6e. verdict -----------------------------------------------------------
+if [ "${#RESIDUE[@]}" -gt 0 ]; then
+  echo ""
+  echo "WIPE FAILED: host is NOT clean. Residue found:"
+  for r in "${RESIDUE[@]}"; do
+    echo "  - ${r//$'\n'/$'\n'    }"
+  done
+  echo ""
+  echo "Re-run after resolving the above, or investigate manually. Exiting non-zero."
+  exit 1
+fi
+
+echo "Wipe complete and verified clean. Ready for fresh install."
+exit 0

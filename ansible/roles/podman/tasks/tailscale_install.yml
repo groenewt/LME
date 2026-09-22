@@ -1,0 +1,136 @@
+---
+# Tailscale daemon install (OPT-IN, additive) — the prerequisite for every
+# tailscale leg (ingress / egress / services).
+#
+# Included from main.yml ONLY when at least one tailscale_serve_* leg is enabled
+# (see the guard on the include). Nothing here runs on a default install, so the
+# stock behaviour is unchanged. This installs the `tailscale` CLI + `tailscaled`
+# daemon, enables/starts the daemon, and brings the node up on the tailnet
+# idempotently. The serve/egress legs that follow only CONFIGURE an already
+# installed, logged-in daemon — this file is what makes that daemon exist.
+#
+# House pattern: mirrors the apt-repo/GPG-key install used for other daemons in
+# this repo (ansible/roles/ludus_lme_agents/tasks/wazuh.yml) and the apt path in
+# ansible/roles/nix (debian-13.yml). Debian/Ubuntu use the official Tailscale apt
+# repo; any other family falls back to the get.tailscale.com convenience script.
+#
+# SECRETS: `tailscale up` reads an auth key from `tailscale_authkey` ONLY when the
+# operator supplies one (via -e / vault / profile vars). No key is ever hardcoded,
+# and the key is never printed (no_log on the up task). With no key the node is
+# left for a manual `tailscale up`; the legs' own login checks then fail clearly.
+
+# ---------------------------------------------------------------------------
+# Install the tailscale CLI + daemon
+# ---------------------------------------------------------------------------
+- name: Check whether the tailscale CLI is already present
+  ansible.builtin.shell: command -v tailscale
+  register: ts_cli_pre
+  changed_when: false
+  failed_when: false
+
+- name: Skip tailscale install (offline mode — assumed pre-installed)
+  ansible.builtin.debug:
+    msg: >-
+      Offline mode - skipping tailscale package install. tailscaled must be
+      pre-installed on this host for the enabled tailscale leg(s) to work.
+  when: offline_mode | default(false)
+
+# --- Debian / Ubuntu: official Tailscale apt repository ---------------------
+- name: Install tailscale from the official apt repository (Debian/Ubuntu)
+  when:
+    - ansible_os_family == "Debian"
+    - not (offline_mode | default(false))
+    - ts_cli_pre.rc != 0
+  become: yes
+  block:
+    - name: Download the Tailscale apt signing key
+      ansible.builtin.get_url:
+        url: "https://pkgs.tailscale.com/stable/{{ ansible_distribution | lower }}/{{ ansible_distribution_release }}.noarmor.gpg"
+        dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+        mode: "0644"
+
+    - name: Add the Tailscale apt repository
+      ansible.builtin.copy:
+        content: "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/{{ ansible_distribution | lower }} {{ ansible_distribution_release }} main\n"
+        dest: /etc/apt/sources.list.d/tailscale.list
+        mode: "0644"
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Install the tailscale package
+      ansible.builtin.apt:
+        name: tailscale
+        state: present
+
+# --- Any other family: the get.tailscale.com convenience installer ----------
+- name: Install tailscale via the convenience script (non-Debian families)
+  ansible.builtin.shell: >-
+    set -o pipefail && curl -fsSL https://tailscale.com/install.sh | sh
+  args:
+    executable: /bin/bash
+  become: yes
+  when:
+    - ansible_os_family != "Debian"
+    - not (offline_mode | default(false))
+    - ts_cli_pre.rc != 0
+
+# ---------------------------------------------------------------------------
+# Enable + start the daemon
+# ---------------------------------------------------------------------------
+- name: Enable and start tailscaled
+  ansible.builtin.systemd:
+    name: tailscaled
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+
+# ---------------------------------------------------------------------------
+# Bring the node up on the tailnet (idempotent)
+# ---------------------------------------------------------------------------
+# Read the backend state once so `tailscale up` only runs when the node is not
+# already Running. `tailscale status --json` exits non-zero when the daemon is
+# not yet reachable / logged in, so a bad rc is also treated as "not up".
+- name: Read current tailscale backend state
+  ansible.builtin.command: tailscale status --json
+  register: ts_up_status
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Set tailscale login fact
+  ansible.builtin.set_fact:
+    ts_backend_running: >-
+      {{ ts_up_status.rc == 0
+         and (('"BackendState": "Running"' in (ts_up_status.stdout | default('')))
+              or ('"BackendState":"Running"' in (ts_up_status.stdout | default('')))) }}
+
+# Only acts with an operator-supplied auth key AND when the node is not already
+# up — re-running `tailscale up` with an already-consumed key would error, and
+# running it with no key on a NeedsLogin node would block on interactive login.
+- name: Bring this node up on the tailnet with the provided auth key
+  ansible.builtin.command: >-
+    tailscale up
+    --authkey={{ tailscale_authkey }}
+    {{ tailscale_up_extra_args | default('') }}
+  register: ts_up_result
+  changed_when: ts_up_result.rc == 0
+  no_log: true
+  become: yes
+  when:
+    - not (ts_backend_running | bool)
+    - tailscale_authkey is defined
+    - (tailscale_authkey | default('') | string | length) > 0
+
+- name: Warn that tailscale is installed but not logged in (no auth key supplied)
+  ansible.builtin.debug:
+    msg: >-
+      tailscaled is installed and running but this node is NOT logged in to the
+      tailnet, and no `tailscale_authkey` was provided. Run `sudo tailscale up`
+      on this host (or re-run with `-e tailscale_authkey=<key>`) before the
+      enabled tailscale leg(s) can serve/reach anything.
+  when:
+    - not (ts_backend_running | bool)
+    - (tailscale_authkey | default('') | string | length) == 0

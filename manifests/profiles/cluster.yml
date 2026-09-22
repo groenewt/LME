@@ -1,0 +1,61 @@
+---
+# manifests/profiles/cluster.yml -- multi-node Elasticsearch profile (value overlay).
+#
+# Proves two G1 mechanisms on the elasticsearch service:
+#   * B1: cgroup memory caps + JVM heap are rendered UNCONDITIONALLY. The current
+#     lme-elasticsearch.container.j2 gates both behind single-node, so a cluster
+#     data node currently renders with NO MemoryHigh/MemoryMax and NO -Xms/-Xmx
+#     (it can OOM the host and its heap floats). Under this profile the derived
+#     caps and heap appear -- that is the intended B1 behaviour change.
+#   * per-node heap/memory sizing: resources.heap is overridable; MemoryHigh and
+#     MemoryMax derive from it (8g -> 12G / 16G via mem_derive).
+#   * the transport port (9300) is published in addition to http (9200).
+#
+# Discovery mode-switch: setting environment.discovery.type to null drops the key
+# from the render (container.j2 skips null env values), because recursive combine
+# cannot delete a key but CAN replace its scalar with null. So a cluster node
+# renders WITHOUT discovery.type=single-node. The per-node cluster discovery
+# keys (node.name, discovery.seed_hosts, cluster.initial_master_nodes,
+# network.publish_host) are per-node/per-deployment, NOT static profile values,
+# so they live in host_vars and combine LAST via lme_service_overrides -- see the
+# documented skeleton in ansible/inventory/host_vars/es{1,2,3}.yml.
+profile_overlay:
+  lme_global:
+    # SF-8 budget: a cluster ES data node at the profile's heap 8g renders MemoryMax
+    # 16G (8g * memory_max_factor 2). The SF-8 preflight
+    # (roles/podman/tasks/container_setup.yml) weighs that ceiling against the node's
+    # ACTUAL RAM -- it overrides host_ram_gb with ansible_memtotal_mb at deploy time
+    # (facts WIN over the value below), so on a real <=16G data node the 16G ceiling
+    # is `oversized` and the install HARD-FAILS no matter what is declared here.
+    # The lever that actually fits a constrained node is per-host HEAP, NOT this
+    # number: lower resources.heap in the node's host_var so heap * memory_max_factor
+    # <= usable RAM (see the honest derivation in host_vars/es{1,2,3}.yml).
+    # host_ram_gb below is DEAD for the ansible preflight: with facts off,
+    # ansible_memtotal_mb defaults to 0 and REPLACES it (0/1024=0), and the assert is
+    # then skipped by its `when: ansible_memtotal_mb > 0` guard -- so the declared
+    # value never gates a real deploy either way. It is live ONLY for direct
+    # memory_budget() calls (the unit tests) and documents the "big box by
+    # definition" expectation; the deploy-time gate is always the facts-based RAM.
+    budget:
+      host_ram_gb: 32
+  services:
+    elasticsearch:
+      # combine(recursive=True) REPLACES lists, so the FULL port list is given, and
+      # `bind` is EXPLICIT on every entry (default posture is CLOSED -- global.yml
+      # binds every published port to 127.0.0.1). "Open" is a PRESENT bind:0.0.0.0,
+      # never an absent bind. A cluster forms over the TRANSPORT port (9300), which
+      # MUST cross hosts, so it is the one entry opened to the LAN; the client HTTP
+      # API (9200) stays loopback (front it via a proxy / an explicit host_var if a
+      # remote client needs it).
+      publish_ports:
+        - {host: 9200, container: 9200, bind: 127.0.0.1}   # client API: closed
+        - {host: 9300, container: 9300, bind: 0.0.0.0}      # transport: LAN opt-in (cross-host cluster)
+      environment:
+        discovery.type: null       # dropped from render (no single-node in a cluster)
+      resources:
+        heap: 8g
+        jvm_base: "-Des.entitlements.enabled=false"
+        memory_high_factor: 1.5
+        memory_max_factor: 2
+  vars:
+    es_discovery: cluster

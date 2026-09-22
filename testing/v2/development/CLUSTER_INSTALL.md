@@ -13,8 +13,10 @@ LME can be deployed in cluster mode where:
 ### Cluster child quadlets
 
 Cluster child nodes only keep the Elasticsearch quadlet dependency graph under
-`/etc/containers/systemd/`. LME stages the full quadlet source tree under
-`/opt/lme/quadlet-source/`, but on child nodes it only installs:
+`/etc/containers/systemd/`. The install is manifest-driven: `render_units.yml`
+renders each enabled service directly into `/etc/containers/systemd/`, and on
+child nodes it skips every service not in the child-active set
+(`lme_child_active_services`), so it writes only:
 
 - `lme.network`
 - `lme-backups.volume`
@@ -28,9 +30,10 @@ are intentionally removed from the active quadlet directory on child nodes, so
 the podman systemd generator never creates those services at boot.
 
 This keeps reboot behavior correct while preserving a future promotion path: a
-promotion workflow can copy the staged files from `/opt/lme/quadlet-source/`
-back into `/etc/containers/systemd/`, run `systemctl daemon-reload`, and then
-enable/start the full stack.
+promotion workflow re-runs `render_units.yml` with the child prune disabled
+(`lme_child_es_only: false`) to render the full stack from the manifests into
+`/etc/containers/systemd/`, runs `systemctl daemon-reload`, and then
+enable/starts the full stack.
 
 ## Prerequisites
 
@@ -256,11 +259,9 @@ Run these checks on a cluster child node after `ansible/elasticsearch.yml` (or
 the Phase 5b child section of `ansible/convert_to_cluster.yml`) completes:
 
 ```bash
-# Active quadlets on the child should be ES-only.
+# Active quadlets on the child should be ES-only (render_units.yml writes only
+# the child-active set directly here; there is no separate staging directory).
 sudo ls -1 /etc/containers/systemd
-
-# Full source tree should still be staged locally for future promotion.
-sudo ls -1 /opt/lme/quadlet-source
 
 # Only Elasticsearch should be present in the active boot path.
 systemctl list-unit-files 'lme-*'
@@ -277,7 +278,6 @@ Expected child-node state:
 
 - `/etc/containers/systemd` contains only the Elasticsearch dependency set plus
   the rendered `lme-elasticsearch.container`
-- `/opt/lme/quadlet-source` contains the full repo quadlet tree
 - Kibana/Fleet/Wazuh/ElastAlert units are not regenerated after reboot
 - Cluster health and node membership stay unchanged
 

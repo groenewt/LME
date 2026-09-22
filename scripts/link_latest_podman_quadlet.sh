@@ -1,4 +1,10 @@
 #!/bin/bash
+# Links the podman QUADLET GENERATOR BINARY (the podman-system-generator /
+# podman-user-generator and podman's systemd units) from the latest Nix-store
+# podman into the standard /usr/lib/systemd generator paths. This is the podman
+# quadlet system-generator toolchain -- NOT the static quadlet/ unit tree; it
+# touches no *.container/*.volume/*.network files under quadlet/ or
+# /etc/containers/systemd.
 #TODO: may need to add a nix-store --gc, to clean up extra files that exist
 # Find the latest podman version in the Nix store
 latest_podman=$(find /nix/store -maxdepth 1 -name '*-podman-*' | 

@@ -1,0 +1,145 @@
+---
+# manifests/global.yml -- cross-cutting deployment values for the whole LME stack.
+#
+# This is a DATA file: literals are expected and correct HERE (and in
+# manifests/profiles/*, manifests/services/*, and the filter plugin). They are
+# banned from the render templates (ansible/templates/units/*.j2), which read
+# every value from this tree via the service manifests.
+#
+# Load order (ansible/roles/podman/tasks/load_manifests.yml):
+#   lme_global = global.yml
+#              | combine(<active profile overlay>, recursive=True)
+#              | combine(lme_global_override | default({}), recursive=True)
+# i.e. profiles overlay the baseline, and an operator host_var override wins LAST.
+
+lme_global:
+
+  # --- userns / cert-owner derivation seeds -------------------------------
+  # THE only place these numbers live. Every id-mapping base and every cert
+  # owner uid is DERIVED from them by filter_plugins/lme_manifests.py:
+  #   userns_base(svc) = subuid_base + slot(svc) * slot_size
+  #   cert key owner   = userns_base(svc) + in_container_uid
+  subuid_base: 165536
+  # /etc/subuid & /etc/subgid range length for the rootless 'containers' user
+  # (the outer range userns slots carve into); base setup_directories renders it.
+  subuid_range: 65536
+  slot_size: 3048
+  # Logical service -> slot index. A service absent here has no pinned id-mapping
+  # and resolves to subuid_base (the observed lme_backups owner, 165536).
+  slots:
+    elasticsearch: 0      # base 165536
+    kibana: 1             # base 168584
+    fleet-server: 2       # base 171632
+    wazuh-manager: 3      # base 174680
+    elastalert: 4         # base 177728
+
+  # --- podman network (renders lme.network) -------------------------------
+  network:
+    name: lme
+    driver: bridge
+    subnet: 10.89.4.0/24
+    gateway: 10.89.4.1
+    ipam_driver: host-local
+
+  # --- images -------------------------------------------------------------
+  # image_tag is the sentinel tag the build/load path retags every image to.
+  # Units reference the `local` ref (localhost/<name>:LME_LATEST) which is stable
+  # across online/offline installs; `pull` is the upstream source used at
+  # build/prefetch time and is what profiles/offline.yml re-points. `group` gates
+  # which services a given install renders (core | elastic_services | llm).
+  # image_tag is a LITERAL tag string (there is no substitution step; the build
+  # path retags every upstream image to localhost/<name>:LME_LATEST and the units
+  # reference that verbatim). `pull` refs and versions are extracted from
+  # config/containers.txt, config/containers-llm.txt and
+  # config/containers-elastic-services.txt -- the current sources of truth.
+  image_tag: LME_LATEST
+  images:
+    elasticsearch:  {local: localhost/elasticsearch:LME_LATEST,      pull: docker.elastic.co/elasticsearch/elasticsearch:8.18.8,     group: core}
+    kibana:         {local: localhost/kibana:LME_LATEST,             pull: docker.elastic.co/kibana/kibana:8.18.8,                  group: core}
+    elastic-agent:  {local: localhost/elastic-agent:LME_LATEST,      pull: docker.elastic.co/beats/elastic-agent:8.18.8,            group: core}
+    distribution:   {local: localhost/distribution:LME_LATEST,       pull: docker.elastic.co/package-registry/distribution:lite-8.18.8, group: core}
+    wazuh-manager:  {local: localhost/wazuh-manager:LME_LATEST,      pull: docker.io/wazuh/wazuh-manager:4.9.1,                     group: core}
+    elastalert2:    {local: localhost/elastalert2:LME_LATEST,        pull: docker.io/jertel/elastalert2:2.20.0,                     group: core}
+    logstash:       {local: localhost/logstash:LME_LATEST,           pull: docker.elastic.co/logstash/logstash:8.18.8,              group: elastic_services}
+    filebeat:       {local: localhost/filebeat:LME_LATEST,           pull: docker.elastic.co/beats/filebeat:8.18.8,                 group: elastic_services}
+    metricbeat:     {local: localhost/metricbeat:LME_LATEST,         pull: docker.elastic.co/beats/metricbeat:8.18.8,               group: elastic_services}
+    heartbeat:      {local: localhost/heartbeat:LME_LATEST,          pull: docker.elastic.co/beats/heartbeat:8.18.8,                group: elastic_services}
+    apm-server:     {local: localhost/apm-server:LME_LATEST,         pull: docker.elastic.co/apm/apm-server:8.18.8,                 group: elastic_services}
+    # llama-cpp: dot->dash rename is intentional (llama.cpp -> llama-cpp); the
+    # same image backs lme-embeddings. pgvector is pg17. litellm is main-latest.
+    pgvector:       {local: localhost/pgvector:LME_LATEST,           pull: docker.io/pgvector/pgvector:pg17,                        group: llm}
+    llama-cpp:      {local: localhost/llama-cpp:LME_LATEST,          pull: ghcr.io/ggml-org/llama.cpp:server,                       group: llm}
+    litellm:        {local: localhost/litellm:LME_LATEST,            pull: ghcr.io/berriai/litellm:main-latest,                     group: llm}
+    # Built locally from a Dockerfile (no upstream pull source).
+    lme-log-analyzer: {local: localhost/lme-log-analyzer:LME_LATEST, build: lme-log-analyzer/Dockerfile, group: llm}
+    lme-dashboard:  {local: localhost/lme-dashboard:LME_LATEST,      build: lme-dashboard/Dockerfile,    group: llm}
+
+  # --- cert tree (B4) -----------------------------------------------------
+  certs:
+    volume: lme_certs               # private workspace volume (setup-certs generates here)
+    host_tree: /opt/lme/certs       # per-service published bundles live under here
+    ca_public_rel: ca/ca.crt        # the ONLY CA material that leaves the workspace
+    default_in_container_uid: 0
+
+  # --- filesystem paths ---------------------------------------------------
+  paths:
+    opt: /opt/lme
+    config: /opt/lme/config
+    env_file: /opt/lme/lme-environment.env
+    vault_pass: /etc/lme/pass.sh
+    models: /opt/lme/llama-models
+
+  # --- container storage (overridable via podman -g / install.sh -g) ------
+  storage:
+    graphroot: /var/lib/containers/storage
+    runroot: /run/containers/storage
+
+  # --- co-residency memory budget (SF-8) ----------------------------------
+  # Aggregate ceiling for a single-node install. The `memory_budget` filter
+  # (filter_plugins/lme_manifests.py) sums the MemoryMax of every ENABLED
+  # container service that declares a resources cap -- JVM heap-derived
+  # (elasticsearch: heap 4g -> 8G max) OR a direct memory_max (the non-JVM caps
+  # added under SF-8) -- and compares the total against usable = host_ram_gb -
+  # reserve_gb. Services with no cap (e.g. fleet-server, logstash, the beats) are
+  # EXCLUDED from the sum and surfaced separately, so the number is a floor, not
+  # the whole footprint. over_budget means OVER-COMMITTED (ceilings exceed usable
+  # RAM) -- MemoryMax is a per-service KILL CEILING, not a reservation, so this is
+  # ADVISORY: the preflight (container_setup.yml SF-8) WARNS on it, never blocks
+  # (the default+llm stack over-commits yet ran end-to-end on a 14G host). The hard
+  # gate is the `oversized` list -- any single service whose own MemoryMax exceeds
+  # usable RAM (a deterministic OOM-kill) fails the install. Overridable per profile
+  # / host_var (e.g. a 32G node raises host_ram_gb).
+  budget:
+    host_ram_gb: 16       # target single-node host RAM
+    reserve_gb: 2         # kept free for the OS + podman/systemd overhead
+
+  # --- canonical published ports (host<->container), per profile-overridable.
+  # DEFAULT NETWORK POSTURE = CLOSED (exposure-binds fix): EVERY host-published
+  # port binds to 127.0.0.1 by default, so nothing is reachable off-box on a fresh
+  # install. render_port() (filter_plugins/lme_manifests.py) only emits 0.0.0.0
+  # when a port carries NO bind -- so a bind:127.0.0.1 here is the loopback wall.
+  # LAN exposure is an EXPLICIT profile opt-in: a profile that must reach a service
+  # off-box re-declares that service's publish_ports with bind:0.0.0.0 on the
+  # specific entry (combine(recursive=True) REPLACES the list, so the full list is
+  # given). "Open" is always a PRESENT bind:0.0.0.0, never an absent bind (see
+  # cluster.yml, which opens ONLY the ES transport port). Services publishing
+  # nothing are omitted.
+  ports:
+    elasticsearch_http:  {host: 9200, container: 9200, bind: 127.0.0.1}
+    elasticsearch_transport: {host: 9300, container: 9300, bind: 127.0.0.1}   # cluster only (cluster.yml opens it)
+    kibana:              {host: 5601, container: 5601, bind: 127.0.0.1}
+    kibana_https:        {host: 443,  container: 5601, bind: 127.0.0.1}
+    fleet_server:        {host: 8220, container: 8220, bind: 127.0.0.1}
+    fleet_distribution:  {host: 8080, container: 8080, bind: 127.0.0.1}
+    wazuh_registration:  {host: 1514, container: 1514, bind: 127.0.0.1}
+    wazuh_enrollment:    {host: 1515, container: 1515, bind: 127.0.0.1}
+    wazuh_syslog:        {host: 514,  container: 514, protocol: udp, bind: 127.0.0.1}
+    wazuh_api:           {host: 55000, container: 55000, bind: 127.0.0.1}
+    apm_server:          {host: 8200, container: 8200, bind: 127.0.0.1}
+    pgvector:            {host: 5432, container: 5432, bind: 127.0.0.1}
+    embeddings:          {host: 8081, container: 8081, bind: 127.0.0.1}
+    litellm:             {host: 4000, container: 4000, bind: 127.0.0.1}
+    log_analyzer:        {host: 8501, container: 8501, bind: 127.0.0.1}
+    dashboard:           {host: 8502, container: 8502, bind: 127.0.0.1}
+    logstash_beats:      {host: 5044, container: 5044, bind: 127.0.0.1}
+    logstash_http:       {host: 8085, container: 8085, bind: 127.0.0.1}

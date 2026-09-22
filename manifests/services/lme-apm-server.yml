@@ -1,0 +1,72 @@
+---
+# APM Server -- kind: container (elastic-services pack). B4 per-svc cert bundle.
+#
+# B4 mount: instead of bind-mounting the shared private cert workspace
+# (lme_certs, which contains ca/ca.key + every service's key) with `,idmap`,
+# apm-server mounts ONLY its own published bundle
+# (cert:apm-server -> /opt/lme/certs/apm-server) at /certs, read-only, NO idmap.
+# ca/ca.key is now mounted into NOTHING. The in-container paths are UNCHANGED:
+# config/apm-server.yml references /certs/apm-server/apm-server.crt,
+# /certs/apm-server/apm-server.key and /certs/ca/ca.crt (verified), which the
+# bundle provides (bundle mirrors the workspace layout: apm-server/ + ca/ca.crt).
+#
+# UID DROP (reverses a documented production failure -- read before re-adding root):
+# the static unit ran User=root because, under the OLD `,idmap` mount, the key was
+# owned by the workspace uid 166536 (= subuid_base 165536 + elasticsearch slot base
+# + in_container_uid 1000) and the apm-server image uid 1000 mapped to a DIFFERENT
+# host subuid, so it got EPERM on the 0640 key -> crash-loop (verified on the
+# Debian-13 e2e). B4 removes that cause entirely: this bundle is NOT idmapped and
+# is chowned to cert_owner = base 0 (host_userns:true) + in_container_uid 1000 =
+# 1000, i.e. the real host uid the image already runs as. Container uid 1000 ==
+# host owner 1000 -> it reads its own 0640 key with no root and no idmap. So the
+# root workaround is not just unnecessary, its precondition (idmap) is gone.
+# apm-server does NOT bind-mount the host journal, so nothing forces host root.
+#
+# Fidelity target = quadlet-optional/elastic-services/lme-apm-server.container with
+# EXACTLY: (1) Volume lme_certs:/certs:ro,idmap -> /opt/lme/certs/apm-server:/certs:ro
+# and (2) drop User=root. Directive REORDER within sections is cosmetic.
+id: apm-server
+name: lme-apm-server
+kind: container
+enabled_when: [install_elastic_services]
+image: apm-server
+description: Elastic APM Server Container Service
+
+dependencies:
+  requires: [elasticsearch, setup-certs]
+  after: [elasticsearch, setup-certs]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  timeout_start_sec: 300
+  start_limit_interval: 120
+  start_limit_burst: 10
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+network_aliases: [lme-apm-server]
+publish_ports:
+  # tailnet_ingress: host ingress opt-in marker (mode=https -> tailscale serve --https
+  # fronts it with the node's ts.net LE cert; consumed by tailscale_ingress.yml only;
+  # render_port ignores it, so the rendered unit bytes are unchanged).
+  - {host: 8200, container: 8200, bind: 127.0.0.1, tailnet_ingress: https}   # default-closed; LAN via profile opt-in
+volumes:
+  - {source: "cert:apm-server", dest: /certs, options: [ro, Z]}     # B4: per-svc bundle, no idmap; Z=SELinux relabel
+  - {source: /opt/lme/config/apm-server.yml, dest: /usr/share/apm-server/apm-server.yml, options: [ro]}
+secrets:
+  - {name: elastic, type: env, target: ELASTICSEARCH_PASSWORD}
+health:
+  cmd: "CMD-SHELL bash -c 'exec 3<>/dev/tcp/127.0.0.1/8200'"
+
+# B4 cert-owner metadata (consumed by init-setup.sh / G5, NOT emitted into the
+# unit). host_userns:true -> no UserNS remap, so cert_owner = in_container_uid
+# directly (base 0 + 1000 = 1000). apm-server is a TLS SERVER, so its bundle needs
+# both its own leaf (apm-server/apm-server.crt+.key) and ca/ca.crt; ca.key absent.
+certs:
+  host_userns: true
+  in_container_uid: 1000
+  needs_ca: true

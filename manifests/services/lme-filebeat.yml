@@ -1,0 +1,66 @@
+---
+# Filebeat -- kind: container (a beat). Exemplar for BLOCKER B4.
+#
+# B4 has TWO independent levers; the load-bearing one for the CA-MITM finding is
+# the MOUNT, not the user. Instead of bind-mounting the shared private cert
+# workspace (lme_certs, which contains ca/ca.key) with `,idmap`, filebeat mounts
+# ONLY its own published bundle (cert:filebeat -> /opt/lme/certs/filebeat) at
+# /certs, read-only, NO idmap. ca/ca.key is now mounted into NOTHING, so no
+# consumer -- root or not -- can read it. filebeat.yml references /certs/ca/ca.crt
+# (verified), which the bundle provides, so in-container paths are unchanged.
+#
+# filebeat KEEPS User=root DELIBERATELY: it bind-mounts the host journal
+# (/var/log/journal, /run/log/journal) and must read it as real host root -- a
+# remapped unprivileged userns cannot. That is safe here precisely because the
+# ca.key exposure is closed by the bundle mount above, independently of the uid.
+# run_as.user:root is a DECLARED manifest value (rendered, not hand-typed), so it
+# satisfies "every atomic value declarative." host_userns:true tells cert_owner
+# the bundle owner is the real host uid (0 for root), not a subuid remap.
+#
+# Fidelity target = the static quadlet-optional/elastic-services/lme-filebeat.container
+# with EXACTLY ONE change: Volume lme_certs:/certs:ro,idmap -> the per-svc bundle
+# /opt/lme/certs/filebeat:/certs:ro. Everything else (incl. User=root) identical;
+# directive REORDER within sections is cosmetic.
+id: filebeat
+name: lme-filebeat
+kind: container
+enabled_when: [install_elastic_services]
+image: filebeat
+description: Elastic Filebeat Container Service
+
+dependencies:
+  requires: [elasticsearch, setup-certs, filebeatdata]
+  after: [elasticsearch, setup-certs, kibana, filebeatdata]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  timeout_start_sec: 300
+  start_limit_interval: 120
+  start_limit_burst: 10
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+network_aliases: [lme-filebeat]
+volumes:
+  - {source: "cert:filebeat", dest: /certs, options: [ro, Z]}          # B4: per-svc bundle, no idmap; Z=SELinux relabel
+  - {source: /opt/lme/config/filebeat.yml, dest: /usr/share/filebeat/filebeat.yml, options: [ro]}
+  - {source: /var/log/journal, dest: /var/log/journal, options: [ro]}
+  - {source: /run/log/journal, dest: /run/log/journal, options: [ro]}
+  - {source: lme_filebeatdata, dest: /usr/share/filebeat/data}
+secrets:
+  - {name: elastic, type: env, target: ELASTICSEARCH_PASSWORD}
+
+# B4 cert-owner metadata (consumed by init-setup.sh / G5, not emitted into the
+# unit). host_userns:true -> no UserNS remap, so cert_owner = in_container_uid
+# directly (0 = root). The bundle is chowned root:root 0640 and mounted only into
+# this unit; root reads it, nothing else can, and ca.key is absent from it.
+certs:
+  host_userns: true
+  in_container_uid: 0
+  needs_ca: true
+run_as:
+  user: root          # DECLARED: required for host-journal read (see header)

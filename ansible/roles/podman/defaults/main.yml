@@ -5,30 +5,63 @@
 nix_daemon_service: "nix-daemon"
 
 # Other podman-specific configurations
-# Note: storage paths are now defined in site.yml 
+# Note: storage paths are now defined in site.yml
 lme_child_es_only: false
-lme_quadlet_source_dir: /opt/lme/quadlet-source
 
-# Child nodes only need the ES dependency graph under /etc/containers/systemd.
-# The full source tree is still staged locally under lme_quadlet_source_dir so a
-# future promotion workflow can restore the rest of the stack without re-cloning.
+# ---------------------------------------------------------------------------
+# Tailscale legs (OPT-IN, all OFF by default).
 #
-# Maintenance model:
-#   - `lme_child_active_quadlet_files` lists the quadlets that ARE copied onto
-#     child nodes (the minimal ES dependency graph).
-#   - `lme_child_active_extras` lists additional quadlets that must be kept on
-#     child nodes even though they are not copied by the active loop — e.g.
-#     files rendered from templates later in the play (lme-elasticsearch.container).
-#   - The set of quadlets to REMOVE on child nodes is computed at runtime from
-#     `quadlet/` minus (active + extras). See roles/podman/tasks/quadlet_setup.yml.
-#   - Adding a new file under quadlet/ therefore requires no change here unless
-#     it should be kept on child nodes.
-lme_child_active_quadlet_files:
-  - lme.network
-  - lme-backups.volume
-  - lme-esdata01.volume
-  - lme-kibanadata.volume
-  - lme-setup-certs.container
+# Each leg is enabled independently and is orthogonal to the elastic-services
+# pack. When ANY of these is true, tailscale_install.yml installs + brings up the
+# daemon before the leg runs (see tasks/main.yml). The tailscale profile
+# (manifests/profiles/tailscale.yml) flips these on together.
+#   * ingress  -> front this node's loopback-bound ports on its ts.net name
+#   * egress   -> accept-routes (+ optional exit-node) so LME can reach out
+#   * services -> publish enabled services as tailnet VIPs (svc:<name>)
+tailscale_serve_ingress: false
+tailscale_serve_egress: false
+tailscale_serve_services: false
+# Consumer-node VIP reachability probe (A1). Default-OFF so existing runs are
+# unchanged; when armed (per-profile / operator -e) it lets deploy_gate.sh probe each
+# manifest-declared VIP endpoint FROM A SECOND inventory host (never a self-curl on the
+# advertiser) and treat an unreachable VIP as a typed failure. CapMap presence proves
+# ALLOCATION/approval only, NOT end-to-end reachability -- this closes that gap.
+tailscale_require_vip_reachable: false
+# Optional operator inputs (never hardcode secrets):
+#   tailscale_authkey       -> auth key for a non-interactive `tailscale up`
+#   tailscale_up_extra_args -> extra flags appended to `tailscale up`
+#   tailscale_exit_node     -> tailnet exit node for the egress leg (opt-in)
 
-lme_child_active_extras:
-  - lme-elasticsearch.container
+# ---------------------------------------------------------------------------
+# Cluster child (ES-only) node service set.
+#
+# Child data nodes run ONLY the Elasticsearch dependency graph. The set is
+# expressed as LOGICAL service ids -- the `id` field of each manifest under
+# manifests/services/ -- NOT unit filenames, because the install is now
+# manifest-driven: render_units.yml renders every ENABLED service whose id is
+# not in lme_child_absent_services.
+#
+# quadlet_setup.yml derives the child prune set from the MANIFEST keys:
+#     lme_child_absent_services = lme_services.keys() - lme_child_active_services
+# Deriving from manifest keys (and NOT from globbing quadlet/) is deliberate:
+# once the legacy quadlet/ tree is deleted, a filesystem glob would go empty and
+# prune nothing, so child data nodes would wrongly keep Kibana/Fleet/Wazuh.
+# Adding a new service manifest therefore prunes it from child nodes
+# automatically unless its logical id is listed here.
+#
+# id map (unit basename -> logical id):
+#   lme.network                 -> network
+#   lme-backups.volume          -> backups
+#   lme-esdata01.volume         -> esdata01
+#   lme-kibanadata.volume       -> kibanadata
+#   lme-setup-certs.container   -> setup-certs
+#   lme-elasticsearch.container -> elasticsearch
+# The umbrella target id `lme` is intentionally NOT listed, so lme.service is
+# not rendered on child nodes (parity with the old "remove lme.service" step).
+lme_child_active_services:
+  - network
+  - backups
+  - esdata01
+  - kibanadata
+  - setup-certs
+  - elasticsearch
