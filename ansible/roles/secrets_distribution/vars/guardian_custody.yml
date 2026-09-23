@@ -72,3 +72,64 @@ guardian_custody_receipt_name: guardian.custody-receipt
 guardian_custody_enc_cipher: aes-256-cbc
 guardian_custody_enc_pbkdf2_iter: 200000
 guardian_custody_enc_md: sha256
+
+# =============================================================================
+# DECLARED C -> D SIGNING INTERFACE (codex-0700 C/D boundary; coordinator
+# codex-0715 interface_precision). This is C's deliverable: a DECLARED custody +
+# SIGNING primitive that D's authority service CONSUMES for AUTHORIZED signing
+# operations. It is NOT a socket server and NOT new Python -- D owns the
+# control.sock / authority PROTOCOL (lease, epoch, reservation admission,
+# authorization + inhibition publication, revoke/stop-drain/replace serialization,
+# nonce consumption). C does NOT stand up a second listener and does NOT move the
+# authority protocol to C.
+#
+# CRITICAL BOUNDARY: reaching the runtime key OR reaching D's socket is NOT
+# authorization to obtain a signature. Authorization is D's protocol: a signature
+# is produced ONLY after D has CONSUMED an authorization for the CURRENT leased
+# epoch. C's interface adds defense-in-depth (it refuses unless the caller-supplied
+# epoch equals the durable-bound epoch, A3), but C is NOT the authority.
+#
+# This is a DECLARATION consumed at integration time; the interface ACK gates
+# INTEGRATION with D's service, not C's independent custody authoring. It is UNWIRED
+# until the joint C/D integration lands a caller.
+guardian_signing_interface:
+  # WHO may invoke a signature.
+  invoker: "D's guardian AUTHORITY SERVICE only (never a member/proxy consumer, never a bare caller)."
+  # WHAT must already be true before a signature is produced (D's authority protocol).
+  precondition_authorization: >-
+    D has CONSUMED an authorization for the CURRENT leased authority_epoch (D's control.sock
+    protocol: lease + reservation admission + nonce consumption). Possession of the key or
+    reachability of the socket is NOT authorization.
+  precondition_epoch_binding: >-
+    The caller-supplied authority_epoch MUST equal the epoch durably bound to the custody
+    blob (A3, guardian.meta). C refuses to sign under any other epoch (defense in depth).
+  # WHERE the private half is read from (never distributed; signer-host-only).
+  key_source: >-
+    The signer-namespace runtime plaintext at
+    guardian_custody_runtime_plaintext_tpl, asserted disjoint from the consumer
+    bind-mount roots. The private half is NEVER copied to a consumer or a distributable.
+  # HOW a signature is produced (Ed25519 raw sign over D-supplied canonical bytes).
+  operation: "Ed25519 raw sign (openssl pkeyutl -sign -rawin) over the canonical byte string D supplies; C does not choose or interpret the message."
+  # WHAT C returns to D.
+  output_fields:
+    - signature            # raw Ed25519 signature bytes over the supplied message
+    - guardian_pub_fingerprint  # SHA-256 of the DER public key (binds the signing key identity)
+    - authority_epoch      # the epoch under which the signature was authorized + produced
+  # WHAT C refuses (defense in depth on top of D's authority protocol).
+  refusals:
+    - "no verified pub<->priv pair for the current epoch (the guardian_custody marker is absent/stale)"
+    - "caller-supplied epoch != durable-bound epoch (A3)"
+    - "runtime key absent or not resident on the signer host (never mint-to-sign)"
+  # WHAT is explicitly NOT C's (stays D's authority protocol).
+  not_owned_by_c:
+    - "the control.sock / authority-socket protocol (listener, admission, serialization)"
+    - "minting/leasing/advancing authority_epoch (A4: epoch is a CONSUMED input)"
+    - "revoke / stop-drain / replace / start serialization + nonce consumption"
+
+# The signing PRIMITIVE as an openssl command TEMPLATE (declaration; no socket, no
+# Python). {runtime_key} = the resolved signer-namespace plaintext; {message_file} =
+# D-supplied canonical bytes; {sig_file} = output signature. Mirrors the pair-verify
+# sign in tasks/guardian_custody.yml, so the interface signs with the same primitive
+# the custody producer already proves a verified pair against.
+guardian_signing_command_tpl: "openssl pkeyutl -sign -inkey {runtime_key} -rawin -in {message_file} -out {sig_file}"
+guardian_signing_verify_command_tpl: "openssl pkeyutl -verify -pubin -inkey {pub_file} -rawin -in {message_file} -sigfile {sig_file}"
