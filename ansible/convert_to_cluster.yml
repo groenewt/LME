@@ -172,6 +172,35 @@
       debug:
         msg: "Found {{ pre_conversion_indices.json | length }} existing indices that will be migrated to replicas=1"
 
+    # Caller-side legibility only (backup_lme is D-owned; NOT modified here). The
+    # backup_lme data-safety gate (D3b) HARD-FAILS the run if LME containers do not stop
+    # cleanly before the volume copy, instead of emitting a torn backup as success. Because
+    # this pre-conversion backup runs with skip_service_restart: true, a failure leaves the
+    # node in an INTERRUPTED state -- the operator needs to know what that looks like and how
+    # to recover, so surface it before the include rather than letting a hard fail read as an
+    # opaque abort.
+    - name: "Backup safety + interrupted-recovery note (operator-facing)"
+      ansible.builtin.debug:
+        msg:
+          - "Creating a pre-conversion backup via backup_lme (skip_service_restart=true)."
+          - "DATA-SAFETY GATE (D3b): backup_lme HARD-FAILS if LME containers do not stop"
+          - "  cleanly before the volume copy; it will NOT report a torn backup as success."
+          - "IF THE BACKUP FAILS the conversion is INTERRUPTED at Phase 1: backup_lme has"
+          - "  stopped lme and force-removed the lme-* containers, and skip_service_restart"
+          - "  leaves them stopped. No cluster reconfiguration (Phase 2+) has run, so the"
+          - "  quadlet is still single-node on disk."
+          - "RECOVERY (in order -- a bare re-run aborts, because Phase 1's ES health check"
+          - "  requires a live Elasticsearch and there is no partial-upgrade resume here:"
+          - "  the quadlet is still single-node):"
+          - "  1) Run 'systemctl start lme' and wait for Elasticsearch to be healthy again"
+          - "     (this restores the pre-conversion single-node state)."
+          - "  2) Investigate the stuck container(s) named in backup_status.txt"
+          - "     (Overall status: UNSAFE) / this run's fail message."
+          - "  3) Re-run this playbook (a fresh single-node conversion from Phase 1)."
+          - "  Alternatively, to accept a crash-consistent backup and proceed at your own"
+          - "  risk, re-run with -e backup_fail_on_unclean_stop=false."
+      when: backup_choice in ['y', 'yes']
+
     - name: Run backup
       include_role:
         name: backup_lme
@@ -383,7 +412,11 @@
     clone_directory: "{{ clone_dir | default(playbook_dir + '/..') }}"
     install_user: "{{ ansible_user_id }}"
     debug_mode: false
-    offline_mode: false
+    # NOTE: offline_mode is deliberately NOT a play var here. A play-scoped default would
+    # be captured by the resolver's auto-normalize as a spurious `operator` selection and
+    # outrank the selected profile/inventory (codex-check-0200). It is resolved PER-HOST in
+    # pre_tasks below (shared podman/resolve entrypoint, lme_profile: cluster) and read as
+    # lme_resolved.offline_mode.
 
     # Storage configuration
     storage_runroot: "/run/containers/storage"
@@ -433,6 +466,22 @@
     lme_skip_secret_creation: true
 
   pre_tasks:
+    # Resolve declared config PER-HOST on the data nodes BEFORE the earliest offline_mode
+    # consumer below. This is the SAME shared early-resolve entrypoint load_manifests.yml
+    # uses (CR-B3), invoked here via include_role so resolve.yml's role-relative includes
+    # (validate_resolved_config.yml) resolve. It passes the SAME lme_profile: cluster as
+    # Phase 2's load_manifests (line ~261) so data-node resolution does not diverge from the
+    # master re-render. clone_directory is controller-side (resolve reads the manifests via
+    # include_vars from the synced repo tree), so this resolves on SSH data nodes too.
+    # Publishes lme_resolved.* / lme_enable_flags for the consumers that follow.
+    - name: Resolve declared config on data nodes (offline_mode et al.)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: resolve
+      vars:
+        clone_directory: "{{ clone_dir | default(playbook_dir + '/..') }}"
+        lme_profile: cluster
+
     - name: Install ansible-core on cluster nodes (Debian/Ubuntu)
       ansible.builtin.apt:
         name: ansible
@@ -441,7 +490,7 @@
       become: yes
       when:
         - ansible_os_family == 'Debian'
-        - not (offline_mode | default(false))
+        - not lme_resolved.offline_mode
 
     - name: Check if ansible-vault is already available (Red Hat)
       ansible.builtin.command: which ansible-vault
@@ -454,7 +503,7 @@
       when:
         - ansible_os_family == 'RedHat'
         - ansible_vault_check.rc != 0
-        - not (offline_mode | default(false))
+        - not lme_resolved.offline_mode
       become: yes
       block:
         - name: Install python3-pip for ansible
