@@ -53,44 +53,71 @@
     file: "{{ lme_manifests_dir }}/profiles/{{ lme_profile }}.yml"
     name: _lme_profile_file
 
-# --- C1 caller-input contract: normalize inputs, resolve ONCE per load ---------
-# codex-manager-caller-contract-decisions-20260923-0200. Inputs arrive namespaced in
-# `lme_inputs` (selections + observations + origins). A NORMALIZED entrypoint
-# (site.yml pre_tasks) sets it from hostvars before the first load. An UN-NORMALIZED
-# entrypoint (upgrade_lme / elasticsearch / convert_to_cluster / the golden harness)
-# leaves it undefined; we AUTO-NORMALIZE once here from the bare variable scope -- which
-# catches -e, inventory AND include_role `vars:` (upgrade passes its detected flags that
-# way; role vars reach included tasks but not hostvars). The `when` guard captures on the
-# FIRST load ONLY, so a later load never re-reads the bridge facts written below (the
-# self-capture the old capture-once guard fought). This compat capture is the OPEN bridge
-# (codex completion_rule); its removal condition is B/E normalizing their entrypoints to
-# set lme_inputs themselves (with observations kept SEPARATE from operator selections).
-- name: Auto-normalize compat inputs into lme_inputs (only when the entrypoint did not)
+# --- C1 caller-input contract: capture pristine operator selections, compose, resolve ---
+# codex-manager-caller-contract-decisions-20260923-0200 + advisor split-brain correction.
+#
+# Inputs arrive namespaced in `lme_inputs` (selections + observations + origins). A
+# NORMALIZED entrypoint (site.yml pre_tasks) sets it from hostvars before the first load;
+# an UN-NORMALIZED entrypoint (upgrade_lme / elasticsearch / convert_to_cluster / the
+# golden harness) leaves it undefined.
+#
+# SPLIT-BRAIN FIX: the previous auto-normalize was ALL-OR-NOTHING (`when: lme_inputs is
+# not defined`). A caller that supplied ONLY observations (B's CR-B1 upgrade-fallback
+# path passes `lme_inputs: {observations: {...}}`) SKIPPED the whole capture, so
+# `selections` collapsed to {} and an operator `-e install_llm=false` DROPPED OUT of the
+# resolution (lme_enable_flags.install_llm went true) while the bare `install_llm` fact
+# stayed false (-e outranks set_fact) -- split-brain rendering. We now capture the
+# operator selection scope into a C1-PRIVATE fact (NEVER the caller-input name
+# lme_inputs) and COMPOSE it with any caller-supplied lme_inputs parts every load, so
+# observations and operator selections coexist.
+#
+# PRISTINE capture: read the bare variable scope for declared registry fields ONCE, on
+# the FIRST load -- BEFORE the bare-name bridge below writes any fact -- so it captures
+# the genuine operator -e / inventory / include_role `vars:` selections and is immune to
+# later bridge pollution. (This is WHY bare `vars` cannot simply be re-read each load:
+# this file's own compat bridge set_facts them, so a later re-read would see resolved
+# OUTPUTS masquerading as operator inputs.) Guarded once; a later load reuses the pristine
+# capture rather than re-reading the now-polluted bare scope. Its removal condition is
+# B/E normalizing their entrypoints to set lme_inputs.selections themselves.
+- name: Capture pristine operator selections once (C1-private fact; never lme_inputs)
   ansible.builtin.set_fact:
-    lme_inputs:
-      selections: "{{ dict(_lme_sel_keys | zip(_lme_sel_keys | map('extract', vars) | list)) }}"
-      observations: {}
-      origins: "{{ dict(_lme_sel_keys | zip(['operator'] * (_lme_sel_keys | length))) }}"
+    _lme_operator_selections: "{{ dict(_lme_sel_keys | zip(_lme_sel_keys | map('extract', vars) | list)) }}"
   vars:
     _lme_reg_keys: "{{ _lme_global_file.lme_config_registry.fields.keys() | list }}"
     _lme_sel_keys: "{{ _lme_reg_keys | select('in', vars) | list }}"
-  when: lme_inputs is not defined
+  when: _lme_operator_selections is not defined
+
+# Effective resolver inputs, recomputed EACH load (no snapshot): the pristine operator
+# capture supplies selections + honest `operator` origins; a NORMALIZED caller's explicit
+# lme_inputs parts combine ON TOP (its selections override per key; its observations and
+# caller-verified finer origins are honoured). combine() is per-key, so an unrelated
+# observation never clears an operator selection -- the split-brain fix. A key present
+# only in the caller's selections (not in bare scope) carries no origin here and is
+# honestly labelled `operator` by the engine (_honest_origin).
+- name: Compose effective resolver inputs (pristine operator capture + caller lme_inputs)
+  ansible.builtin.set_fact:
+    _lme_eff_inputs:
+      selections: "{{ _lme_operator_selections | combine(lme_inputs.selections | default({})) }}"
+      observations: "{{ lme_inputs.observations | default({}) }}"
+      origins: >-
+        {{ dict(_lme_operator_selections.keys() | zip(['operator'] * (_lme_operator_selections | length)))
+           | combine(lme_inputs.origins | default({})) }}
 
 # Resolve every declared field by ITERATING registry.precedence into a NAMESPACED
-# result (resolved + origins + enable_flags). The pure resolver reads ONLY lme_inputs +
-# the profile overlay + the registry, so re-running it each load is self-capture-free.
-# RE-RUN each load (NOT cached): a profile switch or an explicit lme_inputs change on a
-# subsequent load is reflected (codex resolution_lifetime / Q2.7). Required-missing /
-# undeclared-key / type violations RAISE here, before any mutation.
+# result (resolved + origins + enable_flags). The pure resolver reads ONLY the composed
+# effective inputs + the profile overlay + the registry, so re-running it each load is
+# self-capture-free. RE-RUN each load (NOT cached): a profile switch or an explicit
+# lme_inputs change on a subsequent load is reflected (codex resolution_lifetime / Q2.7).
+# Required-missing / undeclared-key / type violations RAISE here, before any mutation.
 - name: Resolve config (pure engine; iterates registry.precedence; re-run each load)
   ansible.builtin.set_fact:
     _lme_resolution: >-
       {{ _lme_global_file.lme_config_registry
          | lme_resolve_config(
              (_lme_profile_file.profile_overlay.vars | default({})),
-             (lme_inputs.selections | default({})),
-             (lme_inputs.observations | default({})),
-             (lme_inputs.origins | default({}))) }}
+             _lme_eff_inputs.selections,
+             _lme_eff_inputs.observations,
+             _lme_eff_inputs.origins) }}
 
 # VALIDATE via the LITERAL shared task (also run by the C1 A1 regression case) BEFORE any
 # mutation. registry-FIRST pipe; the engine's shape gate makes a reversed argument fail
@@ -147,5 +174,29 @@
   ansible.builtin.set_fact:
     "{{ item.key }}": "{{ item.value }}"
   loop: "{{ _lme_resolution.resolved | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# OPTIONAL-VALUE-RESET (C1-OPTIONAL-VALUE-RESET; advisor step 2). A declared OPTIONAL
+# field that resolves to ABSENT (no value at any tier) is legitimately missing from
+# lme_resolved -- the tested optional-absent contract (test_optional_absent_when_unset).
+# But its BARE compat fact, once written true under a PRIOR profile (e.g.
+# tailscale_require_vip_live under the tailscale profile), would SURVIVE a switch to a
+# profile that omits it: the bridge above only writes keys PRESENT in resolved, so it
+# cannot clear a now-absent optional -- a LIVE profile-switch stale-carry regression.
+# We reset each such absent optional's bare fact to its schema-declared `bridge_absent`
+# value. That value is the declared "unset" representation: every current reader uses
+# `| default(false)`, so `false` is byte-identical in EFFECT to absence while clearing
+# the stale carry. lme_resolved itself stays ABSENT (contract + unit tests preserved);
+# ONLY the bare compat fact is reset. A field that declares no `bridge_absent` is left
+# untouched (this reset is opt-in per field, so it never fabricates a value the schema
+# did not sanction). Not null: `| default(false)` does not fire on None.
+- name: Reset stale bare facts for declared optionals now absent (profile-switch carry)
+  ansible.builtin.set_fact:
+    "{{ item.key }}": "{{ item.value.bridge_absent }}"
+  loop: >-
+    {{ _lme_global_file.lme_config_registry.fields | dict2items
+       | selectattr('value.bridge_absent', 'defined')
+       | rejectattr('key', 'in', _lme_resolution.resolved.keys() | list) | list }}
   loop_control:
     label: "{{ item.key }}"
