@@ -192,19 +192,21 @@
       umask 077
 
       rtdir="$(dirname "$RUNTIME_KEY")"
-      install -d -m 700 "$rtdir"
-      # [2] plaintext temp MUST live on the declared runtime filesystem, never a default
-      # TMPDIR that may be on disk. Derive the work dir UNDER the runtime root + verify.
-      work="$(mktemp -d -p "$rtdir" .gc-work.XXXXXX)"; trap 'rm -rf "$work"' EXIT
-      case "$work/" in "$rtdir"/*) : ;; *) echo "work dir $work escaped runtime root $rtdir" >&2; exit 20;; esac
-
-      # [5] re-canonicalize on THIS (signer) host and re-check disjointness before any write.
+      # [5] re-canonicalize on THIS (signer) host and re-check disjointness BEFORE ANY WRITE
+      # (the Ansible filters ran on the controller; a signer-side symlink can still alias a
+      # consumer mount). readlink -m needs no filesystem existence, so these run first.
       rk_canon="$(readlink -m -- "$RUNTIME_KEY")"
       for m in $CONSUMER_MOUNTS; do
         case "$rk_canon/" in "$m"/*) echo "runtime key $rk_canon under consumer mount $m (canonical)" >&2; exit 21;; esac
       done
       dur_canon="$(readlink -m -- "$DURABLE")"
       case "$dur_canon/" in "$rtdir"/*|/run/lme-fencing/*) echo "durable blob $dur_canon under a signer-local/runtime root (canonical)" >&2; exit 22;; esac
+
+      install -d -m 700 "$rtdir"
+      # [2] plaintext temp MUST live on the declared runtime filesystem, never a default
+      # TMPDIR that may be on disk. Derive the work dir UNDER the runtime root + verify.
+      work="$(mktemp -d -p "$rtdir" .gc-work.XXXXXX)"; trap 'rm -rf "$work"' EXIT
+      case "$work/" in "$rtdir"/*) : ;; *) echo "work dir $work escaped runtime root $rtdir" >&2; exit 20;; esac
 
       fp_of_priv(){ openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}'; }
       fp_of_pub(){ openssl pkey -pubin -in "$1" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}'; }
@@ -244,18 +246,42 @@
       # (1) runtime key present (not rotating): converge to a COMPLETE verified-pair state
       # for the current epoch. [3] NEVER a false noop -- noop ONLY when the marker epoch+fp,
       # the runtime-key fp and the published-pub fp ALL agree (and EXPECTED_FP if supplied).
+      # INVARIANT (codex-0730 re-review item 1): after ANY non-refuse decision here, the
+      # marker epoch and the durable's decryptable epoch MUST agree, and the durable MUST
+      # decrypt to the on-disk identity. So the durable is checked for current-epoch,
+      # same-identity recoverability BEFORE the marker is (re)written.
       if [ -f "$RUNTIME_KEY" ] && [ "$ROTATE" != "true" ]; then
         rfp="$(fp_of_priv "$RUNTIME_KEY" 2>/dev/null || true)"
         if [ -n "$rfp" ]; then
           expect_ok "$rfp" || { receipt refuse "$rfp" runtime-fp-not-expected; echo "REFUSE expected-fp" >&2; exit 18; }
           openssl pkey -in "$RUNTIME_KEY" -pubout -out "$work/rpub" 2>/dev/null || true
           if [ -s "$work/rpub" ] && pair_verify "$RUNTIME_KEY" "$work/rpub"; then
-            # durable must exist + be recoverable later; bind at the current epoch if missing.
-            [ -f "$DURABLE" ] || enc_blob "$RUNTIME_KEY" "$EPOCH" "$rfp"
+            # [item 2] a marker naming a DIFFERENT identity than the on-disk key must NOT be
+            # silently reconciled to whatever key happens to be resident -- require D's
+            # expected fingerprint (EXPECTED_FP == rfp is already enforced by expect_ok).
             mok=0
             if [ -f "$MARKER" ]; then
               mepoch="$(sed -n 's/^epoch=//p' "$MARKER")"; mfp="$(sed -n 's/^fingerprint=//p' "$MARKER")"
-              [ "$mepoch" = "$EPOCH" ] && [ "$mfp" = "$rfp" ] && mok=1; fi
+              if [ "$mfp" != "$rfp" ] && [ -z "$EXPECTED_FP" ]; then
+                receipt refuse "$rfp" identity-disagreement-requires-expected-fp; echo "REFUSE identity-disagreement" >&2; exit 25; fi
+              [ "$mepoch" = "$EPOCH" ] && [ "$mfp" = "$rfp" ] && mok=1
+            fi
+            # [item 1] custody consistency: the durable must be recoverable at the CURRENT
+            # epoch AND decrypt to the SAME identity as the on-disk key.
+            if [ -f "$DURABLE" ]; then
+              if try_decrypt "$EPOCH" "$work/dchk"; then
+                [ "$(fp_of_priv "$work/dchk")" = "$rfp" ] || { receipt refuse "$rfp" durable-identity-mismatch-rotate-or-recover; echo "REFUSE durable-identity-mismatch" >&2; exit 26; }
+              else
+                # present but not decryptable at the current epoch: epoch advanced without a
+                # rotation (the KDF is epoch-bound), or tamper/wrong-KEK. Producer refuses; an
+                # epoch bump is contract-tied to explicit rotation. (D seam: confirm whether
+                # epoch-advance-without-rotation should rebind the durable -- surfaced in sitrep.)
+                receipt refuse "$rfp" durable-not-decryptable-at-epoch-rotate-or-recover; echo "REFUSE durable-stale-epoch" >&2; exit 27; fi
+            else
+              # durable MISSING for a trusted on-disk key -> re-establish it, but only under
+              # D's expectation for this identity (never silently fabricate a recovery blob).
+              [ -n "$EXPECTED_FP" ] || { receipt refuse "$rfp" durable-missing-requires-expected-fp; echo "REFUSE durable-missing" >&2; exit 28; }
+              enc_blob "$RUNTIME_KEY" "$EPOCH" "$rfp"; fi
             [ "$mok" = 1 ] || mark_verified "$rfp"
             pubok=0
             if [ -f "$PUB" ] && [ "$(fp_of_pub "$PUB" 2>/dev/null || true)" = "$rfp" ]; then pubok=1; else publish_pub "$RUNTIME_KEY"; fi
