@@ -523,11 +523,21 @@
   become: yes
   ignore_errors: yes
 
+- name: Record whether all LME containers stopped cleanly before the volume copy
+  # Data-safety gate. running_containers reflects the graceful stop/wait result BEFORE
+  # the force-remove above. If it is non-empty, containers were still running after the
+  # stop/wait window and were force-killed (crash-consistent) rather than stopped
+  # cleanly, so a volume copy taken now may be torn/inconsistent. Capture this signal
+  # so the run is never reported as a clean SUCCESS.
+  set_fact:
+    lme_backup_clean_container_stop: "{{ (running_containers.stdout_lines | default([]) | length) == 0 }}"
+    lme_backup_unclean_containers: "{{ running_containers.stdout_lines | default([]) }}"
+
 - name: Display any running containers
   debug:
     msg: "Warning: The following containers are still running and may not be backed up properly: {{ running_containers.stdout_lines }}"
   when: running_containers.stdout_lines | length > 0
-  
+
 - name: Backup each volume
   shell: |
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
@@ -666,11 +676,12 @@
       - Quadlet files: {{ 'SUCCESS' if lme_backup_result is success else 'FAILED' }}
       - Host systemd units: {{ 'SUCCESS' if lme_systemd_units_backup_result is defined and lme_systemd_units_backup_result is success else ('SKIPPED' if lme_systemd_units_backup_result is not defined else 'FAILED') }}
       - Secret manifest: {{ 'SUCCESS' if secret_mapping_result is defined and secret_mapping_result is success else 'FAILED' }}
+      - Containers stopped cleanly before copy: {{ 'YES' if lme_backup_clean_container_stop | default(true) | bool else ('NO - volume copy may be torn/inconsistent (' ~ (lme_backup_unclean_containers | default([]) | join(', ')) ~ ')') }}
       - Volumes: {{ successful_volumes.stdout | int }} of {{ lme_backup_selected_volumes | length }} successful
       - Failed volumes: {{ volume_backup.results | default([]) | selectattr('failed', 'eq', true) | map(attribute='item') | list | join(', ') if volume_backup.results is defined and (volume_backup.results | selectattr('failed', 'eq', true) | list | length > 0) else 'None' }}
       - Service restart: {{ 'SKIPPED - Services left stopped for rollback' if skip_service_restart | default(false) else ('SUCCESS' if service_start_result is success and started_containers.stdout_lines | length > 0 else 'FAILED') }}
-      
-      Overall status: {{ 'SUCCESS' if lme_backup_result is success and successful_volumes.stdout | int == lme_backup_selected_volumes | length else 'PARTIAL - See details above' }}
+
+      Overall status: {{ 'UNSAFE - containers did not stop before the volume copy; backup may be torn/inconsistent and must not be trusted for restore' if not (lme_backup_clean_container_stop | default(true) | bool) else ('SUCCESS' if lme_backup_result is success and successful_volumes.stdout | int == lme_backup_selected_volumes | length else 'PARTIAL - See details above') }}
   become: yes
   
 - name: Read final backup status
@@ -681,4 +692,24 @@
   
 - name: Backup summary
   debug:
-    msg: "{{ (final_status.stdout + '\n\nBackup location: ' + backup_base_dir + '/backups/' + backup_timestamp).splitlines() }}" 
+    msg: "{{ (final_status.stdout + '\n\nBackup location: ' + backup_base_dir + '/backups/' + backup_timestamp).splitlines() }}"
+
+- name: Fail the backup when containers did not stop cleanly (data-safety gate)
+  # Durability domain: a volume copy taken while a data-store container (Postgres/ES)
+  # was still running (then force-killed) is at best crash-consistent and may be torn.
+  # backup_status.txt has already been written above (Overall status: UNSAFE) and the
+  # summary printed, so the evidence is durable. Now fail the run so this backup is
+  # never reported as a clean success to callers -- notably rollback_lme.yml, which
+  # gates its destructive 'rm -rf /opt/lme' on the safety backup succeeding. Override
+  # with backup_fail_on_unclean_stop=false only when a non-LME container legitimately
+  # matches the 'lme' name filter.
+  fail:
+    msg: >-
+      Backup is UNSAFE: container(s) [{{ lme_backup_unclean_containers | default([]) | join(', ') }}]
+      were still running after the stop/wait window and were force-removed, so the volume
+      copy may be torn/inconsistent. See backup_status.txt (Overall status: UNSAFE) at
+      {{ backup_base_dir }}/backups/{{ backup_timestamp }}. Resolve the stuck containers and
+      re-run, or set backup_fail_on_unclean_stop=false to proceed anyway at your own risk.
+  when:
+    - not (lme_backup_clean_container_stop | default(true) | bool)
+    - backup_fail_on_unclean_stop | default(true) | bool
