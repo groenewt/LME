@@ -285,8 +285,14 @@
       ignore_errors: yes
 
     - name: Wait for containers to stop
+      # RESTORE-EARLY-DESTRUCTION-AND-STOP-SCOPE: probe RUNNING containers only. `ps -a`
+      # also lists EXITED containers, so a stopped-but-not-removed lme container would
+      # keep this loop spinning the full retry budget and then (with ignore_errors)
+      # proceed to overwrite live state anyway. We care that nothing is still RUNNING.
+      # NOTE (residual): grep "lme" also matches a co-tenant container whose name
+      # contains "lme"; tightening that name scope is a tracked residual.
       shell: |
-        {{ podman_cmd }} ps -a --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "lme" || true
+        {{ podman_cmd }} ps --filter status=running --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "lme" || true
       args:
         executable: /bin/bash
       register: running_containers
@@ -294,6 +300,17 @@
       retries: 24
       delay: 5
       ignore_errors: yes
+
+    - name: Fail-closed if LME containers are still running before restore
+      # Do NOT overwrite /opt/lme, /etc/lme, quadlets, and secrets while containers are
+      # live. If the stop wait exhausted with containers still running, refuse the
+      # destructive restore rather than corrupting a running deployment.
+      fail:
+        msg: >-
+          LME containers still running after the stop wait
+          ({{ running_containers.stdout_lines | join(', ') }}); refusing to overwrite
+          live state (fail-closed). Stop them and re-run the restore.
+      when: running_containers.stdout_lines | default([]) | length > 0
 
     # Tar streaming avoids NFS "Operation not supported" on cp -a preserving metadata
     - name: Restore LME installation and system state from backup
@@ -411,6 +428,15 @@
         MAPPING_FILE="$BACKUP_ROOT/secret_mapping.txt"
         BACKUP_VAULT_DIR="$BACKUP_ROOT/etc_lme/vault"
 
+        # RESTORE-EARLY-DESTRUCTION: track the names we successfully (re)create and the
+        # live names present before restore, so pruning of stale secrets happens ONLY
+        # after every create has succeeded -- never a blanket wipe up front.
+        RESTORED_NAMES="$(mktemp)"
+        LIVE_BEFORE="$(mktemp)"
+        : > "$RESTORED_NAMES"
+        : > "$LIVE_BEFORE"
+        trap 'rm -f "$RESTORED_NAMES" "$LIVE_BEFORE"' EXIT
+
         # SECRETS-DESTROYED-BEFORE-PAYLOAD-VERIFY guard (fail-closed): verify EVERY
         # secret recorded in the backup has a present, decryptable payload BEFORE the
         # destructive `podman secret rm` below. `--replace` on create is NOT enough --
@@ -426,8 +452,16 @@
             echo "Pre-verify FAILED: no payload file for secret '$name'"
             return 1
           fi
-          if ! ansible-vault view "$path" >/dev/null 2>&1; then
+          local _pv
+          if ! _pv=$(ansible-vault view "$path" 2>/dev/null); then
             echo "Pre-verify FAILED: payload for secret '$name' did not decrypt"
+            return 1
+          fi
+          # RESTORE-EMPTY-SECRET-PREFLIGHT: a payload that decrypts to EMPTY is not a
+          # valid secret; admitting it would pass preverify, then fail on create AFTER
+          # destruction. Reject it here, before anything is removed.
+          if [ -z "$_pv" ]; then
+            echo "Pre-verify FAILED: payload for secret '$name' decrypted EMPTY"
             return 1
           fi
           return 0
@@ -476,10 +510,12 @@
             fi
             echo "No secrets recorded in backup and none live; nothing to restore."
           else
-            # Payloads verified -- safe to clear existing secrets before restore.
-            for secret_id in $(podman secret ls --format "{{ '{{' }}.ID{{ '}}' }}"); do
-              podman secret rm "$secret_id" 2>/dev/null || true
-            done
+            # Payloads verified. Do NOT blanket-remove live secrets here: every create
+            # below uses --replace, and a create can still fail AFTER preverify (e.g. a
+            # podman driver error). Removing everything first would leave a SECRETLESS
+            # host on that failure. Snapshot the live names and prune the stale ones
+            # only AFTER every create succeeds (see the post-create prune below).
+            podman secret ls --format "{{ '{{' }}.Name{{ '}}' }}" 2>/dev/null > "$LIVE_BEFORE" || true
           fi
         else
           # Positional fallback (no manifest, no mapping): do NOT blanket-remove; the
@@ -503,6 +539,12 @@
           printf '%s' "$value" | podman secret create --driver "$podman_driver" --replace "$name" -
         }
 
+        # RESTORE-MASTER-CREATE-FAILURE (codex-0415): accumulate create failures and EXIT
+        # non-zero so the master restore HALTS before activation/destructive follow-on. A
+        # printed "Failed to create secret" that still lets `podman secret ls` return 0 is
+        # NOT successful restoration -- listing resources is not restoration.
+        CREATE_OK=0
+        CREATE_FAILURES=0
         if [ -f "$MANIFEST_FILE" ]; then
           echo "Restoring secrets using secret_manifest.txt"
           while IFS='|' read -r name id driver vault_file captured_file; do
@@ -510,15 +552,20 @@
               ''|\#*) continue ;;
             esac
             if [ -n "$vault_file" ] && [ -f "$BACKUP_VAULT_DIR/$vault_file" ]; then
-              create_secret_from_vault "$name" "$driver" "$BACKUP_VAULT_DIR/$vault_file" \
-                && echo "Successfully restored secret: $name" \
-                || echo "Failed to create secret: $name"
+              if create_secret_from_vault "$name" "$driver" "$BACKUP_VAULT_DIR/$vault_file"; then
+                echo "Successfully restored secret: $name"; CREATE_OK=$((CREATE_OK + 1)); printf '%s\n' "$name" >> "$RESTORED_NAMES"
+              else
+                echo "Failed to create secret: $name" >&2; CREATE_FAILURES=$((CREATE_FAILURES + 1))
+              fi
             elif [ -n "$captured_file" ] && [ -f "$BACKUP_ROOT/$captured_file" ]; then
-              create_secret_from_vault "$name" "$driver" "$BACKUP_ROOT/$captured_file" \
-                && echo "Successfully restored secret: $name" \
-                || echo "Failed to create secret: $name"
+              if create_secret_from_vault "$name" "$driver" "$BACKUP_ROOT/$captured_file"; then
+                echo "Successfully restored secret: $name"; CREATE_OK=$((CREATE_OK + 1)); printf '%s\n' "$name" >> "$RESTORED_NAMES"
+              else
+                echo "Failed to create secret: $name" >&2; CREATE_FAILURES=$((CREATE_FAILURES + 1))
+              fi
             else
-              echo "Warning: no payload available to restore secret '$name' (driver=$driver). Skipping."
+              echo "ERROR: no payload available to restore manifest secret '$name' (driver=$driver)." >&2
+              CREATE_FAILURES=$((CREATE_FAILURES + 1))
             fi
           done < "$MANIFEST_FILE"
         elif [ -f "$MAPPING_FILE" ] && [ -d "$BACKUP_VAULT_DIR" ]; then
@@ -531,10 +578,41 @@
             if [ -f "$BACKUP_VAULT_FILE" ]; then
               SECRET_VALUE=$(ansible-vault view "$BACKUP_VAULT_FILE")
               if [ $? -eq 0 ] && [ -n "$SECRET_VALUE" ]; then
-                echo "$SECRET_VALUE" | podman secret create --driver shell --replace "$secret_name" -
+                if printf '%s' "$SECRET_VALUE" | podman secret create --driver shell --replace "$secret_name" -; then
+                  CREATE_OK=$((CREATE_OK + 1)); printf '%s\n' "$secret_name" >> "$RESTORED_NAMES"
+                else
+                  echo "Failed to create secret: $secret_name" >&2; CREATE_FAILURES=$((CREATE_FAILURES + 1))
+                fi
+              else
+                echo "ERROR: payload for legacy secret '$secret_name' did not decrypt or was empty." >&2
+                CREATE_FAILURES=$((CREATE_FAILURES + 1))
               fi
+            else
+              echo "ERROR: no payload file for legacy secret '$secret_name'." >&2
+              CREATE_FAILURES=$((CREATE_FAILURES + 1))
             fi
           done < "$MAPPING_FILE"
+        fi
+
+        if [ "${CREATE_FAILURES:-0}" -gt 0 ]; then
+          echo "ERROR: ${CREATE_FAILURES} secret create(s) failed (OK=${CREATE_OK}); restoration incomplete." >&2
+          echo "Blocking activation/destructive follow-on (fail-closed); listing is not restoration." >&2
+          exit 3
+        fi
+
+        # RESTORE-EARLY-DESTRUCTION: every create succeeded -- NOW prune live secrets the
+        # restored set no longer includes. LIVE_BEFORE is populated only when a
+        # manifest/mapping drove the restore (positional fallback leaves it empty and
+        # prunes nothing). This is the only destructive secret step, and it runs strictly
+        # after verification + creation.
+        if [ -s "$LIVE_BEFORE" ]; then
+          while IFS= read -r live_name; do
+            [ -n "$live_name" ] || continue
+            if ! grep -qxF "$live_name" "$RESTORED_NAMES"; then
+              echo "Pruning stale secret not in restored set: $live_name"
+              podman secret rm "$live_name" 2>/dev/null || true
+            fi
+          done < "$LIVE_BEFORE"
         fi
 
         echo "Current secrets:"

@@ -9,7 +9,7 @@ from scripts.postgresql_platform import rejoin
 
 def fixture(tmp_path):
     config = {'run_id': 'owned-run', 'node': 'graph', 'profile': 'dual-owned-ha',
-              'owners': {'vector': 'lmedbvector'},
+              'owners': {'vector': 'lmedbvector'}, 'deployment_identity': 'lme-owned',
               'hosts': {node: {'address': node + '.example.ts.net'} for node in rejoin.NODES}}
     request = {'schema_version': 1, 'run_id': 'owned-run', 'domain': 'vector', 'node': 'graph',
                'qemu_generation': 'owned-generation', 'request_nonce': 'a' * 32}

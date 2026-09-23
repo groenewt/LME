@@ -229,6 +229,19 @@ class RejoinRestartSerialization(unittest.TestCase):
             self.assertEqual(result['replica']['recovery'], True)
             self.assertTrue(Path(result['retained_directory']).joinpath('valuable-old-data').read_text() == 'retain this')
 
+    def test_missing_or_malformed_deployment_identity_fails_closed(self):
+        # D-FENCING-ACTUAL-CALLER-VALIDATION-BYPASS (codex-0630): a rebuild with no
+        # resolved deployment_identity must REFUSE (not skip the authorization guard).
+        import tempfile
+        for bad in (None, '', 'has space', '../escape', 'x' * 65):
+            with tempfile.TemporaryDirectory() as d:
+                config, request, kwargs, calls, _ = rejoin_fixture(Path(d), deployment_identity=bad)
+                if bad is None:
+                    del config['deployment_identity']
+                with self.assertRaises(ValueError):
+                    rejoin.rebuild(config, 'vector', request, **kwargs)
+                self.assertEqual(calls, [])   # refused before any native command
+
 
 if __name__ == '__main__':
     unittest.main()

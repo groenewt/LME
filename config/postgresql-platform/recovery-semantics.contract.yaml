@@ -1,0 +1,281 @@
+# LME PostgreSQL/Patroni durability core -- recovery & restore semantics.
+#
+# Declarative contract for master-restore correctness: what makes a restore
+# SUCCESSFUL vs merely non-erroring, and the fail-closed obligations that gate
+# every destructive step. It binds the recovery finding IDs (codex-0415 wave)
+# to their landed code or to a named residual + owner + gate. This file is the
+# single source of truth for the recovery_union invariant and the restore
+# ordering guards implemented in ansible/restore_lme_master.yml.
+#
+# It is machine-validated with yaml.safe_load and carries no code. It COMPLEMENTS
+# (does not supersede) migration-workflow.contract.yaml (which owns the
+# never-initialized / resume admission) and fencing-protocol.contract.yaml
+# (which owns generation + authority fencing). Cross-owner residuals name their
+# owner; nothing here reverts peer work.
+
+contract:
+  name: lme-postgresql-recovery-semantics
+  version: 1
+  domain: D_database
+  status: >-
+    PARTIALLY LANDED. The create-failure accumulation, empty-secret preflight,
+    verify-before-destroy ordering, and fail-closed installation-tree restore
+    are implemented in ansible/restore_lme_master.yml. Content-digest
+    verification, backup-manifest certification, and the isolated legacy-bundle
+    qualification path are RESIDUAL -- named below with owner + gate. Runtime
+    acceptance (a real restore from a real backup) is OPEN.
+
+  doctrine: >-
+    Listing a resource is not restoring it. A restore is SUCCESSFUL only when the
+    recovery_union below holds in full; anything short of that must FAIL LOUDLY
+    and must not have run any destructive step first. There is NO
+    ignore-integrity switch, NO best-effort-secret mode, and NO "podman secret
+    ls returned 0 so we are done" acceptance. Fail-closed is the correct state.
+
+# -----------------------------------------------------------------------------
+# recovery_union -- the joint acceptance predicate. A restore is accepted ONLY
+# when every clause holds. Any single failed clause fails the restore.
+# -----------------------------------------------------------------------------
+recovery_union:
+  clauses:
+    installation_tree_intact:
+      rule: >-
+        /opt/lme, /etc/lme, and the quadlet tree are restored WHOLE from the
+        selected backup, or the restore fails. A partial/torn tar restore is a
+        failure, never a swallow.
+      landed: true
+      evidence: >-
+        ansible/restore_lme_master.yml "Restore LME installation and system
+        state from backup" -- set -euo pipefail + explicit per-pipeline exit
+        capture; a broken tar producer/consumer exits 1.
+    secrets_all_created:
+      rule: >-
+        Every secret named by the backup contract is (re)created. A single
+        create failure fails the restore before activation.
+      landed: true
+      evidence: >-
+        ansible/restore_lme_master.yml "Restore Podman secrets from backup" --
+        CREATE_FAILURES accumulator + exit 3 (RESTORE-MASTER-CREATE-FAILURE).
+    no_destruction_before_verification:
+      rule: >-
+        No existing secret is removed and no live store is mutated until the
+        backup payloads are proven decryptable. An empty/degenerate contract
+        must not be able to wipe live secrets.
+      landed: true
+      evidence: >-
+        ansible/restore_lme_master.yml secret preverify (PREVERIFY_FAILURES ->
+        exit 2) + LIVE_SECRETS guard + positional-fallback verify-then-replace
+        (RESTORE-EMPTY-SECRET-PREFLIGHT, RESTORE-EARLY-DESTRUCTION-AND-STOP-SCOPE).
+    content_and_ownership_verified:
+      rule: >-
+        Each restored payload matches its recorded content digest, and each
+        restored secret's driver/owner matches the recorded contract. Decrypt
+        success is necessary but NOT sufficient.
+      landed: false
+      residual: RESTORE-CONTENT-DIGEST, RESTORE-SECRET-OWNERSHIP
+    manifest_certified:
+      rule: >-
+        The backup manifest itself is certified (integrity-bound) before it is
+        trusted to drive destruction; a tampered/truncated manifest is detected,
+        not obeyed.
+      landed: false
+      residual: BACKUP-MANIFEST-CERTIFICATION
+    fence_and_generation_admitted:
+      rule: >-
+        Before HA rejoin/activation, the current generation + authority fence is
+        satisfied per fencing-protocol.contract.yaml; a restored node does not
+        self-promote on a stale generation.
+      landed: true
+      delegated_to: config/postgresql-platform/fencing-protocol.contract.yaml
+      evidence: >-
+        scripts/postgresql_platform/platform.py observed_generation_check
+        (FENCE-CURRENT-GENERATION-AND-AUTHORITY) + rejoin.py authorize gate
+        (REJOIN-RESTART-SERIALIZATION).
+
+# -----------------------------------------------------------------------------
+# findings -- codex-0415 recovery follow-ons, each with disposition.
+# status: LANDED | RESIDUAL. RESIDUAL names owner + gate + why not this wave.
+# -----------------------------------------------------------------------------
+findings:
+  RESTORE-MASTER-CREATE-FAILURE:
+    status: LANDED
+    wave: this
+    where: ansible/restore_lme_master.yml "Restore Podman secrets from backup"
+    change: >-
+      Individual secret create() calls now accumulate CREATE_FAILURES (manifest,
+      captured, and legacy-mapping branches; a missing payload counts as a
+      failure). After the loop, CREATE_FAILURES>0 prints the tally and exit 3,
+      halting the play before activation/destructive follow-on. Previously a
+      failed create only printed "Failed to create secret" and the task still
+      succeeded because it ended on `podman secret ls` (rc 0). CRITICAL
+      companion fix (see RESTORE-EARLY-DESTRUCTION): the blanket "rm every live
+      secret before restore" was REORDERED to create-first / prune-stale-after
+      the failure gate, so exit 3 can no longer leave a SECRETLESS host.
+    validation:
+      - yaml.safe_load_all OK
+      - ansible-playbook --syntax-check OK
+      - bash -n on the rendered shell body OK
+      - >-
+        BEHAVIORAL: testing/tests/unit/test_restore_master_secrets.py renders the
+        real shell body against stub podman/ansible-vault -- create failure => rc 3
+        with NO prune; empty payload => rc 2 with NO create/rm; clean restore =>
+        rc 0 with stale pruned strictly AFTER creates. 4 passing.
+    residual: >-
+      A play-level block/rescue that writes a PESSIMISTIC terminal status record
+      on any crash (the F2 rollback pattern) is NOT yet wrapped around the full
+      task list -- restructuring an 851-line single play needs live validation.
+      Tracked as recovery-status-record; gated on a real restore rehearsal. The
+      per-step exits already fail loudly; only the durable status marker is owed.
+  RESTORE-EMPTY-SECRET-PREFLIGHT:
+    status: LANDED
+    wave: this (hardened) + prior (preverify block)
+    where: ansible/restore_lme_master.yml secret preverify block
+    note: >-
+      preverify decrypts every manifest/mapping payload before any removal;
+      PREVERIFY_FAILURES>0 -> exit 2; a contract that lists no restorable secrets
+      while live secrets exist refuses to wipe them (exit 2). THIS WAVE:
+      preverify_payload now also rejects a payload that decrypts to EMPTY (it
+      previously only checked decrypt success), so an empty secret cannot pass
+      preflight and then fail on create after destruction. Covered by
+      test_restore_master_secrets.test_empty_payload_refused_before_destruction.
+  RESTORE-EARLY-DESTRUCTION-AND-STOP-SCOPE:
+    status: LANDED
+    wave: this
+    where: ansible/restore_lme_master.yml
+    note: >-
+      THIS WAVE: (1) secret restore no longer blanket-removes live secrets up
+      front -- it snapshots live names, create/replaces the backup set, and
+      prunes only the stale remainder AFTER the create-failure gate, so no
+      destruction happens on a failed restore; (2) a fail-closed guard now
+      refuses to overwrite /opt/lme, /etc/lme, quadlets and secrets while LME
+      containers are still RUNNING (the wait probe now filters status=running,
+      and a new fail task fires if any remain). The installation-tree restore is
+      fail-closed (set -euo pipefail).
+    residual: >-
+      The container-stop grep still matches any name containing "lme" (co-tenant
+      name-scoping residual, flagged inline); the destructive volume-restore step
+      is not yet covered by the recovery_union content check. Gated on
+      content_and_ownership_verified.
+  RESTORE-CONTENT-DIGEST:
+    status: RESIDUAL
+    owner: D_database (authoring) + B (backup-side manifest digest producer)
+    gate: recovery_union.content_and_ownership_verified
+    need: >-
+      The backup manifest must record a per-payload content digest, and restore
+      must recompute + compare it after decrypt (decrypt success is not content
+      correctness). Requires the backup producer to emit digests; authored
+      against that interface, not invented here.
+  RESTORE-SECRET-OWNERSHIP:
+    status: RESIDUAL
+    owner: D_database + C1 (required-material owner map)
+    gate: recovery_union.content_and_ownership_verified
+    need: >-
+      Restored secrets/materials must land under their recorded owner identity
+      (see runtime-inventory-requirements.contract.yaml required_material owners:
+      db-owner, etcd-owner). Restore currently preserves driver but does not
+      assert owner. Coordinate with the C1 material-requirements schema so
+      ownership is one settled source, not a second transcription.
+  BACKUP-MANIFEST-CERTIFICATION:
+    status: RESIDUAL
+    owner: B (backup producer) + D_database (consumer verification)
+    gate: recovery_union.manifest_certified
+    need: >-
+      secret_manifest.txt (and the bundle index) must carry an integrity
+      certification the restore verifies BEFORE trusting it to drive
+      destruction. Without it, a truncated manifest can under-declare secrets and
+      the preflight would pass. No ignore-integrity switch.
+  LEGACY-BUNDLE:
+    status: RESIDUAL
+    owner: D_database
+    gate: recovery_union.manifest_certified
+    need: >-
+      Older bundles (legacy secret_mapping.txt, no manifest, no digests) must be
+      qualified through an ISOLATED path that PRESERVES original bytes + records
+      their digest at qualification time, then treats them as read-only inputs.
+      There is NO switch that disables integrity to "make an old bundle work" --
+      an unqualifiable bundle is refused, not force-restored. The current
+      mapping-file fallback creates secrets but does not qualify/preserve; this
+      is the seam to close.
+  FENCE-CURRENT-GENERATION-AND-AUTHORITY:
+    status: PARTIAL
+    wave: this session (commit 7dbf6e7)
+    delegated_to: config/postgresql-platform/fencing-protocol.contract.yaml
+    where: scripts/postgresql_platform/platform.py observed_generation_check
+    note: >-
+      The container-restart fence denies (exit 255) unless the observed
+      generation (/var/lib/cloud/data/instance-id) matches the resolved
+      qemu_generation AND the deployment_identity-scoped authority marker is
+      present. Restored nodes cannot self-promote on a stale generation.
+    residual: >-
+      codex-0630 FENCE-CURRENT-GENERATION-AND-AUTHORITY: the ExecStartPre compares
+      a LOCAL cloud-init file; there is no producer/readback binding proving that
+      file is the current OWNED runtime generation, and live_gate still reads the
+      config generation. Owner split: B supplies provenance-bound observations; D
+      consumes the same current-generation + leased-authority contract across
+      restart, promotion and rejoin. Local file match is corroboration, not authority.
+  REJOIN-RESTART-SERIALIZATION:
+    status: PARTIAL
+    wave: this session (commit 7dbf6e7 + this-wave fail-closed fix)
+    where: scripts/postgresql_platform/rejoin.py + testing/tests/unit/test_postgresql_fencing_identity.py
+    note: >-
+      rejoin quarantine() refuses while a live deployment_identity-scoped
+      authorization marker exists (a restart cannot race an authorized peer);
+      a revoked/absent marker admits. THIS WAVE closes the fail-OPEN codex-0630
+      flagged: a MISSING/malformed deployment_identity no longer sets authorize=None
+      (which silently skipped the guard) -- rebuild now FAILS CLOSED without a
+      resolved stable identity. Covered by RejoinRestartSerialization tests incl.
+      test_missing_or_malformed_deployment_identity_fails_closed.
+    residual: >-
+      codex-0630 REJOIN-RESTART-SERIALIZATION / D-FENCING-ACTUAL-CALLER-VALIDATION-BYPASS
+      / D-RESTART-AUTHORIZATION-INTEGRITY / D-REJOIN-RESERVATION-OPTIONAL: the
+      absence check + member flock is local corroboration, NOT authoritative
+      serialization. The JOINT (D+C) deliverable is the guardian control.sock
+      revoke / verified stop-drain / permitted-start transition + rejoin-nonce
+      consume + entry-point validation through the sole engine path. All gated on
+      the guardian authority seam (fencing-protocol.contract.yaml, currently absent).
+  DEPLOYMENT-IDENTITY-STORAGE-FENCING:
+    status: LANDED
+    wave: this session (commit 761261f contract + 7dbf6e7 platform validation)
+    where: >-
+      config/postgresql-platform/runtime-inventory-requirements.contract.yaml
+      identity_binding.deployment_identity.adoption + scripts/postgresql_platform/platform.py
+    note: >-
+      Adoption is READ-ONLY: inspect + validate the on-disk deployment_identity;
+      missing/conflicting REJECTS before any mutation. No CA regeneration, no
+      credential replacement, no storage rename. run_id-keyed identities are
+      listed as migrations owed (identity_binding.run_id_migrations_owed).
+
+# -----------------------------------------------------------------------------
+# fail_closed_invariants -- hard rules no future edit may weaken.
+# -----------------------------------------------------------------------------
+fail_closed_invariants:
+  - id: no-listing-as-success
+    rule: A restore step must never accept `podman secret ls` (or any list) rc as proof of restoration.
+  - id: verify-before-destroy
+    rule: No destructive mutation runs before its inputs are proven decryptable/qualified.
+  - id: no-ignore-integrity-switch
+    rule: There is no flag, var, or path that disables digest/manifest/qualification integrity.
+  - id: preserve-original-bytes
+    rule: Legacy/foreign bundles are preserved byte-exact and digested at qualification; never rewritten in place.
+  - id: pessimistic-on-crash
+    rule: >-
+      An interrupted restore must leave a record that says INCOMPLETE, never an
+      absence that reads as success. (Status-record wrapper is residual; the
+      per-step exits already fail loudly.)
+
+# -----------------------------------------------------------------------------
+# validation -- how this wave was checked.
+# -----------------------------------------------------------------------------
+validation:
+  machine:
+    - "python3 -c 'yaml.safe_load' on this file"
+    - "yaml.safe_load_all(ansible/restore_lme_master.yml)"
+    - "ansible-playbook --syntax-check ansible/restore_lme_master.yml"
+    - "bash -n on the rendered secret-restore shell body"
+  runtime_acceptance: OPEN
+  open_items:
+    - RESTORE-CONTENT-DIGEST (needs backup-side digest interface)
+    - BACKUP-MANIFEST-CERTIFICATION (needs backup-side certification producer)
+    - LEGACY-BUNDLE isolated qualification + byte preservation
+    - recovery-status-record (play-level block/rescue pessimistic status)
+    - a real restore-from-backup rehearsal

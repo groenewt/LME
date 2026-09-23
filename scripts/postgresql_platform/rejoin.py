@@ -157,8 +157,16 @@ def rebuild(config, domain, request, *, root=Path('/var/lib/postgresql/member'),
     # quarantine() requires the authorize file absent. The authoritative revoke/consume is the
     # guardian control.sock seam (absent); this absence check + the member flock are the local
     # corroboration (see fencing-protocol.contract.yaml rejoin.authorization_revoked).
+    # D-FENCING-ACTUAL-CALLER-VALIDATION-BYPASS / REJOIN-RESTART-SERIALIZATION (codex-0630):
+    # a MISSING deployment_identity must FAIL CLOSED, not silently disable the revoked-
+    # authorization guard. Previously `authorize = ... if deployment_identity else None`
+    # let a rebuild with no resolved identity skip the authorization check entirely (a
+    # fail-OPEN). The stable identity is a hard fence prerequisite, so refuse without it.
     deployment_identity = config.get('deployment_identity')
-    authorize = Path(authorize_root) / deployment_identity / domain / config['node'] if deployment_identity else None
+    if not (isinstance(deployment_identity, str)
+            and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}', deployment_identity)):
+        raise ValueError('rebuild requires a resolved stable deployment_identity to enforce revoked restart authorization')
+    authorize = Path(authorize_root) / deployment_identity / domain / config['node']
     for path in (root, data, inhibit, identity_path):
         _unalias(path)
     def quarantine():
@@ -176,7 +184,7 @@ def rebuild(config, domain, request, *, root=Path('/var/lib/postgresql/member'),
                 or identity_path.read_text().strip() != request['qemu_generation']
                 or not data.is_dir() or (data / 'PG_VERSION').read_text().strip() != '17'
                 or (data / 'postmaster.pid').exists()
-                or (authorize is not None and (authorize.exists() or authorize.is_symlink()))):
+                or authorize.exists() or authorize.is_symlink()):
             raise ValueError('exact stopped PostgreSQL 17 member, matching persistent quarantine and revoked restart authorization required')
     quarantine()
     nonce = request['request_nonce']
