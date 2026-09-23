@@ -208,11 +208,40 @@ class CalderaOperator():
             json.dump(link_res, fp, indent=2)
 
 
+def _redacted_state(co):
+    """Return a copy of the operator's __dict__ safe for verbose logging.
+
+    Masks the API key and the ``KEY`` auth header (and any api_key embedded in
+    the loaded config) so credentials never reach stdout/logs. Operates on a
+    copy only -- the live operator is untouched, so functional behavior is
+    unchanged.
+    """
+    state = dict(co.__dict__)
+    if "api_key" in state:
+        state["api_key"] = "***REDACTED***"
+    headers = state.get("headers")
+    if isinstance(headers, dict):
+        state["headers"] = {
+            k: ("***REDACTED***" if str(k).upper() == "KEY" else v)
+            for k, v in headers.items()
+        }
+    config = state.get("config")
+    if (isinstance(config, dict)
+            and isinstance(config.get("options"), dict)
+            and "api_key" in config["options"]):
+        config_copy = dict(config)
+        options_copy = dict(config["options"])
+        options_copy["api_key"] = "***REDACTED***"
+        config_copy["options"] = options_copy
+        state["config"] = config_copy
+    return state
+
+
 if __name__ == '__main__':
     args = parse_args()
     co = CalderaOperator(args.config_file, args.api_key, args.verbose)
     if args.verbose:
-        print(co.__dict__)
+        print(_redacted_state(co))
     adversary_id = co.create_adversary()
     if adversary_id is None:
         sys.exit("Error getting adversary ID")
