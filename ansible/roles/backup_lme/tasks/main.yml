@@ -1,6 +1,19 @@
 ---
 # Main tasks file for backup_lme role
 
+- name: Load the canonical backup-integrity declaration
+  # Single source (roles/backup_lme/vars/integrity.yml) shared with the restore
+  # verifier; the content-digest + bundle-certification shell is RENDERED from it
+  # via templates/content_integrity.sh.j2 (codex-0700 D-RECOVERY-REPRESENTATION-WRAPPER).
+  include_vars: integrity.yml
+
+- name: Render the shared content-integrity library once
+  # Render the macro ONCE into a fact; shell tasks then reference {{ lme_integrity_lib }}
+  # (a bare var) rather than inlining lookup('template', ...). Keeping the lookup out of
+  # the large shell scalars avoids Ansible split_args quote/jinja balance trips.
+  set_fact:
+    lme_integrity_lib: "{{ lookup('template', 'templates/content_integrity.sh.j2') }}"
+
 - name: Set backup timestamp
   set_fact:
     backup_timestamp: "{{ ansible_date_time.year }}-{{ ansible_date_time.month }}-{{ ansible_date_time.day }}_{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"
@@ -554,6 +567,7 @@
 - name: Backup each volume
   shell: |
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
+    {{ lme_integrity_lib }}
     VOLUME_PATH=$(podman volume inspect {{ item }} --format "{{ '{{' }}.Mountpoint{{ '}}' }}")
     VOLUME_DIR="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes/{{ item }}"
 
@@ -566,16 +580,22 @@
     # Restore recomputes the identical values over the backup data/ dir and fails
     # closed on mismatch. Written only in the SUCCESS/EMPTY branches: a FAILED copy is left
     # with no manifest so restore refuses it.
+    # listing_sha256 (paths+sizes) is RETAINED for info; content_sha256 (file
+    # CONTENTS + symlink targets, from the shared rendered library lme_content_sha256)
+    # is the NON-VACUOUS integrity signal restore verifies. A same-name/same-size
+    # single-byte change changes content_sha256 but not listing_sha256.
     write_content_manifest() {
       local src="$1" out="$2"
-      local fc tb sha
+      local fc tb sha csha
       fc=$(cd "$src" 2>/dev/null && find . -type f 2>/dev/null | wc -l | tr -d ' ')
       tb=$(cd "$src" 2>/dev/null && find . -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
       sha=$(cd "$src" 2>/dev/null && find . -type f -printf '%P\t%s\n' 2>/dev/null | LC_ALL=C sort | sha256sum | awk '{print $1}')
+      csha=$(lme_content_sha256 "$src")
       {
         echo "file_count=${fc:-0}"
         echo "total_bytes=${tb:-0}"
         echo "listing_sha256=${sha:-}"
+        echo "content_sha256=${csha:-}"
       } > "$out"
     }
 
@@ -606,6 +626,18 @@
       if [ $? -eq 0 ]; then
         # Fingerprint the SOURCE so a silently-torn copy is caught at restore.
         write_content_manifest "$VOLUME_PATH" "$VOLUME_DIR/content_manifest.txt"
+        # Backup-time copy integrity: a cp that returns 0 can still be self-consistently
+        # torn (missed a file). Verify the copied-content digest equals the SOURCE digest
+        # NOW and FAIL the volume on mismatch (no manifest -> restore refuses), instead of
+        # certifying a torn copy as SUCCESS.
+        SRC_CSHA=$(grep "^content_sha256=" "$VOLUME_DIR/content_manifest.txt" | head -n1 | cut -d= -f2)
+        COPY_CSHA=$(lme_content_sha256 "$VOLUME_DIR/data")
+        if [ "$SRC_CSHA" != "$COPY_CSHA" ]; then
+          rm -f "$VOLUME_DIR/content_manifest.txt"
+          echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+          echo "Volume copy content ($COPY_CSHA) != source ($SRC_CSHA) at $VOLUME_DIR; torn copy, no manifest written" >&2
+          exit 1
+        fi
         echo "SUCCESS" > "$VOLUME_DIR/backup_status.txt"
         echo "Volume {{ item }} backed up successfully"
         exit 0
@@ -735,6 +767,32 @@
       Overall status: {{ 'UNSAFE - containers did not stop before the volume copy; backup may be torn/inconsistent and must not be trusted for restore' if not (lme_backup_clean_container_stop | default(false) | bool) else ('SUCCESS' if lme_backup_result is success and successful_volumes.stdout | int == lme_backup_selected_volumes | length else 'PARTIAL - See details above') }}
   become: yes
   
+- name: Certify the backup bundle (content-digest integrity)
+  # BACKUP-MANIFEST-CERTIFICATION producer (codex-0700). Renders the canonical
+  # integrity library (single source shared with restore) and writes
+  # bundle_certification.txt = per-payload content digests + a self-consistency
+  # bundle_sha256. GATED so a PARTIAL/UNCLEAN bundle is NEVER certified: the
+  # install/vault/quadlet copy, the secret manifest and every volume must have
+  # succeeded AND the containers must have stopped cleanly. An uncertified bundle
+  # is REFUSED at restore (fail-closed), never restored on listing_sha256 alone.
+  # NOTE: bundle_sha256 is self-consistency only (detects torn/accidental
+  # truncation); adversarial under-declaration needs the OPEN external anchor
+  # (C1 expected-set / B ledger) or the UNWIRED guardian signature -- so
+  # BACKUP-MANIFEST-CERTIFICATION is PARTIAL, not closed.
+  shell: |
+    {{ lme_integrity_lib }}
+    lme_bundle_certify "{{ backup_base_dir }}/backups/{{ backup_timestamp }}"
+  args:
+    executable: /bin/bash
+  become: yes
+  register: lme_bundle_cert_result
+  when:
+    - lme_backup_result is success
+    - secret_mapping_result is defined and secret_mapping_result is success
+    - (lme_systemd_units_backup_result is not defined) or (lme_systemd_units_backup_result is success)
+    - lme_backup_clean_container_stop | default(false) | bool
+    - (volume_backup.results is not defined) or ((volume_backup.results | selectattr('failed', 'eq', true) | list | length) == 0)
+
 - name: Read final backup status
   command: cat "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/backup_status.txt"
   register: final_status

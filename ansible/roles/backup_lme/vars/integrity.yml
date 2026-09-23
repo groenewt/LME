@@ -1,0 +1,109 @@
+---
+# =============================================================================
+# backup_lme/vars/integrity.yml -- CANONICAL DECLARATION of the backup-bundle
+# integrity contract (payload classes + manifest fields). This is DATA, not
+# logic: the reusable macro template roles/backup_lme/templates/content_integrity.sh.j2
+# renders BOTH the producer and the recovery verifier from this single source, so
+# the backup-side digest and the restore-side check can never drift.
+#
+# This is the concrete CONSUMER that
+#   config/postgresql-platform/recovery-semantics.contract.yaml
+# names for RESTORE-CONTENT-DIGEST and BACKUP-MANIFEST-CERTIFICATION (codex-0700
+# D-RECOVERY-CONTRACT-NOT-EXECUTION-AUTHORITY: the contract is a requirements
+# record, THIS declaration + the rendered macro + the bound restore tasks are the
+# enforcement).
+#
+# Loaded on BOTH sides:
+#   * backup_lme role tasks/main.yml -> include_vars: integrity.yml (producer)
+#   * ansible/restore_lme_master.yml -> include_vars: roles/backup_lme/vars/integrity.yml (verifier)
+#
+# NO SECRET VALUES: only structural declarations. Secret payloads are digested as
+# CIPHERTEXT file bytes (the vault-encrypted files under secrets/ and
+# etc_lme/vault/); plaintext is never read or digested here.
+# =============================================================================
+
+lme_backup_integrity:
+  schema: 1
+
+  # Fields the per-volume content_manifest.txt records. content_sha256 is the
+  # NON-VACUOUS addition (codex-0700 RESTORE-CONTENT-DIGEST: "volume digest
+  # excludes file contents"). listing_sha256 (paths+sizes only) is RETAINED for
+  # backward info but is NOT sufficient and is NOT a fallback -- a bundle without
+  # content_sha256 is REFUSED, never accepted on listing_sha256 alone (that would
+  # be an ignore-integrity switch, fail_closed_invariants.no-ignore-integrity-switch).
+  manifest_fields: [file_count, total_bytes, listing_sha256, content_sha256]
+
+  certification:
+    # Written by the producer AFTER every payload is produced; verified by the
+    # restore entry point BEFORE the first destructive step.
+    bundle_file: bundle_certification.txt
+    self_digest_field: bundle_sha256
+    # SELF-CONSISTENCY ONLY (codex advisor): bundle_sha256 binds the recorded
+    # per-payload content digests together, so a TORN or accidentally TRUNCATED
+    # certification is detected. It does NOT resist an adversary who deletes a
+    # payload line and recomputes bundle_sha256 (under-declaration). That needs an
+    # EXTERNAL anchor -- see completeness_anchor / signature below. Hence
+    # BACKUP-MANIFEST-CERTIFICATION is PARTIAL, not closed.
+    completeness_anchor:
+      status: OPEN
+      # The complete EXPECTED owned payload set is not derivable inside the
+      # restore entry point today (lme_resolved is NOT in scope in
+      # restore_lme_master.yml -- verified). Routed, not invented here:
+      routed_to:
+        - "C1: project the expected owned secret/material set into lme_resolved so restore can check completeness, not just self-consistency"
+        - "B: record bundle_sha256 in the operational ledger as an out-of-bundle anchor"
+    signature:
+      # UNWIRED defense-in-depth: an authenticity signature over bundle_sha256 via
+      # C's guardian signing primitive (guardian_signing_interface). Absent the
+      # guardian AUTHORITY SERVICE (fail-closed / UNSTARTABLE per
+      # fencing-protocol.contract.yaml), this layer stays UNWIRED. Its ABSENCE is
+      # NOT a pass and NOT this-wave's gate -- the enforceable-now gate is the
+      # content-digest + self-consistency check below.
+      status: UNWIRED
+      consumes: ansible/roles/secrets_distribution/vars/guardian_custody.yml#guardian_signing_interface
+      over: bundle_sha256
+
+  # Payload classes the certification covers. Order is irrelevant (the producer
+  # and verifier both sort). kind drives how the digest is computed:
+  #   tree        -> content digest over a directory subtree (files + symlinks)
+  #   file        -> content digest over a single file
+  #   volume_data -> per-volume data/ dir; actual data recompute happens at the
+  #                  existing per-volume restore task (before volume rm), the
+  #                  bundle only binds the recorded digest.
+  payload_classes:
+    - id: lme
+      kind: tree
+      path: lme
+      verified_before: install          # trees are consumed by the install restore
+    - id: etc_lme
+      kind: tree
+      path: etc_lme                      # includes vault/ CIPHERTEXT
+      verified_before: install
+    - id: etc_containers_systemd
+      kind: tree
+      path: etc_containers_systemd
+      verified_before: install
+    - id: etc_systemd_system_lme
+      kind: tree
+      path: etc_systemd_system_lme
+      optional: true                     # absent on hosts with no host units
+      verified_before: install
+    - id: secrets
+      kind: tree
+      path: secrets                      # captured ansible-vault CIPHERTEXT payloads
+      optional: true
+      verified_before: install
+    - id: secret_manifest
+      kind: file
+      path: secret_manifest.txt
+      optional: true                     # legacy bundles carry only secret_mapping.txt
+      verified_before: secrets_restore
+    - id: secret_mapping
+      kind: file
+      path: secret_mapping.txt
+      optional: true
+      verified_before: secrets_restore
+    - id: volumes
+      kind: volume_data
+      path: volumes                      # each volumes/<name>/data has its own content_manifest
+      verified_before: volume_restore

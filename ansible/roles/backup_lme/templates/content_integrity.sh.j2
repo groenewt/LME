@@ -1,0 +1,220 @@
+{#- =========================================================================
+   content_integrity.sh.j2 -- CANONICAL, reusable shell library for backup-bundle
+   content integrity. Rendered (via lookup('template', ...)) into BOTH the backup
+   producer and the restore verifier so the two can never drift. Driven entirely
+   by the roles/backup_lme/vars/integrity.yml declaration (lme_backup_integrity):
+   the payload classes below are RENDERED from that YAML, not hand-listed here.
+
+   This is the representation-compliant home (codex-0700 D-RECOVERY-REPRESENTATION-
+   WRAPPER) for the NEW integrity logic: one source, rendered, F-reviewable. The
+   caller appends its own driver line (lme_bundle_certify / lme_bundle_verify /
+   lme_content_sha256) after this library.
+
+   Functions:
+     lme_content_sha256 <dir>        content digest over a subtree (files+symlinks)
+     lme_content_sha256_file <file>  content digest over one file
+     lme_bundle_certify <root>       write <root>/{{ lme_backup_integrity.certification.bundle_file }}
+     lme_bundle_verify  <root>       fail-closed verify of that certification
+   No secret VALUES are read: secret payloads are digested as CIPHERTEXT bytes.
+========================================================================= -#}
+# --- rendered from lme_backup_integrity (schema {{ lme_backup_integrity.schema }}) ---
+LME_BUNDLE_CERT_FILE="{{ lme_backup_integrity.certification.bundle_file }}"
+LME_BUNDLE_SELF_FIELD="{{ lme_backup_integrity.certification.self_digest_field }}"
+
+lme_tree_payloads=()
+lme_file_payloads=()
+{% for p in lme_backup_integrity.payload_classes if p.kind == 'tree' %}
+lme_tree_payloads+=( "{{ p.id }}|{{ p.path }}|{{ 'opt' if p.optional | default(false) else 'req' }}" )
+{% endfor %}
+{% for p in lme_backup_integrity.payload_classes if p.kind == 'file' %}
+lme_file_payloads+=( "{{ p.id }}|{{ p.path }}|{{ 'opt' if p.optional | default(false) else 'req' }}" )
+{% endfor %}
+{% set vol = (lme_backup_integrity.payload_classes | selectattr('kind','equalto','volume_data') | list | first) %}
+LME_VOLUME_ROOT="{{ vol.path if vol is defined and vol else 'volumes' }}"
+
+# Content digest over a directory subtree: binds each relative path to its file
+# CONTENT hash (or symlink target), NUL-safe end to end, LC_ALL=C ordered so a
+# cluster tarball restored on another host still matches. Catches a same-name /
+# same-size single-byte change that listing_sha256 (paths+sizes only) misses.
+lme_content_sha256() {
+  local dir="$1"
+  if [ ! -d "$dir" ]; then
+    echo "MISSING"
+    return 0
+  fi
+  ( cd "$dir" 2>/dev/null || exit 0
+    find . \( -type f -o -type l \) -printf '%P\0' 2>/dev/null | LC_ALL=C sort -z | \
+    while IFS= read -r -d '' rel; do
+      printf 'P:%s\0' "$rel"
+      if [ -L "$rel" ]; then
+        printf 'L:%s\0' "$(readlink -- "$rel")"
+      else
+        printf 'F:%s\0' "$(sha256sum -- "$rel" 2>/dev/null | awk '{print $1}')"
+      fi
+    done
+  ) | sha256sum | awk '{print $1}'
+}
+
+lme_content_sha256_file() {
+  local f="$1"
+  if [ ! -f "$f" ]; then
+    echo "MISSING"
+    return 0
+  fi
+  sha256sum -- "$f" 2>/dev/null | awk '{print $1}'
+}
+
+# Recompute bundle_sha256 over the SORTED payload lines (excludes the self line).
+lme_bundle_self_digest() {
+  local cert="$1"
+  grep -E '^payload=' "$cert" 2>/dev/null | LC_ALL=C sort | sha256sum | awk '{print $1}'
+}
+
+# Producer: certify the finished bundle. REFUSES (returns non-zero) if a REQUIRED
+# tree/file payload is absent on disk -- a partial bundle is never certified
+# (mirrors the existing "FAILED copy gets no manifest" rule). Caller must ALSO
+# refuse to call this when any upstream backup task failed / stop was unclean.
+lme_bundle_certify() {
+  local root="$1"
+  local cert="$root/$LME_BUNDLE_CERT_FILE"
+  local tmp entry pid ppath preq dig d
+  tmp="$(mktemp)"
+  {
+    echo "# LME backup bundle certification"
+    echo "# schema={{ lme_backup_integrity.schema }}"
+    echo "# created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$tmp"
+
+  for entry in "${lme_tree_payloads[@]}"; do
+    IFS='|' read -r pid ppath preq <<< "$entry"
+    if [ ! -d "$root/$ppath" ]; then
+      if [ "$preq" = "req" ]; then
+        echo "CERTIFY-REFUSED: required tree payload '$pid' absent at $root/$ppath" >&2
+        rm -f "$tmp"; return 1
+      fi
+      continue
+    fi
+    dig="$(lme_content_sha256 "$root/$ppath")"
+    echo "payload=$pid|kind=tree|content_sha256=$dig" >> "$tmp"
+  done
+
+  for entry in "${lme_file_payloads[@]}"; do
+    IFS='|' read -r pid ppath preq <<< "$entry"
+    if [ ! -f "$root/$ppath" ]; then
+      if [ "$preq" = "req" ]; then
+        echo "CERTIFY-REFUSED: required file payload '$pid' absent at $root/$ppath" >&2
+        rm -f "$tmp"; return 1
+      fi
+      continue
+    fi
+    dig="$(lme_content_sha256_file "$root/$ppath")"
+    echo "payload=$pid|kind=file|content_sha256=$dig" >> "$tmp"
+  done
+
+  # Volume payloads: bind each volume's already-produced content_manifest content_sha256.
+  if [ -d "$root/$LME_VOLUME_ROOT" ]; then
+    while IFS= read -r vdir; do
+      [ -n "$vdir" ] || continue
+      local vname vman vsha
+      vname="$(basename "$vdir")"
+      vman="$vdir/content_manifest.txt"
+      if [ ! -f "$vman" ]; then
+        echo "CERTIFY-REFUSED: volume '$vname' has no content_manifest.txt (partial backup)" >&2
+        rm -f "$tmp"; return 1
+      fi
+      vsha="$(grep '^content_sha256=' "$vman" 2>/dev/null | head -n1 | cut -d= -f2)"
+      if [ -z "$vsha" ]; then
+        echo "CERTIFY-REFUSED: volume '$vname' content_manifest lacks content_sha256" >&2
+        rm -f "$tmp"; return 1
+      fi
+      echo "payload=volume:$vname|kind=volume_data|content_sha256=$vsha" >> "$tmp"
+    done < <(find "$root/$LME_VOLUME_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort)
+  fi
+
+  local self
+  self="$(grep -E '^payload=' "$tmp" | LC_ALL=C sort | sha256sum | awk '{print $1}')"
+  echo "$LME_BUNDLE_SELF_FIELD=$self" >> "$tmp"
+  mv "$tmp" "$cert"
+  chmod 600 "$cert" 2>/dev/null || true
+  echo "Bundle certified: $cert ($LME_BUNDLE_SELF_FIELD=$self)"
+  return 0
+}
+
+# Verifier (fail-closed). Exit codes:
+#   3 = certification file missing (old/legacy bundle -> LEGACY-BUNDLE path; NO
+#       fallback to listing_sha256, NO ignore-integrity switch)
+#   4 = self-digest mismatch (torn/truncated certification)
+#   5 = a tree/file payload's on-disk content does not match the certified digest
+#   6 = a certified volume payload has no recorded content_sha256
+#   7 = a required tree/file payload is absent on disk
+lme_bundle_verify() {
+  local root="$1"
+  local cert="$root/$LME_BUNDLE_CERT_FILE"
+  local recorded actual entry pid ppath preq exp act line
+
+  if [ ! -f "$cert" ]; then
+    echo "VERIFY-REFUSED(3): bundle certification missing at $cert." >&2
+    echo "Backup predates integrity certification or is corrupt; refusing destructive restore (no ignore-integrity switch)." >&2
+    return 3
+  fi
+
+  recorded="$(grep -E "^$LME_BUNDLE_SELF_FIELD=" "$cert" | head -n1 | cut -d= -f2)"
+  actual="$(lme_bundle_self_digest "$cert")"
+  if [ -z "$recorded" ] || [ "$recorded" != "$actual" ]; then
+    echo "VERIFY-REFUSED(4): certification self-digest mismatch (recorded=$recorded actual=$actual); torn/tampered certification." >&2
+    return 4
+  fi
+
+  # Tree/file payloads recorded in the certification: recompute on-disk content
+  # and compare. Verified BEFORE the trees are consumed by the install restore.
+  for entry in "${lme_tree_payloads[@]}"; do
+    IFS='|' read -r pid ppath preq <<< "$entry"
+    line="$(grep -E "^payload=$pid\|kind=tree\|" "$cert" | head -n1)"
+    if [ -z "$line" ]; then
+      if [ "$preq" = "req" ]; then
+        echo "VERIFY-REFUSED(7): required tree payload '$pid' not certified." >&2
+        return 7
+      fi
+      continue
+    fi
+    exp="${line##*content_sha256=}"
+    act="$(lme_content_sha256 "$root/$ppath")"
+    if [ "$exp" != "$act" ]; then
+      echo "VERIFY-REFUSED(5): tree payload '$pid' content mismatch (cert=$exp disk=$act)." >&2
+      return 5
+    fi
+  done
+
+  for entry in "${lme_file_payloads[@]}"; do
+    IFS='|' read -r pid ppath preq <<< "$entry"
+    line="$(grep -E "^payload=$pid\|kind=file\|" "$cert" | head -n1)"
+    if [ -z "$line" ]; then
+      if [ "$preq" = "req" ]; then
+        echo "VERIFY-REFUSED(7): required file payload '$pid' not certified." >&2
+        return 7
+      fi
+      continue
+    fi
+    exp="${line##*content_sha256=}"
+    act="$(lme_content_sha256_file "$root/$ppath")"
+    if [ "$exp" != "$act" ]; then
+      echo "VERIFY-REFUSED(5): file payload '$pid' content mismatch (cert=$exp disk=$act)." >&2
+      return 5
+    fi
+  done
+
+  # Volume payloads: assert every certified volume carries a recorded digest. The
+  # actual data recompute-vs-manifest happens at the per-volume restore task
+  # (before volume rm); here we bind the certification to those manifests.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    exp="${line##*content_sha256=}"
+    if [ -z "$exp" ]; then
+      echo "VERIFY-REFUSED(6): a certified volume payload has an empty content_sha256." >&2
+      return 6
+    fi
+  done < <(grep -E '^payload=volume:' "$cert" || true)
+
+  echo "Bundle certification OK: $cert"
+  return 0
+}

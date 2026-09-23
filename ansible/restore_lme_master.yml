@@ -38,6 +38,18 @@
       set_fact:
         podman_cmd: "{{ podman_cmd_result.stdout }}"
 
+    - name: Load the canonical backup-integrity declaration
+      # Same single source the backup producer uses (roles/backup_lme/vars/integrity.yml);
+      # the bundle-certification verifier is RENDERED from it so producer and verifier
+      # cannot drift (codex-0700 D-RECOVERY-REPRESENTATION-WRAPPER).
+      include_vars: roles/backup_lme/vars/integrity.yml
+
+    - name: Render the shared content-integrity library once
+      # Bare {{ lme_integrity_lib }} in the shell tasks below (not an inline lookup)
+      # keeps split_args happy in the large restore shell scalars.
+      set_fact:
+        lme_integrity_lib: "{{ lookup('template', 'roles/backup_lme/templates/content_integrity.sh.j2') }}"
+
     - name: Include SELinux variable setup
       include_role:
         name: base
@@ -311,6 +323,26 @@
           ({{ running_containers.stdout_lines | join(', ') }}); refusing to overwrite
           live state (fail-closed). Stop them and re-run the restore.
       when: running_containers.stdout_lines | default([]) | length > 0
+
+    # RESTORE-ENTRYPOINT-VERIFICATION-ORDER + BACKUP-MANIFEST-CERTIFICATION (codex-0700):
+    # verify the bundle certification BEFORE the first destructive step below. The
+    # install/vault/quadlet trees are overwritten by the next task, so their content
+    # must be proven against the certified digest FIRST. Fail-closed: a missing
+    # certification (old/legacy bundle) is REFUSED (rc 3), a torn/tampered
+    # certification is REFUSED (rc 4), and any tree/file payload whose on-disk content
+    # does not match the certified digest is REFUSED (rc 5). There is NO fallback to
+    # listing_sha256 and NO ignore-integrity switch. An uncertifiable legacy bundle is
+    # routed to the LEGACY-BUNDLE qualification path (recovery-semantics.contract.yaml),
+    # not force-restored. Self-consistency only: adversarial under-declaration is an
+    # OPEN predicate (C1 expected-set / B ledger) -- see the contract.
+    - name: Verify backup bundle certification before any destructive restore (fail-closed)
+      shell: |
+        {{ lme_integrity_lib }}
+        lme_bundle_verify "{{ selected_backup_dir }}"
+      args:
+        executable: /bin/bash
+      register: restore_bundle_verify
+      changed_when: false
 
     # Tar streaming avoids NFS "Operation not supported" on cp -a preserving metadata
     - name: Restore LME installation and system state from backup
@@ -752,6 +784,7 @@
     - name: Verify each selected volume matches its backup content manifest (fail-closed)
       shell: |
         set -euo pipefail
+        {{ lme_integrity_lib }}
         MDIR="{{ selected_backup_dir }}/volumes/{{ item }}"
         MANIFEST="$MDIR/content_manifest.txt"
         DATA="$MDIR/data"
@@ -767,17 +800,31 @@
         exp_fc=$(grep '^file_count=' "$MANIFEST" | head -n1 | cut -d= -f2)
         exp_tb=$(grep '^total_bytes=' "$MANIFEST" | head -n1 | cut -d= -f2)
         exp_sha=$(grep '^listing_sha256=' "$MANIFEST" | head -n1 | cut -d= -f2)
+        # RESTORE-CONTENT-DIGEST: content_sha256 (file CONTENTS) is the real check.
+        # NO fallback -- a manifest without it is a pre-content-digest bundle and is
+        # REFUSED here (routed to LEGACY-BUNDLE), never accepted on listing_sha256 alone.
+        # `|| true`: a pre-content-digest manifest has NO content_sha256 line, so the
+        # grep would fail the whole task with rc 1 under `set -euo pipefail` BEFORE the
+        # explicit fail-closed guard below could run (still a refusal, but rc 1 with no
+        # message). Tolerate the empty match so the guard fires with rc 3 + a clear reason.
+        exp_csha=$(grep '^content_sha256=' "$MANIFEST" | head -n1 | cut -d= -f2 || true)
+        if [ -z "$exp_csha" ]; then
+          echo "ERROR: content_sha256 missing from manifest for volume '{{ item }}' (pre-content-digest bundle)." >&2
+          echo "Refusing destructive restore on listing_sha256 alone (no ignore-integrity switch); qualify via LEGACY-BUNDLE." >&2
+          exit 3
+        fi
         act_fc=$(cd "$DATA" && find . -type f | wc -l | tr -d ' ')
         act_tb=$(cd "$DATA" && find . -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')
         act_sha=$(cd "$DATA" && find . -type f -printf '%P\t%s\n' | LC_ALL=C sort | sha256sum | awk '{print $1}')
-        if [ "$exp_fc" != "$act_fc" ] || [ "$exp_tb" != "$act_tb" ] || [ "$exp_sha" != "$act_sha" ]; then
+        act_csha=$(lme_content_sha256 "$DATA")
+        if [ "$exp_fc" != "$act_fc" ] || [ "$exp_tb" != "$act_tb" ] || [ "$exp_sha" != "$act_sha" ] || [ "$exp_csha" != "$act_csha" ]; then
           echo "ERROR: backup integrity mismatch for volume '{{ item }}' -- refusing destructive restore." >&2
-          echo "  expected: files=$exp_fc bytes=$exp_tb sha=$exp_sha" >&2
-          echo "  actual:   files=$act_fc bytes=$act_tb sha=$act_sha" >&2
-          echo "The backup payload for '{{ item }}' is partial/corrupt; verify backup integrity before retrying." >&2
+          echo "  expected: files=$exp_fc bytes=$exp_tb listing=$exp_sha content=$exp_csha" >&2
+          echo "  actual:   files=$act_fc bytes=$act_tb listing=$act_sha content=$act_csha" >&2
+          echo "The backup payload for '{{ item }}' is partial/corrupt/altered; verify backup integrity before retrying." >&2
           exit 4
         fi
-        echo "Volume '{{ item }}' content integrity OK: files=$act_fc bytes=$act_tb"
+        echo "Volume '{{ item }}' content integrity OK: files=$act_fc bytes=$act_tb content=$act_csha"
       args:
         executable: /bin/bash
       loop: "{{ restore_selected_volume_names | default([]) }}"

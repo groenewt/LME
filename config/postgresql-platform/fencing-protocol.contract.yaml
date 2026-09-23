@@ -536,3 +536,135 @@ contract:
     - make rejoin source_authority/source_node REQUIRED once the test fixture carries them.
     - bootstrap ordering (README step 3) must wait for a published authorization for the initial owner.
     - reconcile README.md negative-inhibitor description with this contract.
+
+  # ===========================================================================
+  # guardian_cd_binding -- the shared C/D interface contract for the guardian
+  # AUTHORITY SERVICE's use of C's signing primitive (codex-0700 ownership split;
+  # codex-0715 interface_precision). D (accountable author of the authority
+  # service + control.sock/authority protocol) is the DESIGN-FIRST author here.
+  #
+  # STATUS: UNWIRED / PROPOSED. This section is ADDRESSED TO C for mutual ack. It
+  # binds to C's DECLARED primitive at
+  #   ansible/roles/secrets_distribution/vars/guardian_custody.yml#guardian_signing_interface
+  # (commit a33d08d; codex-0745 = useful proposal, NOT an implemented boundary and
+  # NOT yet a mutual ack). Integration is GATED on that mutual C/D ack AND on the
+  # guardian authority service existing (fail-closed / UNSTARTABLE today). NO unit
+  # template is authored this wave; C's custody repair (codex-0730 A1..A5) is in
+  # progress, so nothing here is wired to consume guardian_custody.yml yet.
+  #
+  # BOUNDARY (unchanged): reaching the key OR the socket is NOT authorization. A
+  # signature is produced ONLY after D's authority protocol has CONSUMED an
+  # authorization for the CURRENT leased epoch. C never mints the epoch (A4).
+  # ===========================================================================
+  guardian_cd_binding:
+    status: UNWIRED_PROPOSED_AWAITING_C_ACK
+    consumes: ansible/roles/secrets_distribution/vars/guardian_custody.yml#guardian_signing_interface
+    integration_gate: [mutual_C_D_interface_ack, guardian_authority_service_exists]
+
+    # (1) The CANONICAL SIGNED MESSAGE BYTES D hands to C's signing primitive.
+    # D constructs this; C signs the exact bytes and does NOT interpret them.
+    canonical_message:
+      domain_separation_tag: "lme.guardian.authority.v1"   # first field; prevents cross-protocol reuse
+      encoding: >-
+        A deterministic, length-prefixed field list: the tag, then each field below
+        in the FIXED order, each as decimal-length + ':' + raw UTF-8 bytes, joined by
+        no separator (canonical; no whitespace, no map ordering ambiguity). D computes
+        it identically on sign and on verify.
+      fields_in_order:
+        - message_kind          # one of: authorize | consume_result | route | revoke | inhibit
+        - operation             # the f:operation:* identity
+        - run_id
+        - deployment_identity   # stable identity (NOT run_id) the authority is keyed on
+        - domain                # hertzbeat | vector | shared (exact-domain binding)
+        - node
+        - qemu_generation       # the canonical observed generation UUID (exact-generation binding)
+        - action                # bootstrap | promote | restart | rejoin | drain | stop
+        - authority_epoch       # D's CURRENT leased epoch (A4; consumed input, C never mints)
+        - nonce                 # single-use; consumed via control.sock CAS
+        - not_after_epoch_seconds  # integer expiry
+      note: >-
+        The restart-fence authorization file is CURRENTLY unsigned plaintext (handoff.who_signs);
+        this binding is the seam that lets D produce a SIGNED restart authorization over these exact
+        bytes, closing the non-promoting-restart gap (open_items 'signed restart authorization').
+
+    # (2) The AUTHORITY CONTEXT that must already hold before D asks C to sign.
+    authority_context_precondition:
+      leased_epoch_held: "D holds the CURRENT authority_epoch (etcd leader/reservation + lease + epoch)."
+      authorization_consumed: "D has CONSUMED the authorization + nonce for THIS transition (control.sock CAS)."
+      quorum_leader: "quorum + leader_authorized true where the message_kind requires it (see protocol.consume/route)."
+      not_key_possession: "Possession of the runtime key or reachability of the socket is explicitly NOT sufficient (A4)."
+
+    # (3) The EXPECTED-FINGERPRINT RECORD (the concrete C<-D trust binding).
+    expected_fingerprint_record:
+      field: guardian_custody_expected_pub_fingerprint
+      definition: "SHA-256 of the guardian DER SubjectPublicKeyInfo public key."
+      lifecycle: >-
+        C EMITS the fingerprint at bootstrap and at each rotation; D RECORDS it as the
+        trusted expectation and SUPPLIES it back on every sign/verify. Trust is D's
+        recorded expectation, NOT the editable guardian.meta sidecar
+        (codex-0730 C-CUSTODY-EPOCH-FINGERPRINT-PASSPHRASE-BINDING).
+      storage_owner: D_database   # D's authority record; C1 owned registry is the eventual canonical home
+      binding_rule: >-
+        A signature is trusted ONLY if the signing key's structurally-parsed public
+        fingerprint equals this recorded expectation for the current authority_epoch.
+
+    # (4) The RETURNED METADATA C gives back to D (mirrors guardian_signing_interface.output_fields).
+    returned_metadata:
+      - signature                 # raw Ed25519 signature over the canonical_message bytes
+      - guardian_pub_fingerprint  # MUST equal expected_fingerprint_record for the current epoch, else D rejects
+      - authority_epoch           # MUST equal the epoch D supplied, else D rejects (A3 defense-in-depth on C's side too)
+    d_side_acceptance:
+      - "reject if guardian_pub_fingerprint != recorded expected fingerprint for authority_epoch"
+      - "reject if returned authority_epoch != supplied authority_epoch"
+      - "reject if openssl pkeyutl -verify of signature over the canonical bytes fails against the expected pub"
+
+    # (5) ROTATION and REVOKE interleavings (the hard cases).
+    rotation_interleaving:
+      rule: >-
+        Rotation is EXPLICIT and D-driven: D advances authority_epoch, C promotes the new
+        runtime key + pair-verifies BEFORE the marker flip, republishes guardian.pub +
+        fingerprint; D records the NEW expected fingerprint. A signature request that
+        arrives mid-rotation is bound to a SPECIFIC epoch: a request for the OLD epoch after
+        the flip is REFUSED (prior-epoch blob), a request for the NEW epoch before D has
+        recorded the new fingerprint is REFUSED (no trusted expectation yet). No silent
+        reapply mint (guardian_custody.rotation).
+    revoke_interleaving:
+      rule: >-
+        Revocation is D's control.sock authority: D consumes/invalidates the epoch's nonce and
+        removes the positive authorization. A signature produced under a since-revoked
+        authorization is NOT retroactively valid because CONSUMPTION is single-use CAS -- a
+        replayed nonce fails. rejoin checks positive-authorization ABSENCE before the rename
+        (authorization_revoked); the AUTHORITATIVE revoke/verified-stop-drain/permitted-start
+        transition is the guardian seam (open_items 'authoritative revocation/drain').
+    serialization:
+      rule: >-
+        revoke -> verified stop-drain -> permitted start is a SERIALIZED transition through the
+        sole engine path (D-FENCING-ACTUAL-CALLER-VALIDATION-BYPASS): no caller may obtain a
+        signed start authorization while a drain of the same deployment_identity/domain is
+        in-flight.
+
+    # (6) FAILURE RESULTS (what each side returns; all fail-closed).
+    failure_results:
+      c_refuses:   # from guardian_signing_interface.refusals
+        - "no verified pub<->priv pair for the current epoch (marker absent/stale)"
+        - "caller-supplied epoch != durable-bound epoch (A3)"
+        - "runtime key absent or not resident on the signer host (never mint-to-sign)"
+      d_refuses:
+        - "authority_context_precondition not met (no leased epoch / no consumed authorization / no quorum)"
+        - "returned fingerprint or epoch mismatch, or signature verify failure"
+        - "authority service unavailable -> the authorization is NOT produced and the gated unit does NOT start (fail-closed / UNSTARTABLE); NEVER a default-allow"
+      invariant: >-
+        Absence or failure of the authority is UNSTARTABLE, never permissive. There is NO
+        default-allow path that makes a gated unit start when the guardian is unavailable.
+
+    sequenced_fencing_residuals:   # the residuals this seam unblocks, in order
+      - REJOIN-RESTART-SERIALIZATION
+      - D-RESTART-AUTHORIZATION-INTEGRITY
+      - D-REJOIN-RESERVATION-OPTIONAL
+      - FENCE-CURRENT-GENERATION-AND-AUTHORITY
+      - D-FENCING-ACTUAL-CALLER-VALIDATION-BYPASS
+
+    coordination:
+      to_C: "ACK the canonical_message field order/encoding + the output/fingerprint/epoch binding; confirm C signs bytes verbatim and refuses per c_refuses. This ACK gates INTEGRATION only, not C's independent custody authoring."
+      to_C1: "eventual canonical home for expected_fingerprint_record + signer/producer registry (catalog_debts.owed_registries)."
+      to_G: "author negative/interruption cases against THIS binding now (mid-rotation epoch, revoked-nonce replay, fingerprint mismatch, authority-unavailable-unstartable); runtime acceptance awaits the built service."
