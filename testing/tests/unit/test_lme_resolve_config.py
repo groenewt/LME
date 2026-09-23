@@ -185,7 +185,9 @@ def test_unknown_profile_key_raises():
 
 def test_required_missing_raises_when_no_default():
     # synthesise a registry whose required field has no default and no input
-    reg = {"precedence": REGISTRY["precedence"],
+    # (channels reused from the real registry -- the engine's shape gate now
+    # requires a declared channel per precedence tier, A2)
+    reg = {"precedence": REGISTRY["precedence"], "channels": REGISTRY["channels"],
            "fields": {"needed": {"type": "bool", "required": True, "nullable": False}}}
     with pytest.raises(ValueError) as ei:
         resolve(reg, {})
@@ -193,14 +195,14 @@ def test_required_missing_raises_when_no_default():
 
 
 def test_bool_field_rejects_non_bool():
-    reg = {"precedence": REGISTRY["precedence"],
+    reg = {"precedence": REGISTRY["precedence"], "channels": REGISTRY["channels"],
            "fields": {"flag": {"type": "bool", "required": True, "nullable": False, "default": True}}}
     with pytest.raises(ValueError):
         resolve(reg, {}, {"flag": "yes-please"})
 
 
 def test_string_bools_coerced():
-    reg = {"precedence": REGISTRY["precedence"],
+    reg = {"precedence": REGISTRY["precedence"], "channels": REGISTRY["channels"],
            "fields": {"flag": {"type": "bool", "required": True, "nullable": False, "default": True}}}
     r = resolve(reg, {}, {"flag": "false"})
     assert r["resolved"]["flag"] is False

@@ -25,6 +25,8 @@
 #   exactly the observed `lme_backups` volume owner (165536 = 165536 + 0 + 0).
 
 from __future__ import absolute_import, division, print_function
+import hashlib
+import json
 import re
 
 __metaclass__ = type
@@ -255,6 +257,17 @@ ALWAYS = 'always'
 # task var from. An enabled_when token that is neither 'always' nor one of these
 # is a typo (e.g. 'install_lmm'); is_enabled() rejects it LOUDLY rather than
 # silently evaluating it False and dropping the unit from the render.
+#
+# SINGLE SOURCE OF TRUTH: this frozenset MUST equal the set of
+# manifests/global.yml lme_config_registry fields marked `enable_flag: true`. The
+# pure filter cannot read that manifest at call time (no ansible runtime) and is
+# consulted by callers that legitimately pass a PARTIAL/empty flags dict (see the
+# many `is_enabled(..., lme_enable_flags | default({}))` call sites), so the typo
+# guard must key off this STATIC set, not the passed dict. The equality with the
+# registry is enforced DECLARATIVELY (a loader-test case compares the registry's
+# enable_flag keys to the `lme_known_enable_flags` filter) -- drift fails the suite.
+# Do NOT add a member without declaring the field (enable_flag: true) in the
+# registry, and vice versa.
 KNOWN_ENABLE_FLAGS = frozenset((
     'install_llm',
     'install_elastic_services',
@@ -293,14 +306,20 @@ def is_enabled(enabled_when, flags=None, context=None):
             where = ' for service %r' % (context,) if context else ''
             raise ValueError(
                 'lme: unknown enabled_when flag %r%s -- not the %r sentinel and '
-                'not a known enable flag %s. Fix the typo, or add the flag to '
-                'load_manifests.yml and KNOWN_ENABLE_FLAGS.'
+                'not a known enable flag %s. Fix the typo, or declare the flag '
+                '(enable_flag: true) in manifests/global.yml lme_config_registry.'
                 % (f, where, ALWAYS, sorted(KNOWN_ENABLE_FLAGS)))
-    # Pass 2: AND over the (now validated) gates.
+    # Pass 2: AND over the (now validated) gates. An absent flag is OFF (False),
+    # matching the docstring's [install_llm] + {} -> False contract. There is NO
+    # per-flag hidden default here: the DECLARED default lives in the registry
+    # (install_legacy_beats default: true, etc.) and reaches lme_enable_flags
+    # through the resolver, so is_enabled() never re-invents a default. (Removed
+    # RC-OPEN-4: `flags.get(f, f == 'install_legacy_beats')` asymmetrically
+    # defaulted one flag True, contradicting this docstring.)
     for f in enabled_when:
         if f == ALWAYS:
             continue
-        value = flags.get(f, f == 'install_legacy_beats')
+        value = flags.get(f, False)
         if type(value) is not bool:
             if isinstance(value, str) and value.lower() in ('true', 'false'):
                 value = value.lower() == 'true'
@@ -469,14 +488,57 @@ def strict_enable_bool(value):
     raise ValueError('lme: enable flag must be true or false')
 
 
-def _coerce_declared(value, field):
-    """Coerce a resolved value to its DECLARED type, preserving an explicit
-    False / 0 / '' as a real selection. Value-pure: the type token comes from the
-    registry field, never a hardcoded config value.
+_SELECTION_ORIGINS = ('extra_var', 'inventory')  # caller-VERIFIABLE finer sources
+_COMBINED_OPERATOR = 'operator'                   # honest native-selected label (A5)
+_OBSERVED_ORIGINS = ('observation', 'build')      # inferred/derived: NOT defaultable
 
-      * null: kept only if the field is nullable, else a loud error.
-      * bool: via strict_enable_bool (rejects non-bool, non-'true'/'false').
-      * str:  kept as-is (stringified only if a non-str slipped through)."""
+
+def _require_registry_shape(registry):
+    """Structural gate for BOTH resolve and validate (C1-VALIDATE-CALL / A1). A
+    malformed or empty registry RAISES, so a reversed Jinja pipe (`resolved |
+    lme_validate_config(registry)` -> registry bound to `resolved`, resolved bound to
+    `registry`) can never pass silently -- it hits "no fields" here and fails closed.
+    Also validates the precedence COMPOSITION (A2): every tier has a declared channel,
+    no duplicate tier, `default` is last, and no observation/build field is defaultable
+    (an inferred value is not an explicit choice). Returns (fields, precedence,
+    channels)."""
+    if not isinstance(registry, dict):
+        raise ValueError('lme: config registry must be a mapping')
+    fields = registry.get('fields')
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError('lme: config registry has no fields (malformed or reversed registry argument)')
+    precedence = registry.get('precedence')
+    if not isinstance(precedence, list) or not precedence:
+        raise ValueError('lme: config registry has no precedence list')
+    if len(precedence) != len(set(precedence)):
+        raise ValueError('lme: config registry precedence has a duplicate tier %r' % (precedence,))
+    channels = registry.get('channels') or {}
+    for tier in precedence:
+        if tier not in channels:
+            raise ValueError('lme: precedence tier %r has no declared channel' % (tier,))
+    if precedence[-1] != 'default':
+        raise ValueError("lme: config registry precedence must end with the 'default' tier")
+    for key, field in fields.items():
+        if field.get('origin') in _OBSERVED_ORIGINS and 'default' in field:
+            raise ValueError(
+                'lme: field %r declares origin %r (inferred/derived) and therefore MUST NOT '
+                'carry a default -- an inferred value is not an explicit choice' % (key, field.get('origin')))
+    return fields, precedence, channels
+
+
+def _coerce_declared(value, field):
+    """RESOLVE-time normalization to the declared type, preserving an explicit
+    False / 0 / '' / [] / {} as a real selection. Value-pure: the type token comes
+    from the registry field. Distinct from _canonical_ok (validate-time), which
+    REJECTS rather than coerces.
+
+      * null:      kept only if the field is nullable, else a loud error.
+      * bool:      via strict_enable_bool (rejects non-bool, non-'true'/'false').
+      * str:       kept (stringified only if a non-str slipped through).
+      * int:       int, or a numeric string; a bool is NOT an int.
+      * list/dict: must already be that collection (empty allowed; merge semantics
+                   -- e.g. atomic replace vs deep merge -- are the caller/loader's,
+                   declared per field via `merge:`)."""
     if value is None:
         if field.get('nullable'):
             return None
@@ -486,64 +548,137 @@ def _coerce_declared(value, field):
         return strict_enable_bool(value)
     if t == 'str':
         return value if isinstance(value, str) else str(value)
+    if t == 'int':
+        if isinstance(value, bool):
+            raise ValueError('lme: int field got a bool %r' % (value,))
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            raise ValueError('lme: int field value %r is not an integer' % (value,))
+    if t == 'list':
+        if not isinstance(value, list):
+            raise ValueError('lme: list field value %r is not a list' % (value,))
+        return value
+    if t in ('dict', 'map'):
+        if not isinstance(value, dict):
+            raise ValueError('lme: %s field value %r is not a mapping' % (t, value))
+        return value
     raise ValueError('lme: unknown declared config type %r' % (t,))
+
+
+def _canonical_ok(value, field):
+    """VALIDATE-time predicate (C1-CANONICAL-VALIDATION / A3): True iff `value` is
+    ALREADY the exact declared type -- NO coercion. This is what makes validation
+    reject a bool field still holding the string 'false', a str field holding an
+    arbitrary object, etc., rather than silently coercing them."""
+    if value is None:
+        return bool(field.get('nullable'))
+    t = field.get('type')
+    if t == 'bool':
+        return isinstance(value, bool)
+    if t == 'str':
+        return isinstance(value, str)
+    if t == 'int':
+        return isinstance(value, int) and not isinstance(value, bool)
+    if t == 'list':
+        return isinstance(value, list)
+    if t in ('dict', 'map'):
+        return isinstance(value, dict)
+    return False
+
+
+def _channel_value(tier, channels, field, key, selections, profile_vars, observations):
+    """(has_value, value) for `key` at precedence `tier`, per the tier's DECLARED
+    channel source. Membership (not truthiness) decides presence, so an explicit
+    False / 0 / '' / [] / {} counts as present."""
+    src = (channels.get(tier) or {}).get('source')
+    if src == 'selections':
+        if key in selections:
+            return True, selections[key]
+    elif src == 'profile_vars':
+        if key in profile_vars:
+            return True, profile_vars[key]
+    elif src == 'observations':
+        req = (channels.get(tier) or {}).get('requires_field')
+        if (not req or field.get(req)) and key in observations:
+            return True, observations[key]
+    elif src == 'field_default':
+        if 'default' in field:
+            return True, field['default']
+    else:
+        raise ValueError('lme: precedence tier %r has unknown channel source %r' % (tier, src))
+    return False, None
+
+
+def _honest_origin(tier, channels, key, origins, vocab):
+    """A5: never emit a false attribution. For a caller channel (provenance:caller,
+    i.e. the operator tiers) a caller-VERIFIED finer origin (extra_var|inventory) is
+    preserved IF supplied and declared; otherwise the honest combined label
+    `operator` is recorded. A caller label that lies about the tier (e.g. `default`
+    for a selected value) is DISCARDED, not propagated. For profile/observation/
+    default the origin IS the tier name."""
+    if (channels.get(tier) or {}).get('provenance') == 'caller':
+        claimed = origins.get(key)
+        if claimed in _SELECTION_ORIGINS and claimed in vocab:
+            return claimed
+        return _COMBINED_OPERATOR
+    if tier in vocab:
+        return tier
+    raise ValueError('lme: tier %r is not in the declared origin vocabulary' % (tier,))
 
 
 def lme_resolve_config(registry, profile_vars=None, selections=None,
                        observations=None, origins=None):
-    """Resolve every declared config field by DECLARED PRECEDENCE into one dict,
-    with NO snapshot and NO self-capture: this function reads ONLY its explicit
-    arguments and returns namespaced outputs, so a caller that materialises the
-    result under lme_resolved.* / lme_enable_flags never feeds an output back in.
+    """Resolve every declared config field by ITERATING registry.precedence (so the
+    declaration is EFFECTIVE, C1-DECLARED-PRECEDENCE / A2) into one dict, with NO
+    snapshot and NO self-capture: reads ONLY its explicit arguments and returns
+    NAMESPACED outputs, so a caller materialising lme_resolved.* / lme_enable_flags
+    never feeds an output back in.
 
-    Precedence (registry.precedence, high -> low):
-      extra_var > inventory  (both arrive in `selections`; true source in `origins`)
-        > profile            (`profile_vars`, the active profile_overlay.vars)
-        > observation        (`observations`, ONLY where field.upgrade_fallback)
-        > default            (field.default)
+    Precedence tiers + their sources are DECLARED in registry.channels; the default
+    order is extra_var > inventory > profile > observation(only where
+    field.upgrade_fallback) > default. Membership (not truthiness) selects a tier, so
+    an explicit False/0/''/[]/{} at a higher tier is honoured and an observation can
+    never overwrite it. A REQUIRED field with no value at any tier raises (fail-closed,
+    pre-mutation); an OPTIONAL field with no value is ABSENT from `resolved`.
 
-    A REQUIRED field with no value at any tier raises (fail-closed, before any
-    mutation). An OPTIONAL field with no value is ABSENT from `resolved` -- never a
-    fabricated default. Membership (not truthiness) selects a tier, so an explicit
-    False/0/'' at a higher tier is honoured and detection cannot overwrite it.
-
-    Returns {resolved, origins, enable_flags}. `enable_flags` is the subset the
-    registry marks enable_flag: true, for is_enabled()/lme_enable_flags.
-    """
-    fields = (registry or {}).get('fields') or {}
+    Returns {resolved, origins, enable_flags}. Origins are honest (A5): a
+    natively-selected value with no caller-verified finer source is labelled
+    `operator`, never falsely extra_var/inventory."""
+    fields, precedence, channels = _require_registry_shape(registry)
     profile_vars = profile_vars or {}
     selections = selections or {}
     observations = observations or {}
     origins = origins or {}
+    vocab = set(registry.get('origin_vocabulary') or (list(precedence) + [_COMBINED_OPERATOR]))
 
-    # Managed-key assert (symmetric with is_enabled()'s typo guard): a profile var
-    # that names no declared field is a YAML authoring error -- adding a field must
-    # be a registry change, not a silent new key that no schema governs.
-    unknown = [k for k in profile_vars if k not in fields]
-    if unknown:
-        raise ValueError(
-            'lme: profile declares undeclared config key(s) %r; declare them in '
-            'manifests/global.yml lme_config_registry.fields' % (sorted(unknown),))
+    # Managed-key assert (symmetric with is_enabled()'s typo guard): a profile var,
+    # selection or observation naming no declared field is an authoring error --
+    # adding a field must be a registry change, not a silent ungoverned key.
+    for label, src in (('profile', profile_vars), ('selection', selections), ('observation', observations)):
+        unknown = [k for k in src if k not in fields]
+        if unknown:
+            raise ValueError(
+                'lme: %s names undeclared config key(s) %r; declare them in '
+                'manifests/global.yml lme_config_registry.fields' % (label, sorted(unknown)))
 
     resolved = {}
     out_origins = {}
     for key, field in fields.items():
-        if key in selections:
-            value, origin = selections[key], origins.get(key, 'operator')
-        elif key in profile_vars:
-            value, origin = profile_vars[key], 'profile'
-        elif field.get('upgrade_fallback') and key in observations:
-            value, origin = observations[key], 'observation'
-        elif 'default' in field:
-            value, origin = field['default'], 'default'
-        else:
-            if field.get('required'):
-                raise ValueError(
-                    'lme: required config field %r has no value from any tier '
-                    '(extra_var/inventory/profile/observation/default)' % (key,))
-            continue  # optional + unset -> absent from resolved (intended "unset")
-        resolved[key] = _coerce_declared(value, field)
-        out_origins[key] = origin
+        found = False
+        for tier in precedence:
+            has, value = _channel_value(tier, channels, field, key, selections, profile_vars, observations)
+            if has:
+                out_origins[key] = _honest_origin(tier, channels, key, origins, vocab)
+                resolved[key] = _coerce_declared(value, field)
+                found = True
+                break
+        if not found and field.get('required'):
+            raise ValueError(
+                'lme: required config field %r has no value from any tier '
+                '(declared precedence %r)' % (key, precedence))
 
     enable_flags = {k: resolved[k] for k, f in fields.items()
                     if f.get('enable_flag') and k in resolved}
@@ -551,19 +686,54 @@ def lme_resolve_config(registry, profile_vars=None, selections=None,
 
 
 def lme_validate_config(registry, resolved):
-    """Assert a resolved config dict satisfies the registry: every required field
-    present, every present field the declared type / nullability. Returns the dict
-    unchanged on success; raises on violation. Lets a task gate resolution with
-    `resolved | lme_validate_config(registry)` before any mutation."""
-    fields = (registry or {}).get('fields') or {}
-    resolved = resolved or {}
+    """Validate an ALREADY-CANONICAL resolved dict against the registry
+    (C1-CANONICAL-VALIDATION / A3), registry-FIRST so the Jinja pipe is
+    `registry | lme_validate_config(resolved)`. Distinct from resolve-time
+    normalization: this REJECTS (never coerces) -- a bool field still holding
+    'false', a str holding a non-string, an int holding a bool, an undeclared key in
+    the resolved set, a missing required field, or a malformed/reversed registry all
+    RAISE. Returns the dict unchanged on success. The registry-shape gate makes the
+    reversed-pipe fail closed by construction rather than only by argument order."""
+    fields, _precedence, _channels = _require_registry_shape(registry)
+    resolved = resolved if isinstance(resolved, dict) else {}
+    undeclared = [k for k in resolved if k not in fields]
+    if undeclared:
+        raise ValueError('lme: resolved config has undeclared key(s) %r' % (sorted(undeclared),))
     for key, field in fields.items():
         if key not in resolved:
             if field.get('required'):
                 raise ValueError('lme: required config field %r missing from resolved set' % (key,))
             continue
-        _coerce_declared(resolved[key], field)  # raises on type / nullability violation
+        if not _canonical_ok(resolved[key], field):
+            raise ValueError(
+                'lme: resolved field %r value %r is not canonical for declared type %r '
+                '(nullable=%r)' % (key, resolved[key], field.get('type'), bool(field.get('nullable'))))
     return resolved
+
+
+def lme_config_revision(payload):
+    """Content-addressed revision id (sha256 hex) for a resolved config.
+
+    The id is a pure function of the resolution INPUTS (payload = inputs-by-tier,
+    the ordered profile chain, observations, resolved values + origins, and any
+    source/runner digests the caller folds in). Because it is content-addressed --
+    NOT HEAD+timestamp -- it is IDENTICAL across the several loader includes in one
+    playbook run (same inputs -> same id), which is what lets the early gate, the
+    rendered-membership check and the credential gate all assert one revision
+    (codex-0200). A timestamp, if recorded at all, is METADATA and is NOT part of
+    the payload. OUTPUT-ONLY: the id is never fed back as a resolution input.
+
+    Value-pure: canonical JSON (sorted keys, no whitespace) then sha256."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'), default=str)
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def lme_known_enable_flags(_ignored=None):
+    """The static KNOWN_ENABLE_FLAGS set is_enabled() guards against, as a sorted
+    list, so a DECLARATIVE case can assert it equals the registry's enable_flag keys
+    (drift enforcement without a hand-authored Python test / a 4th roster). Takes an
+    ignored arg so it can be used as a Jinja filter (`'' | lme_known_enable_flags`)."""
+    return sorted(KNOWN_ENABLE_FLAGS)
 
 
 class FilterModule(object):
@@ -572,6 +742,8 @@ class FilterModule(object):
             'strict_enable_bool': strict_enable_bool,
             'lme_resolve_config': lme_resolve_config,
             'lme_validate_config': lme_validate_config,
+            'lme_config_revision': lme_config_revision,
+            'lme_known_enable_flags': lme_known_enable_flags,
             'render_userns': render_userns,
             'userns_base': userns_base,
             'cert_owner': cert_owner,
