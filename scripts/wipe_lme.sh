@@ -305,6 +305,50 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 # --------------------------------------------------------------------------
+# 1b. Identity Serve node ingress -- W1/W2 (from C), serve/identity teardown.
+#     The lme-identity-serve.service unit (ansible/roles/identity_proxy) publishes an
+#     HTTPS Tailscale Serve on identity_proxy_serve_port (DEFAULT 443 -> "node:443")
+#     whose BACKEND is a unix socket (unix:/run/lme-identity/proxy.sock), NOT a
+#     127.0.0.1 loopback. That port is a ROLE DEFAULT, not a manifest `tailnet_ingress:`
+#     marker, so it is ABSENT from LME_SERVE_NODE_PORTS and therefore INVISIBLE to the
+#     manifest-derived serve teardown/verify:
+#       * 4a's scoped `--https=<p> off` loop never targets it (443 not in the set);
+#       * the 4c blanket reset never fires for it (4c only inspects `svc:` entries and
+#         `127.0.0.1:<p>` node backends -- a unix-socket front matches NEITHER);
+#       * 6d's residue anchors (`127.0.0.1:<p>`) can never see a unix-socket front.
+#     Net: absent this block a surviving node:<port> identity ingress is torn down by
+#     NOTHING yet the wipe still self-verifies "clean" -- a FALSE success.
+#
+#     The unit DOES match step 1's `lme*` glob, so step 1 normally stops+disables it
+#     (its ExecStop is `tailscale serve --https=<port> off`, which clears the handler).
+#     This block is the EXPLICIT belt-and-suspenders for the case step 1's enumeration
+#     misses it, and -- crucially -- it CAPTURES the deployed serve identity (port +
+#     socket) from the INSTALLED unit so 4a-bis can clear the handler by exact port and
+#     6d can residue-check the exact backend. We read the installed unit (the ACTUAL
+#     deployed identity), not current desired state, and do it HERE -- BEFORE step 3
+#     removes the unit file -- so `disable` can still read [Install] to drop the
+#     WantedBy symlink. Guarded/idempotent and non-fatal if the unit was never
+#     installed (same expected-non-fatal convention as the rest of the teardown).
+# --------------------------------------------------------------------------
+LME_IDENTITY_SERVE_UNIT="/etc/systemd/system/lme-identity-serve.service"
+LME_IDENTITY_SERVE_PORT=""
+LME_IDENTITY_SERVE_SOCK=""
+if [ -f "$LME_IDENTITY_SERVE_UNIT" ]; then
+  # `--https=<port>` off the ExecStart/ExecStop line; ` unix:<path>` off ExecStart.
+  LME_IDENTITY_SERVE_PORT=$(sed -nE 's/.*--https=([0-9]+).*/\1/p' "$LME_IDENTITY_SERVE_UNIT" | head -n1)
+  LME_IDENTITY_SERVE_SOCK=$(sed -nE 's/.*[[:space:]]unix:([^[:space:]]+).*/\1/p' "$LME_IDENTITY_SERVE_UNIT" | head -n1)
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  echo "Stopping/disabling identity Serve unit (removes the node:${LME_IDENTITY_SERVE_PORT:-443} identity ingress)..."
+  # Stop FIRST (its ExecStop clears the node serve handler while tailscaled is up),
+  # THEN disable to drop the WantedBy symlink so it cannot re-publish on next boot.
+  # Two-phase rather than `disable --now` so the stop still runs even if `disable`
+  # errors (mirrors step 1's stop-loop-then-disable-loop ordering).
+  sudo systemctl stop lme-identity-serve.service 2>/dev/null || true
+  sudo systemctl disable lme-identity-serve.service 2>/dev/null || true
+fi
+
+# --------------------------------------------------------------------------
 # 2. Stop/remove all containers, then remove volumes, secrets, images.
 #    (Keep the aggressive `rm -a` steps: LME secrets are NOT lme-prefixed --
 #    they are named elastic/wazuh/wazuh_api/kibana_system/pgvector/llm-keys
@@ -374,6 +418,16 @@ if command -v tailscale >/dev/null 2>&1; then
     sudo tailscale serve --tcp="$_p" off 2>/dev/null || true
   done
 
+  # 4a-bis. Identity Serve node ingress (W2). Remove the EXACT node:<port> HTTPS
+  #         handler the identity Serve unit published -- role-default port captured in
+  #         1b from the installed unit, NOT a manifest marker (so 4a above skipped it).
+  #         Scoped `--https=<port> off` mirrors 4a and is INDEPENDENT of whether the
+  #         unit's ExecStop fired during step 1/1b (e.g. tailscaled was momentarily down
+  #         then but is up now). Idempotent no-op if already off / never served.
+  if [ -n "$LME_IDENTITY_SERVE_PORT" ]; then
+    sudo tailscale serve --https="$LME_IDENTITY_SERVE_PORT" off 2>/dev/null || true
+  fi
+
   # 4b. Remove ONLY LME-owned Tailscale Service VIPs. Enumerate what is actually
   #     advertised, intersect with the LME name set, and clear JUST those. We never
   #     iterate-and-reset every svc:* (that is exactly what used to destroy the
@@ -425,19 +479,32 @@ if command -v tailscale >/dev/null 2>&1; then
     fi
   fi
 
-  # 4d. Revert the EGRESS leg's client preference (Finding C). tailscale_egress.yml
-  #     runs `tailscale set --accept-routes=true` (daemon pref RouteAll:true) so LME
-  #     can reach services behind tailnet subnet routers; a wipe that leaves it on
-  #     keeps the host pulling every advertised subnet route after LME is gone. Revert
-  #     it. `tailscale set` is idempotent (a no-op when already false), so we run it
-  #     unconditionally rather than add a `debug prefs` read (another failure surface)
-  #     just to gate it. NOTE: unlike the serve clears above -- which are scoped to
-  #     LME's EXACT svc/port identities -- RouteAll is a HOST-GLOBAL pref, not
-  #     LME-scoped; reverting it is correct for LME's own egress teardown but would
-  #     also drop a co-tenant's accept-routes on a shared node. The optional exit-node
-  #     (operator opt-in) is deliberately NOT touched.
-  echo "Reverting tailnet egress accept-routes (RouteAll -> false)..."
-  sudo tailscale set --accept-routes=false 2>/dev/null || true
+  # 4d. EGRESS leg client preference (Finding C) -- OPT-IN revert ONLY (co-tenant
+  #     safety; prior B3 "4d" audit). tailscale_egress.yml runs `tailscale set
+  #     --accept-routes=true` (daemon pref RouteAll:true) so LME can reach services
+  #     behind tailnet subnet routers. Unlike the serve clears above -- which are
+  #     scoped to LME's EXACT svc/port identities -- RouteAll is a HOST-GLOBAL daemon
+  #     pref, NOT LME-scoped: forcing it back to false on a SHARED node would also drop
+  #     a CO-TENANT's accept-routes and silently break their subnet reachability. LME
+  #     also cannot know the operator's pre-LME value (there is NO persisted pre-deploy
+  #     ownership ledger -- see the teardown obstruction), so it cannot "restore" the
+  #     prior setting. Therefore PRESERVE accept-routes by DEFAULT (co-tenant safe) and
+  #     revert ONLY when the operator explicitly opts in via LME_WIPE_REVERT_ACCEPT_ROUTES
+  #     (they alone know this host has no co-tenant depending on accept-routes). The
+  #     optional exit-node (operator opt-in) is deliberately NOT touched either way.
+  #     TRADE-OFF: on a DEDICATED host the default leaves RouteAll=true after the wipe
+  #     (Finding C persists there); the self-verify (step 6) does NOT gate on RouteAll,
+  #     so this changes no exit code. The correct fix -- "restore the recorded pre-deploy
+  #     value" -- needs the missing ledger.
+  case "${LME_WIPE_REVERT_ACCEPT_ROUTES:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      echo "Reverting tailnet egress accept-routes (RouteAll -> false; operator opt-in)..."
+      sudo tailscale set --accept-routes=false 2>/dev/null || true
+      ;;
+    *)
+      echo "Preserving host-global accept-routes (co-tenant safe; set LME_WIPE_REVERT_ACCEPT_ROUTES=1 to revert)..."
+      ;;
+  esac
 fi
 
 # --------------------------------------------------------------------------
@@ -593,6 +660,16 @@ if command -v tailscale >/dev/null 2>&1; then
       printf '%s\n' "$serve_status" | grep -qE "127\.0\.0\.1:${_p}([^0-9]|$)" \
         && lme_serve_residue+="127.0.0.1:${_p} (LME node serve)"$'\n'
     done
+    # Identity Serve node ingress residue (W2). Its backend is a UNIX SOCKET (captured
+    # in 1b from the installed unit), invisible to the 127.0.0.1:<port> anchors above,
+    # so match the EXACT socket path in the serve status. Only assertable when the unit
+    # existed at wipe start (its deployed identity was captured); a node serve orphaned
+    # from a PRIOR revision whose unit is already gone cannot be matched here -- an
+    # accepted limitation that the missing per-deployment ownership ledger would close.
+    if [ -n "$LME_IDENTITY_SERVE_SOCK" ] \
+       && printf '%s\n' "$serve_status" | grep -qF "$LME_IDENTITY_SERVE_SOCK"; then
+      lme_serve_residue+="identity Serve backend ${LME_IDENTITY_SERVE_SOCK} still served (node:${LME_IDENTITY_SERVE_PORT:-?})"$'\n'
+    fi
     lme_serve_residue=$(printf '%s' "$lme_serve_residue" | grep -v '^[[:space:]]*$' || true)
     [ -n "$lme_serve_residue" ] \
       && RESIDUE+=("LME tailscale serve config still present:"$'\n'"$lme_serve_residue")
