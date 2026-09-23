@@ -28,13 +28,18 @@
 #       RE-CANONICALIZED on the signer (readlink -m) and re-checked for disjointness
 #       before any write (Ansible filters ran on the controller). Failure-domain
 #       independence + canonical owner/mode are a DECLARED FACT routed to C1/B/D.
-#   [6] C-CUSTODY-CANONICAL-AND-REPRESENTATION-CONTRACT (cheap) -- an unreadable
+#   [6] C-CUSTODY-CANONICAL-AND-REPRESENTATION-CONTRACT (OPEN, C-owned) -- an unreadable
 #       contract is an UNCONDITIONAL HARD failure (the optional bypass is removed).
 #       Custody inputs are validated at THIS candidate's own entry (the required-inputs
-#       assert below), BEFORE any generation. Caller-ordering (a real caller that begins
-#       generation before the custody include) is a WIRING-TIME concern owed to C1 -- it
-#       is NOT claimed here. The shell-to-reusable-template refactor + canonical
-#       resolved-material sourcing are routed to C1/F (F reviews, does not inherit).
+#       assert below). This does NOT establish pre-generation: the actual caller
+#       (credential_materializer.yml) still orders ordinary key generation (~L335) BEFORE
+#       the custody include (~L541-565). That execution order is UNREPAIRED and BLOCKS
+#       wiring (codex-0845 C-CUSTODY-NOT-PREGENERATION). C declares its caller precondition
+#       in vars (guardian_custody_caller_contract) and OWNS closing it -- it is not a pure
+#       C1 hand-off. The shell-to-reusable-template refactor + canonical resolved-material
+#       sourcing are OWED BY C: C authors the compliant representation, F REVIEWS (does not
+#       inherit or author) -- per codex-0845 ownership_correction. Both remain OPEN and
+#       BLOCK qualification; neither is claimed done here.
 #
 # UNWIRED CANDIDATE: no caller includes this file (joint C/D review before wiring).
 # NO SECRET VALUE is read into a fact, printed, or logged: the wrapping key is passed
@@ -270,9 +275,13 @@
       # rotation (e.g. ROTATE left true in the desired config after a signer reboot wiped the
       # tmpfs runtime/marker) -- fall through to the non-rotate convergence/recovery path, which
       # still requires EXPECTED_FP to install from the durable, and NEVER mints over it. A
-      # genuine rotation (target epoch not yet sealed) leaves ROTATE=true untouched. NB: this
-      # guard assumes the epoch-bound durable design; it must be revisited under the
-      # identity-bound alternative (see the D-blocking epoch-semantics question in the sitrep).
+      # genuine rotation (target epoch not yet sealed) leaves ROTATE=true untouched. The ORIGINAL
+      # request is retained in ROTATE_REQ so branch (1) can still REFUSE a same-epoch rotation
+      # REQUEST against a fully-converged epoch rather than swallow it as a silent noop
+      # (codex-0845 C-CUSTODY-ROTATION-REQUEST-NOT-DISTINGUISHED). NB: epoch-bound-durable design
+      # is D-CONFIRMED in b7c60cd (rotation is explicit + bumps authority_epoch, prior-epoch blob
+      # refused); the leased-vs-wrapping-epoch distinction is a joint C/D reconcile (see sitrep).
+      ROTATE_REQ="$ROTATE"
       if [ "$ROTATE" = "true" ] && [ -f "$DURABLE" ] && try_decrypt "$EPOCH" "$work/rotchk"; then
         ROTATE=false; fi
 
@@ -319,6 +328,15 @@
             pubok=0
             if [ -f "$PUB" ] && [ "$(fp_of_pub "$PUB" 2>/dev/null || true)" = "$rfp" ]; then pubok=1; else publish_pub "$RUNTIME_KEY"; fi
             if [ "$mok" = 1 ] && [ "$pubok" = 1 ]; then
+              # (codex-0845 C-CUSTODY-ROTATION-REQUEST-NOT-DISTINGUISHED) a ROTATE=true request
+              # that reaches a FULLY converged epoch (marker+key+pub all agree) never advanced
+              # the epoch: it is neither an interrupted resume (nothing is unpublished, so the
+              # republish arm below did not fire) nor a real reconcile noop. REFUSE -- never a
+              # silent success (D b7c60cd: rotation is explicit and bumps authority_epoch, never
+              # a silent reapply). A reboot-stale ROTATE flag never lands here: its tmpfs marker
+              # is gone, so runtime-key-absent routes it to (2) recovery, not this noop.
+              if [ "$ROTATE_REQ" = "true" ]; then
+                receipt refuse "$rfp" rotate-request-without-epoch-advance; echo "REFUSE rotate-same-epoch-converged" >&2; exit 13; fi
               receipt noop "$rfp" verified-pair-current-epoch; exit 0; fi
             receipt republish "$rfp" reconverged-marker-or-pub; exit 0; fi
           # key present but pair-verify failed -> untrusted; fall through to durable recovery.
