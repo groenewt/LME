@@ -267,3 +267,62 @@
     - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
     - item.key not in (lme_child_absent_services | default([]))
     - (lme_host_services | default([]) | length == 0) or (item.key in (lme_host_services | default([])))
+
+# ---------------------------------------------------------------------------
+# C1 RESOLVED PROJECTIONS (codex-0430 canonical paths). lme_resolved is the SINGLE
+# validated artifact; these tasks derive its material/datastore/membership/identity
+# projections from the composed lme_services (a read-only view = lme_runtime_inventory).
+# Runs AFTER lme_services is built. The projection filters are value-pure (they compute
+# STRUCTURE from the manifests, read no secret byte). On the CURRENT manifest set 0/29
+# services declare material_requirements, so required_material is empty and every selected
+# container service is surfaced as required_material_status.<node>.<svc>.status=undeclared
+# (visible debt) -- NOT failed and NOT hidden as empty (codex-0615: no implicit-empty
+# hiding; missing_field arming is the later migration wave -- global.yml enforcement_status).
+- name: C1 -- validate the full dependency closure before activation (no unknown dep names)
+  ansible.builtin.assert:
+    that:
+      - (lme_services | lme_validate_dependency_closure) is mapping
+    fail_msg: >-
+      a service dependency names an id that resolves to NO declared manifest service (see
+      the raised lme: message). An unknown name would otherwise be silently relaxed to a
+      Wants= on an absent unit (C1-COMPLETE-CONFIGURATION-VALIDATION, dependency half).
+    quiet: true
+
+- name: C1 -- derive the per-host node id + validated stable deployment identity
+  ansible.builtin.set_fact:
+    # Node id = the per-host map key for the projections. inventory_hostname is the demo
+    # value; node-id derivation from declared inventory is D/inventory-owned (D FROZEN R2).
+    _lme_node_id: "{{ inventory_hostname }}"
+    # deployment_identity is validated HERE (shape gate) when supplied; absent -> None, so
+    # material resource_ids emit null and a persistent-resource consumer rejects until it is
+    # declared (the hard 'required' gate arms with the DB selectors).
+    _lme_deployment_identity: >-
+      {{ (lme_resolved.lme_deployment_identity | lme_validate_deployment_identity)
+         if (lme_resolved.lme_deployment_identity is defined) else None }}
+
+- name: C1 -- compose the required_material / datastore / membership projections
+  ansible.builtin.set_fact:
+    _lme_required_material_proj: >-
+      {{ lme_services | lme_project_required_material(
+           _lme_node_id,
+           lme_global.material_catalog,
+           _lme_global_file.lme_config_registry.material_requirements_schema,
+           lme_global.material_catalog_schema,
+           lme_enable_flags | default({}),
+           lme_host_services | default([]),
+           _lme_deployment_identity) }}
+    _lme_datastore_proj: >-
+      {{ lme_services | lme_project_datastore_clients(
+           _lme_node_id, lme_enable_flags | default({}), lme_host_services | default([])) }}
+    _lme_membership_proj: >-
+      {{ lme_resolved.lme_database_membership | default(None) | lme_project_database_membership }}
+
+- name: C1 -- merge the projections into the single canonical artifact lme_resolved
+  ansible.builtin.set_fact:
+    lme_resolved: >-
+      {{ lme_resolved
+         | combine(_lme_required_material_proj, recursive=True)
+         | combine(_lme_datastore_proj, recursive=True)
+         | combine(_lme_membership_proj, recursive=True)
+         | combine({'deployment_identity': _lme_deployment_identity}
+                   if _lme_deployment_identity else {}) }}

@@ -1047,6 +1047,208 @@ def lme_validate_material_requirements(catalog, obligations, schema, catalog_sch
     return obligations
 
 
+# ===========================================================================
+# RESOLVED PROJECTIONS (C1 part C/D). These derive read-only projections of the
+# validated declarations onto the canonical lme_resolved.* paths (codex-0430):
+#   lme_resolved.required_material.<node>.<svc>.<obligation>
+#   lme_resolved.hosts.<node>.resolved_services.<svc>.datastore_clients
+#   lme_resolved.database.{domains,etcd_groups}.<id>.members
+#   lme_resolved.deployment_identity
+# They are value-pure: config VALUES come from the manifests passed in; these
+# functions compute STRUCTURE only, never read a secret byte, and are the single
+# producer feeding lme_resolved (lme_runtime_inventory is a read-only view of it).
+# ===========================================================================
+
+_DEPLOYMENT_ID_RE = re.compile(r'\A[A-Za-z0-9_-]+\Z')
+
+
+def lme_validate_deployment_identity(value, context=None):
+    """DEPLOYMENT-IDENTITY-NOW-REQUIRED (codex-0430 dec 5; codex-0445). A STABLE
+    operator/inventory string: [A-Za-z0-9_-]+, never minted or derived from
+    run_id/config/hostname/directory. Missing/ill-shaped REJECTS before mutation. The
+    HARD 'required for a persistent-resource/DB profile' gate arms with the DB selectors;
+    this validates the shape wherever it is supplied. Returns the value unchanged."""
+    where = ' (%s)' % context if context else ''
+    if not isinstance(value, str) or not _DEPLOYMENT_ID_RE.match(value):
+        raise ValueError(
+            'lme: deployment_identity%s must be a stable [A-Za-z0-9_-]+ operator/inventory '
+            'string, never derived from run_id/config/hostname, got %r' % (where, value))
+    return value
+
+
+def lme_material_resource_id(deployment_identity, node, svc, obligation_id):
+    """Stable resource id for a material obligation: content-addressed over the DEPLOYMENT
+    identity + node + service + obligation id (codex-0430: tied to deployment/declared
+    resource identity, NEVER run_id/evidence run). Returns None when deployment_identity is
+    absent -- the id cannot be stably bound without it, so the obligation is emitted with a
+    null resource_id (a consumer that needs to bind storage/ownership must reject until
+    deployment_identity is declared)."""
+    if not deployment_identity:
+        return None
+    payload = [str(deployment_identity), str(node), str(svc), str(obligation_id)]
+    return hashlib.sha256(
+        json.dumps(payload, separators=(',', ':')).encode('utf-8')).hexdigest()[:32]
+
+
+def _material_evidence(svc):
+    """Structural evidence that a service BEARS material (so an undeclared/declared-none
+    service can be flagged). Reads manifest STRUCTURE only -- never a secret value."""
+    ev = []
+    if svc.get('secrets'):
+        ev.append('secrets')
+    if svc.get('certs'):
+        ev.append('certs')
+    if any(isinstance(v, dict) and str(v.get('source', '')).startswith('cert:')
+           for v in (svc.get('volumes') or [])):
+        ev.append('cert_mount')
+    return sorted(set(ev))
+
+
+def _selected_container_services(services, enable_flags, host_services):
+    """Iterate (sid, svc) for the SELECTED container services on this host -- same three
+    predicates as load_manifests GAP-5 (is_enabled -> host-scope). is_enabled runs FIRST so
+    a scoped-out service with a misspelled enabled_when is still caught loudly."""
+    for sid, svc in (services or {}).items():
+        if not isinstance(svc, dict) or svc.get('kind') != 'container':
+            continue
+        if not is_enabled(svc.get('enabled_when'), enable_flags or {}, context=sid):
+            continue
+        if host_services and sid not in host_services:
+            continue
+        yield sid, svc
+
+
+def lme_project_required_material(services, node, catalog, schema, catalog_schema,
+                                  enable_flags=None, host_services=None,
+                                  deployment_identity=None):
+    """Emit lme_resolved.required_material.<node>.<svc>.<obligation> from each SELECTED
+    container service's declared material_requirements, validated against the catalog +
+    schema. Returns:
+      {'required_material': {node: {svc: {obligation_id: validated_record}}},
+       'required_material_status': {node: {svc: {status, evidence, enabled, resource_ids?}}}}
+    status is 'declared' | 'declared_none' | 'undeclared'. A DECLARED service is validated.
+    A declared-none ({}) service that still bears material EVIDENCE FAILS (codex-0430: an
+    empty declaration cannot erase a secrets/cert obligation). An UNDECLARED service is NOT
+    failed (missing_field is not armed swarm-wide) -- it is surfaced with its structural
+    evidence (visible debt), never hidden as empty. Consumers MUST read
+    required_material_status to distinguish 'no material' from 'not yet declared'."""
+    material = {}
+    status = {}
+    for sid, svc in _selected_container_services(services, enable_flags, host_services):
+        evidence = _material_evidence(svc)
+        if 'material_requirements' not in svc:
+            status.setdefault(node, {})[sid] = {
+                'status': 'undeclared', 'evidence': evidence, 'enabled': True}
+            continue
+        obl = svc['material_requirements']
+        if obl == {} and evidence:
+            raise ValueError(
+                'lme: service %r declares material_requirements: {} (declared-none) but bears '
+                'material evidence %r -- an empty declaration cannot erase a secrets/cert '
+                'obligation (codex-0430)' % (sid, evidence))
+        refs = []
+        for _bid, binding in (svc.get('datastore_clients') or {}).items():
+            refs.extend((binding or {}).get('material_requirement_refs') or [])
+        validated = lme_validate_material_requirements(
+            catalog, obl, schema, catalog_schema,
+            referenced_ids=(refs or None), context=sid)
+        if validated:
+            material.setdefault(node, {})[sid] = validated
+        status.setdefault(node, {})[sid] = {
+            'status': ('declared_none' if not validated else 'declared'),
+            'evidence': evidence, 'enabled': True,
+            'resource_ids': {oid: lme_material_resource_id(deployment_identity, node, sid, oid)
+                             for oid in validated}}
+    return {'required_material': material, 'required_material_status': status}
+
+
+def lme_project_datastore_clients(services, node, enable_flags=None, host_services=None):
+    """Emit lme_resolved.hosts.<node>.resolved_services.<svc>.datastore_clients from each
+    selected service's declared datastore_clients (codex-0430 decision 3). Validates the
+    binding shape (domain_ref/database_ref/principal_ref/endpoint_ref required;
+    material_requirement_refs a list). Returns
+    {'hosts': {node: {'resolved_services': {svc: {'datastore_clients': {...}}}}}}."""
+    required = ('domain_ref', 'database_ref', 'principal_ref', 'endpoint_ref')
+    out = {}
+    for sid, svc in _selected_container_services(services, enable_flags, host_services):
+        clients = svc.get('datastore_clients')
+        if clients is None:
+            continue
+        if not isinstance(clients, dict):
+            raise ValueError('lme: datastore_clients for %r must be a mapping' % sid)
+        for bid, binding in clients.items():
+            if not isinstance(binding, dict):
+                raise ValueError('lme: datastore_clients %r.%r must be a mapping' % (sid, bid))
+            for f in required:
+                if not binding.get(f):
+                    raise ValueError('lme: datastore_clients %r.%r missing %r' % (sid, bid, f))
+            mrefs = binding.get('material_requirement_refs')
+            if mrefs is not None and not isinstance(mrefs, list):
+                raise ValueError('lme: datastore_clients %r.%r material_requirement_refs '
+                                 'must be a list' % (sid, bid))
+        out.setdefault(node, {}).setdefault('resolved_services', {})[sid] = {
+            'datastore_clients': clients}
+    return {'hosts': out}
+
+
+def lme_project_database_membership(membership):
+    """Emit lme_resolved.database.{domains,etcd_groups}.<id>.members from
+    lme_database_membership (codex-0430 decision 4). Validates each group's members is a
+    NON-EMPTY list of UNIQUE non-empty node-id strings (empty/dup rejected). Returns
+    {'database': {...}} ({} when absent). Membership vs the actual inventory + the selected
+    profile's HA constraints (wrong-runtime / insufficient-HA / an extra collector host not
+    joining a domain) is the DB-profile consumer's check (D); this validates the shape."""
+    if not membership:
+        return {'database': {}}
+    if not isinstance(membership, dict):
+        raise ValueError('lme: lme_database_membership must be a mapping')
+    out = {}
+    for group_kind in ('domains', 'etcd_groups'):
+        groups = membership.get(group_kind)
+        if groups is None:
+            continue
+        if not isinstance(groups, dict):
+            raise ValueError('lme: lme_database_membership.%s must be a mapping' % group_kind)
+        proj = {}
+        for gid, gval in groups.items():
+            if not isinstance(gval, dict) or 'members' not in gval:
+                raise ValueError('lme: %s.%r must declare a members list' % (group_kind, gid))
+            members = gval['members']
+            if not isinstance(members, list) or not members:
+                raise ValueError('lme: %s.%r.members must be a non-empty list' % (group_kind, gid))
+            if any(not isinstance(m, str) or not m for m in members):
+                raise ValueError('lme: %s.%r.members must be non-empty node-id strings'
+                                 % (group_kind, gid))
+            if len(set(members)) != len(members):
+                raise ValueError('lme: %s.%r.members has duplicate node ids' % (group_kind, gid))
+            proj[gid] = {'members': list(members)}
+        out[group_kind] = proj
+    return {'database': out}
+
+
+def lme_validate_dependency_closure(services, context=None):
+    """C1-COMPLETE-CONFIGURATION-VALIDATION (dependency half): every id in a service's
+    dependencies (requires/after/wants/partof/binds_to) MUST resolve to a DECLARED manifest
+    service id. An unknown name (a typo like 'elasticsarch') is rejected BEFORE activation,
+    rather than silently relaxed to a Wants= on an absent unit. Validates against the FULL
+    manifest set (a legitimate cross-host requires is relaxed to Wants by GAP-3 host-scoping
+    -- that is separate and stays valid; only names that resolve to NO manifest fail).
+    Returns the services map unchanged on success."""
+    services = services or {}
+    known = set(services.keys())
+    rel_kinds = ('requires', 'after', 'wants', 'partof', 'binds_to')
+    for sid, svc in services.items():
+        deps = (svc or {}).get('dependencies') or {}
+        for rel in rel_kinds:
+            for dep in (deps.get(rel) or []):
+                if dep not in known:
+                    raise ValueError(
+                        'lme: service %r dependencies.%s names %r which resolves to no '
+                        'declared manifest service id (known: %r)'
+                        % (sid, rel, dep, sorted(known)))
+    return services
+
+
 class FilterModule(object):
     def filters(self):
         return {
@@ -1057,6 +1259,12 @@ class FilterModule(object):
             'lme_known_enable_flags': lme_known_enable_flags,
             'lme_validate_material_requirements': lme_validate_material_requirements,
             'lme_validate_material_catalog': lme_validate_material_catalog,
+            'lme_validate_deployment_identity': lme_validate_deployment_identity,
+            'lme_material_resource_id': lme_material_resource_id,
+            'lme_project_required_material': lme_project_required_material,
+            'lme_project_datastore_clients': lme_project_datastore_clients,
+            'lme_project_database_membership': lme_project_database_membership,
+            'lme_validate_dependency_closure': lme_validate_dependency_closure,
             'render_userns': render_userns,
             'userns_base': userns_base,
             'cert_owner': cert_owner,

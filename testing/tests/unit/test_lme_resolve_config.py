@@ -82,10 +82,18 @@ def test_registry_declares_expected_shape():
     # only these two carry the observation-backed upgrade fallback
     fb = sorted(k for k, v in fields.items() if v.get("upgrade_fallback"))
     assert fb == ["install_elastic_services", "offline_mode"]
-    # exactly one optional field, and it declares NO default (absent when unset)
-    optional = [k for k, v in fields.items() if not v.get("required")]
-    assert optional == ["tailscale_require_vip_live"]
-    assert "default" not in fields["tailscale_require_vip_live"]
+    # the optional fields declare NO default (absent when unset). tailscale_require_vip_live
+    # is the original optional; lme_deployment_identity + lme_database_membership are the
+    # C1 material/identity inputs (codex-0430 dec 4+5) -- optional here, hard-required only
+    # under a persistent-resource/DB profile (armed with the still-gated DB selectors).
+    optional = sorted(k for k, v in fields.items() if not v.get("required"))
+    assert optional == sorted([
+        "tailscale_require_vip_live",
+        "lme_deployment_identity",
+        "lme_database_membership",
+    ])
+    for k in optional:
+        assert "default" not in fields[k], k
 
 
 def test_every_profile_var_key_is_declared():

@@ -1086,3 +1086,136 @@ def test_material_empty_semantics_policy_must_be_complete_and_true(policy):
     broken = {**_MAT_SCHEMA, "empty_semantics": policy}
     with pytest.raises(ValueError):
         validate_material(_MAT_CATALOG, {}, broken, _MAT_CAT_SCHEMA)
+
+
+# ===========================================================================
+# RESOLVED PROJECTIONS (C1 part C/D): required_material, datastore_clients,
+# database membership, deployment identity, dependency closure.
+# ===========================================================================
+project_required_material = FILTERS["lme_project_required_material"]
+project_datastore_clients = FILTERS["lme_project_datastore_clients"]
+project_database_membership = FILTERS["lme_project_database_membership"]
+validate_deployment_identity = FILTERS["lme_validate_deployment_identity"]
+material_resource_id = FILTERS["lme_material_resource_id"]
+validate_dependency_closure = FILTERS["lme_validate_dependency_closure"]
+
+# every enable flag on so most services are selected in the sweep
+_ALL_FLAGS = {"install_llm": True, "install_elastic_services": True, "offline_mode": False,
+              "install_otel": True, "install_legacy_beats": True}
+
+
+def _all_services_map():
+    """id -> manifest doc, as load_manifests.yml builds lme_services (no overlay)."""
+    return {doc["id"]: doc for _n, doc in _MANIFESTS if doc and "id" in doc}
+
+
+def test_projection_over_real_manifests_emits_no_declared_material_yet():
+    # 0/29 services declare material_requirements -> required_material empty, but EVERY
+    # selected container service is surfaced as status:undeclared (visible debt, not hidden).
+    services = _all_services_map()
+    out = project_required_material(services, "n1", _MAT_CATALOG, _MAT_SCHEMA,
+                                    _MAT_CAT_SCHEMA, enable_flags=_ALL_FLAGS,
+                                    deployment_identity="lmedeploy1")
+    assert out["required_material"] == {}
+    status = out["required_material_status"]["n1"]
+    assert status, "expected some selected container services"
+    assert all(v["status"] == "undeclared" for v in status.values())
+    # elasticsearch bears certs/secrets evidence -> flagged, not empty
+    assert "elasticsearch" in status
+    assert status["elasticsearch"]["evidence"]
+
+
+def test_projection_declares_and_binds_a_resource_id():
+    svc = {"id": "svcx", "kind": "container", "enabled_when": ["always"],
+           "material_requirements": _good_obligation()}
+    out = project_required_material({"svcx": svc}, "n1", _MAT_CATALOG, _MAT_SCHEMA,
+                                    _MAT_CAT_SCHEMA, deployment_identity="lmedeploy1")
+    assert out["required_material"]["n1"]["svcx"] == _good_obligation()
+    rid = out["required_material_status"]["n1"]["svcx"]["resource_ids"]["guardian_pub_proxy"]
+    assert isinstance(rid, str) and len(rid) == 32
+    assert out["required_material_status"]["n1"]["svcx"]["status"] == "declared"
+
+
+def test_projection_declared_none_with_evidence_fails():
+    svc = {"id": "svcx", "kind": "container", "enabled_when": ["always"],
+           "secrets": [{"name": "es_pw"}], "material_requirements": {}}
+    with pytest.raises(ValueError) as e:
+        project_required_material({"svcx": svc}, "n1", _MAT_CATALOG, _MAT_SCHEMA,
+                                  _MAT_CAT_SCHEMA)
+    assert "declared-none" in str(e.value)
+
+
+def test_projection_declared_none_without_evidence_is_ok():
+    svc = {"id": "svcx", "kind": "container", "enabled_when": ["always"],
+           "material_requirements": {}}
+    out = project_required_material({"svcx": svc}, "n1", _MAT_CATALOG, _MAT_SCHEMA,
+                                    _MAT_CAT_SCHEMA)
+    assert out["required_material"] == {}
+    assert out["required_material_status"]["n1"]["svcx"]["status"] == "declared_none"
+
+
+def test_material_resource_id_is_stable_and_deployment_bound():
+    a = material_resource_id("dep1", "n1", "svc", "o1")
+    assert a == material_resource_id("dep1", "n1", "svc", "o1")      # stable
+    assert a != material_resource_id("dep2", "n1", "svc", "o1")      # deployment-bound
+    assert material_resource_id(None, "n1", "svc", "o1") is None     # unbound without identity
+
+
+@pytest.mark.parametrize("ok", ["lmedeploy1", "LME-Prod_01", "a"])
+def test_deployment_identity_valid(ok):
+    assert validate_deployment_identity(ok) == ok
+
+
+@pytest.mark.parametrize("bad", ["", "has space", "has/slash", 5, None, "a.b"])
+def test_deployment_identity_invalid(bad):
+    with pytest.raises(ValueError):
+        validate_deployment_identity(bad)
+
+
+def test_project_datastore_clients_shape():
+    svc = {"id": "log-analyzer", "kind": "container", "enabled_when": ["always"],
+           "datastore_clients": {"vec": {
+               "domain_ref": "vectors", "database_ref": "lme_vectors",
+               "principal_ref": "lmedbhb", "endpoint_ref": "vectors_writer",
+               "material_requirement_refs": ["vec_pgpass"]}}}
+    out = project_datastore_clients({"log-analyzer": svc}, "n1")
+    assert out["hosts"]["n1"]["resolved_services"]["log-analyzer"]["datastore_clients"]["vec"][
+        "domain_ref"] == "vectors"
+
+
+def test_project_datastore_clients_missing_ref_fails():
+    svc = {"id": "x", "kind": "container", "enabled_when": ["always"],
+           "datastore_clients": {"vec": {"domain_ref": "vectors"}}}
+    with pytest.raises(ValueError):
+        project_datastore_clients({"x": svc}, "n1")
+
+
+def test_project_database_membership_ok_and_absent():
+    m = {"domains": {"vectors": {"members": ["graph", "trixie"]}},
+         "etcd_groups": {"vec_etcd": {"members": ["graph", "trixie", "silmaril"]}}}
+    out = project_database_membership(m)
+    assert out["database"]["domains"]["vectors"]["members"] == ["graph", "trixie"]
+    assert project_database_membership(None) == {"database": {}}
+
+
+@pytest.mark.parametrize("bad", [
+    {"domains": {"d": {"members": ["a", "a"]}}},   # duplicate
+    {"domains": {"d": {"members": []}}},           # empty
+    {"domains": {"d": {}}},                         # no members
+])
+def test_project_database_membership_rejects_bad(bad):
+    with pytest.raises(ValueError):
+        project_database_membership(bad)
+
+
+def test_dependency_closure_real_manifests_all_resolve():
+    # every requires/after/wants/partof/binds_to id in the real tree resolves to a manifest
+    assert validate_dependency_closure(_all_services_map()) == _all_services_map()
+
+
+def test_dependency_closure_unknown_name_fails():
+    svc = {"id": "x", "kind": "container",
+           "dependencies": {"requires": ["elasticsarch"]}}   # typo
+    with pytest.raises(ValueError) as e:
+        validate_dependency_closure({"x": svc})
+    assert "resolves to no declared manifest service id" in str(e.value)
