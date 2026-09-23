@@ -1,0 +1,77 @@
+---
+# =============================================================================
+# backup_lme/tasks/assert_integrity_paths.yml
+#
+# Declaration-level, fail-closed guard (codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-
+# UNVALIDATED; codex-1030 path_scope refinement). Path-NAME fields in the
+# lme_backup_integrity declaration are used to build PRIVILEGED filesystem targets: the
+# per-volume data dir and manifest file, the volumes root, the `file: state=absent`
+# deletion target for the stale certificate, and the read paths the topology probe uses.
+# A traversal ('..'), an absolute path, or an unexpected separator would let a privileged
+# create/delete/read ESCAPE the owned backup bundle.
+#
+# codex-1030: apply the SINGLE-COMPONENT rule ONLY to fields DECLARED as a single
+# component/filename (root_dir, data_dir, manifest_file, bundle_file, quadlet_payload_id).
+# Fields that MAY legitimately be a relative multi-segment path (payload_classes[].path,
+# topology quadlet_relpath) are validated for NO TRAVERSAL / NOT ABSOLUTE instead, so a
+# legitimate inventory-declared relocation is not prohibited. This is DATA validation
+# (ansible.builtin.assert): no shell body, no Python.
+#
+# NOTE (codex-1030): this module-level assert is necessary but NOT sufficient on its own --
+# a declaration proven in-scope here still needs the per-mutation runtime guard
+# (lme_assert_deletion_scope + canonical containment + outcome check) because concurrent
+# creation / symlink replacement can occur between admission and mutation (TOCTOU).
+# =============================================================================
+
+- name: Assert single-component backup-integrity path-name fields (no separator/traversal)
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.value is string
+      - item.value | length > 0
+      - "'/' not in item.value"
+      - item.value not in ['.', '..']
+    fail_msg: >-
+      backup-integrity declaration field {{ item.name }}={{ item.value | to_json }} must be a
+      single path component (no '/', not '.'/'..'). A separator or traversal here would let a
+      privileged create/delete escape the owned backup bundle. Refusing before any mutation.
+  loop:
+    - { name: 'volume_layout.root_dir',      value: "{{ lme_backup_integrity.volume_layout.root_dir }}" }
+    - { name: 'volume_layout.data_dir',      value: "{{ lme_backup_integrity.volume_layout.data_dir }}" }
+    - { name: 'volume_layout.manifest_file', value: "{{ lme_backup_integrity.volume_layout.manifest_file }}" }
+    - { name: 'certification.bundle_file',   value: "{{ lme_backup_integrity.certification.bundle_file }}" }
+    - { name: 'topology_classification.quadlet_payload_id', value: "{{ lme_backup_integrity.topology_classification.quadlet_payload_id }}" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Assert payload_classes paths are bundle-relative (no traversal, not absolute)
+  # Multi-segment relatives are permitted (legit relocation); '..' components and absolute
+  # paths are refused.
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.path is defined
+      - item.path is string
+      - item.path | length > 0
+      - not (item.path.startswith('/'))
+      - "'..' not in (item.path.split('/'))"
+    fail_msg: >-
+      backup-integrity payload_classes id={{ item.id | default('?') }} path
+      {{ item.path | default('<undef>') | to_json }} must be a bundle-relative path with no
+      '..' component and not absolute. Refusing before any mutation.
+  loop: "{{ lme_backup_integrity.payload_classes }}"
+  loop_control:
+    label: "{{ item.id | default('?') }}"
+
+- name: Assert topology quadlet_relpath is bundle-relative (no traversal, not absolute)
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - lme_backup_integrity.topology_classification.quadlet_relpath is string
+      - lme_backup_integrity.topology_classification.quadlet_relpath | length > 0
+      - not (lme_backup_integrity.topology_classification.quadlet_relpath.startswith('/'))
+      - "'..' not in (lme_backup_integrity.topology_classification.quadlet_relpath.split('/'))"
+    fail_msg: >-
+      topology_classification.quadlet_relpath
+      {{ lme_backup_integrity.topology_classification.quadlet_relpath | to_json }} must be a
+      bundle-relative path with no '..' component and not absolute.

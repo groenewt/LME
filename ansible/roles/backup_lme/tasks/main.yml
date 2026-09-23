@@ -7,6 +7,14 @@
   # via templates/content_integrity.sh.j2 (codex-0700 D-RECOVERY-REPRESENTATION-WRAPPER).
   include_vars: integrity.yml
 
+- name: Validate backup-integrity path-name fields before any privileged path is built
+  # codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED: fail closed if any declared
+  # path-name field (root_dir/data_dir/manifest_file/bundle_file/payload paths) is not a
+  # single component. Runs before the library render and before any become:yes mutation.
+  # This is the module-reachable gate for the `file: state=absent` stale-cert deletion,
+  # which no shell library guard can cover.
+  ansible.builtin.include_tasks: assert_integrity_paths.yml
+
 - name: Render the shared content-integrity library once
   # Render the macro ONCE into a fact; shell tasks then reference {{ lme_integrity_lib }}
   # (a bare var) rather than inlining lookup('template', ...). Keeping the lookup out of
@@ -148,6 +156,42 @@
         msg: "Backup cancelled due to validation failures"
       when: (not lme_dir_check.stat.exists or not containers_file_check.stat.exists or lme_service_check.failed) and 
             (not skip_prompts | default(false) and validation_override is defined and validation_override.user_input | lower != 'yes')
+
+- name: Stat the target backup generation directory before creating anything
+  # codex-0945 D-BACKUP-PRIOR-GENERATION-DESTROYED-BEFORE-REPLACEMENT: backup_timestamp has
+  # MINUTE granularity, so a same-minute re-run (or an interrupted retry) would REUSE this
+  # directory, and the downstream stale-cert removal + `rm -rf data/` would destroy the
+  # prior recoverable generation BEFORE a verified replacement is durably admitted. Detect
+  # a pre-existing generation here, before any create/delete, and refuse below.
+  ansible.builtin.stat:
+    path: "{{ backup_base_dir }}/backups/{{ backup_timestamp }}"
+  register: lme_backup_generation_dir_stat
+  become: yes
+
+- name: Refuse to overwrite an existing backup generation directory (INTERIM preservation guard)
+  # INTERIM, bounded producer-local guard (codex-1030): it PRESERVES a prior generation by
+  # refusing to reuse its dir, but it does NOT by itself close the retry / mixed-generation /
+  # interrupted-recovery findings and does NOT SUPERSEDE codex-0845 or dissolve codex-0915.
+  # A timestamp + refuse-all cannot supply the three distinctions those require, which stay
+  # OPEN and are routed to B's generation/provenance contract plus D's consumer state
+  # transitions:
+  #   (a) a COMPLETED matching owned operation verifies + reuses its admitted result;
+  #   (b) an INCOMPLETE owned operation resumes from verified state under its declared identity;
+  #   (c) FOREIGN/conflicting/unknown state refuses without destructive adoption.
+  # This refuse implements only a coarse form of (c) for the whole generation dir, aligned with
+  # manifests/ledger/backup-generation.contract.yaml (committed_is_immutable). TOCTOU: this is
+  # a stat-then-create; a concurrent creator between the stat and the dir creation is NOT
+  # excluded here -- atomic op_id admission is B-owned and OPEN. Behavior change (recorded): a
+  # same-minute re-backup now REFUSES rather than overwriting.
+  ansible.builtin.fail:
+    msg: >-
+      Backup generation directory {{ backup_base_dir }}/backups/{{ backup_timestamp }}
+      already exists. Refusing to reuse it: overwriting would destroy a prior recoverable
+      generation before a verified replacement is admitted (codex-0945
+      D-BACKUP-PRIOR-GENERATION-DESTROYED-BEFORE-REPLACEMENT). Re-run in a later minute, or
+      let the backup-generation ledger mint a fresh bundle_dir/op_id.
+  when: lme_backup_generation_dir_stat.stat.exists
+  become: yes
 
 - name: Create backup directory if it doesn't exist
   file:
@@ -594,6 +638,31 @@
     # restore verifies; a same-size single-byte change changes it. The data dir and the
     # manifest filename come from the declaration (LME_VOLUME_DATA_DIR / _MANIFEST_FILE).
 
+    # codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED (runtime, producer half):
+    # {{ item }} (a podman volume name) and backup_timestamp are Jinja-interpolated and
+    # could in principle carry a traversal, moving VOLUME_DIR out of the owned generation
+    # tree before the first mutation (this mkdir). Prove the volume name is a single
+    # component, that the generation root stays under backups/, and that VOLUME_DIR
+    # canonically stays under the generation root -- BEFORE any mkdir/rm. realpath -m is
+    # used because the generation tree may not exist yet; it still resolves any symlink in
+    # the existing prefix. These checks are explicit (no reliance on set -e).
+    case "{{ item }}" in
+      */* | "" | "." | "..")
+        echo "Refusing volume name with a path separator or traversal component: '{{ item }}'" >&2
+        exit 1 ;;
+    esac
+    _lme_backups_root="$(realpath -m -- "{{ backup_base_dir }}/backups")"
+    _lme_gen_root="$(realpath -m -- "{{ backup_base_dir }}/backups/{{ backup_timestamp }}")"
+    case "$_lme_gen_root/" in
+      "$_lme_backups_root"/*) : ;;
+      *) echo "Refusing generation root '$_lme_gen_root' outside '$_lme_backups_root' (bad backup_timestamp?)" >&2; exit 1 ;;
+    esac
+    _lme_vdir_rp="$(realpath -m -- "$VOLUME_DIR")"
+    case "$_lme_vdir_rp/" in
+      "$_lme_gen_root"/*) : ;;
+      *) echo "Refusing VOLUME_DIR '$_lme_vdir_rp' outside the owned generation root '$_lme_gen_root'" >&2; exit 1 ;;
+    esac
+
     # Create volume backup directory
     mkdir -p "$VOLUME_DIR"
 
@@ -631,8 +700,25 @@
       # Clear any pre-existing data/ from a reused backup dir FIRST so cp writes a fresh
       # copy of the CURRENT source (cp -a merges into an existing tree, which would let
       # prior-generation since-deleted files survive and be certified as current).
+      # Fail-closed scope guard (codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED):
+      # prove the deletion target canonically resolves to $VOLUME_DIR/<data_dir> and nothing
+      # else before this privileged rm. (Generation-immutability already refuses a reused
+      # generation dir up front, so on a fresh run this data/ does not pre-exist; the guard
+      # is defense-in-depth against a symlinked/escaping target.)
+      lme_assert_deletion_scope "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" "$VOLUME_DIR" "$LME_VOLUME_DATA_DIR" || {
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} refused: data-dir deletion target failed the scope guard; no manifest written" >&2
+        exit 1
+      }
       rm -rf "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
       mkdir -p "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
+      # Outcome check (codex-1030): proving the target was in-scope does not prove the clear+
+      # create actually succeeded. Require the data dir to now exist AND be empty before cp.
+      if [ ! -d "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" ] || [ -n "$(ls -A "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" 2>/dev/null)" ]; then
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} clear/create outcome check failed (data dir missing or not empty after clear); no manifest written" >&2
+        exit 1
+      fi
       {{ cp_preserve_cmd }} "$VOLUME_PATH/." "$VOLUME_DIR/$LME_VOLUME_DATA_DIR/"
       if [ $? -eq 0 ]; then
         # Write the SOURCE manifest and FAIL the volume (no manifest -> restore refuses)
@@ -658,8 +744,22 @@
       echo "Volume {{ item }} is empty, creating empty data directory"
       # Clear any retained data from a reused backup dir so the empty manifest never
       # certifies STALE payload from a prior generation as a successful empty backup.
+      # Fail-closed scope guard (codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED):
+      # same canonical-containment proof as the non-empty branch before this privileged rm.
+      lme_assert_deletion_scope "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" "$VOLUME_DIR" "$LME_VOLUME_DATA_DIR" || {
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} refused: data-dir deletion target failed the scope guard; no manifest written" >&2
+        exit 1
+      }
       rm -rf "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
       mkdir -p "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
+      # Outcome check (codex-1030): the data dir must now exist AND be empty before the
+      # empty-manifest write, proving the clear+create actually took effect.
+      if [ ! -d "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" ] || [ -n "$(ls -A "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" 2>/dev/null)" ]; then
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} clear/create outcome check failed (empty branch); no manifest written" >&2
+        exit 1
+      fi
       # Empty volume: manifest over the (empty) data dir records 0 files / 0 bytes,
       # so restore verifies expected-empty instead of treating empty as torn. Fail the
       # volume (no manifest) if even that manifest cannot be written.

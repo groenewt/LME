@@ -44,6 +44,12 @@
       # cannot drift (codex-0700 D-RECOVERY-REPRESENTATION-WRAPPER).
       include_vars: roles/backup_lme/vars/integrity.yml
 
+    - name: Validate backup-integrity path-name fields before any privileged path is built
+      # codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED: the same single-component
+      # gate the producer runs, applied on the restore side before any path is built from the
+      # declaration and before the first destructive step.
+      ansible.builtin.include_tasks: roles/backup_lme/tasks/assert_integrity_paths.yml
+
     - name: Render the shared content-integrity library once
       # Bare {{ lme_integrity_lib }} in the shell tasks below (not an inline lookup)
       # keeps split_args happy in the large restore shell scalars.
@@ -278,34 +284,83 @@
     - name: Detect Elasticsearch topology reflected in backup bundle
       shell: |
         set -euo pipefail
-        if [ -f "{{ selected_backup_dir }}/cluster_recovery_note.txt" ]; then
-          echo "cluster"
-          exit 0
-        fi
-        # backup_lme stores quadlets under etc_containers_systemd; tarball layouts may use etc/containers/systemd
-        if [ -f "{{ selected_backup_dir }}/etc_containers_systemd/lme-elasticsearch.container" ]; then
-          f="{{ selected_backup_dir }}/etc_containers_systemd/lme-elasticsearch.container"
-        elif [ -f "{{ selected_backup_dir }}/etc/containers/systemd/lme-elasticsearch.container" ]; then
-          f="{{ selected_backup_dir }}/etc/containers/systemd/lme-elasticsearch.container"
+        {{ lme_integrity_lib }}
+        BD="{{ selected_backup_dir }}"
+        CERT="$BD/$LME_BUNDLE_CERT_FILE"
+        # codex-0930 D-RESTORE-UNCERTIFIED-CLASSIFICATION-INPUTS: this probe steers the
+        # DESTRUCTIVE ES-volume restore decision (restore_es_volumes below), so it derives
+        # topology ONLY from CERTIFIED content. etc_containers_systemd is a REQUIRED certified
+        # tree already content-verified by the pre-mutation gate above, so the archived
+        # elasticsearch quadlet is trustworthy. The former uncertified inputs are removed as
+        # authorities: (a) the root-level cluster_recovery_note.txt short-circuit and (b) the
+        # etc/containers/systemd fallback path -- either could flip ES-volume selection without
+        # changing a certified digest.
+        # codex-1015 D-RESTORE-TOPOLOGY-DECLARATION-DIVERGENCE: the quadlet payload/path, the
+        # single-node marker and the note payload id/path are DECLARED in vars/integrity.yml
+        # (topology_classification) and consumed here as LME_TOPO_* exports -- NOT hardcoded --
+        # so a portable/relocated archive changes them in one place.
+        Q="$BD/$LME_TOPO_QUADLET_PAYLOAD/$LME_TOPO_QUADLET_RELPATH"
+        if [ -f "$Q" ] && grep -qF "$LME_TOPO_SINGLE_NODE_MARKER" "$Q"; then
+          TOPO="single-node"
+        elif [ -f "$Q" ]; then
+          TOPO="cluster"
         else
-          f=""
+          # codex-1015 D-RESTORE-UNKNOWN-TOPOLOGY-ENABLES-DESTRUCTIVE-RESTORE: a certified tree
+          # need not contain the quadlet, and 'unknown' is NOT proof of single-node. We report
+          # 'unknown' here; the DESTRUCTIVE ES-volume decision ("Resolve restore_es_volumes")
+          # REFUSES on unknown rather than defaulting to restore. Never treat absent evidence
+          # as affirmative restoration permission.
+          TOPO="unknown"
         fi
-        if [ -z "$f" ] || [ ! -f "$f" ]; then
-          echo "unknown"
-        elif grep -qF 'discovery.type=single-node' "$f"; then
-          echo "single-node"
-        else
-          echo "cluster"
+        # The cluster note is a certifiable OPTIONAL payload; backup_lme writes it ONLY in
+        # cluster mode. If present it MUST be certified AND agree with the certified quadlet;
+        # a planted/uncertified note (the gate tolerates an absent OPTIONAL payload, so the
+        # gate alone does not catch this) or a disagreeing note FAILS CLOSED (exit 9). Both the
+        # note path and its certificate payload id are declaration-derived (LME_TOPO_*).
+        NOTE="$BD/$LME_TOPO_NOTE_PATH"
+        if [ -e "$NOTE" ]; then
+          if ! grep -qE "^payload=${LME_TOPO_NOTE_ID}\|kind=file\|" "$CERT"; then
+            echo "REFUSE: ${LME_TOPO_NOTE_PATH} present but NOT in the bundle certification (uncertified restore-steering input); refusing before the destructive ES-volume decision." >&2
+            exit 9
+          fi
+          if [ "$TOPO" != "cluster" ]; then
+            echo "REFUSE: certified ${LME_TOPO_NOTE_PATH} disagrees with the certified elasticsearch quadlet topology ('$TOPO'); refusing." >&2
+            exit 9
+          fi
         fi
+        echo "$TOPO"
       args:
         executable: /bin/bash
       register: restore_backup_es_mode_probe
       changed_when: false
 
-    - name: Resolve restore_es_volumes when set to automatic default
+    - name: Refuse the automatic ES-volume decision on unknown/ambiguous topology (fail-closed)
+      # codex-1015 D-RESTORE-UNKNOWN-TOPOLOGY-ENABLES-DESTRUCTIVE-RESTORE: restoring ES data
+      # volumes is DESTRUCTIVE (destroy+recreate the live ES volumes). The automatic default
+      # must act ONLY on AFFIRMATIVE certified topology. If the probe could not affirmatively
+      # classify (topology 'unknown', or the required quadlet evidence was absent), refuse
+      # rather than defaulting -- absence of evidence is never restoration permission. The
+      # operator can still set restore_es_volumes explicitly (true/false) to proceed.
+      ansible.builtin.fail:
+        msg: >-
+          Backup topology could not be affirmatively classified (probe
+          '{{ restore_backup_es_mode_probe.stdout | trim }}'). The Elasticsearch data-volume
+          restore decision is destructive; refusing to default it. Set restore_es_volumes
+          explicitly to true or false for this backup, or restore a backup whose certified
+          elasticsearch quadlet affirmatively declares its topology.
+      when:
+        - restore_es_volumes | string | lower == 'auto'
+        - (restore_backup_es_mode_probe.stdout | trim) not in ['single-node', 'cluster']
+
+    - name: Resolve restore_es_volumes from affirmative topology only
+      # single-node => ES data lives in the volumes, restore them; cluster => ES data lives in
+      # snapshots (not these volumes), skip volume restore. 'unknown' never reaches here (the
+      # fail above stops it), so the destructive default is only ever taken on positive evidence.
       set_fact:
-        restore_es_volumes: "{{ (restore_backup_es_mode_probe.stdout | trim) != 'cluster' }}"
-      when: restore_es_volumes | string | lower == 'auto'
+        restore_es_volumes: "{{ (restore_backup_es_mode_probe.stdout | trim) == 'single-node' }}"
+      when:
+        - restore_es_volumes | string | lower == 'auto'
+        - (restore_backup_es_mode_probe.stdout | trim) in ['single-node', 'cluster']
 
     - name: Display restore mode
       debug:

@@ -44,6 +44,17 @@ LME_MF_COUNT="{{ bi.manifest_fields.count }}"
 LME_MF_BYTES="{{ bi.manifest_fields.bytes }}"
 LME_MF_LISTING="{{ bi.manifest_fields.listing }}"
 LME_MF_CONTENT="{{ bi.manifest_fields.content }}"
+# Topology-classification signals (codex-1015 D-RESTORE-TOPOLOGY-DECLARATION-DIVERGENCE):
+# DECLARED in vars/integrity.yml topology_classification and exported so the restore probe
+# CONSUMES them instead of hardcoding the quadlet path/marker/note id. LME_TOPO_NOTE_PATH is
+# DERIVED from the note payload's OWN payload_classes entry (single source; not restated).
+{% set _lme_note = (bi.payload_classes | selectattr('id', 'equalto', bi.topology_classification.note_payload_id) | list | first) -%}
+LME_TOPO_QUADLET_PAYLOAD="{{ bi.topology_classification.quadlet_payload_id }}"
+LME_TOPO_QUADLET_RELPATH="{{ bi.topology_classification.quadlet_relpath }}"
+LME_TOPO_SINGLE_NODE_MARKER="{{ bi.topology_classification.single_node_marker }}"
+LME_TOPO_NOTE_ID="{{ bi.topology_classification.note_payload_id }}"
+LME_TOPO_NOTE_PATH="{{ _lme_note.path }}"
+LME_TOPO_REQUIRE_EVIDENCE="{{ 'yes' if bi.topology_classification.require_affirmative_evidence | default(true) else 'no' }}"
 # Fail-closed on an under-declared contract: a missing volume_layout key would render
 # to an empty string (plain jinja2 emits "" for a missing attribute), turning
 # "$root/$LME_VOLUME_ROOT" into "$root/" (every payload tree read as an uncertified
@@ -59,7 +70,31 @@ LME_MF_CONTENT="{{ bi.manifest_fields.content }}"
   "${LME_MF_COUNT:?content_integrity: manifest_fields.count missing from declaration}" \
   "${LME_MF_BYTES:?content_integrity: manifest_fields.bytes missing from declaration}" \
   "${LME_MF_LISTING:?content_integrity: manifest_fields.listing missing from declaration}" \
-  "${LME_MF_CONTENT:?content_integrity: manifest_fields.content missing from declaration}"
+  "${LME_MF_CONTENT:?content_integrity: manifest_fields.content missing from declaration}" \
+  "${LME_TOPO_QUADLET_PAYLOAD:?content_integrity: topology_classification.quadlet_payload_id missing from declaration}" \
+  "${LME_TOPO_QUADLET_RELPATH:?content_integrity: topology_classification.quadlet_relpath missing from declaration}" \
+  "${LME_TOPO_SINGLE_NODE_MARKER:?content_integrity: topology_classification.single_node_marker missing from declaration}" \
+  "${LME_TOPO_NOTE_ID:?content_integrity: topology_classification.note_payload_id missing from declaration}" \
+  "${LME_TOPO_NOTE_PATH:?content_integrity: note payload path not resolvable from payload_classes}"
+
+# codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED (library-source-time half): the
+# `:?` guards above only prove NON-NULL. A path-name field that renders to a value with a
+# path separator or a traversal component (e.g. data_dir: ../other, bundle_file: ../../x)
+# would still pass `:?` and then be used to build a privileged rm target that escapes the
+# owned bundle. These fields are declared as SINGLE path components; assert that here, at
+# source time, BEFORE any function can build a target. Fail-closed: an offending value
+# aborts the sourcing shell (exit 1) before any mutation. The declaration-level Ansible
+# `assert` in tasks/assert_integrity_paths.yml is the PRIMARY, module-reachable gate (it
+# also covers `file: state=absent` on certification.bundle_file, which no shell can guard);
+# this is defense-in-depth on the shell side and is what the unit harness exercises.
+for _lme_pn in "$LME_VOLUME_ROOT" "$LME_VOLUME_DATA_DIR" "$LME_VOLUME_MANIFEST_FILE" "$LME_BUNDLE_CERT_FILE"; do
+  case "$_lme_pn" in
+    */* | "" | "." | "..")
+      echo "content_integrity: refusing declaration path-name field that is not a single component: '$_lme_pn'" >&2
+      exit 1 ;;
+  esac
+done
+unset _lme_pn
 
 lme_tree_payloads=()
 lme_file_payloads=()
@@ -69,6 +104,31 @@ lme_tree_payloads+=( "{{ p.id }}|{{ p.path }}|{{ 'opt' if p.optional | default(f
 {% for p in bi.payload_classes if p.kind == 'file' -%}
 lme_file_payloads+=( "{{ p.id }}|{{ p.path }}|{{ 'opt' if p.optional | default(false) else 'req' }}" )
 {% endfor %}
+# Fail-closed pre-deletion scope guard (codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-
+# UNVALIDATED, runtime half): before any privileged `rm -rf` of a resolved TARGET, prove
+# the target canonically equals OWNED_PARENT/LEAF and nothing else -- rejecting a traversal
+# leaf, absolute injection, and symlink escape. OWNED_PARENT must already exist (the
+# producer mkdir's the volume dir first); TARGET may not exist yet, so it is canonicalized
+# with `realpath -m`, which still resolves any symlink present in the existing prefix (so a
+# data/ that is a symlink to /etc resolves out of scope and is REFUSED). Returns non-zero
+# on any doubt; it NEVER widens scope, it only refuses. The caller fails the volume and
+# writes no manifest on a non-zero return.
+lme_assert_deletion_scope() {
+  local target="$1" owned_parent="$2" leaf="$3" rp_parent rp_target
+  case "$leaf" in
+    */* | "" | "." | "..")
+      echo "lme_assert_deletion_scope: leaf is not a single component: '$leaf'" >&2; return 1 ;;
+  esac
+  rp_parent="$(realpath -e -- "$owned_parent" 2>/dev/null)" \
+    || { echo "lme_assert_deletion_scope: owned parent does not resolve: '$owned_parent'" >&2; return 1; }
+  rp_target="$(realpath -m -- "$target" 2>/dev/null)" \
+    || { echo "lme_assert_deletion_scope: target does not resolve: '$target'" >&2; return 1; }
+  if [ "$rp_target" != "$rp_parent/$leaf" ]; then
+    echo "lme_assert_deletion_scope: REFUSING deletion outside owned scope: target resolves to '$rp_target', expected '$rp_parent/$leaf'" >&2
+    return 1
+  fi
+  return 0
+}
 # Content digest over a directory subtree: binds each relative path to its file
 # CONTENT hash (or symlink target), NUL-safe (no variable capture of the NUL stream),
 # LC_ALL=C ordered so a cluster tarball restored on another host still matches.
@@ -274,7 +334,7 @@ lme_bundle_certify() {
   # dir silently omit volumes; podman volume names carry no newline so line-reading is safe).
   if [ -d "$root/$LME_VOLUME_ROOT" ]; then
     local cert_voldirs
-    cert_voldirs="$(find "$root/$LME_VOLUME_ROOT" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)" \
+    cert_voldirs="$( set -o pipefail; find "$root/$LME_VOLUME_ROOT" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort )" \
       || { echo "CERTIFY-REFUSED: cannot enumerate $root/$LME_VOLUME_ROOT" >&2; rm -f "$tmp"; return 1; }
     while IFS= read -r vdir; do
       [ -n "$vdir" ] || continue
@@ -415,7 +475,7 @@ lme_bundle_verify() {
 
   if [ -d "$vroot" ]; then
     local ondisk_voldirs
-    ondisk_voldirs="$(find "$vroot" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)" \
+    ondisk_voldirs="$( set -o pipefail; find "$vroot" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort )" \
       || { echo "VERIFY-REFUSED(2): cannot enumerate $vroot" >&2; return 2; }
     while IFS= read -r d; do
       [ -n "$d" ] || continue
