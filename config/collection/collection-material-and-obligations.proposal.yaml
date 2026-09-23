@@ -70,6 +70,29 @@ e_material_catalog_definitions:
     kind: password_file
     payload_validity: non_empty_password
     description: The `kibana_system` service-account password.
+  # --- server LEAF certificates (public half; kind certificate -> distributable). Each ES/
+  #     Kibana/Fleet server presents its own leaf; the PRIVATE key half is the non-distributable
+  #     *_tls_key def below + consumer_local_tls_key_obligations. Grounded in the service
+  #     manifests' ssl.certificate settings (E-PROPOSAL-INCOMPLETE-TLS-OBLIGATIONS: CA-only was
+  #     an INCOMPLETE closure -- a TLS server needs CA-trust + leaf-cert + leaf-key). owner:C
+  #     (ratification), same as lme_internal_ca. -----------------------------------------------
+  elasticsearch_cert:
+    owner: C
+    kind: certificate
+    payload_validity: non_empty_pem_certificate
+    description: >-
+      elasticsearch.crt (+ elasticsearch.chain.pem for the HTTP endpoint) -- ES's server leaf,
+      workspace-local (setup-certs). manifest xpack.security.{http,transport}.ssl.certificate.
+  kibana_cert:
+    owner: C
+    kind: certificate
+    payload_validity: non_empty_pem_certificate
+    description: kibana.crt -- Kibana's server leaf (B4 cert:kibana bundle). manifest SERVER_SSL_CERTIFICATE.
+  fleet_server_cert:
+    owner: C
+    kind: certificate
+    payload_validity: non_empty_pem_certificate
+    description: fleet-server.crt -- Fleet server leaf (B4 cert:fleet-server bundle). manifest FLEET_SERVER_CERT.
   # --- E-OWNED telemetry / app material -------------------------------------
   # GROUNDED in manifests/services/lme-otel-collector.yml: `secrets: [{name:
   # otel_elastic_api_key, type: mount, target: /run/secrets/otel-elastic-api-key}]` --
@@ -126,6 +149,14 @@ service_obligations:
         placement_class: env          # -> KIBANA_PASSWORD / ELASTICSEARCH_PASSWORD env
         consumer: lme-elasticsearch
         profile_condition: always
+      elasticsearch_leaf_cert:
+        material_ref: elasticsearch_cert
+        placement_class: mount        # workspace-local leaf; ES presents it on http (chain.pem) + transport (.crt)
+        consumer: lme-elasticsearch
+        destination: certs/elasticsearch/elasticsearch.crt   # manifest xpack.security.transport.ssl.certificate; http uses elasticsearch.chain.pem (same leaf, chain sibling)
+        owner_role: elasticsearch
+        mode: "0644"                  # init-setup.sh:73 (non-key workspace files chmod 644)
+        profile_condition: always
       # NB: ES is the CA producer + TLS terminator -- it mounts the SHARED lme_certs
       # workspace (manifest: "NOT a B4 per-service-bundle consumer"), so its ca.crt, leaf
       # cert and private key are all HOST-LOCAL (setup-certs), NOT a distributed placement.
@@ -148,6 +179,14 @@ service_obligations:
         owner_role: kibana
         mode: "0644"
         profile_condition: always
+      kibana_leaf_cert:
+        material_ref: kibana_cert
+        placement_class: mount        # Kibana's server leaf (B4 cert:kibana bundle)
+        consumer: lme-kibana
+        destination: config/certs/kibana/kibana.crt   # manifest SERVER_SSL_CERTIFICATE
+        owner_role: kibana
+        mode: "0644"                  # published bundle .crt install -m 0644
+        profile_condition: always
     datastore_clients:
       elasticsearch:
         domain_ref: lme-elasticsearch
@@ -169,6 +208,14 @@ service_obligations:
         destination: /certs/ca/ca.crt   # grounded: manifest FLEET_CA=/certs/ca/ca.crt, cert:fleet-server -> /certs
         owner_role: fleet-server
         mode: "0644"
+        profile_condition: always
+      fleet_server_leaf_cert:
+        material_ref: fleet_server_cert
+        placement_class: mount        # Fleet's server leaf (B4 cert:fleet-server bundle)
+        consumer: lme-fleet-server
+        destination: /certs/fleet-server/fleet-server.crt   # manifest FLEET_SERVER_CERT
+        owner_role: fleet-server
+        mode: "0644"                  # published bundle .crt install -m 0644
         profile_condition: always
     datastore_clients:
       elasticsearch:
@@ -235,10 +282,17 @@ consumer_local_tls_key_obligations:
   e_owed_at_fold:
     # fleet-server is E's service and C did NOT author its local obligation, so E authors
     # fleet_server_tls_key_local under C's local_host form at the joint fold (do NOT drop it --
-    # security_boundary: a required consumer-local key obligation is never deleted). Mirror of
-    # C's kibana_tls_key_local: production=local_host, producer_ref=setup-certs,
-    # placement_class=secrets, consumer=fleet-server, profile_condition=install_elastic_services,
-    # destination=/certs/fleet-server/fleet-server.key, owner_role=fleet-server, mode="0640".
+    # security_boundary: a required consumer-local key obligation is never deleted). Shape:
+    # production=local_host, producer_ref=setup-certs, placement_class=secrets,
+    # consumer=fleet-server, destination=/certs/fleet-server/fleet-server.key,
+    # owner_role=fleet-server, mode="0640" (fleet-server is a B4 bundle consumer; bundle key
+    # is `install -m 0640`, main.yml:216).
+    # profile_condition=ALWAYS -- NOT install_elastic_services. lme-fleet-server is
+    # enabled_when:[always] (manifests/services/lme-fleet-server.yml:16), so gating its TLS
+    # key on install_elastic_services (default false) would DROP the obligation on a default
+    # profile while the service still runs -- a TLS-admission loosening (constraint 5). This
+    # is the SAME correction routed to C for elasticsearch_tls_key_local / kibana_tls_key_local
+    # (both services are also enabled_when:[always]).
     - fleet_server_tls_key_local
   produced_by: setup-certs (host-local; lme_certs workspace / B4 per-service bundle)
   keys:
@@ -247,12 +301,18 @@ consumer_local_tls_key_obligations:
     - {service: fleet-server,  material_def: fleet_server_tls_key,  in_container_path: /certs/fleet-server/fleet-server.key,          owner_role: fleet-server,  authored_by: E_OWED (see e_owed_at_fold)}
   requirement: >-
     Each key MUST be present, host-local, owned by the cert-owner uid the manifest `certs:`
-    block derives (lme_manifests.cert_owner). VERIFIED modes from ansible/roles/certs/tasks/
-    main.yml: the setup-certs WORKSPACE key is mode 0600 (main.yml:155); the PUBLISHED B4
-    per-service bundle key is mode 0640 (main.yml:216, `install -m 0640 <svc>.key`). The key
-    MUST NOT be distributed and MUST NOT be dropped to make the distributable-kind restriction
-    pass. ca/ca.crt is published 0644 (main.yml:204) and the CA PRIVATE key ca/ca.key is NEVER
-    copied out of the workspace (main.yml:167).
+    block derives (lme_manifests.cert_owner). MODES RE-VERIFIED 2026-09-23 from PRIMARY source
+    (an earlier draft mis-cited main.yml:155, which is the cert-bundle TARBALL push, not a key):
+    the setup-certs WORKSPACE leaf key (elasticsearch/kibana/fleet-server .key) is mode 0640,
+    owned elasticsearch:elasticsearch -- config/setup/init-setup.sh:72
+    (`find ... -name '*.key' -exec chmod 640`) + :69 (chown -R elasticsearch); the PUBLISHED B4
+    per-service bundle key is ALSO mode 0640 (ansible/roles/certs/tasks/main.yml:216,
+    `install -m 0640 <svc>.key`). So C's elasticsearch_tls_key_local mode 0640 is CORRECT for the
+    workspace leaf key -- NOT a mismatch. The ONLY 0600 key is the CA SIGNING key ca/ca.key,
+    chowned OFF the elasticsearch uid to userns-root 0:0 and chmod 0600 (init-setup.sh:83-86) so
+    the ES service process cannot read it (CA-MITM carve-out); ca/ca.key is NEVER distributed or
+    published (main.yml:219, `find ... -name 'ca.key' -delete`). The service leaf key MUST NOT be
+    distributed and MUST NOT be dropped to make the distributable-kind restriction pass.
 
 # ---------------------------------------------------------------------------
 # 4. cluster_uuid DISPOSITION (P3). cluster_uuid is CREATED by Elasticsearch at bootstrap
@@ -321,6 +381,52 @@ residuals:
     owner: E (authors) + C (defs)
 
 # ---------------------------------------------------------------------------
+# 5b. CODEX 0730 AUDIT DISPOSITION (codex-independent-custody-and-entrypoint-evidence-
+#     20260923-0730, collection_proposal findings against the pre-fix commit 98f7bb9).
+#     This file is the CURRENT source; several findings were already repaired after 98f7bb9.
+# ---------------------------------------------------------------------------
+codex_0730_audit_disposition:
+  - id: E-PROPOSAL-OTEL-CONSUMER-CONTRACT-MISMATCH
+    status: RESOLVED_POST_98f7bb9
+    detail: >-
+      The pre-fix version bound otel to principal `elastic` + CA /etc/certs/ca/ca.crt with a
+      CA-only obligation. CURRENT (this file): principal_ref otel_elastic_api_key (scoped
+      write-only key), CA destination /certs/ca/ca.crt, plus the scoped API-key mount at
+      /run/secrets/otel-elastic-api-key. Re-verified against config/otel-collector.yml:26-27,49,66
+      + manifest lme-otel-collector.yml secrets/certs -- exact match; NO superuser fallback.
+  - id: E-PROPOSAL-INCOMPLETE-TLS-OBLIGATIONS
+    status: RESOLVED
+    detail: >-
+      Added server leaf-cert catalog defs (elasticsearch_cert/kibana_cert/fleet_server_cert,
+      kind certificate) + a leaf-cert mount obligation per TLS server (grounded in each
+      manifest's ssl.certificate path). Closure is now CA-trust + leaf-cert + host-local
+      leaf-key (consumer_local_tls_key_obligations). The private-key half stays a
+      non-distributable local obligation (C's local_host form) -- NOT deleted to pass the
+      distributable restriction (security_boundary).
+  - id: E-PROPOSAL-UNRESOLVED-DATASTORE-REFERENCES
+    status: ROUTED
+    detail: same as residual ENDPOINT-REF-RESOLUTION -- endpoint_ref/domain_ref/principal_ref are
+      shape-valid but resolve against no canonical endpoint/trust registry yet. Owner C1 (registry) + E (bindings).
+  - id: E-PROPOSAL-OBSERVATION-ADMISSION
+    status: SHAPE_CORRECT_LIVE_SOURCE_OWED_BY_C1
+    detail: >-
+      Codex's claim "removing the default alone leaves a supplied observation absent" was against
+      the pre-fix field (which also lacked upgrade_fallback). CURRENT field carries
+      upgrade_fallback:true, so the observation CHANNEL admits it -- PROVEN by the real
+      lme_resolve_config double-test (with observation -> origin=observation; see verification).
+      What remains owed is the LIVE observation SOURCE (what supplies the observed cluster_uuid to
+      the loader at resolve time) -- a C1 registry/loader concern, correctly routed, not an E hand-set.
+    owner: C1
+  - id: E-PROPOSAL-CATALOG-FOLD-METADATA
+    status: DOCUMENTED
+    detail: >-
+      The `owner:` annotation is NOT a catalog schema field; the fold MUST strip it (a literal fold
+      fails lme_validate_material_catalog on an undeclared field). Documented in the section-1 FOLD
+      NOTE + the CATALOG-DEF-FOLD-DEDUP residual; the verification harness strips `owner:` before
+      validating (11 merged defs pass). The mechanical strip+dedup step is C1's at fold time.
+    owner: E (annotation) + C1 (fold step)
+
+# ---------------------------------------------------------------------------
 # 6. VERIFICATION (schema-validated proposal, NOT wired / NOT deploy-qualified).
 # ---------------------------------------------------------------------------
 verification:
@@ -336,8 +442,11 @@ verification:
     lme_project_datastore_clients(<container-shaped svcs>), and lme_resolve_config for the
     cluster_uuid field. Harness (not wired, scratchpad-only): validate_proposal.py.
   result: >-
-    PASS. catalog: 8 defs valid (7 E + guardian_public_key). material_requirements valid,
-    obligation counts: elasticsearch(2) / kibana(2) / fleet-server(2) / otel-collector(2).
+    PASS. catalog: 11 defs valid (10 E + guardian_public_key). material_requirements valid,
+    obligation counts: elasticsearch(3) / kibana(3) / fleet-server(3) / otel-collector(2) -- each
+    TLS-server service now carries the COMPLETE closure (CA-trust where distributed + server
+    leaf-cert obligation + the host-local private-key obligation in
+    consumer_local_tls_key_obligations); otel is a pure ES client (CA + scoped API key, no leaf).
     datastore_clients: projected -- 3 client services bound (kibana, fleet-server, otel-collector;
     ES declares {} as the datastore, not a client); every material_requirement_ref resolves to a
     same-service obligation id. cluster_uuid double-test through the REAL lme_resolve_config:
