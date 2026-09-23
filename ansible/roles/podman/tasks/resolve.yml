@@ -87,13 +87,35 @@
     _lme_sel_keys: "{{ _lme_reg_keys | select('in', vars) | list }}"
   when: _lme_operator_selections is not defined
 
+# C1-CONFLICTING-INPUT-PRECEDENCE. Before composing, REJECT the ambiguous case where the
+# pristine operator capture (native extra-var/inventory precedence already chose this
+# winner) and a caller-normalized lme_inputs.selections DISAGREE on a key. Previously the
+# caller value combined ON TOP, so a lower-tier namespaced install_llm=true silently
+# overwrote a captured extra-var install_llm=false in the resolver while Ansible's bare
+# extra-var stayed false -- split-brain. Agreeing keys are fine; only a genuine value
+# disagreement (unestablishable provenance) fails here. Removal condition: B/E normalize
+# their entrypoints to set lme_inputs.selections themselves (then the pristine capture is
+# redundant, not conflicting).
+- name: Reject conflicting operator vs namespaced selection (C1-CONFLICTING-INPUT-PRECEDENCE)
+  ansible.builtin.assert:
+    that:
+      - (_lme_operator_selections | lme_selection_conflicts(lme_inputs.selections | default({}))) | length == 0
+    fail_msg: >-
+      config selection conflict on {{ _lme_operator_selections | lme_selection_conflicts(lme_inputs.selections | default({})) }}
+      -- given BOTH as a native operator selection (extra-var/inventory) AND as a differing
+      lme_inputs.selections value. Native precedence already chose the operator value; a
+      lower-tier namespaced selection may not silently override it. Normalize the caller to
+      one precedence contract or drop the conflicting namespaced key.
+    quiet: true
+
 # Effective resolver inputs, recomputed EACH load (no snapshot): the pristine operator
 # capture supplies selections + honest `operator` origins; a NORMALIZED caller's explicit
-# lme_inputs parts combine ON TOP (its selections override per key; its observations and
-# caller-verified finer origins are honoured). combine() is per-key, so an unrelated
-# observation never clears an operator selection -- the split-brain fix. A key present
-# only in the caller's selections (not in bare scope) carries no origin here and is
-# honestly labelled `operator` by the engine (_honest_origin).
+# lme_inputs parts combine ON TOP (its selections override per key -- but a CONFLICTING key
+# was already rejected above, so this combine only ADDS caller-only keys or reasserts an
+# AGREEING value; its observations and caller-verified finer origins are honoured).
+# combine() is per-key, so an unrelated observation never clears an operator selection --
+# the split-brain fix. A key present only in the caller's selections (not in bare scope)
+# carries no origin here and is honestly labelled `operator` by the engine (_honest_origin).
 - name: Compose effective resolver inputs (pristine operator capture + caller lme_inputs)
   ansible.builtin.set_fact:
     _lme_eff_inputs:
@@ -153,7 +175,7 @@
     lme_resolved_revision: >-
       {{ {'schema_version': (_lme_global_file.lme_config_registry.schema_version | default(1)),
           'ordered_profiles': _lme_profile_identities,
-          'resolved': _lme_resolution.resolved} | lme_config_revision }}
+          'resolved': _lme_revision_resolved} | lme_config_revision }}
   vars:
     # ordered overlay identities + hashes are RETAINED even for the current single
     # overlay (codex ordered_profiles). The multi-overlay chain merge is the declared
@@ -161,6 +183,19 @@
     _lme_profile_identities:
       - name: "{{ lme_profile }}"
         sha256: "{{ lookup('file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | hash('sha256') }}"
+    # THREE-IDENTITY BINDING (D FROZEN codex-0330): the config revision hashes the desired
+    # CONFIG only. A field marked `exclude_from_revision` in the registry (lme_deployment_identity)
+    # is a STABLE IDENTITY that keys storage/fence/credential ownership -- it MUST NOT churn or
+    # be keyed into the config revision. It is dropped from the revision payload here (still
+    # resolved + projected to lme_resolved.deployment_identity). Membership stays IN (it is
+    # desired config). Absent for current deploys -> byte-identical revision either way.
+    _lme_revision_excluded: >-
+      {{ _lme_global_file.lme_config_registry.fields | dict2items
+         | selectattr('value.exclude_from_revision', 'defined')
+         | selectattr('value.exclude_from_revision') | map(attribute='key') | list }}
+    _lme_revision_resolved: >-
+      {{ _lme_resolution.resolved | dict2items
+         | rejectattr('key', 'in', _lme_revision_excluded) | items2dict }}
 
 # OPEN DEBT (codex resolution_lifetime -- explicitly transitional, removed as consumer
 # migrations land; no parallel legacy backend at acceptance): materialize the resolved

@@ -1226,6 +1226,19 @@ def lme_project_database_membership(membership):
     return {'database': out}
 
 
+def lme_selection_conflicts(operator_selections, caller_selections):
+    """C1-CONFLICTING-INPUT-PRECEDENCE: the sorted keys present in BOTH the pristine
+    operator capture (native extra-var/inventory precedence already resolved this winner)
+    AND a caller-normalized lme_inputs.selections, with DIFFERING values. A lower-tier
+    namespaced selection may not silently override the operator's native selection; where
+    the two disagree provenance cannot be established, so the resolver REJECTS (rather than
+    combining one over the other and recreating consumer disagreement). Agreeing keys are
+    NOT conflicts. Value-pure."""
+    op = operator_selections or {}
+    caller = caller_selections or {}
+    return sorted(k for k in op if k in caller and op[k] != caller[k])
+
+
 def lme_validate_dependency_closure(services, context=None):
     """C1-COMPLETE-CONFIGURATION-VALIDATION (dependency half): every id in a service's
     dependencies (requires/after/wants/partof/binds_to) MUST resolve to a DECLARED manifest
@@ -1265,6 +1278,7 @@ class FilterModule(object):
             'lme_project_datastore_clients': lme_project_datastore_clients,
             'lme_project_database_membership': lme_project_database_membership,
             'lme_validate_dependency_closure': lme_validate_dependency_closure,
+            'lme_selection_conflicts': lme_selection_conflicts,
             'render_userns': render_userns,
             'userns_base': userns_base,
             'cert_owner': cert_owner,

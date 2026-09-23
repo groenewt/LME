@@ -127,13 +127,55 @@
   # --tags certs) before any base/nix task. This is the FIRST leg of the C1
   # site_and_shared_resolution caller migration; the per-play artifact-identity +
   # repeated-invocation/changed-profile qualification is the coordinated follow-on (see
-  # the C1 sitrep). NOTE: a missing dependency now fails HERE, before mutation.
+  # the C1 sitrep). Dependency-closure NOTE (was unsupported, now accurate --
+  # C1-COMPLETE-CONFIGURATION-VALIDATION): load_manifests runs
+  # lme_validate_dependency_closure, so a dependency naming an id that resolves to NO
+  # declared manifest service (a typo) FAILS here, before mutation. A legitimate
+  # cross-host dependency (relaxed to Wants= by GAP-3 host-scoping) is separate and stays
+  # valid -- only unresolvable names fail.
+  #
+  # ALL-HOST BARRIER (C1-ALL-HOST-VALIDATION-BARRIER): per-host validation alone is NOT a
+  # global pre-mutation barrier -- with the default linear strategy a host that FAILS
+  # validation is dropped and its valid peers would still enter the mutating roles. The
+  # block sets any_errors_fatal so a validation failure on ANY targeted host aborts the
+  # play before ANY host mutates, and a run_once barrier assert confirms the COMPLETE
+  # target set validated (no host silently removed). SCOPE: this covers the single-batch
+  # linear play (install.sh runs site.yml on localhost; a multi-host `-i inventory` run is
+  # one batch). A serial/batched run validates only within a batch -- a dedicated
+  # validation-only pre-play across the full inventory is the declared residual (see the
+  # C1 sitrep); G exercises one-invalid-peer with zero mutations on every peer.
   pre_tasks:
-    - name: GLOBAL pre-mutation resolve+validate barrier (fail-closed before any mutation)
-      ansible.builtin.include_role:
-        name: podman
-        tasks_from: load_manifests
-        apply:
+    - name: GLOBAL pre-mutation resolve+validate ALL-HOST barrier (fail-closed before any mutation)
+      any_errors_fatal: true
+      block:
+        - name: Resolve+validate declared config + service/trust projections (per host)
+          ansible.builtin.include_role:
+            name: podman
+            tasks_from: load_manifests
+            apply:
+              tags: ['always']
+          tags: ['always']
+        - name: Mark this host's pre-mutation validation complete
+          ansible.builtin.set_fact:
+            _lme_prevalidated: true
+          tags: ['always']
+        - name: ALL-HOST BARRIER -- every targeted host must validate before any peer mutates
+          ansible.builtin.assert:
+            that:
+              # no targeted host was dropped by a validation failure ...
+              - (ansible_play_hosts_all | difference(ansible_play_hosts)) | length == 0
+              # ... and every surviving targeted host set the validated fact.
+              - >-
+                (ansible_play_hosts
+                 | map('extract', hostvars, '_lme_prevalidated')
+                 | select('equalto', true) | list | length)
+                == (ansible_play_hosts | length)
+            fail_msg: >-
+              pre-mutation validation did not succeed on every targeted host (failed/removed:
+              {{ ansible_play_hosts_all | difference(ansible_play_hosts) }}). No host proceeds
+              into a mutating role until the COMPLETE target set validates.
+            quiet: true
+          run_once: true
           tags: ['always']
       tags: ['always']
 

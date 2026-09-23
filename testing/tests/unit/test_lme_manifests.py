@@ -1219,3 +1219,16 @@ def test_dependency_closure_unknown_name_fails():
     with pytest.raises(ValueError) as e:
         validate_dependency_closure({"x": svc})
     assert "resolves to no declared manifest service id" in str(e.value)
+
+
+selection_conflicts = FILTERS["lme_selection_conflicts"]
+
+
+def test_selection_conflicts_detects_only_disagreements():
+    # agreeing key -> not a conflict; disagreeing key -> conflict; caller-only key -> fine
+    op = {"install_llm": False, "offline_mode": True}
+    caller = {"install_llm": True, "offline_mode": True, "install_otel": True}
+    assert selection_conflicts(op, caller) == ["install_llm"]
+    assert selection_conflicts(op, {"install_llm": False}) == []   # agrees
+    assert selection_conflicts({}, caller) == []
+    assert selection_conflicts(op, None) == []
