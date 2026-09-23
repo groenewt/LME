@@ -1,0 +1,96 @@
+# LME OTLP gateway collector -- durable delivery into Elasticsearch.
+#
+# Delivery: the whole config/ tree is synced to /opt/lme/config/ by
+# ansible/roles/podman/tasks/quadlet_setup.yml, and this file is mounted read-only at
+# /etc/otelcol/config.yaml by manifests/services/lme-otel-collector.yml. The collector is
+# enabled only when install_otel=true (default false), so this config is inert on a default
+# deploy. Before this file existed the manifest mounted a NON-existent config, so enabling
+# install_otel could never start the collector; this is the missing real config.
+#
+# DURABILITY (do not weaken): every exporter uses a persistent file_storage-backed
+# sending_queue plus retry_on_failure, so OTLP data survives a collector or Elasticsearch
+# restart and is redelivered rather than dropped. The queue lives on the mounted rw volume
+# /var/lib/lme-telemetry (host /data/lme/telemetry, declared in the manifest).
+#
+# AUTH (do not weaken to superuser): delivery uses a SCOPED, write-only Elasticsearch API
+# key read from /run/secrets/otel-elastic-api-key -- NOT the `elastic` superuser that the
+# legacy beats use. That scoped key, and the index templates in
+# config/telemetry/elastic-logs-template.json + elastic-metrics-template.json, must be
+# provisioned before enabling install_otel (see the E-domain contract requests). We do NOT
+# fall back to superuser credentials to force a green result.
+#
+# Native-validate against the exact otelcol-contrib image before enabling (the pinned image
+# is docker.io/otel/opentelemetry-collector-contrib in manifests/global.yml).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317   # published 127.0.0.1:4317 by the manifest
+      http:
+        endpoint: 0.0.0.0:4318   # published 127.0.0.1:4318 by the manifest
+
+extensions:
+  file_storage/elastic:
+    directory: /var/lib/lme-telemetry/otel-elastic
+    create_directory: true
+  bearertokenauth/elastic:
+    scheme: ApiKey
+    filename: /run/secrets/otel-elastic-api-key   # scoped write-only key (provisioned separately)
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 200          # under the manifest MemoryMax=256M
+    spike_limit_mib: 50
+  batch:
+    send_batch_size: 1000
+    timeout: 5s
+
+exporters:
+  elasticsearch:
+    endpoints: [https://lme-elasticsearch:9200]   # in-network alias; valid SAN on the ES leaf cert
+    auth:
+      authenticator: bearertokenauth/elastic
+    tls:
+      ca_file: /certs/ca/ca.crt                    # provided by the cert:otel-collector bundle
+      insecure: false
+      insecure_skip_verify: false
+    mapping:
+      allowed_modes: [ecs]
+    logs_index: lme-typed-logs                     # matches config/telemetry/elastic-logs-template.json
+    metrics_index: lme-native-metrics              # matches config/telemetry/elastic-metrics-template.json
+    sending_queue:
+      enabled: true
+      storage: file_storage/elastic
+      sizer: bytes
+      queue_size: 268435456
+      num_consumers: 2
+      block_on_overflow: false
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 0s
+
+service:
+  extensions: [file_storage/elastic, bearertokenauth/elastic]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888
+  # Traces are intentionally omitted: no shipped ES index template exists for traces yet, so
+  # writing them would create a dynamically-mapped index. Add a traces template + pipeline as
+  # a follow-up before enabling trace ingest.
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [elasticsearch]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [elasticsearch]
