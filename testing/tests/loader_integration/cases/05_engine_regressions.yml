@@ -48,7 +48,7 @@ cases:
     call: validate_reversed
     registry: *base_registry
     resolved: {offline_mode: true}      # becomes the registry arg under the reversed pipe -> no 'fields'
-    expect: {raises: true}
+    expect: {raises: true, raises_match: "no fields"}   # AND for the RIGHT reason (registry-shape gate), not any error
     invariant_task: "A1: the reversed pipe `resolved | lme_validate_config(registry)` fails closed (registry-shape gate rejects a no-fields registry), not a silent pass"
     fail_msg: "A1 REGRESSION: a reversed lme_validate_config pipe validated silently instead of failing closed on the registry-shape gate"
 
@@ -150,7 +150,7 @@ cases:
       precedence: [operator, default]
       channels: {operator: {provenance: caller, source: selections}, default: {source: field_default}}
     resolved: []              # a non-mapping resolved input
-    expect: {raises: true}
+    expect: {raises: true, raises_match: "must be a mapping"}   # rejected for the non-mapping reason, not incidentally
     invariant_task: "C1-OPTIONAL-NONMAPPING: a non-mapping resolved input is rejected INDEPENDENTLY of whether any field is required (no silent coercion of [] -> {})"
     fail_msg: "C1-OPTIONAL-NONMAPPING REGRESSION: a non-mapping resolved input validated because the registry had only optional fields"
 
@@ -164,6 +164,65 @@ cases:
       precedence: [operator, default]
       channels: {operator: {provenance: caller, source: selections}, default: {source: field_default}}
     resolved: {}
-    expect: {raises: true}
+    expect: {raises: true, raises_match: "unsupported/absent type"}   # rejected at the schema gate, not for a later reason
     invariant_task: "C1-UNKNOWN-NULLABLE-TYPE: a field declaring an unsupported type fails the registry-shape gate BEFORE any value is inspected, so a nullable unsupported-type field cannot slip a null past validation"
     fail_msg: "C1-UNKNOWN-NULLABLE-TYPE REGRESSION: an unsupported declared type passed schema validation (the None short-circuit let a nullable field skip the type check)"
+
+  # --- REAL-registry proof (not a synthetic mirror): the SHIPPED manifests/global.yml -----
+  # Loads the actual lme_config_registry and proves three laws at once against it: empty
+  # inputs resolve to the DECLARED defaults with origin=default, that resolved dict validates
+  # (round-trip), and the resolver's KNOWN_ENABLE_FLAGS set has not DRIFTED from the registry's
+  # enable_flag field keys (drift enforcement without a hand-authored Python test / a 4th roster).
+  - name: real-registry-empty-resolve-yields-declared-defaults-and-no-enableflag-drift
+    kind: engine_regression
+    requires_contract: false
+    call: resolve
+    registry_from_rel: manifests/global.yml    # joined onto repo_root at render (the SHIPPED registry)
+    registry_key: lme_config_registry
+    resolve: {}                                # NO operator/profile/observation inputs
+    expect:
+      resolved:
+        install_llm: true                      # declared defaults from the SHIPPED registry
+        install_elastic_services: false
+        offline_mode: false
+        install_otel: false
+        install_legacy_beats: true
+        es_discovery: single-node
+        lme_consumer_profile: false
+      origins:
+        install_llm: default                   # every field resolved from the default tier
+        install_elastic_services: default
+        offline_mode: default
+        es_discovery: default
+        lme_consumer_profile: default
+      validate_roundtrip: true                 # the resolved dict validates canonical against the same registry
+      known_enable_flags_match: true           # KNOWN_ENABLE_FLAGS == registry enable_flag keys (no drift)
+    invariant_task: "real-registry: the SHIPPED manifests/global.yml lme_config_registry resolves declared defaults (origin=default) with empty inputs, validates round-trip, and its enable_flag keys match the resolver's KNOWN_ENABLE_FLAGS (no drift)"
+    fail_msg: "real-registry REGRESSION: the shipped registry did not resolve declared defaults / validate round-trip, OR KNOWN_ENABLE_FLAGS drifted from the registry's enable_flag field keys (is_enabled typo-guard vs registry out of sync)"
+
+  # --- content-addressed revision (codex-0330: lme_config_revision same/different) ---------
+  - name: resolved-revision-is-deterministic-for-identical-payload
+    kind: engine_regression
+    requires_contract: false
+    call: revision
+    payload:
+      resolved: {offline_mode: false, install_llm: true}
+      origins: {offline_mode: default, install_llm: default}
+    # payload_b defaults to payload -> same inputs
+    expect: {revision_differ: false, revision_equal: true}
+    invariant_task: "revision: lme_config_revision is content-addressed -- identical resolution inputs yield the IDENTICAL revision id (so the early gate, membership check and credential gate all read one revision in a single run)"
+    fail_msg: "revision REGRESSION: identical resolution inputs produced DIFFERENT revision ids (revision is not a pure function of inputs -- a timestamp/HEAD leaked into the payload)"
+
+  - name: resolved-revision-changes-when-an-input-changes
+    kind: engine_regression
+    requires_contract: false
+    call: revision
+    payload:
+      resolved: {offline_mode: false, install_llm: true}
+      origins: {offline_mode: default, install_llm: default}
+    payload_b:
+      resolved: {offline_mode: true, install_llm: true}    # ONE field flipped
+      origins: {offline_mode: operator, install_llm: default}
+    expect: {revision_equal: false, revision_differ: true}
+    invariant_task: "revision: a change in ANY resolution input (a flipped value / origin) changes the revision id, so a stale revision cannot masquerade as the current one across consumers"
+    fail_msg: "revision REGRESSION: a changed resolution input did NOT change the revision id (a stale/other-revision resolution could pass the cross-consumer agreement gate)"

@@ -26,10 +26,22 @@ bound_c1_sitrep: null              # channel message_id of the C1 loader-cutover
 # only; origin labels echoed unvalidated) are the A1-A5 that 8ceb297 closed. Binding therefore
 # still waits on the CUTOVER sitrep, not the engine.
 c1_milestone_landed:
-  registry_schema: {commit: 2eb54c3, name: lme_config_registry, locus: "manifests/global.yml (~line 228); NB registry data NOT materialised in worktree at HEAD"}
-  resolver_engine: {commit: 0058948, filters: [lme_resolve_config, lme_validate_config], locus: "ansible/roles/podman/filter_plugins/lme_manifests.py", resolver_sha256_at_0058948: 784a5cabb79f8450bee46f3b09e5da22326d767e7f5d66a2681c3fd91906b37b}
+  # registry_schema: the lme_config_registry IS materialised in the worktree at HEAD --
+  # manifests/global.yml lines 221-262 (VERIFIED by loading it: precedence, channels,
+  # origin_vocabulary and the 12 field declarations are all present). The real-registry
+  # engine case (cases/05) loads THIS file and resolves against it, so the shape is not
+  # assumed -- it is exercised.
+  registry_schema: {commit: 2eb54c3, name: lme_config_registry, locus: "manifests/global.yml lines 221-262 (materialised + loaded by the real-registry engine case)"}
+  resolver_engine: {commit: 0058948, filters: [lme_resolve_config, lme_validate_config, lme_config_revision, lme_known_enable_flags], locus: "ansible/roles/podman/filter_plugins/lme_manifests.py", resolver_sha256_at_0058948: 784a5cabb79f8450bee46f3b09e5da22326d767e7f5d66a2681c3fd91906b37b}
   resolver_audit_closed: {commit: 8ceb297, items: [A1_failclosed_validate, A2_effective_precedence, A3_canonical_validation, A5_honest_origins, extended_types], resolver_sha256_now: ddb92eaea08dd82839e59188d9f527d2d0a17a077ca80136292b004c9adc4614}
-  emitted_origin_tokens_at_8ceb297: [operator, profile, observation, default]   # _honest_origin: vocab = precedence tiers + _COMBINED_OPERATOR('operator'); finer extra_var|inventory only when caller-verified
+  # emitted origin tokens VERIFIED two ways: (a) the resolver's _honest_origin at 8ceb297,
+  # and (b) the SHIPPED registry's declared origin_vocabulary at manifests/global.yml:246 =
+  # [extra_var, inventory, operator, profile, observation, default]. So `operator` + the finer
+  # `extra_var`/`inventory` are BOTH declared -- the finer-verified-origin engine case (which
+  # preserves a caller-verified `inventory`) is valid against the REAL registry, not only the
+  # synthetic mirror.
+  emitted_origin_tokens_at_8ceb297: [operator, profile, observation, default]   # combined-operator + tier names
+  real_registry_origin_vocabulary: [extra_var, inventory, operator, profile, observation, default]   # manifests/global.yml:246
   NOT_landed: [loader_cutover, versioned_output_artifact, content_addressed_revision, consumer_migration]
 
 # --- C1 public names this tier reads. Registry + engine CONFIRMED; the resolved-dict / revision /
@@ -60,11 +72,15 @@ names:
 #   where `operator` is the native-Ansible-combined tier; extra_var / inventory are finer sub-labels
 #   ONLY when the loader genuinely exposes a single non-merged caller-verified source. Value-precedence
 #   (extra-var>inventory, operator>observation) is still asserted in BOTH directions via real -e/-i.
-# If the registry's DECLARED origin_vocabulary at cutover differs, the coordinator reconciles here
-# (fail-closed: a token mismatch fails at bind, never a false pass).
+# CONFIRMED against the SHIPPED registry: manifests/global.yml:246 declares
+# origin_vocabulary: [extra_var, inventory, operator, profile, observation, default] -- the
+# SAME token set as (values + finer_when_exposed) below. So this reconciliation already holds
+# against the real registry, not just the resolver; no divergence to reconcile at cutover.
+# (fail-closed: were a token to mismatch at bind, it fails, never a false pass).
 origin_vocabulary:
   ruled_by: codex-manager-input-artifact-rulings-20260923-0245
   reconciled_to_resolver: 8ceb297
+  confirmed_against_shipped_registry: "manifests/global.yml:246"
   values: [operator, profile, observation, default]
   finer_when_exposed: [extra_var, inventory]
 
@@ -81,8 +97,13 @@ origin_vocabulary:
 engine_leg:
   status: ready
   built: [engine_probe.yml.j2, "cases/05_engine_regressions.yml", "run_integration.yml resolver copy+sha256"]
-  invokes: [lme_resolve_config, lme_validate_config]
-  proves: [reversed-pipe-fail-closed_A1, reordered-precedence_A2, extended-types, origin-rejection_A5, optional-nonmapping, unknown-nullable-type]
+  invokes: [lme_resolve_config, lme_validate_config, lme_config_revision, lme_known_enable_flags]
+  cases: 12
+  proves: [reversed-pipe-fail-closed_A1, reordered-precedence_A2, extended-types, origin-rejection_A5,
+           finer-verified-origin_A5, optional-nonmapping, unknown-nullable-type,
+           real-registry-defaults+validate-roundtrip+enable-flag-drift, revision-deterministic, revision-sensitive]
+  raises_are_reason_checked: true   # every raises:true case ALSO asserts a raises_match substring in the error
+  mutation_verified: "6 guard mutations (no-fields/non-mapping/unsupported-type/precedence/honest-origin/enable-flag-drift) each flip their target case RED; baselines PASS -- so no case is fail-open (M1 in particular: a DIFFERENT error no longer passes the reversed-pipe case)"
   provenance: "immutable per-run copy at runs/<run_id>/_engine/filter_plugins; engine_resolver_sha256 banked in results.yml"
 probe_handler:
   status: not_ready                 # the ENTRYPOINT leg (see above); engine leg is separate + ready
@@ -90,7 +111,16 @@ probe_handler:
   supported_expect_keys: []         # resolved/origin renderable but unverified; revision/gates_agree/reject/no_secret_values NOT rendered at entrypoint scope
   supported_environments: [localhost]
   debt_owner: G_acceptance
-  todo: "isolated sha256-verified source copy; -e extra-vars + -i inventory + host_vars + markers layering; ordered profile overlays + profile_switch; real entrypoint invocation via a RESOLVE-ONLY seam (upgrade_lme.yml/convert_to_cluster.yml are become:yes and touch live host paths -- the probe must exercise resolution WITHOUT the mutating tasks, e.g. a C1/B-provided resolve-only tag/seam), not just load_manifests; render revision/gates_agree/reject/no_secret_values asserts; zero-assertion render == ERROR"
+  # C1 cutover contract change (claude-C1-cutover-milestone-20260923): the full-loader probe's
+  # isolated_source copy-set MUST include BOTH extracted task files the loader now include_tasks:
+  #   ansible/roles/podman/tasks/resolve.yml               (CR-B3 extracted early-resolve entrypoint)
+  #   ansible/roles/podman/tasks/validate_resolved_config.yml (shared fail-closed validator)
+  # or the isolated loader copy will fail to find its included task files. Record here so the
+  # entrypoint-leg build (below) copies them; C1 already applied this to the scratch cases.yml.
+  full_loader_isolated_source_must_include:
+    - ansible/roles/podman/tasks/resolve.yml
+    - ansible/roles/podman/tasks/validate_resolved_config.yml
+  todo: "isolated sha256-verified source copy (INCLUDING resolve.yml + validate_resolved_config.yml per C1 cutover); -e extra-vars + -i inventory + host_vars + markers layering; ordered profile overlays + profile_switch; real entrypoint invocation via a RESOLVE-ONLY seam (upgrade_lme.yml/convert_to_cluster.yml are become:yes and touch live host paths -- the probe must exercise resolution WITHOUT the mutating tasks, e.g. a C1/B-provided resolve-only tag/seam), not just load_manifests; render revision/gates_agree/reject/no_secret_values asserts; zero-assertion render == ERROR"
   marker_path_policy: "marker fixtures (installed_pack_quadlet, offline_marker, ...) are created and read ONLY inside the isolated per-case work dir under a REMAPPED marker root -- NEVER the live host marker locations (e.g. /opt/lme/* paths). The probe must not stat, read or write any live host path; the resolve-only seam must accept an overridable marker root so detection runs entirely in the sandbox."
 
 # --- Precedence + defaults are DECLARED by the contract (codex-check-0200) and are
