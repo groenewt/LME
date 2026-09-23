@@ -148,23 +148,64 @@
         path: /etc/containers/systemd/lme-apm-server.container
       register: elastic_pack_quadlet
 
-    # Respect an explicit extra-var override (-e install_elastic_services=... /
-    # -e install_llm=...); otherwise infer the pack from what is already
-    # installed. Distinct facts are used because extra-vars outrank set_fact, so
-    # a self-referential "install_elastic_services: {{ install_elastic_services |
-    # default(...) }}" would silently no-op whenever the operator passes the var.
-    # The LLM stack is new in 2.3.0 (no pre-upgrade quadlet to detect), so it
-    # follows the site.yml default-on unless explicitly disabled.
-    - name: Resolve optional-stack enablement for this upgrade
-      set_fact:
-        lme_pack_enabled: "{{ install_elastic_services | default(elastic_pack_quadlet.stat.exists) | bool }}"
-        lme_llm_enabled: "{{ install_llm | default(true) | bool }}"
+    # Hoisted UP (was stat'd just before the render include) so BOTH detected
+    # observations exist before the shared resolver runs. The resolve point is
+    # AFTER both stats and BEFORE the first resolved-key consumer, so it covers the
+    # enablement debug below AND the pack pull/tag gates further down.
+    - name: Detect offline-mode marker for this upgrade
+      stat:
+        path: /opt/lme/OFFLINE_MODE
+      register: offline_marker
 
-    - name: Display detected optional-stack enablement
+    # --- CR-B1: consume the C1 caller-INPUT resolver contract ------------------
+    # upgrade no longer re-derives enablement with its own set_facts. It builds the
+    # NAMESPACED lme_inputs that the shared resolver (roles/podman/tasks/resolve.yml)
+    # expects, keeping DETECTED state (observations) strictly SEPARATE from operator
+    # SELECTIONS so detection ranks at the observation tier (below profile), NOT
+    # falsely as an operator -e (the auto-normalize bug this migration removes).
+    #
+    # selections: captured registry-derived from the bare scope BEFORE the resolve
+    #   include -- podman role defaults are NOT in scope yet, so only operator
+    #   -e / inventory values for a declared field appear. This reads the SAME field
+    #   list the registry declares (no parallel roster; global.yml forbids one). The
+    #   upgrade play defines NO registry field as a play var, so nothing here can
+    #   mistake a play default for an operator selection (the convert:386 trap).
+    # observations: ONLY the two upgrade_fallback:true fields
+    #   (install_elastic_services <- installed-pack quadlet; offline_mode <- on-disk
+    #   marker). install_llm is NEVER observed (upgrade_fallback:false), and NO
+    #   profile is inferred from the marker (that would let the offline profile's
+    #   install_elastic_services:false shadow a detected pack at tier-3).
+    # origins: {} -- the loader honestly labels a natively-selected value 'operator'.
+    - name: Load the config registry field list for caller-input construction
+      ansible.builtin.include_vars:
+        file: "{{ clone_directory }}/manifests/global.yml"
+        name: _upg_global_file
+
+    - name: Build namespaced resolver inputs (selections operator-only; observations separate)
+      ansible.builtin.set_fact:
+        lme_inputs: >-
+          {{ {'selections': dict(_upg_sel_keys | zip(_upg_sel_keys | map('extract', vars) | list)),
+              'observations': {'install_elastic_services': elastic_pack_quadlet.stat.exists,
+                               'offline_mode': offline_marker.stat.exists},
+              'origins': {}} }}
+      vars:
+        _upg_reg_keys: "{{ _upg_global_file.lme_config_registry.fields.keys() | list }}"
+        _upg_sel_keys: "{{ _upg_reg_keys | select('in', vars) | list }}"
+
+    - name: Early-resolve declared config before the first resolved-key consumer
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: resolve
+
+    - name: Display resolved optional-stack enablement (with provenance)
       debug:
         msg: >-
-          Elastic services pack: {{ 'enabled' if lme_pack_enabled else 'disabled' }};
-          LLM stack: {{ 'enabled' if lme_llm_enabled else 'disabled' }}
+          Elastic services pack: {{ 'enabled' if lme_enable_flags.install_elastic_services else 'disabled' }}
+          (origin {{ lme_resolved_origins.install_elastic_services }});
+          LLM stack: {{ 'enabled' if lme_enable_flags.install_llm else 'disabled' }}
+          (origin {{ lme_resolved_origins.install_llm }});
+          offline_mode: {{ lme_enable_flags.offline_mode }}
+          (origin {{ lme_resolved_origins.offline_mode }})
 
     - name: Extract container versions
       set_fact:
@@ -282,12 +323,40 @@
         msg: "Starting LME backup process before upgrade. This may take a few minutes..."
       when: backup_choice in ['y', 'yes']
         
-    - name: Run backup
-      include_role:
-        name: backup_lme
-      vars:
-        skip_prompts: true  # Skip prompts during automated backup
-        skip_service_restart: true  # Leave services stopped for upgrade operations
+    # backup_lme now fails closed on an unclean pre-op backup (D3b hardening in the
+    # D-exclusive role, which is NOT edited here). Wrap only the CALLER side so an
+    # aborted backup is legible: the role stops the containers before copying and we
+    # pass skip_service_restart, so a failure most likely leaves LME stopped and no
+    # upgrade change has been made yet. Re-fail after the message so the upgrade
+    # still aborts -- never proceed to stop/re-render on an unverified backup.
+    - name: Run pre-upgrade backup (fail-closed; caller-side interrupted-backup legibility)
+      block:
+        - name: Run backup
+          include_role:
+            name: backup_lme
+          vars:
+            skip_prompts: true  # Skip prompts during automated backup
+            skip_service_restart: true  # Leave services stopped for upgrade operations
+      rescue:
+        - name: Report the interrupted/failed pre-upgrade backup and abort
+          ansible.builtin.fail:
+            msg: |
+              The pre-upgrade backup FAILED or was interrupted before completing cleanly,
+              so the upgrade has been ABORTED. No service, unit, image or config changes
+              have been made yet (only helper scripts under /opt/lme/scripts were refreshed).
+
+              State to expect:
+                * backup_lme stops the LME containers before copying and this run passed
+                  skip_service_restart, so LME is most likely STOPPED right now.
+                  Restore service with:  sudo systemctl start lme
+                * Any partial backup is under /opt/lme/backup/ -- see the backup task
+                  output above for the exact timestamped directory and which
+                  component/volume failed.
+
+              Recovery:
+                * Resolve the cause reported above (e.g. free disk space, an unclean
+                  container stop, or an unreadable volume), confirm LME is healthy, then
+                  re-run:  ansible-playbook ansible/upgrade_lme.yml
       when: backup_choice in ['y', 'yes']
 
     - name: Stop LME service when backup is skipped
@@ -419,7 +488,7 @@
       delay: 5
       until: pull_elastic_result is not failed
       ignore_errors: yes
-      when: lme_pack_enabled | default(false) | bool
+      when: lme_enable_flags.install_elastic_services
 
     - name: Display elastic services container pull errors
       debug:
@@ -440,7 +509,7 @@
       delay: 5
       until: tag_elastic_result is not failed
       ignore_errors: yes
-      when: lme_pack_enabled | default(false) | bool
+      when: lme_enable_flags.install_elastic_services
 
     - name: Display elastic services container tag errors
       debug:
@@ -506,6 +575,54 @@
             executable: /bin/bash
           register: llm_keys_secret
 
+        # --- Offline (air-gapped) artifact staging (fail-closed) ---------------
+        # When offline_mode resolves true, the AI-stack images and GGUF models come
+        # from the prepared offline bundle, NOT upstream. This mirrors the canonical
+        # fresh-install path exactly rather than inventing a mechanism:
+        #   * images -> load_offline_containers.yml (the SAME file container_setup.yml
+        #     uses) runs offline_resources/load_containers.sh, which `podman load`s
+        #     every image tar and retags it to its localhost/<name>:LME_LATEST local
+        #     ref -- the exact ref the online pulls/builds below tag to.
+        #   * models -> load_offline_llm.yml (the SAME file llama_cpp_setup.yml uses)
+        #     copies the two GGUFs from offline_resources/models/.
+        # Both fail CLOSED if the artifacts are absent (the load script errors; the
+        # model copy errors), so a missing/incomplete bundle stops the upgrade HERE
+        # instead of the later fail-closed is-active assert firing after services are
+        # already stopped and units re-rendered. A bare `when: not offline_mode` skip
+        # of the pulls would be a silent false-success hole -- explicitly avoided.
+        # NB load_offline_containers loads the WHOLE image set (core + elastic + llm),
+        # so inside this install_llm-gated block the offline CORE-image realization
+        # now rides install_llm; the online core pulls above keep their own path.
+        - name: Stage AI-stack images from the offline bundle (airgap; fail-closed)
+          ansible.builtin.include_role:
+            name: podman
+            tasks_from: load_offline_containers
+          when: offline_mode | default(false) | bool
+
+        # load_containers.sh loads whatever the bundle CONTAINS: a bundle prepared
+        # without --llm loads cleanly yet leaves the AI images missing. Assert each
+        # llm-group local ref (derived from the resolver-loaded global manifest, NOT a
+        # hand list) is present so that gap fails HERE. No ignore_errors -> fail-closed.
+        - name: Assert every offline-staged LLM image is present (fail-closed; bundle may omit --llm)
+          shell: |
+            export PATH=$PATH:/nix/var/nix/profiles/default/bin
+            {{ podman_cmd }} image exists {{ item.value.local | quote }}
+          args:
+            executable: /bin/bash
+          changed_when: false
+          loop: "{{ _lme_global_file.lme_global.images | dict2items
+                    | selectattr('value.group', 'defined')
+                    | selectattr('value.group', 'equalto', 'llm') | list }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value.local }})"
+          when: offline_mode | default(false) | bool
+
+        - name: Stage LLM GGUF models from the offline bundle (airgap; fail-closed)
+          ansible.builtin.include_role:
+            name: podman
+            tasks_from: load_offline_llm
+          when: offline_mode | default(false) | bool
+
         - name: Pull llama.cpp container image
           shell: "{{ podman_cmd }} pull ghcr.io/ggml-org/llama.cpp:server"
           args:
@@ -514,11 +631,13 @@
           retries: 3
           delay: 5
           until: pull_llama is not failed
+          when: not (offline_mode | default(false) | bool)
 
         - name: Tag llama.cpp container image
           shell: "{{ podman_cmd }} image tag ghcr.io/ggml-org/llama.cpp:server localhost/llama-cpp:LME_LATEST"
           args:
             executable: /bin/bash
+          when: not (offline_mode | default(false) | bool)
 
         - name: Pull LiteLLM container image
           shell: "{{ podman_cmd }} pull ghcr.io/berriai/litellm:main-latest"
@@ -528,11 +647,13 @@
           retries: 3
           delay: 5
           until: pull_litellm is not failed
+          when: not (offline_mode | default(false) | bool)
 
         - name: Tag LiteLLM container image
           shell: "{{ podman_cmd }} image tag ghcr.io/berriai/litellm:main-latest localhost/litellm:LME_LATEST"
           args:
             executable: /bin/bash
+          when: not (offline_mode | default(false) | bool)
 
         - name: Pull pgvector container image
           shell: "{{ podman_cmd }} pull docker.io/pgvector/pgvector:pg17"
@@ -542,12 +663,17 @@
           retries: 3
           delay: 5
           until: pull_pgvector is not failed
+          when: not (offline_mode | default(false) | bool)
 
         - name: Tag pgvector container image
           shell: "{{ podman_cmd }} image tag docker.io/pgvector/pgvector:pg17 localhost/pgvector:LME_LATEST"
           args:
             executable: /bin/bash
+          when: not (offline_mode | default(false) | bool)
 
+        # Offline: prepare_offline.sh pre-builds these two build-type images into the
+        # bundle, so the offline load above already realized them; the local build is
+        # online-only.
         - name: Build LME Dashboard container image
           shell: |
             cd {{ clone_directory }}/lme-dashboard
@@ -555,6 +681,7 @@
           args:
             executable: /bin/bash
           register: build_dashboard
+          when: not (offline_mode | default(false) | bool)
 
         - name: Build LME Log Analyzer container image
           shell: |
@@ -563,7 +690,11 @@
           args:
             executable: /bin/bash
           register: build_log_analyzer
+          when: not (offline_mode | default(false) | bool)
 
+        # Models: offline staging (load_offline_llm.yml above) already copied these
+        # from the bundle; the get_url fetch is online-only. Mirrors
+        # llama_cpp_setup.yml:117-145 (get_url gated `when: not offline_mode`).
         - name: Download LFM2.5 1.2B model (Q4_K_M quantization, ~698MB)
           get_url:
             url: https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/LFM2.5-1.2B-Instruct-Q4_K_M.gguf
@@ -574,6 +705,7 @@
           retries: 3
           delay: 10
           until: model_download is not failed
+          when: not (offline_mode | default(false) | bool)
 
         - name: Download nomic-embed-text model (Q4_K_M quantization, ~81MB)
           get_url:
@@ -585,6 +717,7 @@
           retries: 3
           delay: 10
           until: embed_download is not failed
+          when: not (offline_mode | default(false) | bool)
 
         - name: Copy updated instances.yml for AI service cert generation
           copy:
@@ -671,7 +804,7 @@
               - Systemd units: lme-llm-keys.service/path, lme-llama-model.service/path
       when:
         - current_lme_version is version('2.3.0', '<')
-        - lme_llm_enabled | default(true) | bool
+        - lme_enable_flags.install_llm
 
     - name: Skip AI stack (already at 2.3.0+)
       debug:
@@ -717,36 +850,25 @@
     # lme_enable_flags, and render_units.yml renders every ENABLED service. The
     # umbrella target lme.service is rendered to /etc/systemd/system/lme.service
     # (manifests/services/lme.service.yml, kind: target), which replaces the old
-    # static lme.service copy. include_role brings the podman role's defaults
-    # (lme_child_es_only, lme_child_active_services) into scope, and the render
-    # facts mirror the -e vars install.sh passes on a fresh install: install_llm /
-    # install_elastic_services from this upgrade's detected enablement
-    # (lme_llm_enabled / lme_pack_enabled), offline_mode from the on-disk marker,
-    # and the profile derived offline->offline / else default (operator -e wins).
-    - name: Detect offline-mode marker for the unit render
-      stat:
-        path: /opt/lme/OFFLINE_MODE
-      register: offline_marker
-
-    # Resolve the render facts into DIFFERENTLY-NAMED intermediates first. Passing
-    # `offline_mode: "{{ offline_mode | default(...) }}"` / `lme_profile: "{{ lme_profile
-    # | default(...) }}"` directly self-references and triggers a recursive-loop
-    # template error when no -e is given (the exact trap site.yml:44-51 documents). An
-    # operator -e offline_mode / -e lme_profile still wins via the default() here.
-    - name: Resolve render facts for the manifest pipeline (mirror install.sh -e vars)
-      set_fact:
-        _render_offline_mode: "{{ offline_mode | default(offline_marker.stat.exists) | bool }}"
-        _render_lme_profile: "{{ lme_profile | default('offline' if offline_marker.stat.exists else 'default') }}"
-
-    - name: Load service manifests into facts (render pipeline; mirrors fresh install)
+    # static lme.service copy.
+    #
+    # SINGLE-RESOLUTION CONSISTENCY (CR-B1): the render pipeline re-runs the SAME
+    # shared resolver (load_manifests.yml -> resolve.yml) that ran EARLY above.
+    # lme_inputs (the operator selections + the two observations) and lme_profile
+    # persist as play facts from that early resolve, so this second resolution is
+    # IDENTICAL -- same lme_resolved, same lme_enable_flags, and the SAME
+    # content-addressed lme_resolved_revision -- which is what keeps an unchanged
+    # config from rewriting/restarting a healthy consumer. We therefore pass NO
+    # enablement/offline/profile vars here: the old marker-inferred
+    # _render_offline_mode / _render_lme_profile are GONE. resolve reads lme_inputs
+    # (not bare scope), so re-passing install_llm/install_elastic_services/offline_mode
+    # would be redundant, and forcing lme_profile='offline' from the marker would
+    # WRONGLY apply the offline overlay's install_elastic_services:false at tier-3 and
+    # shadow the detected pack (offline_mode already carries via the observation).
+    - name: Load service manifests into facts (render pipeline; re-runs the shared resolver)
       include_role:
         name: podman
         tasks_from: load_manifests.yml
-      vars:
-        install_llm: "{{ lme_llm_enabled }}"
-        install_elastic_services: "{{ lme_pack_enabled }}"
-        offline_mode: "{{ _render_offline_mode }}"
-        lme_profile: "{{ _render_lme_profile }}"
 
     # render_units consumes the lme_enable_flags / lme_services facts that
     # load_manifests just set (no vars need re-passing) and writes the units to
@@ -773,14 +895,15 @@
     # Mint the AI web-UI auth secrets BEFORE the umbrella restart.
     #
     # render_units.yml (above) renders lme-dashboard / lme-log-analyzer / lme-litellm
-    # on install_llm ALONE (the load_manifests include passes only
-    # install_llm: lme_llm_enabled -- no version gate), and those units consume the
+    # on install_llm ALONE (the render pipeline re-resolves via the shared resolver;
+    # is_enabled reads lme_enable_flags.install_llm -- no version gate), and those units
+    # consume the
     # podman secrets litellm_master_key (litellm: env LITELLM_MASTER_KEY; both UIs:
     # env LITELLM_API_KEY) and webui_api_key (both UIs: env WEBUI_API_KEY). The
     # pre-2.3.0 AI-stack block above mints only pgvector + llm-keys, so without the
     # two mints below podman refuses to start the UIs on the restart -- a fail-closed
     # brick that the old loose wait then masked as green. Gating here on
-    # lme_llm_enabled (the SAME flag render_units used) instead of the AI-stack
+    # lme_enable_flags.install_llm (the SAME flag render_units used) instead of the AI-stack
     # block's version('2.3.0','<') gate closes the mismatch: a host that installed
     # 2.3.0 with install_llm=false and later upgrades with install_llm=true still gets
     # the keys. if-absent keeps them a free no-op (and STABLE) when they already
@@ -796,7 +919,7 @@
       args:
         executable: /bin/bash
       no_log: true
-      when: lme_llm_enabled | default(true) | bool
+      when: lme_enable_flags.install_llm
 
     - name: Mint webui_api_key secret before restart (fail-closed brick fix)
       shell: |
@@ -806,7 +929,7 @@
       args:
         executable: /bin/bash
       no_log: true
-      when: lme_llm_enabled | default(true) | bool
+      when: lme_enable_flags.install_llm
 
     # ============================================================
     # Publish the per-service host-tree cert bundles BEFORE the umbrella restart.
@@ -860,7 +983,7 @@
         state: restarted
       tags: ['system']
 
-    # Fail-closed CORE brick guard (round-6), runs REGARDLESS of lme_llm_enabled.
+    # Fail-closed CORE brick guard (round-6), runs REGARDLESS of lme_enable_flags.install_llm.
     # The always-on core web unit lme-kibana mounts the host-tree cert:kibana bundle that
     # the now-unconditional certs publish above fills; a missing/half-published bundle
     # crash-loops it. The AI-UI assert below is LLM-gated, so before this task NOTHING
@@ -882,7 +1005,7 @@
     # thus MASKED a UI that podman refused to start -- e.g. a missing webui_api_key /
     # litellm_master_key secret bricks lme-dashboard / lme-log-analyzer). This asserts
     # the enabled UI units are actually active; NO ignore_errors, so a brick surfaces
-    # as a task failure instead of a false success. Gated on lme_llm_enabled because
+    # as a task failure instead of a false success. Gated on lme_enable_flags.install_llm because
     # the units are rendered (and thus expected active) only when the LLM stack is on;
     # no profile overlay disables them (only tailscale rebinds their ports). The
     # generous retry ceiling tolerates the full ES -> litellm/pgvector/embeddings ->
@@ -895,7 +1018,7 @@
       until: ai_ui_units_active.rc == 0
       retries: 60
       delay: 10
-      when: lme_llm_enabled | default(true) | bool
+      when: lme_enable_flags.install_llm
       
     - name: Wait for services to be ready
       pause:
@@ -1011,7 +1134,7 @@
             msg: "{{ 'Documentation ingestion completed successfully' if ingest_result.rc == 0 else 'Documentation ingestion failed (non-fatal) — can be re-run manually' }}"
       when:
         - current_lme_version is version('2.3.0', '<')
-        - lme_llm_enabled | default(true) | bool
+        - lme_enable_flags.install_llm
 
     # Re-land the Elastic services pack config + certs on upgrade. The pack's units
     # themselves are now rendered by the manifest render above (render_units.yml
@@ -1028,7 +1151,7 @@
         name: podman
         tasks_from: elastic_services_setup.yml
       when:
-        - lme_pack_enabled | default(false) | bool
+        - lme_enable_flags.install_elastic_services
         - not (lme_child_es_only | default(false) | bool)
 
     - name: Update LME version in environment file
