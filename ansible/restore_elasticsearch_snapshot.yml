@@ -26,6 +26,38 @@
     rename_pattern: ""
     rename_replacement: ""
 
+    # Post-restore health gate (codex-0345 item 2 / D-0437 health_states): an
+    # ALLOWED state, not merely "not literal red". yellow is normal on a
+    # single-node cluster (unassigned replicas); red is the failure. A timed_out
+    # health response carries a stale status and is never healthy.
+    allowed_post_restore_health_states:
+      - green
+      - yellow
+
+    # Asynchronous completion polling (codex-0345 item 1 / D-0437 async_completion):
+    # bounded retry/until. Defaults ~= 1 hour (120 * 30s), matching the
+    # synchronous _restore timeout.
+    async_restore_poll_retries: 120
+    async_restore_poll_delay: 30
+
+    # Bounded readback for Kibana reaching 'active' after restart (absorbs a
+    # transient 'activating'); exhausting it FAILS the play.
+    kibana_start_probe_retries: 12
+    kibana_start_probe_delay: 5
+
+    # Recovery model / resume support (codex-0345 item 4 / D-0437 prior_state_and_resume).
+    # Per-repo+snapshot checkpoint so an interrupted run is diagnosable and a re-run
+    # RESUMES rather than blindly re-destroying. Bound to cluster identity so a
+    # marker from a wiped/rebuilt cluster cannot trigger a false skip.
+    # NOTE: exact schema, resume-decision matrix and cluster-UUID stability under a
+    # global-state restore are flagged to D/E (see report).
+    restore_checkpoint_dir: /opt/lme/state/restore
+    restore_checkpoint_file: "{{ restore_checkpoint_dir }}/{{ es_snapshot_repo }}__{{ snapshot_name }}.json"
+
+    # Baseline so the fact is always defined; the path-specific tasks below set the
+    # actually-restored index list. An empty list here MUST fail the content gate.
+    restored_indices: []
+
   tasks:
     - name: Require snapshot_name
       ansible.builtin.assert:
@@ -226,18 +258,336 @@
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
 
+    # ---------------------------------------------------------------------------
+    # codex-0345 item 4 / D-0437 prior_state_and_resume: record PRIOR STATE +
+    # failure checkpoints + resume that never re-initialises or loses data.
+    # Capture what exists BEFORE the destructive restore so a failure is
+    # diagnosable and a re-run can RESUME rather than blindly re-destroy.
+    # ---------------------------------------------------------------------------
+    - name: Ensure restore checkpoint directory exists
+      ansible.builtin.file:
+        path: "{{ restore_checkpoint_dir }}"
+        state: directory
+        mode: "0700"
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Read prior restore checkpoint (if any)
+      ansible.builtin.slurp:
+        src: "{{ restore_checkpoint_file }}"
+      register: restore_checkpoint_slurp
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Parse prior restore checkpoint
+      ansible.builtin.set_fact:
+        # A present-but-corrupt checkpoint fails here at from_json (operator
+        # attention); a missing checkpoint yields {} (fresh run). Corrupt-marker
+        # policy is flagged to D.
+        restore_checkpoint_prior: >-
+          {{ (restore_checkpoint_slurp.content | b64decode | from_json)
+             if (restore_checkpoint_slurp.content is defined) else {} }}
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Capture cluster identity before restore (prior state)
+      ansible.builtin.uri:
+        url: "{{ local_es_url }}/"
+        method: GET
+        user: "{{ elastic_username }}"
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: cluster_root
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Capture existing indices before restore (prior state)
+      ansible.builtin.uri:
+        url: "{{ local_es_url }}/_cat/indices?format=json&h=index,health,status,pri,docs.count"
+        method: GET
+        user: "{{ elastic_username }}"
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: prior_indices
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Capture cluster health before restore (prior state)
+      ansible.builtin.uri:
+        url: "{{ local_es_url }}/_cluster/health"
+        method: GET
+        user: "{{ elastic_username }}"
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: prior_cluster_health
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Capture in-progress recoveries before restore (prior state)
+      ansible.builtin.uri:
+        url: "{{ local_es_url }}/_cat/recovery?format=json&h=index,shard,type,stage,repository,snapshot"
+        method: GET
+        user: "{{ elastic_username }}"
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: prior_recovery
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Capture Kibana service state before restore (prior state)
+      ansible.builtin.command: systemctl show -p ActiveState --value lme-kibana
+      register: kibana_prior_show
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    # _cat/recovery type/stage values are matched case-INSENSITIVELY (documented
+    # lowercase 'snapshot'/'done'; the regex tolerance removes any version risk).
+    - name: Derive prior-state signals
+      ansible.builtin.set_fact:
+        current_cluster_uuid: "{{ cluster_root.json.cluster_uuid | default('') }}"
+        kibana_prior_active_state: "{{ kibana_prior_show.stdout | default('') | trim }}"
+        # DONE snapshot recoveries for THIS repo+snapshot in the LIVE cluster now.
+        prior_snapshot_recovery_done_indices: >-
+          {{ prior_recovery.json | default([])
+             | selectattr('type', 'match', '^snapshot$', true)
+             | selectattr('repository', 'equalto', es_snapshot_repo)
+             | selectattr('snapshot', 'equalto', snapshot_name)
+             | selectattr('stage', 'match', '^done$', true)
+             | map(attribute='index') | list | unique | sort }}
+        # An ACTIVE (non-done) snapshot recovery for THIS repo+snapshot.
+        restore_active_in_progress: >-
+          {{ (prior_recovery.json | default([])
+              | selectattr('type', 'match', '^snapshot$', true)
+              | selectattr('repository', 'equalto', es_snapshot_repo)
+              | selectattr('snapshot', 'equalto', snapshot_name)
+              | rejectattr('stage', 'match', '^done$', true)
+              | list | length) > 0 }}
+        # Identity: a checkpoint only counts if it names THIS repo+snapshot AND was
+        # written against THIS cluster (a wiped/rebuilt cluster gets a new UUID).
+        restore_checkpoint_identity_match: >-
+          {{ (restore_checkpoint_prior.repository | default('') == es_snapshot_repo)
+             and (restore_checkpoint_prior.snapshot | default('') == snapshot_name)
+             and (restore_checkpoint_prior.cluster_uuid | default('') | length > 0)
+             and (restore_checkpoint_prior.cluster_uuid | default('') == (cluster_root.json.cluster_uuid | default('__none__'))) }}
+        # The submitting run's pre-submit DONE baseline (used to bind completion on
+        # a resume to that run's attempt, not the current run's live snapshot).
+        checkpoint_prior_done_baseline: "{{ restore_checkpoint_prior.prior_snapshot_recovery_done_indices | default([]) }}"
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Derive checkpoint-phase signals
+      ansible.builtin.set_fact:
+        # Write-ahead: the submit-intent marker (written BEFORE the blocking submit)
+        # and the submitted marker both mean "this playbook launched this restore".
+        restore_recorded_submitted: >-
+          {{ (restore_checkpoint_identity_match | bool)
+             and (restore_checkpoint_prior.phase | default('') in ['restore_submit_intent', 'restore_submitted']) }}
+        restore_recorded_completed: >-
+          {{ (restore_checkpoint_identity_match | bool)
+             and (restore_checkpoint_prior.phase | default('') == 'restore_completed_verified') }}
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Derive resume baselines
+      ansible.builtin.set_fact:
+        # On a recorded run use its baseline; on a fresh run use the current live set.
+        poll_baseline: >-
+          {{ checkpoint_prior_done_baseline if (restore_recorded_submitted | bool)
+             else prior_snapshot_recovery_done_indices }}
+        # Snapshot indices that reached DONE beyond the submitting run's baseline
+        # (i.e. this attempt finished while the controller was away).
+        live_new_done_indices: >-
+          {{ prior_snapshot_recovery_done_indices
+             | difference(checkpoint_prior_done_baseline if (restore_recorded_submitted | bool)
+                          else prior_snapshot_recovery_done_indices) }}
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Decide submit/resume/verify/skip/refuse
+      ansible.builtin.set_fact:
+        # (a) our recorded restore is still running -> RESUME (poll + verify).
+        restore_resume_poll: "{{ (restore_active_in_progress | bool) and (restore_recorded_submitted | bool) }}"
+        # (b) our recorded restore finished while we were away -> VERIFY only.
+        restore_verify_finished: >-
+          {{ (not (restore_active_in_progress | bool)) and (restore_recorded_submitted | bool)
+             and ((live_new_done_indices | length) > 0) }}
+        # completed marker for THIS cluster -> idempotent SKIP (re-verify live only).
+        restore_skip_completed: "{{ (restore_recorded_completed | bool) and (not (restore_active_in_progress | bool)) }}"
+        # fresh destructive run.
+        restore_should_submit: >-
+          {{ (not (restore_active_in_progress | bool))
+             and (not (restore_recorded_submitted | bool))
+             and (not (restore_recorded_completed | bool)) }}
+        # foreign/unrecorded active restore -> refuse (do not double-destroy).
+        restore_refuse_foreign: "{{ (restore_active_in_progress | bool) and (not (restore_recorded_submitted | bool)) }}"
+        # our recorded restore left nothing landed and no completed marker -> refuse
+        # (do NOT auto-resubmit; the exact policy is flagged to D).
+        restore_refuse_incomplete: >-
+          {{ (not (restore_active_in_progress | bool)) and (restore_recorded_submitted | bool)
+             and ((live_new_done_indices | length) == 0) and (not (restore_recorded_completed | bool)) }}
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Refuse foreign/unrecorded in-progress restore
+      ansible.builtin.assert:
+        that:
+          - not (restore_refuse_foreign | bool)
+        fail_msg: >-
+          A restore of snapshot '{{ snapshot_name }}' from repository '{{ es_snapshot_repo }}'
+          is already in progress but is NOT recorded (by matching cluster identity) in this
+          playbook's checkpoint ({{ restore_checkpoint_file }}). Refusing to launch a concurrent
+          destructive restore over an unrecorded/foreign in-flight recovery.
+        success_msg: "No unrecorded in-progress restore of '{{ snapshot_name }}' detected."
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Refuse an incomplete recorded restore that landed nothing
+      ansible.builtin.assert:
+        that:
+          - not (restore_refuse_incomplete | bool)
+        fail_msg: >-
+          A prior recorded restore of '{{ snapshot_name }}' (checkpoint phase
+          '{{ restore_checkpoint_prior.phase | default('?') }}') is neither in progress nor did it
+          land any new indices beyond its recorded baseline. Refusing to blindly re-destroy/resubmit;
+          an operator (with D's recovery ruling) must decide whether to resume, clear, or resubmit.
+          Checkpoint: {{ restore_checkpoint_file }}.
+        success_msg: "No incomplete recorded restore to reconcile."
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Report restore decision
+      ansible.builtin.debug:
+        msg: >-
+          Restore decision for '{{ snapshot_name }}' @ '{{ es_snapshot_repo }}':
+          submit={{ restore_should_submit | bool }}, resume={{ restore_resume_poll | bool }},
+          verify_finished={{ restore_verify_finished | bool }},
+          skip_completed={{ restore_skip_completed | bool }},
+          active_in_progress={{ restore_active_in_progress | bool }},
+          identity_match={{ restore_checkpoint_identity_match | bool }},
+          kibana_prior_state='{{ kibana_prior_active_state }}'.
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Build restore checkpoint base record
+      ansible.builtin.set_fact:
+        restore_checkpoint_base: >-
+          {{ {
+            'schema': 'lme-es-restore-checkpoint/v1',
+            'repository': es_snapshot_repo,
+            'snapshot': snapshot_name,
+            'restore_mode': restore_mode,
+            'cluster_uuid': current_cluster_uuid,
+            'observed_at': now(true, '%Y-%m-%dT%H:%M:%SZ'),
+            'prior_cluster_health_status': prior_cluster_health.json.status | default('unknown'),
+            'prior_index_names': (prior_indices.json | default([]) | map(attribute='index') | list | sort),
+            'prior_snapshot_recovery_done_indices': prior_snapshot_recovery_done_indices,
+            'kibana_prior_active_state': kibana_prior_active_state,
+            'decision': {
+              'restore_should_submit': restore_should_submit | bool,
+              'restore_resume_poll': restore_resume_poll | bool,
+              'restore_verify_finished': restore_verify_finished | bool,
+              'restore_skip_completed': restore_skip_completed | bool,
+              'restore_active_in_progress': restore_active_in_progress | bool
+            }
+          } }}
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Checkpoint - prior state captured
+      ansible.builtin.copy:
+        content: "{{ restore_checkpoint_base | combine({'phase': 'prior_state_captured'}) | to_nice_json }}"
+        dest: "{{ restore_checkpoint_file }}"
+        mode: "0600"
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    # FENCE stop-scope (partnership with D's RESTORE-EARLY-DESTRUCTION-AND-STOP-SCOPE):
+    # the ONLY service this playbook stops is lme-kibana, and ONLY on the master ES
+    # node (delegate = groups['elasticsearch'][0], where Kibana/Fleet run per the
+    # inventory), and ONLY for a fresh_cluster full restore that we are submitting.
+    # It touches no other unit, host, or the ES service itself. ignore_errors was
+    # removed (codex-0345 item 3 / D-0437 stop_evidence): a failed stop aborts the
+    # play BEFORE any destructive restore.
     - name: Stop Kibana before fresh-cluster restore
       ansible.builtin.systemd:
         name: lme-kibana
         state: stopped
-      register: kibana_stop_result
       when:
         - restore_mode == 'fresh_cluster'
         - include_global_state | bool
         - stop_kibana_during_restore | bool
+        - restore_should_submit | bool
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
-      ignore_errors: true
+
+    # 'cleanly stopped' must be ESTABLISHED via an affirmative probe, not inferred
+    # from the module return (which reports pre-action state). UNKNOWN => fail closed.
+    - name: Probe Kibana state after stop
+      ansible.builtin.command: systemctl show -p ActiveState --value lme-kibana
+      register: kibana_post_stop
+      changed_when: false
+      check_mode: false
+      when:
+        - restore_mode == 'fresh_cluster'
+        - include_global_state | bool
+        - stop_kibana_during_restore | bool
+        - restore_should_submit | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Assert Kibana is cleanly stopped before restore
+      ansible.builtin.assert:
+        that:
+          - (kibana_post_stop.stdout | default('') | trim) == 'inactive'
+        fail_msg: >-
+          Kibana is not cleanly stopped before the restore
+          (ActiveState={{ kibana_post_stop.stdout | default('unknown') | trim }}).
+          Refusing to restore over a Kibana that is not established as stopped.
+        success_msg: "Kibana is cleanly stopped (inactive) before restore."
+      when:
+        - restore_mode == 'fresh_cluster'
+        - include_global_state | bool
+        - stop_kibana_during_restore | bool
+        - restore_should_submit | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Checkpoint - Kibana stopped
+      ansible.builtin.copy:
+        content: "{{ restore_checkpoint_base | combine({'phase': 'kibana_stopped'}) | to_nice_json }}"
+        dest: "{{ restore_checkpoint_file }}"
+        mode: "0600"
+      when:
+        - restore_mode == 'fresh_cluster'
+        - include_global_state | bool
+        - stop_kibana_during_restore | bool
+        - restore_should_submit | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    # Write-ahead intent marker BEFORE the (blocking) submit. If the controller
+    # dies during a synchronous restore, ES keeps restoring; a re-run then sees this
+    # intent marker + an active recovery and RESUMES instead of refusing its own work.
+    - name: Checkpoint - restore submit intent (write-ahead)
+      ansible.builtin.copy:
+        content: "{{ restore_checkpoint_base | combine({'phase': 'restore_submit_intent'}) | to_nice_json }}"
+        dest: "{{ restore_checkpoint_file }}"
+        mode: "0600"
+      when: restore_should_submit | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
 
     - name: Restore Elasticsearch snapshot
       ansible.builtin.uri:
@@ -252,6 +602,16 @@
         status_code: [200]
         timeout: 3600
       register: snapshot_restore_result
+      when: restore_should_submit | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Checkpoint - restore submitted
+      ansible.builtin.copy:
+        content: "{{ restore_checkpoint_base | combine({'phase': 'restore_submitted'}) | to_nice_json }}"
+        dest: "{{ restore_checkpoint_file }}"
+        mode: "0600"
+      when: restore_should_submit | bool
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
 
@@ -269,21 +629,157 @@
         success_msg: >-
           Restore accepted:
           {{ snapshot_restore_result.json.snapshot.shards.successful }} shards restored, 0 failed.
-      when: wait_for_completion | bool
+      when:
+        - wait_for_completion | bool
+        - restore_should_submit | bool
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
 
+    # codex-0345 item 1 / D-0437 async_completion: 'accepted' is ADMISSION ONLY,
+    # not completion. Keep the admission gate, THEN poll to completion and read back
+    # restored content.
     - name: Verify asynchronous restore was accepted by the cluster
       ansible.builtin.assert:
         that:
           - (snapshot_restore_result.json.accepted | default(false)) | bool
         fail_msg: >-
           Asynchronous restore of snapshot '{{ snapshot_name }}' was not accepted by the cluster.
-      when: not (wait_for_completion | bool)
+        success_msg: >-
+          Asynchronous restore of '{{ snapshot_name }}' admitted; polling to completion.
+      when:
+        - not (wait_for_completion | bool)
+        - restore_should_submit | bool
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
 
-    - name: Check cluster health after synchronous restore
+    # Poll _cat/recovery until THIS attempt's snapshot recoveries all reach 'done'.
+    # Binding to THIS attempt: target = snapshot rows for this repo+snapshot whose
+    # index is NOT in poll_baseline (the submitting run's pre-submit DONE set), so
+    # stale DONE entries from an earlier restore cannot satisfy completion. Runs for
+    # a fresh async submit AND for a resumed in-progress restore (either mode).
+    # Exhausting retries FAILS the play.
+    - name: Poll asynchronous/resumed restore to completion
+      ansible.builtin.uri:
+        url: "{{ local_es_url }}/_cat/recovery?format=json&h=index,shard,type,stage,repository,snapshot"
+        method: GET
+        user: "{{ elastic_username }}"
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: async_recovery_poll
+      until: >-
+        ((async_recovery_poll.json | default([])
+          | selectattr('type', 'match', '^snapshot$', true)
+          | selectattr('repository', 'equalto', es_snapshot_repo)
+          | selectattr('snapshot', 'equalto', snapshot_name)
+          | rejectattr('index', 'in', poll_baseline)
+          | list | length) > 0)
+        and
+        ((async_recovery_poll.json | default([])
+          | selectattr('type', 'match', '^snapshot$', true)
+          | selectattr('repository', 'equalto', es_snapshot_repo)
+          | selectattr('snapshot', 'equalto', snapshot_name)
+          | rejectattr('index', 'in', poll_baseline)
+          | rejectattr('stage', 'match', '^done$', true)
+          | list | length) == 0)
+      retries: "{{ async_restore_poll_retries | int }}"
+      delay: "{{ async_restore_poll_delay | int }}"
+      when: >-
+        (restore_resume_poll | bool)
+        or ((not (wait_for_completion | bool)) and (restore_should_submit | bool))
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    # ------- Determine the indices actually restored by THIS attempt (all paths) -------
+    - name: Set restored indices (synchronous restore)
+      ansible.builtin.set_fact:
+        restored_indices: "{{ snapshot_restore_result.json.snapshot.indices | default([]) | unique | sort }}"
+      when:
+        - wait_for_completion | bool
+        - restore_should_submit | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Set restored indices (asynchronous / resumed restore)
+      ansible.builtin.set_fact:
+        restored_indices: >-
+          {{ async_recovery_poll.json | default([])
+             | selectattr('type', 'match', '^snapshot$', true)
+             | selectattr('repository', 'equalto', es_snapshot_repo)
+             | selectattr('snapshot', 'equalto', snapshot_name)
+             | rejectattr('index', 'in', poll_baseline)
+             | map(attribute='index') | list | unique | sort }}
+      when: >-
+        (restore_resume_poll | bool)
+        or ((not (wait_for_completion | bool)) and (restore_should_submit | bool))
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Set restored indices (recorded restore finished offline, verifying live)
+      ansible.builtin.set_fact:
+        restored_indices: "{{ live_new_done_indices | unique | sort }}"
+      when: restore_verify_finished | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Set restored indices (already-completed, verifying live)
+      ansible.builtin.set_fact:
+        restored_indices: "{{ restore_checkpoint_prior.restored_indices | default([]) | unique | sort }}"
+      when: restore_skip_completed | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    # Content readback: the restored indices must actually exist and hold shards.
+    # A missing index 404s this call (torn state -> fail-fast); present-but-bad is
+    # caught by the assert below. Admission/health alone must NOT pass.
+    - name: Read back restored indices health/shards (content verification)
+      ansible.builtin.uri:
+        url: "{{ local_es_url }}/_cat/indices/{{ restored_indices | join(',') }}?format=json&h=index,health,status,pri,docs.count"
+        method: GET
+        user: "{{ elastic_username }}"
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: restored_index_cat
+      when: restored_indices | length > 0
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Assert restored content is present and non-empty
+      ansible.builtin.assert:
+        that:
+          # Not admission-only: at least one index was actually restored.
+          - restored_indices | length > 0
+          # Every restored index is present in the live cluster.
+          - (restored_index_cat.json | default([]) | length) == (restored_indices | length)
+          # Every restored index is open, not red, and has primary shards allocated.
+          - (restored_index_cat.json | default([]) | rejectattr('status', 'equalto', 'open') | list | length) == 0
+          - (restored_index_cat.json | default([]) | selectattr('health', 'equalto', 'red') | list | length) == 0
+          - (restored_index_cat.json | default([]) | selectattr('pri', 'defined') | map(attribute='pri') | map('int') | select('<', 1) | list | length) == 0
+          # Cross-check against D1's captured snapshot record: with no rename, the
+          # restored set must be a SUBSET of the snapshot's indices (equality is
+          # unsafe -- '*' does not restore system/feature-state indices as regular
+          # indices; see report flag to E for exact expected-set semantics).
+          - (rename_pattern | length > 0) or ((restored_indices | difference(es_snapshot_record.indices | default([])) | length) == 0)
+        fail_msg: >-
+          Restored content verification FAILED for snapshot '{{ snapshot_name }}':
+          restored_indices={{ restored_indices }},
+          present={{ restored_index_cat.json | default([]) | map(attribute='index') | list }}.
+          A restore that was merely admitted, produced no indices, left an index
+          closed/red, or restored indices absent from the snapshot record must not
+          pass as success.
+        success_msg: >-
+          Restored content verified: {{ restored_indices | length }} indices present,
+          open, not red, with primary shards allocated.
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    # codex-0345 item 2 / D-0437 health_states: honor an ALLOWED state and
+    # timed_out. Runs for BOTH synchronous and asynchronous/resumed/verified paths
+    # (an async restore must not restart Kibana without a health gate).
+    - name: Check cluster health after restore
       ansible.builtin.uri:
         url: "{{ local_es_url }}/_cluster/health?wait_for_no_relocating_shards=true&timeout=120s"
         method: GET
@@ -293,25 +789,68 @@
         validate_certs: false
         status_code: [200]
       register: post_restore_cluster_health
-      when: wait_for_completion | bool
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
 
-    - name: Assert cluster is not red after synchronous restore
+    - name: Assert cluster reached an allowed, non-timed-out health state after restore
       ansible.builtin.assert:
         that:
           - post_restore_cluster_health.json.status is defined
-          - post_restore_cluster_health.json.status != 'red'
+          # A timed_out health response carries a stale status and is never healthy.
+          - not (post_restore_cluster_health.json.timed_out | default(true))
+          # Require an explicitly ALLOWED state, not merely "not literal red".
+          - post_restore_cluster_health.json.status in allowed_post_restore_health_states
         fail_msg: >-
           Cluster health is '{{ post_restore_cluster_health.json.status | default("unknown") }}'
-          after restoring snapshot '{{ snapshot_name }}'. A red cluster indicates the restore did
-          not produce a usable cluster state; refusing to report success or restart Kibana over it.
+          (timed_out={{ post_restore_cluster_health.json.timed_out | default("unknown") }})
+          after restoring snapshot '{{ snapshot_name }}'. Only
+          {{ allowed_post_restore_health_states }} with timed_out=false are accepted;
+          refusing to report success or restart Kibana over an unhealthy or unsettled cluster.
         success_msg: >-
-          Post-restore cluster health: {{ post_restore_cluster_health.json.status }}.
-      when: wait_for_completion | bool
+          Post-restore cluster health: {{ post_restore_cluster_health.json.status }}
+          (timed_out=false).
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
 
+    # Re-read cluster identity AFTER the restore so the completion marker records the
+    # post-restore UUID. Whether a global-state restore changes cluster_uuid is
+    # flagged to D/E; recording the post value keeps the skip decision self-consistent.
+    - name: Capture cluster identity after restore
+      ansible.builtin.uri:
+        url: "{{ local_es_url }}/"
+        method: GET
+        user: "{{ elastic_username }}"
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: cluster_root_post
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Build completion checkpoint record
+      ansible.builtin.set_fact:
+        restore_checkpoint_completed: >-
+          {{ restore_checkpoint_base | combine({
+               'cluster_uuid': (cluster_root_post.json.cluster_uuid | default(current_cluster_uuid)),
+               'restored_indices': restored_indices
+             }) }}
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Checkpoint - restore completed and verified
+      ansible.builtin.copy:
+        content: "{{ restore_checkpoint_completed | combine({'phase': 'restore_completed_verified'}) | to_nice_json }}"
+        dest: "{{ restore_checkpoint_file }}"
+        mode: "0600"
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    # codex-0345 item 3 (start side) / D-0437 fail_fast: ignore_errors removed -- a
+    # failed restart is now a real failure. This is on the SUCCESS path only (after
+    # the content and health gates); D's fail-fast stands: a red/failed/partial
+    # restore aborts before here, so Kibana is NOT restarted over torn data (no
+    # always/rescue restart added).
     - name: Start Kibana after fresh-cluster restore
       ansible.builtin.systemd:
         name: lme-kibana
@@ -323,21 +862,75 @@
         - restart_kibana_after_restore | bool
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
-      ignore_errors: true
+
+    # Affirmative readback (module return reports pre-action state). Bounded until
+    # absorbs a transient 'activating'; never reaching 'active' FAILS the play.
+    - name: Probe Kibana state after restart (bounded)
+      ansible.builtin.command: systemctl show -p ActiveState --value lme-kibana
+      register: kibana_post_start
+      changed_when: false
+      check_mode: false
+      until: (kibana_post_start.stdout | default('') | trim) == 'active'
+      retries: "{{ kibana_start_probe_retries | int }}"
+      delay: "{{ kibana_start_probe_delay | int }}"
+      when:
+        - restore_mode == 'fresh_cluster'
+        - include_global_state | bool
+        - stop_kibana_during_restore | bool
+        - restart_kibana_after_restore | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Assert Kibana is active after restart
+      ansible.builtin.assert:
+        that:
+          - (kibana_post_start.stdout | default('') | trim) == 'active'
+        fail_msg: >-
+          Kibana did not reach 'active' after the restore
+          (ActiveState={{ kibana_post_start.stdout | default('unknown') | trim }}).
+        success_msg: "Kibana is active after restore."
+      when:
+        - restore_mode == 'fresh_cluster'
+        - include_global_state | bool
+        - stop_kibana_during_restore | bool
+        - restart_kibana_after_restore | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Checkpoint - Kibana restarted
+      ansible.builtin.copy:
+        content: "{{ restore_checkpoint_completed | combine({'phase': 'kibana_restarted'}) | to_nice_json }}"
+        dest: "{{ restore_checkpoint_file }}"
+        mode: "0600"
+      when:
+        - restore_mode == 'fresh_cluster'
+        - include_global_state | bool
+        - stop_kibana_during_restore | bool
+        - restart_kibana_after_restore | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
 
     - name: Display restore summary
       ansible.builtin.debug:
         msg:
           - "============================================"
-          - "  Snapshot Restore Submitted"
+          - "  Snapshot Restore Verified"
           - "============================================"
           - "Repository: {{ es_snapshot_repo }}"
           - "Snapshot: {{ snapshot_name }}"
           - "Restore mode: {{ restore_mode }}"
-          - "Indices: {{ restore_indices }}"
+          - "Requested indices: {{ restore_indices }}"
           - "Include global state: {{ include_global_state | bool }}"
           - "Waited for completion: {{ wait_for_completion | bool }}"
+          - >-
+            Outcome: {{ 'already restored (verified live), no restore performed'
+              if (restore_skip_completed | bool)
+              else ('recorded restore finished offline and verified' if (restore_verify_finished | bool)
+              else ('resumed in-progress restore and verified' if (restore_resume_poll | bool)
+              else 'restore submitted and verified')) }}
+          - "Restored indices ({{ restored_indices | length }}): {{ restored_indices | join(', ') }}"
           - "Verified nodes: {{ repo_verify.json.nodes.values() | map(attribute='name') | list | join(', ') }}"
-          - "Cluster health after restore: {{ post_restore_cluster_health.json.status if post_restore_cluster_health is defined and post_restore_cluster_health.json is defined else 'not checked (async restore)' }}"
+          - "Cluster health after restore: {{ post_restore_cluster_health.json.status | default('unknown') }}"
+          - "Checkpoint: {{ restore_checkpoint_file }}"
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
