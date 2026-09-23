@@ -85,12 +85,20 @@
          | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)
          | combine(lme_global_override | default({}), recursive=True) }}
 
-- name: Apply profile vars as facts (enable flags such as install_llm/offline_mode)
+# Apply the profile's NON-FLAG vars as facts (es_discovery, tailscale_serve_*, ...).
+# The five ENABLE FLAGS are DELIBERATELY excluded here and resolved from scratch below
+# (defaults | profile | operator LAST) so that (a) an operator inventory/host_var/-e
+# override outranks the profile -- a profile set_fact would wrongly outrank inventory --
+# and (b) a flag absent from a newly-selected profile REVERTS to its default instead of
+# retaining a stale prior-load value. See "Resolve enable flags from scratch" below.
+- name: Apply profile NON-flag vars as facts
   ansible.builtin.set_fact:
     "{{ item.key }}": "{{ item.value }}"
-  loop: "{{ (_lme_profile_file.profile_overlay.vars | default({})) | dict2items }}"
+  loop: "{{ (_lme_profile_file.profile_overlay.vars | default({})) | dict2items | rejectattr('key', 'in', _lme_flag_keys) | list }}"
   loop_control:
     label: "{{ item.key }}"
+  vars:
+    _lme_flag_keys: [install_llm, install_elastic_services, offline_mode, install_otel, install_legacy_beats]
 
 # Assemble the flags dict that render_units.yml's is_enabled() consults. Defaults
 # recovered from the current role (install_llm default true; elastic-services and
@@ -119,14 +127,55 @@
     fail_msg: Consumer profile requires topology-derived secret source, certificate authority and endpoints.
   when: lme_consumer_profile | default(false) | strict_enable_bool
 
+# --- Enable-flag resolution (offline-stale + inventory-override defect fix) ----------
+# Precedence CONFIRMED by codex (extra-var > inventory/host_var > profile > default);
+# recomputed FROM SCRATCH each load (no combine-into-prior, no stale set_fact). Root
+# cause of both defects: the old code applied profile flags as top-level host facts,
+# which (a) outrank inventory (set_fact > inventory in Ansible) and (b) persist across
+# reloads. defaults/main.yml defines NONE of these five, so `is defined` on the FIRST,
+# uncontaminated load means the OPERATOR (inventory/host_var/-e) set it.
+- name: Capture operator flag overrides once (uncontaminated by any profile/prior-load fact)
+  ansible.builtin.set_fact:
+    _lme_operator_flags: >-
+      {{ {}
+         | combine({'install_llm': install_llm} if install_llm is defined else {})
+         | combine({'install_elastic_services': install_elastic_services} if install_elastic_services is defined else {})
+         | combine({'offline_mode': offline_mode} if offline_mode is defined else {})
+         | combine({'install_otel': install_otel} if install_otel is defined else {})
+         | combine({'install_legacy_beats': install_legacy_beats} if install_legacy_beats is defined else {}) }}
+  when: _lme_operator_flags is not defined
+
+- name: Resolve enable flags from scratch (defaults | profile | operator LAST)
+  ansible.builtin.set_fact:
+    _lme_resolved_flags: >-
+      {{ _lme_flag_defaults
+         | combine(_lme_profile_flags, recursive=True)
+         | combine(_lme_operator_flags | default({}), recursive=True) }}
+  vars:
+    _lme_flag_keys: [install_llm, install_elastic_services, offline_mode, install_otel, install_legacy_beats]
+    _lme_flag_defaults: {install_llm: true, install_elastic_services: false, offline_mode: false, install_otel: false, install_legacy_beats: true}
+    _lme_profile_flags: "{{ (_lme_profile_file.profile_overlay.vars | default({})) | dict2items | selectattr('key', 'in', _lme_flag_keys) | list | items2dict }}"
+
+# Materialize the resolved flags as bare facts so INSTALL-TIME consumers that read them
+# directly (main.yml / llama_cpp_setup.yml / load_offline_containers.yml, e.g.
+# `offline_mode | default(false)`) see the resolved value. This runs each load and
+# reflects the from-scratch resolution; the operator capture above is guarded so it is
+# NEVER re-read from these materialized facts.
+- name: Materialize resolved enable flags as bare facts
+  ansible.builtin.set_fact:
+    "{{ item.key }}": "{{ item.value }}"
+  loop: "{{ _lme_resolved_flags | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
 - name: Assemble enable flags for is_enabled()
   ansible.builtin.set_fact:
     lme_enable_flags:
-      install_llm: "{{ install_llm | default(true) | strict_enable_bool }}"
-      install_elastic_services: "{{ install_elastic_services | default(false) | strict_enable_bool }}"
-      offline_mode: "{{ offline_mode | default(false) | strict_enable_bool }}"
-      install_otel: "{{ install_otel | default(false) | strict_enable_bool }}"
-      install_legacy_beats: "{{ install_legacy_beats | default(true) | strict_enable_bool }}"
+      install_llm: "{{ _lme_resolved_flags.install_llm | strict_enable_bool }}"
+      install_elastic_services: "{{ _lme_resolved_flags.install_elastic_services | strict_enable_bool }}"
+      offline_mode: "{{ _lme_resolved_flags.offline_mode | strict_enable_bool }}"
+      install_otel: "{{ _lme_resolved_flags.install_otel | strict_enable_bool }}"
+      install_legacy_beats: "{{ _lme_resolved_flags.install_legacy_beats | strict_enable_bool }}"
 
 # GAP-3 host-scoping roster (lme_host_services): DELIBERATELY NOT assembled into a fact
 # here. It is an operator/host_vars-supplied list of service ids (host_vars/<host>.yml);
@@ -206,6 +255,16 @@
   run_once: true
   become: false
   register: _lme_service_files
+
+# Reset lme_services before the build loop so each load resolves the CURRENT service
+# set from scratch. Without this, `lme_services | default({})` in the build task below
+# combines into whatever a PRIOR load left behind -- so a service whose manifest was
+# removed persists as a stale entry (the service-removal retention defect). The loop
+# still accumulates within THIS load (first iteration reads {}, later ones read the
+# growing map); only the cross-load carry-over is severed.
+- name: Reset lme_services (recompute the current service set from scratch each load)
+  ansible.builtin.set_fact:
+    lme_services: {}
 
 - name: Build lme_services map (service | profile.services[id] | operator override[id] LAST)
   ansible.builtin.set_fact:
