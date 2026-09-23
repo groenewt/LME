@@ -60,15 +60,16 @@ def render_userns(userns, lme_global):
       * {mode: auto_unpinned}           -> auto
     where BASE = subuid_base + slot*slot_size and SIZE = slot_size.
     """
-    mode = userns.get('mode', 'auto')
+    cfg = lme_global['userns']
+    mode = userns.get('mode', cfg['default_mode'])
     if mode == 'share_with':
-        return 'container:lme-%s' % userns['service']
+        return cfg['share_ref'].format(name=userns['service'])
     if mode == 'auto_unpinned':
-        return 'auto'
+        return cfg['unpinned_value']
     # mode == auto (pinned id-mapping)
     base = _slot_base(userns.get('slot'), lme_global)
     size = int(lme_global['slot_size'])
-    return 'auto:uidmapping=0:%d:%d,gidmapping=0:%d:%d' % (base, size, base, size)
+    return cfg['auto_format'].format(base=base, size=size)
 
 
 def cert_owner(certs, lme_global):
