@@ -2,11 +2,15 @@
 # testing/tests/loader_integration/one_case.yml
 # Per-case dispatch. `case` is the loop var. Appends exactly one record to `results`.
 #
-# Three paths:
+# Paths:
 #   static_scan  -> read-only entrypoint lint, RUNNABLE NOW (no contract).
-#   QUEUED       -> contract-dependent case at an unbound HEAD: fail-closed to QUEUED.
-#   bound        -> contract bound: render probe from macros/probe.j2 + run the REAL
-#                   loader through the entrypoint context, judge the invariant strictly.
+#   QUEUED       -> a contract case is QUEUED whenever the C1 contract is unbound OR the
+#                   G-owned probe handler cannot faithfully render it (unhandled input/
+#                   expect key, or an environment beyond localhost). Fail-closed: this is
+#                   why binding C1 alone can NEVER turn an un-renderable case into a pass.
+#   bound        -> contract bound AND probe handler ready for THIS case's keys/env:
+#                   render the probe from macros/probe.j2, run it, judge strictly. A probe
+#                   that renders ZERO assertions is ERROR, never PASS.
 
 # --- static_scan (runnable now) -----------------------------------------------
 - name: "static_scan targets :: {{ case.name }}"
@@ -28,28 +32,45 @@
          } ] }}
   when: case.kind == 'static_scan'
 
-# --- contract-dependent + UNBOUND -> QUEUED (fail-closed, always visible) ------
-- name: "QUEUED (C1 contract unbound) :: {{ case.name }}"
+# --- probe-handler readiness for contract cases -------------------------------
+- name: "Assess probe-handler readiness :: {{ case.name }}"
+  ansible.builtin.set_fact:
+    _unhandled_inputs: "{{ ((case.inputs | default({})).keys() | list) | difference(contract_binding.probe_handler.supported_input_keys) }}"
+    _unhandled_expects: "{{ ((case.expect | default({})).keys() | list) | difference(contract_binding.probe_handler.supported_expect_keys) }}"
+    _env_ok: "{{ (case.environment | default('localhost')) in contract_binding.probe_handler.supported_environments }}"
+  when: case.kind != 'static_scan'
+
+- name: "Compute _probe_ready / _handler_blocked :: {{ case.name }}"
+  ansible.builtin.set_fact:
+    _handler_blocked: "{{ (contract_binding.probe_handler.status != 'ready') or (_unhandled_inputs | length > 0) or (_unhandled_expects | length > 0) or (not _env_ok) }}"
+    _probe_ready: "{{ contract_bound and (contract_binding.probe_handler.status == 'ready') and (_unhandled_inputs | length == 0) and (_unhandled_expects | length == 0) and _env_ok }}"
+  when: case.kind != 'static_scan'
+
+# --- QUEUED (unbound OR probe handler cannot render this case) -> fail-closed --
+- name: "QUEUED :: {{ case.name }}"
   ansible.builtin.set_fact:
     results: >-
       {{ results + [ {
            'case': case.name, 'kind': case.kind, 'invariant_task': case.invariant_task,
            'verdict': 'QUEUED', 'requires_contract': true,
-           'queued_on': (case.queued_on | default(['C1'])),
+           'queued_on': ((case.queued_on | default(['C1'])) + (['G_probe_handler'] if _handler_blocked else [])) | unique,
            'binding_status': contract_binding.status,
+           'probe_handler_blocked': _handler_blocked,
+           'unhandled_keys': (_unhandled_inputs + _unhandled_expects),
+           'environment': (case.environment | default('localhost')),
            'entrypoints': (case.entrypoints | default([]))
          } ] }}
   when:
     - case.kind != 'static_scan'
     - (case.requires_contract | default(true))
-    - not contract_bound
+    - (not contract_bound) or (not _probe_ready)
 
-# --- contract BOUND -> render + run the probe (activated on C1 bind) -----------
+# --- BOUND + probe-handler-ready -> render + run the probe ---------------------
 - name: "bound probe :: {{ case.name }}"
   when:
     - case.kind != 'static_scan'
     - (case.requires_contract | default(true))
-    - contract_bound
+    - _probe_ready | default(false)
   block:
     - name: "Prepare per-case work dir :: {{ case.name }}"
       ansible.builtin.file:
@@ -63,26 +84,33 @@
         dest: "{{ work }}/{{ case.name }}/probe.yml"
         mode: "0644"
 
+    - name: "Count rendered assertions (a zero-assertion probe must NOT be able to pass)"
+      ansible.builtin.set_fact:
+        _assert_count: "{{ (lookup('ansible.builtin.file', work ~ '/' ~ case.name ~ '/probe.yml')).splitlines() | select('search', 'ansible.builtin.assert') | list | length }}"
+
     - name: "Run probe under scrubbed env :: {{ case.name }}"
       ansible.builtin.command:
-        cmd: /usr/bin/env -i HOME={{ work }}/{{ case.name }} PATH=/usr/bin:/bin /usr/bin/ansible-playbook probe.yml
+        cmd: /usr/bin/env -i HOME={{ work }}/{{ case.name }} PATH=/usr/bin:/bin ANSIBLE_ROLES_PATH={{ repo_root }}/ansible/roles /usr/bin/ansible-playbook probe.yml
         chdir: "{{ work }}/{{ case.name }}"
       register: probe_run
       changed_when: false
       failed_when: false
+      when: (_assert_count | int) > 0
 
-    - name: "Judge probe outcome strictly (task name + fail_msg) :: {{ case.name }}"
+    - name: "Judge probe outcome strictly (zero-assert=ERROR; else task name + fail_msg) :: {{ case.name }}"
       ansible.builtin.set_fact:
         results: >-
           {{ results + [ {
                'case': case.name, 'kind': case.kind, 'invariant_task': case.invariant_task,
-               'verdict': ('PASS' if probe_run.rc == 0
+               'verdict': ('ERROR' if (_assert_count | int) == 0
+                           else ('PASS' if probe_run.rc == 0
                            else ('REJECTED-as-expected' if ((case.expect.reject | default(false))
                                  and (case.invariant_task in (probe_run.stdout | default(''))))
                            else ('XFAIL-as-expected' if ((case.fail_msg | default('')) != ''
                                  and (case.fail_msg in (probe_run.stdout | default('')))
                                  and (case.invariant_task in (probe_run.stdout | default(''))))
-                           else 'FAIL'))),
-               'rc': probe_run.rc,
+                           else 'FAIL')))),
+               'assert_count': (_assert_count | int),
+               'rc': (probe_run.rc | default('n/a')),
                'log': (work ~ '/' ~ case.name ~ '/probe.yml')
              } ] }}
