@@ -4,6 +4,7 @@ The caller runs this in a disposable container with the exact owner's parent
 volume mounted at /var/lib/postgresql/member. This helper never releases a fence
 or promotes a server. Old data and failed staging trees are retained.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -150,66 +151,114 @@ def rebuild(config, domain, request, *, root=Path('/var/lib/postgresql/member'),
     for path in (root, data, inhibit, identity_path):
         _unalias(path)
     def quarantine():
+        # VERIFIED exact-stop + restart-inhibition, mirroring platform.validate_receipt
+        # (which raises unless every prior writer is stopped is True and
+        # restart_inhibited is True). Here restart_inhibited == the persistent inhibit
+        # marker present and bound to this exact generation; stopped == the old datadir
+        # holds NO postmaster.pid at all. Any pid file -- including a STALE one left by a
+        # crash, a SIGKILL after a podman stop timeout, or a hypervisor fence -- is
+        # UNKNOWN stop evidence and is refused; that is a deliberately conservative
+        # local stand-in for the guardian-attested stopped flag, and such cases need an
+        # operator to confirm the old server is down and remove the pid file by hand.
         if (not inhibit.is_file() or inhibit.read_text() != request['qemu_generation']
                 or identity_path.read_text().strip() != request['qemu_generation']
-                or not data.is_dir() or (data / 'PG_VERSION').read_text().strip() != '17'):
+                or not data.is_dir() or (data / 'PG_VERSION').read_text().strip() != '17'
+                or (data / 'postmaster.pid').exists()):
             raise ValueError('exact stopped PostgreSQL 17 member and matching persistent quarantine required')
     quarantine()
     nonce = request['request_nonce']
     stage, retained = root / (domain + '.rebuild-' + nonce), root / (domain + '.retained-' + nonce)
     if stage.exists() or retained.exists() or stage.is_symlink() or retained.is_symlink():
         raise ValueError('rebuild nonce cannot reuse any previous staging or retained tree')
-    before_route = route_reader(config, domain)
-    if (request.get('source_authority', before_route['authority']) != before_route['authority']
-            or request.get('source_node', before_route['primary_node']) != before_route['primary_node']):
-        raise ValueError('fresh source authority differs from guardian rejoin reservation')
-    before = source_readback(config, domain, before_route, command)
-    host = safe_token(config['hosts'][before_route['primary_node']]['address'], r'[A-Za-z0-9.-]+')
-    port = topology(config['profile'])['domains'][domain]['port']
-    conninfo = (f'host={host} port={port} user=replicator dbname=replication '
-                'sslmode=verify-full sslrootcert=/run/secrets/pg-ca.crt sslcert=/run/secrets/replicator.crt '
-                'sslkey=/run/secrets/replicator.key passfile=/run/secrets/physical.pgpass connect_timeout=5 '
-                'application_name=lme_rebuild_' + config['node'])
-    checked(command, ['pg_basebackup', '--dbname', conninfo, '--pgdata', str(stage), '--format=plain',
-        '--wal-method=stream', '--checkpoint=fast', '--manifest-checksums=SHA256', '--no-password'], timeout=900)
-    manifest_bytes = (stage / 'backup_manifest').read_bytes()
-    manifest = json.loads(manifest_bytes)
-    verify_manifest(manifest, before)
-    verification = checked(command, ['pg_verifybackup', str(stage)], timeout=300)
-    control = checked(command, ['pg_controldata', str(stage)], timeout=15).stdout
-    fields = dict(line.split(':', 1) for line in control.splitlines() if ':' in line)
-    if (fields.get('Database system identifier', '').strip() != before['system_identifier']
-            or fields.get("Latest checkpoint's TimeLineID", '').strip() != str(before['timeline'])):
-        raise ValueError('backup control file differs from the authorized source lineage')
-    # Create recovery settings only after pg_verifybackup checks the original manifest.
-    auto = stage / 'postgresql.auto.conf'
-    _unalias(auto)
-    with auto.open('a') as stream:
-        stream.write("\nprimary_conninfo = '" + conninfo + "'\nprimary_slot_name = ''\nrecovery_target_timeline = 'latest'\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    (stage / 'standby.signal').touch(mode=0o600)
-    replica = replica_probe(stage, before, command=command)
-    verify_replica(replica, before)
-    after_route = route_reader(config, domain)
-    if any(after_route.get(key) != before_route.get(key) for key in ('primary_node', 'authority')):
-        raise ValueError('guardian authority changed while rebuilding; quarantine retained')
-    after = source_readback(config, domain, after_route, command)
-    if any(after[key] != before[key] for key in ('system_identifier', 'timeline')):
-        raise ValueError('source changed lineage while rebuilding')
-    quarantine()
-    # The helper has stopped its isolated server. Retain both trees if installing
-    # fails; never roll back to an unfenced writable former primary automatically.
-    data.rename(retained)
-    stage.rename(data)
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    # Race-safe rebuild admission. The reservation compare alone cannot fence this:
+    # without a lock two concurrent rebuilds both read the same fresh route, both
+    # pass the compare and both race the datadir rename. An exclusive advisory
+    # flock (LOCK_EX|LOCK_NB) on a per-(owner-volume,domain) lock file admits exactly
+    # one live rebuild; unlike an O_EXCL sentinel the kernel releases it when this
+    # process dies, so a SIGKILL/OOM during the up-to-900s pg_basebackup does NOT
+    # brick every future rejoin. The lock file lives on the member volume, NEVER the
+    # root-owned guardian fence tree (/var/lib/lme-fencing), which this rootless
+    # rebuild container cannot write. Nonce single-consumption (replay protection) is
+    # carried by the nonce-keyed stage/retained trees, which are never reused. The
+    # AUTHORITATIVE single-use is a guardian `consume` of the rejoin nonce over
+    # control.sock -- an absent seam.
+    lock = root / (domain + '.rejoin.lock')
+    _unalias(lock)
+    lock_fd = os.open(str(lock), os.O_CREAT | os.O_WRONLY, 0o600)
     try:
-        os.fsync(fd)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ValueError('a concurrent rejoin already holds this member; refusing to race the rename') from None
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, (nonce + '\n').encode())
+        os.fsync(lock_fd)
+        before_route = route_reader(config, domain)
+        # Non-vacuous reservation compare: the guardian-issued source binding, WHEN
+        # carried, must equal the freshly observed route; a mismatch means the primary
+        # moved after the reservation and the rebuild is refused. When the request
+        # omits the binding, race-safety comes from the member lock above (and, once it
+        # exists, the guardian consume seam) -- never from a self-comparison default.
+        for field, current in (('source_authority', before_route['authority']),
+                               ('source_node', before_route['primary_node'])):
+            if field in request and request[field] != current:
+                raise ValueError('fresh source authority differs from guardian rejoin reservation')
+        before = source_readback(config, domain, before_route, command)
+        host = safe_token(config['hosts'][before_route['primary_node']]['address'], r'[A-Za-z0-9.-]+')
+        port = topology(config['profile'])['domains'][domain]['port']
+        conninfo = (f'host={host} port={port} user=replicator dbname=replication '
+                    'sslmode=verify-full sslrootcert=/run/secrets/pg-ca.crt sslcert=/run/secrets/replicator.crt '
+                    'sslkey=/run/secrets/replicator.key passfile=/run/secrets/physical.pgpass connect_timeout=5 '
+                    'application_name=lme_rebuild_' + config['node'])
+        checked(command, ['pg_basebackup', '--dbname', conninfo, '--pgdata', str(stage), '--format=plain',
+            '--wal-method=stream', '--checkpoint=fast', '--manifest-checksums=SHA256', '--no-password'], timeout=900)
+        manifest_bytes = (stage / 'backup_manifest').read_bytes()
+        manifest = json.loads(manifest_bytes)
+        verify_manifest(manifest, before)
+        verification = checked(command, ['pg_verifybackup', str(stage)], timeout=300)
+        control = checked(command, ['pg_controldata', str(stage)], timeout=15).stdout
+        fields = dict(line.split(':', 1) for line in control.splitlines() if ':' in line)
+        if (fields.get('Database system identifier', '').strip() != before['system_identifier']
+                or fields.get("Latest checkpoint's TimeLineID", '').strip() != str(before['timeline'])):
+            raise ValueError('backup control file differs from the authorized source lineage')
+        # Create recovery settings only after pg_verifybackup checks the original manifest.
+        auto = stage / 'postgresql.auto.conf'
+        _unalias(auto)
+        with auto.open('a') as stream:
+            stream.write("\nprimary_conninfo = '" + conninfo + "'\nprimary_slot_name = ''\nrecovery_target_timeline = 'latest'\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        (stage / 'standby.signal').touch(mode=0o600)
+        replica = replica_probe(stage, before, command=command)
+        verify_replica(replica, before)
+        after_route = route_reader(config, domain)
+        if any(after_route.get(key) != before_route.get(key) for key in ('primary_node', 'authority')):
+            raise ValueError('guardian authority changed while rebuilding; quarantine retained')
+        after = source_readback(config, domain, after_route, command)
+        if any(after[key] != before[key] for key in ('system_identifier', 'timeline')):
+            raise ValueError('source changed lineage while rebuilding')
+        # VERIFIED exact-stop gate immediately before the irreversible rename:
+        # quarantine() re-checks restart-inhibition AND that no live postmaster.pid
+        # owns the old datadir (UNKNOWN stop => raise). Between this check and the
+        # rename the positive-authorization container fence keeps the fenced member
+        # unstartable; the pid check is this helper's local corroboration of it.
+        quarantine()
+        # The helper has stopped its isolated server. Retain both trees if installing
+        # fails; never roll back to an unfenced writable former primary automatically.
+        data.rename(retained)
+        stage.rename(data)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return {**request, 'operation': 'rebuild', 'source_route': after_route, 'source_before': before,
+                'source_after': after, 'replica': replica, 'backup_control': control,
+                'backup_manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(), 'wal_ranges': manifest['WAL-Ranges'],
+                'verification': {'program': 'pg_verifybackup', 'returncode': verification.returncode},
+                'installed_directory': str(data), 'retained_directory': str(retained),
+                'restart_inhibited': inhibit.exists(), 'completed_at': time.time()}
     finally:
-        os.close(fd)
-    return {**request, 'operation': 'rebuild', 'source_route': after_route, 'source_before': before,
-            'source_after': after, 'replica': replica, 'backup_control': control,
-            'backup_manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(), 'wal_ranges': manifest['WAL-Ranges'],
-            'verification': {'program': 'pg_verifybackup', 'returncode': verification.returncode},
-            'installed_directory': str(data), 'retained_directory': str(retained),
-            'restart_inhibited': inhibit.exists(), 'completed_at': time.time()}
+        # Closing releases the advisory flock. The lock file persists on the member
+        # volume (unlinking a flock target is racy); a lingering empty file is inert.
+        os.close(lock_fd)

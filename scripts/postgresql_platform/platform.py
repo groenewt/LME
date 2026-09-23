@@ -273,6 +273,16 @@ def render(config):
         ipaddress.ip_network(item['cidr'], strict=True)
     if str(uuid.UUID(config['qemu_generation'])) != config['qemu_generation']:
         raise ValueError('canonical observed QEMU generation required')
+    # Container-restart fence identity. The positive-authorization path (below) is
+    # keyed on the STABLE deployment identity, never run_id: a fresh evidence run
+    # must not hand a fenced member a new empty inhibit tree and silently un-fence
+    # it. C1-REGISTRY SEAM: `deployment_identity` is supplied by the C1 registry
+    # (stable across runs and QEMU boots); resolved_role_config does not source it
+    # yet, so it is currently unresolved and the fence renders an unconditional
+    # deny (fail-closed). A malformed token fails render closed rather than allow.
+    fence_identity = config.get('deployment_identity')
+    if fence_identity is not None:
+        safe_token(fence_identity, r'[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}')
     images = config['images']
     for kind in ('patroni', 'etcd'):
         if not re.fullmatch(r'(?:[a-zA-Z0-9./:_-]+@)?sha256:[a-f0-9]{64}', images[kind]):
@@ -331,8 +341,64 @@ def render(config):
                                                                     'sslcert': '/run/secrets/replicator.crt', 'sslkey': '/run/secrets/replicator.key'}},
                                  'pgpass': '/tmp/physical.pgpass', 'pg_hba': hba, 'pre_promote': gate_command,
                                  'remove_data_directory_on_rewind_failure': False, 'remove_data_directory_on_diverged_timelines': False},
+                  # Safe-failover eligibility, fail-closed. Every non-initial member
+                  # RENDERS nofailover=true; this default is NOT loosened here. Eligibility
+                  # is EXPLICIT: only the initial owner's synchronous standby (the member
+                  # named by synchronized_standby_slots under synchronous_mode_strict, so it
+                  # owns the durable committed state) may become promotable. Clearing the tag
+                  # to false is delegated to the guardian reconciler's `eligibility` operation
+                  # on the B-owned forced-command relay (config/postgresql-platform/
+                  # reconcile_guest.py), which re-verifies recovery+lineage+minimum WAL+
+                  # synchronized failover slots (its ready() gate) BEFORE clearing it -- a
+                  # gate this render must never pre-empt by statically emitting false. The
+                  # actual promotion is then gated cryptographically by pre_promote ->
+                  # gate-live (wired above), so eligibility alone promotes nothing. The
+                  # reconciler DRIVER (lme_lab.postgresql_reconcile.reconcile_once) is
+                  # currently quarantined; until it is reintegrated automatic failover is
+                  # correctly UNAVAILABLE (fail-closed), and the 90s recovery target is
+                  # therefore NOT RUN. synchronous_mode_strict / failover slots /
+                  # synchronized_standby_slots are unchanged. See fencing-protocol.contract.yaml.
                   'tags': {'nofailover': node != spec['initial_owner']}}
         files[f'patroni-{domain}.json'] = json.dumps(member, indent=2) + '\n'
+        # --- Container-restart fence: POSITIVE AUTHORIZATION, fail-closed. ---
+        # The unit starts ONLY when the fencing authority has published a readable,
+        # current, exact-domain and exact-generation authorization for this member.
+        # Every other case DENIES: missing / EACCES-unreadable / stale / wrong-domain
+        # / wrong-generation / unresolved-identity. This REPLACES the old
+        # `test ! -e <inhibit>` check, which (a) treated a missing marker and an
+        # EACCES stat failure alike as ALLOW and (b) keyed on run_id, so a fresh
+        # evidence run got an empty inhibit tree and silently un-fenced the node.
+        # The deny fails THIS unit only; it never converts guest fencing into a
+        # physical-host action.
+        #
+        # Visibility (systemd.service(5)): an ExecCondition= exit of 1..254 QUIETLY
+        # SKIPS the unit without marking it failed -- a fenced member would be
+        # invisible. We require fenced state to be OBSERVABLE, so the gate is an
+        # ExecStartPre= that exits 255 on any deny, which puts the unit into the
+        # failed state. With Restart=on-failure it restart-loops to start-limit-hit
+        # and stays failed; once a valid authorization is published the guardian/
+        # operator must `systemctl reset-failed` before the unit will start.
+        #
+        # systemd expands `$`/`%` in Exec lines, so every literal `$` is rendered
+        # `$$` and every `%` `%%` (e.g. `date +%%s` -> `date +%s` at runtime). The
+        # authority must grant the exact rootless owner READ and NO write access to
+        # the authorization; a wrong mode reads as EACCES, i.e. deny. Authorization
+        # file format: line 1 == exactly "authorize <identity> <domain> <node>
+        # <qemu_generation>"; line 2 == integer not-after epoch seconds.
+        # While no authority (control.sock server + Ed25519 signer + marker-writer)
+        # exists, the authorization is absent and HA is correctly UNSTARTABLE.
+        authorization = f'/var/lib/lme-fencing/authorize/{fence_identity}/{domain}/{node}'
+        if fence_identity is None:
+            fence_gate = "ExecStartPre=/bin/sh -c 'echo \"lme-fencing: stable deployment identity unresolved\" >&2; exit 255'"
+        else:
+            expected = f'authorize {fence_identity} {domain} {node} {config["qemu_generation"]}'
+            body = (f'a={authorization}; '
+                    '[ -r "$$a" ] || exit 255; '
+                    f'[ "$$(sed -n 1p "$$a")" = "{expected}" ] || exit 255; '
+                    'e=$$(sed -n 2p "$$a") || exit 255; '
+                    'case "$$e" in ""|*[!0-9]*) exit 255;; esac; '
+                    '[ "$$(date +%%s)" -lt "$$e" ] || exit 255')
+            fence_gate = "ExecStartPre=/bin/sh -c '" + body + "'"
         files[f'{name}.container'] = f'''[Unit]
 Description=LME PostgreSQL {domain} (guarded Patroni)
 After=network-online.target
@@ -355,7 +421,7 @@ NoNewPrivileges=true
 [Service]
 Restart=on-failure
 MemoryMax={memory}M
-ExecCondition=/usr/bin/test ! -e /var/lib/lme-fencing/inhibit/{run_id}/{domain}/{node}
+{fence_gate}
 TimeoutStartSec=300
 [Install]
 WantedBy=default.target

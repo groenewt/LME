@@ -1,0 +1,395 @@
+# LME PostgreSQL/Patroni durability core -- fencing & authorization protocol.
+#
+# Declarative contract for the container-restart fence (positive authorization),
+# safe-failover eligibility, and the rejoin race/stop guards implemented in
+# scripts/postgresql_platform/{platform.py,rejoin.py}. This file is the single
+# source of truth for the authorize / consume / route protocol and the owner
+# handoff. It is machine-validated with yaml.safe_load and carries no code.
+#
+# It SUPERSEDES the negative-inhibitor description in this directory's README.md
+# (see supersedes.readme_sections below); that README is outside this wave's
+# write scope and must be reconciled by its owner.
+
+contract:
+  name: lme-postgresql-fencing-protocol
+  version: 1
+  domain: D_database
+  status: >-
+    FAIL-CLOSED and intentionally UNSTARTABLE. The fencing authority
+    (control.sock server + Ed25519 signer + authorization/marker writer) does
+    NOT exist yet, and the C1 registry does not yet supply the stable
+    deployment identity. Under positive authorization that means HA cannot
+    start -- which is the correct, safe state. NOBODY may add a default-allow,
+    a static nofailover=false, or a synthetic authorization to make it start.
+
+  doctrine:
+    default: deny
+    principle: >-
+      Every gate is positive: a member or transition proceeds ONLY on present,
+      readable, current, exactly-bound, guardian-issued authorization. Absence,
+      unreadability (EACCES), staleness, wrong binding or unresolved identity
+      all DENY. A deny only prevents THIS unit/transition; it never escalates to
+      a physical-host action (no poweroff, no host fencing from a guest path).
+    do_not_weaken:
+      - synchronous_mode_strict
+      - synchronous_node_count=1
+      - failover slots (failover=true, synced, non-temporary, no invalidation)
+      - synchronized_standby_slots
+      - clientcert=verify-full / sslmode=verify-full everywhere
+      - pg_verifybackup / quarantine / rename-dance in rejoin
+
+  # ---- Named integration seams (all currently ABSENT unless noted) ----------
+  seams:
+    control_sock_server:
+      status: absent
+      path: /run/lme-fencing/control.sock
+      role: >-
+        Guardian-owned Unix-socket server that answers the three operations
+        below. It owns real etcd leader/reservation verification and the
+        nonce/epoch compare-and-set; static signed booleans cannot satisfy it.
+      operations: [authorize, consume, route]
+      referenced_by:
+        - scripts/postgresql_platform/platform.py (live_gate, gate, proxy_route)
+        - scripts/postgresql_platform/rejoin.py (read_route -> proxy_route)
+    ed25519_guardian_signer:
+      status: absent
+      role: >-
+        Signs the gate-live context/receipt/route/consume envelopes with detached
+        Ed25519 over canonical UTF-8 JSON (json.dumps sort_keys, separators
+        (',',':'), ensure_ascii=false). Verified by platform.verify_envelope,
+        which requires a 44-byte Ed25519 SubjectPublicKeyInfo public key. NOTE:
+        this signer does NOT sign the container-restart authorization file, which
+        is plaintext (see container_restart_fence.integrity_model).
+      signing_material_owner: C
+      signing_material: >-
+        C generates the Ed25519 keypair and publishes ONLY the public key -- to
+        members at /run/secrets/guardian.pub and to proxies at
+        /run/guardian/public.pem.
+      private_key_destination: >-
+        /run/lme-fencing (runtime tmpfs on the authority-socket signer host). The
+        private half lands only in tmpfs, is NEVER persisted to a volume or disk
+        and is NEVER distributed. This is the counterpart to the fail-closed
+        authorize/consume/route path. (Declared per C credential-materializer
+        coordination; C owns generation+placement, D only references guardian.pub.)
+    forced_command_relay:
+      status: present-but-inert
+      owner: B
+      implementation: config/postgresql-platform/reconcile_guest.py
+      role: >-
+        Narrowly-scoped, root, single-domain forced-command relay. It performs
+        only inspect / subscriber_slots / set_guard / eligibility on ONE owned
+        Patroni domain, re-checks the observed guest QEMU generation against
+        /var/lib/cloud/data/instance-id, and refuses any other operation. It is
+        the ONLY writer permitted to toggle a member's nofailover tag or its
+        synchronized_standby_slots guard, and only via SIGHUP (never a restart).
+    reconciler_driver:
+      status: quarantined
+      owner: guardian
+      symbol: lme_lab.postgresql_reconcile.reconcile_once
+      role: >-
+        The loop (documented cadence: every ~10s) that drives the relay:
+        set_guard to the DCS-authorized synchronous standby, then eligibility
+        to clear nofailover on exactly that qualified standby after readback.
+        Until it is reintegrated from .quarantine, automatic failover is
+        UNAVAILABLE by design.
+    c1_registry_stable_identity:
+      status: absent
+      token: deployment_identity
+      role: >-
+        Stable deployment identity that keys the container-restart fence path.
+        It is NOT run_id and NOT qemu_generation: it must survive across
+        evidence runs and QEMU boots so a fresh run cannot silently un-fence a
+        member. platform.render reads config['deployment_identity'];
+        resolved_role_config does not source it yet, so it is unresolved and the
+        fence renders an unconditional deny. When C1 lands, resolved_role_config
+        must populate it from the resolved inventory.
+
+  # ---- Owner handoff (who does what) ---------------------------------------
+  handoff:
+    who_signs: >-
+      C (Ed25519 guardian signer) signs the gate-live envelopes only: context,
+      receipt, consume result and route. Members/proxies hold only the public
+      key. IMPORTANT: the container-restart authorization file is UNSIGNED
+      plaintext -- ExecStartPre verifies no signature. Its integrity rests solely
+      on the file being root-owned and NOT writable by the member owner. A
+      non-promoting restart (e.g. a replica coming back up) passes through ONLY
+      this plaintext gate; Ed25519 is verified only at bootstrap/promote via
+      gate-live. Closing that gap (a signed restart authorization) is an open
+      item below.
+    who_writes_authorization: >-
+      The guardian authorization/marker writer (part of the control.sock
+      authority, absent). It writes root-owned authorization files readable by
+      the exact rootless member owner and by no writer, and the root-owned
+      inhibit quarantine records consumed by rejoin.
+    who_relays_forced_command: >-
+      B (config/postgresql-platform/reconcile_guest.py), driven by the guardian
+      reconciler. It relays ONLY set_guard and eligibility to a single owned
+      domain, gated by its own ready() readback for eligibility=false.
+    who_consumes:
+      - >-
+        Member promotion/bootstrap: platform.live_gate -> gate consumes the
+        signed receipt's nonce via a control.sock `consume` (CAS), enforcing
+        quorum + leader_authorized + consumed, all freshly bound.
+      - >-
+        Proxy data path: platform.proxy_route consumes a signed `route` bound to
+        run/domain/node/owner/challenge with fenced+quorum+leader lease/epoch.
+      - >-
+        Rejoin: rejoin.read_route consumes a fresh `route`; the AUTHORITATIVE
+        single-consumption of the rejoin nonce is a guardian `consume` (seam
+        absent), corroborated locally by the O_EXCL member lock.
+
+  # ---- Protocol: exact-domain + exact-generation binding --------------------
+  protocol:
+    authorize:
+      request_fields: [operation, run_id, domain, node, qemu_generation, action, challenge]
+      transport_timeout_seconds: 180
+      response: signed context + inner receipt; 30s freshness
+      binding: >-
+        Response must echo run_id/domain/node/qemu_generation/action exactly;
+        context.candidate must equal {node, qemu_generation}; any rebinding to a
+        different transition is rejected (platform.live_gate).
+    consume:
+      request_fields: [operation, receipt_sha256, challenge, context]
+      transport_timeout_seconds: 15
+      result_freshness_seconds: 5
+      required_true: [consumed, quorum, leader_authorized]
+      binding: >-
+        Signed result must echo run_id/domain/candidate/authority/action/
+        request_nonce, the challenge and the receipt digest. Replay (reused
+        nonce) must fail the CAS (platform.gate).
+    route:
+      request_fields: [operation, run_id, domain, node, owner, challenge]
+      result_freshness_seconds: 5
+      required_true: [quorum, leader_authorized, fenced]
+      required_present: [authority.lease, authority.epoch]
+      binding: >-
+        primary_node must map to an allowed {host,port} in the resolved
+        inventory; otherwise the route is refused (platform.validate_route).
+    exact_domain: >-
+      Every gate is bound to a single domain (hertzbeat|vector|shared); a
+      receipt/authorization for another domain fails the binding check.
+    exact_generation: >-
+      Every gate is bound to the canonical observed QEMU generation (a UUID).
+      The restart fence additionally pins the current boot generation in the
+      authorization content; a stale generation is a deny.
+
+  # ---- Task 1: container-restart fence (platform.render) --------------------
+  container_restart_fence:
+    model: positive-authorization
+    replaces: >-
+      The former `ExecCondition=/usr/bin/test ! -e
+      /var/lib/lme-fencing/inhibit/<run>/<domain>/<node>`, which had two holes:
+      (a) `test ! -e` treated a MISSING marker and an EACCES traversal failure
+      alike as "no marker => ALLOW" (missing-permissive + EACCES-permissive);
+      (b) it keyed on run_id, so a fresh evidence run got an empty inhibit tree
+      and silently UN-FENCED the node.
+    rule: >-
+      The member unit starts ONLY when a readable, current, exact-domain and
+      exact-generation authorization is present and valid. DENY in every other
+      case.
+    authorization_path: /var/lib/lme-fencing/authorize/<deployment_identity>/<domain>/<node>
+    keyed_on: deployment_identity  # stable; never run_id
+    authorization_file_format:
+      line_1: '"authorize <deployment_identity> <domain> <node> <qemu_generation>" (exact whole line)'
+      line_2: '<not_after_epoch_seconds> (integer)'
+    deny_cases:
+      - missing (file absent)
+      - unreadable (EACCES for the rootless owner)
+      - stale (now >= not_after epoch, or non-integer epoch)
+      - wrong-domain (line 1 mismatch)
+      - wrong-generation (line 1 mismatch)
+      - unresolved-identity (deployment_identity is None -> unconditional deny)
+    integrity_model: >-
+      The authorization file is UNSIGNED plaintext; ExecStartPre performs no
+      cryptographic check. Its integrity rests ENTIRELY on the file being
+      root-owned and NOT writable by the member owner (the trust boundary is
+      filesystem write access, not a signature). This is a coarse restart gate; a
+      restart that does NOT promote (a replica returning) passes ONLY this gate.
+      The cryptographic Ed25519 gate runs only at bootstrap/promote via gate-live.
+      A signed restart authorization is an open item.
+    access_requirement: >-
+      The authority must grant the exact rootless member owner READ and NO write
+      access to the authorization file. A wrong mode reads as EACCES, i.e. deny;
+      the member owner must never be able to forge its own authorization.
+    visibility_decision:
+      mechanism: ExecStartPre
+      exit_on_deny: 255
+      rationale: >-
+        systemd.service(5): an ExecCondition= exit of 1..254 QUIETLY SKIPS the
+        unit without marking it failed, so a fenced member would be invisible.
+        A fenced start MUST be observable, so the gate is an ExecStartPre= that
+        exits 255 on any deny, putting the unit into the failed state.
+      restart_interaction: >-
+        Restart=on-failure makes the unit restart-loop to start-limit-hit and
+        stay failed while fenced. After a valid authorization is published the
+        guardian/operator must `systemctl reset-failed` the unit before it will
+        start.
+    systemd_escaping: >-
+      systemd expands `$` and `%` in Exec lines, so the rendered shell escapes
+      every literal `$` as `$$` and every `%` as `%%` (e.g. `date +%%s` ->
+      `date +%s` at runtime). Validated offline three ways: (1) simulating the
+      `$$`->`$` / `%%`->`%` expansion and running the un-escaped body under POSIX
+      `sh` across all seven cases (allow=rc0; missing/EACCES/stale/wrong-domain/
+      wrong-generation/bad-epoch=rc255); (2) `sh -n` on the body; (3) the podman
+      Quadlet generator dry-run (`quadlet -dryrun -user`), which emitted the
+      ExecStartPre= line into the generated pg-vector.service with `$$`/`%%`
+      intact, confirming Quadlet passes [Service] ExecStartPre= through unchanged.
+    non_escalation: >-
+      The deny path exits the unit's own ExecStartPre only. It never issues a
+      host command; guest fencing is never converted into a physical-host
+      shutdown.
+    while_authority_absent: >-
+      No authorization can exist, so every member is denied and HA is correctly
+      UNSTARTABLE. This is the intended fail-closed state; do not add a
+      default-allow to make the cluster start.
+
+  # ---- Task 2: safe-failover eligibility (platform.render tags.nofailover) ---
+  failover_eligibility:
+    render_default:
+      rule: nofailover = (node != initial_owner)
+      meaning: every non-initial member RENDERS nofailover=true (fail-closed)
+      note: this default is NOT loosened; render never emits nofailover=false
+    eligible_member: >-
+      The initial owner's synchronous standby: the member named by
+      synchronized_standby_slots under synchronous_mode_strict, which therefore
+      holds the durable committed state. Only it may become promotable.
+    clearing:
+      authority: guardian reconciler -> B-owned reconcile_guest.py `eligibility`
+      precondition: >-
+        The relay's ready() gate re-verifies recovery=true, matching lineage
+        (system_identifier), minimum replayed WAL (LSN), and complete
+        synchronized failover slots BEFORE it clears nofailover to false. render
+        must never pre-empt this by statically emitting false.
+      mechanism: SIGHUP reload of patroni.json; never a restart
+    promotion_gate:
+      pre_promote: wired  # platform.render member.postgresql.pre_promote = gate_command
+      effect: >-
+        Even after nofailover is cleared, the actual promotion runs pre_promote
+        -> gate-live (promote) -> guardian authorize/consume, which re-qualifies
+        the candidate. Eligibility alone promotes nothing.
+    recovery_target_90s:
+      status: NOT RUN
+      reason: >-
+        Requires the guardian reconciler driver (reconcile_once, currently
+        quarantined) plus the fencing authority and a live cluster. Not claimed.
+
+  # ---- Task 3: rejoin race-safety + verified stop (rejoin.rebuild) ----------
+  rejoin:
+    member_lock:
+      path: <member_volume>/<domain>.rejoin.lock
+      scope: per (owner-volume, domain); NOT run-scoped
+      mechanism: >-
+        fcntl.flock(LOCK_EX|LOCK_NB) on a persistent lock file, held for the whole
+        critical section. Advisory but sufficient: rejoin is the only writer of the
+        datadir rename. Chosen over an O_EXCL sentinel because the kernel releases a
+        flock when the holding process dies, so a SIGKILL/OOM during the up-to-900s
+        pg_basebackup does NOT strand the lock and brick future rejoins.
+      release: fd closed in finally (kernel releases the flock); file is NOT unlinked
+        (unlinking a flock target is racy); a lingering empty file is inert.
+      location_rule: >-
+        On the member volume ONLY. Never under /var/lib/lme-fencing, which is the
+        root-owned guardian fence tree the rootless rebuild container cannot
+        write (that write would EACCES/EROFS and fail every rejoin).
+      closes: concurrent-rebuild race (two rebuilds racing the datadir rename)
+    nonce_single_consumption:
+      local: nonce-keyed stage/retained trees are never reused (replay guard)
+      authoritative:
+        status: absent-seam
+        rule: >-
+          The authoritative single-consumption of the rejoin nonce is a guardian
+          `consume` over control.sock. Until present, the flock member lock is
+          the local corroboration, not a substitute for guardian CAS.
+    reservation_compare:
+      status: PARTIAL
+      rule: >-
+        The guardian-issued source binding (source_authority, source_node), WHEN
+        carried in the request, must equal the freshly observed route; a mismatch
+        is refused. The former self-defaulting compare
+        (request.get('source_authority', before_route['authority'])) was VACUOUS
+        and is removed.
+      open: >-
+        The current test fixture carries neither field, so making them REQUIRED
+        needs the owner of testing/tests/unit/test_postgresql_rejoin.py to add
+        them; that is out of this wave's write scope.
+    verified_stop:
+      rule: >-
+        Before any datadir rename/replace, quarantine() requires VERIFIED
+        exact-stop: restart_inhibited == the persistent inhibit marker present
+        and bound to this exact generation, AND stopped == the old datadir holds
+        NO postmaster.pid AT ALL. Any pid file -- including a STALE one left by a
+        crash, a SIGKILL after a podman stop timeout, or a hypervisor fence -- is
+        UNKNOWN stop evidence and FAILS qualification, mirroring
+        platform.validate_receipt which raises unless every prior writer is
+        stopped=true and restart_inhibited=true.
+      operator_note: >-
+        This is a deliberately conservative LOCAL stand-in for the guardian-attested
+        stopped flag. The usual rejoin triggers (crash, SIGKILL, hypervisor fence)
+        leave a stale pid file, so each such case is refused until an operator
+        confirms the old server is down and removes the pid file by hand.
+      rechecked: quarantine() runs again immediately before the rename
+      fence_bridge: >-
+        Between the final quarantine() and the rename, the positive-authorization
+        container fence keeps the fenced member unstartable; the postmaster.pid
+        check is this helper's local corroboration of that fence.
+    preserved:
+      - pg_basebackup + backup_manifest lineage/timeline/WAL verification
+      - pg_verifybackup checksum verification
+      - pg_controldata lineage/timeline match
+      - isolated read-only replica probe on a private socket (no TCP)
+      - retain old + staged trees on failure; never auto-roll-back to a writable primary
+
+  # ---- Cross-references that this contract supersedes or flags ---------------
+  supersedes:
+    readme_sections:
+      - file: config/postgresql-platform/README.md
+        lines_approx: "129-133"
+        was: >-
+          Describes a NEGATIVE inhibitor -- "Quadlet ExecCondition prevents
+          restart while that marker exists". Superseded by positive
+          authorization; the inhibit marker is retained ONLY as the rejoin
+          restart_inhibited quarantine record.
+      - file: config/postgresql-platform/README.md
+        lines_approx: "33-38"
+        note: >-
+          Describes the reconciler that clears nofailover after readback. Still
+          accurate in intent; this contract records that its driver is currently
+          quarantined, so failover is unavailable until reintegrated.
+      - file: config/postgresql-platform/README.md
+        lines_approx: "42-50 (Ordered deployment, step 3 bootstrap)"
+        note: >-
+          Under positive authorization the bootstrap step can no longer start
+          Patroni until the authority has published an authorization for the
+          initial owner (in addition to the existing gate-live bootstrap permit).
+          The ordered deployment must account for the authority being live first.
+    other_consumers:
+      - file: config/postgresql-platform/reconcile_guest.py
+        owner: B
+        note: >-
+          Reads the NEGATIVE inhibit marker (observed['inhibited'], L59) and the
+          nofailover tag (L64). Consistent with this contract: the inhibit marker
+          is retained as the quarantine record; reconcile_guest is the sole writer
+          of nofailover/synchronized_standby_slots. Unaffected by the fence flip.
+      - file: ansible/roles/postgresql_backup/files/retire.py
+        lines_approx: "68"
+        note: >-
+          The SEPARATE backup-retire unit still uses a root-owned marker +
+          Quadlet ExecCondition (a different unit, not the pg member restart
+          fence). Out of this wave's scope; flagged if the same positive-auth
+          treatment is later wanted there.
+      - concern: Ansible tasks that create fence directories or assert on the rendered unit
+        note: >-
+          None found under ansible/ referencing /var/lib/lme-fencing/{inhibit,
+          authorize} or the member ExecCondition/ExecStartPre (grep clean, excluding
+          .quarantine). If such tasks exist elsewhere they must create the
+          authorize/ tree and expect ExecStartPre, not the old ExecCondition.
+
+  open_items:
+    - C1 registry must supply deployment_identity to resolved_role_config.
+    - control.sock authority (server + Ed25519 signer + authorization/marker writer) must be built.
+    - Ed25519 private key must land only in /run/lme-fencing tmpfs, never persisted or distributed.
+    - signed restart authorization -- the restart-fence authorization is currently unsigned plaintext (root-owned, non-owner-writable); a signed form would close the non-promoting-restart gap.
+    - reconcile_once driver must be reintegrated from .quarantine to enable failover.
+    - guardian `consume` of the rejoin nonce (authoritative single-use) must be built.
+    - make rejoin source_authority/source_node REQUIRED once the test fixture carries them.
+    - bootstrap ordering (README step 3) must wait for a published authorization for the initial owner.
+    - reconcile README.md negative-inhibitor description with this contract.
