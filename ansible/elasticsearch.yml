@@ -1,6 +1,117 @@
 ---
+# =============================================================================
+# PRE-MUTATION VALIDATION BARRIER (E-owned entrypoint; C1-OTHER-CALLER-PREFLIGHT).
+#
+# This is the FIRST play so it fronts EVERY host mutation on this entrypoint --
+# including the raw `apt-get install python3` bootstrap play below, which mutates
+# a host BEFORE any Deploy-play pre_task could run. site.yml runs its barrier as a
+# pre_task because its only preceding work is on localhost; elasticsearch.yml must
+# bootstrap remote Python first, so the barrier here MUST be a dedicated pre-play,
+# not a pre_task (codex-0700: do NOT copy the incomplete site.yml barrier shape).
+#
+# It reproduces site.yml's INTENT (fail-closed all-host resolve+validate before any
+# mutation) with two deliberate hardenings over site.yml:148-180:
+#   * DEDICATED VALIDATION-ONLY PLAY across the COMPLETE inventory with NO `serial`,
+#     so it closes the batching residual site.yml's own comment names (site.yml
+#     142-146 -- a serial/batched run validates only within a batch): NO Elasticsearch
+#     host enters a mutating play until EVERY targeted host has validated.
+#   * STRUCTURED evidence bound to a per-INVOCATION token + the content-addressed
+#     resolved revision, NOT an unversioned boolean, so a stale/foreign
+#     `_lme_prevalidated` fact from a prior play or a serial batch cannot satisfy the
+#     gate (codex-0645 C1-SERIAL-BARRIER-STALE-FACT-ACCEPTANCE: bind evidence to THIS
+#     invocation + resolved revision, never reuse a historical true fact).
+#
+# NO REMOTE PYTHON / NO MUTATION: every task here is controller-side (set_fact,
+# assert, include_vars/include_role -> load_manifests, and a localhost-delegated
+# find), so this play validates the whole inventory even before the Python-bootstrap
+# play runs and changes nothing on any host. become:false + gather_facts:false make
+# that explicit. HONEST RESIDUALS (routed to C1, NOT claimed fixed here):
+#   * lme_resolved_revision is the config-only revision computed BEFORE the
+#     material/datastore projections (C1-COMPLETE-RESOLVED-REVISION, open) -- binding
+#     to it does not yet cover the fully-composed consumer configuration.
+#   * the JSON-vs-YAML boolean conflict-gate representation defect lives in C1's
+#     lme_selection_conflicts (C1-CONFLICT-GATE-BOOLEAN-REPRESENTATION-REGRESSION);
+#     a caller barrier cannot normalize it -- the fix is in the shared resolver.
+- name: Pre-mutation resolve+validate ALL-HOST barrier (fail-closed before any mutation)
+  hosts: elasticsearch
+  gather_facts: false
+  become: false
+  # Abort the WHOLE play the moment ANY targeted host errors (matches site.yml's block),
+  # so no host advances to the bootstrap/deploy plays on a partial validation. The run_once
+  # completeness assert below is the defense-in-depth backstop for a host dropped WITHOUT a
+  # task-level failure (e.g. removed during connection), which any_errors_fatal alone misses.
+  any_errors_fatal: true
+  vars:
+    # Shared with the Deploy play via YAML anchor so the manifests root (hence the
+    # resolution inputs) has ONE source and the two plays cannot diverge.
+    clone_directory: &lme_clone_directory "{{ clone_dir | default(playbook_dir + '/..') }}"
+  tasks:
+    - name: Barrier -- reject a pre-supplied / carried validation token or evidence fact
+      ansible.builtin.assert:
+        that:
+          # `-e` outranks set_fact and facts carry across plays; refuse either so an
+          # injected or historical value can never masquerade as THIS run's evidence.
+          - _lme_es_barrier_run_token is not defined
+          - _lme_es_prevalidated is not defined
+        fail_msg: >-
+          _lme_es_barrier_run_token / _lme_es_prevalidated must NOT be pre-supplied (-e) or
+          carried from a prior play -- the barrier mints its own per-invocation evidence so a
+          historical or injected value cannot satisfy the gate.
+        quiet: true
+      tags: ['always']
+
+    - name: Barrier -- mint this invocation's validation token (run_once; shared to every host)
+      ansible.builtin.set_fact:
+        _lme_es_barrier_run_token: "es-barrier-{{ lookup('pipe', 'date +%s%N') }}-{{ 999999999 | random }}"
+      run_once: true
+      tags: ['always']
+
+    - name: Barrier -- resolve+validate declared config + service/trust projections (per host, pre-mutation)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: load_manifests
+        apply:
+          tags: ['always']
+      tags: ['always']
+
+    - name: Barrier -- record this host's pre-mutation validation evidence (token + resolved revision)
+      ansible.builtin.set_fact:
+        _lme_es_prevalidated:
+          token: "{{ _lme_es_barrier_run_token }}"
+          revision: "{{ lme_resolved_revision }}"
+      tags: ['always']
+
+    - name: Barrier -- every targeted host validated THIS invocation before any peer mutates
+      ansible.builtin.assert:
+        that:
+          # No targeted host was silently dropped by a validation failure (any_errors_fatal
+          # already aborts; this also catches a host removed for another reason) ...
+          - (ansible_play_hosts_all | difference(ansible_play_hosts)) | length == 0
+          # ... and EVERY surviving targeted host recorded evidence bound to THIS run's token
+          # AND to THIS run's resolved revision. A missing fact yields {} (version-safe
+          # extract), which fails the `token defined` test and drops the count below the
+          # target size -> fail_msg. A stale/foreign fact fails the token/revision equality.
+          - >-
+            (ansible_play_hosts | map('extract', hostvars)
+             | map(attribute='_lme_es_prevalidated', default={})
+             | selectattr('token', 'defined')
+             | selectattr('token', 'equalto', _lme_es_barrier_run_token)
+             | selectattr('revision', 'defined')
+             | selectattr('revision', 'equalto', lme_resolved_revision)
+             | list | length) == (ansible_play_hosts | length)
+        fail_msg: >-
+          pre-mutation validation did not succeed on every targeted Elasticsearch host for THIS
+          invocation (token {{ _lme_es_barrier_run_token }}, revision {{ lme_resolved_revision }};
+          failed/removed: {{ ansible_play_hosts_all | difference(ansible_play_hosts) }}). No host
+          proceeds into the bootstrap/deploy plays until the COMPLETE target set validates this run.
+        quiet: true
+      run_once: true
+      tags: ['always']
+
 # Bootstrap play: install Python on remote nodes so Ansible modules work.
 # The raw module does not need Python on the target, so this always succeeds.
+# It runs AFTER the barrier play above, so this first host mutation is gated on a
+# clean all-host pre-mutation validation.
 - name: Bootstrap Python on cluster nodes
   hosts: elasticsearch
   gather_facts: false
@@ -22,10 +133,18 @@
   become: yes
   vars:
     # Common variables (same as site.yml)
-    clone_directory: "{{ clone_dir | default(playbook_dir + '/..') }}"
+    clone_directory: *lme_clone_directory   # shared with the barrier play (one source)
     install_user: "{{ ansible_user_id }}"
     debug_mode: false
-    offline_mode: false
+    # offline_mode is DELIBERATELY NOT a play var. It is a declared registry field, so a
+    # play var here is captured by the resolver's pristine operator-selection scan
+    # (resolve.yml:82-88) and, at the operator tier, OUTRANKS an inventory/host_var or
+    # profile offline selection -- the exact shadow site.yml:12-26 removed. The registry
+    # default is already false (manifests/global.yml), and the parity pre_task below re-runs
+    # load_manifests, which resolves offline_mode and bridges it under its bare name BEFORE
+    # the ansible-core bootstrap tasks read `offline_mode | default(false)`, so a run that
+    # does not select offline is byte-unchanged while a profile/inventory offline selection
+    # is no longer silently overridden.
 
     # Storage configuration
     storage_runroot: "/run/containers/storage"
@@ -92,6 +211,39 @@
     lme_skip_secret_creation: true
 
   pre_tasks:
+    # --- PARITY GATE (E-owned): the validated config MUST be the deployed config -------
+    # Re-resolve+validate on THIS host and prove the config the barrier play validated is
+    # byte-identical to the config being deployed: same per-invocation token AND same
+    # content-addressed resolved revision. Per-host (NOT run_once) so it still holds if a
+    # future change adds `serial:`. The re-run also re-bridges the resolved bare facts
+    # (offline_mode, install_llm, ...) that the ansible-core bootstrap tasks below read,
+    # now that offline_mode is no longer a shadowing play var. Runs FIRST so nothing
+    # mutating in this play precedes it.
+    - name: Parity -- re-resolve+validate this host's declared config (matches the barrier play)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: load_manifests
+        apply:
+          tags: ['always']
+      tags: ['always']
+
+    - name: Parity -- refuse to deploy unless the barrier validated THIS exact config on THIS host
+      ansible.builtin.assert:
+        that:
+          - _lme_es_prevalidated is defined
+          # token absent -> the barrier play did not run this invocation (fail closed).
+          - (_lme_es_prevalidated.token | default('')) == (_lme_es_barrier_run_token | default('__barrier_did_not_run__'))
+          # revision drift -> the config changed between validation and deploy (fail closed).
+          - (_lme_es_prevalidated.revision | default('')) == lme_resolved_revision
+        fail_msg: >-
+          {{ inventory_hostname }} has no matching pre-mutation validation evidence for THIS deploy
+          (expected token {{ _lme_es_barrier_run_token | default('UNSET -- barrier play did not run') }}
+          and resolved revision {{ lme_resolved_revision }}). The validated config is not the config
+          being deployed; refusing to enter a mutating role.
+        quiet: true
+      tags: ['always']
+    # --- end PARITY GATE ---------------------------------------------------------------
+
     # Cluster child nodes never run install.sh, so ansible-vault is not present.
     # The podman shell secret driver uses `ansible-vault view` at container runtime
     # to decrypt secrets.  We must ensure ansible-core is available on every node.
