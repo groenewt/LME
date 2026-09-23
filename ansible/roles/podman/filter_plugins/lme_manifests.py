@@ -491,6 +491,7 @@ def strict_enable_bool(value):
 _SELECTION_ORIGINS = ('extra_var', 'inventory')  # caller-VERIFIABLE finer sources
 _COMBINED_OPERATOR = 'operator'                   # honest native-selected label (A5)
 _OBSERVED_ORIGINS = ('observation', 'build')      # inferred/derived: NOT defaultable
+_SUPPORTED_TYPES = ('bool', 'str', 'int', 'list', 'dict', 'map')  # the only declarable field types
 
 
 def _require_registry_shape(registry):
@@ -500,8 +501,11 @@ def _require_registry_shape(registry):
     `registry`) can never pass silently -- it hits "no fields" here and fails closed.
     Also validates the precedence COMPOSITION (A2): every tier has a declared channel,
     no duplicate tier, `default` is last, and no observation/build field is defaultable
-    (an inferred value is not an explicit choice). Returns (fields, precedence,
-    channels)."""
+    (an inferred value is not an explicit choice). Every field MUST declare a SUPPORTED
+    type -- this runs BEFORE any value is inspected, so a nullable field declaring an
+    unsupported type can no longer slip a null past validation via the None short-circuit
+    in _coerce_declared / _canonical_ok (C1-UNKNOWN-NULLABLE-TYPE). Returns (fields,
+    precedence, channels)."""
     if not isinstance(registry, dict):
         raise ValueError('lme: config registry must be a mapping')
     fields = registry.get('fields')
@@ -519,6 +523,13 @@ def _require_registry_shape(registry):
     if precedence[-1] != 'default':
         raise ValueError("lme: config registry precedence must end with the 'default' tier")
     for key, field in fields.items():
+        if not isinstance(field, dict):
+            raise ValueError('lme: field %r declaration is not a mapping' % (key,))
+        if field.get('type') not in _SUPPORTED_TYPES:
+            raise ValueError(
+                'lme: field %r declares unsupported/absent type %r (supported: %r) -- schema '
+                'checked before any value, so a nullable unsupported-type field cannot pass'
+                % (key, field.get('type'), list(_SUPPORTED_TYPES)))
         if field.get('origin') in _OBSERVED_ORIGINS and 'default' in field:
             raise ValueError(
                 'lme: field %r declares origin %r (inferred/derived) and therefore MUST NOT '
@@ -695,7 +706,12 @@ def lme_validate_config(registry, resolved):
     RAISE. Returns the dict unchanged on success. The registry-shape gate makes the
     reversed-pipe fail closed by construction rather than only by argument order."""
     fields, _precedence, _channels = _require_registry_shape(registry)
-    resolved = resolved if isinstance(resolved, dict) else {}
+    # Reject a non-mapping resolved input INDEPENDENTLY of whether any field is required
+    # (C1-OPTIONAL-NONMAPPING): silently coercing [] / None / a scalar to {} let a
+    # registry with only optional fields "validate" a bogus input as if it were empty.
+    if not isinstance(resolved, dict):
+        raise ValueError(
+            'lme: resolved config must be a mapping, got %r' % (type(resolved).__name__,))
     undeclared = [k for k in resolved if k not in fields]
     if undeclared:
         raise ValueError('lme: resolved config has undeclared key(s) %r' % (sorted(undeclared),))
