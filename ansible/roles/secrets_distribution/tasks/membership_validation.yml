@@ -1,0 +1,129 @@
+---
+# =============================================================================
+# membership_validation.yml -- PRE-GENERATION validation of DECLARED database
+# domain / etcd-group MEMBERSHIP, consuming C1's CANONICAL projection
+#   lme_resolved.database.domains.<id>.members
+#   lme_resolved.database.etcd_groups.<id>.members
+# (load_manifests.yml lme_project_database_membership).
+#
+# WHY (codex-0500 C-MATERIAL-HA-VALIDATION-REGRESSION; codex-0500-C-addendum
+# membership; the finding that REFUTED C's earlier "fails closed at
+# owners[db-<domain>]" claim): a one-host map with owner keys previously passed
+# ALL initial assertions while EVERY host silently became a DB/etcd member. An
+# omitted required member was NOT detected by the per-host owner lookup. This
+# validates the DECLARED profile MEMBERSHIP + host binding BEFORE any generation
+# and scopes membership to the DECLARED members -- it does NOT restore a fixed
+# total-inventory count (codex: "Do not restore a fixed total-inventory count as
+# the fix"), and it does NOT invent an HA cardinality (if the profile declares
+# none, that is raised with D, never defaulted to 3).
+#
+# This consumes the CANONICAL artifact (lme_resolved), NOT a private desired-state
+# vars file. The domain SET a profile requires is the legitimate profile topology
+# (credential_material_topology[<profile>].domains -- a profile->domains map, not
+# material desired-state). Owner-name / fqdn / tailscale / endpoint bindings are
+# NOT yet projected into lme_resolved -- that owner/endpoint projection is the
+# OWED C1+D bridge (surfaced in the sitrep + credential_materializer notes);
+# this file validates MEMBERSHIP only, which C1 already projects.
+# =============================================================================
+
+- name: membership -- require the canonical resolved database membership projection
+  ansible.builtin.assert:
+    that:
+      - lme_resolved is defined
+      - lme_resolved.database is defined
+      - lme_resolved.database.domains is defined
+      - lme_resolved.database.domains is mapping
+      - (lme_resolved.database.domains | length) > 0
+    fail_msg: >-
+      credential materialization requires DECLARED database membership
+      (lme_resolved.database.domains.<id>.members, projected by
+      lme_project_database_membership). It is ABSENT -- a selected DB profile with
+      no declared membership is REJECTED before generation (a one-host / owner-only
+      map is NOT sufficient; codex-0500 C-MATERIAL-HA-VALIDATION-REGRESSION).
+    quiet: true
+
+- name: membership -- resolve the profile's required domains + the known host set
+  ansible.builtin.set_fact:
+    # profile -> required domains (legitimate profile topology, not material desired-state).
+    _cm_required_domains: "{{ credential_material_topology[_cm_profile].domains }}"
+    # the play's host set is the inventory truth every declared member must belong to.
+    _cm_known_hosts: "{{ (membership_known_hosts | default(ansible_play_hosts_all | default([]))) | list }}"
+
+- name: membership -- assert every REQUIRED profile domain has declared non-empty members
+  ansible.builtin.assert:
+    that:
+      # (a) no required domain is ABSENT from the projected membership, and
+      # (b) among the present required domains, NONE has an empty members list.
+      # A required domain that declares no members is the one-host regression.
+      # Loop-free (a loop-assert referencing `item` in fail_msg trips Ansible option
+      # templating); the two set-expressions cover every required domain.
+      - (_cm_required_domains | reject('in', lme_resolved.database.domains.keys() | list) | list | length) == 0
+      - (_cm_required_domains | select('in', lme_resolved.database.domains.keys() | list)
+           | map('extract', lme_resolved.database.domains) | map(attribute='members')
+           | map('length') | select('equalto', 0) | list | length) == 0
+    fail_msg: >-
+      a required database domain for profile {{ _cm_profile }} (needs {{ _cm_required_domains }})
+      is ABSENT or has an EMPTY members list in lme_resolved.database.domains
+      (present: {{ lme_resolved.database.domains.keys() | list }}) -- a profile domain with no
+      membership is REJECTED before generation (codex-0500 C-MATERIAL-HA-VALIDATION-REGRESSION).
+      Declare lme_database_membership.domains.<domain>.members.
+    quiet: true
+
+- name: membership -- assert every declared domain member is a known inventory host
+  ansible.builtin.assert:
+    that:
+      # union of all required-domain members must be a subset of the known host set.
+      - (_cm_required_domains | select('in', lme_resolved.database.domains.keys() | list)
+           | map('extract', lme_resolved.database.domains) | map(attribute='members')
+           | flatten | unique | difference(_cm_known_hosts) | length) == 0
+    fail_msg: >-
+      a database domain declares member(s) not in the known inventory host set
+      {{ _cm_known_hosts }} (declared:
+      {{ _cm_required_domains | select('in', lme_resolved.database.domains.keys() | list)
+         | map('extract', lme_resolved.database.domains) | map(attribute='members') | flatten | unique }})
+      -- an owner-only / renamed-node map cannot smuggle a non-inventory member (codex-0500 membership).
+    quiet: true
+
+- name: membership -- require declared etcd-group membership (subset of known hosts)
+  ansible.builtin.assert:
+    that:
+      - lme_resolved.database.etcd_groups is defined
+      - lme_resolved.database.etcd_groups is mapping
+      - (lme_resolved.database.etcd_groups | length) > 0
+      # NO etcd group may declare an EMPTY members list: an all-empty (or any-empty)
+      # groups map would otherwise pass every check here and yield ZERO etcd grants
+      # SILENTLY. This is consumed by _cm_etcd_member_nodes, so it must be non-empty.
+      - (lme_resolved.database.etcd_groups.values() | map(attribute='members')
+           | map('length') | select('equalto', 0) | list | length) == 0
+      # union of all etcd-group members must be a subset of the known host set.
+      - (lme_resolved.database.etcd_groups.values() | map(attribute='members') | flatten
+           | unique | difference(_cm_known_hosts) | length) == 0
+    fail_msg: >-
+      etcd-group membership is ABSENT, has an EMPTY members list, or names non-inventory
+      hosts (lme_resolved.database.etcd_groups) -- REJECTED before generation. etcd
+      membership must be DECLARED, non-empty, and a subset of the known hosts, never
+      derived from the full host set.
+    quiet: true
+
+# --- Scope the DB/etcd member node set to the DECLARED members (NOT all hosts) ---
+# A non-member host (e.g. a collector) is EXCLUDED here, so it never becomes a DB
+# member. This REPLACES the old _cm_nodes = ALL hosts derivation for membership.
+- name: membership -- derive the DECLARED member node set (scopes generation)
+  ansible.builtin.set_fact:
+    _cm_member_nodes: "{{ (_cm_required_domains
+                          | map('extract', lme_resolved.database.domains)
+                          | map(attribute='members') | flatten | unique | sort) }}"
+    _cm_etcd_member_nodes: "{{ (lme_resolved.database.etcd_groups.values()
+                               | map(attribute='members') | flatten | unique | sort) }}"
+
+- name: membership -- expose a non-secret membership validation receipt
+  ansible.builtin.set_fact:
+    credential_membership_validation:
+      profile: "{{ _cm_profile }}"
+      required_domains: "{{ _cm_required_domains }}"
+      domain_members: "{{ dict(_cm_required_domains | zip(_cm_required_domains
+                          | map('extract', lme_resolved.database.domains)
+                          | map(attribute='members'))) }}"
+      member_nodes: "{{ _cm_member_nodes }}"
+      etcd_member_nodes: "{{ _cm_etcd_member_nodes }}"
+      validated: true
