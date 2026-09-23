@@ -181,6 +181,16 @@
       must not depend on the database it exists to help recover.
     quiet: true
 
+# --- The PERSISTENT lost-custody witness: the controller staging pub survives a signer
+# reboot (the signer-local pub is on tmpfs). Statted on the controller and passed into the
+# shell so a post-reboot bootstrap can NEVER re-mint over a previously-published identity.
+- name: guardian_custody -- stat the persistent controller staging pub (lost-custody witness)
+  ansible.builtin.stat:
+    path: "{{ _gc_pub_staging }}"
+  delegate_to: localhost
+  run_once: true
+  register: _gc_staging_pub_stat
+
 # --- THE decision table + custody producer (idempotent, restartable checkpoints)
 # Runs on the SIGNER NODE (delegate handled by the caller/include; default = this
 # host). All inputs arrive via `environment:` so no source-derived string is inlined
@@ -239,18 +249,32 @@
       receipt(){ printf '{"decision":"%s","epoch":"%s","fingerprint":"%s","reason":"%s"}\n' "$1" "$EPOCH" "${2:-}" "${3:-}" > "$RECEIPT"; chmod 644 "$RECEIPT"; printf 'RESULT:%s\n' "$1"; }
       install -d -m 700 "$(dirname "$RECEIPT")"
 
-      # [1] the wrapping key MUST be a NON-EMPTY, SINGLE-LINE hex/base64 secret (openssl
-      # `-pass file:` consumes only the first line). Validated WITHOUT reading the value into
-      # a variable or printing it -- `head | grep -q` emits nothing (codex-0815: reject empty
-      # content and enforce the declared hex/base64 format, not just single-line).
-      [ "$(wc -l < "$WRAP")" -le 1 ] || { receipt refuse "" wrapping-key-not-single-line; echo "REFUSE wrap-multiline" >&2; exit 23; }
+      # [1] the wrapping key MUST be a NON-EMPTY, SINGLE-LINE hex/base64 secret whose WHOLE
+      # contents are validated -- because mkpass consumes the whole file (tr -d), so the bytes
+      # validated must be the bytes used (codex-0815 re-review). `grep -c ''` counts an
+      # UNTERMINATED final line that `wc -l` would miss; `grep -qxE` matches the entire line,
+      # not just head -n1. The charset test is a CHARSET+LENGTH FLOOR (the base64 class also
+      # accepts hex), not strict hex-XOR-base64. No value is read into a variable or printed.
       [ -s "$WRAP" ] || { receipt refuse "" wrapping-key-empty; echo "REFUSE wrap-empty" >&2; exit 29; }
-      head -n1 "$WRAP" | LC_ALL=C grep -qE '^([0-9a-fA-F]{32,}|[A-Za-z0-9+/=_-]{32,})$' || { receipt refuse "" wrapping-key-format-invalid; echo "REFUSE wrap-format" >&2; exit 30; }
+      [ "$(grep -c '' "$WRAP")" -eq 1 ] || { receipt refuse "" wrapping-key-not-single-line; echo "REFUSE wrap-multiline" >&2; exit 23; }
+      LC_ALL=C grep -qxE '^([0-9a-fA-F]{32,}|[A-Za-z0-9+/=_-]{32,})$' "$WRAP" || { receipt refuse "" wrapping-key-format-invalid; echo "REFUSE wrap-format" >&2; exit 30; }
 
       # (0) legacy UNPREFIXED material in the staging PARENT -> adopt via B ledger, never mint.
       legacy_parent="$(dirname "$STAGING_ROOT")"
       if [ -e "$legacy_parent/guardian/guardian.pub" ] || [ -e "$legacy_parent/pki" ] || [ -e "$legacy_parent/secrets" ]; then
         receipt refuse "" legacy-unprefixed-material-route-adoption-through-B-ledger; echo "REFUSE legacy-unprefixed" >&2; exit 9; fi
+
+      # (0b) DEGRADE a stale ROTATE=true to convergence when the target-epoch identity is
+      # ALREADY sealed in the durable (codex-0815 re-review C-CUSTODY reboot re-mint): if the
+      # durable already decrypts at the current epoch to a valid key, this is NOT a fresh
+      # rotation (e.g. ROTATE left true in the desired config after a signer reboot wiped the
+      # tmpfs runtime/marker) -- fall through to the non-rotate convergence/recovery path, which
+      # still requires EXPECTED_FP to install from the durable, and NEVER mints over it. A
+      # genuine rotation (target epoch not yet sealed) leaves ROTATE=true untouched. NB: this
+      # guard assumes the epoch-bound durable design; it must be revisited under the
+      # identity-bound alternative (see the D-blocking epoch-semantics question in the sitrep).
+      if [ "$ROTATE" = "true" ] && [ -f "$DURABLE" ] && try_decrypt "$EPOCH" "$work/rotchk"; then
+        ROTATE=false; fi
 
       # (1) runtime key present (not rotating): converge to a COMPLETE verified-pair state
       # for the current epoch. [3] NEVER a false noop -- noop ONLY when the marker epoch+fp,
@@ -319,25 +343,10 @@
       # re-verify BEFORE the marker flip, then publish (A5 order; old key kept until publish).
       if [ "$ROTATE" = "true" ]; then
         [ -f "$DURABLE" ] || { receipt refuse "" rotate-without-existing-identity; echo "REFUSE rotate-no-base" >&2; exit 12; }
-        # RESUME an interrupted rotation (codex-0815 C-CUSTODY-INTERRUPTED-PUBLICATION-FALSE-NOOP):
-        # if the swap to THIS epoch already completed (marker epoch+fp == runtime fp AND the
-        # durable decrypts at this epoch to that same identity), finish publication instead of
-        # failing the same-epoch guard with exit 13. The operator need not change the desired
-        # ROTATE=true config to escape reconciliation.
-        if [ -f "$MARKER" ] && [ -f "$RUNTIME_KEY" ]; then
-          mepoch="$(sed -n 's/^epoch=//p' "$MARKER")"; mfp="$(sed -n 's/^fingerprint=//p' "$MARKER")"
-          rrfp="$(fp_of_priv "$RUNTIME_KEY" 2>/dev/null || true)"
-          if [ "$mepoch" = "$EPOCH" ] && [ -n "$rrfp" ] && [ "$mfp" = "$rrfp" ] \
-             && try_decrypt "$EPOCH" "$work/rchk" && [ "$(fp_of_priv "$work/rchk")" = "$rrfp" ]; then
-            openssl pkey -in "$RUNTIME_KEY" -pubout -out "$work/rrpub" 2>/dev/null
-            pair_verify "$RUNTIME_KEY" "$work/rrpub" || { receipt refuse "$rrfp" rotate-resume-pair-verify-failed; echo "REFUSE rotate-resume-verify" >&2; exit 31; }
-            if [ -f "$PUB" ] && [ "$(fp_of_pub "$PUB" 2>/dev/null || true)" = "$rrfp" ]; then
-              receipt noop "$rrfp" rotation-already-complete; exit 0; fi
-            publish_pub "$RUNTIME_KEY"; rm -f "${RUNTIME_KEY}.prev"
-            receipt republish "$rrfp" rotation-resumed-publication; exit 0; fi
-        fi
-        # not a resumable interrupted rotation -> a marker already at this epoch means the
-        # epoch was NOT bumped for a genuine new rotation.
+        # A marker already at this epoch means the epoch was NOT bumped for a genuine new
+        # rotation. (An interrupted rotation whose durable is already sealed to this epoch is
+        # handled EARLIER: guard (0b) degrades ROTATE=true to convergence when the target-epoch
+        # identity already decrypts, so this branch runs only for a genuine, not-yet-sealed bump.)
         if [ -f "$MARKER" ]; then mepoch="$(sed -n 's/^epoch=//p' "$MARKER")"; [ "$mepoch" != "$EPOCH" ] || { receipt refuse "" rotate-epoch-not-bumped; echo "REFUSE rotate-same-epoch" >&2; exit 13; }; fi
         slot="${RUNTIME_KEY}.epoch-${EPOCH}"
         openssl genpkey -algorithm ED25519 -out "$work/new.key" 2>/dev/null
@@ -355,8 +364,12 @@
         rm -f "${RUNTIME_KEY}.prev"                                           # success -> drop prior
         receipt rotate "$newfp" rotated-epoch-bumped-old-refused; exit 0; fi
 
-      # (4) trusted pub but no durable + no verifiable runtime key -> lost custody, NEVER mint.
-      if [ -f "$PUB" ]; then
+      # (4) a PRIOR published identity but no durable + no verifiable runtime key -> lost
+      # custody, NEVER mint. The persistent witness is the CONTROLLER STAGING pub
+      # (STAGING_PUB_PRESENT): the signer-local pub is on tmpfs and vanishes on reboot, so
+      # relying on it alone would let a post-reboot bootstrap re-mint over a lost identity
+      # (codex-0815 re-review). The controller staging pub survives the signer host.
+      if [ -f "$PUB" ] || [ "$STAGING_PUB_PRESENT" = "true" ]; then
         receipt refuse "" trusted-pub-without-durable-custody-lost-never-mint; echo "REFUSE lost-custody" >&2; exit 15; fi
 
       # (5) nothing exists: bootstrap ONLY under an approved plan (material_stage_clarification).
@@ -384,6 +397,7 @@
     PUB: "{{ _gc_pub_signer }}"
     WRAP: "{{ guardian_custody_wrapping_key_ref }}"
     STAGING_ROOT: "{{ _cm_staging_root }}"
+    STAGING_PUB_PRESENT: "{{ _gc_staging_pub_stat.stat.exists | default(false) | bool | lower }}"
     CONSUMER_MOUNTS: "{{ guardian_custody_consumer_bind_mount_roots | join(' ') }}"
     ROTATE: "{{ guardian_custody_rotate | default(false) | bool | lower }}"
     BOOTSTRAP_OK: "{{ guardian_custody_bootstrap_approved | default(false) | bool | lower }}"
