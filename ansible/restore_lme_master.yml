@@ -796,48 +796,17 @@
         set -euo pipefail
         {{ lme_integrity_lib }}
         MDIR="{{ selected_backup_dir }}/$LME_VOLUME_ROOT/{{ item }}"
-        MANIFEST="$MDIR/$LME_VOLUME_MANIFEST_FILE"
-        DATA="$MDIR/$LME_VOLUME_DATA_DIR"
-        if [ ! -f "$MANIFEST" ]; then
-          echo "ERROR: content manifest missing for volume '{{ item }}' at $MANIFEST." >&2
-          echo "Backup predates integrity manifests or is corrupt; refusing destructive restore of '{{ item }}'." >&2
-          exit 3
-        fi
-        if [ ! -d "$DATA" ]; then
-          echo "ERROR: backup data dir missing for volume '{{ item }}' at $DATA." >&2
-          exit 3
-        fi
-        exp_fc=$(grep '^file_count=' "$MANIFEST" | head -n1 | cut -d= -f2)
-        exp_tb=$(grep '^total_bytes=' "$MANIFEST" | head -n1 | cut -d= -f2)
-        exp_sha=$(grep '^listing_sha256=' "$MANIFEST" | head -n1 | cut -d= -f2)
-        # RESTORE-CONTENT-DIGEST: content_sha256 (file CONTENTS) is the real check.
-        # NO fallback -- a manifest without it is a pre-content-digest bundle and is
-        # REFUSED here (routed to LEGACY-BUNDLE), never accepted on listing_sha256 alone.
-        # `|| true`: a pre-content-digest manifest has NO content_sha256 line, so the
-        # grep would fail the whole task with rc 1 under `set -euo pipefail` BEFORE the
-        # explicit fail-closed guard below could run (still a refusal, but rc 1 with no
-        # message). Tolerate the empty match so the guard fires with rc 3 + a clear reason.
-        exp_csha=$(grep '^content_sha256=' "$MANIFEST" | head -n1 | cut -d= -f2 || true)
-        if [ -z "$exp_csha" ]; then
-          echo "ERROR: content_sha256 missing from manifest for volume '{{ item }}' (pre-content-digest bundle)." >&2
-          echo "Refusing destructive restore on listing_sha256 alone (no ignore-integrity switch); qualify via LEGACY-BUNDLE." >&2
-          exit 3
-        fi
-        # Match lme_write_content_manifest exactly (find -printf '.' | wc -c): a plain
-        # `find | wc -l` overcounts a filename containing a newline and would falsely
-        # refuse (rc4). Keep the producer and this recompute byte-identical.
-        act_fc=$(cd "$DATA" && find . -type f -printf '.' | wc -c | tr -d ' ')
-        act_tb=$(cd "$DATA" && find . -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')
-        act_sha=$(cd "$DATA" && find . -type f -printf '%P\t%s\n' | LC_ALL=C sort | sha256sum | awk '{print $1}')
-        act_csha=$(lme_content_sha256 "$DATA")
-        if [ "$exp_fc" != "$act_fc" ] || [ "$exp_tb" != "$act_tb" ] || [ "$exp_sha" != "$act_sha" ] || [ "$exp_csha" != "$act_csha" ]; then
-          echo "ERROR: backup integrity mismatch for volume '{{ item }}' -- refusing destructive restore." >&2
-          echo "  expected: files=$exp_fc bytes=$exp_tb listing=$exp_sha content=$exp_csha" >&2
-          echo "  actual:   files=$act_fc bytes=$act_tb listing=$act_sha content=$act_csha" >&2
-          echo "The backup payload for '{{ item }}' is partial/corrupt/altered; verify backup integrity before retrying." >&2
-          exit 4
-        fi
-        echo "Volume '{{ item }}' content integrity OK: files=$act_fc bytes=$act_tb content=$act_csha"
+        # SINGLE SOURCE (codex-0845/0915 D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE):
+        # the manifest field NAMES and the recompute formulas live in the shared library
+        # (lme_verify_content_manifest) -- the same library the producer side is rendered
+        # from -- so this restore consumer no longer hand-inlines a "keep byte-identical to
+        # the producer" snippet and cannot drift from it. rc3 = missing manifest/data dir,
+        # or a pre-content-digest (LEGACY) bundle with no content field (NO listing-only
+        # fallback, no ignore-integrity switch); rc4 = a recomputed value does not match the
+        # manifest (partial/corrupt/altered payload). Runs BEFORE any destructive podman
+        # volume rm below (verify-before-destroy).
+        echo "Verifying content integrity for volume '{{ item }}' before destructive restore..."
+        lme_verify_content_manifest "$MDIR/$LME_VOLUME_MANIFEST_FILE" "$MDIR/$LME_VOLUME_DATA_DIR"
       args:
         executable: /bin/bash
       loop: "{{ restore_selected_volume_names | default([]) }}"

@@ -35,6 +35,15 @@ LME_BUNDLE_SELF_FIELD="{{ bi.certification.self_digest_field }}"
 LME_VOLUME_ROOT="{{ bi.volume_layout.root_dir }}"
 LME_VOLUME_DATA_DIR="{{ bi.volume_layout.data_dir }}"
 LME_VOLUME_MANIFEST_FILE="{{ bi.volume_layout.manifest_file }}"
+# content_manifest.txt field NAMES (role-keyed in bi.manifest_fields): a SINGLE source
+# consumed by BOTH the writer (lme_write_content_manifest) and the reader
+# (lme_verify_content_manifest) so a field-name change relocates producer and restore
+# together. NOTE: the bundle_certification.txt "content_sha256=" lines are a SEPARATE
+# schema (the certificate, not the manifest) and stay literal.
+LME_MF_COUNT="{{ bi.manifest_fields.count }}"
+LME_MF_BYTES="{{ bi.manifest_fields.bytes }}"
+LME_MF_LISTING="{{ bi.manifest_fields.listing }}"
+LME_MF_CONTENT="{{ bi.manifest_fields.content }}"
 # Fail-closed on an under-declared contract: a missing volume_layout key would render
 # to an empty string (plain jinja2 emits "" for a missing attribute), turning
 # "$root/$LME_VOLUME_ROOT" into "$root/" (every payload tree read as an uncertified
@@ -46,7 +55,11 @@ LME_VOLUME_MANIFEST_FILE="{{ bi.volume_layout.manifest_file }}"
   "${LME_BUNDLE_SELF_FIELD:?content_integrity: certification.self_digest_field missing from declaration}" \
   "${LME_VOLUME_ROOT:?content_integrity: volume_layout.root_dir missing from declaration}" \
   "${LME_VOLUME_DATA_DIR:?content_integrity: volume_layout.data_dir missing from declaration}" \
-  "${LME_VOLUME_MANIFEST_FILE:?content_integrity: volume_layout.manifest_file missing from declaration}"
+  "${LME_VOLUME_MANIFEST_FILE:?content_integrity: volume_layout.manifest_file missing from declaration}" \
+  "${LME_MF_COUNT:?content_integrity: manifest_fields.count missing from declaration}" \
+  "${LME_MF_BYTES:?content_integrity: manifest_fields.bytes missing from declaration}" \
+  "${LME_MF_LISTING:?content_integrity: manifest_fields.listing missing from declaration}" \
+  "${LME_MF_CONTENT:?content_integrity: manifest_fields.content missing from declaration}"
 
 lme_tree_payloads=()
 lme_file_payloads=()
@@ -128,11 +141,60 @@ lme_write_content_manifest() {
   csha="$(lme_content_sha256 "$src")" || return 1
   [ -n "$csha" ] || { echo "lme_write_content_manifest: empty content digest for $src" >&2; return 1; }
   {
-    echo "file_count=${fc:-0}"
-    echo "total_bytes=${tb:-0}"
-    echo "listing_sha256=${sha}"
-    echo "content_sha256=${csha}"
+    echo "${LME_MF_COUNT}=${fc:-0}"
+    echo "${LME_MF_BYTES}=${tb:-0}"
+    echo "${LME_MF_LISTING}=${sha}"
+    echo "${LME_MF_CONTENT}=${csha}"
   } > "$out" || return 1
+  return 0
+}
+
+# Reader companion to lme_write_content_manifest: verify a produced volume's data dir
+# against its content_manifest, BEFORE any destructive restore. This is the SINGLE
+# source of the manifest recompute (file count / total bytes / listing / content), so
+# the restore consumer no longer hand-inlines a "keep byte-identical to the producer"
+# snippet (codex-0845/0915 D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE). Field
+# names come from LME_MF_*; the recompute formulas MATCH lme_write_content_manifest
+# exactly (find -printf '.' | wc -c, not find | wc -l, so a newline in a filename does
+# not falsely fail). Fail-closed exit codes (caller runs under set -euo pipefail; every
+# grep is guarded so a missing field never aborts before the explicit refusal):
+#   3 = manifest missing, data dir missing, or the content field absent (LEGACY bundle
+#       -- NO fallback to listing alone, no ignore-integrity switch)
+#   4 = a recomputed value does not match the manifest (partial/corrupt/altered payload)
+lme_verify_content_manifest() {
+  local manifest="$1" data="$2"
+  if [ ! -f "$manifest" ]; then
+    echo "lme_verify_content_manifest: content manifest missing at $manifest" >&2
+    echo "Backup predates integrity manifests or is corrupt; refusing destructive restore." >&2
+    return 3
+  fi
+  if [ ! -d "$data" ]; then
+    echo "lme_verify_content_manifest: backup data dir missing at $data" >&2
+    return 3
+  fi
+  local exp_fc exp_tb exp_ls exp_cs act_fc act_tb act_ls act_cs
+  exp_fc="$(grep "^${LME_MF_COUNT}=" "$manifest" | head -n1 | cut -d= -f2 || true)"
+  exp_tb="$(grep "^${LME_MF_BYTES}=" "$manifest" | head -n1 | cut -d= -f2 || true)"
+  exp_ls="$(grep "^${LME_MF_LISTING}=" "$manifest" | head -n1 | cut -d= -f2 || true)"
+  # content is the real check. A manifest WITHOUT it is a pre-content-digest bundle and
+  # is REFUSED here (rc3, route to LEGACY-BUNDLE), never accepted on listing alone.
+  exp_cs="$(grep "^${LME_MF_CONTENT}=" "$manifest" | head -n1 | cut -d= -f2 || true)"
+  if [ -z "$exp_cs" ]; then
+    echo "lme_verify_content_manifest: ${LME_MF_CONTENT} missing from $manifest (pre-content-digest bundle)." >&2
+    echo "Refusing destructive restore on ${LME_MF_LISTING} alone (no ignore-integrity switch); qualify via LEGACY-BUNDLE." >&2
+    return 3
+  fi
+  act_fc="$( cd "$data" && find . -type f -printf '.' | wc -c | tr -d ' ' )"
+  act_tb="$( cd "$data" && find . -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}' )"
+  act_ls="$( cd "$data" && find . -type f -printf '%P\t%s\n' | LC_ALL=C sort | sha256sum | awk '{print $1}' )"
+  act_cs="$(lme_content_sha256 "$data")" || { echo "lme_verify_content_manifest: content digest recompute failed for $data" >&2; return 4; }
+  if [ "$exp_fc" != "$act_fc" ] || [ "$exp_tb" != "$act_tb" ] || [ "$exp_ls" != "$act_ls" ] || [ "$exp_cs" != "$act_cs" ]; then
+    echo "lme_verify_content_manifest: content integrity mismatch -- refusing destructive restore." >&2
+    echo "  expected: ${LME_MF_COUNT}=$exp_fc ${LME_MF_BYTES}=$exp_tb ${LME_MF_LISTING}=$exp_ls ${LME_MF_CONTENT}=$exp_cs" >&2
+    echo "  actual:   ${LME_MF_COUNT}=$act_fc ${LME_MF_BYTES}=$act_tb ${LME_MF_LISTING}=$act_ls ${LME_MF_CONTENT}=$act_cs" >&2
+    return 4
+  fi
+  echo "content integrity OK: ${LME_MF_COUNT}=$act_fc ${LME_MF_BYTES}=$act_tb ${LME_MF_CONTENT}=$act_cs"
   return 0
 }
 
@@ -146,7 +208,7 @@ lme_finalize_volume_backup() {
   local data="$vdir/$LME_VOLUME_DATA_DIR"
   lme_write_content_manifest "$mountpoint" "$man" || { rm -f "$man"; return 1; }
   local src copy
-  src="$(grep '^content_sha256=' "$man" | head -n1 | cut -d= -f2 || true)"
+  src="$(grep "^${LME_MF_CONTENT}=" "$man" | head -n1 | cut -d= -f2 || true)"
   copy="$(lme_content_sha256 "$data")" || { rm -f "$man"; return 1; }
   if [ -z "$src" ] || [ "$src" != "$copy" ]; then
     rm -f "$man"
@@ -230,7 +292,7 @@ lme_bundle_certify() {
         echo "CERTIFY-REFUSED: volume '$vname' has no $LME_VOLUME_MANIFEST_FILE (partial backup)" >&2
         rm -f "$tmp"; return 1
       fi
-      vsha="$(grep '^content_sha256=' "$vman" | head -n1 | cut -d= -f2 || true)"
+      vsha="$(grep "^${LME_MF_CONTENT}=" "$vman" | head -n1 | cut -d= -f2 || true)"
       if [ -z "$vsha" ]; then
         echo "CERTIFY-REFUSED: volume '$vname' manifest lacks content_sha256" >&2
         rm -f "$tmp"; return 1
@@ -341,7 +403,7 @@ lme_bundle_verify() {
     vman="$vroot/$name/$LME_VOLUME_MANIFEST_FILE"
     if [ ! -d "$vdata" ]; then echo "VERIFY-REFUSED(7): certified volume '$name' missing data dir $vdata." >&2; return 7; fi
     if [ ! -f "$vman" ]; then echo "VERIFY-REFUSED(7): certified volume '$name' missing manifest $vman." >&2; return 7; fi
-    mdig="$(grep '^content_sha256=' "$vman" | head -n1 | cut -d= -f2 || true)"
+    mdig="$(grep "^${LME_MF_CONTENT}=" "$vman" | head -n1 | cut -d= -f2 || true)"
     if [ -z "$mdig" ] || [ "$mdig" != "$cdig" ]; then
       echo "VERIFY-REFUSED(5): volume '$name' manifest digest ($mdig) != certified ($cdig)." >&2; return 5
     fi
