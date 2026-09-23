@@ -58,9 +58,10 @@ e_material_catalog_definitions:
     kind: certificate
     payload_validity: non_empty_pem_certificate
     description: >-
-      Internal LME CA public cert (ca/ca.crt) -- the ONLY cert that leaves the setup-certs
-      workspace (global.yml certs.ca_public_rel); distributed to cross-host consumers (GAP-2 CA
-      overlay). Distributable. The CA PRIVATE key is never a catalog material.
+      Internal LME CA public cert (ca/ca.crt); distributed to cross-host consumers (GAP-2 CA
+      overlay + the B4 per-service bundles, which also carry the public LEAF certs kibana.crt /
+      fleet-server.crt). Distributable. The CA PRIVATE key ca/ca.key is never a catalog material
+      and is chowned off the ES uid + kept 0600 (init-setup.sh:83-86, never published).
   elastic_password:
     owner: C
     kind: password_file
@@ -150,20 +151,17 @@ service_obligations:
         placement_class: env          # -> KIBANA_PASSWORD / ELASTICSEARCH_PASSWORD env
         consumer: lme-elasticsearch
         profile_condition: always
-      elasticsearch_leaf_cert:
-        material_ref: elasticsearch_cert
-        placement_class: mount        # workspace-local leaf; ES presents it on http (chain.pem) + transport (.crt)
-        consumer: lme-elasticsearch
-        destination: certs/elasticsearch/elasticsearch.crt   # manifest xpack.security.transport.ssl.certificate; http uses elasticsearch.chain.pem (same leaf, chain sibling)
-        owner_role: elasticsearch
-        mode: "0644"                  # init-setup.sh:73 (non-key workspace files chmod 644)
-        profile_condition: always
-      # NB: ES is the CA producer + TLS terminator -- it mounts the SHARED lme_certs
-      # workspace (manifest: "NOT a B4 per-service-bundle consumer"), so its ca.crt, leaf
-      # cert and private key are all HOST-LOCAL (setup-certs), NOT a distributed placement.
-      # So ES has NO internal_ca_trust obligation here; its private key is in
-      # consumer_local_tls_key_obligations. (The distributable CA obligation lives on the
-      # CONSUMERS below, which mount it via their B4 bundle / GAP-2 cross-host overlay.)
+      # NB: ES is the CA producer + TLS terminator -- it mounts the SHARED lme_certs workspace
+      # (manifest: "NOT a B4 per-service-bundle consumer"), so its whole cert/key SET
+      # (ca/ca.crt, elasticsearch.crt, elasticsearch.chain.pem [http], elasticsearch.key
+      # [transport+http]) is WORKSPACE material produced by setup-certs on the SOURCE host --
+      # NOT a distributed mount placement. Modeling any of them as a plain `mount` obligation
+      # here would falsely mark self-produced material as distributed. So ES's cert/key set is
+      # OWED under C's local_host production form (see es_workspace_material_owed in
+      # consumer_local_tls_key_obligations), NOT declared as a distributed obligation. ES has NO
+      # internal_ca_trust obligation (it PRODUCES the CA). The distributable CA + leaf-cert
+      # obligations live on the CONSUMERS below (kibana/fleet), which receive them via a B4
+      # bundle. THIS is why the codex_0730 INCOMPLETE-TLS disposition is PARTIAL, not RESOLVED.
     datastore_clients: {}             # ES is the datastore, not a client
   kibana:
     material_requirements:
@@ -295,25 +293,50 @@ consumer_local_tls_key_obligations:
     # is the SAME correction routed to C for elasticsearch_tls_key_local / kibana_tls_key_local
     # (both services are also enabled_when:[always]).
     - fleet_server_tls_key_local
+  # ES is the CA producer + source host; its whole workspace cert/key SET is self-produced and
+  # OWED under C's local_host form (NOT declared as a distributed mount obligation above).
+  es_workspace_material_owed:
+    note: >-
+      ES mounts the shared lme_certs workspace, so ca/ca.crt + elasticsearch.crt +
+      elasticsearch.chain.pem + elasticsearch.key are workspace-local material, self-produced by
+      setup-certs on the source host. Owed as local_host obligations (elasticsearch_tls_key_local
+      already authored by C(1b7e8b8); the public ca.crt/leaf-cert/chain still to be enumerated in
+      the joint wave). This is why codex_0730 INCOMPLETE-TLS is PARTIAL for ES.
+    files: [ca/ca.crt, elasticsearch/elasticsearch.crt, elasticsearch/elasticsearch.chain.pem, elasticsearch/elasticsearch.key]
   produced_by: setup-certs (host-local; lme_certs workspace / B4 per-service bundle)
   keys:
     - {service: elasticsearch, material_def: elasticsearch_tls_key, in_container_path: config/certs/elasticsearch/elasticsearch.key, owner_role: elasticsearch, authored_by: C(1b7e8b8) as elasticsearch_tls_key_local}
     - {service: kibana,        material_def: kibana_tls_key,        in_container_path: config/certs/kibana/kibana.key,               owner_role: kibana,        authored_by: C(1b7e8b8) as kibana_tls_key_local}
     - {service: fleet-server,  material_def: fleet_server_tls_key,  in_container_path: /certs/fleet-server/fleet-server.key,          owner_role: fleet-server,  authored_by: E_OWED (see e_owed_at_fold)}
-  requirement: >-
-    Each key MUST be present, host-local, owned by the cert-owner uid the manifest `certs:`
-    block derives (lme_manifests.cert_owner). MODES RE-VERIFIED 2026-09-23 from PRIMARY source
-    (an earlier draft mis-cited main.yml:155, which is the cert-bundle TARBALL push, not a key):
-    the setup-certs WORKSPACE leaf key (elasticsearch/kibana/fleet-server .key) is mode 0640,
-    owned elasticsearch:elasticsearch -- config/setup/init-setup.sh:72
-    (`find ... -name '*.key' -exec chmod 640`) + :69 (chown -R elasticsearch); the PUBLISHED B4
-    per-service bundle key is ALSO mode 0640 (ansible/roles/certs/tasks/main.yml:216,
-    `install -m 0640 <svc>.key`). So C's elasticsearch_tls_key_local mode 0640 is CORRECT for the
-    workspace leaf key -- NOT a mismatch. The ONLY 0600 key is the CA SIGNING key ca/ca.key,
-    chowned OFF the elasticsearch uid to userns-root 0:0 and chmod 0600 (init-setup.sh:83-86) so
-    the ES service process cannot read it (CA-MITM carve-out); ca/ca.key is NEVER distributed or
-    published (main.yml:219, `find ... -name 'ca.key' -delete`). The service leaf key MUST NOT be
-    distributed and MUST NOT be dropped to make the distributable-kind restriction pass.
+  mode_facts: >-
+    MODES RE-VERIFIED 2026-09-23 from PRIMARY source (an earlier draft mis-cited main.yml:155,
+    which is the cert-bundle TARBALL push, not a key): the setup-certs WORKSPACE leaf key
+    (elasticsearch/kibana/fleet-server .key) is mode 0640, owned elasticsearch:elasticsearch --
+    config/setup/init-setup.sh:72 (`find ... -name '*.key' -exec chmod 640`) + :69 (chown -R
+    elasticsearch); the PUBLISHED B4 per-service bundle key is ALSO 0640
+    (ansible/roles/certs/tasks/main.yml:216, `install -m 0640 <svc>.key`). So C's
+    elasticsearch_tls_key_local mode 0640 is CORRECT for the workspace leaf key -- NOT a mismatch.
+    ca/ca.key is 0600, chowned off the ES uid to userns-root 0:0 (init-setup.sh:83-86, CA-MITM carve-out).
+  distribution_reality:
+    # HONEST CORRECTION 2026-09-23: an earlier draft claimed these keys are "NEVER distributed".
+    # That is the TARGET, not today's cluster behavior. Verified against the certs role:
+    target_end_state: >-
+      local_host production (C's form) -- each node produces its OWN private key locally; only the
+      SIGNED public cert crosses hosts; no private key is ever distributed.
+    today_behavior: >-
+      CENTRAL-MINT + WHOLE-WORKSPACE PUSH. ansible/roles/certs/tasks/main.yml:118-131 tars the
+      ENTIRE source-host lme_certs workspace (`tar -C <ws> -czf ... .`, NO exclude) and
+      slurps+extracts it into EVERY host's lme_certs volume. On a cluster this DISTRIBUTES the leaf
+      private keys AND the CA signing key ca/ca.key to every data node. (The main.yml:219
+      `find -name 'ca.key' -delete` only strips ca.key from the SEPARATE B4 PUBLISHED bundles, NOT
+      from this workspace push.) So the private keys ARE distributed today.
+    routed_to: C
+    routing: >-
+      ES/certs counterpart of C's db_private_key_distribution_reconciliation (choose local
+      production vs a typed, audited scoped-distribution exception). E does NOT touch the certs
+      role. The obligation MUST NOT be dropped to satisfy the distributable-kind restriction
+      (security_boundary); it is declared owed under the local_host target and the current
+      distribution is flagged for reconciliation, not silently accepted.
 
 # ---------------------------------------------------------------------------
 # 4. cluster_uuid DISPOSITION (P3). cluster_uuid is CREATED by Elasticsearch at bootstrap
@@ -396,14 +419,20 @@ codex_0730_audit_disposition:
       /run/secrets/otel-elastic-api-key. Re-verified against config/otel-collector.yml:26-27,49,66
       + manifest lme-otel-collector.yml secrets/certs -- exact match; NO superuser fallback.
   - id: E-PROPOSAL-INCOMPLETE-TLS-OBLIGATIONS
-    status: RESOLVED
+    status: PARTIAL
     detail: >-
       Added server leaf-cert catalog defs (elasticsearch_cert/kibana_cert/fleet_server_cert,
-      kind certificate) + a leaf-cert mount obligation per TLS server (grounded in each
-      manifest's ssl.certificate path). Closure is now CA-trust + leaf-cert + host-local
-      leaf-key (consumer_local_tls_key_obligations). The private-key half stays a
-      non-distributable local obligation (C's local_host form) -- NOT deleted to pass the
-      distributable restriction (security_boundary).
+      kind certificate). KIBANA + FLEET: leaf-cert mount obligations added (public certs,
+      distributable, grounded in SERVER_SSL_CERTIFICATE / FLEET_SERVER_CERT) -> those two are
+      RESOLVED (CA-trust + leaf-cert obligations; private key owed local). ELASTICSEARCH: OWED,
+      not a plain mount -- ES mounts the shared workspace, so ca/ca.crt + elasticsearch.crt +
+      chain.pem + key are self-produced workspace material; declaring them as distributed mounts
+      would falsely mark self-produced material as distributed. They are enumerated under
+      consumer_local_tls_key_obligations.es_workspace_material_owed (owed under C's local_host
+      form). ALSO OWED (routed to C, see consumer_local_tls_key_obligations.distribution_reality):
+      today's cluster certs path central-mints on the source and PUSHES the whole workspace
+      (private keys + ca.key included) to every node (main.yml:118-131), so the local-production
+      target is not yet the runtime -- the ES counterpart of C's db_private_key_distribution_reconciliation.
   - id: E-PROPOSAL-UNRESOLVED-DATASTORE-REFERENCES
     status: ROUTED
     detail: same as residual ENDPOINT-REF-RESOLUTION -- endpoint_ref/domain_ref/principal_ref are
@@ -444,10 +473,12 @@ verification:
     cluster_uuid field. Harness (not wired, scratchpad-only): validate_proposal.py.
   result: >-
     PASS. catalog: 11 defs valid (10 E + guardian_public_key). material_requirements valid,
-    obligation counts: elasticsearch(3) / kibana(3) / fleet-server(3) / otel-collector(2) -- each
-    TLS-server service now carries the COMPLETE closure (CA-trust where distributed + server
-    leaf-cert obligation + the host-local private-key obligation in
-    consumer_local_tls_key_obligations); otel is a pure ES client (CA + scoped API key, no leaf).
+    obligation counts: elasticsearch(2) / kibana(3) / fleet-server(3) / otel-collector(2).
+    Kibana + Fleet carry the distributable-cert closure (CA-trust + server leaf-cert mount +
+    host-local private-key obligation). ES declares no distributed cert/CA mount -- it mounts the
+    self-produced workspace, so its cert/key set is OWED under C's local_host form
+    (es_workspace_material_owed); INCOMPLETE-TLS is therefore PARTIAL for ES (see disposition).
+    otel is a pure ES client (CA + scoped API key, no leaf).
     datastore_clients: projected -- 3 client services bound (kibana, fleet-server, otel-collector;
     ES declares {} as the datastore, not a client); every material_requirement_ref resolves to a
     same-service obligation id. cluster_uuid double-test through the REAL lme_resolve_config:
