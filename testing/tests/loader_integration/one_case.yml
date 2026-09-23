@@ -143,6 +143,16 @@
       ansible.builtin.set_fact:
         _eng_assert_count: "{{ (lookup('ansible.builtin.file', work ~ '/' ~ case.name ~ '/probe.yml')).splitlines() | select('search', 'ansible.builtin.assert') | list | length }}"
 
+    # Typo/authoring guard (the origins-vs-origin class): the engine path does NOT get the
+    # contract-case _unhandled_expects check, and the zero-assert guard cannot see a DROPPED
+    # assertion (every probe renders exactly one assert TASK). So validate the expect keys
+    # against a pinned allowlist, and REQUIRE raises_match on any raises case
+    # (G-EXPECTED-REJECTION-CAUSE: a rescued failure must be reason-checked, not any error).
+    - name: "Validate engine expect keys + raises reasoning :: {{ case.name }}"
+      ansible.builtin.set_fact:
+        _eng_bad_expect_keys: "{{ ((case.expect | default({})).keys() | list) | difference(case_schema.engine_expect_allowlist) }}"
+        _eng_raises_unreasoned: "{{ (case.expect.raises | default(false)) and (case.expect.raises_match is not defined) }}"
+
     - name: "Run engine probe under scrubbed env against the immutable resolver copy :: {{ case.name }}"
       ansible.builtin.command:
         cmd: /usr/bin/env -i HOME={{ work }}/{{ case.name }} PATH=/usr/bin:/bin ANSIBLE_FILTER_PLUGINS={{ engine_filter_dir }} /usr/bin/ansible-playbook probe.yml
@@ -150,17 +160,31 @@
       register: eng_run
       changed_when: false
       failed_when: false
-      when: (_eng_assert_count | int) > 0
+      when:
+        - (_eng_assert_count | int) > 0
+        - (_eng_bad_expect_keys | length) == 0
+        - not _eng_raises_unreasoned
 
-    - name: "Judge engine probe (zero-assert=ERROR; else rc) :: {{ case.name }}"
+    # Receipt binding (codex-0400): bind the executed template + runner + copied filters (sha) +
+    # rendered probe + ACTUAL exit/stdout/stderr, so a receipt is an EXECUTION log, not just a
+    # generated artifact. The template + runner + case-file shas live in the top-level
+    # authored_sha256 map; the copied resolver is engine_resolver_sha256.
+    - name: "Judge engine probe (bad-keys/unreasoned-raises/zero-assert=ERROR; else rc) :: {{ case.name }}"
       ansible.builtin.set_fact:
         results: >-
           {{ results + [ {
                'case': case.name, 'kind': case.kind, 'invariant_task': case.invariant_task,
-               'verdict': ('ERROR' if (_eng_assert_count | int) == 0
-                           else ('PASS' if eng_run.rc == 0 else 'FAIL')),
+               'verdict': ('ERROR' if ((_eng_bad_expect_keys | length) > 0 or _eng_raises_unreasoned or (_eng_assert_count | int) == 0)
+                           else ('PASS' if (eng_run.rc | default(1)) == 0 else 'FAIL')),
                'assert_count': (_eng_assert_count | int),
                'rc': (eng_run.rc | default('n/a')),
+               'bad_expect_keys': _eng_bad_expect_keys,
+               'raises_unreasoned': _eng_raises_unreasoned,
                'resolver_sha256': engine_resolver_sha256,
+               'template': 'engine_probe.yml.j2',
+               'engine_filter_dir': engine_filter_dir,
+               'rendered_probe': (work ~ '/' ~ case.name ~ '/probe.yml'),
+               'stdout_tail': ((eng_run.stdout | default('')).splitlines() | reject('equalto', '') | list)[-12:],
+               'stderr_tail': ((eng_run.stderr | default('')).splitlines() | reject('equalto', '') | list)[-8:],
                'log': (work ~ '/' ~ case.name ~ '/probe.yml')
              } ] }}

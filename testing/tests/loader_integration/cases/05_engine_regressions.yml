@@ -94,22 +94,33 @@ cases:
     fail_msg: "A2 REGRESSION: reordering registry.precedence did NOT change the winner (the resolver consults a fixed order, not the declaration)"
 
   # --- extended-type (int 0 / empty collection / nullable null preserved) --------------
+  # G-FALSELIKE-SELECTION-DISCRIMINATION (codex-0400): the explicit false-like values MUST
+  # differ from the lower-tier fallback so that dropping the operator selection would change
+  # the OUTCOME, and we assert origins=operator so a value that matched the default by accident
+  # cannot pass. Here the PROFILE tier carries contrasting non-falselike values; the operator
+  # tier carries the falselike ones. If the resolver treated 0/[]/{}/null as "absent", the
+  # profile value would win (different value AND origin=profile) -> the case FAILs.
   - name: extended-types-explicit-falselike-preserved
     kind: engine_regression
     requires_contract: false
     call: resolve
     registry: *base_registry
     resolve:
-      selections: {max_shards: 0, extra_hosts: [], overrides: {}, optional_note: null}
+      profile_vars: {max_shards: 7, extra_hosts: ['h1'], overrides: {k: 1}, optional_note: "note"}   # CONTRASTING lower tier
+      selections:   {max_shards: 0, extra_hosts: [],     overrides: {},     optional_note: null}      # explicit falselike, operator tier
     expect:
       resolved:
-        max_shards: 0            # explicit int zero, NOT treated as absent
-        extra_hosts: []          # explicit empty list
-        overrides: {}            # explicit empty map
-        optional_note: null      # explicit null on a nullable field
-        install_llm: true        # untouched declared default
-    invariant_task: "extended-type: explicit false-like values (int 0, empty list, empty map, null on a nullable field) are preserved by membership, never overwritten as absent"
-    fail_msg: "extended-type REGRESSION: an explicit 0 / [] / {} / null was treated as absent and replaced by a default/detection"
+        max_shards: 0            # explicit int zero beats profile 7 (NOT treated as absent)
+        extra_hosts: []          # explicit empty list beats ['h1']
+        overrides: {}            # explicit empty map beats {k:1}
+        optional_note: null      # explicit null on a nullable field beats "note"
+      origins:
+        max_shards: operator     # DISCRIMINATION: proves the falselike operator value WON (not dropped -> profile)
+        extra_hosts: operator
+        overrides: operator
+        optional_note: operator
+    invariant_task: "extended-type: explicit false-like values (int 0, empty list, empty map, null on a nullable field) selected at the operator tier are preserved by MEMBERSHIP and beat a contrasting profile fallback (origin=operator), never overwritten as absent"
+    fail_msg: "extended-type REGRESSION: an explicit 0 / [] / {} / null was treated as absent and the contrasting profile fallback won (value and/or origin=profile) instead of the operator selection"
 
   # --- origin-rejection (A5 honest origins) -------------------------------------------
   - name: false-origin-claim-discarded-as-operator
@@ -200,29 +211,52 @@ cases:
     invariant_task: "real-registry: the SHIPPED manifests/global.yml lme_config_registry resolves declared defaults (origin=default) with empty inputs, validates round-trip, and its enable_flag keys match the resolver's KNOWN_ENABLE_FLAGS (no drift)"
     fail_msg: "real-registry REGRESSION: the shipped registry did not resolve declared defaults / validate round-trip, OR KNOWN_ENABLE_FLAGS drifted from the registry's enable_flag field keys (is_enabled typo-guard vs registry out of sync)"
 
-  # --- content-addressed revision (codex-0330: lme_config_revision same/different) ---------
-  - name: resolved-revision-is-deterministic-for-identical-payload
+  # --- content-addressed revision (codex-0330 + C1 63b2658: config-ALONE, origins DROPPED) ---
+  # C1 made the revision deterministic from the resolved CONFIG alone (dropped origins) so the
+  # SAME values via -e / profile / compat-normalize yield the SAME revision. So the payload here
+  # is config-only (a resolved-values dict, no origins) and the sensitivity case flips only a
+  # resolved VALUE -- flipping an origin must NOT change the id (that is the point of 63b2658).
+  - name: resolved-revision-is-deterministic-for-identical-config
     kind: engine_regression
     requires_contract: false
     call: revision
-    payload:
-      resolved: {offline_mode: false, install_llm: true}
-      origins: {offline_mode: default, install_llm: default}
-    # payload_b defaults to payload -> same inputs
+    payload: {offline_mode: false, install_llm: true, es_discovery: single-node}   # config-only
+    # payload_b defaults to payload -> identical config
     expect: {revision_differ: false, revision_equal: true}
-    invariant_task: "revision: lme_config_revision is content-addressed -- identical resolution inputs yield the IDENTICAL revision id (so the early gate, membership check and credential gate all read one revision in a single run)"
-    fail_msg: "revision REGRESSION: identical resolution inputs produced DIFFERENT revision ids (revision is not a pure function of inputs -- a timestamp/HEAD leaked into the payload)"
+    invariant_task: "revision: lme_config_revision is content-addressed over the resolved CONFIG ALONE (origins dropped, C1 63b2658) -- identical config yields the IDENTICAL revision id, so the early gate, membership check and credential gate read one revision in a single run"
+    fail_msg: "revision REGRESSION: identical resolved config produced DIFFERENT revision ids (a timestamp/HEAD/origin leaked into the payload -- not a pure function of the config)"
 
-  - name: resolved-revision-changes-when-an-input-changes
+  - name: resolved-revision-changes-when-a-config-value-changes
     kind: engine_regression
     requires_contract: false
     call: revision
-    payload:
-      resolved: {offline_mode: false, install_llm: true}
-      origins: {offline_mode: default, install_llm: default}
-    payload_b:
-      resolved: {offline_mode: true, install_llm: true}    # ONE field flipped
-      origins: {offline_mode: operator, install_llm: default}
+    payload:   {offline_mode: false, install_llm: true, es_discovery: single-node}
+    payload_b: {offline_mode: true,  install_llm: true, es_discovery: single-node}   # ONE resolved VALUE flipped (not an origin)
     expect: {revision_equal: false, revision_differ: true}
-    invariant_task: "revision: a change in ANY resolution input (a flipped value / origin) changes the revision id, so a stale revision cannot masquerade as the current one across consumers"
-    fail_msg: "revision REGRESSION: a changed resolution input did NOT change the revision id (a stale/other-revision resolution could pass the cross-consumer agreement gate)"
+    invariant_task: "revision: a change in a resolved config VALUE changes the revision id, so a stale config cannot masquerade as the current one across consumers"
+    fail_msg: "revision REGRESSION: a changed resolved config value did NOT change the revision id (a stale/other-config resolution could pass the cross-consumer agreement gate)"
+
+  # --- adversarial resolver caller (codex-0400: adversarial caller / pre-mutation tests) ------
+  - name: resolver-rejects-selection-naming-undeclared-field
+    kind: engine_regression
+    requires_contract: false
+    call: resolve
+    registry: *base_registry
+    resolve:
+      selections: {not_a_declared_field: true}     # a caller key that names no declared field
+    expect: {raises: true, raises_match: "undeclared config key"}
+    invariant_task: "adversarial: a selection naming an UNDECLARED field is rejected (managed-key assert) -- adding a field must be a registry change, not a silent ungoverned caller key"
+    fail_msg: "adversarial REGRESSION: the resolver accepted a selection for an undeclared field (an ungoverned caller key slipped through instead of failing closed)"
+
+  - name: resolver-required-field-with-no-value-fails-closed-pre-mutation
+    kind: engine_regression
+    requires_contract: false
+    call: resolve
+    registry:
+      fields: {must_have: {type: bool, required: true, nullable: false}}   # required, NO default at any tier
+      precedence: [operator, default]
+      channels: {operator: {provenance: caller, source: selections}, default: {source: field_default}}
+    resolve: {}                                   # nothing selected; default tier declares no default
+    expect: {raises: true, raises_match: "has no value from any tier"}
+    invariant_task: "adversarial: a REQUIRED field with no value at any tier fails closed BEFORE any mutation (pre-mutation fail-closed), never resolving to a silent absent/None"
+    fail_msg: "adversarial REGRESSION: a required field with no value resolved silently (absent/None) instead of failing closed pre-mutation"

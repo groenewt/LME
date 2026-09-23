@@ -117,28 +117,54 @@
       loop: "{{ contract_binding.entrypoints | dict2items }}"
       loop_control: {label: "{{ item.key }}"}
 
-    - name: sha256 of authored case files + macro (evidence identity)
+    - name: sha256 of authored case files + macros + runner + task files (evidence identity)
+      # T8 requires runner/macro hashes: the engine_probe.yml.j2 macro produces every runnable
+      # engine verdict, and one_case.yml / scan_target.yml / run_integration.yml are the runner
+      # logic -- all must be bound to the receipt, not only the case data + the contract-probe macro.
       ansible.builtin.stat:
         path: "{{ item }}"
         checksum_algorithm: sha256
       register: authored_stat
-      loop: "{{ case_files + [ playbook_dir ~ '/macros/probe.j2' ] }}"
+      loop: >-
+        {{ case_files + [
+             playbook_dir ~ '/macros/probe.j2',
+             playbook_dir ~ '/engine_probe.yml.j2',
+             playbook_dir ~ '/one_case.yml',
+             playbook_dir ~ '/scan_target.yml',
+             playbook_dir ~ '/run_integration.yml'
+           ] }}
       loop_control: {label: "{{ item | basename }}"}
 
-    - name: Pre-slurp entrypoint file lines once (read-only; feeds static_scan)
-      ansible.builtin.slurp:
-        src: "{{ repo_root }}/{{ item.value }}"
-      register: entrypoint_slurp
+    # Read the entrypoints from the COMMITTED HEAD blob, NOT the working tree: this tier runs in a
+    # SHARED worktree with concurrent editors (B/E migrate entrypoints in-flight), so a working-tree
+    # read makes the static_scan non-deterministic and lets a peer's UNCOMMITTED mid-edit contaminate
+    # the before-baseline. Binding to `git show HEAD:<path>` makes the scan judge COMMITTED state only
+    # (the real acceptance/migration-landing signal) and bound to a ref -- broken lineage is rejected,
+    # never a fabricated identity (T8). worktree_dirty is still recorded for provenance.
+    - name: Read entrypoint lines from the committed HEAD blob (ref-bound; immune to uncommitted peer edits)
+      ansible.builtin.command: "git show HEAD:{{ item.value }}"
+      args: {chdir: "{{ repo_root }}"}
+      register: head_entrypoint_show
+      changed_when: false
       loop: "{{ contract_binding.entrypoints | dict2items }}"
       loop_control: {label: "{{ item.key }}"}
 
-    - name: Build entrypoint_lines map keyed by short name (splitlines handles CRLF+LF; a '\n' literal is NOT honored inside a block scalar)
+    - name: Record the HEAD blob id of each entrypoint (content identity bound to the ref)
+      ansible.builtin.command: "git rev-parse HEAD:{{ item.value }}"
+      args: {chdir: "{{ repo_root }}"}
+      register: head_entrypoint_blob
+      changed_when: false
+      loop: "{{ contract_binding.entrypoints | dict2items }}"
+      loop_control: {label: "{{ item.key }}"}
+
+    - name: Build entrypoint_lines (from the HEAD blob) + head_entrypoint_blobs map keyed by short name
       ansible.builtin.set_fact:
         entrypoint_lines: >-
-          {{ entrypoint_lines | default({})
-             | combine({ item.item.key: (item.content | b64decode).splitlines() }) }}
-      loop: "{{ entrypoint_slurp.results }}"
-      loop_control: {label: "{{ item.item.key }}"}
+          {{ dict(head_entrypoint_show.results | map(attribute='item.key') | list
+                  | zip(head_entrypoint_show.results | map(attribute='stdout_lines') | list)) }}
+        head_entrypoint_blobs: >-
+          {{ dict(head_entrypoint_blob.results | map(attribute='item.key') | list
+                  | zip(head_entrypoint_blob.results | map(attribute='stdout') | list)) }}
 
     - name: Publish evidence facts
       ansible.builtin.set_fact:
@@ -229,6 +255,7 @@
               'contract_bound': contract_bound,
               'toolchain': toolchain,
               'entrypoints_sha256': entrypoints_sha256,
+              'head_entrypoint_blobs': head_entrypoint_blobs,
               'engine_resolver_sha256': engine_resolver_sha256,
               'authored_sha256': authored_sha256,
               'tally': {'total': n_total, 'pass': n_pass, 'queued': n_queued, 'hard_fail': n_hardfail},
