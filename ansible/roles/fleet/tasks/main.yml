@@ -33,7 +33,24 @@
 - name: Resolve separate Fleet enrollment and output hosts
   ansible.builtin.set_fact:
     fleet_enrollment_host: "{{ fleet_enrollment_host | default(fleet_advertise_host | default(ipvar)) }}"
-    fleet_output_host: "{{ fleet_output_host | default(fleet_advertise_host | default(ipvar)) }}"
+    # D1 collection fix (root cause "LME collects nothing"): a SINGLE-HOST deploy's only
+    # shipping agent is the fleet-server's own elastic-agent, which lives on the podman `lme`
+    # network. Elasticsearch publishes 9200 on 127.0.0.1 ONLY (manifests/services/
+    # lme-elasticsearch.yml) unless a profile opens it, so the historical default output host
+    # (advertise_host -> ipvar = host LAN IP) was UNREACHABLE and the agent could never ship;
+    # the mandatory metrics data-flow gate below (metrics/logs-elastic_agent.*) then times out.
+    # The in-network alias `lme-elasticsearch` IS reachable and is a valid SAN on the ES leaf
+    # certificate, so it satisfies ssl.verification_mode:full for a same-host agent. Only the
+    # MULTINODE profile has remote agents that need an externally reachable output, and that
+    # profile opens ES on fleet_output_bind_address; there the external advertise/ipvar host is
+    # preserved EXACTLY as before. An explicit operator-supplied fleet_output_host always wins.
+    fleet_output_host: >-
+      {{ fleet_output_host
+         | default(
+             (fleet_advertise_host | default(ipvar))
+             if ((lme_profile | default('default')) == 'multinode')
+             else 'lme-elasticsearch'
+           ) }}
 
 - name: Resolve separate Fleet enrollment and output URLs
   ansible.builtin.set_fact:
@@ -78,6 +95,28 @@
   when:
     - lme_lab_mode | default(false) | bool
     - lme_profile | default('default') == 'multinode'
+
+# D1 reachability contract: turn the silent "advertise an unreachable output" failure
+# (ES 9200 loopback-only while agents are told to ship elsewhere) into a hard, explanatory
+# assert. This is the reachability check the collection root-cause analysis found MISSING.
+- name: Assert the resolved Fleet default output is reachable by shipping agents
+  ansible.builtin.assert:
+    that:
+      - >-
+        (fleet_output_url | urlsplit('hostname')) == 'lme-elasticsearch'
+        or ((lme_profile | default('default')) == 'multinode')
+        or (tailscale_serve_services | default(false) | bool)
+        or (fleet_output_bind_address | default('') | length > 0
+            and fleet_output_bind_address not in ['127.0.0.1', '::1'])
+    fail_msg: >-
+      Fleet default output {{ fleet_output_url }} is not reachable by shipping agents:
+      Elasticsearch 9200 binds loopback-only unless a profile opens it, so nothing could ship
+      here and the metrics/logs-elastic_agent.* data-flow gate would time out. Use the
+      in-network alias https://lme-elasticsearch:9200 for a single-host deploy (now the
+      default), or set fleet_output_bind_address (multinode) / enable tailnet Serve so remote
+      agents can reach Elasticsearch.
+    success_msg: "Fleet default output {{ fleet_output_url }} resolves to a reachable endpoint."
+    quiet: true
 
 - name: Debug - Display set variables (sensitive information redacted)
   debug:
@@ -627,8 +666,28 @@
       kbn-version: "{{ kibana_version }}"
       kbn-xsrf: "kibana"
       Content-Type: "application/json"
+    # Tolerate 404 so an offline mirror that does not bundle the endpoint package does not
+    # hard-fail the whole install here; availability is evaluated explicitly below.
+    status_code: [200, 404]
   register: endpoint_package_result
   no_log: true
+
+- name: Determine whether the Elastic Defend (endpoint) package is available
+  ansible.builtin.set_fact:
+    endpoint_package_available: >-
+      {{ (endpoint_package_result.status | default(0)) == 200
+         and ((endpoint_package_result.json | default({})).get('item', {}).get('version', '') | length > 0) }}
+
+- name: Report Elastic Defend (endpoint) package availability
+  ansible.builtin.debug:
+    msg: >-
+      {{ ('Elastic Defend (endpoint) package available -- version '
+          ~ ((endpoint_package_result.json | default({})).get('item', {}).get('version', ''))
+          ~ '; the Elastic Defend integration will be created.')
+         if (endpoint_package_available | bool)
+         else ('Elastic Defend (endpoint) package is NOT available from the package registry '
+               ~ '(e.g. not bundled in this offline mirror); the Elastic Defend integration is '
+               ~ 'SKIPPED. Endpoint-security telemetry requires this package.') }}
 
 - name: Create Elastic Defend package policy
   uri:
@@ -670,7 +729,24 @@
   retries: 12
   delay: 30
   no_log: true
-  ignore_errors: yes
+  # Only attempt when the package is actually available (handles offline mirrors that do not
+  # bundle it). The former blanket `ignore_errors: yes` silently swallowed EVERY failure --
+  # including a real, present-package failure -- so a broken endpoint integration looked green.
+  # It is now fail-closed (asserted below) when the package is available.
+  when: endpoint_package_available | bool
+
+- name: Assert Elastic Defend integration was created when its package is available
+  ansible.builtin.assert:
+    that:
+      - (elastic_defend_policy_result.status | default(0)) in [200, 409]
+    fail_msg: >-
+      The Elastic Defend (endpoint) package is available but its package policy could not be
+      created on policy '{{ policy_id }}' (last status
+      {{ elastic_defend_policy_result.status | default('none') }}). This condition was
+      previously swallowed by ignore_errors, hiding absent endpoint-security collection.
+      Investigate the Fleet /api/fleet/package_policies response.
+    quiet: true
+  when: endpoint_package_available | bool
 
 - name: Display results
   debug:
@@ -794,6 +870,17 @@
          | selectattr('policy_id', 'equalto', policy_id)
          | map(attribute='local_metadata.host.hostname', default='')
          | reject('equalto', '') | list }}
+    # D3: count online agents on the fleet-server's OWN policy (id fixed in
+    # manifests/services/lme-fleet-server.yml + config/kibana.yml preconfig). The prior
+    # non-lab gate accepted total>0 & online>0 -- any online agent, even an unrelated one --
+    # while the fleet-server agent (the one that must ship self-monitoring) could be down.
+    _fleet_online_server_policy_agents: >-
+      {{ (fleet_agents_result.json | default({})).get('items', [])
+         | selectattr('status', 'defined')
+         | selectattr('status', 'equalto', 'online')
+         | selectattr('policy_id', 'defined')
+         | selectattr('policy_id', 'equalto', 'fleet-server-policy')
+         | list | length }}
   until: >-
     fleet_agents_result.status == 200 and
     (
@@ -802,7 +889,8 @@
       or
       (not (lme_lab_mode | default(false) | bool) and
        fleet_agents_result.json.total > 0 and
-       fleet_agents_result.json.statusSummary.online > 0)
+       fleet_agents_result.json.statusSummary.online > 0 and
+       (_fleet_online_server_policy_agents | int) > 0)
     )
   retries: 60
   delay: 20
