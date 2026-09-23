@@ -1,0 +1,49 @@
+{#
+  pg_service.conf -- libpq connection service file for one database domain owner.
+  NON-SECRET: references CA/client-cert/passfile PATHS only (no inline password).
+  Mounted at PGSERVICEFILE=/run/secrets/pg_service.conf (rejoin.py:40,
+  acceptance.py). CLI service connections force sslmode=verify-full.
+
+  Section roster mirrors platform.resolved_role_config config['services']
+  (platform.py:236-241) scoped to this domain, and the dissolved producer's
+  pg_service.conf (lme_lab.credentials:414-441):
+    <domain>_admin, <domain>_candidate_<node>, <db>_source (own + imported),
+    <db>_replica (imported, dual-owned-ha only).
+  The union across both domain owners' files covers config['services'] exactly.
+#}
+{%- set domain = cm_domain -%}
+{#- Primary rw endpoint = first declared alias (single source of truth; the full
+    list is the cert-SAN set). Preserves lme_lab.credentials:408: hertzbeat and
+    shared -> pg-hertzbeat-rw, vector -> pg-vector-rw. -#}
+{%- set alias = credential_material_domain_rw_alias[domain] | first -%}
+{%- set port = credential_material_domain_port[domain] -%}
+{%- set own_dbs = credential_material_domain_databases[domain] -%}
+{%- set imports = credential_material_domain_imports[domain] -%}
+{%- macro section(host, prt, dbname, user='postgres', prefix='pg', cert='admin', passfile='admin.pgpass') -%}
+host={{ host }}
+port={{ prt }}
+dbname={{ dbname }}
+user={{ user }}
+sslmode=verify-full
+sslrootcert=/run/secrets/{{ prefix }}-ca.crt
+sslcert=/run/secrets/{{ cert }}.crt
+sslkey=/run/secrets/{{ cert }}.key
+passfile=/run/secrets/{{ passfile }}
+connect_timeout=5
+{% endmacro -%}
+[{{ domain }}_admin]
+{{ section(alias, 5432, 'postgres') }}
+{% for n in _cm_nodes %}
+[{{ domain }}_candidate_{{ n }}]
+{{ section(lme_runtime_inventory.hosts[n].fqdn, port, 'postgres') }}
+{% endfor %}
+{% for db in own_dbs %}
+[{{ db }}_source]
+{{ section(alias, 5432, db) }}
+{% endfor %}
+{% for imp in imports %}
+[{{ imp.db }}_source]
+{{ section('pg-' + imp.origin + '-rw', 5432, imp.db, 'lme_replicator', 'replication-' + imp.db, 'replication-' + imp.db, 'logical.pgpass') }}
+[{{ imp.db }}_replica]
+{{ section(alias, 5432, imp.db + '_replica') }}
+{% endfor %}
