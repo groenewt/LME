@@ -203,6 +203,137 @@ def test_restore_volume_verify_refuses_missing_content_sha256(tmp_path):
     assert "content_sha256 missing" in r.stderr
 
 
+# ---------------------------------------------------------------------------
+# Cases 7-9 -- NON-CIRCULAR: drive the REAL task bodies (producer + certify +
+# restore gate), not the library directly. Case 6 and 1-4 render the library and
+# call its functions; these extract the actual "Backup each volume", "Certify the
+# backup bundle" and restore "Verify backup bundle certification" shell bodies,
+# render them with jinja2 (the ansible lookup('template') render was cross-checked
+# to be functionally identical), and run them against bash/podman stubs. This is
+# what proves the producer writes a bundle the real verifier accepts end to end.
+# ---------------------------------------------------------------------------
+def _task_body(doc_tasks, name_prefix, **render_vars) -> str:
+    for t in doc_tasks:
+        if t.get("name", "").startswith(name_prefix):
+            body = LOOKUP_RE.sub(lambda m: _render_library(), t["shell"])
+            return jinja2.Environment().from_string(body).render(**render_vars)
+    raise AssertionError(f"task {name_prefix!r} not found")
+
+
+def _volume_task_body(**v) -> str:
+    doc = yaml.safe_load(BACKUP_TASKS.read_text())
+    return _task_body(doc, "Backup each volume", **v)
+
+
+def _certify_task_body(**v) -> str:
+    doc = yaml.safe_load(BACKUP_TASKS.read_text())
+    return _task_body(doc, "Certify the backup bundle", **v)
+
+
+def _restore_gate_body(**v) -> str:
+    doc = yaml.safe_load(RESTORE.read_text())
+    return _task_body(doc[0]["tasks"], "Verify backup bundle certification before any destructive", **v)
+
+
+def _podman_stub_dir(tmp_path, mountpoint: Path) -> Path:
+    """A PATH dir whose `podman volume inspect ... --format ...` prints mountpoint."""
+    b = tmp_path / "stubbin"
+    b.mkdir(exist_ok=True)
+    p = b / "podman"
+    p.write_text('#!/usr/bin/env bash\n'
+                 'if [ "$1" = "volume" ] && [ "$2" = "inspect" ]; then\n'
+                 f'  echo "{mountpoint}"\n  exit 0\nfi\nexit 0\n')
+    p.chmod(0o755)
+    return b
+
+
+def _run_env(script: str, path_prepend: Path):
+    import os
+    env = dict(os.environ)
+    env["PATH"] = f"{path_prepend}:{env['PATH']}"
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+
+def _fabricate_trees(root: Path) -> None:
+    """Required trees so the real certify task does not refuse (rc1)."""
+    (root / "lme").mkdir(parents=True, exist_ok=True)
+    (root / "etc_lme").mkdir(parents=True, exist_ok=True)
+    (root / "etc_containers_systemd").mkdir(parents=True, exist_ok=True)
+    (root / "lme/a.txt").write_bytes(b"install-a")
+    (root / "etc_lme/pass.sh").write_bytes(b"cipher\n")
+    (root / "etc_containers_systemd/lme.container").write_bytes(b"quad\n")
+
+
+def test_producer_volume_task_writes_matching_content_sha256(tmp_path):
+    src = tmp_path / "vol_src"
+    (src / "sub").mkdir(parents=True)
+    (src / "f1").write_bytes(b"alpha\n")
+    (src / "sub/f2").write_bytes(b"beta\n")
+    stub = _podman_stub_dir(tmp_path, src)
+    body = _volume_task_body(item="lme_x", backup_base_dir=str(tmp_path / "bk"),
+                             backup_timestamp="T", cp_preserve_cmd="cp -a")
+    r = _run_env(body, stub)
+    assert r.returncode == 0, r.stderr
+    vdir = tmp_path / "bk/backups/T/volumes/lme_x"
+    assert (vdir / "backup_status.txt").read_text().strip() == "SUCCESS"
+    man = (vdir / "content_manifest.txt").read_text()
+    assert "content_sha256=" in man
+    recorded = next(l.split("=", 1)[1] for l in man.splitlines() if l.startswith("content_sha256="))
+    # The recorded digest must equal the library's digest of the COPIED data dir.
+    actual = _run(_lib_plus(f'lme_content_sha256 "{vdir}/data"')).stdout.strip()
+    assert recorded == actual and recorded not in ("", "MISSING")
+
+
+def test_producer_volume_task_torn_copy_refused_no_manifest(tmp_path):
+    src = tmp_path / "vol_src"
+    src.mkdir()
+    (src / "f1").write_bytes(b"one\n")
+    (src / "f2").write_bytes(b"two\n")           # >=2 files so a dropped file tears the subtree
+    stub = _podman_stub_dir(tmp_path, src)
+    torn = tmp_path / "torn_cp.sh"
+    torn.write_text('#!/usr/bin/env bash\n'
+                    'cp -a "$1" "$2"\n'
+                    'f=$(find "$2" -type f | LC_ALL=C sort | head -n1)\n'
+                    '[ -n "$f" ] && rm -f "$f"\n'   # cp returns 0 but the copy is silently short
+                    'exit 0\n')
+    torn.chmod(0o755)
+    body = _volume_task_body(item="lme_x", backup_base_dir=str(tmp_path / "bk"),
+                             backup_timestamp="T", cp_preserve_cmd=str(torn))
+    r = _run_env(body, stub)
+    vdir = tmp_path / "bk/backups/T/volumes/lme_x"
+    assert r.returncode != 0, "torn copy must fail the volume"
+    assert (vdir / "backup_status.txt").read_text().strip() == "FAILED"
+    assert not (vdir / "content_manifest.txt").exists(), "a torn copy must leave NO manifest"
+
+
+def test_real_producer_to_restore_gate_roundtrip(tmp_path):
+    """Real volume task -> real certify task -> real restore verify gate, end to end."""
+    root = tmp_path / "bundle"
+    _fabricate_trees(root)
+    # Produce the volume via the REAL producer task body.
+    src = tmp_path / "vol_src"
+    src.mkdir()
+    (src / "f1").write_bytes(b"vol-1\n")
+    stub = _podman_stub_dir(tmp_path, src)
+    vbody = _volume_task_body(item="lme_x", backup_base_dir=str(tmp_path / "stage"),
+                              backup_timestamp="T", cp_preserve_cmd="cp -a")
+    assert _run_env(vbody, stub).returncode == 0
+    import shutil
+    shutil.copytree(tmp_path / "stage/backups/T/volumes", root / "volumes")
+    # Certify with the REAL certify task body (root = stage bundle level).
+    cbody = _certify_task_body(backup_base_dir=str(tmp_path), backup_timestamp="X")
+    # point the certify body's fixed root at our bundle:
+    cbody = cbody.replace(f'"{tmp_path}/backups/X"', f'"{root}"')
+    assert _run(cbody).returncode == 0, "real certify task must certify a clean bundle"
+    assert (root / "bundle_certification.txt").exists()
+    # Verify with the REAL restore gate body.
+    gbody = _restore_gate_body(selected_backup_dir=str(root))
+    assert _run(gbody).returncode == 0, "real restore gate must accept the freshly certified bundle"
+    # Tamper a REQUIRED tree (same-size byte change) -> gate refuses (rc5).
+    (root / "lme/a.txt").write_bytes(b"install-Z")
+    assert _run(gbody).returncode == 5
+
+
 if __name__ == "__main__":
     import sys
     import pytest
