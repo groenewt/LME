@@ -4,39 +4,46 @@
 #
 # Implements the D-CONFIRMED custody shape (fencing-protocol.contract.yaml
 # guardian_custody, amendments A1..A5; commit 2e9328f) as an ACTUAL producer
-# change -- codex-0630 guardian_custody_decision.implementation_constraints:
-# "the contract's RESOLVES-collision wording is a DESIGN CLAIM ONLY until you
-# CHANGE + TEST the producer." This is that change.
+# change, and applies the codex-0730 custody-audit repairs (ADDRESSED, pending
+# codex re-review -- A1..A5 are NOT self-certified as qualified):
+#   [1] C-CUSTODY-EPOCH-FINGERPRINT-PASSPHRASE-BINDING -- the wrapping-key passphrase
+#       is now a SINGLE LINE `wrapkey:epoch` (openssl `-pass file:` reads only the
+#       first line, so the epoch is genuinely part of the KDF and nothing is silently
+#       truncated), and TRUST comes from guardian_custody_expected_pub_fingerprint --
+#       a CONSUMED input on D's authority seam -- verified against the recovered key's
+#       structural fingerprint. The guardian.meta sidecar is INFORMATIONAL, never the
+#       trust anchor.
+#   [2] C-CUSTODY-PLAINTEXT-STAGING-OUTSIDE-RUNTIME -- the work dir is created UNDER
+#       the declared runtime root (mktemp -p) and asserted inside it; EXIT-trap cleanup.
+#   [3] C-CUSTODY-INTERRUPTED-PUBLICATION-FALSE-NOOP -- no-op ONLY when the marker
+#       epoch+fp, the runtime-key fp and the published-pub fp ALL agree; a missing or
+#       mismatched pub REPUBLISHES (never a false noop), and an interrupted-rotation
+#       marker whose fp != the runtime key falls through. Rotation promotes + verifies
+#       the new key BEFORE the marker flip and retains the prior key until publish.
+#   [4] C-CUSTODY-SIGNER-CONTROLLER-PUBLICATION-MISMATCH -- the pub is published to a
+#       SIGNER-LOCAL path, then TRANSFERRED to controller staging and fp-verified (the
+#       canonical producer-location declaration is routed to C1).
+#   [5] C-CUSTODY-INDEPENDENCE-PATH-AND-OWNER-VALIDATION (mechanical) -- resolved paths
+#       are asserted absolute + traversal-free (rejects `..`/`.` aliases), then
+#       RE-CANONICALIZED on the signer (readlink -m) and re-checked for disjointness
+#       before any write (Ansible filters ran on the controller). Failure-domain
+#       independence + canonical owner/mode are a DECLARED FACT routed to C1/B/D.
+#   [6] C-CUSTODY-CANONICAL-AND-REPRESENTATION-CONTRACT (cheap) -- an unreadable
+#       contract is now a HARD failure; custody-input validation is hoisted
+#       pre-generation by the caller. The shell-to-reusable-template refactor is
+#       routed to C1/F.
 #
-# WHAT IT DOES (differs from the old inline mint on every axis flagged):
-#   A1  runtime plaintext lives ONLY at the signer-host-only, deployment+signer
-#       namespaced path (NOT the shared /run/lme-fencing bind-mounted READ-ONLY
-#       into every member+proxy). Runs on the SIGNER NODE, not the controller.
-#   A2  the durable blob is wrapped under a wrapping key held as a DECLARED
-#       reference INDEPENDENT of the signer host and of the recovered DB.
-#   A3  the durable record binds authority_epoch + guardian_pub_fingerprint (both
-#       folded into the KDF passphrase); a prior-epoch blob is REFUSED.
-#   A4  authority = the CURRENT leased epoch (an INPUT from D's authority seam),
-#       NEVER key/backup possession; the epoch is never read from a file beside
-#       the blob.
-#   A5  order = [generate_or_recover, install_runtime_plaintext, pair_verify,
-#       mark_verified, publish_pub]; the guard gates on the VERIFIED-PAIR MARKER,
-#       not on guardian.pub existence. Every step is a restartable checkpoint.
-#
-# UNWIRED CANDIDATE: no caller includes this file (joint C/D review before
-# wiring). NO SECRET VALUE is read into a fact, printed, or logged: the wrapping
-# key is passed to openssl via `-pass file:` (never argv); every material task is
-# no_log; only non-secret decision tokens + fingerprints leave the shell (receipt).
-#
-# JOINT (C/D) deliverables NOT owned here: authoritative revocation, start/replace
-# serialization, signer failure/recovery ACCEPTANCE tests (owners: authority_and_
-# rejoin=D, observed_resources=B, failure_tests=G). This authors the CUSTODY +
-# GENERATION side only; runtime recovery acceptance stays OPEN.
+# UNWIRED CANDIDATE: no caller includes this file (joint C/D review before wiring).
+# NO SECRET VALUE is read into a fact, printed, or logged: the wrapping key is passed
+# to openssl via `-pass file:` (never argv); every material task is no_log; only
+# non-secret decision tokens + fingerprints leave the shell (receipt).
 # =============================================================================
 
 # --- REQUIRED inputs (no default -> fail closed). authority_epoch + signer_id +
 #     recovery_store + wrapping_key_ref are canonical/authority-seam inputs; the
 #     producer never mints or hostname-derives them (A4; codex-0630 "no default").
+#     expected_pub_fingerprint is OPTIONAL at bootstrap (C EMITS it) and REQUIRED for
+#     durable recovery (D supplies the trusted expectation back).
 - name: guardian_custody -- assert the required custody inputs are supplied (no defaults)
   ansible.builtin.assert:
     that:
@@ -63,9 +70,13 @@
     _gc_contract_path: "{{ guardian_custody_contract_path
                           | default((role_path | default(playbook_dir, true)) + '/../../../config/postgresql-platform/fencing-protocol.contract.yaml', true) }}"
 
-- name: guardian_custody -- load the fencing contract text for a drift check (skip if unreadable)
+# codex-0730 [6]: an unreadable contract is a HARD failure (drift cannot be verified
+# against a contract you cannot read). errors='strict' RAISES on an unreadable path
+# unless guardian_custody_contract_optional is explicitly set true (never the default).
+- name: guardian_custody -- load the fencing contract text for the drift check (unreadable = HARD fail)
   ansible.builtin.set_fact:
-    _gc_contract_text: "{{ lookup('file', _gc_contract_path, errors='ignore') | default('', true) }}"
+    _gc_contract_text: "{{ lookup('file', _gc_contract_path,
+                            errors=(guardian_custody_contract_optional | default(false) | ternary('ignore', 'strict'))) }}"
 
 - name: guardian_custody -- assert declared defaults still match the contract templates
   ansible.builtin.assert:
@@ -78,12 +89,14 @@
       - guardian_custody_durable_tpl | regex_replace('\\{recovery_store\\}', '<recovery_store>')
            | regex_replace('\\{deployment_identity\\}', '<deployment_identity>')
            | regex_replace('\\{signer_id\\}', '<signer_id>') == guardian_custody_durable_contract_literal
-      # And the contract file still declares those literals (skip if unreadable in a bare unit test).
-      - (_gc_contract_text | length) == 0 or (guardian_custody_runtime_plaintext_contract_literal in _gc_contract_text)
-      - (_gc_contract_text | length) == 0 or (guardian_custody_durable_contract_literal in _gc_contract_text)
+      # The contract file (now REQUIRED readable, unless explicitly optional) still
+      # declares those literals.
+      - (guardian_custody_contract_optional | default(false) | bool) or (guardian_custody_runtime_plaintext_contract_literal in _gc_contract_text)
+      - (guardian_custody_contract_optional | default(false) | bool) or (guardian_custody_durable_contract_literal in _gc_contract_text)
     fail_msg: >-
-      guardian custody placement DRIFT: the declared default templates no longer reduce to
-      the contract's guardian_custody.runtime_plaintext_path / encrypted_durable_ref literals.
+      guardian custody placement DRIFT (or an unreadable contract): the declared default
+      templates no longer reduce to the contract's guardian_custody.runtime_plaintext_path /
+      encrypted_durable_ref literals, or the contract could not be read.
       Reconcile vars/guardian_custody.yml with fencing-protocol.contract.yaml before producing.
     quiet: true
 
@@ -103,20 +116,43 @@
                  | regex_replace('\\{deployment_identity\\}', _cm_deployment_identity)
                  | regex_replace('\\{signer_id\\}', guardian_custody_signer_id) }}"
 
-- name: guardian_custody -- resolve marker / receipt / published-pub placements
+- name: guardian_custody -- resolve marker / receipt / signer-local + controller pub placements
   ansible.builtin.set_fact:
     _gc_marker: "{{ (_gc_runtime_key | dirname) ~ '/' ~ guardian_custody_marker_name }}"
     _gc_receipt: "{{ (_gc_runtime_key | dirname) ~ '/' ~ guardian_custody_receipt_name }}"
+    # [4] the pub is published SIGNER-LOCAL first (beside the runtime key), then
+    # TRANSFERRED to the controller staging dir by the tasks below.
+    _gc_pub_signer: "{{ (_gc_runtime_key | dirname) ~ '/guardian.pub' }}"
     _gc_pub_staging: "{{ _cm_staging_root }}/guardian/guardian.pub"
 
-# --- A1 + A2 disjointness (component-wise; NOT string prefix) -------------------
+# --- [5] path safety: absolute + NO traversal ('..'/'.') components -------------
+- name: guardian_custody -- assert resolved custody paths are absolute and traversal-free
+  ansible.builtin.assert:
+    that:
+      - _gc_runtime_key is match('^/')
+      - not (_gc_runtime_key is search('(^|/)\.\.(/|$)'))
+      - not (_gc_runtime_key is search('(^|/)\.(/|$)'))
+      - (guardian_custody_recovery_store | string) is match('^/')
+      - not ((guardian_custody_recovery_store | string) is search('(^|/)\.\.(/|$)'))
+      - _gc_durable is match('^/')
+      - not (_gc_durable is search('(^|/)\.\.(/|$)'))
+      - (guardian_custody_runtime_root | string) is match('^/')
+      - not ((guardian_custody_runtime_root | string) is search('(^|/)\.\.(/|$)'))
+    fail_msg: >-
+      a resolved guardian custody path is relative or contains a '..'/'.' traversal
+      component (codex-0730 C-CUSTODY-INDEPENDENCE: e.g. /run/lme-fencing-signer/../lme-fencing
+      aliases a consumer mount while passing a naive prefix check). Refuse before any write.
+    quiet: true
+
+# --- A1 + A2 disjointness (component-wise; NOT string prefix). The SIGNER re-checks
+#     the CANONICAL path in the shell too (Ansible filters run on the controller). ---
 - name: guardian_custody -- assert the runtime plaintext is disjoint from every consumer mount
   ansible.builtin.assert:
     that:
       # Boundary-anchored regex (NOT a bare string prefix): '/run/lme-fencing' IS a string
       # prefix of the CORRECT '/run/lme-fencing-signer', so a naive startswith wrongly rejects
-      # the right path. Anchoring each mount root with a following '/' makes the check land on
-      # the path-component boundary -- '/run/lme-fencing-signer/...' does NOT match '^/run/lme\-fencing/'.
+      # the right path. Anchoring each mount root with a following '/' lands on the component
+      # boundary -- '/run/lme-fencing-signer/...' does NOT match '^/run/lme\-fencing/'.
       - not ((_gc_runtime_key ~ '/') is match('^(' + (guardian_custody_consumer_bind_mount_roots | map('regex_escape') | join('|')) + ')/'))
     fail_msg: >-
       guardian runtime plaintext {{ _gc_runtime_key }} overlaps a consumer bind-mount root
@@ -130,6 +166,10 @@
     that:
       # A2: the encrypted durable ref must not sit under the signer runtime root (would die
       # with the signer host) nor under a DB data root (would die with the DB it recovers).
+      # NOTE (codex-0730): a pathname predicate CANNOT prove failure-domain independence
+      # (a /var/lib/signer-local-custody dir passes every check here). True independence is a
+      # DECLARED FACT owed by C1/B/D (topology), recorded in the C sitrep -- this is the
+      # mechanical floor, not a proof of independence.
       - not ((guardian_custody_recovery_store ~ '/').startswith(guardian_custody_runtime_root ~ '/'))
       - not ((guardian_custody_recovery_store ~ '/').startswith('/run/lme-fencing/'))
       - not (guardian_custody_recovery_store | regex_search('^/data/[^/]+/(pgdata|postgresql/data)(/|$)'))
@@ -141,115 +181,156 @@
 
 # --- THE decision table + custody producer (idempotent, restartable checkpoints)
 # Runs on the SIGNER NODE (delegate handled by the caller/include; default = this
-# host). All inputs arrive via `environment:` so no source-derived string is
-# inlined into the script body (guards the identity-comment-injection class).
-# no_log: the whole task handles key material.
+# host). All inputs arrive via `environment:` so no source-derived string is inlined
+# into the script body (guards the identity-comment-injection class). no_log: the
+# whole task handles key material.
 - name: guardian_custody -- generate-or-recover, install, pair-verify, mark, publish
   ansible.builtin.shell:
     executable: /bin/bash
     cmd: |
       set -euo pipefail
       umask 077
-      work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+
+      rtdir="$(dirname "$RUNTIME_KEY")"
+      install -d -m 700 "$rtdir"
+      # [2] plaintext temp MUST live on the declared runtime filesystem, never a default
+      # TMPDIR that may be on disk. Derive the work dir UNDER the runtime root + verify.
+      work="$(mktemp -d -p "$rtdir" .gc-work.XXXXXX)"; trap 'rm -rf "$work"' EXIT
+      case "$work/" in "$rtdir"/*) : ;; *) echo "work dir $work escaped runtime root $rtdir" >&2; exit 20;; esac
+
+      # [5] re-canonicalize on THIS (signer) host and re-check disjointness before any write.
+      rk_canon="$(readlink -m -- "$RUNTIME_KEY")"
+      for m in $CONSUMER_MOUNTS; do
+        case "$rk_canon/" in "$m"/*) echo "runtime key $rk_canon under consumer mount $m (canonical)" >&2; exit 21;; esac
+      done
+      dur_canon="$(readlink -m -- "$DURABLE")"
+      case "$dur_canon/" in "$rtdir"/*|/run/lme-fencing/*) echo "durable blob $dur_canon under a signer-local/runtime root (canonical)" >&2; exit 22;; esac
 
       fp_of_priv(){ openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}'; }
       fp_of_pub(){ openssl pkey -pubin -in "$1" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}'; }
-      mkpass(){ # $1=epoch $2=fp -> path to a 0600 passphrase file: wrapkey || epoch || fp
-        local pf="$work/pass"; { cat "$WRAP"; printf '\n%s\n%s\n' "$1" "$2"; } > "$pf"; chmod 600 "$pf"; printf '%s' "$pf"; }
+      # [1] SINGLE-LINE composite passphrase `wrapkey:epoch` (epoch bound into the KDF;
+      # `-pass file:` reads only the first line, so this is fully consumed and a prior-epoch
+      # blob will NOT decrypt at the current epoch). The wrap key is asserted single-line.
+      mkpass(){ local pf="$work/pass"; { tr -d '\r\n' < "$WRAP"; printf ':%s' "$1"; } > "$pf"; chmod 600 "$pf"; printf '%s' "$pf"; }
       enc_blob(){ # $1=privkey $2=epoch $3=fp
-        local pf; pf="$(mkpass "$2" "$3")"
+        local pf; pf="$(mkpass "$2")"
         openssl enc -"$CIPHER" -pbkdf2 -iter "$ITER" -md "$MD" -salt -in "$1" -out "$work/blob" -pass "file:$pf"
-        install -d -m 700 "$(dirname "$DURABLE")"; install -m 600 "$work/blob" "$DURABLE"
-        printf '{"epoch":"%s","pub_fingerprint":"%s","cipher":"%s"}\n' "$2" "$3" "$CIPHER" > "$work/meta"
-        install -m 600 "$work/meta" "$META"; }
-      pair_verify(){ # $1=privkey $2=pubfile -> 0 iff the pub corresponds to the priv
-        printf 'guardian-pair-verify\n%s\n%s\n%s\n' "$EPOCH" "$DID" "$SIGNER" > "$work/chal"
+        install -d -m 700 "$(dirname "$DURABLE")"
+        install -m 600 "$work/blob" "$DURABLE.tmp.$$" && mv -f "$DURABLE.tmp.$$" "$DURABLE"
+        printf '{"epoch":"%s","pub_fingerprint":"%s","cipher":"%s","note":"INFORMATIONAL sidecar; trust=composite-passphrase(epoch)+expected_fingerprint, NOT this file"}\n' "$2" "$3" "$CIPHER" > "$work/meta"
+        install -m 600 "$work/meta" "$META.tmp.$$" && mv -f "$META.tmp.$$" "$META"; }
+      try_decrypt(){ # $1=epoch $2=outfile -> 0 iff decrypts AND structurally parses
+        local pf; pf="$(mkpass "$1")"
+        openssl enc -d -"$CIPHER" -pbkdf2 -iter "$ITER" -md "$MD" -in "$DURABLE" -out "$2" -pass "file:$pf" 2>/dev/null || return 1
+        openssl pkey -in "$2" -noout 2>/dev/null; }
+      pair_verify(){ printf 'guardian-pair-verify\n%s\n%s\n%s\n' "$EPOCH" "$DID" "$SIGNER" > "$work/chal"
         openssl pkeyutl -sign -inkey "$1" -rawin -in "$work/chal" -out "$work/sig" 2>/dev/null || return 1
         openssl pkeyutl -verify -pubin -inkey "$2" -rawin -in "$work/chal" -sigfile "$work/sig" >/dev/null 2>&1; }
-      install_runtime(){ install -d -m 700 "$(dirname "$RUNTIME_KEY")"; install -m 600 "$1" "$RUNTIME_KEY"; }
-      mark_verified(){ install -d -m 700 "$(dirname "$MARKER")"; printf 'epoch=%s\nfingerprint=%s\n' "$EPOCH" "$1" > "$MARKER"; chmod 600 "$MARKER"; }
-      publish_pub(){ install -d -m 700 "$(dirname "$PUB")"; openssl pkey -in "$1" -pubout -out "$work/pub" 2>/dev/null; install -m 644 "$work/pub" "$PUB"; }
+      install_runtime(){ install -d -m 700 "$rtdir"; install -m 600 "$1" "$RUNTIME_KEY.tmp.$$" && mv -f "$RUNTIME_KEY.tmp.$$" "$RUNTIME_KEY"; }
+      mark_verified(){ install -d -m 700 "$(dirname "$MARKER")"; printf 'epoch=%s\nfingerprint=%s\n' "$EPOCH" "$1" > "$work/marker"; install -m 600 "$work/marker" "$MARKER.tmp.$$" && mv -f "$MARKER.tmp.$$" "$MARKER"; }
+      publish_pub(){ install -d -m 700 "$(dirname "$PUB")"; openssl pkey -in "$1" -pubout -out "$work/pub" 2>/dev/null; install -m 644 "$work/pub" "$PUB.tmp.$$" && mv -f "$PUB.tmp.$$" "$PUB"; }
+      expect_ok(){ [ -z "$EXPECTED_FP" ] || [ "$EXPECTED_FP" = "$1" ]; }
       receipt(){ printf '{"decision":"%s","epoch":"%s","fingerprint":"%s","reason":"%s"}\n' "$1" "$EPOCH" "${2:-}" "${3:-}" > "$RECEIPT"; chmod 644 "$RECEIPT"; printf 'RESULT:%s\n' "$1"; }
+      install -d -m 700 "$(dirname "$RECEIPT")"
+
+      # [1] the wrapping key MUST be single-line (asserted WITHOUT reading the secret value).
+      [ "$(wc -l < "$WRAP")" -le 1 ] || { receipt refuse "" wrapping-key-not-single-line; echo "REFUSE wrap-multiline" >&2; exit 23; }
 
       # (0) legacy UNPREFIXED material in the staging PARENT -> adopt via B ledger, never mint.
       legacy_parent="$(dirname "$STAGING_ROOT")"
       if [ -e "$legacy_parent/guardian/guardian.pub" ] || [ -e "$legacy_parent/pki" ] || [ -e "$legacy_parent/secrets" ]; then
-        install -d -m 700 "$(dirname "$RECEIPT")"; receipt refuse "" legacy-unprefixed-material-route-adoption-through-B-ledger; echo "REFUSE legacy-unprefixed" >&2; exit 9; fi
+        receipt refuse "" legacy-unprefixed-material-route-adoption-through-B-ledger; echo "REFUSE legacy-unprefixed" >&2; exit 9; fi
 
-      # (1) already a verified pair for the CURRENT epoch (guard keys on the marker, not pub existence).
-      if [ -f "$MARKER" ] && [ -f "$RUNTIME_KEY" ]; then
-        mepoch="$(sed -n 's/^epoch=//p' "$MARKER")"
-        if [ "$mepoch" = "$EPOCH" ]; then
+      # (1) runtime key present (not rotating): converge to a COMPLETE verified-pair state
+      # for the current epoch. [3] NEVER a false noop -- noop ONLY when the marker epoch+fp,
+      # the runtime-key fp and the published-pub fp ALL agree (and EXPECTED_FP if supplied).
+      if [ -f "$RUNTIME_KEY" ] && [ "$ROTATE" != "true" ]; then
+        rfp="$(fp_of_priv "$RUNTIME_KEY" 2>/dev/null || true)"
+        if [ -n "$rfp" ]; then
+          expect_ok "$rfp" || { receipt refuse "$rfp" runtime-fp-not-expected; echo "REFUSE expected-fp" >&2; exit 18; }
           openssl pkey -in "$RUNTIME_KEY" -pubout -out "$work/rpub" 2>/dev/null || true
           if [ -s "$work/rpub" ] && pair_verify "$RUNTIME_KEY" "$work/rpub"; then
-            if [ -f "$PUB" ]; then [ "$(fp_of_pub "$PUB")" = "$(fp_of_priv "$RUNTIME_KEY")" ] || { receipt refuse "" published-pub-mismatch; echo "REFUSE pub-mismatch">&2; exit 10; }; fi
-            receipt noop "$(fp_of_priv "$RUNTIME_KEY")" verified-pair-current-epoch; exit 0; fi; fi; fi
+            # durable must exist + be recoverable later; bind at the current epoch if missing.
+            [ -f "$DURABLE" ] || enc_blob "$RUNTIME_KEY" "$EPOCH" "$rfp"
+            mok=0
+            if [ -f "$MARKER" ]; then
+              mepoch="$(sed -n 's/^epoch=//p' "$MARKER")"; mfp="$(sed -n 's/^fingerprint=//p' "$MARKER")"
+              [ "$mepoch" = "$EPOCH" ] && [ "$mfp" = "$rfp" ] && mok=1; fi
+            [ "$mok" = 1 ] || mark_verified "$rfp"
+            pubok=0
+            if [ -f "$PUB" ] && [ "$(fp_of_pub "$PUB" 2>/dev/null || true)" = "$rfp" ]; then pubok=1; else publish_pub "$RUNTIME_KEY"; fi
+            if [ "$mok" = 1 ] && [ "$pubok" = 1 ]; then
+              receipt noop "$rfp" verified-pair-current-epoch; exit 0; fi
+            receipt republish "$rfp" reconverged-marker-or-pub; exit 0; fi
+          # key present but pair-verify failed -> untrusted; fall through to durable recovery.
+        fi
+      fi
 
-      # (2) durable present -> recover (unless rotating). Prior-epoch blob is REFUSED.
-      if [ -f "$DURABLE" ] && [ -f "$META" ] && [ "$ROTATE" != "true" ]; then
-        mepoch="$(sed -n 's/.*"epoch":"\([^"]*\)".*/\1/p' "$META")"
-        mfp="$(sed -n 's/.*"pub_fingerprint":"\([^"]*\)".*/\1/p' "$META")"
-        install -d -m 700 "$(dirname "$RECEIPT")"
-        if [ "$mepoch" != "$EPOCH" ]; then receipt refuse "$mfp" prior-epoch-blob-refused; echo "REFUSE prior-epoch $mepoch vs $EPOCH">&2; exit 4; fi
-        pf="$(mkpass "$mepoch" "$mfp")"
-        if ! openssl enc -d -"$CIPHER" -pbkdf2 -iter "$ITER" -md "$MD" -in "$DURABLE" -out "$work/rec.key" -pass "file:$pf" 2>/dev/null; then
-          receipt refuse "" decrypt-failed-tamper-or-wrong-wrapping-key; echo "REFUSE decrypt-failed">&2; exit 5; fi
-        openssl pkey -in "$work/rec.key" -noout 2>/dev/null || { receipt refuse "" recovered-key-malformed; echo "REFUSE malformed">&2; exit 6; }
+      # (2) runtime key ABSENT/untrusted, durable present -> recover. Needs the TRUSTED
+      # EXPECTED_FP; decrypt is epoch-bound so a prior-epoch blob fails here by construction.
+      if [ -f "$DURABLE" ] && [ "$ROTATE" != "true" ]; then
+        [ -n "$EXPECTED_FP" ] || { receipt refuse "" recovery-requires-expected-fingerprint; echo "REFUSE no-expected-fp" >&2; exit 19; }
+        if ! try_decrypt "$EPOCH" "$work/rec.key"; then
+          receipt refuse "" decrypt-failed-prior-epoch-tamper-or-wrong-key; echo "REFUSE decrypt-failed" >&2; exit 5; fi
         rfp="$(fp_of_priv "$work/rec.key")"
-        [ "$rfp" = "$mfp" ] || { receipt refuse "$rfp" fingerprint-mismatch-vs-sidecar; echo "REFUSE fp-mismatch">&2; exit 7; }
-        install_runtime "$work/rec.key"                                   # A5: install ...
-        if [ -f "$PUB" ]; then pubf="$PUB"; else openssl pkey -in "$work/rec.key" -pubout -out "$work/dpub" 2>/dev/null; pubf="$work/dpub"; fi
-        pair_verify "$work/rec.key" "$pubf" || { receipt refuse "$rfp" recover-pair-verify-failed; echo "REFUSE pair-verify">&2; exit 11; }
-        mark_verified "$rfp"                                              # ... pair-verify, mark ...
-        publish_pub "$work/rec.key"                                       # ... THEN publish
+        [ "$rfp" = "$EXPECTED_FP" ] || { receipt refuse "$rfp" recovered-fp-not-expected; echo "REFUSE fp-not-expected" >&2; exit 7; }
+        install_runtime "$work/rec.key"
+        openssl pkey -in "$RUNTIME_KEY" -pubout -out "$work/dpub" 2>/dev/null
+        pair_verify "$RUNTIME_KEY" "$work/dpub" || { receipt refuse "$rfp" recover-pair-verify-failed; echo "REFUSE pair-verify" >&2; exit 11; }
+        mark_verified "$rfp"; publish_pub "$RUNTIME_KEY"
         receipt recover "$rfp" recovered-and-pair-verified; exit 0; fi
 
-      # (3) explicit rotation: epoch-scoped slot, install+verify BEFORE promote/publish (A5).
+      # (3) explicit rotation: generate + verify the NEW key, retain the prior, PROMOTE and
+      # re-verify BEFORE the marker flip, then publish (A5 order; old key kept until publish).
       if [ "$ROTATE" = "true" ]; then
-        install -d -m 700 "$(dirname "$RECEIPT")"
-        [ -f "$DURABLE" ] && [ -f "$META" ] || { receipt refuse "" rotate-without-existing-identity; echo "REFUSE rotate-no-base">&2; exit 12; }
-        old_epoch="$(sed -n 's/.*"epoch":"\([^"]*\)".*/\1/p' "$META")"
-        [ "$old_epoch" != "$EPOCH" ] || { receipt refuse "" rotate-epoch-not-bumped; echo "REFUSE rotate-same-epoch">&2; exit 13; }
+        [ -f "$DURABLE" ] || { receipt refuse "" rotate-without-existing-identity; echo "REFUSE rotate-no-base" >&2; exit 12; }
+        if [ -f "$MARKER" ]; then mepoch="$(sed -n 's/^epoch=//p' "$MARKER")"; [ "$mepoch" != "$EPOCH" ] || { receipt refuse "" rotate-epoch-not-bumped; echo "REFUSE rotate-same-epoch" >&2; exit 13; }; fi
         slot="${RUNTIME_KEY}.epoch-${EPOCH}"
         openssl genpkey -algorithm ED25519 -out "$work/new.key" 2>/dev/null
-        install -d -m 700 "$(dirname "$slot")"; install -m 600 "$work/new.key" "$slot"
-        openssl pkey -in "$work/new.key" -pubout -out "$work/new.pub" 2>/dev/null
-        pair_verify "$slot" "$work/new.pub" || { receipt refuse "" rotate-pair-verify-failed; echo "REFUSE rotate-verify">&2; exit 14; }
         newfp="$(fp_of_priv "$work/new.key")"
-        enc_blob "$work/new.key" "$EPOCH" "$newfp"    # rebind durable at NEW epoch -> old-epoch blob henceforth refused
-        mark_verified "$newfp"                        # verified BEFORE promote/publish
-        mv -f "$slot" "$RUNTIME_KEY"                  # promote (old key kept until here)
-        publish_pub "$work/new.key"
+        install -d -m 700 "$(dirname "$slot")"; install -m 600 "$work/new.key" "$slot"
+        openssl pkey -in "$slot" -pubout -out "$work/new.pub" 2>/dev/null
+        pair_verify "$slot" "$work/new.pub" || { receipt refuse "$newfp" rotate-pair-verify-failed; echo "REFUSE rotate-verify" >&2; exit 14; }
+        [ -f "$RUNTIME_KEY" ] && cp -a "$RUNTIME_KEY" "${RUNTIME_KEY}.prev"   # retain prior until publish
+        enc_blob "$slot" "$EPOCH" "$newfp"                                    # rebind durable at the NEW epoch
+        mv -f "$slot" "$RUNTIME_KEY"                                          # promote (prior kept in .prev)
+        openssl pkey -in "$RUNTIME_KEY" -pubout -out "$work/prom.pub" 2>/dev/null
+        pair_verify "$RUNTIME_KEY" "$work/prom.pub" || { receipt refuse "$newfp" rotate-promote-verify-failed; echo "REFUSE rotate-promote" >&2; exit 14; }
+        mark_verified "$newfp"                                                # marker AFTER promote+verify
+        publish_pub "$RUNTIME_KEY"
+        rm -f "${RUNTIME_KEY}.prev"                                           # success -> drop prior
         receipt rotate "$newfp" rotated-epoch-bumped-old-refused; exit 0; fi
 
       # (4) trusted pub but no durable + no verifiable runtime key -> lost custody, NEVER mint.
       if [ -f "$PUB" ]; then
-        install -d -m 700 "$(dirname "$RECEIPT")"; receipt refuse "" trusted-pub-without-durable-custody-lost-never-mint; echo "REFUSE lost-custody">&2; exit 15; fi
+        receipt refuse "" trusted-pub-without-durable-custody-lost-never-mint; echo "REFUSE lost-custody" >&2; exit 15; fi
 
       # (5) nothing exists: bootstrap ONLY under an approved plan (material_stage_clarification).
-      install -d -m 700 "$(dirname "$RECEIPT")"
-      if [ "$BOOTSTRAP_OK" != "true" ]; then receipt refuse "" no-approved-bootstrap-plan; echo "REFUSE no-bootstrap">&2; exit 16; fi
+      if [ "$BOOTSTRAP_OK" != "true" ]; then receipt refuse "" no-approved-bootstrap-plan; echo "REFUSE no-bootstrap" >&2; exit 16; fi
       openssl genpkey -algorithm ED25519 -out "$work/gen.key" 2>/dev/null
       genfp="$(fp_of_priv "$work/gen.key")"
-      enc_blob "$work/gen.key" "$EPOCH" "$genfp"      # generate_or_recover (durable bound to epoch+fp)
+      expect_ok "$genfp" || { receipt refuse "$genfp" bootstrap-fp-not-expected; echo "REFUSE gen-expected-fp" >&2; exit 24; }
+      enc_blob "$work/gen.key" "$EPOCH" "$genfp"      # generate_or_recover (durable epoch-bound)
       install_runtime "$work/gen.key"                 # install
-      openssl pkey -in "$work/gen.key" -pubout -out "$work/gen.pub" 2>/dev/null
-      pair_verify "$work/gen.key" "$work/gen.pub" || { receipt refuse "$genfp" bootstrap-pair-verify-failed; echo "REFUSE gen-verify">&2; exit 17; }
+      openssl pkey -in "$RUNTIME_KEY" -pubout -out "$work/gen.pub" 2>/dev/null
+      pair_verify "$RUNTIME_KEY" "$work/gen.pub" || { receipt refuse "$genfp" bootstrap-pair-verify-failed; echo "REFUSE gen-verify" >&2; exit 17; }
       mark_verified "$genfp"                          # mark verified BEFORE publish
-      publish_pub "$work/gen.key"                     # publish pub last
+      publish_pub "$RUNTIME_KEY"                      # publish pub last (C EMITS genfp -> D records as EXPECTED_FP)
       receipt generate "$genfp" bootstrapped-and-pair-verified; exit 0
   environment:
     DID: "{{ _cm_deployment_identity }}"
     SIGNER: "{{ guardian_custody_signer_id }}"
     EPOCH: "{{ guardian_custody_authority_epoch }}"
+    EXPECTED_FP: "{{ guardian_custody_expected_pub_fingerprint | default('') }}"
     RUNTIME_KEY: "{{ _gc_runtime_key }}"
     DURABLE: "{{ _gc_durable }}"
     META: "{{ _gc_meta }}"
     MARKER: "{{ _gc_marker }}"
     RECEIPT: "{{ _gc_receipt }}"
-    PUB: "{{ _gc_pub_staging }}"
+    PUB: "{{ _gc_pub_signer }}"
     WRAP: "{{ guardian_custody_wrapping_key_ref }}"
     STAGING_ROOT: "{{ _cm_staging_root }}"
+    CONSUMER_MOUNTS: "{{ guardian_custody_consumer_bind_mount_roots | join(' ') }}"
     ROTATE: "{{ guardian_custody_rotate | default(false) | bool | lower }}"
     BOOTSTRAP_OK: "{{ guardian_custody_bootstrap_approved | default(false) | bool | lower }}"
     CIPHER: "{{ guardian_custody_enc_cipher }}"
@@ -269,12 +350,12 @@
   ansible.builtin.set_fact:
     guardian_custody_decision: "{{ _gc_receipt_raw.content | b64decode | from_json }}"
 
-# --- The GUARD: downstream trust/publish/grant gates on the VERIFIED-PAIR MARKER,
+# --- The GUARD: downstream trust/publish/grant gates on the VERIFIED-PAIR decision,
 #     NOT on guardian.pub existence (A5 guard_gate). ------------------------------
 - name: guardian_custody -- assert a VERIFIED pub<->priv pair for the current epoch (guard)
   ansible.builtin.assert:
     that:
-      - guardian_custody_decision.decision in ['generate', 'recover', 'rotate', 'noop']
+      - guardian_custody_decision.decision in ['generate', 'recover', 'rotate', 'republish', 'noop']
       - guardian_custody_decision.fingerprint is defined
       - (guardian_custody_decision.fingerprint | length) > 0
     fail_msg: >-
@@ -283,3 +364,40 @@
       reason={{ guardian_custody_decision.reason | default('?') }}). Downstream trust/publish/grant
       is gated on this verified pair, never on guardian.pub existence.
     quiet: true
+
+# --- [4] TRANSFER the signer-local pub to controller staging + fp-verify. The pub is
+#     produced on the SIGNER; the materializer slurps grant sources on the CONTROLLER.
+#     This reads the signer pub (runs where custody ran) and writes it on the controller,
+#     verifying the fingerprint equals the verified-pair decision. The CANONICAL
+#     producer-location declaration (which host, which distribution) is routed to C1.
+- name: guardian_custody -- read the signer-local published guardian.pub
+  ansible.builtin.slurp:
+    src: "{{ _gc_pub_signer }}"
+  register: _gc_pub_raw
+
+- name: guardian_custody -- ensure the controller staging guardian dir exists
+  ansible.builtin.file:
+    path: "{{ _gc_pub_staging | dirname }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  run_once: true
+
+- name: guardian_custody -- place guardian.pub into controller staging (transfer)
+  ansible.builtin.copy:
+    content: "{{ _gc_pub_raw.content | b64decode }}"
+    dest: "{{ _gc_pub_staging }}"
+    mode: "0644"
+  delegate_to: localhost
+  run_once: true
+
+- name: guardian_custody -- verify the transferred pub fingerprint equals the custody decision
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      set -euo pipefail;
+      fp="$(openssl pkey -pubin -in {{ _gc_pub_staging | quote }} -pubout -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')";
+      test "$fp" = {{ guardian_custody_decision.fingerprint | quote }}
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
