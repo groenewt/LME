@@ -2,68 +2,203 @@
 # =============================================================================
 # backup_lme/tasks/assert_integrity_paths.yml
 #
-# Declaration-level, fail-closed guard (codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-
-# UNVALIDATED; codex-1030 path_scope refinement). Path-NAME fields in the
-# lme_backup_integrity declaration are used to build PRIVILEGED filesystem targets: the
-# per-volume data dir and manifest file, the volumes root, the `file: state=absent`
-# deletion target for the stale certificate, and the read paths the topology probe uses.
-# A traversal ('..'), an absolute path, or an unexpected separator would let a privileged
-# create/delete/read ESCAPE the owned backup bundle.
+# Declaration-level, fail-closed record-schema gate for lme_backup_integrity. Fields from
+# this declaration are used to build PRIVILEGED filesystem targets AND to build the payload
+# RECORDS the content-integrity library parses (IFS='|' read) and the cert lines it matches
+# (grep). A traversal, an absolute path, a separator, a shell metacharacter, a CR/LF, or a
+# delimiter here would let a privileged create/delete/read ESCAPE the owned bundle, EXECUTE
+# while the library is sourced, TRUNCATE a line-based record, or SILENTLY reclassify a
+# required payload as optional. This is DATA validation (ansible.builtin.assert): no shell,
+# no Python; it is the PRIMARY module-reachable gate (it also covers `file: state=absent` on
+# certification.bundle_file, which no shell library guard can reach).
 #
-# codex-1030: apply the SINGLE-COMPONENT rule ONLY to fields DECLARED as a single
-# component/filename (root_dir, data_dir, manifest_file, bundle_file, quadlet_payload_id).
-# Fields that MAY legitimately be a relative multi-segment path (payload_classes[].path,
-# topology quadlet_relpath) are validated for NO TRAVERSAL / NOT ABSOLUTE instead, so a
-# legitimate inventory-declared relocation is not prohibited. This is DATA validation
-# (ansible.builtin.assert): no shell body, no Python.
+# History / findings closed here:
+#   codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED  -- single-component path names.
+#   codex-1115 D-DECLARED-PATH-SHELL-INTERPOLATION          -- allowlist (defense in depth to _shq).
+#   codex-1200 D-U1-DELIMITER-CHANGES-REQUIRED-MEMBERSHIP   -- id/path exclude '|'; kind enumerated;
+#                                                              optional is boolean; ids unique.
+#   codex-1200 D-U1-ALLOWLIST-ACCEPTS-FINAL-NEWLINE         -- ANCHOR-FREE `is not search([^set])`
+#                                                              replaces `is match(^...$)` so a value is
+#                                                              rejected for a disallowed char ANYWHERE
+#                                                              (incl. LF/CR, which `$` allowed before it).
+#   codex-1200 D-INTERNAL-GREP-PATTERNS-REGEX (matching half) -- id / field-name / self_digest_field
+#                                                              charsets exclude every regex metacharacter
+#                                                              (no '.', no '*', ...), so the library greps
+#                                                              at template 251-256/421/438/453 and restore
+#                                                              :322 are LITERAL over the admitted set
+#                                                              (closure-by-gate; U3 converts grep->exact).
+#   codex-1200 D-MARKER-FIXED-STRING-STILL-OPTION-SENSITIVE (declaration half) -- marker has no CR/LF and
+#                                                              does not start with '-'. The restore:303
+#                                                              caller fix (grep -qF -e) is routed to the
+#                                                              coordinator (restore is committed, not U1).
+#   codex-1300 D-U1-CASE-INSENSITIVE-UNIQUENESS-REGRESSION  -- id/path uniqueness uses unique(case_
+#                                                              sensitive=true): distinct-case ids (Data vs
+#                                                              data) / paths (Payload vs payload) are DISTINCT
+#                                                              (case-sensitive shell fields, grep patterns,
+#                                                              Linux paths); the default case-insensitive
+#                                                              unique wrongly rejected them. Exact duplicates
+#                                                              still refused.
+#   codex-1300/1330 retained_membership_gap (OPEN, NOT closed here) -- `volume_data` per-entry path,
+#                                                              requiredness and ownership are ADMITTED by the
+#                                                              schema gate above AND the declaration stays
+#                                                              expressive (add/relocate volume sources is
+#                                                              preserved), but the rendered library does NOT
+#                                                              yet CONSUME each volume_data entry: it discovers
+#                                                              volumes by scanning $LME_VOLUME_ROOT (=
+#                                                              volume_layout.root_dir) at certify (:358-385) /
+#                                                              verify (:476-514). Per codex-1330 acceptance_
+#                                                              limit this gap is NOT papered over with a fixed
+#                                                              root / shrunk matrix; it stays VISIBLE as
+#                                                              incomplete until per-entry consumption (a declared
+#                                                              expected volume set) is implemented. Aligned with
+#                                                              vars/integrity.yml completeness_anchor OPEN + the
+#                                                              B-ledger / C1 expected-set routing.
 #
-# NOTE (codex-1030): this module-level assert is necessary but NOT sufficient on its own --
-# a declaration proven in-scope here still needs the per-mutation runtime guard
-# (lme_assert_deletion_scope + canonical containment + outcome check) because concurrent
-# creation / symlink replacement can occur between admission and mutation (TOCTOU).
+# Charset rationale:
+#   * PATH-NAME components (root_dir/data_dir/manifest_file/bundle_file) and PATHS
+#     (payload_classes[].path, quadlet_relpath) are real filenames -> keep '.'; paths add '/'.
+#   * IDENTIFIERS (payload id, note_payload_id, quadlet_payload_id) and FIELD-NAME tokens
+#     (manifest_fields.*, self_digest_field) sit in library REGEX positions -> DROP '.' so the
+#     pattern cannot alias (a.b vs axb). No current id or field name uses a dot.
+#
+# NOT sufficient alone (recorded): a declaration proven in-scope here still needs the per-mutation
+# runtime guards (lme_assert_deletion_scope + canonical containment + outcome checks) because
+# concurrent creation / symlink replacement can occur between admission and mutation (TOCTOU).
 # =============================================================================
 
-- name: Assert single-component backup-integrity path-name fields (no separator/traversal)
+- name: Assert single-component backup-integrity path-name fields (filenames; no separator/CR/LF/metachar)
   ansible.builtin.assert:
     quiet: true
     that:
       - item.value is string
       - item.value | length > 0
-      - "'/' not in item.value"
       - item.value not in ['.', '..']
+      # anchor-free: refuses '/', shell metacharacters, CR, LF, '|' anywhere (unlike `^...$`,
+      # `$` matched before a trailing LF and let a newline-terminated value through).
+      - item.value is not search('[^A-Za-z0-9._-]')
     fail_msg: >-
-      backup-integrity declaration field {{ item.name }}={{ item.value | to_json }} must be a
-      single path component (no '/', not '.'/'..'). A separator or traversal here would let a
-      privileged create/delete escape the owned backup bundle. Refusing before any mutation.
+      backup-integrity path-name field {{ item.name }}={{ item.value | to_json }} must be a single
+      filename component of [A-Za-z0-9._-] only (no '/', not '.'/'..', no shell metacharacter, no
+      CR/LF). Such a value would let a privileged create/delete escape the owned backup bundle or
+      execute/truncate while the library is sourced. Refusing before any mutation.
   loop:
     - { name: 'volume_layout.root_dir',      value: "{{ lme_backup_integrity.volume_layout.root_dir }}" }
     - { name: 'volume_layout.data_dir',      value: "{{ lme_backup_integrity.volume_layout.data_dir }}" }
     - { name: 'volume_layout.manifest_file', value: "{{ lme_backup_integrity.volume_layout.manifest_file }}" }
     - { name: 'certification.bundle_file',   value: "{{ lme_backup_integrity.certification.bundle_file }}" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Assert backup-integrity identifier fields are safe regex-free tokens (no dot/separator/CR/LF)
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.value is string
+      - item.value | length > 0
+      # identifiers land in library grep patterns (template 438/453, restore :322) -> exclude '.'
+      # and every other regex metacharacter so the pattern is LITERAL over the admitted set.
+      - item.value is not search('[^A-Za-z0-9_-]')
+    fail_msg: >-
+      backup-integrity identifier {{ item.name }}={{ item.value | to_json }} must be a token of
+      [A-Za-z0-9_-] only (no '.', no separator, no shell/regex metacharacter, no CR/LF). It is
+      interpolated into a shell-sourced record and a library grep pattern. Refusing before any mutation.
+  loop:
+    - { name: 'topology_classification.note_payload_id',    value: "{{ lme_backup_integrity.topology_classification.note_payload_id }}" }
     - { name: 'topology_classification.quadlet_payload_id', value: "{{ lme_backup_integrity.topology_classification.quadlet_payload_id }}" }
   loop_control:
     label: "{{ item.name }}"
 
-- name: Assert payload_classes paths are bundle-relative (no traversal, not absolute)
-  # Multi-segment relatives are permitted (legit relocation); '..' components and absolute
-  # paths are refused.
+- name: Assert manifest field-name tokens are safe regex-free tokens (library regex positions)
   ansible.builtin.assert:
     quiet: true
     that:
+      - item.value is string
+      - item.value | length > 0
+      - item.value is not search('[^A-Za-z0-9_-]')
+    fail_msg: >-
+      backup-integrity field-name {{ item.name }}={{ item.value | to_json }} must be a token of
+      [A-Za-z0-9_-] only. It is interpolated as a grep pattern in the content-integrity library
+      (template 251-256/421); a '.' or other metacharacter would alias the match. Refusing.
+  loop:
+    - { name: 'manifest_fields.count',          value: "{{ lme_backup_integrity.manifest_fields.count }}" }
+    - { name: 'manifest_fields.bytes',          value: "{{ lme_backup_integrity.manifest_fields.bytes }}" }
+    - { name: 'manifest_fields.listing',        value: "{{ lme_backup_integrity.manifest_fields.listing }}" }
+    - { name: 'manifest_fields.content',        value: "{{ lme_backup_integrity.manifest_fields.content }}" }
+    - { name: 'certification.self_digest_field', value: "{{ lme_backup_integrity.certification.self_digest_field }}" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Assert each payload_classes entry has an unambiguous, schema-valid record
+  # codex-1200 D-U1-DELIMITER-CHANGES-REQUIRED-MEMBERSHIP: the library builds one shell record
+  # per entry as id|path|req|opt and splits it with IFS='|'. Enforce that id/path carry NO '|'
+  # (charset excludes it) and NO CR/LF, that kind is one of the three the loops dispatch on (a
+  # typo'd kind silently drops the payload from BOTH loops -> a membership gap), and that optional
+  # is a real boolean (optional:"false" is a truthy STRING that renders 'opt' and downgrades a
+  # required payload). Multi-segment relative paths are permitted; '..' and absolute are refused.
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.id is defined
+      - item.id is string
+      - item.id | length > 0
+      - item.id is not search('[^A-Za-z0-9_-]')
+      - item.kind is defined
+      - item.kind in ['tree', 'file', 'volume_data']
+      - (item.optional is not defined) or (item.optional is boolean)
       - item.path is defined
       - item.path is string
       - item.path | length > 0
       - not (item.path.startswith('/'))
       - "'..' not in (item.path.split('/'))"
+      # no empty or '.' segment: 'lme/', 'a//b', './x', 'a/./b' are ambiguous or redundant
+      # spellings of a member path and are refused so a path maps to exactly one location.
+      - "'' not in (item.path.split('/'))"
+      - "'.' not in (item.path.split('/'))"
+      - item.path is not search('[^A-Za-z0-9._/-]')
     fail_msg: >-
-      backup-integrity payload_classes id={{ item.id | default('?') }} path
-      {{ item.path | default('<undef>') | to_json }} must be a bundle-relative path with no
-      '..' component and not absolute. Refusing before any mutation.
+      payload_classes entry id={{ item.id | default('<undef>') | to_json }}
+      kind={{ item.kind | default('<undef>') | to_json }}
+      optional={{ item.optional | default('<absent>') | to_json }}
+      path={{ item.path | default('<undef>') | to_json }} is not a schema-valid record:
+      id must be [A-Za-z0-9_-]; kind must be tree|file|volume_data; optional must be boolean if
+      present; path must be a bundle-relative [A-Za-z0-9._/-] path (no '..', not absolute, no '|'/CR/LF).
+      An out-of-schema record could execute, truncate, mis-split, or silently drop a required payload.
+      Refusing before any mutation.
   loop: "{{ lme_backup_integrity.payload_classes }}"
   loop_control:
     label: "{{ item.id | default('?') }}"
 
-- name: Assert topology quadlet_relpath is bundle-relative (no traversal, not absolute)
+- name: Assert payload_classes ids are unique (no duplicate membership records)
+  # codex-1300 D-U1-CASE-INSENSITIVE-UNIQUENESS-REGRESSION: `unique` defaults to
+  # case_sensitive=false, so it FOLDS distinct ids that differ only in case (Data vs data)
+  # into one and WRONGLY rejects a valid declaration as duplicate. ids/paths are consumed
+  # case-sensitively downstream (shell record fields, grep patterns, on-disk path names on a
+  # case-sensitive Linux filesystem), so uniqueness MUST be case-sensitive. `case_sensitive=true`
+  # keeps distinct-case names AND still refuses an EXACT duplicate (same-case, same-string).
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (lme_backup_integrity.payload_classes | map(attribute='id') | list | length)
+        == (lme_backup_integrity.payload_classes | map(attribute='id') | unique(case_sensitive=true) | list | length)
+    fail_msg: >-
+      payload_classes ids must be unique (case-sensitive); an EXACT-duplicate id would produce ambiguous
+      certification/verification records. Declared ids: {{ lme_backup_integrity.payload_classes | map(attribute='id') | list | to_json }}.
+
+- name: Assert payload_classes paths are unique (no two members aliasing one content location)
+  # codex-1300 D-U1-CASE-INSENSITIVE-UNIQUENESS-REGRESSION (path half): a Linux bundle path is
+  # case-sensitive, so Payload/ and payload/ are DISTINCT locations; a case-insensitive `unique`
+  # would fold them and wrongly reject the declaration. case_sensitive=true accepts distinct-case
+  # paths and still refuses an exact-duplicate path (two ids aliasing one content location).
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (lme_backup_integrity.payload_classes | map(attribute='path') | list | length)
+        == (lme_backup_integrity.payload_classes | map(attribute='path') | unique(case_sensitive=true) | list | length)
+    fail_msg: >-
+      payload_classes paths must be unique (case-sensitive); two ids sharing one EXACT path alias the same
+      content and make membership ambiguous. Declared paths: {{ lme_backup_integrity.payload_classes | map(attribute='path') | list | to_json }}.
+
+- name: Assert topology quadlet_relpath is bundle-relative (no traversal, not absolute, no CR/LF)
   ansible.builtin.assert:
     quiet: true
     that:
@@ -71,7 +206,32 @@
       - lme_backup_integrity.topology_classification.quadlet_relpath | length > 0
       - not (lme_backup_integrity.topology_classification.quadlet_relpath.startswith('/'))
       - "'..' not in (lme_backup_integrity.topology_classification.quadlet_relpath.split('/'))"
+      - "'' not in (lme_backup_integrity.topology_classification.quadlet_relpath.split('/'))"
+      - "'.' not in (lme_backup_integrity.topology_classification.quadlet_relpath.split('/'))"
+      - lme_backup_integrity.topology_classification.quadlet_relpath is not search('[^A-Za-z0-9._/-]')
     fail_msg: >-
       topology_classification.quadlet_relpath
       {{ lme_backup_integrity.topology_classification.quadlet_relpath | to_json }} must be a
-      bundle-relative path with no '..' component and not absolute.
+      bundle-relative path of [A-Za-z0-9._/-] only (no '..' component, not absolute, no shell
+      metacharacter, no CR/LF). Refusing.
+
+- name: Assert single_node_marker is a safe classifier token (no CR/LF, not option-shaped)
+  # codex-1200 D-MARKER-FIXED-STRING-STILL-OPTION-SENSITIVE (declaration half): the marker is a
+  # grep -F operand at restore:303. A CR/LF in a fixed-string pattern is a pattern separator (an
+  # empty element matches EVERY line), and a marker like `--help` is parsed as a grep OPTION whose
+  # success would classify any bundle single-node and steer the destructive ES-volume decision.
+  # The marker legitimately contains '=', '.', '-' (e.g. discovery.type=single-node), so it is NOT
+  # charset-restricted; refuse only CR/LF and a leading '-'. The caller-side `grep -qF -e "$marker"`
+  # / `--` fix at restore:303 is routed to the coordinator (restore is committed, not a U1 file).
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - lme_backup_integrity.topology_classification.single_node_marker is string
+      - lme_backup_integrity.topology_classification.single_node_marker | length > 0
+      - lme_backup_integrity.topology_classification.single_node_marker is not search('[\r\n]')
+      - not (lme_backup_integrity.topology_classification.single_node_marker.startswith('-'))
+    fail_msg: >-
+      topology_classification.single_node_marker
+      {{ lme_backup_integrity.topology_classification.single_node_marker | to_json }} must be a
+      single-line token that does not start with '-' (no CR/LF; not option-shaped), so it cannot be
+      a grep pattern separator or a grep option at the classifier boundary. Refusing.
