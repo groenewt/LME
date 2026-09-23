@@ -830,6 +830,7 @@ def test_llm_on_upgrade_publishes_both_core_and_ai_ui_cert_bundles():
 # from manifests/global.yml, never hardcoded in the engine.
 # ---------------------------------------------------------------------------------
 validate_material = FILTERS["lme_validate_material_requirements"]
+validate_catalog = FILTERS["lme_validate_material_catalog"]
 
 
 def _material_schema():
@@ -837,8 +838,20 @@ def _material_schema():
         return yaml.safe_load(fh)["lme_config_registry"]["material_requirements_schema"]
 
 
+def _catalog_schema():
+    with open(GLOBAL_YML, "r") as fh:
+        return yaml.safe_load(fh)["lme_global"]["material_catalog_schema"]
+
+
 _MAT_CATALOG = LME_GLOBAL["material_catalog"]
 _MAT_SCHEMA = _material_schema()
+_MAT_CAT_SCHEMA = _catalog_schema()
+
+
+def _vm(obligations, **kw):
+    """Thread the real catalog + both schemas; default context."""
+    kw.setdefault("context", "svcA")
+    return validate_material(_MAT_CATALOG, obligations, _MAT_SCHEMA, _MAT_CAT_SCHEMA, **kw)
 
 
 def _good_obligation():
@@ -855,73 +868,188 @@ def _good_obligation():
     }
 
 
+# --- catalog validation (C1-MATERIAL-CATALOG-DEFINITION-VALIDATION) --------------
+def test_material_catalog_validates_clean():
+    assert validate_catalog(_MAT_CATALOG, _MAT_CAT_SCHEMA) == _MAT_CATALOG
+
+
 def test_material_catalog_guardian_is_public_key_only():
     # the shared definition is a PUBLIC key -- a shared ref never distributes private material
     assert _MAT_CATALOG["guardian_public_key"]["kind"] == "public_key"
 
 
+@pytest.mark.parametrize("defn", [None, {}, {"payload_validity": "x"},
+                                  {"kind": "bogus_kind", "payload_validity": "x"}])
+def test_material_catalog_bad_definition_rejected(defn):
+    # null/empty definition, absent kind, unknown kind all FAIL (bare membership no longer passes)
+    with pytest.raises(ValueError):
+        validate_catalog({"d": defn}, _MAT_CAT_SCHEMA)
+
+
+# --- the three empty cases ------------------------------------------------------
 def test_material_declared_none_passes():
-    # explicit `material_requirements: {}` == legitimately requires none == PASS
-    assert validate_material(_MAT_CATALOG, {}, _MAT_SCHEMA, context="svcA") == {}
+    assert _vm({}) == {}
 
 
 def test_material_missing_field_fails_not_implicitly_empty():
-    # a selected service OMITTING the field (None) is INCOMPLETE, never implicitly empty
     with pytest.raises(ValueError) as e:
-        validate_material(_MAT_CATALOG, None, _MAT_SCHEMA, context="svcA")
+        _vm(None)
     assert "MISSING" in str(e.value)
 
 
 def test_material_declared_none_contradicting_ref_is_invalid():
     with pytest.raises(ValueError) as e:
-        validate_material(_MAT_CATALOG, {}, _MAT_SCHEMA,
-                          referenced_ids=["o1"], context="svcA")
+        _vm({}, referenced_ids=["o1"])
     assert "INVALID" in str(e.value)
 
 
+# --- typed obligation happy path + references -----------------------------------
 def test_material_valid_typed_obligation_resolves():
     good = _good_obligation()
-    assert validate_material(_MAT_CATALOG, good, _MAT_SCHEMA,
-                             referenced_ids=["guardian_pub_proxy"],
-                             context="svcA") == good
+    assert _vm(good, referenced_ids=["guardian_pub_proxy"]) == good
+
+
+def test_material_lifecycle_and_retention_optional_refs_accepted():
+    good = _good_obligation()
+    good["guardian_pub_proxy"]["lifecycle"] = "bootstrap"
+    good["guardian_pub_proxy"]["retention"] = "prior_revision"
+    good["guardian_pub_proxy"]["producer_ref"] = "guardian_signer_producer"
+    good["guardian_pub_proxy"]["custody_ref"] = "guardian_custody"
+    good["guardian_pub_proxy"]["trust_ref"] = "guardian_public_key"
+    assert _vm(good) == good
+
+
+def test_material_lifecycle_vocab_enforced():
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["lifecycle"] = "nonsense"
+    with pytest.raises(ValueError):
+        _vm(bad)
+
+
+def test_material_trust_ref_named_must_resolve():
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["trust_ref"] = "ghost_trust"   # no colon => must resolve
+    with pytest.raises(ValueError) as e:
+        _vm(bad)
+    assert "trust_ref" in str(e.value)
 
 
 def test_material_ref_must_resolve_to_catalog_definition():
     bad = _good_obligation()
     bad["guardian_pub_proxy"]["material_ref"] = "no_such_def"
     with pytest.raises(ValueError) as e:
-        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
+        _vm(bad)
     assert "material_catalog" in str(e.value)
+
+
+def test_material_ref_private_kind_is_not_distributable():
+    # a catalog NAME alone cannot authorize private-material distribution
+    priv_cat = {"signer_priv": {"kind": "private_key", "payload_validity": "x"}}
+    obl = _good_obligation()
+    obl["guardian_pub_proxy"]["material_ref"] = "signer_priv"
+    with pytest.raises(ValueError) as e:
+        validate_material(priv_cat, obl, _MAT_SCHEMA, _MAT_CAT_SCHEMA, context="svcA")
+    assert "distributable" in str(e.value)
 
 
 def test_material_placement_class_must_be_in_vocab():
     bad = _good_obligation()
     bad["guardian_pub_proxy"]["placement_class"] = "elsewhere"
     with pytest.raises(ValueError) as e:
-        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
+        _vm(bad)
     assert "vocab" in str(e.value)
 
 
-def test_material_mode_must_be_octal():
+# --- placement-FORM conditionals (C1-MATERIAL-CANONICAL-REFERENCE-SHAPE) ---------
+def test_material_file_form_requires_destination_owner_mode():
     bad = _good_obligation()
-    bad["guardian_pub_proxy"]["mode"] = "rwx"
+    del bad["guardian_pub_proxy"]["mode"]
     with pytest.raises(ValueError) as e:
-        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
-    assert "octal" in str(e.value)
+        _vm(bad)
+    assert "requires" in str(e.value)
 
 
-def test_material_dangling_reference_is_unproduced_fail():
+def test_material_env_form_needs_no_path_or_mode():
+    obl = {"db_dsn_env": {
+        "material_ref": "guardian_public_key",   # any distributable def; env carries no file
+        "placement_class": "env",
+        "consumer": "litellm process env",
+        "profile_condition": "install_llm",
+    }}
+    assert _vm(obl) == obl
+
+
+def test_material_env_form_forbids_destination_and_mode():
+    obl = {"db_dsn_env": {
+        "material_ref": "guardian_public_key",
+        "placement_class": "env",
+        "destination": "/should/not/be/here",
+        "consumer": "x",
+        "profile_condition": "always",
+    }}
+    with pytest.raises(ValueError) as e:
+        _vm(obl)
+    assert "must NOT declare" in str(e.value)
+
+
+# --- mode boundary regressions (C1-MATERIAL-MODE-TRAILING-NEWLINE) ---------------
+@pytest.mark.parametrize("mode", ["0644\n", " 0644", "0644 ", "8888", "0o644", "rwx", "12"])
+def test_material_mode_malformed_rejected(mode):
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["mode"] = mode
+    with pytest.raises(ValueError):
+        _vm(bad)
+
+
+@pytest.mark.parametrize("mode", ["0600", "600", "0644", "0755"])
+def test_material_mode_valid_octal_accepted(mode):
+    good = _good_obligation()
+    good["guardian_pub_proxy"]["mode"] = mode
+    assert _vm(good) == good
+
+
+# --- identifier + reference input (C1-MATERIAL-IDENTIFIER-AND-REFERENCE-VALIDATION)
+@pytest.mark.parametrize("bad_id", [1, "", "Bad_Caps", "9leading", "has space"])
+def test_material_obligation_id_must_be_a_valid_name(bad_id):
+    rec = _good_obligation()["guardian_pub_proxy"]
+    with pytest.raises(ValueError):
+        _vm({bad_id: rec})
+
+
+def test_material_empty_string_required_field_rejected():
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["consumer"] = ""
+    with pytest.raises(ValueError) as e:
+        _vm(bad)
+    assert "empty" in str(e.value)
+
+
+@pytest.mark.parametrize("bad_refs", ["ghost", {"a": 1}, 5, True])
+def test_material_referenced_ids_must_be_a_list(bad_refs):
+    with pytest.raises(ValueError) as e:
+        _vm(_good_obligation(), referenced_ids=bad_refs)
+    assert "referenced_ids" in str(e.value)
+
+
+def test_material_profile_condition_must_be_in_vocab():
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["profile_condition"] = "whenever"
+    with pytest.raises(ValueError) as e:
+        _vm(bad)
+    assert "profile_condition" in str(e.value)
+
+
+def test_material_unresolved_reference_is_a_config_error():
     good = _good_obligation()
     with pytest.raises(ValueError) as e:
-        validate_material(_MAT_CATALOG, good, _MAT_SCHEMA,
-                          referenced_ids=["ghost"], context="svcA")
-    assert "declared-but-unproduced" in str(e.value)
+        _vm(good, referenced_ids=["ghost"])
+    assert "pre-generation configuration error" in str(e.value)
 
 
 def test_material_missing_required_record_field_fails():
     bad = {"x": {"material_ref": "guardian_public_key", "placement_class": "config"}}
     with pytest.raises(ValueError) as e:
-        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
+        _vm(bad)
     assert "missing required" in str(e.value)
 
 
@@ -929,5 +1057,32 @@ def test_material_undeclared_record_field_rejected():
     bad = _good_obligation()
     bad["guardian_pub_proxy"]["surprise"] = "x"
     with pytest.raises(ValueError) as e:
-        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
+        _vm(bad)
     assert "undeclared" in str(e.value)
+
+
+# --- schema self-validation (C1-MATERIAL-SCHEMA-VALIDATION + empty-policy) -------
+def test_material_schema_empty_record_rejected():
+    broken = {**_MAT_SCHEMA, "record": {}}
+    with pytest.raises(ValueError):
+        validate_material(_MAT_CATALOG, _good_obligation(), broken, _MAT_CAT_SCHEMA)
+
+
+def test_material_schema_unsupported_field_type_rejected():
+    broken = {**_MAT_SCHEMA,
+              "record": {**_MAT_SCHEMA["record"],
+                         "consumer": {"type": "list", "required": True}}}
+    with pytest.raises(ValueError):
+        validate_material(_MAT_CATALOG, _good_obligation(), broken, _MAT_CAT_SCHEMA)
+
+
+@pytest.mark.parametrize("policy", [
+    {"declared_none_passes": False, "missing_field_fails": True, "empty_contradicting_refs_invalid": True},
+    {"missing_field_fails": True, "empty_contradicting_refs_invalid": True},   # missing key
+    {"declared_none_passes": True, "missing_field_fails": True,
+     "empty_contradicting_refs_invalid": True, "surprise": True},             # unknown key
+])
+def test_material_empty_semantics_policy_must_be_complete_and_true(policy):
+    broken = {**_MAT_SCHEMA, "empty_semantics": policy}
+    with pytest.raises(ValueError):
+        validate_material(_MAT_CATALOG, {}, broken, _MAT_CAT_SCHEMA)

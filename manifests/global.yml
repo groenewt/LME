@@ -201,6 +201,25 @@ lme_global:
     # definitions; E adds telemetry/app material definitions. Each is a payload
     # definition ONLY -- the per-service obligation carries the placement.
 
+  # --- material_catalog schema (C1-MATERIAL-CATALOG-DEFINITION-VALIDATION) -------
+  # The DECLARED shape every material_catalog definition is validated against by
+  # lme_manifests.py::lme_validate_material_catalog. A null/empty definition, an
+  # unknown/absent kind or an absent payload_validity now FAIL (previously a bare
+  # catalog membership passed). `distributable_kinds` is the closure that makes a
+  # catalog NAME alone insufficient to authorize private-material distribution: an
+  # obligation may only reference a definition whose kind is distributable, so
+  # flipping guardian_public_key.kind to private_key makes every obligation that
+  # references it FAIL (the private key is host-local, never a catalog-distributed
+  # obligation payload). Value-pure: the vocab/closure is read from HERE.
+  material_catalog_schema:
+    definition:
+      kind:             {type: str, required: true,  vocab: [public_key, private_key, certificate, password_file, json, conf, pgpass, dsn]}
+      payload_validity: {type: str, required: true}
+      description:      {type: str, required: false}
+    # Kinds an obligation MAY reference (material distributed to a consumer). A kind
+    # NOT listed here (e.g. private_key) is host-local / non-distributable.
+    distributable_kinds: [public_key, certificate, password_file, json, conf, pgpass, dsn]
+
 # =============================================================================
 # lme_config_registry -- the DECLARED SCHEMA for every operator/profile-managed
 # config field (C1 shared contract; codex-manager-caller-contract-decisions-
@@ -310,16 +329,50 @@ lme_config_registry:
   # lme_manifests.py::lme_validate_material_requirements enforces this shape value-purely
   # (vocab read from here, never hardcoded in Python).
   material_requirements_schema:
+    # ALWAYS-required base fields carry required:true. destination/owner_role/mode are
+    # NOT base-required: they are placement-FORM conditional (a file-backed placement
+    # needs them; an env-backed secret must NOT fabricate a path/mode) -- see
+    # placement_forms (C1-MATERIAL-CANONICAL-REFERENCE-SHAPE). trust/producer/custody/
+    # lifecycle/retention are the lifecycle-and-retention references
+    # (C1-MATERIAL-LIFECYCLE-AND-RETENTION); producer_ref/custody_ref resolve against
+    # canonical producer/custody declarations that C/D still OWE (their reference
+    # closure arms when those declarations land -- shape is validated now).
     record:
-      material_ref:      {type: str,  required: true}   # -> lme_global.material_catalog.<id>
-      placement_class:   {type: str,  required: true, vocab: [secrets, config, mount]}
-      destination:       {type: str,  required: true}   # path template (dir class derives from placement_class)
-      owner_role:        {type: str,  required: true}   # account/role that owns the materialized file
-      mode:              {type: str,  required: true}   # octal string, e.g. "0600"
-      consumer:          {type: str,  required: true}   # what mounts/reads it
-      profile_condition: {type: str,  required: true}   # always | <db-profile> | <enable-flag>
-      trust_ref:         {type: str,  required: false}  # optional CA/credential reference
-    # The THREE empty-list cases (codex-0430 decision 2; C RESTORE-EMPTY-SECRET-PREFLIGHT):
+      material_ref:      {type: str, required: true}    # -> lme_global.material_catalog.<id> (must be a DISTRIBUTABLE kind)
+      placement_class:   {type: str, required: true, vocab: [secrets, config, mount, env]}
+      consumer:          {type: str, required: true}    # what mounts/reads it (nonempty)
+      profile_condition: {type: str, required: true}    # validated against profile_condition_vocab
+      destination:       {type: str, required: false}   # file-backed placement only (placement_forms)
+      owner_role:        {type: str, required: false}   # file-backed placement only
+      mode:              {type: str, required: false}   # file-backed placement only; octal, validated against mode_pattern
+      trust_ref:         {type: str, required: false}   # optional CA/credential reference (-> catalog def when it names one)
+      producer_ref:      {type: str, required: false}   # canonical producer declaration (C/D owe the producer registry)
+      custody_ref:       {type: str, required: false}   # canonical custody/recovery declaration (C/D owe the custody registry)
+      lifecycle:         {type: str, required: false, vocab: [bootstrap, rotate, adopt, static]}
+      retention:         {type: str, required: false, vocab: [none, prior_revision, durable]}
+    # Obligation map keys MUST match this -- stable service-local names, never integers
+    # or empties (C1-MATERIAL-IDENTIFIER-AND-REFERENCE-VALIDATION).
+    obligation_id_pattern: '\A[a-z][a-z0-9_-]*\Z'
+    # Complete anchored octal mode -- \A...\Z rejects "0644\n" and " 0644"
+    # (C1-MATERIAL-MODE-TRAILING-NEWLINE).
+    mode_pattern: '\A[0-7]{3,4}\Z'
+    # Per-placement-form field requirements (value-pure; replaces mode/path dispatch
+    # embedded in Python -- codex-0515 value_purity). A file-backed form REQUIRES the
+    # path/owner/mode triple; the env form FORBIDS a fabricated path/mode.
+    placement_forms:
+      secrets: {requires: [destination, owner_role, mode], forbids: []}
+      config:  {requires: [destination, owner_role, mode], forbids: []}
+      mount:   {requires: [destination, owner_role, mode], forbids: []}
+      env:     {requires: [], forbids: [destination, mode]}
+    # profile_condition tokens: always | an enable flag | a db-profile. Declared here so
+    # an unknown condition FAILS (C1-MATERIAL-SEMANTIC-REFERENCE-CLOSURE); drift-checkable
+    # against lme_config_registry enable flags + the DB profile enum like lme_known_enable_flags.
+    profile_condition_vocab: [always, install_llm, install_elastic_services, install_otel, install_legacy_beats, offline_mode, shared-ha, dual-owned-ha]
+    # THE THREE empty-list cases (codex-0430 decision 2; C RESTORE-EMPTY-SECRET-PREFLIGHT).
+    # ALL THREE keys are REQUIRED and MUST be boolean true: an omitted key, a non-bool,
+    # or a value that would DISABLE a required failure (e.g. declared_none_passes:false)
+    # is an UNSUPPORTED policy and is REJECTED, never silently honored/ignored
+    # (C1-MATERIAL-REFERENCE-INPUT-AND-EMPTY-POLICY).
     empty_semantics:
       declared_none_passes: true              # explicit `material_requirements: {}` = legitimately requires none = PASS
       missing_field_fails: true               # a SELECTED service OMITTING the field = INCOMPLETE = FAIL (never implicitly empty)
@@ -327,14 +380,30 @@ lme_config_registry:
     reference_resolution:
       rule: >-
         Every material_requirement_ref (from datastore_clients, secrets or mounts) MUST
-        resolve to an obligation id declared here; a dangling ref is declared-but-unproduced
-        = FAIL before mutation. material_ref MUST resolve to a material_catalog definition.
+        resolve to an obligation id declared here; an UNRESOLVED reference is a
+        PRE-GENERATION CONFIGURATION error (a missing/invalid DECLARATION), distinct from
+        a valid declared production that legitimately yields an absent payload
+        (codex-0515 stage_and_evidence_corrections + material_stage_clarification: validate
+        the full plan BEFORE generation; keep desired/produced/installed/validated
+        distinct). material_ref MUST resolve to a material_catalog definition of a
+        DISTRIBUTABLE kind.
     enforcement_status:
-      loader_wired: false
+      # loader_wired = the production loader (load_manifests.yml) INVOKES the validator
+      # and EMITS lme_resolved.required_material on the live path. It is true once that
+      # wiring exists; it is NOT a claim of live-run/deploy acceptance.
+      loader_wired: true
+      # missing_field_enforced = arming missing_field_fails on EVERY selected service.
+      # Still FALSE: arming it now fails every current service (0/29 declare the field).
+      # It arms in the coordinated wave AFTER C/D/E author material_requirements. The
+      # projection emitter instead marks an undeclared-but-material-bearing service as
+      # status:undeclared (visible debt) WITHOUT failing it.
+      missing_field_enforced: false
+      # activation_qualified = a live loader run / deploy acceptance of the emitted
+      # projection. NOT established by the wiring wave; stays open.
+      activation_qualified: false
       note: >-
-        The DECLARATION schema + the value-pure validator are LIVE. Enforcing
-        missing_field_fails in the production loader is ARMED in the coordinated wave
-        AFTER C/D/E author material_requirements on every selected service -- arming it
-        now would fail every current service (none declares the field yet). C's
+        The DECLARATION schema, the value-pure validator AND the loader projection
+        emitter are LIVE (lme_resolved.required_material.<node>.<svc>.<obligation>). C's
         materializer PRODUCES against these records; D's completeness loop + restore/
-        rollback preflight VERIFY; F2's rollback gate CONSUMES the union.
+        rollback preflight VERIFY; F2's rollback gate CONSUMES the union. Arming
+        missing_field on all selected services + live-run acceptance remain deferred.

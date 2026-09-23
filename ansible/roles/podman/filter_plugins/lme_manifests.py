@@ -752,44 +752,195 @@ def lme_known_enable_flags(_ignored=None):
     return sorted(KNOWN_ENABLE_FLAGS)
 
 
-_MODE_RE = re.compile(r'^[0-7]{3,4}$')
+_MATERIAL_SUPPORTED_FIELD_TYPES = ('str', 'bool', 'int')  # record-field declared types
 
 
-def lme_validate_material_requirements(catalog, obligations, schema,
+def _require_material_catalog_schema(catalog_schema):
+    """Structural gate for the material_catalog SCHEMA. Returns
+    (definition_fields, kind_vocab, distributable_kinds)."""
+    if not isinstance(catalog_schema, dict):
+        raise ValueError('lme: material_catalog_schema must be a mapping')
+    definition = catalog_schema.get('definition')
+    if not isinstance(definition, dict) or not definition:
+        raise ValueError('lme: material_catalog_schema.definition has no fields')
+    kind_decl = definition.get('kind')
+    if not isinstance(kind_decl, dict) or not isinstance(kind_decl.get('vocab'), list) \
+            or not kind_decl['vocab']:
+        raise ValueError('lme: material_catalog_schema.definition.kind needs a non-empty vocab')
+    distributable = catalog_schema.get('distributable_kinds')
+    if not isinstance(distributable, list):
+        raise ValueError('lme: material_catalog_schema.distributable_kinds must be a list')
+    bad = [k for k in distributable if k not in kind_decl['vocab']]
+    if bad:
+        raise ValueError('lme: distributable_kinds %r are not in the kind vocab %r'
+                         % (sorted(bad), sorted(kind_decl['vocab'])))
+    return definition, set(kind_decl['vocab']), set(distributable)
+
+
+def lme_validate_material_catalog(catalog, catalog_schema, context=None):
+    """Validate the shared `lme_global.material_catalog` against
+    `lme_global.material_catalog_schema` (C1-MATERIAL-CATALOG-DEFINITION-VALIDATION). A
+    null/empty definition, an absent/unknown `kind` or an absent/empty `payload_validity`
+    now FAIL -- previously bare catalog membership passed and a private-key definition was
+    indistinguishable from a public one. Value-pure: the required fields, kind vocab and
+    distributable set are READ from the schema. Returns the catalog on success."""
+    where = ' (catalog %r)' % (context,) if context else ''
+    definition, kind_vocab, _distributable = _require_material_catalog_schema(catalog_schema)
+    if not isinstance(catalog, dict):
+        raise ValueError('lme: material_catalog%s must be a mapping' % where)
+    for name, defn in catalog.items():
+        dwhere = '%s definition %r' % (where, name)
+        if not isinstance(defn, dict) or not defn:
+            raise ValueError('lme: material_catalog%s is null/empty -- a definition MUST '
+                             'declare kind + payload_validity' % dwhere)
+        for fname, fdecl in definition.items():
+            present = fname in defn
+            if not present:
+                if fdecl.get('required'):
+                    raise ValueError('lme: material_catalog%s missing required field %r'
+                                     % (dwhere, fname))
+                continue
+            val = defn[fname]
+            if fdecl.get('type') == 'str' and (not isinstance(val, str) or not val):
+                raise ValueError('lme: material_catalog%s field %r must be a non-empty '
+                                 'string, got %r' % (dwhere, fname, val))
+            vocab = fdecl.get('vocab')
+            if vocab and val not in vocab:
+                raise ValueError('lme: material_catalog%s field %r value %r not in vocab %r'
+                                 % (dwhere, fname, val, sorted(vocab)))
+        undeclared = [k for k in defn if k not in definition]
+        if undeclared:
+            raise ValueError('lme: material_catalog%s has undeclared field(s) %r'
+                             % (dwhere, sorted(undeclared)))
+    return catalog
+
+
+def _require_material_schema(schema):
+    """Structural gate for the material_requirements SCHEMA itself
+    (C1-MATERIAL-SCHEMA-VALIDATION): an empty record, an unsupported field type, an
+    incomplete/ill-typed empty_semantics policy, an absent id/mode pattern or an
+    under-declared placement_forms are REJECTED before any obligation is inspected.
+    Returns a normalized bundle the obligation loop consumes."""
+    if not isinstance(schema, dict):
+        raise ValueError('lme: material_requirements_schema must be a mapping')
+    record = schema.get('record')
+    if not isinstance(record, dict) or not record:
+        raise ValueError('lme: material_requirements_schema.record is empty/absent')
+    for fname, fdecl in record.items():
+        if not isinstance(fdecl, dict):
+            raise ValueError('lme: material_requirements_schema.record.%s is not a mapping' % fname)
+        if fdecl.get('type') not in _MATERIAL_SUPPORTED_FIELD_TYPES:
+            raise ValueError(
+                'lme: material_requirements_schema.record.%s declares unsupported/absent '
+                'type %r (supported: %r)' % (fname, fdecl.get('type'),
+                                             list(_MATERIAL_SUPPORTED_FIELD_TYPES)))
+        if 'vocab' in fdecl and (not isinstance(fdecl['vocab'], list) or not fdecl['vocab']):
+            raise ValueError('lme: material_requirements_schema.record.%s vocab must be a '
+                             'non-empty list' % fname)
+    id_pat = schema.get('obligation_id_pattern')
+    mode_pat = schema.get('mode_pattern')
+    if not isinstance(id_pat, str) or not isinstance(mode_pat, str):
+        raise ValueError('lme: material_requirements_schema needs str obligation_id_pattern '
+                         '+ mode_pattern')
+    placement_decl = record.get('placement_class', {})
+    placement_vocab = placement_decl.get('vocab') if isinstance(placement_decl, dict) else None
+    if not placement_vocab:
+        raise ValueError('lme: material_requirements_schema.record.placement_class needs a vocab')
+    forms = schema.get('placement_forms')
+    if not isinstance(forms, dict):
+        raise ValueError('lme: material_requirements_schema.placement_forms must be a mapping')
+    for pc in placement_vocab:
+        form = forms.get(pc)
+        if not isinstance(form, dict) or not isinstance(form.get('requires'), list) \
+                or not isinstance(form.get('forbids'), list):
+            raise ValueError('lme: placement_forms.%s must declare requires[] + forbids[]' % pc)
+    pcv = schema.get('profile_condition_vocab')
+    if not isinstance(pcv, list) or not pcv:
+        raise ValueError('lme: material_requirements_schema.profile_condition_vocab must be a '
+                         'non-empty list')
+    # empty_semantics: ALL three keys REQUIRED, each boolean true. A non-bool, an omitted
+    # key, or a value that DISABLES a required failure is an unsupported policy -> reject
+    # (C1-MATERIAL-REFERENCE-INPUT-AND-EMPTY-POLICY -- never silently honored/ignored).
+    required_policy = ('declared_none_passes', 'missing_field_fails', 'empty_contradicting_refs_invalid')
+    empty_sem = schema.get('empty_semantics')
+    if not isinstance(empty_sem, dict):
+        raise ValueError('lme: material_requirements_schema.empty_semantics must be a mapping')
+    unknown = [k for k in empty_sem if k not in required_policy]
+    if unknown:
+        raise ValueError('lme: empty_semantics has unsupported key(s) %r' % sorted(unknown))
+    for k in required_policy:
+        if k not in empty_sem:
+            raise ValueError('lme: empty_semantics is missing required policy %r' % k)
+        if empty_sem[k] is not True:
+            raise ValueError('lme: empty_semantics.%s=%r is an unsupported policy -- it would '
+                             'DISABLE a required failure; only `true` is supported'
+                             % (k, empty_sem[k]))
+    return {
+        'record': record,
+        'id_re': re.compile(id_pat),
+        'mode_re': re.compile(mode_pat),
+        'placement_vocab': set(placement_vocab),
+        'forms': forms,
+        'profile_condition_vocab': set(pcv),
+        'vocabs': {k: set(f['vocab']) for k, f in record.items() if f.get('vocab')},
+        'base_required': [k for k, f in record.items() if f.get('required')],
+        'form_fields': set(('destination', 'owner_role', 'mode')),
+    }
+
+
+def lme_validate_material_requirements(catalog, obligations, schema, catalog_schema,
                                        referenced_ids=None, context=None):
     """Validate ONE service's declared `material_requirements` against the shared
-    `lme_global.material_catalog` and the declared record schema
-    (`lme_config_registry.material_requirements_schema`). Value-pure: every field name,
-    required flag and vocabulary is READ from `schema`, never hardcoded here (the
-    filter-plugin literal ban). This is the SCHEMA_REQUIRED_MATERIAL enforcer
-    (codex-manager-material-and-membership-contract-decisions-20260923-0430 decision 1+2;
-    C convergence ack 0429; D b87f313 record_shape). It validates the DECLARATION shape +
-    reference resolution; the deploy-time "obligation declared but not produced" and
-    "decryptable-but-malformed payload" checks are the consumer's (C materializer /
-    D completeness) using the same catalog payload_validity.
+    `lme_global.material_catalog`, the record schema
+    (`lme_config_registry.material_requirements_schema`) and the catalog schema. Value-pure:
+    every field name, required flag, vocabulary, placement-form rule and pattern is READ
+    from the schemas, never hardcoded here (the filter-plugin literal ban). This is the
+    SCHEMA_REQUIRED_MATERIAL enforcer (codex-0430 decision 1+2). It validates the
+    DECLARATION shape + reference resolution; the deploy-time "obligation produced but
+    malformed" checks are the consumer's (C materializer / D completeness).
 
-    `obligations` is the service's material_requirements field value:
+    `obligations` (the service's material_requirements value):
       * None  -> the field is ABSENT. A SELECTED service omitting it is INCOMPLETE and
-                 RAISES (missing != implicitly-empty; codex-0430 decision 2). Callers
-                 that must tolerate an unselected service simply do not call this.
-      * {}    -> explicit declared-none. PASSES iff nothing references an obligation
-                 (an empty declaration that contradicts a cred/trust/mount ref is INVALID).
+                 RAISES (missing != implicitly-empty; codex-0430 decision 2). The
+                 projection emitter does NOT call this for an undeclared service (it marks
+                 status:undeclared instead) until missing_field is armed swarm-wide.
+      * {}    -> explicit declared-none. PASSES iff nothing references an obligation.
       * map   -> each obligation id -> a typed record validated against schema.record.
 
-    `referenced_ids` is the set/list of obligation ids that OTHER declarations
-    (datastore_clients.material_requirement_refs, secrets, mounts) point at; every one
-    MUST resolve to a declared obligation (a dangling ref = declared-but-unproduced =
-    FAIL before mutation). Returns the validated obligations map on success."""
+    `catalog_schema` supplies the kind vocab + distributable set: an obligation's
+    material_ref MUST resolve to a definition of a DISTRIBUTABLE kind, so a catalog NAME
+    alone cannot authorize private-material distribution
+    (C1-MATERIAL-CATALOG-DEFINITION-VALIDATION).
+
+    `referenced_ids` is the list/set/tuple of obligation ids OTHER declarations point at;
+    every one MUST resolve to a declared obligation. An UNRESOLVED reference is a
+    PRE-GENERATION CONFIG error (a missing/invalid declaration), NOT proof the payload was
+    not produced (codex-0515 stage_and_evidence_corrections). Returns the validated
+    obligations map on success."""
     where = ' for service %r' % (context,) if context else ''
-    if not isinstance(schema, dict) or not isinstance(schema.get('record'), dict):
-        raise ValueError('lme: material_requirements_schema has no record shape')
-    record_fields = schema['record']
-    empty_sem = schema.get('empty_semantics') or {}
-    refs = set(referenced_ids or [])
+    S = _require_material_schema(schema)
+    _def, _kind_vocab, distributable = _require_material_catalog_schema(catalog_schema)
+    catalog = catalog or {}
+    empty_sem = schema['empty_semantics']
+
+    # referenced_ids input type: only None / list / tuple / set of ids -- a bare string
+    # (-> set of chars) or a mapping (-> set of keys) is malformed
+    # (C1-MATERIAL-REFERENCE-INPUT-AND-EMPTY-POLICY).
+    if referenced_ids is None:
+        refs = set()
+    elif isinstance(referenced_ids, (list, tuple, set)):
+        bad = [r for r in referenced_ids if not isinstance(r, str) or not r]
+        if bad:
+            raise ValueError('lme: referenced_ids%s contains non-string/empty id(s) %r'
+                             % (where, bad))
+        refs = set(referenced_ids)
+    else:
+        raise ValueError('lme: referenced_ids%s must be a list/tuple/set of ids, got %r'
+                         % (where, type(referenced_ids).__name__))
 
     # --- the three empty-list cases (codex-0430 decision 2) ---------------------
     if obligations is None:
-        if empty_sem.get('missing_field_fails', True):
+        if empty_sem['missing_field_fails']:
             raise ValueError(
                 'lme: material_requirements is MISSING%s -- a selected service must '
                 'declare the field (explicit {} for declared-none); omission is '
@@ -799,7 +950,7 @@ def lme_validate_material_requirements(catalog, obligations, schema,
         raise ValueError('lme: material_requirements%s must be a mapping, got %r'
                          % (where, type(obligations).__name__))
     if not obligations:
-        if refs and empty_sem.get('empty_contradicting_refs_invalid', True):
+        if refs and empty_sem['empty_contradicting_refs_invalid']:
             raise ValueError(
                 'lme: material_requirements%s is declared-none ({}) but obligation '
                 'reference(s) %r point at it -- an empty declaration contradicting '
@@ -807,47 +958,92 @@ def lme_validate_material_requirements(catalog, obligations, schema,
         return {}
 
     # --- typed record validation ----------------------------------------------
-    vocabs = {k: set(f['vocab']) for k, f in record_fields.items() if f.get('vocab')}
     for oid, rec in obligations.items():
         rwhere = '%s obligation %r' % (where, oid)
+        # obligation id (map key): stable service-local name, never an int/empty.
+        if not isinstance(oid, str) or not S['id_re'].match(oid):
+            raise ValueError('lme: material_requirements%s id must match %r (a stable '
+                             'service-local name, never an integer/empty)'
+                             % (rwhere, schema['obligation_id_pattern']))
         if not isinstance(rec, dict):
             raise ValueError('lme: material_requirements%s is not a mapping' % rwhere)
-        for fname, fdecl in record_fields.items():
-            present = fname in rec
-            if not present:
-                if fdecl.get('required'):
-                    raise ValueError('lme: material_requirements%s missing required '
-                                     'field %r' % (rwhere, fname))
-                continue
-            val = rec[fname]
-            if fdecl.get('type') == 'str' and not isinstance(val, str):
-                raise ValueError('lme: material_requirements%s field %r must be a '
-                                 'string, got %r' % (rwhere, fname, val))
-            if fname in vocabs and val not in vocabs[fname]:
-                raise ValueError('lme: material_requirements%s field %r value %r not '
-                                 'in declared vocab %r' % (rwhere, fname, val,
-                                                           sorted(vocabs[fname])))
-        undeclared = [k for k in rec if k not in record_fields]
+        undeclared = [k for k in rec if k not in S['record']]
         if undeclared:
             raise ValueError('lme: material_requirements%s has undeclared field(s) %r'
                              % (rwhere, sorted(undeclared)))
-        # material_ref MUST resolve to a catalog payload definition.
-        mref = rec.get('material_ref')
-        if mref is not None and mref not in (catalog or {}):
-            raise ValueError('lme: material_requirements%s material_ref %r resolves to '
-                             'no lme_global.material_catalog definition' % (rwhere, mref))
-        # mode, when declared a str, MUST be an octal string.
+        # base-required fields present + (for str) nonempty.
+        for fname in S['base_required']:
+            if fname not in rec:
+                raise ValueError('lme: material_requirements%s missing required field %r'
+                                 % (rwhere, fname))
+        # typed + vocab + nonempty per declared field.
+        for fname, fdecl in S['record'].items():
+            if fname not in rec:
+                continue
+            val = rec[fname]
+            if fdecl.get('type') == 'str':
+                if not isinstance(val, str):
+                    raise ValueError('lme: material_requirements%s field %r must be a '
+                                     'string, got %r' % (rwhere, fname, val))
+                if fdecl.get('required') and not val:
+                    raise ValueError('lme: material_requirements%s required field %r is '
+                                     'empty' % (rwhere, fname))
+            if fname in S['vocabs'] and val not in S['vocabs'][fname]:
+                raise ValueError('lme: material_requirements%s field %r value %r not in '
+                                 'declared vocab %r' % (rwhere, fname, val,
+                                                        sorted(S['vocabs'][fname])))
+        # placement-FORM conditional requires/forbids (C1-MATERIAL-CANONICAL-REFERENCE-SHAPE).
+        pc = rec['placement_class']
+        form = S['forms'][pc]
+        for fname in form['requires']:
+            if fname not in rec or not (isinstance(rec[fname], str) and rec[fname]):
+                raise ValueError('lme: material_requirements%s placement_class %r requires '
+                                 'a non-empty %r' % (rwhere, pc, fname))
+        for fname in form['forbids']:
+            if fname in rec:
+                raise ValueError('lme: material_requirements%s placement_class %r must NOT '
+                                 'declare %r (env-backed forms fabricate no file path/mode)'
+                                 % (rwhere, pc, fname))
+        # profile_condition semantic closure.
+        if rec['profile_condition'] not in S['profile_condition_vocab']:
+            raise ValueError('lme: material_requirements%s profile_condition %r not in the '
+                             'declared vocab %r' % (rwhere, rec['profile_condition'],
+                                                    sorted(S['profile_condition_vocab'])))
+        # mode (when a file-backed form declared it): complete anchored octal.
         mode = rec.get('mode')
-        if isinstance(mode, str) and not _MODE_RE.match(mode):
-            raise ValueError('lme: material_requirements%s mode %r is not an octal '
-                             'string (e.g. "0600")' % (rwhere, mode))
+        if isinstance(mode, str) and not S['mode_re'].match(mode):
+            raise ValueError('lme: material_requirements%s mode %r is not a complete octal '
+                             'string (e.g. "0600"); trailing/leading junk rejected'
+                             % (rwhere, mode))
+        # material_ref -> a catalog definition of a DISTRIBUTABLE kind. A catalog NAME
+        # alone (or a private_key kind) cannot authorize distribution.
+        mref = rec['material_ref']
+        if mref not in catalog:
+            raise ValueError('lme: material_requirements%s material_ref %r resolves to no '
+                             'lme_global.material_catalog definition' % (rwhere, mref))
+        kind = (catalog[mref] or {}).get('kind')
+        if kind not in distributable:
+            raise ValueError('lme: material_requirements%s material_ref %r has kind %r which '
+                             'is NOT distributable %r -- a catalog reference cannot authorize '
+                             'distributing private material' % (rwhere, mref, kind,
+                                                                sorted(distributable)))
+        # trust_ref, when it NAMES a catalog def, must resolve; producer/custody references
+        # are shape-validated now (nonempty str), their closure arms when C/D declare the
+        # producer/custody registries (C1-MATERIAL-LIFECYCLE-AND-RETENTION -- reported owed).
+        tref = rec.get('trust_ref')
+        if isinstance(tref, str) and tref and ':' not in tref and tref not in catalog \
+                and tref not in obligations:
+            raise ValueError('lme: material_requirements%s trust_ref %r resolves to no '
+                             'catalog definition or sibling obligation' % (rwhere, tref))
 
-    # --- reference resolution: every referenced obligation id must exist --------
-    dangling = sorted(r for r in refs if r not in obligations)
-    if dangling:
+    # --- reference resolution: every referenced obligation id must resolve ------
+    unresolved = sorted(r for r in refs if r not in obligations)
+    if unresolved:
         raise ValueError(
-            'lme: material_requirement_ref(s) %r%s resolve to no declared obligation '
-            '(declared-but-unproduced -- fail before mutation)' % (dangling, where))
+            'lme: material_requirement_ref(s) %r%s resolve to no declared obligation -- an '
+            'UNRESOLVED reference is a pre-generation configuration error (fail before '
+            'mutation), distinct from a valid declared production yielding an absent payload'
+            % (unresolved, where))
     return obligations
 
 
@@ -860,6 +1056,7 @@ class FilterModule(object):
             'lme_config_revision': lme_config_revision,
             'lme_known_enable_flags': lme_known_enable_flags,
             'lme_validate_material_requirements': lme_validate_material_requirements,
+            'lme_validate_material_catalog': lme_validate_material_catalog,
             'render_userns': render_userns,
             'userns_base': userns_base,
             'cert_owner': cert_owner,
