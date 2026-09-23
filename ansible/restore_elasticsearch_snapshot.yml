@@ -173,6 +173,34 @@
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
 
+    - name: Extract snapshot record from metadata (verify-before-destroy)
+      ansible.builtin.set_fact:
+        es_snapshot_record: >-
+          {{ (snapshot_metadata.json.snapshots | default([]))
+             | selectattr('snapshot', 'equalto', snapshot_name) | list | first
+             | default({}) }}
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Verify snapshot source is complete and non-empty before any destructive restore
+      ansible.builtin.assert:
+        that:
+          - es_snapshot_record | length > 0
+          - es_snapshot_record.state is defined
+          - es_snapshot_record.state == 'SUCCESS'
+          - (es_snapshot_record.indices | default([])) | length > 0
+        fail_msg: >-
+          Refusing to restore: snapshot '{{ snapshot_name }}' in repository '{{ es_snapshot_repo }}'
+          is missing, not in SUCCESS state
+          (state={{ es_snapshot_record.state | default('ABSENT') }}), or contains no indices
+          ({{ (es_snapshot_record.indices | default([])) | length }} found).
+          A partial, failed, incompatible, or empty snapshot must not overwrite live cluster state.
+        success_msg: >-
+          Snapshot '{{ snapshot_name }}' verified: state=SUCCESS,
+          {{ (es_snapshot_record.indices | default([])) | length }} indices present.
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
     - name: Build restore request body
       ansible.builtin.set_fact:
         es_snapshot_restore_body: >-
@@ -227,6 +255,34 @@
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
 
+    - name: Verify synchronous restore completed with no failed shards
+      ansible.builtin.assert:
+        that:
+          - snapshot_restore_result.json.snapshot is defined
+          - (snapshot_restore_result.json.snapshot.shards.failed | int) == 0
+          - (snapshot_restore_result.json.snapshot.shards.successful | int) > 0
+        fail_msg: >-
+          Restore of snapshot '{{ snapshot_name }}' reported failed shards or restored nothing:
+          failed={{ snapshot_restore_result.json.snapshot.shards.failed | default('?') }},
+          successful={{ snapshot_restore_result.json.snapshot.shards.successful | default('?') }}.
+          An HTTP 200 from _restore does not by itself mean the data was restored.
+        success_msg: >-
+          Restore accepted:
+          {{ snapshot_restore_result.json.snapshot.shards.successful }} shards restored, 0 failed.
+      when: wait_for_completion | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Verify asynchronous restore was accepted by the cluster
+      ansible.builtin.assert:
+        that:
+          - (snapshot_restore_result.json.accepted | default(false)) | bool
+        fail_msg: >-
+          Asynchronous restore of snapshot '{{ snapshot_name }}' was not accepted by the cluster.
+      when: not (wait_for_completion | bool)
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
     - name: Check cluster health after synchronous restore
       ansible.builtin.uri:
         url: "{{ local_es_url }}/_cluster/health?wait_for_no_relocating_shards=true&timeout=120s"
@@ -237,6 +293,21 @@
         validate_certs: false
         status_code: [200]
       register: post_restore_cluster_health
+      when: wait_for_completion | bool
+      run_once: true
+      delegate_to: "{{ groups['elasticsearch'][0] }}"
+
+    - name: Assert cluster is not red after synchronous restore
+      ansible.builtin.assert:
+        that:
+          - post_restore_cluster_health.json.status is defined
+          - post_restore_cluster_health.json.status != 'red'
+        fail_msg: >-
+          Cluster health is '{{ post_restore_cluster_health.json.status | default("unknown") }}'
+          after restoring snapshot '{{ snapshot_name }}'. A red cluster indicates the restore did
+          not produce a usable cluster state; refusing to report success or restart Kibana over it.
+        success_msg: >-
+          Post-restore cluster health: {{ post_restore_cluster_health.json.status }}.
       when: wait_for_completion | bool
       run_once: true
       delegate_to: "{{ groups['elasticsearch'][0] }}"
