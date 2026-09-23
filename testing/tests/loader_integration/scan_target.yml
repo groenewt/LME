@@ -1,16 +1,34 @@
 ---
 # testing/tests/loader_integration/scan_target.yml
 # One static_scan target = one regex over one entrypoint's pre-slurped lines.
-# `target` is the loop var; `case` is in scope. Appends one finding to scan_findings.
+# `target` is the loop var; `case` and `mode` are in scope. Appends one finding to scan_findings.
 #
-# A target with expect_present:true asserts the pattern IS present at this HEAD
-# (before-evidence: caller-composed default / play-var still there). When B/E remove
-# it, `found` flips to false and `ok` flips to false -> the case FAILs, which is the
-# acceptance signal that the play-default was removed. expect_present:false asserts a
-# forbidden pattern is already absent.
+# TWO expectations per target, so the SAME case gates in BOTH run modes without a
+# hand-edit at acceptance time (the defect this fixes: with a single expect_present,
+# acceptance could never go green because the before-state patterns are exactly what
+# B/C/D/E remove):
+#   expect_present   -- the BEFORE / design baseline: the pattern's presence at THIS HEAD.
+#                       mode=design gates every target against this. It is the self-proof
+#                       that the scan + representation execute and discriminate.
+#   accept_present   -- the AFTER / acceptance expectation: the pattern's REQUIRED presence
+#                       once B/C/D/E migrate the entrypoint to the C1 resolved-config
+#                       contract. mode=acceptance gates against this. Defaults to
+#                       expect_present when the post-migration state is unchanged.
+#   evidence_only:true -- the after-state is NOT confidently assertable yet (the exact
+#                       post-migration spelling is C1/B's to pin, e.g. lme_profile /
+#                       _render_*). Catalogue it as before-evidence but do NOT gate it in
+#                       acceptance mode. It is STILL gated in design mode (before-state known).
 - name: "scan {{ target.entrypoint }} :: {{ target.label }}"
   ansible.builtin.set_fact:
     _match_lines: "{{ (entrypoint_lines[target.entrypoint] | default([])) | map('trim') | select('search', target.pattern) | list }}"
+
+- name: "derive per-mode expectation {{ target.entrypoint }} :: {{ target.label }}"
+  ansible.builtin.set_fact:
+    _found: "{{ (_match_lines | length) > 0 }}"
+    _mode_acceptance: "{{ (mode | default('design')) == 'acceptance' }}"
+    _evidence_only: "{{ target.evidence_only | default(false) }}"
+    _expect_present: "{{ target.expect_present }}"
+    _accept_present: "{{ target.accept_present | default(target.expect_present) }}"
 
 - name: "record finding {{ target.entrypoint }} :: {{ target.label }}"
   ansible.builtin.set_fact:
@@ -20,9 +38,15 @@
            'entrypoint': target.entrypoint,
            'label': target.label,
            'pattern': target.pattern,
-           'expect_present': target.expect_present,
-           'found': ((_match_lines | length) > 0),
+           'mode': (mode | default('design')),
+           'expect_present': _expect_present,
+           'accept_present': _accept_present,
+           'evidence_only': _evidence_only,
+           'expected_for_mode': (_accept_present if _mode_acceptance else _expect_present),
+           'gated': ((not _mode_acceptance) or (not _evidence_only)),
+           'found': _found,
            'match_count': (_match_lines | length),
            'sample': (_match_lines[:4]),
-           'ok': (((_match_lines | length) > 0) == target.expect_present)
+           'ok': (true if (_mode_acceptance and _evidence_only)
+                  else (_found == (_accept_present if _mode_acceptance else _expect_present)))
          } ] }}
