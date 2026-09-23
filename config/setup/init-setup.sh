@@ -71,8 +71,15 @@ if [ -d "${CERTS_DIR}" ]; then
   # Public material (certs, chains) world-readable; private keys group-only; CA key owner-only.
   find "${CERTS_DIR}" -type f -name '*.key' -exec chmod 640 {} \;
   find "${CERTS_DIR}" -type f -not -name '*.key' -not -name '*.zip' -exec chmod 644 {} \;
-  # Zip bundles contain the CA and every service key; keep them owner-only (they double as idempotence sentinels).
+  # Zip bundles contain the CA signing key (ca.zip) and every service key (certs.zip),
+  # so they carry the SAME MITM material as ca/ca.key. Keep them 0600 AND owned by
+  # userns-root (0:0), OFF the elasticsearch service uid -- otherwise the ES service
+  # process (which mounts this whole workspace as `elasticsearch`) could `unzip -p
+  # ca.zip ca/ca.key` and recover the CA signing key, defeating the ca/ca.key carve-out
+  # below. Only userns-root (this script, as -f sentinels) and the host-root ansible
+  # cert layer (which rm's these to force regen) read the zips, so 0:0 is safe.
   find "${CERTS_DIR}" -maxdepth 1 -type f -name '*.zip' -exec chmod 600 {} \;
+  find "${CERTS_DIR}" -maxdepth 1 -type f -name '*.zip' -exec chown 0:0 {} \;
   # CA private key: OFF the elasticsearch service uid (owner -> userns-root) AND 0600.
   if [ -f "${CERTS_DIR}/ca/ca.key" ]; then
     chown 0:0 "${CERTS_DIR}/ca/ca.key"
