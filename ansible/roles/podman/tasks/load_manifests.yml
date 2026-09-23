@@ -85,26 +85,101 @@
          | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)
          | combine(lme_global_override | default({}), recursive=True) }}
 
-# Apply the profile's NON-FLAG vars as facts (es_discovery, tailscale_serve_*, ...).
-# The five ENABLE FLAGS are DELIBERATELY excluded here and resolved from scratch below
-# (defaults | profile | operator LAST) so that (a) an operator inventory/host_var/-e
-# override outranks the profile -- a profile set_fact would wrongly outrank inventory --
-# and (b) a flag absent from a newly-selected profile REVERTS to its default instead of
-# retaining a stale prior-load value. See "Resolve enable flags from scratch" below.
-- name: Apply profile NON-flag vars as facts
+# --- C1 caller-input contract: normalize inputs, resolve ONCE per load ---------
+# codex-manager-caller-contract-decisions-20260923-0200. Inputs arrive namespaced in
+# `lme_inputs` (selections + observations + origins). A NORMALIZED entrypoint
+# (site.yml pre_tasks) sets it from hostvars before the first load. An UN-NORMALIZED
+# entrypoint (upgrade_lme / elasticsearch / convert_to_cluster / the golden harness)
+# leaves it undefined; we AUTO-NORMALIZE once here from the bare variable scope -- which
+# catches -e, inventory AND include_role `vars:` (upgrade passes its detected flags that
+# way; role vars reach included tasks but not hostvars). The `when` guard captures on the
+# FIRST load ONLY, so a later load never re-reads the bridge facts written below (the
+# self-capture the old capture-once guard fought). This compat capture is the OPEN bridge
+# (codex completion_rule); its removal condition is B/E normalizing their entrypoints to
+# set lme_inputs themselves (with observations kept SEPARATE from operator selections).
+- name: Auto-normalize compat inputs into lme_inputs (only when the entrypoint did not)
+  ansible.builtin.set_fact:
+    lme_inputs:
+      selections: "{{ dict(_lme_sel_keys | zip(_lme_sel_keys | map('extract', vars) | list)) }}"
+      observations: {}
+      origins: "{{ dict(_lme_sel_keys | zip(['operator'] * (_lme_sel_keys | length))) }}"
+  vars:
+    _lme_reg_keys: "{{ _lme_global_file.lme_config_registry.fields.keys() | list }}"
+    _lme_sel_keys: "{{ _lme_reg_keys | select('in', vars) | list }}"
+  when: lme_inputs is not defined
+
+# Resolve every declared field by ITERATING registry.precedence into a NAMESPACED
+# result (resolved + origins + enable_flags). The pure resolver reads ONLY lme_inputs +
+# the profile overlay + the registry, so re-running it each load is self-capture-free.
+# RE-RUN each load (NOT cached): a profile switch or an explicit lme_inputs change on a
+# subsequent load is reflected (codex resolution_lifetime / Q2.7). Required-missing /
+# undeclared-key / type violations RAISE here, before any mutation.
+- name: Resolve config (pure engine; iterates registry.precedence; re-run each load)
+  ansible.builtin.set_fact:
+    _lme_resolution: >-
+      {{ _lme_global_file.lme_config_registry
+         | lme_resolve_config(
+             (_lme_profile_file.profile_overlay.vars | default({})),
+             (lme_inputs.selections | default({})),
+             (lme_inputs.observations | default({})),
+             (lme_inputs.origins | default({}))) }}
+
+# VALIDATE via the LITERAL shared task (also run by the C1 A1 regression case) BEFORE any
+# mutation. registry-FIRST pipe; the engine's shape gate makes a reversed argument fail
+# closed. This is the fail-open bug's fix (codex C1-VALIDATE-CALL / A1).
+- name: Validate the resolved config against the declared schema (fail-closed, pre-mutation)
+  ansible.builtin.include_tasks: validate_resolved_config.yml
+  vars:
+    _lme_validate_registry: "{{ _lme_global_file.lme_config_registry }}"
+    _lme_validate_resolved: "{{ _lme_resolution.resolved }}"
+
+# Publish the NAMESPACED outputs. lme_enable_flags comes straight from the engine (already
+# strict-bool-coerced) -- it is is_enabled()'s input, an OUTPUT name never read back as
+# operator input, so this is self-capture-free. lme_resolved_origins carries honest
+# provenance (a natively-selected value is labelled `operator`, never falsely extra_var).
+- name: Publish namespaced resolved config, origins and enable flags (OUTPUT names)
+  ansible.builtin.set_fact:
+    lme_resolved: "{{ _lme_resolution.resolved }}"
+    lme_resolved_origins: "{{ _lme_resolution.origins }}"
+    lme_enable_flags: "{{ _lme_resolution.enable_flags }}"
+
+# CONFIGURATION revision (codex revision_identity (b)): content-addressed over the
+# canonical declared/resolved config + ordered profile identities + schema version.
+# DETERMINISTIC across the several loader includes in one run (same inputs -> same id) and
+# EXCLUDING wall-clock / volatile observation timestamps / unrelated commits, so an
+# unchanged config never rewrites or restarts a healthy consumer. OUTPUT-ONLY: never fed
+# back as a resolution input. (Per-run EVIDENCE identity -- run id, digests, timestamps,
+# observations -- is a SEPARATE record; see the versioned-artifact follow-on.)
+- name: Compute the content-addressed configuration revision (deterministic; OUTPUT-ONLY)
+  ansible.builtin.set_fact:
+    lme_resolved_revision: >-
+      {{ {'schema_version': (_lme_global_file.lme_config_registry.schema_version | default(1)),
+          'ordered_profiles': _lme_profile_identities,
+          'resolved': _lme_resolution.resolved,
+          'origins': _lme_resolution.origins} | lme_config_revision }}
+  vars:
+    # ordered overlay identities + hashes are RETAINED even for the current single
+    # overlay (codex ordered_profiles). The multi-overlay chain merge is the declared
+    # follow-on; the resolver already accepts one merged mapping.
+    _lme_profile_identities:
+      - name: "{{ lme_profile }}"
+        sha256: "{{ lookup('file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | hash('sha256') }}"
+
+# OPEN DEBT (codex resolution_lifetime -- explicitly transitional, removed as consumer
+# migrations land; no parallel legacy backend at acceptance): materialize the resolved
+# values under their BARE names for consumers not yet migrated to read lme_resolved.*
+# (tailscale_serve_* in podman/tasks/main.yml + tailscale_*.yml; offline_mode in the
+# offline load tasks; install_llm / install_elastic_services in container_setup / main.yml
+# + site.yml:179/188; lme_consumer_profile). The loader NEVER reads a bare name as input
+# (it reads lme_inputs), so this cannot self-capture. Optional fields absent from
+# lme_resolved are NOT bridged (their readers use `| default`).
+- name: Bridge resolved values to bare facts for un-migrated consumers (OPEN debt)
   ansible.builtin.set_fact:
     "{{ item.key }}": "{{ item.value }}"
-  loop: "{{ (_lme_profile_file.profile_overlay.vars | default({})) | dict2items | rejectattr('key', 'in', _lme_flag_keys) | list }}"
+  loop: "{{ _lme_resolution.resolved | dict2items }}"
   loop_control:
     label: "{{ item.key }}"
-  vars:
-    _lme_flag_keys: [install_llm, install_elastic_services, offline_mode, install_otel, install_legacy_beats]
 
-# Assemble the flags dict that render_units.yml's is_enabled() consults. Defaults
-# recovered from the current role (install_llm default true; elastic-services and
-# offline default false). Runs AFTER the profile-vars set_fact so a profile (or an
-# operator -e) override flows in. is_enabled treats the 'always' sentinel as a
-# no-op, so unlisted flags never need an entry here.
 # Temporary failure boundary during canonical-engine reconciliation. This is an
 # implementation gap, not an operator prohibition or an alternate deployment path.
 - name: Reject selectors whose canonical composition is not yet integrated
@@ -124,58 +199,12 @@
       - lme_certs_source_host | default('') | length > 0
       - lme_service_overrides.dashboard.environment.ELASTICSEARCH_URL | default('') | length > 0
       - lme_service_overrides.dashboard.environment.LITELLM_URL | default('') | length > 0
-    fail_msg: Consumer profile requires topology-derived secret source, certificate authority and endpoints.
-  when: lme_consumer_profile | default(false) | strict_enable_bool
-
-# --- Enable-flag resolution (offline-stale + inventory-override defect fix) ----------
-# Precedence CONFIRMED by codex (extra-var > inventory/host_var > profile > default);
-# recomputed FROM SCRATCH each load (no combine-into-prior, no stale set_fact). Root
-# cause of both defects: the old code applied profile flags as top-level host facts,
-# which (a) outrank inventory (set_fact > inventory in Ansible) and (b) persist across
-# reloads. defaults/main.yml defines NONE of these five, so `is defined` on the FIRST,
-# uncontaminated load means the OPERATOR (inventory/host_var/-e) set it.
-- name: Capture operator flag overrides once (uncontaminated by any profile/prior-load fact)
-  ansible.builtin.set_fact:
-    _lme_operator_flags: >-
-      {{ {}
-         | combine({'install_llm': install_llm} if install_llm is defined else {})
-         | combine({'install_elastic_services': install_elastic_services} if install_elastic_services is defined else {})
-         | combine({'offline_mode': offline_mode} if offline_mode is defined else {})
-         | combine({'install_otel': install_otel} if install_otel is defined else {})
-         | combine({'install_legacy_beats': install_legacy_beats} if install_legacy_beats is defined else {}) }}
-  when: _lme_operator_flags is not defined
-
-- name: Resolve enable flags from scratch (defaults | profile | operator LAST)
-  ansible.builtin.set_fact:
-    _lme_resolved_flags: >-
-      {{ _lme_flag_defaults
-         | combine(_lme_profile_flags, recursive=True)
-         | combine(_lme_operator_flags | default({}), recursive=True) }}
-  vars:
-    _lme_flag_keys: [install_llm, install_elastic_services, offline_mode, install_otel, install_legacy_beats]
-    _lme_flag_defaults: {install_llm: true, install_elastic_services: false, offline_mode: false, install_otel: false, install_legacy_beats: true}
-    _lme_profile_flags: "{{ (_lme_profile_file.profile_overlay.vars | default({})) | dict2items | selectattr('key', 'in', _lme_flag_keys) | list | items2dict }}"
-
-# Materialize the resolved flags as bare facts so INSTALL-TIME consumers that read them
-# directly (main.yml / llama_cpp_setup.yml / load_offline_containers.yml, e.g.
-# `offline_mode | default(false)`) see the resolved value. This runs each load and
-# reflects the from-scratch resolution; the operator capture above is guarded so it is
-# NEVER re-read from these materialized facts.
-- name: Materialize resolved enable flags as bare facts
-  ansible.builtin.set_fact:
-    "{{ item.key }}": "{{ item.value }}"
-  loop: "{{ _lme_resolved_flags | dict2items }}"
-  loop_control:
-    label: "{{ item.key }}"
-
-- name: Assemble enable flags for is_enabled()
-  ansible.builtin.set_fact:
-    lme_enable_flags:
-      install_llm: "{{ _lme_resolved_flags.install_llm | strict_enable_bool }}"
-      install_elastic_services: "{{ _lme_resolved_flags.install_elastic_services | strict_enable_bool }}"
-      offline_mode: "{{ _lme_resolved_flags.offline_mode | strict_enable_bool }}"
-      install_otel: "{{ _lme_resolved_flags.install_otel | strict_enable_bool }}"
-      install_legacy_beats: "{{ _lme_resolved_flags.install_legacy_beats | strict_enable_bool }}"
+      # CR-E-5: log-analyzer runs on the trixie consumer and hardcodes the alias, so it
+      # needs the same topology-derived endpoints as dashboard.
+      - lme_service_overrides['log-analyzer'].environment.ELASTICSEARCH_URL | default('') | length > 0
+      - lme_service_overrides['log-analyzer'].environment.LITELLM_URL | default('') | length > 0
+    fail_msg: Consumer profile requires topology-derived secret source, certificate authority and endpoints for dashboard AND log-analyzer.
+  when: lme_resolved.lme_consumer_profile | default(false) | strict_enable_bool
 
 # GAP-3 host-scoping roster (lme_host_services): DELIBERATELY NOT assembled into a fact
 # here. It is an operator/host_vars-supplied list of service ids (host_vars/<host>.yml);
