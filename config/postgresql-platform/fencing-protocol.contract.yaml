@@ -546,11 +546,13 @@ contract:
   # STATUS: UNWIRED / PROPOSED. This section is ADDRESSED TO C for mutual ack. It
   # binds to C's DECLARED primitive at
   #   ansible/roles/secrets_distribution/vars/guardian_custody.yml#guardian_signing_interface
-  # (commit a33d08d; codex-0745 = useful proposal, NOT an implemented boundary and
-  # NOT yet a mutual ack). Integration is GATED on that mutual C/D ack AND on the
-  # guardian authority service existing (fail-closed / UNSTARTABLE today). NO unit
-  # template is authored this wave; C's custody repair (codex-0730 A1..A5) is in
-  # progress, so nothing here is wired to consume guardian_custody.yml yet.
+  # RE-PINNED to C's HANDED-BACK final interface (see binding_pin below): the committed
+  # guardian_custody.yml blob at commit 775af2e, full content sha256 45f18ce3...  (was the
+  # older ebc5e850/a33d08d proposal). codex-0745 was a useful proposal, NOT an implemented
+  # boundary; this is still NOT yet a mutual ack. Integration is GATED on that mutual C/D
+  # ack AND on the guardian authority service existing (fail-closed / UNSTARTABLE today).
+  # NO unit template is authored this wave; nothing here is wired to consume
+  # guardian_custody.yml yet.
   #
   # BOUNDARY (unchanged): reaching the key OR the socket is NOT authorization. A
   # signature is produced ONLY after D's authority protocol has CONSUMED an
@@ -559,7 +561,102 @@ contract:
   guardian_cd_binding:
     status: UNWIRED_PROPOSED_AWAITING_C_ACK
     consumes: ansible/roles/secrets_distribution/vars/guardian_custody.yml#guardian_signing_interface
+
+    # binding_pin -- the EXACT interface revision this binding is written against, so a later
+    # edit of guardian_custody.yml cannot silently move the boundary under an existing ack.
+    # Pinned to C's HANDED-BACK final interface. The pin is the COMMITTED blob (not the
+    # working tree, which has drifted while a C relaunch edits the file); mutual C/D ack is
+    # taken against this committed content, and any re-ack must re-pin.
+    binding_pin:
+      file: ansible/roles/secrets_distribution/vars/guardian_custody.yml
+      section: guardian_signing_interface
+      content_sha256: 45f18ce3de0365b246bf40ed59095a3df4768f9fafe9a2c8f507f3036332c1fe
+      pinned_commit: 775af2e   # last commit that set this blob; verified 775af2e:<file> == 764e99b:<file> == this sha256
+      supersedes_pin: ebc5e850de...   # the prior proposal revision (commit 59498ae)
+      working_tree_drift_note: >-
+        As authored, the working-tree blob is 239cf586... (a C relaunch is editing the file).
+        The ack is against the committed 45f18ce3 content; when C's edits land, D re-computes
+        the sha256 and re-pins before re-acking. Drift here is EXPECTED, not a failure.
+      ack_status: PROPOSED_AWAITING_C   # mutual ack = closure, not D's commit prose
     integration_gate: [mutual_C_D_interface_ack, guardian_authority_service_exists]
+
+    # (0) REQUIRED PRECISION -- the LEAD VIABILITY item (coordinator tick25). Before any
+    # authority-transition or recovery semantics can be stated without contradiction, three
+    # DISTINCT epoch/identity notions that the signing interface touches MUST be kept
+    # separate. Conflating any two of them is the root viability defect: it would let a key
+    # rotation, an authority handover, or a restore of old ciphertext silently authorize (or
+    # silently refuse) a transition. Names below are the ACTUAL fields of the pinned
+    # guardian_signing_interface (output_fields / trust_epoch_binding_input) and A2's
+    # recovery_store.wrapping_key_ref -- not invented.
+    required_precision:
+      item_1_three_epoch_identities:
+        status: DRAFT_AWAITING_C_ACK
+        leased_authority_epoch:
+          field: authority_epoch   # guardian_signing_interface.output_fields + trust_epoch_binding_input
+          owner: D_database
+          meaning: >-
+            The CURRENT authority lease held via D's control.sock (etcd leader/reservation +
+            lease + monotonic epoch). It answers "who is authorized to authorize a transition
+            RIGHT NOW". D mints/advances it; C NEVER mints it (guardian_signing_interface
+            not_owned_by_c). A signature is authorized under exactly one authority_epoch and D
+            rejects a returned epoch != the supplied one.
+          governs: authority-transition (promote/revoke/drain/permit-start), NOT key trust, NOT ciphertext age.
+        signing_key_identity_and_rotation:
+          field: guardian_pub_fingerprint   # output_fields; expected form = trust_epoch_binding_input.expected_pub_fingerprint
+          owner: C_custody   # C emits at bootstrap/rotation; D RECORDS the expectation and supplies it back
+          meaning: >-
+            SHA-256 of the guardian DER SubjectPublicKeyInfo public key -- the IDENTITY of the
+            key that produced a signature. Rotation changes THIS (a new keypair -> a new
+            fingerprint), independently of whether the authority lease changed. Trust = the
+            signing key's structurally-parsed fingerprint equals D's recorded expectation FOR
+            the current authority_epoch (precondition_epoch_binding).
+          governs: which signature bytes are trusted; a rotation is bound to a specific epoch (rotation_interleaving), it does NOT itself advance authority.
+          not_the_same_as: leased_authority_epoch   # a rotation may occur within one authority_epoch; an authority handover may occur without a rotation.
+        ciphertext_wrapping_epoch:
+          field: recovery_store.wrapping_key_ref   # AMENDMENT A2 (recovery_store), C custody owned
+          owner: C_custody
+          meaning: >-
+            The epoch/identity of the WRAP (key-encryption) key under which recovery-store /
+            backup ciphertext was encrypted at rest. It answers "which KEK can decrypt THIS
+            ciphertext", and it advances on wrap-key rotation while prior-epoch ciphertext is
+            preserved (guardian_custody wave-5c). It is NEITHER the signing-key identity NOR
+            the authority lease: old ciphertext stays decryptable under its own wrapping epoch
+            long after the signing key rotated and after many authority handovers.
+          governs: decryptability of recovered ciphertext, NOT authorization and NOT signature trust.
+        why_distinct: >-
+          A restore is the case that forces the separation: recovered ciphertext carries an
+          OLD ciphertext_wrapping_epoch; it must be decryptable under that old wrap epoch, yet
+          the restore action must be authorized under the CURRENT leased_authority_epoch and
+          any restore-authorization signature must verify against the CURRENT
+          signing_key_identity. Binding restore admission to the ciphertext's wrapping epoch,
+          or trusting a signature because the wrapping epoch matches, would be the viability
+          bug this item exists to forbid.
+      authority_transition_semantics:
+        status: DRAFT_AWAITING_C_ACK
+        transition_authorized_under: leased_authority_epoch   # the ONLY epoch that authorizes a transition
+        rule: >-
+          Every authority transition (promote | revoke | drain | permit-start | restart) is
+          authorized under the CURRENT leased_authority_epoch and serialized through the sole
+          engine path (serialization/revoke_interleaving above). A transition NEVER derives its
+          authority from a key fingerprint or a ciphertext wrapping epoch. A signature produced
+          under authority_epoch N is not valid for a transition claimed under epoch N+1
+          (d_side_acceptance), and single-use nonce CAS makes a since-revoked authorization
+          non-replayable.
+      recovery_semantics:
+        status: DRAFT_AWAITING_C_ACK
+        rule: >-
+          On recovery/restore: (1) admission is authorized under the CURRENT
+          leased_authority_epoch, never under the restored bundle's ciphertext_wrapping_epoch;
+          (2) restored ciphertext is decrypted under ITS OWN ciphertext_wrapping_epoch via the
+          independently-held wrapping key (recovery_store.wrapping_key_ref, A2), then MUST be
+          re-wrapped to the current wrapping epoch before it is treated as live custody; (3) any
+          restore-authorization signature is verified against the CURRENT signing_key_identity
+          (expected_pub_fingerprint) for the current authority_epoch -- a signature that only
+          verifies against a prior key is REFUSED. Absence of the authority is UNSTARTABLE, never
+          a default-allow (invariant below).
+        routed_open:
+          - "C: ACK that recovery_store.wrapping_key_ref is the SOLE carrier of ciphertext_wrapping_epoch and that prior-epoch wrap keys remain resolvable for decrypt-then-rewrap (wave-5c preserve-prior-epoch-ciphertext)."
+          - "D: the concrete restore-authorization signature seam is the same canonical_message binding (message_kind=authorize over a restore transition); it stays UNWIRED until the guardian authority service exists."
 
     # (1) The CANONICAL SIGNED MESSAGE BYTES D hands to C's signing primitive.
     # D constructs this; C signs the exact bytes and does NOT interpret them.
