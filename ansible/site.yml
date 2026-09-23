@@ -148,6 +148,38 @@
     - name: GLOBAL pre-mutation resolve+validate ALL-HOST barrier (fail-closed before any mutation)
       any_errors_fatal: true
       block:
+        # INVOCATION-BOUND EVIDENCE (C1-SERIAL-BARRIER-STALE-FACT-ACCEPTANCE, codex-0645 HIGH).
+        # Previously the barrier marked `_lme_prevalidated: true` (an UNVERSIONED boolean) and
+        # the all-host assert read every host's flag. A `true` carried from a PRIOR play in the
+        # same process satisfied the gate without THIS play having validated, and (in a serial
+        # batch) a valid peer could reach post-barrier tasks on stale evidence before an invalid
+        # peer validated. This mirrors E's elasticsearch.yml run-token gate: refuse any
+        # pre-supplied evidence, mint a per-invocation token, and record {token, revision} so a
+        # historical/injected/-e-pinned fact cannot satisfy the gate. NB the SERIAL/BATCHED
+        # ordering half (a valid batch mutating before a later batch validates) needs a separate
+        # validation-only pre-play across the FULL inventory -- that remains a declared C1
+        # residual (owner C1; G covers batching/reentry). The token closes the stale-FACT half.
+        - name: Barrier -- refuse pre-supplied / carried validation evidence (must be minted THIS run)
+          ansible.builtin.assert:
+            that:
+              - _lme_prevalidated is not defined
+              - _lme_site_barrier_run_token is not defined
+              # lme_resolved_revision + the operator-selection capture are OUTPUT facts the
+              # barrier's own load_manifests mints; an -e-pinned/carried value would forge the
+              # evidence AND (revision) the render-time parity comparison. Reject both here.
+              - lme_resolved_revision is not defined
+              - _lme_operator_selections is not defined
+            fail_msg: >-
+              _lme_prevalidated / _lme_site_barrier_run_token / lme_resolved_revision /
+              _lme_operator_selections must NOT be pre-supplied (-e) or carried from a prior play
+              -- the barrier mints its own per-invocation evidence and resolves its own revision.
+            quiet: true
+          tags: ['always']
+        - name: Barrier -- mint this invocation's validation token (run_once; shared to every host)
+          ansible.builtin.set_fact:
+            _lme_site_barrier_run_token: "site-barrier-{{ lookup('pipe', 'date +%s%N') }}-{{ 999999999 | random }}"
+          run_once: true
+          tags: ['always']
         - name: Resolve+validate declared config + service/trust projections (per host)
           ansible.builtin.include_role:
             name: podman
@@ -155,25 +187,31 @@
             apply:
               tags: ['always']
           tags: ['always']
-        - name: Mark this host's pre-mutation validation complete
+        - name: Mark this host's pre-mutation validation complete (bound to token + resolved revision)
           ansible.builtin.set_fact:
-            _lme_prevalidated: true
+            _lme_prevalidated:
+              token: "{{ _lme_site_barrier_run_token }}"
+              revision: "{{ lme_resolved_revision }}"
           tags: ['always']
-        - name: ALL-HOST BARRIER -- every targeted host must validate before any peer mutates
+        - name: ALL-HOST BARRIER -- every targeted host validated THIS invocation before any peer mutates
           ansible.builtin.assert:
             that:
               # no targeted host was dropped by a validation failure ...
               - (ansible_play_hosts_all | difference(ansible_play_hosts)) | length == 0
-              # ... and every surviving targeted host set the validated fact.
+              # ... and EVERY surviving targeted host recorded evidence bound to THIS run's token
+              # AND carrying a resolved revision (a host that errored has no fact -> {} -> drops).
               - >-
-                (ansible_play_hosts
-                 | map('extract', hostvars, '_lme_prevalidated')
-                 | select('equalto', true) | list | length)
-                == (ansible_play_hosts | length)
+                (ansible_play_hosts | map('extract', hostvars)
+                 | map(attribute='_lme_prevalidated', default={})
+                 | selectattr('token', 'defined')
+                 | selectattr('token', 'equalto', _lme_site_barrier_run_token)
+                 | selectattr('revision', 'defined')
+                 | list | length) == (ansible_play_hosts | length)
             fail_msg: >-
-              pre-mutation validation did not succeed on every targeted host (failed/removed:
+              pre-mutation validation did not succeed on every targeted host for THIS invocation
+              (token {{ _lme_site_barrier_run_token }}; failed/removed:
               {{ ansible_play_hosts_all | difference(ansible_play_hosts) }}). No host proceeds
-              into a mutating role until the COMPLETE target set validates.
+              into a mutating role until the COMPLETE target set validates this run.
             quiet: true
           run_once: true
           tags: ['always']
