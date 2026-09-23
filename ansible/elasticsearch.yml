@@ -46,17 +46,27 @@
     # resolution inputs) has ONE source and the two plays cannot diverge.
     clone_directory: &lme_clone_directory "{{ clone_dir | default(playbook_dir + '/..') }}"
   tasks:
-    - name: Barrier -- reject a pre-supplied / carried validation token or evidence fact
+    - name: Barrier -- reject a pre-supplied / carried validation token, evidence or capture
       ansible.builtin.assert:
         that:
           # `-e` outranks set_fact and facts carry across plays; refuse either so an
           # injected or historical value can never masquerade as THIS run's evidence.
           - _lme_es_barrier_run_token is not defined
           - _lme_es_prevalidated is not defined
+          # Also refuse a carried resolver operator-selection capture. resolve.yml captures
+          # _lme_operator_selections ONCE (guarded `is not defined`) and reuses it every later
+          # load; a value carried from a PRIOR play in the same process would make the barrier
+          # validate a STALE capture. install.sh runs elasticsearch.yml as its OWN
+          # ansible-playbook process (install.sh:1037, Phase 2), so a fresh run never pre-sets
+          # it -- this only rejects a genuinely stale/injected capture. NB the WITHIN-invocation
+          # limitation (the Deploy play's own var scope is not re-captured) is the shared
+          # resolver's C1-CAPTURE-AND-ARTIFACT-COMPLETENESS, routed to C1, not closed here.
+          - _lme_operator_selections is not defined
         fail_msg: >-
-          _lme_es_barrier_run_token / _lme_es_prevalidated must NOT be pre-supplied (-e) or
-          carried from a prior play -- the barrier mints its own per-invocation evidence so a
-          historical or injected value cannot satisfy the gate.
+          _lme_es_barrier_run_token / _lme_es_prevalidated / _lme_operator_selections must NOT be
+          pre-supplied (-e) or carried from a prior play -- the barrier mints its own
+          per-invocation evidence and a pristine operator-selection capture, so a historical or
+          injected value cannot satisfy the gate.
         quiet: true
       tags: ['always']
 
@@ -211,13 +221,20 @@
     lme_skip_secret_creation: true
 
   pre_tasks:
-    # --- PARITY GATE (E-owned): the validated config MUST be the deployed config -------
-    # Re-resolve+validate on THIS host and prove the config the barrier play validated is
-    # byte-identical to the config being deployed: same per-invocation token AND same
-    # content-addressed resolved revision. Per-host (NOT run_once) so it still holds if a
-    # future change adds `serial:`. The re-run also re-bridges the resolved bare facts
-    # (offline_mode, install_llm, ...) that the ansible-core bootstrap tasks below read,
-    # now that offline_mode is no longer a shadowing play var. Runs FIRST so nothing
+    # --- PARITY GATE (E-owned): the validated config is STABLE into the deploy ---------
+    # Re-resolve+validate on THIS host and require the barrier's evidence to match: same
+    # per-invocation token AND same content-addressed resolved revision. WHAT THIS PROVES
+    # (honest scope): the manifest tree, the selected profile and the registry resolve to
+    # the SAME revision in the Deploy play as in the barrier play -- i.e. those inputs did
+    # not change between validation and deploy, and the barrier play actually ran this
+    # invocation. WHAT IT DOES NOT PROVE: full variable-scope identity. resolve.yml captures
+    # the operator selection scope ONCE (in the barrier play) and the re-run reuses it, so a
+    # registry field introduced ONLY in this play's var scope would not change the revision
+    # -- that is the shared resolver's C1-CAPTURE-AND-ARTIFACT-COMPLETENESS (routed to C1).
+    # This play deliberately introduces NO registry-field var (offline_mode was removed), so
+    # there is no such divergence today. Per-host (NOT run_once) so it still holds if a future
+    # change adds `serial:`. The re-run also re-bridges the resolved bare facts (offline_mode,
+    # install_llm, ...) the ansible-core bootstrap tasks below read. Runs FIRST so nothing
     # mutating in this play precedes it.
     - name: Parity -- re-resolve+validate this host's declared config (matches the barrier play)
       ansible.builtin.include_role:
