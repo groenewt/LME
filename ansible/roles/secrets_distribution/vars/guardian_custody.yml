@@ -63,15 +63,31 @@ guardian_custody_consumer_bind_mount_roots:
 guardian_custody_marker_name: guardian.verified-pair
 guardian_custody_receipt_name: guardian.custody-receipt
 
-# --- Encryption parameters (no AEAD on this toolchain: OpenSSL enc rejects GCM) -
-# Integrity is provided by (a) epoch+fingerprint bound into the KDF passphrase
-# (tamper/relabel/wrong-key -> decrypt fails by construction), (b) a structural
-# openssl pkey parse of the recovered key, and (c) a pub<->priv pair-verify.
-# RESIDUAL (hardening, joint review): authenticated encryption (encrypt-then-MAC
-# / AEAD once the toolchain supports it) over the ciphertext.
+# --- Encryption parameters ------------------------------------------------------
+# CORRECTION (codex-0730 C-CUSTODY-EPOCH-FINGERPRINT-PASSPHRASE-BINDING, HIGH,
+# CONFIRMED): the ORIGINAL ca2e93f claim that "epoch+fingerprint are bound into the
+# KDF passphrase (tamper/relabel/wrong-key -> decrypt fails by construction)" was
+# FALSE. OpenSSL `-pass file:` reads ONLY the FIRST LINE of the passphrase file
+# (/usr/share/man/man1/openssl-passphrase-options.1ssl.gz), so the epoch/fingerprint
+# appended on later lines had NO effect on the key, and the only epoch comparand was
+# the EDITABLE guardian.meta sidecar -- not an authenticated binding.
+# CORRECTED design (implemented in tasks/guardian_custody.yml repair wave):
+#   * the wrapping-key reference is a SINGLE-LINE hex/base64 secret (asserted), so
+#     `-pass file:` consumes it whole (a multi-line/binary key was silently truncated);
+#   * TRUST comes from guardian_custody_expected_pub_fingerprint -- a CONSUMED input on
+#     D's authority seam (alongside authority_epoch, A4), NOT the sidecar -- and recovery
+#     accepts a key ONLY if its structurally-parsed public fingerprint equals that
+#     independently-trusted expectation, then a pub<->priv pair-verify;
+#   * confidentiality is CBC+PBKDF2 (no AEAD via `openssl enc` on this toolchain).
+# RESIDUAL (hardening, joint review): an authenticated durable envelope
+# (openssl cms AuthEnvelopedData / encrypt-then-MAC) so a tampered ciphertext fails
+# BEFORE the fingerprint check, not only at it.
 guardian_custody_enc_cipher: aes-256-cbc
 guardian_custody_enc_pbkdf2_iter: 200000
 guardian_custody_enc_md: sha256
+# The wrapping key reference MUST be a single-line secret (hex or base64), because
+# `-pass file:` stops at the first newline; the task asserts this format.
+guardian_custody_wrapping_key_format: single_line_hex_or_base64
 
 # =============================================================================
 # DECLARED C -> D SIGNING INTERFACE (codex-0700 C/D boundary; coordinator
@@ -101,8 +117,16 @@ guardian_signing_interface:
     protocol: lease + reservation admission + nonce consumption). Possession of the key or
     reachability of the socket is NOT authorization.
   precondition_epoch_binding: >-
-    The caller-supplied authority_epoch MUST equal the epoch durably bound to the custody
-    blob (A3, guardian.meta). C refuses to sign under any other epoch (defense in depth).
+    The caller-supplied authority_epoch MUST equal the CONSUMED expected epoch on D's
+    authority seam, and the signing key's structurally-parsed public fingerprint MUST equal
+    the CONSUMED guardian_custody_expected_pub_fingerprint (D's recorded expectation), NOT the
+    editable guardian.meta sidecar (codex-0730 C-CUSTODY-EPOCH-FINGERPRINT-PASSPHRASE-BINDING:
+    the sidecar is not authoritative). C refuses otherwise (defense in depth).
+  trust_epoch_binding_input:
+    # THE concrete C<-D trust/epoch binding (codex-0700 asked C to record it): D records the
+    # fingerprint C emits at bootstrap/rotation and hands it back as an input to recovery/sign.
+    expected_pub_fingerprint: "D-recorded SHA-256 of the guardian DER public key (C emits at bootstrap/rotation; D stores + supplies back)"
+    authority_epoch: "D's current leased epoch (A4, consumed; C never mints it)"
   # WHERE the private half is read from (never distributed; signer-host-only).
   key_source: >-
     The signer-namespace runtime plaintext at
