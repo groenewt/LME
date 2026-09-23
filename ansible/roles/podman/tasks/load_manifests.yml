@@ -92,6 +92,28 @@
          | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)
          | combine(lme_global_override | default({}), recursive=True) }}
 
+# POLICY IS NOT AN OVERRIDE CHANNEL (v6.1, codex-1710 C1-COMPOSED-SCHEMA-WEAKENS-ITS-OWN-SECURITY-
+# POLICY -- invalid-policy control). The two material SCHEMAS are the security policy and are sourced
+# from the DECLARED _lme_global_file, so a schema override is silently IGNORED downstream. A silently
+# ignored security input is a false success (an operator/profile believes they set a policy that has no
+# effect). We REFUSE it at the door: neither the operator override nor a profile overlay may carry
+# material_catalog_schema / material_provision_schema. Profiles compose DATA only; policy lives in the
+# declared manifest. This is a channel refusal, NOT a whole-registry equality gate, and adds no policy
+# literal to the filter. Stock profiles do not carry these keys, so it is neutral (proven by neutrality).
+- name: "C1 -- refuse a material SCHEMA supplied through the override or profile channel (policy is declared-only)"
+  ansible.builtin.assert:
+    that:
+      - "'material_catalog_schema' not in (lme_global_override | default({}))"
+      - "'material_provision_schema' not in (lme_global_override | default({}))"
+      - "'material_catalog_schema' not in (_lme_profile_file.profile_overlay.lme_global | default({}))"
+      - "'material_provision_schema' not in (_lme_profile_file.profile_overlay.lme_global | default({}))"
+    fail_msg: >-
+      a material_catalog_schema / material_provision_schema was supplied through lme_global_override or a
+      profile overlay -- the material SCHEMAS are the security policy and are admitted ONLY from the
+      declared manifest (_lme_global_file). Recompose the DATA registries instead; policy is not an
+      override channel (C1 fix_3 / codex-1710 invalid-policy control).
+    quiet: true
+
 # Temporary failure boundary during canonical-engine reconciliation. This is an
 # implementation gap, not an operator prohibition or an alternate deployment path.
 - name: Reject selectors whose canonical composition is not yet integrated
@@ -417,17 +439,94 @@
 - name: C1 -- validate the material catalog on the loader path + reject override tampering (A2)
   ansible.builtin.assert:
     that:
-      - (lme_global.material_catalog | default({})) == (_lme_global_file.lme_global.material_catalog | default({}))
-      - (lme_global.material_catalog_schema | default({})) == (_lme_global_file.lme_global.material_catalog_schema | default({}))
+      # C1-COMPOSED-MATERIAL-DECLARATIONS-REJECTED (codex-1625): the loader legitimately
+      # composes base | profile overlay | operator override, so an ADMITTED difference from
+      # the base file is NOT by itself unauthorized -- a profile may declare different material
+      # placement/owner/consumer. We therefore do NOT compare the composed catalog to the base
+      # file. Instead we validate the ACTUAL composed (admitted) value against the schema + the
+      # security invariants, which reject the real attacks (relabelling a kind, widening the
+      # distributable set, an undeclared field, missing payload_validity) while ADMITTING
+      # authorized composition. lme_validate_material_catalog raises on any schema/security
+      # violation of the composed value; a bare int/bool type substitution on a security field
+      # is rejected by the type-strict checks inside the validator (is-True/is-False identity,
+      # non-boolean-int hop order, forbidden mode bits), not by a whole-registry equality gate.
+      #
+      # SCHEMA AUTHORITY IS BOUND TO THE DECLARED SOURCE, NOT EQUALITY-LOCKED (v6.1, codex-1710
+      # C1-COMPOSED-SCHEMA-WEAKENS-ITS-OWN-SECURITY-POLICY): the material_catalog_schema declares
+      # the kind vocab and the distributable set -- the security policy. It composes from the SAME
+      # lme_global_override as the DATA, so validating the composed value against the composed
+      # schema would let an operator relax the policy that admits their own value. We therefore
+      # source the SCHEMA from _lme_global_file.lme_global (the raw global.yml fact, which
+      # resolve.yml:72-73 binds byte-for-byte to the on-disk manifest and an -e _lme_global_file
+      # forgery is rejected there), exactly as this projection already sources
+      # material_requirements_schema from the non-composed _lme_global_file.lme_config_registry.
+      # No whole-registry equality gate and no private policy literal in the filter -- policy
+      # authority is the declared manifest; only the material_catalog DATA stays composable.
       - >-
-        (_lme_global_file.lme_global.material_catalog | default({})
-         | lme_validate_material_catalog(_lme_global_file.lme_global.material_catalog_schema)) is mapping
+        (lme_global.material_catalog | default({})
+         | lme_validate_material_catalog(_lme_global_file.lme_global.material_catalog_schema | default({}))) is mapping
     fail_msg: >-
-      the shared material_catalog / material_catalog_schema was changed by an
-      lme_global_override / profile overlay, or the declared catalog is schema-invalid (unknown
-      kind, missing payload_validity, undeclared field). The material security registry is
-      authored ONLY in manifests/global.yml -- an override must not relabel a kind or widen the
-      distributable set (C1-MATERIAL-CATALOG-DEFINITION-VALIDATION / A2).
+      the COMPOSED material_catalog is schema-invalid or breaks a security invariant (unknown
+      kind, missing payload_validity, undeclared field, a relabelled kind or a widened
+      distributable set). Authorized profile/operator composition is admitted; only a
+      schema/security violation of the admitted value is rejected
+      (C1-MATERIAL-CATALOG-DEFINITION-VALIDATION / A2).
+    quiet: true
+
+# C1-MATERIAL fix_3 -- validate the producer/custody registries + private-key material
+# provision THROUGH the consuming loader path (machine-validated + CONSUMED, not a descriptive
+# registry: codex C_TLS.follow_up). Same A2 shape as the catalog gate above: producer_registry /
+# custody_registry / material_provision / material_provision_schema are part of the material
+# SECURITY boundary, so the composed value MUST equal the declared file value (an override must
+# not add/relabel a producer or rebind custody), and the DECLARED provision must be schema-valid
+# (closure onto the catalog; a leaf key must be non-distributable; an all-host DESIRED custody
+# scope for a private key is rejected). loader_wired stays FALSE -- the per-service obligations
+# are NOT wired this fold; this gate consumes only the registries/provision.
+- name: C1 -- validate the producer/custody registries + material provision on the loader path (A2, fix_3)
+  ansible.builtin.assert:
+    that:
+      # C1-COMPOSED-MATERIAL-DECLARATIONS-REJECTED (codex-1625): as with the catalog gate, the
+      # producer/custody registries and the material provision are COMPOSED (base | profile |
+      # operator override), so a legitimate profile change to placement/owner/consumer must be
+      # ADMITTED. We do NOT equality-lock the composed registries to the base file. We validate
+      # the ACTUAL composed value against the schema + security invariants. The type-substitution
+      # concern that motivated C1-REGISTRY-TYPE-EQUALITY-BYPASS is closed INSIDE the validator on
+      # the composed value: ca_key_rule.non_publication is-True and .distributable is-False are
+      # identity checks (drift:1 / non_publication:1 style int/bool substitution on a security
+      # bool is rejected), custody hop order must be a non-boolean int (1.0 rejected), a private
+      # leaf mode may not grant leaf_mode_forbidden_mask bits (no widening), non-publication is
+      # enforced by REFERENCED MATERIAL IDENTITY (a renamed CA-alias leaf is rejected), and
+      # producer membership + the produced-private-key partition bind production to custody.
+      # An authorized overlay that only recomposes placement/owner/consumer passes all of these.
+      #
+      # SCHEMA AUTHORITY BOUND TO THE DECLARED SOURCE (v6.1, codex-1710 C1-COMPOSED-SCHEMA-
+      # WEAKENS-ITS-OWN-SECURITY-POLICY): the material_provision_schema IS the security policy (it
+      # declares the ceiling mask, the required CA owner, the vocabs and the typed record shapes).
+      # It composes from the SAME lme_global_override as the data, so validating the composed value
+      # against the composed schema let an operator set leaf_mode_forbidden_mask -> "0000" and then
+      # widen a mode. We do NOT equality-lock it (codex forbids restoring a whole-registry gate);
+      # instead the SCHEMA is sourced from _lme_global_file.lme_global (the raw global.yml fact,
+      # byte-bound to disk by resolve.yml:72-73), so an override cannot reach it. The DATA registries
+      # (material_catalog / producer / custody / material_provision) stay composed from lme_global.
+      - >-
+        (lme_global.material_catalog | default({})
+         | lme_validate_material_registries(
+             _lme_global_file.lme_global.material_catalog_schema | default({}),
+             lme_global.producer_registry | default({}),
+             lme_global.custody_registry | default({}),
+             lme_global.material_provision | default({}),
+             _lme_global_file.lme_global.material_provision_schema | default({}))) is mapping
+    fail_msg: >-
+      the COMPOSED producer/custody registries or material provision break a schema or security
+      invariant (a producer/custody/channel reference resolves to nothing, a leaf-key provision
+      references a distributable or non-publication material, a renamed leaf references a
+      non-publication material by identity, a producer does not produce the material a leaf
+      delivers, a leaf consumer is not a consumer of its terminal channel, a private-key
+      provision declares an all-host desired scope, a hop order is a bool/float, a private-key
+      mode grants forbidden bits, ca_key_rule.non_publication is not exactly true /
+      .distributable is not exactly false, or the produced-private-key partition is violated).
+      Authorized profile/operator composition is admitted; only a schema/security violation of
+      the admitted value is rejected (C1-MATERIAL fix_3 / A2).
     quiet: true
 
 # C1 -- compose the required_material / datastore / membership projections and MERGE them
@@ -452,9 +551,11 @@
          | combine(lme_services | lme_project_required_material(
                      inventory_hostname, lme_global.material_catalog,
                      _lme_global_file.lme_config_registry.material_requirements_schema,
-                     lme_global.material_catalog_schema, lme_enable_flags | default({}),
+                     _lme_global_file.lme_global.material_catalog_schema, lme_enable_flags | default({}),
                      lme_host_services | default([]),
-                     _lme_resolution.resolved | lme_validated_deployment_identity), recursive=True)
+                     _lme_resolution.resolved | lme_validated_deployment_identity,
+                     lme_global.producer_registry | default(None),
+                     lme_global.custody_registry | default(None)), recursive=True)
          | combine(lme_services | lme_project_datastore_clients(
                      inventory_hostname, lme_enable_flags | default({}),
                      lme_host_services | default([])), recursive=True)
@@ -499,9 +600,11 @@
            | combine(lme_services | lme_project_required_material(
                        inventory_hostname, lme_global.material_catalog,
                        _lme_global_file.lme_config_registry.material_requirements_schema,
-                       lme_global.material_catalog_schema, lme_enable_flags | default({}),
+                       _lme_global_file.lme_global.material_catalog_schema, lme_enable_flags | default({}),
                        lme_host_services | default([]),
-                       _lme_resolution.resolved | lme_validated_deployment_identity), recursive=True)
+                       _lme_resolution.resolved | lme_validated_deployment_identity,
+                       lme_global.producer_registry | default(None),
+                       lme_global.custody_registry | default(None)), recursive=True)
            | combine(lme_services | lme_project_datastore_clients(
                        inventory_hostname, lme_enable_flags | default({}),
                        lme_host_services | default([])), recursive=True)
@@ -520,6 +623,95 @@
       disagrees with its freshly recomputed value -- the canonical derived artifact must bind the
       COMPLETE composed state (C1-COMPLETE-RESOLVED-REVISION / C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
     quiet: true
+
+# C1 IDENTITY PROJECTION PRODUCER (codex-identity-and-authoring-correction-1500). Until now NO
+# loader set_fact derived lme_runtime_inventory -- only a test fixture set it -- so its
+# deployment_identity was an INDEPENDENTLY-supplied second source, not a projection of the
+# canonical lme_resolved.deployment_identity. Make the LOADER its single mechanical producer: a
+# STRICT projection. We PROJECT INTO an already-supplied runtime inventory (never fabricate the
+# container -- credential_materializer.yml requires run_id/hosts and would fail on a partial one)
+# and only when the canonical identity is PRESENT. When the canonical identity is ABSENT, a
+# runtime deployment_identity has NO canonical authority to project from, so it is NOT admitted:
+# the guard below REFUSES a present-but-uncanonical runtime identity (stale derived identity, or
+# an independently-supplied second source, cannot retain admission status). Only the fully
+# dormant case (no canonical AND no runtime identity supplied) passes untouched, which keeps the
+# neutral profiles neutral (C1-ABSENT-CANONICAL-IDENTITY-LEAVES-STALE-PROJECTION, codex-1625; the
+# earlier comment wrongly attributed a fallback permission to a MAIN consumer_limit -- MAIN1500
+# corrected that authority claim, so no such permission is asserted here). Config revision
+# (lme_resolved_revision) and observed native identity (e.g. cluster_uuid) stay SEPARATE -- this
+# projects ONLY deployment_identity. An inventory/host_var runtime identity is OVERRIDDEN by the
+# canonical (projection wins); an -e extra-var one cannot be overridden by set_fact, so the
+# read-back below fails closed if it disagrees. Entrypoints that run load_manifests before the
+# identity consumers get the strict projection; the credential_materializer L143-144
+# reject-on-mismatch remains the transitional guard for paths that reach a consumer without this
+# loader.
+- name: "C1 -- refuse a runtime-inventory identity with no canonical authority (absent-canonical fail-closed)"
+  ansible.builtin.assert:
+    that:
+      # A runtime deployment_identity may exist ONLY as a projection of the canonical resolved
+      # identity. If it is present while the canonical identity is ABSENT, it is stale or an
+      # independent second source and must NOT retain admission at the loader. The fully dormant
+      # case (no runtime identity supplied) is unaffected: this fires only when a runtime identity
+      # IS present. (Whether a given op is persistent/custody-selected is decided consumer-side --
+      # the loader has no persistent-op selector -- so the loader simply refuses an uncanonical
+      # runtime identity outright rather than claiming to know the op class.)
+      - lme_resolved.deployment_identity is defined
+    fail_msg: >-
+      lme_runtime_inventory.deployment_identity ({{ lme_runtime_inventory.deployment_identity | default('<undef>') }})
+      is present but the canonical lme_resolved.deployment_identity is ABSENT -- a runtime identity has no
+      canonical authority to project from and cannot retain admission at the loader (stale or
+      independently-supplied identity is refused before it reaches any consumer)
+      (C1-ABSENT-CANONICAL-IDENTITY-LEAVES-STALE-PROJECTION).
+    quiet: true
+  when:
+    - lme_runtime_inventory is defined
+    - lme_runtime_inventory is mapping
+    - lme_runtime_inventory.deployment_identity is defined
+- name: C1 -- reject a supplied runtime-inventory identity that disagrees with the canonical (pre-projection)
+  ansible.builtin.assert:
+    that:
+      # If a runtime inventory already carries a deployment_identity, it MUST agree (type-aware)
+      # with the canonical BEFORE we project -- so an inventory/host_var disagreement fails HERE
+      # rather than being silently overwritten by the set_fact below (which would blind the
+      # credential_materializer L143-144 reject-on-mismatch guard). The set_fact then only FILLS
+      # an absent key. -e extra-var disagreement is also caught here (the value is defined).
+      - (lme_runtime_inventory.deployment_identity is not defined) or ((lme_runtime_inventory.deployment_identity) | lme_type_aware_equal(lme_resolved.deployment_identity))
+    fail_msg: >-
+      a supplied lme_runtime_inventory.deployment_identity ({{ lme_runtime_inventory.deployment_identity | default('<undef>') }})
+      disagrees with the canonical lme_resolved.deployment_identity ({{ lme_resolved.deployment_identity }}) --
+      the runtime inventory is a read-only projection of the canonical resolved identity, never an
+      independent second source; fail-closed before projecting (C1 identity single-producer).
+    quiet: true
+  when:
+    - lme_resolved.deployment_identity is defined
+    - lme_runtime_inventory is defined
+    - lme_runtime_inventory is mapping
+
+- name: C1 -- produce lme_runtime_inventory.deployment_identity as a strict projection of lme_resolved (fill absent)
+  ansible.builtin.set_fact:
+    lme_runtime_inventory: >-
+      {{ lme_runtime_inventory | combine({'deployment_identity': lme_resolved.deployment_identity}) }}
+  when:
+    - lme_resolved.deployment_identity is defined
+    - lme_runtime_inventory is defined
+    - lme_runtime_inventory is mapping
+
+- name: "C1 -- read-back: the runtime-inventory identity is the canonical projection (reject -e disagreement)"
+  ansible.builtin.assert:
+    that:
+      - lme_runtime_inventory.deployment_identity is defined
+      - (lme_runtime_inventory.deployment_identity) | lme_type_aware_equal(lme_resolved.deployment_identity)
+    fail_msg: >-
+      lme_runtime_inventory.deployment_identity ({{ lme_runtime_inventory.deployment_identity | default('<undef>') }})
+      is not the canonical lme_resolved.deployment_identity ({{ lme_resolved.deployment_identity }}) -- the
+      runtime inventory is a read-only projection of the canonical resolved identity, never an
+      independent second source. An -e extra-var that disagrees with the canonical identity is
+      rejected here (set_fact cannot override it), fail-closed before any consumer reads it.
+    quiet: true
+  when:
+    - lme_resolved.deployment_identity is defined
+    - lme_runtime_inventory is defined
+    - lme_runtime_inventory is mapping
 
 # RENDER-TIME PARITY (C1-SERIAL-BARRIER-STALE-FACT-ACCEPTANCE). When the site.yml pre-mutation
 # barrier ran, it recorded _lme_prevalidated.{token,revision} for THIS host from ITS

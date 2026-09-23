@@ -1023,7 +1023,8 @@ def _require_material_schema(schema):
 
 
 def lme_validate_material_requirements(catalog, obligations, schema, catalog_schema,
-                                       referenced_ids=None, context=None):
+                                       referenced_ids=None, context=None,
+                                       producer_registry=None, custody_registry=None):
     """Validate ONE service's declared `material_requirements` against the shared
     `lme_global.material_catalog`, the record schema
     (`lme_config_registry.material_requirements_schema`) and the catalog schema. Value-pure:
@@ -1196,6 +1197,46 @@ def lme_validate_material_requirements(catalog, obligations, schema, catalog_sch
             elif tref not in catalog and tref not in obligations:
                 raise ValueError('lme: material_requirements%s trust_ref %r resolves to no '
                                  'catalog definition or sibling obligation' % (rwhere, tref))
+        # producer_ref / custody_ref closure (fix_3). SHAPE is validated above (present ->
+        # non-empty str). CLOSURE arms when the registries are SUPPLIED: the live loader path
+        # passes lme_global.{producer_registry,custody_registry}, so a present producer_ref
+        # MUST resolve to a producer_registry entry and a present custody_ref to a
+        # custody_registry entry. When a registry is NOT supplied the field stays shape-only
+        # -- the schema's DECLARED pre-arm contract ("producer_ref/custody_ref resolve against
+        # canonical producer/custody declarations ... reference closure arms when those
+        # declarations land"). No service declares material_requirements today (0/29), so this
+        # changes nothing on the current live path; it arms the reference for the names this
+        # fold introduces (certs_role / certs_workspace / certs_bundle_publish).
+        pref = rec.get('producer_ref')
+        if isinstance(pref, str) and pref and producer_registry is not None:
+            if pref not in producer_registry:
+                raise ValueError('lme: material_requirements%s producer_ref %r resolves to no '
+                                 'producer_registry entry' % (rwhere, pref))
+            # MEMBERSHIP (codex-1625 additional_partial_validation): existence of the producer
+            # is not enough -- the named producer MUST actually produce the material this
+            # obligation requires, exactly like the leaf-key producer-membership check. A
+            # producer_ref pointing at a real producer that does NOT list material_ref is a
+            # broken production relationship, not a valid reference.
+            _pref_produces = (producer_registry[pref] or {}).get('produces_materials') or []
+            if mref not in _pref_produces:
+                raise ValueError('lme: material_requirements%s producer_ref %r does not produce '
+                                 'material_ref %r (produces %r) -- producer existence is not a '
+                                 'production relationship' % (rwhere, pref, mref,
+                                                              sorted(_pref_produces)))
+        cref = rec.get('custody_ref')
+        if isinstance(cref, str) and cref and custody_registry is not None:
+            if cref not in custody_registry:
+                raise ValueError('lme: material_requirements%s custody_ref %r resolves to no '
+                                 'custody_registry entry' % (rwhere, cref))
+            # C-CORR-ES-CUSTODY-CHANNEL: the consuming service MUST be a declared consumer of
+            # the custody channel it references (elasticsearch -> certs_workspace; kibana /
+            # fleet-server -> certs_bundle_publish). context is the service id. This stops an
+            # obligation being GREEN on the WRONG channel (e.g. ES on the published bundle).
+            consumers = (custody_registry[cref] or {}).get('consumers') or []
+            if context is not None and context not in consumers:
+                raise ValueError('lme: material_requirements%s custody_ref %r does not list '
+                                 'consumer %r (declared consumers %r) -- wrong custody channel'
+                                 % (rwhere, cref, context, sorted(consumers)))
 
     # --- reference resolution: every referenced obligation id must resolve ------
     unresolved = sorted(r for r in refs if r not in obligations)
@@ -1206,6 +1247,463 @@ def lme_validate_material_requirements(catalog, obligations, schema, catalog_sch
             'mutation), distinct from a valid declared production yielding an absent payload'
             % (unresolved, where))
     return obligations
+
+
+def lme_type_aware_equal(a, b, context=None):
+    """Value-pure structural TYPE-AWARE equality (fix_3, C1-REGISTRY-TYPE-EQUALITY-BYPASS /
+    C1-TYPED-EQUALITY-MAPPING-KEYS codex-1625). Ordinary Jinja/Python == conflates 1 with True
+    and 0 with False (bool is an int subclass, and a Python dict collapses {True: x}/{1: x} and
+    {1: x}/{1.0: x} at the KEY level too), so a plain == would treat type substitutions as equal.
+    This DELEGATES to the single existing type-aware comparator `_leaf_equal`, which requires the
+    same canonical kind (bool distinguished from int, int from float) at EVERY leaf AND pairs
+    mapping keys TYPE-AWARELY ({True: x} != {1: x}, {1: x} != {1.0: x}). The earlier fix_3 v5
+    copy used set(keys)/b[k] and so reopened the key-level conflation this function exists to
+    close; it is removed in favour of the one engine (no second partially type-aware helper).
+    Used by the loader for scalar deployment_identity agreement; returns True only on exact
+    structural + type identity."""
+    return _leaf_equal(a, b)
+
+
+def _require_material_provision_schema(provision_schema):
+    """Structural gate for lme_global.material_provision_schema (fix_3). Returns the five
+    record sub-schemas + the compiled mode regex. Value-pure -- every required list / vocab
+    / pattern is READ from the schema, never hardcoded."""
+    if not isinstance(provision_schema, dict):
+        raise ValueError('lme: material_provision_schema must be a mapping')
+    parts = {}
+    for key in ('producer_record', 'custody_record', 'leaf_key_provision_record',
+                'custody_hop_record', 'ca_key_rule_record'):
+        part = provision_schema.get(key)
+        if not isinstance(part, dict) or not isinstance(part.get('required'), list) \
+                or not part['required']:
+            raise ValueError('lme: material_provision_schema.%s needs a non-empty '
+                             'required list' % key)
+        parts[key] = part
+    mode_pat = provision_schema.get('mode_pattern')
+    if not isinstance(mode_pat, str) or not mode_pat:
+        raise ValueError('lme: material_provision_schema.mode_pattern must be a non-empty '
+                         'string')
+    parts['mode_re'] = re.compile(mode_pat)
+    # leaf_mode_forbidden_mask (C1-COMPOSED-MATERIAL-DECLARATIONS-REJECTED codex-1625): the
+    # octal permission bits a delivered private-key leaf mode may NEVER grant, DECLARED as data
+    # (an octal string in the schema, never a bitmask literal in Python). This is the ABSOLUTE
+    # restrictiveness ceiling that replaces the removed whole-registry equality gate for the one
+    # security field that is a free-form string (mode) rather than an is-True/is-False bool: an
+    # override may legitimately recompose placement/owner/consumer, but it can never widen a
+    # private key past this mask (e.g. grant world read or group write).
+    mask = provision_schema.get('leaf_mode_forbidden_mask')
+    if not isinstance(mask, str) or not mode_pat or not parts['mode_re'].match(mask):
+        raise ValueError('lme: material_provision_schema.leaf_mode_forbidden_mask must be a '
+                         'complete octal string (e.g. "0027") matching mode_pattern')
+    parts['mode_forbidden_bits'] = int(mask, 8)
+    parts['mode_forbidden_mask'] = mask
+    # custody_mode_key_kinds (fix_3 v6.2, codex-1812 C1-CUSTODY-MODE-KIND-CLOSURE): the DECLARED
+    # classification of every custody channel mode KEY to a material_catalog KIND. This is policy
+    # (it lives in the schema, which the loader admits only from the declared source), not
+    # composed data: the private-material ceiling for a custody mode is chosen by this declared
+    # class, never by whether the mode key happens to also name a catalog id. Its values are
+    # checked against the catalog kind vocab by the caller (which holds the catalog schema).
+    mkk = provision_schema.get('custody_mode_key_kinds')
+    if not isinstance(mkk, dict) or not mkk:
+        raise ValueError('lme: material_provision_schema.custody_mode_key_kinds must be a '
+                         'non-empty mapping of custody mode key -> material kind')
+    for mk, mkind in mkk.items():
+        if not isinstance(mk, str) or not mk or not isinstance(mkind, str) or not mkind:
+            raise ValueError('lme: material_provision_schema.custody_mode_key_kinds entry '
+                             '%r: %r must map a non-empty string key to a non-empty kind string'
+                             % (mk, mkind))
+    parts['mode_key_kinds'] = mkk
+    return parts
+
+
+def _prov_required(entry, required, where):
+    """Every required field present and not None; a declared list/mapping field non-empty."""
+    if not isinstance(entry, dict) or not entry:
+        raise ValueError('lme: %s must be a non-empty mapping' % where)
+    for f in required:
+        if f not in entry or entry[f] is None:
+            raise ValueError('lme: %s missing required field %r' % (where, f))
+        if isinstance(entry[f], (list, dict)) and not entry[f]:
+            raise ValueError('lme: %s field %r is empty' % (where, f))
+
+
+def _prov_vocab(part, vocab_key, value, where):
+    """Membership against a schema-declared vocab. The vocab itself MUST be declared
+    (value-purity): an absent vocab is a schema error, not a silent pass."""
+    vocab = part.get(vocab_key)
+    if not isinstance(vocab, list) or not vocab:
+        raise ValueError('lme: material_provision_schema %r vocab is absent/empty' % vocab_key)
+    if value not in vocab:
+        raise ValueError('lme: %s value %r not in %s %r'
+                         % (where, value, vocab_key, sorted(vocab)))
+
+
+def lme_validate_material_registries(catalog, catalog_schema, producer_registry,
+                                     custody_registry, material_provision,
+                                     provision_schema, context=None):
+    """Validate the fix_3 producer/custody registries + the private-key material provision
+    (lme_global.{producer_registry,custody_registry,material_provision}) against
+    lme_global.material_provision_schema, with reference closure onto the shared
+    material_catalog. THIS is the machine validation that makes private-key production /
+    custody / placement CONSUMED in the single engine (codex C_TLS.follow_up: a descriptive
+    registry with no enforcement is NOT provision); it is invoked on the loader path
+    (load_manifests.yml A2 block), fail-closed pre-mutation. Value-pure: no host, uid or
+    secret byte is read; every required list, vocab and pattern is READ from the schema.
+    Returns material_provision on success.
+
+    Enforced:
+      * producer_registry: each entry carries producer_record.required; id matches id_pattern;
+        host_scope + reference_form in vocab; every produces_materials id resolves to a catalog
+        def.
+      * custody_registry: each entry carries custody_record.required; desired_host_scope in the
+        desired vocab (which OMITS every_host, so an all-host desired custody scope is rejected
+        for the channel); observed_host_scope + reference_form in vocab; drift is a boolean AND
+        drift == (observed != desired); consumers a non-empty list; every modes value a complete
+        octal; every modes KEY classified by the declared custody_mode_key_kinds (unknown /
+        aliased keys rejected; a key naming a catalog id must carry that material's kind) and
+        ceilinged by leaf_mode_forbidden_mask when its declared class is non-distributable;
+        non_publication ids resolve to catalog defs.
+      * leaf-to-channel kind closure: every channel a leaf key is delivered through must declare
+        a custody mode classified as that material's kind.
+      * leaf_key_provision: each entry carries leaf_key_provision_record.required; material
+        resolves to a catalog def of a NON-distributable (private_key) kind -- a leaf key can
+        never be a distributable obligation; producer -> producer_registry; every channel ->
+        custody_registry; delivery_mode + lifecycle in vocab; mode a complete octal;
+        host_scope in the leaf vocab, which DELIBERATELY omits every_host so an all-host
+        DESIRED custody scope for a private key is REJECTED (today's all-host replication is
+        observed behavior, never the target).
+      * ca_key_rule: carries ca_key_rule_record.required; material -> a private_key catalog
+        def; non_publication true; distributable false; carve_out carries carve_out_required;
+        conformance in vocab. It is a SEPARATE rule and MUST NOT appear in leaf_key_provision.
+    """
+    where = ' (%s)' % context if context else ''
+    P = _require_material_provision_schema(provision_schema)
+    _def, _kv, distributable = _require_material_catalog_schema(catalog_schema)
+    # Every declared custody mode-key class must be a real catalog KIND (closure of the policy
+    # map itself: a typo'd class can neither silently exempt nor silently ceiling a key).
+    _bad_classes = sorted(set(P['mode_key_kinds'].values()) - set(_kv))
+    if _bad_classes:
+        raise ValueError('lme: material_provision_schema.custody_mode_key_kinds classes %r are '
+                         'not in the material_catalog kind vocab %r'
+                         % (_bad_classes, sorted(_kv)))
+    catalog = catalog or {}
+    if not isinstance(producer_registry, dict) or not producer_registry:
+        raise ValueError('lme: producer_registry%s must be a non-empty mapping' % where)
+    if not isinstance(custody_registry, dict) or not custody_registry:
+        raise ValueError('lme: custody_registry%s must be a non-empty mapping' % where)
+    if not isinstance(material_provision, dict) or not material_provision:
+        raise ValueError('lme: material_provision%s must be a non-empty mapping' % where)
+
+    # --- producer_registry ------------------------------------------------------
+    prod_rec = P['producer_record']
+    for pid, entry in producer_registry.items():
+        pwhere = 'producer_registry.%s' % pid
+        _prov_required(entry, prod_rec['required'], pwhere)
+        idpat = prod_rec.get('id_pattern')
+        if isinstance(idpat, str) and idpat and not re.match(idpat, str(pid)):
+            raise ValueError('lme: %s id %r does not match id_pattern %r'
+                             % (pwhere, pid, idpat))
+        # map-key / record-id coherence: the mapping KEY is the record identity, so a record
+        # whose own id field names a DIFFERENT producer is incoherent -- reference existence
+        # alone is insufficient (codex still_required map-key/record-id coherence).
+        if entry.get('id') != pid:
+            raise ValueError('lme: %s.id %r does not equal its registry key %r -- the map key '
+                             'IS the record identity' % (pwhere, entry.get('id'), pid))
+        _prov_vocab(prod_rec, 'host_scope_vocab', entry['host_scope'], pwhere)
+        _prov_vocab(prod_rec, 'reference_form_vocab', entry['reference_form'], pwhere)
+        mats = entry['produces_materials']
+        if not isinstance(mats, list):
+            raise ValueError('lme: %s.produces_materials must be a list' % pwhere)
+        for mid in mats:
+            if mid not in catalog:
+                raise ValueError('lme: %s produces_materials %r resolves to no '
+                                 'material_catalog definition' % (pwhere, mid))
+
+    # --- custody_registry -------------------------------------------------------
+    # non_publication_materials: the material ids declared NEVER-published across every custody
+    # channel (union) PLUS the ca_key_rule material (added after ca_key_rule is validated). A
+    # leaf provision -- a publish-to-channel contract -- may NEVER reference a member of this
+    # set, checked by REFERENCED MATERIAL IDENTITY (not the leaf map KEY), which closes the
+    # renamed/aliased-leaf bypass (C1-CA-ALIAS-PROVISION-BYPASS).
+    non_publication_materials = set()
+    # channel id -> the set of DECLARED mode-key classes its modes cover (v6.2 kind closure);
+    # the leaf loop requires every delivery channel to classify the delivered material's kind.
+    channel_mode_kinds = {}
+    cust_rec = P['custody_record']
+    for cid, entry in custody_registry.items():
+        cwhere = 'custody_registry.%s' % cid
+        _prov_required(entry, cust_rec['required'], cwhere)
+        if entry.get('id') != cid:
+            raise ValueError('lme: %s.id %r does not equal its registry key %r -- the map key '
+                             'IS the record identity' % (cwhere, entry.get('id'), cid))
+        # desired_host_scope vocab OMITS every_host -> an all-host DESIRED custody scope is
+        # rejected for the channel itself (not only the leaf provision); today's all-host
+        # replication is recorded as observed_host_scope + drift, never blessed as desired.
+        _prov_vocab(cust_rec, 'desired_host_scope_vocab', entry['desired_host_scope'], cwhere)
+        _prov_vocab(cust_rec, 'observed_host_scope_vocab', entry['observed_host_scope'], cwhere)
+        _prov_vocab(cust_rec, 'reference_form_vocab', entry['reference_form'], cwhere)
+        if not isinstance(entry['consumers'], list) or not entry['consumers']:
+            raise ValueError('lme: %s.consumers must be a non-empty list' % cwhere)
+        if not isinstance(entry['drift'], bool):
+            raise ValueError('lme: %s.drift must be a boolean' % cwhere)
+        # drift MUST equal (observed != desired): a mislabelled channel (drift:false while
+        # observed diverges) cannot silently bless the divergence.
+        if entry['drift'] != (entry['observed_host_scope'] != entry['desired_host_scope']):
+            raise ValueError('lme: %s.drift %r disagrees with observed_host_scope %r != '
+                             'desired_host_scope %r' % (cwhere, entry['drift'],
+                             entry['observed_host_scope'], entry['desired_host_scope']))
+        if not isinstance(entry['modes'], dict) or not entry['modes']:
+            raise ValueError('lme: %s.modes must be a non-empty mapping' % cwhere)
+        for mk, mv in entry['modes'].items():
+            if not isinstance(mv, str) or not P['mode_re'].match(mv):
+                raise ValueError('lme: %s.modes[%r] %r is not a complete octal string'
+                                 % (cwhere, mk, mv))
+            # MODE-KEY KIND CLOSURE (fix_3 v6.2, codex-1812 C1-CUSTODY-MODE-KIND-CLOSURE). v6.1
+            # ceilinged a custody mode ONLY when its key was also a catalog id, so the real
+            # private-key channel key (a generic class key, not a catalog id) escaped the ceiling
+            # and could be widened to a world-readable mode. Now EVERY mode key must be classified
+            # by the DECLARED schema map custody_mode_key_kinds (policy, declared-source only):
+            #   * an unclassified / unknown / aliased key is REJECTED (no silent exemption);
+            #   * a key that is ALSO a catalog id must carry that material's own catalog kind as
+            #     its declared class (an alias cannot relabel a private key as a certificate);
+            #   * the ceiling is chosen by the DECLARED class: a non-distributable class is under
+            #     leaf_mode_forbidden_mask, a distributable class is not.
+            # No mode key or material identity is named in Python -- all of it is read from YAML.
+            mclass = P['mode_key_kinds'].get(mk)
+            if mclass is None:
+                raise ValueError('lme: %s.modes[%r] is not classified by '
+                                 'material_provision_schema.custody_mode_key_kinds %r -- an '
+                                 'unknown or aliased custody mode key cannot escape the '
+                                 'private-material ceiling'
+                                 % (cwhere, mk, sorted(P['mode_key_kinds'])))
+            if mk in catalog and (catalog[mk] or {}).get('kind') != mclass:
+                raise ValueError('lme: %s.modes[%r] is declared class %r but material_catalog '
+                                 '%r has kind %r -- a custody mode key naming a catalog material '
+                                 'must carry that material\'s own kind'
+                                 % (cwhere, mk, mclass, mk, (catalog[mk] or {}).get('kind')))
+            if mclass not in distributable and int(mv, 8) & P['mode_forbidden_bits']:
+                raise ValueError('lme: %s.modes[%r] %r grants bits forbidden for the '
+                                 'non-distributable class %r by '
+                                 'material_provision_schema.leaf_mode_forbidden_mask %r'
+                                 % (cwhere, mk, mv, mclass, P['mode_forbidden_mask']))
+            channel_mode_kinds.setdefault(cid, set()).add(mclass)
+        for npid in (entry.get('non_publication') or []):
+            if npid not in catalog:
+                raise ValueError('lme: %s.non_publication %r resolves to no material_catalog '
+                                 'definition' % (cwhere, npid))
+            non_publication_materials.add(npid)
+
+    # --- material_provision.ca_key_rule (validated BEFORE the leaf loop so its material joins
+    #     non_publication_materials; the renamed-leaf case is then caught by identity in the
+    #     leaf loop, and the explicit KEY-form control is retained after it) ---------
+    ca_rec = P['ca_key_rule_record']
+    ca = material_provision.get('ca_key_rule')
+    _prov_required(ca, ca_rec['required'], 'ca_key_rule')
+    ca_mid = ca['material']
+    if ca_mid not in catalog:
+        raise ValueError('lme: ca_key_rule material %r resolves to no material_catalog '
+                         'definition' % ca_mid)
+    if (catalog[ca_mid] or {}).get('kind') in distributable:
+        raise ValueError('lme: ca_key_rule material %r must be a NON-distributable private '
+                         'key' % ca_mid)
+    if ca['non_publication'] is not True:
+        raise ValueError('lme: ca_key_rule.non_publication must be true')
+    if ca['distributable'] is not False:
+        raise ValueError('lme: ca_key_rule.distributable must be false')
+    carve = ca['carve_out']
+    if not isinstance(carve, dict):
+        raise ValueError('lme: ca_key_rule.carve_out must be a mapping')
+    for f in (ca_rec.get('carve_out_required') or []):
+        if f not in carve or carve[f] is None:
+            raise ValueError('lme: ca_key_rule.carve_out missing required field %r' % f)
+    # The CA private key carve-out mode is under the SAME restrictiveness ceiling as a leaf key
+    # (codex-1625 + v6.1 self-found bypass): an override can never widen the CA key past
+    # leaf_mode_forbidden_mask. A NON-string or non-octal carve mode (e.g. an unquoted 0666 that
+    # YAML loads as the int 438, or "0644 " with trailing space) previously SKIPPED the ceiling
+    # silently -- it now RAISES, exactly like the leaf mode check.
+    _carve_mode = carve.get('mode')
+    if not isinstance(_carve_mode, str) or not P['mode_re'].match(_carve_mode):
+        raise ValueError('lme: ca_key_rule.carve_out.mode %r is not a complete octal string -- a '
+                         'non-string or trailing-junk carve mode cannot skip the restrictiveness '
+                         'ceiling' % (_carve_mode,))
+    if int(_carve_mode, 8) & P['mode_forbidden_bits']:
+        raise ValueError('lme: ca_key_rule.carve_out.mode %r grants bits forbidden by '
+                         'material_provision_schema.leaf_mode_forbidden_mask %r -- the CA '
+                         'private key mode cannot be widened by an override'
+                         % (_carve_mode, P['mode_forbidden_mask']))
+    # carve_out.owner: the CA private key MUST stay userns-root (the 0:0 CA-MITM ownership fix).
+    # The required owner is DECLARED in the ca_key_rule_record schema, which the loader sources
+    # from _lme_global_file.lme_global (byte-bound to the on-disk manifest by resolve.yml:72-73),
+    # so an override cannot reach it to both change the owner and relax the schema (codex-1710
+    # C1-COMPOSED-SCHEMA-WEAKENS-ITS-OWN-SECURITY-POLICY). Nothing validated owner before.
+    _req_owner = ca_rec.get('carve_out_owner')
+    if _req_owner is not None and carve.get('owner') != _req_owner:
+        raise ValueError('lme: ca_key_rule.carve_out.owner %r must be the declared CA-key owner %r '
+                         '(userns-root; an override cannot re-own the CA private key)'
+                         % (carve.get('owner'), _req_owner))
+    _prov_vocab(ca_rec, 'observed_host_scope_vocab', ca['observed_host_scope'], 'ca_key_rule')
+    _prov_vocab(ca_rec, 'conformance_vocab', ca['conformance'], 'ca_key_rule')
+    non_publication_materials.add(ca_mid)
+
+    # --- material_provision.leaf_key_provision ----------------------------------
+    leaf_rec = P['leaf_key_provision_record']
+    hop_rec = P['custody_hop_record']
+    leaves = material_provision.get('leaf_key_provision')
+    if not isinstance(leaves, dict) or not leaves:
+        raise ValueError('lme: material_provision.leaf_key_provision%s must be a non-empty '
+                         'mapping' % where)
+    leaf_material_owner = {}   # material id -> the ONE leaf key that delivers it
+    for lid, entry in leaves.items():
+        lwhere = 'leaf_key_provision.%s' % lid
+        _prov_required(entry, leaf_rec['required'], lwhere)
+        # material -> a catalog def of a NON-distributable (private_key) kind.
+        mid = entry['material']
+        if mid not in catalog:
+            raise ValueError('lme: %s material %r resolves to no material_catalog '
+                             'definition' % (lwhere, mid))
+        kind = (catalog[mid] or {}).get('kind')
+        if kind in distributable:
+            raise ValueError('lme: %s material %r has kind %r which IS distributable -- a '
+                             'leaf-key PROVISION must reference a NON-distributable private '
+                             'key, never a distributable material' % (lwhere, mid, kind))
+        # NON-PUBLICATION BY REFERENCED MATERIAL IDENTITY (C1-CA-ALIAS-PROVISION-BYPASS). A
+        # material declared non-publication (the ca_key_rule material or any custody
+        # non_publication id) may NEVER be delivered as a leaf key -- checked on
+        # entry['material'], NOT the leaf map KEY, so a renamed/aliased leaf entry
+        # ({sneaky_alias: {material: ca_key, ...}}) is rejected exactly like a leaf keyed
+        # ca_key. This is the identity enforcement the prior KEY-only check missed.
+        if mid in non_publication_materials:
+            raise ValueError('lme: %s material %r is declared NON-PUBLICATION (ca_key_rule / '
+                             'custody non_publication) and must NEVER be delivered as a leaf '
+                             'key -- a renamed leaf entry cannot bypass non-publication by '
+                             'referenced material identity' % (lwhere, mid))
+        # a private key is delivered by AT MOST ONE leaf (no double-custody of one key).
+        if mid in leaf_material_owner:
+            raise ValueError('lme: %s material %r is already delivered by leaf %r -- a private '
+                             'key is delivered by at most one leaf_key_provision entry'
+                             % (lwhere, mid, leaf_material_owner[mid]))
+        leaf_material_owner[mid] = lid
+        # producer -> producer_registry AND producer MEMBERSHIP: the declared producer must
+        # actually PRODUCE this material (reference existence alone is insufficient; codex
+        # still_required producer material membership).
+        producer = entry['producer']
+        if producer not in producer_registry:
+            raise ValueError('lme: %s producer %r resolves to no producer_registry entry'
+                             % (lwhere, producer))
+        prod_mats = producer_registry[producer].get('produces_materials') or []
+        if mid not in prod_mats:
+            raise ValueError('lme: %s material %r is not in producer %r produces_materials %r '
+                             '-- the declared producer must actually produce the material it '
+                             'delivers' % (lwhere, mid, producer, sorted(prod_mats)))
+        # channels: every channel resolves to a custody_registry entry (closure).
+        if not isinstance(entry['channels'], list) or not entry['channels']:
+            raise ValueError('lme: %s.channels must be a non-empty list' % lwhere)
+        for ch in entry['channels']:
+            if ch not in custody_registry:
+                raise ValueError('lme: %s channel %r resolves to no custody_registry entry'
+                                 % (lwhere, ch))
+            # KIND-TO-CHANNEL-MODE RELATIONSHIP (v6.2): a channel that carries this private key
+            # must declare a mode for the key's kind (via a classified mode key), so the
+            # private-material ceiling above actually governs the mode the key lands with on
+            # that channel -- a channel with no classified mode for the kind cannot carry it.
+            if kind not in channel_mode_kinds.get(ch, set()):
+                raise ValueError('lme: %s channel %r declares no custody mode classified as the '
+                                 'delivered material kind %r (classes %r) -- the channel mode '
+                                 'for this private material is unclassified'
+                                 % (lwhere, ch, kind, sorted(channel_mode_kinds.get(ch, set()))))
+        # TYPED ORDERED custody hops + residual locations (codex still_required: a channels
+        # list + a transits_controller boolean is NOT a typed custody-hop model). Each hop is
+        # an ordered {channel, order, residual_copy, host_scope, transits_controller} record;
+        # the ordered hop channel sequence MUST equal the channels closure list, order is a
+        # dense 1..N, residual_copy/transits_controller are real booleans, host_scope is in
+        # the declared vocab. This carries WHERE each residual copy lands (host_scope) and
+        # WHETHER it persists (residual_copy), per hop -- not a single opaque boolean.
+        hops = entry['custody_hops']
+        if not isinstance(hops, list) or not hops:
+            raise ValueError('lme: %s.custody_hops must be a non-empty ordered list' % lwhere)
+        hop_channels = []
+        for i, hop in enumerate(hops):
+            hwhere = '%s.custody_hops[%d]' % (lwhere, i)
+            _prov_required(hop, hop_rec['required'], hwhere)
+            if hop['channel'] not in custody_registry:
+                raise ValueError('lme: %s channel %r resolves to no custody_registry entry'
+                                 % (hwhere, hop['channel']))
+            if (not isinstance(hop['order'], int) or isinstance(hop['order'], bool)
+                    or hop['order'] != i + 1):
+                raise ValueError('lme: %s.order %r must be the dense 1-based INTEGER hop '
+                                 'position %d (a bool or a float such as 1.0 is rejected: '
+                                 'the declared type is a non-boolean int)'
+                                 % (hwhere, hop['order'], i + 1))
+            if not isinstance(hop['residual_copy'], bool):
+                raise ValueError('lme: %s.residual_copy must be a boolean' % hwhere)
+            if not isinstance(hop['transits_controller'], bool):
+                raise ValueError('lme: %s.transits_controller must be a boolean' % hwhere)
+            _prov_vocab(hop_rec, 'host_scope_vocab', hop['host_scope'], hwhere)
+            hop_channels.append(hop['channel'])
+        if hop_channels != list(entry['channels']):
+            raise ValueError('lme: %s.custody_hops channel order %r must equal the channels '
+                             'closure list %r' % (lwhere, hop_channels, list(entry['channels'])))
+        # terminal_channel: the LAST delivery hop, DECLARED as data (no channels[-1] literal in
+        # Python). It must be the last hop's channel, and the leaf CONSUMER must be a declared
+        # consumer of it -- consumer / terminal-channel coherence (codex still_required). This
+        # stops a leaf delivered GREEN on the wrong terminal channel.
+        term = entry['terminal_channel']
+        if term != hop_channels[-1]:
+            raise ValueError('lme: %s.terminal_channel %r must be the last custody hop channel '
+                             '%r' % (lwhere, term, hop_channels[-1]))
+        term_consumers = (custody_registry[term] or {}).get('consumers') or []
+        if entry['consumer'] not in term_consumers:
+            raise ValueError('lme: %s consumer %r is not a declared consumer of its terminal '
+                             'channel %r (consumers %r) -- wrong terminal custody channel'
+                             % (lwhere, entry['consumer'], term, sorted(term_consumers)))
+        _prov_vocab(leaf_rec, 'delivery_mode_vocab', entry['delivery_mode'], lwhere)
+        _prov_vocab(leaf_rec, 'lifecycle_vocab', entry['lifecycle'], lwhere)
+        # host_scope vocab DELIBERATELY omits every_host: an all-host DESIRED custody scope
+        # for a private key is rejected (today's all-host replication is observed, never the
+        # target). This is the machine enforcement of desired-vs-observed separation.
+        _prov_vocab(leaf_rec, 'host_scope_vocab', entry['host_scope'], lwhere)
+        mode = entry['mode']
+        if not isinstance(mode, str) or not P['mode_re'].match(mode):
+            raise ValueError('lme: %s mode %r is not a complete octal string' % (lwhere, mode))
+        # RESTRICTIVENESS CEILING (codex-1625 C1-COMPOSED-MATERIAL-DECLARATIONS-REJECTED). A
+        # delivered private key must not grant any bit the schema forbids (world r/w/x, group
+        # write). This is the absolute invariant that keeps an lme_global_override / profile
+        # overlay from WIDENING a leaf mode once the whole-registry equality gate is removed.
+        if int(mode, 8) & P['mode_forbidden_bits']:
+            raise ValueError('lme: %s mode %r grants permission bits forbidden for a delivered '
+                             'private key by material_provision_schema.leaf_mode_forbidden_mask '
+                             '%r -- an override may recompose placement/owner/consumer but may '
+                             'never widen a private-key mode' % (lwhere, mode,
+                                                                 P['mode_forbidden_mask']))
+
+    # --- CA/leaf separation (retained explicit KEY-form control) + PARTITION ------
+    # The identity check above already rejects any leaf REFERENCING ca_mid; retain the
+    # explicit key-form control (a leaf literally KEYED as the ca material) for clarity.
+    if ca_mid in leaves:
+        raise ValueError('lme: ca_key_rule material %r must NOT also be a leaf_key_provision '
+                         'entry -- the CA-key rule is SEPARATE from every leaf delivery '
+                         'contract (codex private_key_correction)' % ca_mid)
+    # PARTITION over PRODUCER RELATIONS (codex still_required): every NON-distributable
+    # (private-key) material a producer produces must be classified EXACTLY ONCE -- either
+    # delivered by a leaf (published to a channel) or declared non_publication -- never both,
+    # never neither. A produced private key that is neither is an unaccounted key; one that is
+    # both is a contradiction. This binds production to custody by material identity.
+    for pid, entry in producer_registry.items():
+        for mid in (entry.get('produces_materials') or []):
+            if (catalog[mid] or {}).get('kind') in distributable:
+                continue
+            in_leaf = mid in leaf_material_owner
+            in_np = mid in non_publication_materials
+            if in_leaf and in_np:
+                raise ValueError('lme: producer %r private key %r is BOTH a leaf delivery and '
+                                 'non_publication -- a private key cannot be both published to '
+                                 'a channel and non-publication' % (pid, mid))
+            if not in_leaf and not in_np:
+                raise ValueError('lme: producer %r produces private key %r but it is neither '
+                                 'delivered by a leaf_key_provision entry nor declared '
+                                 'non_publication -- every produced private key must be '
+                                 'classified exactly once' % (pid, mid))
+    return material_provision
 
 
 # ===========================================================================
@@ -1295,7 +1793,8 @@ def _selected_container_services(services, enable_flags, host_services):
 
 def lme_project_required_material(services, node, catalog, schema, catalog_schema,
                                   enable_flags=None, host_services=None,
-                                  deployment_identity=None):
+                                  deployment_identity=None, producer_registry=None,
+                                  custody_registry=None):
     """Emit lme_resolved.required_material.<node>.<svc>.<obligation> from each SELECTED
     container service's declared material_requirements, validated against the catalog +
     schema. Returns:
@@ -1326,7 +1825,8 @@ def lme_project_required_material(services, node, catalog, schema, catalog_schem
             refs.extend((binding or {}).get('material_requirement_refs') or [])
         validated = lme_validate_material_requirements(
             catalog, obl, schema, catalog_schema,
-            referenced_ids=(refs or None), context=sid)
+            referenced_ids=(refs or None), context=sid,
+            producer_registry=producer_registry, custody_registry=custody_registry)
         if validated:
             material.setdefault(node, {})[sid] = validated
         status.setdefault(node, {})[sid] = {
@@ -1879,6 +2379,8 @@ class FilterModule(object):
             'lme_known_enable_flags': lme_known_enable_flags,
             'lme_validate_material_requirements': lme_validate_material_requirements,
             'lme_validate_material_catalog': lme_validate_material_catalog,
+            'lme_validate_material_registries': lme_validate_material_registries,
+            'lme_type_aware_equal': lme_type_aware_equal,
             'lme_validate_deployment_identity': lme_validate_deployment_identity,
             'lme_validated_deployment_identity': lme_validated_deployment_identity,
             'lme_material_resource_id': lme_material_resource_id,

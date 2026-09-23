@@ -195,6 +195,74 @@ lme_global:
         The fencing guardian's PUBLIC signing key (F1). Published (never the private
         key) to each fenced proxy's config dir, and separately referenced where trust
         is pinned. The private key is NOT a catalog-distributable material.
+    # --- fix_3 TLS material definitions (the ES/Kibana/Fleet TLS surface; grounded from
+    #     ansible/roles/certs at b8095d0, per claude-C-TLS-catalog-...-1332 +
+    #     corrections-addendum-1338). Payload SEMANTICS ONLY (kind + payload_validity);
+    #     placement lives on the per-service obligation (certs) / the leaf_key_provision
+    #     entry (keys). Certificates are DISTRIBUTABLE; the *_key defs are kind
+    #     private_key -> NON-distributable, so NO material_requirements obligation may
+    #     material_ref them (fail-closed by construction). Their delivery is declared in
+    #     lme_global.material_provision.leaf_key_provision (ca_key: material_provision.
+    #     ca_key_rule), NEVER as an obligation. This fold catalogues ONLY the three-service
+    #     TLS surface; per-backend CA aliases, the LLM pack leaves and beats CA-only
+    #     consumers are OUT of scope (see material_provision.open_scope).
+    ca_cert:
+      kind: certificate
+      payload_validity: non_empty_pem_certificate
+      description: >-
+        Shared PUBLIC CA trust anchor (ca/ca.crt). Every server obligation's trust_ref
+        resolves to this bare name. NEVER the CA private key -- ca_key is a separate
+        non-distributable private_key def governed by material_provision.ca_key_rule.
+    elasticsearch_cert:
+      kind: certificate
+      payload_validity: non_empty_pem_certificate
+      description: >-
+        ES TRANSPORT leaf (xpack.security.transport.ssl.certificate),
+        elasticsearch/elasticsearch.crt. ONE shared leaf whose SANs cover every es_hosts
+        entry (instances.yml.j2 mints one 'elasticsearch' entry, not one leaf per node).
+    elasticsearch_chain:
+      kind: certificate
+      payload_validity: non_empty_pem_certificate_chain_to_ca
+      description: >-
+        ES HTTP leaf-first chain (xpack.security.http.ssl.certificate),
+        elasticsearch/elasticsearch.chain.pem. SPLIT from elasticsearch_cert on codex/
+        advisor guidance: a leaf-first chain has a DIFFERENT (chain-to-ca) validity than a
+        single transport leaf. NB non_empty_pem_certificate_chain_to_ca REFERENCES ca_cert
+        (a richer rule) -- it is an UNENFORCED name today (payload_validity rule registry
+        is OPEN debt, see material_provision.open_scope.payload_validity_rule_registry).
+    kibana_cert:
+      kind: certificate
+      payload_validity: non_empty_pem_certificate
+      description: Kibana SERVER_SSL_CERTIFICATE leaf (kibana/kibana.crt).
+    fleet_server_cert:
+      kind: certificate
+      payload_validity: non_empty_pem_certificate
+      description: Fleet FLEET_SERVER_CERT leaf (fleet-server/fleet-server.crt).
+    ca_key:
+      kind: private_key
+      payload_validity: non_empty_pem_private_key
+      description: >-
+        CA signing key (ca/ca.key). NON-distributable. Governed by
+        material_provision.ca_key_rule (non-publication + the 0:0/0600 workspace carve-out);
+        it is NOT a leaf provision entry, and its rule does NOT constrain leaf-key delivery.
+    elasticsearch_key:
+      kind: private_key
+      payload_validity: non_empty_pem_private_key
+      description: >-
+        ES leaf private key (elasticsearch/elasticsearch.key). NON-distributable; delivered
+        via material_provision.leaf_key_provision.elasticsearch_key (certs_workspace).
+    kibana_key:
+      kind: private_key
+      payload_validity: non_empty_pem_private_key
+      description: >-
+        Kibana leaf private key (kibana/kibana.key). NON-distributable; delivered via
+        material_provision.leaf_key_provision.kibana_key (TWO-HOP: workspace residual + bundle).
+    fleet_server_key:
+      kind: private_key
+      payload_validity: non_empty_pem_private_key
+      description: >-
+        Fleet leaf private key (fleet-server/fleet-server.key). NON-distributable; delivered
+        via material_provision.leaf_key_provision.fleet_server_key (TWO-HOP: workspace residual + bundle).
     # EXTENSION CONTRACT (reviewed here; sole writer C1): C adds certificate /
     # private_key(host-local, non-distributable) / password_file / json / conf payload
     # definitions for credential material; D adds DB replicator/etcd cert + pgpass
@@ -219,6 +287,226 @@ lme_global:
     # Kinds an obligation MAY reference (material distributed to a consumer). A kind
     # NOT listed here (e.g. private_key) is host-local / non-distributable.
     distributable_kinds: [public_key, certificate, password_file, json, conf, pgpass, dsn]
+
+  # --- fix_3 producer registry (producer_ref targets) --------------------------
+  # The CANONICAL producers of catalog materials. A material_requirements obligation's
+  # producer_ref, and a leaf_key_provision entry's producer, resolve to a BARE name here
+  # (reference_closure armed by lme_validate_material_registries on the loader path). This
+  # lands the registry codex-1300 flagged as owed; content grounded from ansible/roles/certs
+  # (claude-C-TLS-...-1332 section 2), host_scope vocab aligned to C's 1410 schema. Authored
+  # ONLY here (C1 sole writer of lme_global); an override must not add/relabel a producer (A2
+  # file-equality gate in load_manifests.yml).
+  producer_registry:
+    certs_role:
+      id: certs_role
+      implementation: ansible/roles/certs (lme-setup-certs oneshot -> config/setup/init-setup.sh)
+      host_scope: source_host               # runs ONCE on the cert SOURCE host (first ES-group host; degenerate self on single-node)
+      produces_materials:                   # each MUST resolve to a material_catalog def (closure)
+        - ca_cert
+        - ca_key
+        - elasticsearch_cert
+        - elasticsearch_chain
+        - elasticsearch_key
+        - kibana_cert
+        - kibana_key
+        - fleet_server_cert
+        - fleet_server_key
+      reference_form: bare_name
+
+  # --- fix_3 custody registry (custody_ref / delivery-channel targets) ----------
+  # The TWO delivery channels, with the desired/observed/drift split adopted from C's 1410
+  # schema. DESIRED custody scope is consumer_host; TODAY's all-host replication + controller
+  # transit is recorded as observed_host_scope: every_host + drift: true -- RECORDED, never
+  # blessed as the target (codex: do not make current all-host replication the desired scope).
+  # The schema's desired_host_scope_vocab OMITS every_host, so an all-host DESIRED scope is
+  # rejected by construction for the channel too (not only the leaf). transits_controller
+  # records the 1338 controller-slurp of ALL leaf keys + ca_key. Content grounded from certs
+  # main.yml (1332 section 3 + 1338 corr 2). Cert PLACEMENTS stay OFF this registry -- placement
+  # lives on the per-service obligation (schema contract); only the non-distributable KEY
+  # provision lives in material_provision.leaf_key_provision below.
+  custody_registry:
+    certs_workspace:
+      id: certs_workspace
+      backing: podman_volume:lme_certs      # the minted-cert WORKSPACE
+      consumers: [elasticsearch]            # ES mounts the workspace directly (TLS terminator + generator context)
+      desired_host_scope: consumer_host     # ES is the only workspace consumer
+      observed_host_scope: every_host       # whole-workspace tarball to EVERY play host (no run_once/host filter)
+      transits_controller: true             # slurped through the controller (ALL leaf keys + ca.key), 1338 corr 2
+      drift: true                           # observed != desired -> RECORDED nonconformance, not endorsed
+      non_publication: [ca_key]             # ca.key present (0:0/0600 carve-out) but NEVER published / service-readable
+      modes:
+        leaf_key:  '0640'
+        leaf_cert: '0644'
+        ca_cert:   '0644'
+        ca_key:    '0600'                    # 0:0 userns-root, CA-MITM carve-out
+      reference_form: bare_name
+    certs_bundle_publish:
+      id: certs_bundle_publish
+      backing: host_tree_bundle             # <certs.host_tree>/<svc>, mounted cert:<svc> ro
+      consumers: [kibana, fleet-server]     # + CA-only consumers (beats) receive ca/ca.crt only (out of this fold)
+      desired_host_scope: consumer_host
+      observed_host_scope: every_host       # B4 publish loops all enabled bundles on EVERY host
+      transits_controller: true             # bundle copied from the controller-slurped workspace
+      drift: true
+      non_publication: [ca_key]             # certs main.yml find -name ca.key -delete belt-and-suspenders; ca.crt only published
+      modes:
+        leaf_key:  '0640'
+        leaf_cert: '0644'
+        ca_cert:   '0644'
+      reference_form: bare_name
+
+  # --- fix_3 material provision (private-key delivery + CA-key rule) ------------
+  # private_key is NON-distributable, so a leaf key CANNOT be a material_requirements
+  # obligation. option_a (C recommendation, my 1347 choice): each leaf key is a declared
+  # PROVISION entry -- producer + delivery channels + placement/owner/mode + consumer +
+  # host_scope + lifecycle. The two-hop delivery (1338 corr 2) is DATA here (channels list),
+  # not prose. ca_key is a SEPARATE rule (non-publication + carve-out), never a provision
+  # entry, and does NOT constrain leaf delivery (codex private_key_correction).
+  # lme_validate_material_registries CONSUMES this on the loader path (machine-validated, not
+  # a descriptive registry): material -> a private_key catalog def; producer -> producer_
+  # registry; every channel -> custody_registry; host_scope != every_host; mode octal.
+  material_provision:
+    leaf_key_provision:
+      elasticsearch_key:
+        material: elasticsearch_key
+        producer: certs_role                    # MEMBERSHIP: elasticsearch_key is in certs_role.produces_materials
+        delivery_mode: central_mint_delivery   # NOT local_generation for any of the three this deployment
+        channels: [certs_workspace]            # SINGLE-HOP: ES mounts the workspace directly
+        custody_hops:                          # TYPED ORDERED hops + residual locations (order == channels order)
+          - {channel: certs_workspace, order: 1, residual_copy: true, host_scope: every_host, transits_controller: true}
+        terminal_channel: certs_workspace      # DECLARED terminal (consumer must be a certs_workspace consumer)
+        consumer: elasticsearch
+        host_scope: consumer_host
+        placement: /usr/share/elasticsearch/config/certs/elasticsearch/elasticsearch.key
+        owner_role: elasticsearch              # workspace uid -> host subuid
+        mode: '0640'
+        lifecycle: bootstrap
+      kibana_key:
+        material: kibana_key
+        producer: certs_role                    # MEMBERSHIP: kibana_key is in certs_role.produces_materials
+        delivery_mode: central_mint_delivery
+        channels: [certs_workspace, certs_bundle_publish]   # TWO-HOP (1338 corr 2): workspace residual + published bundle
+        custody_hops:
+          - {channel: certs_workspace,      order: 1, residual_copy: true, host_scope: every_host, transits_controller: true}
+          - {channel: certs_bundle_publish, order: 2, residual_copy: true, host_scope: every_host, transits_controller: true}
+        terminal_channel: certs_bundle_publish  # kibana is a certs_bundle_publish consumer
+        consumer: kibana
+        host_scope: consumer_host
+        placement: /usr/share/kibana/config/certs/kibana/kibana.key
+        owner_role: 'cert_owner:kibana'        # manifest-DERIVED host subuid (no uid literal; derivation in lme_manifests.py cert_owner)
+        mode: '0640'
+        lifecycle: bootstrap
+      fleet_server_key:
+        material: fleet_server_key
+        producer: certs_role                    # MEMBERSHIP: fleet_server_key is in certs_role.produces_materials
+        delivery_mode: central_mint_delivery
+        channels: [certs_workspace, certs_bundle_publish]   # TWO-HOP
+        custody_hops:
+          - {channel: certs_workspace,      order: 1, residual_copy: true, host_scope: every_host, transits_controller: true}
+          - {channel: certs_bundle_publish, order: 2, residual_copy: true, host_scope: every_host, transits_controller: true}
+        terminal_channel: certs_bundle_publish  # fleet-server is a certs_bundle_publish consumer
+        consumer: fleet-server
+        host_scope: consumer_host
+        placement: /certs/fleet-server/fleet-server.key
+        owner_role: 'cert_owner:fleet-server'
+        mode: '0640'
+        lifecycle: bootstrap
+    ca_key_rule:
+      material: ca_key
+      non_publication: true                  # never in a published bundle; never delivered to a bundle consumer
+      distributable: false
+      carve_out:
+        where: workspace_mounted             # elasticsearch, setup-certs mount lme_certs
+        owner: '0:0'                         # userns-root
+        mode: '0600'                         # no service uid can read it (CA-MITM ownership+mode fix, NOT distribution)
+      observed_host_scope: every_host        # whole-workspace tarball replicates ca.key (0:0/0600) to every play host
+      transits_controller: true              # + transits the controller via slurp (1338 corr 2)
+      conformance: open_nonconformance
+    # ENFORCED by lme_validate_material_registries on the loader A2 gate (fix_3 v5): non-
+    # publication by REFERENCED MATERIAL IDENTITY (a renamed leaf referencing ca_key is
+    # rejected, not only a leaf keyed ca_key); producer MEMBERSHIP (a leaf's producer must
+    # actually produce the material it delivers); map-key/record-id coherence (producer /
+    # custody key == its id field); typed ORDERED custody_hops with per-hop residual_copy +
+    # host_scope; consumer / terminal-channel coherence (a leaf consumer must consume its
+    # terminal channel); and the PRODUCER PARTITION (every produced private key is classified
+    # exactly once -- a leaf delivery or non_publication, never both, never neither).
+    #
+    # STILL OPEN (split by owner; each remains a required obligation, not resolved here):
+    open_scope:
+      consumer_host_delivery_scoping: 'DESIRED = consumer_host; OBSERVED = every_host + drift:true (both channels), now carried per hop as residual_copy + host_scope. Live target-scoped DELIVERY (making observed == desired) is C-owned + OPEN.'
+      residual_controller_copies: 'The typed custody_hops now DECLARE that every leaf key transits the controller and leaves a residual copy at every_host; the CA key carries the same via ca_key_rule. Making the live pipeline STOP leaving those residuals is C-owned + OPEN.'
+      live_republish_atomicity: 'certs main.yml re-run can empty a running bundle consumer /certs until restart. C-owned + OPEN.'
+      payload_validity_rule_registry: 'C-owned. payload_validity names (incl non_empty_pem_certificate_chain_to_ca, which references ca_cert) are declared but NOT byte-enforced -- no rule registry resolves them to a structural check. Content owed by C (payload_validity_rules + ed25519_spki_public_key + a lme_validate_material_catalog resolution change); the guardian/envelope material definitions live in the same C lane.'
+      obligation_custody_mode_cross_check: 'CLOSED in v6.2: the declared kind->mode-key map (material_provision_schema.custody_mode_key_kinds) classifies every custody mode key, rejects unknown/aliased keys, ceilings every non-distributable class and requires each leaf-key channel to declare a mode for the key kind. STILL OPEN (C1 lane): equality of a per-service OBLIGATION or leaf-provision mode with its channel per-kind mode (e.g. an ES cert obligation 0644 vs the channel leaf_cert mode) is not enforced; per-service obligations are not yet wired (see per_service_obligations_unwired).'
+      guardian_registry_closure: 'C-owned. guardian_signer_producer / guardian_custody producer+custody ids and the guardian_private_key catalog def are NOT declared here -- the FIRST service that declares a guardian obligation FAILS CLOSED until C lands them. Guardian/envelope lane.'
+      per_service_obligations_unwired: 'E / manifest-owner-owned. The 3 per-service cert obligations are NOT authored onto lme-{elasticsearch,kibana,fleet-server}.yml (would also require declaring their env-password material). loader_wired stays FALSE; arming is the coordinated material_requirements migration wave.'
+      tailscale_and_other_profiles: 'OPEN + required. Tailscale Serve certificate/profile behavior, independent file-certificate, self-signed/internal-trust profiles and wider inventory/profile lifecycle are not modelled here (separate profiles).'
+      out_of_scope_materials: 'per-backend CA aliases (elasticsearch-ca.crt/litellm-ca.crt/embeddings-ca.crt), LLM-pack (litellm/embeddings) leaves and beats CA-only consumers are not catalogued yet (additive catalog defs, later wave).'
+
+  # --- fix_3 material provision schema (validates the three blocks above) -------
+  # The DECLARED shape lme_validate_material_registries enforces value-purely (vocab/closure
+  # read from HERE, never hardcoded in the filter). desired/observed/drift split + host_scope
+  # tokens adopted from C's 1410 schema. Part of the material security boundary: the A2 loader
+  # gate asserts producer_registry / custody_registry / material_provision /
+  # material_provision_schema each equal the declared file value (no override may rebind custody).
+  material_provision_schema:
+    producer_record:
+      required: [id, implementation, host_scope, produces_materials, reference_form]
+      host_scope_vocab: [source_host, signer_host, controller, every_host]
+      reference_form_vocab: [bare_name]
+      id_pattern: '\A[a-z][a-z0-9_-]*\Z'
+    custody_record:
+      required: [id, backing, consumers, desired_host_scope, observed_host_scope, drift, modes, reference_form]
+      # every_host DELIBERATELY absent from DESIRED -> an all-host desired custody scope is rejected for the channel itself.
+      desired_host_scope_vocab: [consumer_host, signer_host, controller_transit, source_host]
+      observed_host_scope_vocab: [consumer_host, signer_host, controller_transit, source_host, every_host]
+      reference_form_vocab: [bare_name]
+    leaf_key_provision_record:
+      required: [material, producer, delivery_mode, channels, custody_hops, terminal_channel, consumer, host_scope, placement, owner_role, mode, lifecycle]
+      delivery_mode_vocab: [central_mint_delivery, local_generation]
+      lifecycle_vocab: [bootstrap, rotate, adopt, static]
+      host_scope_vocab: [consumer_host, source_host]      # NOTE: every_host DELIBERATELY absent -- a private_key provision must not declare an all-host DESIRED scope
+    # TYPED ORDERED custody hop (fix_3 v5, codex still_required typed custody hops + residual
+    # locations). Each hop records WHICH channel, its ORDER, whether a residual_copy persists,
+    # WHERE it lands (host_scope), and whether it transits_controller -- a per-hop typed model,
+    # not a single opaque boolean. observed host_scope vocab (every_host is a real residual).
+    custody_hop_record:
+      required: [channel, order, residual_copy, host_scope, transits_controller]
+      host_scope_vocab: [consumer_host, signer_host, controller_transit, source_host, every_host]
+    ca_key_rule_record:
+      required: [material, non_publication, distributable, carve_out, observed_host_scope, conformance]
+      carve_out_required: [where, owner, mode]
+      # The CA private key MUST stay userns-root 0:0 (the CA-MITM ownership fix). Declared here in
+      # the material_provision_schema, which the loader sources from _lme_global_file (byte-bound to
+      # this on-disk manifest by resolve.yml), so an override cannot reach it to both re-own the key
+      # and relax the rule -- policy authority is the declared source, not an equality gate (v6.1).
+      carve_out_owner: '0:0'
+      observed_host_scope_vocab: [consumer_host, signer_host, controller_transit, source_host, every_host]
+      conformance_vocab: [conformant, open_nonconformance]
+    # Complete anchored octal mode -- \A...\Z rejects "0644\n" / " 0644".
+    mode_pattern: '\A[0-7]{3,4}\Z'
+    # RESTRICTIVENESS CEILING for every delivered private-key leaf mode + the CA carve-out mode
+    # (C1-COMPOSED-MATERIAL-DECLARATIONS-REJECTED, codex-1625). The octal permission bits a
+    # private key mode may NEVER grant: 0027 = group-write (020) + all world/other bits (007).
+    # 0640 (owner rw, group r) and 0600 pass; 0644 (world-read) and 0660 (group-write) are
+    # REJECTED. This is the absolute invariant that lets an override recompose placement/owner/
+    # consumer while it can never widen a private key -- it replaces the removed whole-registry
+    # equality gate for the one security field (mode) that is a free-form string, not a bool.
+    leaf_mode_forbidden_mask: '0027'
+    # CUSTODY MODE-KEY KIND CLOSURE (fix_3 v6.2, codex-1812 C1-CUSTODY-MODE-KIND-CLOSURE). Every
+    # custody_registry.*.modes KEY must be classified here to a material_catalog KIND; the
+    # restrictiveness ceiling above applies to a custody mode by its DECLARED class (a
+    # non-distributable class is ceilinged). An unclassified / unknown / aliased mode key is
+    # REJECTED, a key that also names a catalog id must carry that material's own kind, and every
+    # channel a leaf key travels through must declare a mode for the key's kind. This is POLICY:
+    # it lives in the schema, admitted only from this declared source (the loader refuses a
+    # material schema supplied through the override or profile channel), so composed data cannot
+    # reclassify a private-key mode key as a certificate to escape the ceiling.
+    custody_mode_key_kinds:
+      leaf_key:  private_key
+      leaf_cert: certificate
+      ca_cert:   certificate
+      ca_key:    private_key
 
 # =============================================================================
 # lme_config_registry -- the DECLARED SCHEMA for every operator/profile-managed
