@@ -418,25 +418,117 @@ fail_closed_invariants:
     rule: >-
       A backup with no bundle_certification.txt (or no per-volume content_sha256) is REFUSED at
       restore, routed to LEGACY-BUNDLE qualification, never force-restored.
+  - id: complete-volume-set-and-data-before-destroy
+    rule: >-
+      The pre-mutation gate (lme_bundle_verify) binds the COMPLETE certified volume set to disk:
+      every certified volume must exist, its local manifest digest must equal the certified digest,
+      and a fresh recompute of its data/ must equal the certified digest; any missing, extra,
+      duplicate or mismatched member is REFUSED before the first mutation. Restore success is never
+      derived from surviving directories.
+  - id: no-false-certification
+    rule: >-
+      Certification stages on the publication filesystem, checks the mv, and RE-VERIFIES the
+      committed artifact before reporting success; a read/enumeration/staging failure returns
+      non-zero and never contributes an empty digest. A reused backup dir has any stale
+      certificate invalidated up front so a skipped/failed certify cannot qualify a new bundle.
+
+# -----------------------------------------------------------------------------
+# codex_0845_recovery_audit_dispositions -- disposition for every ID in
+# codex-manager-C1-launch-ack-custody-resume-and-backup-review-20260923-0845
+# (review of commit b7c60cd). RESOLVED items are behaviorally checked in scratch
+# (non-durable, ansible-core 2.17.14; deploy target 2.19.11 UNVERIFIED here).
+# -----------------------------------------------------------------------------
+codex_0845_recovery_audit_dispositions:
+  - id: D-BACKUP-IO-AND-CERTIFICATE-PUBLICATION-FALSE-SUCCESS
+    severity: high
+    status: RESOLVED
+    how: >-
+      content_integrity.sh.j2 functions now fail-closed (missing input returns non-zero, not a
+      MISSING/rc0 sentinel; sha256sum read failures and unreadable subtrees propagate via pipefail;
+      no empty digest field is emitted). certify stages with mktemp on the bundle filesystem, checks
+      the mv, and re-runs lme_bundle_verify on the committed artifact before reporting success. The
+      certify and verify task bodies now set -euo pipefail. Scratch: an unreadable file in a required
+      tree makes certify REFUSE (nonzero) instead of certifying.
+  - id: D-BACKUP-CERTIFIED-VOLUME-SET-AND-DIGEST-UNBOUND
+    severity: high
+    status: RESOLVED
+    how: >-
+      lme_bundle_verify now, per certified volume, requires the data dir, requires the local manifest
+      content_sha256 == certified digest, and recomputes the data content digest == certified digest;
+      it enforces exact set membership (rejecting duplicates rc8, extra/undeclared on-disk members rc8,
+      and absent certified members rc7). Scratch: volume+manifest edited together with an intact
+      certificate -> rc5; deleted certified volume -> rc7; extra on-disk volume -> rc8.
+  - id: D-RESTORE-COMPLETE-CONTENT-QUALIFICATION-AFTER-MUTATION
+    severity: high
+    status: PARTIAL
+    resolved_part: >-
+      Volume DATA content is now fully qualified inside the pre-mutation gate (see above), so a corrupt
+      volume is refused BEFORE install/config copying, not only at the later per-volume task. The later
+      per-volume check is retained as defense in depth.
+    open_part: >-
+      Required-SECRET completeness at the executable boundary (the expected owned secret/material set)
+      is NOT derivable inside the restore entry point today -> routed to C1 (completeness_anchor).
+  - id: D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE
+    severity: high
+    status: PARTIAL
+    resolved_part: >-
+      Stale certificate invalidated at backup start (a reused dir cannot retain a valid cert if the
+      new certify is skipped/failed); mktemp staging constrained to the publication filesystem; the
+      backup status now records the certification outcome (PRESENT/ABSENT) after certify runs.
+    open_part: >-
+      A first-class backup GENERATION/REVISION identity + interrupted-operation state model (preserve
+      prior valid backups, distinguish incomplete new work) is operational-provenance/ledger territory
+      -> routed to B. Not authored this wave.
+  - id: D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE
+    severity: high
+    status: PARTIAL
+    resolved_part: >-
+      content_integrity.sh.j2 is now a genuine parameterized Jinja macro (lme_integrity_library(bi));
+      write_content_manifest + the copy-vs-source guard are library functions (no hand-inlined digest
+      shell in the producer task); volume data-dir + manifest-file names are DECLARED in integrity.yml
+      (volume_layout) and consumed on BOTH sides via LME_VOLUME_DATA_DIR/_MANIFEST_FILE and the Jinja
+      declared values in restore. A name change in the declaration relocates the producer, the library,
+      the gate and the restore per-volume check.
+    open_part: >-
+      A few Ansible-level restore paths still spell 'volumes' literally (roster find/stat at
+      restore_lme_master ~716-736); full declaration-only relocation of the roster derivation remains.
+      The Python test mechanism (below) is superseded pending a declarative harness. F reviews.
+  - id: immediate_representation_violation (Python test file)
+    status: DISCLOSED_FROZEN
+    how: >-
+      testing/tests/unit/test_backup_integrity.py is hand-authored Python and violates the universal
+      YAML/genuine-Jinja rule (tests are not exempt). It is FROZEN (still green, historical evidence),
+      NOT extended. Disposition: replace with a declarative case mechanism modeled on G's
+      loader_integration (cases as data + a macro-rendered driver); a spec is routed to G. The Python
+      file is removed only after the declarative replacement works. No new Python authored to fix it.
+  - id: additional_integrity_limits (digest scope + symlink newline)
+    status: RECORDED
+    how: >-
+      integrity.yml now declares digest_covers/digest_excludes: content_sha256 binds relative path +
+      regular-file content + symlink target, and does NOT bind mode/owner/group/dir-metadata/acl/xattr.
+      Symlink-target trailing-newline handling: the claim is narrowed to target bytes as returned by
+      readlink (command substitution strips a trailing newline); exact-byte symlink handling is an
+      open refinement, not claimed closed.
 
 # -----------------------------------------------------------------------------
 # validation -- how this wave was checked (honest: behavioral vs syntax-only).
 # -----------------------------------------------------------------------------
 validation:
   behavioral:
-    - "testing/tests/unit/test_backup_integrity.py -- 7 cases: non-vacuity (same-size byte change refused rc5), self-consistency honest-limit, missing cert rc3, torn cert rc4, producer gate, ordering, no-listing-fallback rc3. PASS."
-    - "testing/tests/unit/test_restore_master_secrets.py -- secret restore create/preverify/prune. PASS."
-    - "scratch ansible-playbook -i localhost, -c local -- lookup('template') wiring for BOTH producer (role-relative) and restore (playbook-relative) forms renders + runs certify/verify. PASS (rc0/rc0/rc3/rc5)."
+    - "testing/tests/unit/test_backup_integrity.py -- 10 cases (FROZEN, superseded-pending-declarative): non-vacuity rc5, self-consistency honest-limit, missing cert rc3, torn cert rc4, producer gate, ordering, no-listing-fallback rc3, real-producer-writes-matching-digest, real-torn-copy-refused, real producer->certify->restore-gate roundtrip. PASS (10/10) against the rewritten library."
+    - "testing/tests/unit/test_restore_master_secrets.py -- secret restore create/preverify/prune. PASS. Full D suite 37/37 PASS."
+    - "scratch (non-durable) fail-closed rc matrix on the ansible-lookup-rendered library: certify rc0 / verify rc0; tree tamper rc5; volume+manifest co-edit with intact cert rc5; deleted certified volume rc7; extra on-disk volume rc8; unreadable file in required tree -> certify REFUSES nonzero; empty volume certifiable. Real task-body roundtrip (producer happy SUCCESS+manifest / torn FAILED+no-manifest / certify rc0 / restore-gate rc0 / gate tamper rc5)."
   syntax_only:
-    - "ansible-playbook --syntax-check ansible/backup_lme.yml + ansible/restore_lme_master.yml -- PASS."
-    - "yaml.safe_load(_all) on the edited files -- PASS."
-    - "The Ansible install-tree restore task + running-container guard are NOT covered by the rendered-shell tests (syntax only)."
+    - "ansible-playbook --syntax-check ansible/backup_lme.yml + ansible/restore_lme_master.yml + ansible/rollback_lme.yml -- PASS. cluster_backup_lme.yml needs an inventory (pre-existing hosts: group dependency, unmodified by D)."
+    - "Ansible split_args balance scan over every shell/command body in both task files -- NONE unbalanced. yaml.safe_load(_all) -- PASS."
+  version_caveat: "All renders/behavioral runs on ansible-core 2.17.14; the deploy target is 2.19.11 (data-tagging/templating) -- behavior there is UNVERIFIED (no 2.19 venv on this host). The ansible lookup('template') render was cross-checked functionally identical to the plain-jinja2 render used by the tests."
   runtime_acceptance: OPEN
   open_items:
-    - Adversarial certification completeness (completeness_anchor) -- C1 expected-set / B ledger / guardian signature.
-    - Per-secret content digest + owner assertion.
-    - RESTORE-PARTIAL-REPLACEMENT idempotency (native rehearsal).
-    - LEGACY-BUNDLE isolated qualification + byte preservation.
-    - recovery-status-record (play-level pessimistic status).
-    - Guardian authority seam (REJOIN/FENCE serialization) -- see fencing-protocol.contract.yaml.
-    - A real restore-from-backup rehearsal.
+    - Required-secret completeness at the restore boundary (completeness_anchor) -- routed to C1.
+    - Backup generation/revision + interrupted-operation identity model -- routed to B.
+    - Declarative test harness to replace the frozen Python (modeled on G loader_integration) -- spec routed to G.
+    - Full declaration-only relocation of the restore roster derivation (a few 'volumes' literals remain).
+    - Per-secret content digest + owner assertion; RESTORE-PARTIAL-REPLACEMENT idempotency (native rehearsal).
+    - LEGACY-BUNDLE isolated qualification + byte preservation; recovery-status-record (play-level pessimistic status).
+    - Guardian authority seam (REJOIN/FENCE serialization) -- see fencing-protocol.contract.yaml; joint C/D transition contract (codex-0845).
+    - A real restore-from-backup rehearsal on the 2.19.11 deploy target.

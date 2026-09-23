@@ -162,7 +162,20 @@
     state: directory
     mode: '0755'
   become: yes
-  
+
+# codex-0845 D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE (cheap fail-closed part): a
+# date-based backup dir can be REUSED within the same minute. If a prior run left a
+# valid bundle_certification.txt and this run then fails or SKIPS the certify task,
+# the stale certificate would qualify a changed/incomplete bundle at restore. Remove
+# any pre-existing certificate up front so an uncertified new bundle is REFUSED (rc3)
+# rather than admitted on a stale certificate. (Backup generation/revision identity is
+# routed to B; this is only the stale-cert invalidation.)
+- name: Invalidate any stale bundle certification before writing a new backup
+  file:
+    path: "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.certification.bundle_file }}"
+    state: absent
+  become: yes
+
 - name: Create backup of LME installation
   shell: |
     # Create the backup directory structure
@@ -571,33 +584,12 @@
     VOLUME_PATH=$(podman volume inspect {{ item }} --format "{{ '{{' }}.Mountpoint{{ '}}' }}")
     VOLUME_DIR="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes/{{ item }}"
 
-    # Content manifest (durability integrity signal). Records file count + total
-    # bytes + a listing sha256 (covers relative paths and sizes, NOT file contents)
-    # computed from the SOURCE volume so a torn/partial backup copy can be detected
-    # at restore BEFORE any destructive volume removal -- existence/non-empty alone
-    # is insufficient because a partial data/ copy is still non-empty. LC_ALL=C keeps
-    # the sort order host-independent (cluster tarballs are restored on other hosts).
-    # Restore recomputes the identical values over the backup data/ dir and fails
-    # closed on mismatch. Written only in the SUCCESS/EMPTY branches: a FAILED copy is left
-    # with no manifest so restore refuses it.
-    # listing_sha256 (paths+sizes) is RETAINED for info; content_sha256 (file
-    # CONTENTS + symlink targets, from the shared rendered library lme_content_sha256)
-    # is the NON-VACUOUS integrity signal restore verifies. A same-name/same-size
-    # single-byte change changes content_sha256 but not listing_sha256.
-    write_content_manifest() {
-      local src="$1" out="$2"
-      local fc tb sha csha
-      fc=$(cd "$src" 2>/dev/null && find . -type f 2>/dev/null | wc -l | tr -d ' ')
-      tb=$(cd "$src" 2>/dev/null && find . -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
-      sha=$(cd "$src" 2>/dev/null && find . -type f -printf '%P\t%s\n' 2>/dev/null | LC_ALL=C sort | sha256sum | awk '{print $1}')
-      csha=$(lme_content_sha256 "$src")
-      {
-        echo "file_count=${fc:-0}"
-        echo "total_bytes=${tb:-0}"
-        echo "listing_sha256=${sha:-}"
-        echo "content_sha256=${csha:-}"
-      } > "$out"
-    }
+    # Content manifest + torn-copy guard are provided by the shared rendered library
+    # (lme_write_content_manifest / lme_finalize_volume_backup) so the producer and the
+    # restore verifier can never drift and this task carries no hand-inlined digest
+    # shell. content_sha256 (file CONTENTS + symlink targets) is the NON-VACUOUS signal
+    # restore verifies; a same-size single-byte change changes it. The data dir and the
+    # manifest filename come from the declaration (LME_VOLUME_DATA_DIR / _MANIFEST_FILE).
 
     # Create volume backup directory
     mkdir -p "$VOLUME_DIR"
@@ -622,25 +614,21 @@
 
     # Copy the volume contents
     if [ -d "$VOLUME_PATH" ] && [ "$(ls -A "$VOLUME_PATH")" ]; then
-      {{ cp_preserve_cmd }} "$VOLUME_PATH/." "$VOLUME_DIR/data/"
+      {{ cp_preserve_cmd }} "$VOLUME_PATH/." "$VOLUME_DIR/$LME_VOLUME_DATA_DIR/"
       if [ $? -eq 0 ]; then
-        # Fingerprint the SOURCE so a silently-torn copy is caught at restore.
-        write_content_manifest "$VOLUME_PATH" "$VOLUME_DIR/content_manifest.txt"
-        # Backup-time copy integrity: a cp that returns 0 can still be self-consistently
-        # torn (missed a file). Verify the copied-content digest equals the SOURCE digest
-        # NOW and FAIL the volume on mismatch (no manifest -> restore refuses), instead of
-        # certifying a torn copy as SUCCESS.
-        SRC_CSHA=$(grep "^content_sha256=" "$VOLUME_DIR/content_manifest.txt" | head -n1 | cut -d= -f2)
-        COPY_CSHA=$(lme_content_sha256 "$VOLUME_DIR/data")
-        if [ "$SRC_CSHA" != "$COPY_CSHA" ]; then
-          rm -f "$VOLUME_DIR/content_manifest.txt"
+        # Write the SOURCE manifest and FAIL the volume (no manifest -> restore refuses)
+        # if the copied content digest differs from the source. A cp returning 0 can
+        # still be self-consistently torn; the library helper is the single source of
+        # this torn-copy guard, shared with restore.
+        if lme_finalize_volume_backup "$VOLUME_PATH" "$VOLUME_DIR"; then
+          echo "SUCCESS" > "$VOLUME_DIR/backup_status.txt"
+          echo "Volume {{ item }} backed up successfully"
+          exit 0
+        else
           echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
-          echo "Volume copy content ($COPY_CSHA) != source ($SRC_CSHA) at $VOLUME_DIR; torn copy, no manifest written" >&2
+          echo "Volume {{ item }} failed content-integrity finalize (torn/unreadable copy); no manifest written" >&2
           exit 1
         fi
-        echo "SUCCESS" > "$VOLUME_DIR/backup_status.txt"
-        echo "Volume {{ item }} backed up successfully"
-        exit 0
       else
         echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
         echo "Failed to backup volume {{ item }}"
@@ -649,11 +637,18 @@
     else
       echo "EMPTY" > "$VOLUME_DIR/backup_status.txt"
       echo "Volume {{ item }} is empty, creating empty data directory"
-      mkdir -p "$VOLUME_DIR/data"
+      mkdir -p "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
       # Empty volume: manifest over the (empty) data dir records 0 files / 0 bytes,
-      # so restore verifies "expected empty" instead of treating empty as torn.
-      write_content_manifest "$VOLUME_DIR/data" "$VOLUME_DIR/content_manifest.txt"
-      exit 0
+      # so restore verifies expected-empty instead of treating empty as torn. Fail the
+      # volume (no manifest) if even that manifest cannot be written.
+      if lme_write_content_manifest "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" "$VOLUME_DIR/$LME_VOLUME_MANIFEST_FILE"; then
+        exit 0
+      else
+        rm -f "$VOLUME_DIR/$LME_VOLUME_MANIFEST_FILE"
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} empty-manifest write failed; no manifest written" >&2
+        exit 1
+      fi
     fi
   args:
     executable: /bin/bash
@@ -780,6 +775,7 @@
   # (C1 expected-set / B ledger) or the UNWIRED guardian signature -- so
   # BACKUP-MANIFEST-CERTIFICATION is PARTIAL, not closed.
   shell: |
+    set -euo pipefail
     {{ lme_integrity_lib }}
     lme_bundle_certify "{{ backup_base_dir }}/backups/{{ backup_timestamp }}"
   args:
@@ -792,6 +788,25 @@
     - (lme_systemd_units_backup_result is not defined) or (lme_systemd_units_backup_result is success)
     - lme_backup_clean_container_stop | default(false) | bool
     - (volume_backup.results is not defined) or ((volume_backup.results | selectattr('failed', 'eq', true) | list | length) == 0)
+
+# codex-0845 D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE: the status file above is
+# written BEFORE certification runs, so record the certification outcome afterward.
+# An uncertified backup CANNOT be restored (restore refuses rc3), so the status must
+# say so explicitly rather than reading SUCCESS while no certificate exists.
+- name: Record bundle certification outcome in the backup status
+  shell: |
+    set -euo pipefail
+    S="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/backup_status.txt"
+    C="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.certification.bundle_file }}"
+    if [ -f "$C" ]; then
+      echo "- Bundle certification: PRESENT ($C) -- restorable" >> "$S"
+    else
+      echo "- Bundle certification: ABSENT -- UNCERTIFIED, restore will REFUSE this bundle (rc3); take a new backup" >> "$S"
+    fi
+  args:
+    executable: /bin/bash
+  become: yes
+  changed_when: false
 
 - name: Read final backup status
   command: cat "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/backup_status.txt"
