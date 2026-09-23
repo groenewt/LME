@@ -445,10 +445,13 @@ codex_0845_recovery_audit_dispositions:
     how: >-
       content_integrity.sh.j2 functions now fail-closed (missing input returns non-zero, not a
       MISSING/rc0 sentinel; sha256sum read failures and unreadable subtrees propagate via pipefail;
-      no empty digest field is emitted). certify stages with mktemp on the bundle filesystem, checks
-      the mv, and re-runs lme_bundle_verify on the committed artifact before reporting success. The
-      certify and verify task bodies now set -euo pipefail. Scratch: an unreadable file in a required
-      tree makes certify REFUSE (nonzero) instead of certifying.
+      no empty digest field is emitted). lme_content_sha256 captures the subshell rc with `|| rc=$?`
+      (an `if ! ( ... )` made $? the negation status 0 -- fixed, so a read failure now returns nonzero
+      with EMPTY stdout, not merely caught by a downstream backstop). certify stages with mktemp on the
+      bundle filesystem, checks the mv, and re-runs lme_bundle_verify on the committed artifact before
+      reporting success; certify/verify task bodies set -euo pipefail. Scratch discriminating cases:
+      unreadable file in a required tree -> certify REFUSES nonzero; certificate path pre-existing as a
+      DIRECTORY (failed publication, mv lands inside) -> post-publication verify fails -> certify nonzero.
   - id: D-BACKUP-CERTIFIED-VOLUME-SET-AND-DIGEST-UNBOUND
     severity: high
     status: RESOLVED
@@ -456,29 +459,50 @@ codex_0845_recovery_audit_dispositions:
       lme_bundle_verify now, per certified volume, requires the data dir, requires the local manifest
       content_sha256 == certified digest, and recomputes the data content digest == certified digest;
       it enforces exact set membership (rejecting duplicates rc8, extra/undeclared on-disk members rc8,
-      and absent certified members rc7). Scratch: volume+manifest edited together with an intact
-      certificate -> rc5; deleted certified volume -> rc7; extra on-disk volume -> rc8.
+      and absent certified members rc7). certify itself now REFUSES a partial volume (a volume dir with
+      no data/ from a mountpoint-resolve failure) instead of silently skipping it. Scratch:
+      volume+manifest edited together with an intact certificate -> rc5; deleted certified volume -> rc7;
+      extra on-disk volume -> rc8; failed volume in bundle -> certify refuses.
+    roster_binding_note: >-
+      F1 requested "do not derive success from surviving files". The restore roster is still derived
+      with `find`, but the pre-mutation gate enforces EXACT certified<->on-disk volume-set equality, so a
+      deleted certified member fails (rc7) and an added member fails (rc8) BEFORE any mutation -- the
+      find-derived roster cannot silently shrink or grow restoration. The gate, not the find, is the
+      authority. (Rebuilding the roster from cert lines is therefore redundant with the exact-set gate.)
   - id: D-RESTORE-COMPLETE-CONTENT-QUALIFICATION-AFTER-MUTATION
     severity: high
     status: PARTIAL
     resolved_part: >-
       Volume DATA content is now fully qualified inside the pre-mutation gate (see above), so a corrupt
-      volume is refused BEFORE install/config copying, not only at the later per-volume task. The later
-      per-volume check is retained as defense in depth.
+      volume is refused BEFORE install/config copying, not only at the later per-volume task (retained as
+      defense in depth). The gate was also MOVED EARLIER -- it now runs immediately after
+      selected_backup_dir is resolved and BEFORE the topology-classification reads (cluster_recovery_note.txt
+      / archived elasticsearch quadlet) that steer ES volume selection, so no uncertified bundle content
+      is read to drive behaviour. The restore per-volume file_count recompute was aligned to the library
+      (find -printf '.' | wc -c) so a filename containing a newline no longer causes a false rc4 refuse.
     open_part: >-
       Required-SECRET completeness at the executable boundary (the expected owned secret/material set)
       is NOT derivable inside the restore entry point today -> routed to C1 (completeness_anchor).
+      A couple of pre-gate reads remain benign (tar.gz basename selection); the behaviour-steering ones
+      are now post-gate.
   - id: D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE
     severity: high
     status: PARTIAL
     resolved_part: >-
       Stale certificate invalidated at backup start (a reused dir cannot retain a valid cert if the
       new certify is skipped/failed); mktemp staging constrained to the publication filesystem; the
-      backup status now records the certification outcome (PRESENT/ABSENT) after certify runs.
+      backup status now records the certification outcome (PRESENT/ABSENT) after certify runs. NEW: the
+      play now FAILS (no override, no-ignore-integrity-switch) when the bundle was not certified
+      (lme_bundle_cert_result is skipped) -- so an uncertified/partial backup can no longer report
+      success to a consumer (rollback_lme.yml gates its rm -rf /opt/lme + destructive volume removal on
+      the safety backup succeeding). BEHAVIOUR CHANGE: a PARTIAL backup now fails the play.
     open_part: >-
       A first-class backup GENERATION/REVISION identity + interrupted-operation state model (preserve
       prior valid backups, distinguish incomplete new work) is operational-provenance/ledger territory
-      -> routed to B. Not authored this wave.
+      -> routed to B. Also NOT closed: invalidating the stale certificate does NOT remove leftover files
+      from a prior run in a REUSED backup dir (cp -a merges into existing trees; a prior volumes/<Y>/ or
+      source-since-deleted files persist), so certification could bless mixed-generation content in a
+      reused dir. This needs the generation/revision model (fresh dir per generation) -> routed to B.
   - id: D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE
     severity: high
     status: PARTIAL

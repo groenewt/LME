@@ -249,8 +249,32 @@
             selected_backup_dir: "{{ restore_extracted_dirs.files[0].path }}"
             restore_tar_staging_cleanup: "{{ restore_tar_staging.path }}"
 
-    # Once selected_backup_dir points at bundle contents we can classify the backup using the same signals as
-    # backup_lme (cluster_recovery_note vs discovery.type in the archived elasticsearch quadlet).
+    # RESTORE-ENTRYPOINT-VERIFICATION-ORDER + BACKUP-MANIFEST-CERTIFICATION (codex-0700/0845):
+    # verify the bundle certification BEFORE the FIRST read of any bundle content that
+    # drives behaviour -- including the topology-classification reads immediately below
+    # (which steer ES volume selection) and every destructive step further down. The
+    # install/vault/quadlet trees, and each certified volume DATA dir, are proven against
+    # the certified digest FIRST. Fail-closed: missing certification (legacy bundle) is
+    # REFUSED (rc3), torn/tampered certification REFUSED (rc4), any tree/file/volume-data
+    # content mismatch REFUSED (rc5), empty certified volume digest (rc6), missing required
+    # or certified member (rc7), duplicate/extra volume member (rc8). NO fallback to
+    # listing_sha256, NO ignore-integrity switch. An uncertifiable legacy bundle is routed
+    # to LEGACY-BUNDLE qualification (recovery-semantics.contract.yaml), never force-restored.
+    # Self-consistency + complete on-disk volume-set binding; adversarial certificate
+    # under-declaration of an OPTIONAL payload stays OPEN (C1 expected-set / B ledger).
+    - name: Verify backup bundle certification before any destructive restore (fail-closed)
+      shell: |
+        set -euo pipefail
+        {{ lme_integrity_lib }}
+        lme_bundle_verify "{{ selected_backup_dir }}"
+      args:
+        executable: /bin/bash
+      register: restore_bundle_verify
+      changed_when: false
+
+    # Once selected_backup_dir points at bundle contents (and is now VERIFIED above) we can
+    # classify the backup using the same signals as backup_lme (cluster_recovery_note vs
+    # discovery.type in the archived elasticsearch quadlet).
     - name: Detect Elasticsearch topology reflected in backup bundle
       shell: |
         set -euo pipefail
@@ -324,26 +348,11 @@
           live state (fail-closed). Stop them and re-run the restore.
       when: running_containers.stdout_lines | default([]) | length > 0
 
-    # RESTORE-ENTRYPOINT-VERIFICATION-ORDER + BACKUP-MANIFEST-CERTIFICATION (codex-0700):
-    # verify the bundle certification BEFORE the first destructive step below. The
-    # install/vault/quadlet trees are overwritten by the next task, so their content
-    # must be proven against the certified digest FIRST. Fail-closed: a missing
-    # certification (old/legacy bundle) is REFUSED (rc 3), a torn/tampered
-    # certification is REFUSED (rc 4), and any tree/file payload whose on-disk content
-    # does not match the certified digest is REFUSED (rc 5). There is NO fallback to
-    # listing_sha256 and NO ignore-integrity switch. An uncertifiable legacy bundle is
-    # routed to the LEGACY-BUNDLE qualification path (recovery-semantics.contract.yaml),
-    # not force-restored. Self-consistency only: adversarial under-declaration is an
-    # OPEN predicate (C1 expected-set / B ledger) -- see the contract.
-    - name: Verify backup bundle certification before any destructive restore (fail-closed)
-      shell: |
-        set -euo pipefail
-        {{ lme_integrity_lib }}
-        lme_bundle_verify "{{ selected_backup_dir }}"
-      args:
-        executable: /bin/bash
-      register: restore_bundle_verify
-      changed_when: false
+    # NOTE: the bundle certification gate now runs EARLIER, immediately after
+    # selected_backup_dir is resolved and BEFORE the topology-classification reads
+    # (cluster_recovery_note.txt / archived elasticsearch quadlet), so no uncertified
+    # bundle content -- not even a classification input that steers volume selection --
+    # is read before verification. See "Verify backup bundle certification ..." above.
 
     # Tar streaming avoids NFS "Operation not supported" on cp -a preserving metadata
     - name: Restore LME installation and system state from backup
@@ -814,7 +823,10 @@
           echo "Refusing destructive restore on listing_sha256 alone (no ignore-integrity switch); qualify via LEGACY-BUNDLE." >&2
           exit 3
         fi
-        act_fc=$(cd "$DATA" && find . -type f | wc -l | tr -d ' ')
+        # Match lme_write_content_manifest exactly (find -printf '.' | wc -c): a plain
+        # `find | wc -l` overcounts a filename containing a newline and would falsely
+        # refuse (rc4). Keep the producer and this recompute byte-identical.
+        act_fc=$(cd "$DATA" && find . -type f -printf '.' | wc -c | tr -d ' ')
         act_tb=$(cd "$DATA" && find . -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')
         act_sha=$(cd "$DATA" && find . -type f -printf '%P\t%s\n' | LC_ALL=C sort | sha256sum | awk '{print $1}')
         act_csha=$(lme_content_sha256 "$DATA")

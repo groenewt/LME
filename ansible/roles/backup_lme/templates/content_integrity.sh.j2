@@ -59,24 +59,27 @@ lme_content_sha256() {
     return 1
   fi
   tmp="$(mktemp)" || { echo "lme_content_sha256: mktemp failed" >&2; return 1; }
-  if ! (
-        set -o pipefail
-        cd "$dir" || exit 3
-        find . \( -type f -o -type l \) -printf '%P\0' | LC_ALL=C sort -z | \
-        while IFS= read -r -d '' rel; do
-          printf 'P:%s\0' "$rel"
-          if [ -L "$rel" ]; then
-            local tgt
-            tgt="$(readlink -- "$rel")" || exit 4
-            printf 'L:%s\0' "$tgt"
-          else
-            local h
-            h="$(sha256sum < "$rel")" || exit 5
-            printf 'F:%s\0' "${h%% *}"
-          fi
-        done
-      ) > "$tmp"; then
-    rc=$?
+  # Capture the subshell rc explicitly: `if ! ( ... )` would make $? the status of the
+  # negation (always 0), silently swallowing the real failure. `|| rc=$?` records it.
+  rc=0
+  (
+    set -o pipefail
+    cd "$dir" || exit 3
+    find . \( -type f -o -type l \) -printf '%P\0' | LC_ALL=C sort -z | \
+    while IFS= read -r -d '' rel; do
+      printf 'P:%s\0' "$rel"
+      if [ -L "$rel" ]; then
+        local tgt
+        tgt="$(readlink -- "$rel")" || exit 4
+        printf 'L:%s\0' "$tgt"
+      else
+        local h
+        h="$(sha256sum < "$rel")" || exit 5
+        printf 'F:%s\0' "${h%% *}"
+      fi
+    done
+  ) > "$tmp" || rc=$?
+  if [ "$rc" -ne 0 ]; then
     rm -f "$tmp"
     echo "lme_content_sha256: enumeration/read failure (rc=$rc) under $dir" >&2
     return "$rc"
@@ -197,8 +200,15 @@ lme_bundle_certify() {
   if [ -d "$root/$LME_VOLUME_ROOT" ]; then
     while IFS= read -r vdir; do
       [ -n "$vdir" ] || continue
-      [ -d "$vdir/$LME_VOLUME_DATA_DIR" ] || continue
       vname="$(basename "$vdir")"
+      # A volume dir with no data/ is a FAILED/partial volume (e.g. mountpoint resolve
+      # failure leaves FAILED status, no data, no manifest). Do NOT silently skip it --
+      # a partial bundle must never be certified (mirrors b7c60cd; the Ansible when: gate
+      # is defense in depth, the library is the contract).
+      if [ ! -d "$vdir/$LME_VOLUME_DATA_DIR" ]; then
+        echo "CERTIFY-REFUSED: volume '$vname' has no $LME_VOLUME_DATA_DIR dir (failed/partial backup)" >&2
+        rm -f "$tmp"; return 1
+      fi
       vman="$vdir/$LME_VOLUME_MANIFEST_FILE"
       if [ ! -f "$vman" ]; then
         echo "CERTIFY-REFUSED: volume '$vname' has no $LME_VOLUME_MANIFEST_FILE (partial backup)" >&2
