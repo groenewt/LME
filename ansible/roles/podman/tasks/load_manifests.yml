@@ -63,20 +63,17 @@
 # container_setup.yml:17 loads it defensively), both reached from podman main.yml
 # (:248 / :240), so lme_global / lme_services / _lme_service_overrides_eff render live.
 
-- name: Resolve manifests dir and active profile
-  ansible.builtin.set_fact:
-    lme_manifests_dir: "{{ lme_manifests_dir | default(clone_directory ~ '/manifests') }}"
-    lme_profile: "{{ lme_profile | default('default') }}"
-
-- name: Load global manifest
-  ansible.builtin.include_vars:
-    file: "{{ lme_manifests_dir }}/global.yml"
-    name: _lme_global_file
-
-- name: Load active profile overlay
-  ansible.builtin.include_vars:
-    file: "{{ lme_manifests_dir }}/profiles/{{ lme_profile }}.yml"
-    name: _lme_profile_file
+# The SHARED early-resolve entrypoint (CR-B3) loads global.yml + the active profile
+# overlay, normalizes caller inputs (lme_inputs), resolves every declared field by the
+# registry's precedence, validates (fail-closed) and publishes lme_resolved /
+# lme_resolved_origins / lme_enable_flags / lme_resolved_revision + the bare-name compat
+# bridge. upgrade_lme.yml and convert_to_cluster.yml include the SAME file (via
+# `include_role: name=podman, tasks_from=resolve`) so resolution is DRY and reusable
+# OUTSIDE site.yml. See resolve.yml for the full input/output contract; it sets
+# _lme_global_file + _lme_profile_file, which the lme_global / lme_services composition
+# below reads.
+- name: Resolve config into facts via the shared early-resolve entrypoint (CR-B3)
+  ansible.builtin.include_tasks: resolve.yml
 
 - name: Compose lme_global (global | profile | operator override LAST)
   ansible.builtin.set_fact:
@@ -84,101 +81,6 @@
       {{ _lme_global_file.lme_global
          | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)
          | combine(lme_global_override | default({}), recursive=True) }}
-
-# --- C1 caller-input contract: normalize inputs, resolve ONCE per load ---------
-# codex-manager-caller-contract-decisions-20260923-0200. Inputs arrive namespaced in
-# `lme_inputs` (selections + observations + origins). A NORMALIZED entrypoint
-# (site.yml pre_tasks) sets it from hostvars before the first load. An UN-NORMALIZED
-# entrypoint (upgrade_lme / elasticsearch / convert_to_cluster / the golden harness)
-# leaves it undefined; we AUTO-NORMALIZE once here from the bare variable scope -- which
-# catches -e, inventory AND include_role `vars:` (upgrade passes its detected flags that
-# way; role vars reach included tasks but not hostvars). The `when` guard captures on the
-# FIRST load ONLY, so a later load never re-reads the bridge facts written below (the
-# self-capture the old capture-once guard fought). This compat capture is the OPEN bridge
-# (codex completion_rule); its removal condition is B/E normalizing their entrypoints to
-# set lme_inputs themselves (with observations kept SEPARATE from operator selections).
-- name: Auto-normalize compat inputs into lme_inputs (only when the entrypoint did not)
-  ansible.builtin.set_fact:
-    lme_inputs:
-      selections: "{{ dict(_lme_sel_keys | zip(_lme_sel_keys | map('extract', vars) | list)) }}"
-      observations: {}
-      origins: "{{ dict(_lme_sel_keys | zip(['operator'] * (_lme_sel_keys | length))) }}"
-  vars:
-    _lme_reg_keys: "{{ _lme_global_file.lme_config_registry.fields.keys() | list }}"
-    _lme_sel_keys: "{{ _lme_reg_keys | select('in', vars) | list }}"
-  when: lme_inputs is not defined
-
-# Resolve every declared field by ITERATING registry.precedence into a NAMESPACED
-# result (resolved + origins + enable_flags). The pure resolver reads ONLY lme_inputs +
-# the profile overlay + the registry, so re-running it each load is self-capture-free.
-# RE-RUN each load (NOT cached): a profile switch or an explicit lme_inputs change on a
-# subsequent load is reflected (codex resolution_lifetime / Q2.7). Required-missing /
-# undeclared-key / type violations RAISE here, before any mutation.
-- name: Resolve config (pure engine; iterates registry.precedence; re-run each load)
-  ansible.builtin.set_fact:
-    _lme_resolution: >-
-      {{ _lme_global_file.lme_config_registry
-         | lme_resolve_config(
-             (_lme_profile_file.profile_overlay.vars | default({})),
-             (lme_inputs.selections | default({})),
-             (lme_inputs.observations | default({})),
-             (lme_inputs.origins | default({}))) }}
-
-# VALIDATE via the LITERAL shared task (also run by the C1 A1 regression case) BEFORE any
-# mutation. registry-FIRST pipe; the engine's shape gate makes a reversed argument fail
-# closed. This is the fail-open bug's fix (codex C1-VALIDATE-CALL / A1).
-- name: Validate the resolved config against the declared schema (fail-closed, pre-mutation)
-  ansible.builtin.include_tasks: validate_resolved_config.yml
-  vars:
-    _lme_validate_registry: "{{ _lme_global_file.lme_config_registry }}"
-    _lme_validate_resolved: "{{ _lme_resolution.resolved }}"
-
-# Publish the NAMESPACED outputs. lme_enable_flags comes straight from the engine (already
-# strict-bool-coerced) -- it is is_enabled()'s input, an OUTPUT name never read back as
-# operator input, so this is self-capture-free. lme_resolved_origins carries honest
-# provenance (a natively-selected value is labelled `operator`, never falsely extra_var).
-- name: Publish namespaced resolved config, origins and enable flags (OUTPUT names)
-  ansible.builtin.set_fact:
-    lme_resolved: "{{ _lme_resolution.resolved }}"
-    lme_resolved_origins: "{{ _lme_resolution.origins }}"
-    lme_enable_flags: "{{ _lme_resolution.enable_flags }}"
-
-# CONFIGURATION revision (codex revision_identity (b)): content-addressed over the
-# canonical declared/resolved config + ordered profile identities + schema version.
-# DETERMINISTIC across the several loader includes in one run (same inputs -> same id) and
-# EXCLUDING wall-clock / volatile observation timestamps / unrelated commits, so an
-# unchanged config never rewrites or restarts a healthy consumer. OUTPUT-ONLY: never fed
-# back as a resolution input. (Per-run EVIDENCE identity -- run id, digests, timestamps,
-# observations -- is a SEPARATE record; see the versioned-artifact follow-on.)
-- name: Compute the content-addressed configuration revision (deterministic; OUTPUT-ONLY)
-  ansible.builtin.set_fact:
-    lme_resolved_revision: >-
-      {{ {'schema_version': (_lme_global_file.lme_config_registry.schema_version | default(1)),
-          'ordered_profiles': _lme_profile_identities,
-          'resolved': _lme_resolution.resolved,
-          'origins': _lme_resolution.origins} | lme_config_revision }}
-  vars:
-    # ordered overlay identities + hashes are RETAINED even for the current single
-    # overlay (codex ordered_profiles). The multi-overlay chain merge is the declared
-    # follow-on; the resolver already accepts one merged mapping.
-    _lme_profile_identities:
-      - name: "{{ lme_profile }}"
-        sha256: "{{ lookup('file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | hash('sha256') }}"
-
-# OPEN DEBT (codex resolution_lifetime -- explicitly transitional, removed as consumer
-# migrations land; no parallel legacy backend at acceptance): materialize the resolved
-# values under their BARE names for consumers not yet migrated to read lme_resolved.*
-# (tailscale_serve_* in podman/tasks/main.yml + tailscale_*.yml; offline_mode in the
-# offline load tasks; install_llm / install_elastic_services in container_setup / main.yml
-# + site.yml:179/188; lme_consumer_profile). The loader NEVER reads a bare name as input
-# (it reads lme_inputs), so this cannot self-capture. Optional fields absent from
-# lme_resolved are NOT bridged (their readers use `| default`).
-- name: Bridge resolved values to bare facts for un-migrated consumers (OPEN debt)
-  ansible.builtin.set_fact:
-    "{{ item.key }}": "{{ item.value }}"
-  loop: "{{ _lme_resolution.resolved | dict2items }}"
-  loop_control:
-    label: "{{ item.key }}"
 
 # Temporary failure boundary during canonical-engine reconciliation. This is an
 # implementation gap, not an operator prohibition or an alternate deployment path.
