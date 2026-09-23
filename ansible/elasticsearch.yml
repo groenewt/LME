@@ -67,11 +67,17 @@
           # limitation (the Deploy play's own var scope is not re-captured) is the shared
           # resolver's C1-CAPTURE-AND-ARTIFACT-COMPLETENESS, routed to C1, not closed here.
           - _lme_operator_selections is not defined
+          # And refuse a pre-supplied resolved revision. lme_resolved_revision is an OUTPUT-ONLY
+          # set_fact (resolve.yml:173-178); an extra-var OUTRANKS a set_fact, so `-e
+          # lme_resolved_revision=X` would PIN the same forged value into BOTH the barrier's
+          # recorded evidence AND the Deploy parity comparison, defeating the revision binding P1
+          # requires. It is never legitimately pre-supplied, so reject it here.
+          - lme_resolved_revision is not defined
         fail_msg: >-
-          _lme_es_barrier_run_token / _lme_es_prevalidated / _lme_operator_selections must NOT be
-          pre-supplied (-e) or carried from a prior play -- the barrier mints its own
-          per-invocation evidence and a pristine operator-selection capture, so a historical or
-          injected value cannot satisfy the gate.
+          _lme_es_barrier_run_token / _lme_es_prevalidated / _lme_operator_selections /
+          lme_resolved_revision must NOT be pre-supplied (-e) or carried from a prior play -- the
+          barrier mints its own per-invocation evidence and resolves its own revision, so a
+          historical, injected or -e-pinned value cannot satisfy the gate.
         quiet: true
       tags: ['always']
 
@@ -154,13 +160,11 @@
 - name: Deploy Elasticsearch
   hosts: elasticsearch
   become: yes
-  # Make the Deploy-play PARITY GATE (pre_tasks below) an ALL-HOST pre-mutation stop:
-  # any_errors_fatal aborts every host the moment one host's parity assert fails, so a
-  # peer whose config revision drifted between the barrier play and deploy cannot fail
-  # locally while another host proceeds into the mutating role (codex
-  # E-PREFLIGHT-DRIFT-AFTER-BOOTSTRAP-PEER-CONTINUES). strategy:linear guarantees
-  # any_errors_fatal is honored (see the barrier play).
-  any_errors_fatal: true
+  # strategy:linear guarantees any_errors_fatal is honored (see the barrier play). The
+  # PARITY GATE's all-host stop is SCOPED to the parity block in pre_tasks (below), NOT the
+  # whole play, so a config-revision drift on any host aborts every host before the mutating
+  # role while the rest of the deploy keeps normal per-host failure semantics (minimal blast
+  # radius; the local master is not coupled to an unrelated data-node deploy-task failure).
   strategy: linear
   vars:
     # Common variables (same as site.yml)
@@ -257,29 +261,39 @@
     # change adds `serial:`. The re-run also re-bridges the resolved bare facts (offline_mode,
     # install_llm, ...) the ansible-core bootstrap tasks below read. Runs FIRST so nothing
     # mutating in this play precedes it.
-    - name: Parity -- re-resolve+validate this host's declared config (matches the barrier play)
-      ansible.builtin.include_role:
-        name: podman
-        tasks_from: load_manifests
-        apply:
+    # any_errors_fatal on THIS BLOCK (not the whole play): a parity failure on ANY host
+    # aborts every host before the mutating role, so a peer whose revision drifted cannot fail
+    # locally while another host proceeds into deploy (codex
+    # E-PREFLIGHT-DRIFT-AFTER-BOOTSTRAP-PEER-CONTINUES). Scoped to the block so an unrelated
+    # deploy-task failure later keeps normal per-host semantics. NB the raw python bootstrap
+    # play STILL precedes this, so this is an all-host stop before DEPLOY mutations, not before
+    # the (idempotent, non-destructive) python install.
+    - name: Parity gate -- all-host pre-deploy validation stop
+      any_errors_fatal: true
+      block:
+        - name: Parity -- re-resolve+validate this host's declared config (matches the barrier play)
+          ansible.builtin.include_role:
+            name: podman
+            tasks_from: load_manifests
+            apply:
+              tags: ['always']
           tags: ['always']
-      tags: ['always']
 
-    - name: Parity -- refuse to deploy unless the barrier validated THIS exact config on THIS host
-      ansible.builtin.assert:
-        that:
-          - _lme_es_prevalidated is defined
-          # token absent -> the barrier play did not run this invocation (fail closed).
-          - (_lme_es_prevalidated.token | default('')) == (_lme_es_barrier_run_token | default('__barrier_did_not_run__'))
-          # revision drift -> the config changed between validation and deploy (fail closed).
-          - (_lme_es_prevalidated.revision | default('')) == lme_resolved_revision
-        fail_msg: >-
-          {{ inventory_hostname }} has no matching pre-mutation validation evidence for THIS deploy
-          (expected token {{ _lme_es_barrier_run_token | default('UNSET -- barrier play did not run') }}
-          and resolved revision {{ lme_resolved_revision }}). The validated config is not the config
-          being deployed; refusing to enter a mutating role.
-        quiet: true
-      tags: ['always']
+        - name: Parity -- refuse to deploy unless the barrier validated THIS exact config on THIS host
+          ansible.builtin.assert:
+            that:
+              - _lme_es_prevalidated is defined
+              # token absent -> the barrier play did not run this invocation (fail closed).
+              - (_lme_es_prevalidated.token | default('')) == (_lme_es_barrier_run_token | default('__barrier_did_not_run__'))
+              # revision drift -> the config changed between validation and deploy (fail closed).
+              - (_lme_es_prevalidated.revision | default('')) == lme_resolved_revision
+            fail_msg: >-
+              {{ inventory_hostname }} has no matching pre-mutation validation evidence for THIS deploy
+              (expected token {{ _lme_es_barrier_run_token | default('UNSET -- barrier play did not run') }}
+              and resolved revision {{ lme_resolved_revision }}). The validated config is not the config
+              being deployed; refusing to enter a mutating role.
+            quiet: true
+          tags: ['always']
     # --- end PARITY GATE ---------------------------------------------------------------
 
     # Cluster child nodes never run install.sh, so ansible-vault is not present.
