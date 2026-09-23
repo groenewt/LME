@@ -752,6 +752,105 @@ def lme_known_enable_flags(_ignored=None):
     return sorted(KNOWN_ENABLE_FLAGS)
 
 
+_MODE_RE = re.compile(r'^[0-7]{3,4}$')
+
+
+def lme_validate_material_requirements(catalog, obligations, schema,
+                                       referenced_ids=None, context=None):
+    """Validate ONE service's declared `material_requirements` against the shared
+    `lme_global.material_catalog` and the declared record schema
+    (`lme_config_registry.material_requirements_schema`). Value-pure: every field name,
+    required flag and vocabulary is READ from `schema`, never hardcoded here (the
+    filter-plugin literal ban). This is the SCHEMA_REQUIRED_MATERIAL enforcer
+    (codex-manager-material-and-membership-contract-decisions-20260923-0430 decision 1+2;
+    C convergence ack 0429; D b87f313 record_shape). It validates the DECLARATION shape +
+    reference resolution; the deploy-time "obligation declared but not produced" and
+    "decryptable-but-malformed payload" checks are the consumer's (C materializer /
+    D completeness) using the same catalog payload_validity.
+
+    `obligations` is the service's material_requirements field value:
+      * None  -> the field is ABSENT. A SELECTED service omitting it is INCOMPLETE and
+                 RAISES (missing != implicitly-empty; codex-0430 decision 2). Callers
+                 that must tolerate an unselected service simply do not call this.
+      * {}    -> explicit declared-none. PASSES iff nothing references an obligation
+                 (an empty declaration that contradicts a cred/trust/mount ref is INVALID).
+      * map   -> each obligation id -> a typed record validated against schema.record.
+
+    `referenced_ids` is the set/list of obligation ids that OTHER declarations
+    (datastore_clients.material_requirement_refs, secrets, mounts) point at; every one
+    MUST resolve to a declared obligation (a dangling ref = declared-but-unproduced =
+    FAIL before mutation). Returns the validated obligations map on success."""
+    where = ' for service %r' % (context,) if context else ''
+    if not isinstance(schema, dict) or not isinstance(schema.get('record'), dict):
+        raise ValueError('lme: material_requirements_schema has no record shape')
+    record_fields = schema['record']
+    empty_sem = schema.get('empty_semantics') or {}
+    refs = set(referenced_ids or [])
+
+    # --- the three empty-list cases (codex-0430 decision 2) ---------------------
+    if obligations is None:
+        if empty_sem.get('missing_field_fails', True):
+            raise ValueError(
+                'lme: material_requirements is MISSING%s -- a selected service must '
+                'declare the field (explicit {} for declared-none); omission is '
+                'INCOMPLETE, never implicitly empty' % where)
+        return {}
+    if not isinstance(obligations, dict):
+        raise ValueError('lme: material_requirements%s must be a mapping, got %r'
+                         % (where, type(obligations).__name__))
+    if not obligations:
+        if refs and empty_sem.get('empty_contradicting_refs_invalid', True):
+            raise ValueError(
+                'lme: material_requirements%s is declared-none ({}) but obligation '
+                'reference(s) %r point at it -- an empty declaration contradicting '
+                'cred/trust/mount refs is INVALID' % (where, sorted(refs)))
+        return {}
+
+    # --- typed record validation ----------------------------------------------
+    vocabs = {k: set(f['vocab']) for k, f in record_fields.items() if f.get('vocab')}
+    for oid, rec in obligations.items():
+        rwhere = '%s obligation %r' % (where, oid)
+        if not isinstance(rec, dict):
+            raise ValueError('lme: material_requirements%s is not a mapping' % rwhere)
+        for fname, fdecl in record_fields.items():
+            present = fname in rec
+            if not present:
+                if fdecl.get('required'):
+                    raise ValueError('lme: material_requirements%s missing required '
+                                     'field %r' % (rwhere, fname))
+                continue
+            val = rec[fname]
+            if fdecl.get('type') == 'str' and not isinstance(val, str):
+                raise ValueError('lme: material_requirements%s field %r must be a '
+                                 'string, got %r' % (rwhere, fname, val))
+            if fname in vocabs and val not in vocabs[fname]:
+                raise ValueError('lme: material_requirements%s field %r value %r not '
+                                 'in declared vocab %r' % (rwhere, fname, val,
+                                                           sorted(vocabs[fname])))
+        undeclared = [k for k in rec if k not in record_fields]
+        if undeclared:
+            raise ValueError('lme: material_requirements%s has undeclared field(s) %r'
+                             % (rwhere, sorted(undeclared)))
+        # material_ref MUST resolve to a catalog payload definition.
+        mref = rec.get('material_ref')
+        if mref is not None and mref not in (catalog or {}):
+            raise ValueError('lme: material_requirements%s material_ref %r resolves to '
+                             'no lme_global.material_catalog definition' % (rwhere, mref))
+        # mode, when declared a str, MUST be an octal string.
+        mode = rec.get('mode')
+        if isinstance(mode, str) and not _MODE_RE.match(mode):
+            raise ValueError('lme: material_requirements%s mode %r is not an octal '
+                             'string (e.g. "0600")' % (rwhere, mode))
+
+    # --- reference resolution: every referenced obligation id must exist --------
+    dangling = sorted(r for r in refs if r not in obligations)
+    if dangling:
+        raise ValueError(
+            'lme: material_requirement_ref(s) %r%s resolve to no declared obligation '
+            '(declared-but-unproduced -- fail before mutation)' % (dangling, where))
+    return obligations
+
+
 class FilterModule(object):
     def filters(self):
         return {
@@ -760,6 +859,7 @@ class FilterModule(object):
             'lme_validate_config': lme_validate_config,
             'lme_config_revision': lme_config_revision,
             'lme_known_enable_flags': lme_known_enable_flags,
+            'lme_validate_material_requirements': lme_validate_material_requirements,
             'render_userns': render_userns,
             'userns_base': userns_base,
             'cert_owner': cert_owner,

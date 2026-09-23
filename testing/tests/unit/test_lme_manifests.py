@@ -822,3 +822,112 @@ def test_llm_on_upgrade_publishes_both_core_and_ai_ui_cert_bundles():
     for svc in ("kibana", "fleet-server", "fleet-distribution", "wazuh-manager",
                 "dashboard", "log-analyzer", "litellm"):
         assert svc in owners, "%s missing from LLM-on cert bundle owners" % svc
+
+
+# ---------------------------------------------------------------------------------
+# typed material_requirements validator (SCHEMA-REQUIRED-MATERIAL; codex-0430 dec 1+2;
+# C convergence ack 0429; D b87f313 record_shape). Value-pure: catalog + schema read
+# from manifests/global.yml, never hardcoded in the engine.
+# ---------------------------------------------------------------------------------
+validate_material = FILTERS["lme_validate_material_requirements"]
+
+
+def _material_schema():
+    with open(GLOBAL_YML, "r") as fh:
+        return yaml.safe_load(fh)["lme_config_registry"]["material_requirements_schema"]
+
+
+_MAT_CATALOG = LME_GLOBAL["material_catalog"]
+_MAT_SCHEMA = _material_schema()
+
+
+def _good_obligation():
+    return {
+        "guardian_pub_proxy": {
+            "material_ref": "guardian_public_key",
+            "placement_class": "config",
+            "destination": "/data/{owner}/config/postgresql/guardian.pub",
+            "owner_role": "lmedbhb",
+            "mode": "0644",
+            "consumer": "fenced proxy mount",
+            "profile_condition": "always",
+        }
+    }
+
+
+def test_material_catalog_guardian_is_public_key_only():
+    # the shared definition is a PUBLIC key -- a shared ref never distributes private material
+    assert _MAT_CATALOG["guardian_public_key"]["kind"] == "public_key"
+
+
+def test_material_declared_none_passes():
+    # explicit `material_requirements: {}` == legitimately requires none == PASS
+    assert validate_material(_MAT_CATALOG, {}, _MAT_SCHEMA, context="svcA") == {}
+
+
+def test_material_missing_field_fails_not_implicitly_empty():
+    # a selected service OMITTING the field (None) is INCOMPLETE, never implicitly empty
+    with pytest.raises(ValueError) as e:
+        validate_material(_MAT_CATALOG, None, _MAT_SCHEMA, context="svcA")
+    assert "MISSING" in str(e.value)
+
+
+def test_material_declared_none_contradicting_ref_is_invalid():
+    with pytest.raises(ValueError) as e:
+        validate_material(_MAT_CATALOG, {}, _MAT_SCHEMA,
+                          referenced_ids=["o1"], context="svcA")
+    assert "INVALID" in str(e.value)
+
+
+def test_material_valid_typed_obligation_resolves():
+    good = _good_obligation()
+    assert validate_material(_MAT_CATALOG, good, _MAT_SCHEMA,
+                             referenced_ids=["guardian_pub_proxy"],
+                             context="svcA") == good
+
+
+def test_material_ref_must_resolve_to_catalog_definition():
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["material_ref"] = "no_such_def"
+    with pytest.raises(ValueError) as e:
+        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
+    assert "material_catalog" in str(e.value)
+
+
+def test_material_placement_class_must_be_in_vocab():
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["placement_class"] = "elsewhere"
+    with pytest.raises(ValueError) as e:
+        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
+    assert "vocab" in str(e.value)
+
+
+def test_material_mode_must_be_octal():
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["mode"] = "rwx"
+    with pytest.raises(ValueError) as e:
+        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
+    assert "octal" in str(e.value)
+
+
+def test_material_dangling_reference_is_unproduced_fail():
+    good = _good_obligation()
+    with pytest.raises(ValueError) as e:
+        validate_material(_MAT_CATALOG, good, _MAT_SCHEMA,
+                          referenced_ids=["ghost"], context="svcA")
+    assert "declared-but-unproduced" in str(e.value)
+
+
+def test_material_missing_required_record_field_fails():
+    bad = {"x": {"material_ref": "guardian_public_key", "placement_class": "config"}}
+    with pytest.raises(ValueError) as e:
+        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
+    assert "missing required" in str(e.value)
+
+
+def test_material_undeclared_record_field_rejected():
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["surprise"] = "x"
+    with pytest.raises(ValueError) as e:
+        validate_material(_MAT_CATALOG, bad, _MAT_SCHEMA, context="svcA")
+    assert "undeclared" in str(e.value)
