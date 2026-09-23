@@ -1,0 +1,207 @@
+# testing/tests/loader_integration/cases/02_consumer_agreement.yml
+#
+# INTEGRATION-tier acceptance data for the LME resolved-config contract, mapping to
+# Codex required_contract_test #6 (the three consumer tiers all read the SAME resolved
+# revision) PLUS the cross-consumer origin / anti-snapshot invariants of
+# codex-check-0200. Leaf-authored (G2), disjoint from every other cases/NN_*.yml.
+#
+# THE THREE CONSUMER TIERS (contract_binding.consumer_gates) that must agree on ONE
+# resolved revision bound to one deployment:
+#   early_upgrade_gate          = ansible/upgrade_lme.yml (160,161,422,443,674,738-749)
+#   rendered_service_membership = ansible/roles/podman/tasks/render_units.yml
+#                                 (is_enabled() over the resolved enable-flags -> lme_services)
+#   credential_certificate_gate = ansible/roles/podman/tasks/load_manifests.yml
+#                                 ("Require resolved consumer secret and certificate bindings")
+#
+# QUEUED UNTIL C1. The C1 lme_resolved.* contract + its revision field are NOT landed
+# (contract_binding.status == pending_c1_sitrep). EVERY case here is contract-dependent,
+# so each carries queued_on and the runner marks it QUEUED (never PASS, never SKIP) until
+# the coordinator flips contract_binding to bound. Being QUEUED at this HEAD is CORRECT;
+# these become runnable, un-touched, the moment C1 binds.
+#
+# WHY EACH CASE IS A REAL GUARD (not a vacuous pass) -- verified against HEAD:
+#   * The credential gate is CONDITIONAL (load_manifests.yml:177,
+#     when: lme_resolved.lme_consumer_profile). Cases that exercise it force the
+#     consumer profile (manifests/profiles/consumer.yml sets lme_consumer_profile: true)
+#     so the gate EXECUTES rather than being skipped -- "agrees"/"passes" is meaningless
+#     for a skipped assert. The invariant_task states "executed, not skipped".
+#   * The gate today reads BARE vars (load_manifests.yml:172-175), so a presence-only
+#     check passes at HEAD from any stray hostvar. Case 2 additionally asserts ORIGIN,
+#     so a non-origin-tracked accidental hostvar fails.
+#   * The snapshot-once defect is invisible when both reads share identical inputs, so
+#     Case 5 changes a declared input BETWEEN the two reads (profile_sequence) and
+#     asserts the later read reflects the CURRENT input, not the first-load snapshot.
+#
+# CONVENTIONS:
+#   * expect field keys are BARE resolved-contract names (install_llm, lme_profile, ...)
+#     or dotted paths into a bare fact (lme_service_overrides.dashboard.environment.*).
+#     They are NOT prefixed lme_resolved.* -- C1's public names are pending and are bound
+#     ONLY via contract_binding.yml, never guessed in case data.
+#   * NO secret VALUES anywhere. All fixtures are synthetic .invalid hosts/URLs.
+
+schema_version: 1
+cases:
+  # 1) The primary contract-test-#6 invariant: all three consumer tiers read ONE
+  #    resolved revision. On `upgrade`, -e lme_profile=consumer overrides the
+  #    marker-derived _render_lme_profile (upgrade_lme.yml:749 role var; -e wins) so
+  #    the credential gate is armed; the four synthetic bindings let it pass once armed.
+  - name: early-upgrade-gate-rendered-membership-credential-gate-same-revision
+    kind: consumer_agreement
+    requires_contract: true
+    queued_on: [C1, B, C]
+    entrypoints: [upgrade, site]
+    inputs:
+      profile: consumer
+      extra_vars:
+        # -e beats upgrade_lme.yml:739's marker-inferred _render_lme_profile, arming the gate
+        lme_profile: consumer
+        lme_secrets_source_host: secrets-source.example.invalid
+        lme_certs_source_host: certs-source.example.invalid
+        lme_service_overrides:
+          dashboard:
+            environment:
+              ELASTICSEARCH_URL: https://es.example.invalid:9200
+              LITELLM_URL: https://litellm.example.invalid:4000
+    expect:
+      # consumer_agreement kind == ">=2 gates read the SAME resolved revision"; listing all
+      # three carries the same-revision expectation. The invariant_task makes it explicit.
+      gates_agree: [early_upgrade_gate, rendered_service_membership, credential_certificate_gate]
+    invariant_task: >-
+      consumer-agreement: the early upgrade gate, the rendered service-membership gate and the
+      consumer credential/certificate gate all EXECUTE (none skipped) and read ONE resolved
+      revision bound to the same deployment
+    fail_msg: >-
+      consumer tiers disagree on the resolved revision (or a gate was skipped rather than executed):
+      at HEAD the early upgrade gate computes its own enable flags at upgrade_lme.yml:158-161,
+      ~580 lines BEFORE the resolver runs (the load_manifests include_role at upgrade_lme.yml:741),
+      so no shared resolved revision exists for the three tiers to agree on; C1 must make all three
+      consumers read lme_resolved.* bound to one revision.
+
+  # 2) The credential/cert gate must pass ONLY on bindings present in the RESOLVED contract
+  #    WITH a recorded origin -- an accidental bare hostvar (no origin) must not arm a consumer.
+  - name: consumer-profile-requires-resolved-secret-cert-endpoints
+    kind: consumer_agreement
+    requires_contract: true
+    queued_on: [C1, C]
+    entrypoints: [site, upgrade]
+    inputs:
+      profile: consumer
+      extra_vars:
+        lme_secrets_source_host: secrets-source.example.invalid
+        lme_certs_source_host: certs-source.example.invalid
+        lme_service_overrides:
+          dashboard:
+            environment:
+              ELASTICSEARCH_URL: https://es.example.invalid:9200
+              LITELLM_URL: https://litellm.example.invalid:4000
+    expect:
+      resolved:
+        lme_secrets_source_host: secrets-source.example.invalid
+        lme_certs_source_host: certs-source.example.invalid
+        lme_service_overrides.dashboard.environment.ELASTICSEARCH_URL: https://es.example.invalid:9200
+        lme_service_overrides.dashboard.environment.LITELLM_URL: https://litellm.example.invalid:4000
+      origin:
+        lme_secrets_source_host: extra_var
+        lme_certs_source_host: extra_var
+        lme_service_overrides.dashboard.environment.ELASTICSEARCH_URL: extra_var
+        lme_service_overrides.dashboard.environment.LITELLM_URL: extra_var
+    invariant_task: >-
+      consumer-agreement: the credential/certificate gate EXECUTES (consumer profile true, not
+      skipped) and passes ONLY when all four bindings (secrets_source_host, certs_source_host,
+      dashboard ELASTICSEARCH_URL + LITELLM_URL) are present in the RESOLVED contract with a
+      recorded origin -- an accidental bare hostvar with no origin record does not satisfy it
+    fail_msg: >-
+      consumer credential/cert gate accepted a binding that is not origin-tracked in the resolved
+      contract: at HEAD load_manifests.yml:172-175 asserts the BARE vars lme_secrets_source_host /
+      lme_certs_source_host / lme_service_overrides.dashboard.environment.ELASTICSEARCH_URL /
+      LITELLM_URL, so any stray hostvar satisfies it; C1/C must source these four from lme_resolved.*
+      with a recorded origin so an accidental hostvar cannot arm a consumer.
+
+  # 3) Rendered membership is derived from the RESOLVED enable-flags. On the default profile
+  #    (default.yml overlay does NOT touch the enable flags; declared defaults stand):
+  #    install_llm=true, install_elastic_services=false, install_otel=false.
+  - name: rendered-service-membership-matches-resolved-enable-flags
+    kind: consumer_agreement
+    requires_contract: true
+    queued_on: [C1]
+    entrypoints: [site]
+    inputs:
+      profile: default
+    expect:
+      # install_llm=true (declared default) -> LLM services rendered
+      members_include: [litellm, dashboard, log-analyzer, llama-cpp]
+      # install_elastic_services=false + install_otel=false (declared defaults) -> excluded
+      members_exclude: [apm-server, logstash, heartbeat, otel-collector]
+    invariant_task: >-
+      consumer-agreement: rendered service membership (render_units is_enabled() over the resolved
+      enable-flags) is derived from the SAME resolved enable-flags the other consumers read --
+      install_llm=true includes the LLM services; install_elastic_services=false and install_otel=false
+      exclude the elastic + otel services
+    fail_msg: >-
+      rendered service membership diverged from the resolved enable-flags: an LLM service was dropped
+      though install_llm resolved true, or an elastic/otel service rendered though
+      install_elastic_services/install_otel resolved false -- render_units (render_units.yml:34-38)
+      must read the resolved enable-flags assembled in load_manifests.yml:136-140 (lme_enable_flags
+      from lme_resolved), not an independently recomputed flag set.
+
+  # 4) A marker-inferred profile is NOT an explicit operator choice; its origin must be
+  #    retained as observation-backed. No -e lme_profile and no -e offline_mode: the value
+  #    is inferred purely from the on-disk marker.
+  - name: marker-inferred-profile-not-recorded-as-explicit-operator-choice
+    kind: origin
+    requires_contract: true
+    queued_on: [C1, B]
+    entrypoints: [upgrade]
+    inputs:
+      markers:
+        offline_mode_marker:
+          path: /opt/lme/OFFLINE_MODE
+          state: present
+      # DELIBERATELY no explicit lme_profile and no -e offline_mode: the profile is INFERRED
+      # from the marker (upgrade_lme.yml:738-739 -> _render_lme_profile 'offline'), not chosen.
+    expect:
+      resolved:
+        lme_profile: offline
+      origin:
+        # observation-backed inference, within contract_binding's declared origin vocabulary;
+        # NOT 'profile' (explicit operator-selected overlay) and NOT 'extra_var' (operator -e).
+        lme_profile: preservation
+    invariant_task: >-
+      origin: a marker-inferred lme_profile (offline, derived from the /opt/lme/OFFLINE_MODE marker
+      with no operator -e) is recorded as observation-backed (preservation), NEVER as an explicit
+      operator profile choice
+    fail_msg: >-
+      marker-inferred lme_profile was recorded as an explicit operator choice: at HEAD lme_profile is
+      resolved OUTSIDE the registry (bare, load_manifests.yml:69) from upgrade_lme.yml:739's marker
+      inference with NO origin record, while the auto-normalize stamps 'operator' on every bare-scope
+      registry key (load_manifests.yml:105, capturing the include_role vars at upgrade_lme.yml:749);
+      C1 must record this selector's origin as observation-backed and MUST NOT mark it 'profile' or
+      'operator' (codex-check-0200: an auto-inferred profile is not an explicit operator profile choice).
+
+  # 5) No snapshot-once across consumers: each read RECOMPUTES from the current declared inputs.
+  #    A declared-input change BETWEEN the two reads in one run is the discriminator -- with
+  #    identical inputs a snapshot-once impl and a recompute look the same.
+  - name: same-deployment-new-revision-no-snapshot-once-across-consumers
+    kind: revision
+    requires_contract: true
+    queued_on: [C1]
+    entrypoints: [upgrade, site]
+    inputs:
+      # first read resolves 'default' (offline_mode false); a declared-input change then makes
+      # the second read resolve 'offline' (offline_mode true) within the SAME run.
+      profile_sequence: [default, offline]
+    expect:
+      resolved:
+        # the LATER read must reflect the CURRENT input (offline), not a cached first-load snapshot
+        offline_mode: true
+    invariant_task: >-
+      revision: two consumer reads in one run each RECOMPUTE lme_resolved from the current declared
+      inputs -- a load after a declared-input change reflects the new inputs (offline_mode true),
+      while two reads of the SAME load agree on one revision; no snapshot-once cached first-load
+      result is served
+    fail_msg: >-
+      a consumer read served a snapshot-once cached first-load result instead of recomputing: the
+      second read still reflected the first load's inputs (offline_mode false) -- load_manifests.yml:109
+      (when: lme_inputs is not defined) must capture raw inputs on first load only WITHOUT freezing the
+      resolved OUTPUT, so each load recomputes lme_resolved from the current inputs and revision
+      (codex-check-0200: do not restore snapshot-once behavior).
