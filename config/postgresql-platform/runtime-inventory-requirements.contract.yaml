@@ -176,6 +176,36 @@ authority:
   migration_ref: config/postgresql-platform/migration-workflow.contract.yaml   # D-MIGRATION-IDENTITY-SCOPE/RESUME (open)
 
 # ---------------------------------------------------------------------------------------
+# INITIALIZED-STORAGE LIFECYCLE + AUTHORITY (D-AI-OFF-STORAGE-EXECUTION, codex-0445)
+# preserve_initialized_storage has NO execution consumer today: AI-off disables BOTH the
+# pgvector service AND its volume, ordinary rendering excludes the volume from the expected
+# set and prunes its managed Quadlet (render_units.yml SF-5), and wipe removes it
+# unconditionally (wipe_lme.sh podman volume rm -a). D declares an INDEPENDENT lifecycle
+# whose authority is NOT the service enable flag.
+# ---------------------------------------------------------------------------------------
+initialized_storage_lifecycle:
+  principle: >-
+    Initialized storage (a data volume that has been initdb'd and holds authoritative data)
+    has its OWN lifecycle + authority, INDEPENDENT of the service enable flag. Disabling the
+    client (install_llm=false), or ordinary rendering excluding the volume unit, is a
+    render/desired-state change -- it is NEVER a disposition of the on-disk DATA. Removal of
+    initialized storage requires verified ownership + retention authority, never a side effect.
+  resources: [lme_pgvectordata, "HA db-<domain> volumes (/data/{owner}/volumes/postgresql/<domain>)", "etcd volume (/data/{etcd_owner}/volumes/postgresql/etcd)"]
+  states:   # keep desired / rendered / initialized distinct (parallels material desired/produced/installed/validated)
+    desired_enabled: "install_llm / lme_database_profile selection -> whether the service+volume unit is RENDERED"
+    initialized: "OBSERVATION-tier readback: the volume has been initdb'd and holds data (UNKNOWN -> treat as initialized, never empty)"
+  rules:
+    - "render EXCLUSION of a volume unit (AI-off / not-selected) MUST NOT imply DATA removal: a rendered-out but INITIALIZED volume is preserved, not orphaned or wiped."
+    - "removal of an INITIALIZED volume requires verified owner identity + retention authority (B scopes the explicit removal by verified ownership/retention); wipe's blanket `podman volume rm -a` is NOT that authority."
+    - "authority-to-none (install_llm off with initialized storage present) PRESERVES and routes to migration-workflow.contract.yaml (authority-to-none trigger), never orphans (see manifests/services/lme-pgvector.yml authority preserve_initialized_storage)."
+    - "a profile/authority change on initialized storage routes to the migration workflow (rejection_guard), never an in-place reinit."
+  owners: {D: "declares this lifecycle + authority", C1: "reconciles into the registry (independent-storage authority, not the enable flag)", B: "scopes explicit removal by verified ownership/retention", G: "tests actual changed-reapply + teardown, not merely the presence of a manifest flag"}
+  execution_gap_residual: >-
+    OPEN: no execution consumer yet enforces this. render_units.yml SF-5 prune + wipe_lme.sh
+    `podman volume rm -a` + install_llm:false render exclusion remain the gaps. C1 reconciles the
+    authority; B scopes removal; G tests changed-reapply + teardown. Runtime acceptance OPEN.
+
+# ---------------------------------------------------------------------------------------
 # REQUIRED MATERIAL (SCHEMA-REQUIRED-MATERIAL) -- TYPED requirements, ground-truth files
 # ---------------------------------------------------------------------------------------
 required_material:
@@ -187,11 +217,28 @@ required_material:
     Do NOT universally demand a nonempty set for every owner (some owner-roles legitimately require none).
     Observed resources MUST NEVER shrink the expected requirements. RETRACTS schema-v1's blanket
     'owner present with empty set => reject'.
+  superset_rule: >-
+    D-REQUIRED-MATERIAL-PLACEMENTS (codex-0445 SUPERSET RULE): the typed required_material contract
+    is a SUPERSET that references the existing platform.py completeness authority (PostgreSQL
+    CA/server/admin, pg_service.conf, role-passwords.json, patroni.env, etcd-client, backup-client)
+    and ADDS guardian.pub (db-owner secrets) + the etcd-owner set ON TOP -- NEVER a replacement that
+    drops obligations. Grant presence is NECESSARY, NOT sufficient: content/payload/permission
+    validation is a separate gate (C-MATERIAL-GRANT-EVIDENCE). Each guardian.pub PLACEMENT is a
+    DISTINCT obligation referencing the ONE canonical lme_global.material_catalog.guardian_public_key
+    definition (a shared reference NEVER authorizes distributing private material).
   db_domain_owner:
     dir_class: secrets
     destination_template: "/data/{owner}/secrets/postgresql/{name}"
-    currently_checked:    # GROUND TRUTH: platform.py L231-234 completeness tuple (per domain owner)
-      always: [pg-ca.crt, pg-server.crt, pg-server.key, admin.crt, admin.key, admin.pgpass, pg_service.conf, role-passwords.json, patroni.env, etcd-ca.crt, etcd-client.crt, etcd-client.key, backup-ca.crt, backup-client.crt, backup-client.key]
+    currently_checked:    # GROUND TRUTH: platform.py completeness tuple (per domain owner) -- NOW includes guardian.pub
+      always: [pg-ca.crt, pg-server.crt, pg-server.key, admin.crt, admin.key, admin.pgpass, pg_service.conf, role-passwords.json, patroni.env, etcd-ca.crt, etcd-client.crt, etcd-client.key, backup-ca.crt, backup-client.crt, backup-client.key, guardian.pub]
+    guardian_pub_placement:   # D-REQUIRED-MATERIAL-PLACEMENTS: db-owner secrets-dir obligation, ADDED
+      name: guardian.pub
+      material_ref: guardian_public_key   # -> lme_global.material_catalog.guardian_public_key
+      placement_class: secrets
+      destination: "/data/{owner}/secrets/postgresql/guardian.pub"
+      mode: "0644"
+      consumer: "member pre_promote/bootstrap gate reads /run/secrets/guardian.pub (render L313) + rejoin read_route (rejoin L55)"
+      distinct_from: "the proxy config-dir guardian.pub (proxy_owner below) -- two obligations, one definition"
     render_referenced_but_UNCHECKED:   # render() references these; completeness reshape ADDS them (with correct dir/profile)
       always: {names: [replicator.crt, replicator.key], destination: "/data/{owner}/secrets/postgresql/", consumer: "patroni physical replication (render L341)"}
       dual-owned-ha:
@@ -201,7 +248,13 @@ required_material:
   etcd_owner:
     dir_class: secrets
     destination_template: "/data/{etcd_owner}/secrets/postgresql/{name}"
-    render_referenced_but_UNCHECKED: {names: [etcd-server.crt, etcd-server.key], consumer: "etcd server TLS (render L473-475); the -server pair is not covered by the L231 tuple (which checks etcd-client.*)"}
+    currently_checked:    # NOW checked: the etcd-owner secrets dir had ZERO completeness coverage (platform.py etcd_owner loop)
+      always: [etcd-ca.crt, etcd-server.crt, etcd-server.key]
+      note: >-
+        etcd server mounts /data/{etcd_owner}/secrets/postgresql at /run/secrets (render L475) and reads
+        etcd-ca.crt (--trusted-ca-file / --peer-trusted-ca-file) + the etcd-server pair (render L473). These
+        are the ETCD owner account (owners.etcd), distinct from the db-domain owner whose tuple checks
+        etcd-client.*. etcd-ca.crt references the SAME canonical CA as the db-owner etcd-ca.crt obligation.
   proxy_owner:
     dir_class: config      # DIFFERENT placement from the secrets-dir guardian.pub
     destination_template: "/data/{owner}/config/postgresql/guardian.pub"
@@ -253,10 +306,31 @@ identity_binding:
     operator_input_key: lme_deployment_identity   # proposed; parallels lme_database_profile
     type: "str [a-zA-Z0-9_-]+ (stable across reapply + evidence runs)"
     origin: INVENTORY   # operator/host_var only; resolver MUST NOT mint or config-derive it
-    keys: [fence_authorization, persistent_storage_root, credential_ownership]
-    absence: fail_closed   # render() deny-renders (F1, e1a4ec2)
-    backward_incompatible: "an existing deployment WITHOUT this input deny-renders -> its HA cannot start. Needs operator ratification (same class as F2's two backward-incompat flags)."
-    named_consumer_edit: "resolved_role_config (platform.py L249) must read resolved['deployment_identity'] and thread it into config (D-owned)."
+    keys: [fence_authorization, persistent_storage_root, credential_ownership, resolved_db_role]
+    absence: reject_before_mutation   # UPDATED: resolved_role_config RAISES (7dbf6e7); render() keeps deny-render as defense in depth
+    backward_incompatible: "an existing deployment WITHOUT this input REJECTS before mutation (ratified codex-0445 decision_deployment_identity) -> its HA cannot start until declared. Same backward-incompat class as F2's flags; needs operator ratification."
+    named_consumer_edit: "DONE (7dbf6e7): resolved_role_config reads resolved['deployment_identity'], validates the token, REJECTS missing/malformed, and threads it into config (fence_authorization + storage root + credential ownership)."
+    adoption:   # DEPLOYMENT-IDENTITY storage/fencing side (codex-0445 decision_deployment_identity; ratified)
+      reaches: [persistent_storage_root, resolved_db_role, fence_authorization]
+      existing_deployment: >-
+        Adopting an existing deployment is READ-ONLY inspect + validate of EVERY adopted resource
+        against the declared identity. Adoption PRESERVES data, native identities, credentials and
+        trust: NO CA regeneration, NO credential replacement, NO storage rename, NO machine recreate
+        merely to fill the identity field.
+      reject: >-
+        Missing OR conflicting lme_deployment_identity REJECTS before ANY mutation; it never
+        authorizes stopping existing services or treating their storage as uninitialized. A run_id /
+        config-revision / hostname / whichever-directory-exists is NOT a deployment identity.
+      run_id_migrations_owed:   # persistent identities still keyed on run_id (advisor; D-PORTABILITY residual)
+        - "platform.py Patroni namespace /lme/{run_id}/{domain}/ (render L328) -> should key on deployment_identity"
+        - "platform.py pgBackRest repo1-path .../{run_id}/{domain} (render L438) -> deployment_identity (else retention_full breaks per evidence run)"
+        - "platform.py etcd --initial-cluster-token lme-{run_id} (render L473) -> deployment_identity"
+        - "rejoin.py inhibit path /var/lib/lme-fencing/inhibit/{run_id}/... (rejoin L149) -> deployment_identity; COORDINATE with B (reconcile_guest.py reads this marker)"
+      migration_residual: >-
+        OPEN: the four run_id-keyed persistent identities above are NOT yet migrated (a coordinated
+        change: the fence authorize tree is already deployment_identity-keyed, but storage/backup/etcd
+        token/inhibit still key on run_id). Migrating them is the storage side of DEPLOYMENT-IDENTITY;
+        the inhibit path needs B coordination. Threaded fence identity (7dbf6e7) is the first step.
   config_revision: {origin: DERIVED, role: provenance_only}
   run_id:
     view_path: run_id
@@ -281,12 +355,71 @@ single_authority:
     - {copy: "platform.py L300 owners{} + ansible/roles/postgresql_backup defaults/main.yml", concept: "owner-account defaults", owner: D}
     - {copy: "platform.py render fallbacks (L306/459/460)", concept: "provider memory defaults", owner: D}
     - {copy: "platform.py L245-247 proxy client set", concept: "datastore-client relationships", owner: D}
-  open_question: "does lme_manifests.py read config/postgresql-platform/? If NOT, C1 either consumes this file directly OR transcribes it into the engine registry and this file is retired -- the two must NEVER be live at once."
+  open_question: "RESOLVED (b15dc72): lme_manifests.py reads lme_global (manifests/global.yml), NOT config/postgresql-platform/. C1 TRANSCRIBES this file into the engine registry; this file RETIRES on completion (see retirement). The two must NEVER be live at once."
+
+# ---------------------------------------------------------------------------------------
+# RETIREMENT (D-SCHEMA-SUPERSEDED-PROPOSALS: fold approved requirements into the canonical
+# registry using the SETTLED 0430 paths, then RETIRE the transcription authority AFTER
+# transfer; preserve historical evidence via git). This file is a TRANSCRIPTION INPUT, not
+# an engine-read schema.
+# ---------------------------------------------------------------------------------------
+retirement:
+  status: FOLD_IN_PROGRESS
+  fold_target: manifests/global.yml (lme_config_registry + lme_global.material_catalog) -- C1 owns
+  already_landed_b15dc72:
+    - lme_config_registry.material_requirements_schema (typed obligation record; empty_semantics; reference_resolution; enforcement_status.loader_wired=false)
+    - lme_global.material_catalog.guardian_public_key (the ONE canonical guardian.pub payload definition)
+  settled_paths_0430:   # the engine projection this file's requirements map onto (codex-0430; C addendum 0512)
+    required_material: lme_resolved.required_material.<node>.<svc>.<obligation>
+    datastore_clients: lme_resolved.hosts.<node>.resolved_services.<svc>.datastore_clients
+    membership: lme_resolved.database.{domains,etcd_groups}.<id>.members
+    deployment_identity: lme_resolved.deployment_identity
+  retires_when: >-
+    C1 completes the selected-service material_requirements/datastore_clients/membership migration and
+    the loader enforces it (loader_wired=true). At that point this file is RETIRED (kept in git history
+    as evidence) and MUST NOT remain live alongside the registry as an engine-read authority.
+  d_owes_to_c1:   # reviewed DB material/client/membership DEFINITIONS for C1 to integrate (coordinator 0615)
+    material_catalog_definitions: see db_material_catalog_definitions below
+    membership_definitions: see membership.domains_by_profile (folds to database.{domains,etcd_groups}.<id>.members)
+    client_definitions: see client_relationships (folds to resolved_services.<svc>.datastore_clients)
+
+# ---------------------------------------------------------------------------------------
+# DB MATERIAL CATALOG DEFINITIONS (D contributes payload DEFINITIONS for C1's material_catalog
+# EXTENSION CONTRACT; coordinator-0615 "supply reviewed DB material/client/membership definitions").
+# Each is a payload-SEMANTICS definition ONLY (kind + validity); PLACEMENT lives on the per-service
+# obligation (destination/owner_role/mode/consumer/profile_condition). kind private_key is
+# host-local, NON-DISTRIBUTABLE (never a catalog-distributable grant).
+# ---------------------------------------------------------------------------------------
+db_material_catalog_definitions:
+  postgresql_ca:              {kind: certificate, payload_validity: non_empty_pem_certificate, description: "PostgreSQL internal CA (pg-ca.crt) verifying server + replication + client certs."}
+  postgresql_server_cert:     {kind: certificate, payload_validity: non_empty_pem_certificate, description: "Patroni/Postgres server TLS cert (pg-server.crt); SAN covers the member address + alias."}
+  postgresql_server_key:      {kind: private_key, payload_validity: non_empty_pem_private_key, description: "Server TLS private key (pg-server.key); host-local, non-distributable."}
+  postgresql_admin_cert:      {kind: certificate, payload_validity: non_empty_pem_certificate, description: "Superuser client cert (admin.crt) for clientcert=verify-full admin access."}
+  postgresql_admin_key:       {kind: private_key, payload_validity: non_empty_pem_private_key, description: "admin.key; host-local."}
+  postgresql_admin_pgpass:    {kind: password_file, payload_validity: non_empty_pgpass, description: "admin.pgpass (0600) libpq passfile for the admin role."}
+  postgresql_role_passwords:  {kind: json, payload_validity: non_empty_json_object, description: "role-passwords.json (0600): per-role SCRAM secrets consumed at bootstrap."}
+  postgresql_service_conf:    {kind: conf, payload_validity: non_empty_pg_service_conf, description: "pg_service.conf (0644): named service connection definitions."}
+  patroni_env:                {kind: env_file, payload_validity: non_empty_env_file, description: "patroni.env (0600): EnvironmentFile for the member unit."}
+  etcd_ca:                    {kind: certificate, payload_validity: non_empty_pem_certificate, description: "etcd CA (etcd-ca.crt): trusted-ca for etcd client AND server/peer TLS."}
+  etcd_client_cert:           {kind: certificate, payload_validity: non_empty_pem_certificate, description: "etcd-client.crt for Patroni's etcd3 client."}
+  etcd_client_key:            {kind: private_key, payload_validity: non_empty_pem_private_key, description: "etcd-client.key; host-local."}
+  etcd_server_cert:           {kind: certificate, payload_validity: non_empty_pem_certificate, description: "etcd-server.crt for the etcd server + peer TLS (etcd owner)."}
+  etcd_server_key:            {kind: private_key, payload_validity: non_empty_pem_private_key, description: "etcd-server.key; host-local (etcd owner)."}
+  backup_ca:                  {kind: certificate, payload_validity: non_empty_pem_certificate, description: "backup-ca.crt: pgBackRest TLS repo host CA."}
+  backup_client_cert:         {kind: certificate, payload_validity: non_empty_pem_certificate, description: "backup-client.crt for pgBackRest TLS to the off-host repo."}
+  backup_client_key:          {kind: private_key, payload_validity: non_empty_pem_private_key, description: "backup-client.key; host-local."}
+  postgresql_replicator_cert: {kind: certificate, payload_validity: non_empty_pem_certificate, description: "replicator.crt for physical replication (render L341)."}
+  postgresql_replicator_key:  {kind: private_key, payload_validity: non_empty_pem_private_key, description: "replicator.key; host-local."}
+  postgresql_physical_pgpass: {kind: password_file, payload_validity: non_empty_pgpass, description: "physical.pgpass (0600): physical replication passfile."}
+  postgresql_logical_pgpass:  {kind: password_file, payload_validity: non_empty_pgpass, description: "logical.pgpass (0600): logical subscription passfile (dual-owned-ha)."}
+  replication_domain_ca:      {kind: certificate, payload_validity: non_empty_pem_certificate, description: "replication-<db>-ca.crt: cross-domain logical replication TLS CA (dual-owned-ha)."}
+  replication_domain_cert:    {kind: certificate, payload_validity: non_empty_pem_certificate, description: "replication-<db>.crt: cross-domain logical replication client cert."}
+  replication_domain_key:     {kind: private_key, payload_validity: non_empty_pem_private_key, description: "replication-<db>.key; host-local."}
 
 # ---------------------------------------------------------------------------------------
 # OPEN field questions for C1 integration (codex-0415: return precise remaining questions)
 # ---------------------------------------------------------------------------------------
 open_field_questions_for_c1:
-  - "exact key spelling of authority.vector_store_owner + where current_initialized_authority observation is surfaced vs read by the migration workflow."
-  - "canonical placement of the typed required_material records in the engine registry (this file vs lme_manifests-read registry) -- see single_authority.open_question."
+  - "exact key spelling of authority.vector_store_owner + where current_initialized_authority observation is surfaced vs read by the migration workflow (still open at b15dc72)."
   - "datastore_client relationship field shape on services (SCHEMA-CLIENT-RELATIONSHIPS) -- D proposes {datastore, trust_ref, credential_ref}; C1/C confirm."
+  - "canonical id spelling for the db_material_catalog_definitions above when C1 folds them into lme_global.material_catalog (D proposes the ids above; C1 owns the registry keyspace)."
