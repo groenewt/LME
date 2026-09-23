@@ -32,6 +32,21 @@
 #     Case 5 changes a declared input BETWEEN the two reads (profile_sequence) and
 #     asserts the later read reflects the CURRENT input, not the first-load snapshot.
 #
+# RUNNER NOTE (for the coordinator at C1 bind -- these cases conform to the PINNED
+# CASE-SCHEMA.yml, which recognizes every vehicle below; the current coordinator-owned
+# macros/probe.j2 renders only extra_vars/profile + expect.resolved/origin/members_*).
+# To give these cases real teeth at bind, probe.j2 must additionally render:
+#   * inputs.markers        -> materialize the on-disk marker (case 4: /opt/lme/OFFLINE_MODE)
+#                              AND run through the upgrade_lme.yml context so its marker
+#                              inference (738-739) actually executes (probe currently calls
+#                              load_manifests directly, so the entrypoint gates are not run).
+#   * inputs.profile_sequence -> apply the declared-input change and read AFTER it (case 5).
+#   * expect.gates_agree    -> assert all named consumer gates read one resolved revision
+#                              (case 1); without it case 1 renders no assertion at bind.
+# Until then cases 1/4/5 stay fail-closed (QUEUED now; a missing binding/marker ERRORs
+# rather than PASSes) -- never a vacuous green. Case 3 is fully exercised by the current
+# macro today; case 2 is exercised modulo C1 defining the four consumer binding fields.
+#
 # CONVENTIONS:
 #   * expect field keys are BARE resolved-contract names (install_llm, lme_profile, ...)
 #     or dotted paths into a bare fact (lme_service_overrides.dashboard.environment.*).
@@ -161,22 +176,29 @@ cases:
       # from the marker (upgrade_lme.yml:738-739 -> _render_lme_profile 'offline'), not chosen.
     expect:
       resolved:
+        # offline_mode IS a registry field (upgrade_fallback: true) -> C1's resolver is
+        # guaranteed to carry it; the marker infers it true. lme_profile is NOT a registry
+        # field (resolved bare at load_manifests.yml:69) -> needs C1 to record a selector origin.
+        offline_mode: true
         lme_profile: offline
       origin:
         # observation-backed inference, within contract_binding's declared origin vocabulary;
         # NOT 'profile' (explicit operator-selected overlay) and NOT 'extra_var' (operator -e).
+        offline_mode: preservation
         lme_profile: preservation
     invariant_task: >-
-      origin: a marker-inferred lme_profile (offline, derived from the /opt/lme/OFFLINE_MODE marker
-      with no operator -e) is recorded as observation-backed (preservation), NEVER as an explicit
-      operator profile choice
+      origin: a marker-inferred offline posture (offline_mode true / lme_profile offline, derived from
+      the /opt/lme/OFFLINE_MODE marker with no operator -e) is recorded as observation-backed
+      (preservation), NEVER as an explicit operator profile choice
     fail_msg: >-
-      marker-inferred lme_profile was recorded as an explicit operator choice: at HEAD lme_profile is
-      resolved OUTSIDE the registry (bare, load_manifests.yml:69) from upgrade_lme.yml:739's marker
-      inference with NO origin record, while the auto-normalize stamps 'operator' on every bare-scope
-      registry key (load_manifests.yml:105, capturing the include_role vars at upgrade_lme.yml:749);
-      C1 must record this selector's origin as observation-backed and MUST NOT mark it 'profile' or
-      'operator' (codex-check-0200: an auto-inferred profile is not an explicit operator profile choice).
+      marker-inferred offline posture was recorded as an explicit operator choice: at HEAD offline_mode
+      (registry field, upgrade_fallback: true) is derived from the marker at upgrade_lme.yml:738, passed
+      as an include_role var at upgrade_lme.yml:746-748, and stamped 'operator' by the auto-normalize at
+      load_manifests.yml:105; lme_profile is resolved OUTSIDE the registry (bare, load_manifests.yml:69)
+      from upgrade_lme.yml:739's marker inference with NO origin record at all. C1 must record both
+      selectors' origin as observation-backed and MUST NOT mark them 'profile' or 'operator'; lme_profile
+      additionally needs C1 to record a selector origin (it is not a registry field today).
+      (codex-check-0200: an auto-inferred profile is not an explicit operator profile choice.)
 
   # 5) No snapshot-once across consumers: each read RECOMPUTES from the current declared inputs.
   #    A declared-input change BETWEEN the two reads in one run is the discriminator -- with
@@ -185,23 +207,30 @@ cases:
     kind: revision
     requires_contract: true
     queued_on: [C1]
-    entrypoints: [upgrade, site]
+    # upgrade-only: the HEAD discriminator is the ONCE-captured include_role selection
+    # (upgrade offline_mode:false, upgrade_lme.yml:748) outranking the later offline read.
+    # On `site` the pre_tasks lme_inputs carries no offline_mode, so the offline profile wins
+    # and the result is true even under snapshot-once -- a vacuous leg, so it is dropped.
+    entrypoints: [upgrade]
     inputs:
       # first read resolves 'default' (offline_mode false); a declared-input change then makes
       # the second read resolve 'offline' (offline_mode true) within the SAME run.
       profile_sequence: [default, offline]
     expect:
       resolved:
-        # the LATER read must reflect the CURRENT input (offline), not a cached first-load snapshot
+        # the LATER read must reflect the CURRENT input (offline), not a stale first-load capture
         offline_mode: true
     invariant_task: >-
       revision: two consumer reads in one run each RECOMPUTE lme_resolved from the current declared
       inputs -- a load after a declared-input change reflects the new inputs (offline_mode true),
-      while two reads of the SAME load agree on one revision; no snapshot-once cached first-load
-      result is served
+      while two reads of the SAME load agree on one revision; no stale first-load capture is served
     fail_msg: >-
-      a consumer read served a snapshot-once cached first-load result instead of recomputing: the
-      second read still reflected the first load's inputs (offline_mode false) -- load_manifests.yml:109
-      (when: lme_inputs is not defined) must capture raw inputs on first load only WITHOUT freezing the
-      resolved OUTPUT, so each load recomputes lme_resolved from the current inputs and revision
-      (codex-check-0200: do not restore snapshot-once behavior).
+      a consumer read served a stale first-load input capture instead of the current declared inputs:
+      the second read still reflected the first load's inputs (offline_mode false) though the current
+      input selects offline. The loader already recomputes the OUTPUT each load (load_manifests.yml:116-124
+      run unconditionally; the overlay is re-read at 76-79), so the residual risk is the lme_inputs
+      capture frozen by the `when: lme_inputs is not defined` guard at load_manifests.yml:100-109 -- each
+      resolution must use the CURRENT declared inputs/observations, not the frozen first-load lme_inputs,
+      while still excluding the bridge facts written at 150-155. HEAD discriminator: the once-captured
+      include_role selection (offline_mode:false, upgrade_lme.yml:748) outranks the later offline read
+      (codex-check-0200: each resolution uses current declared inputs; do not restore snapshot-once).
