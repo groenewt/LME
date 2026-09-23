@@ -518,9 +518,17 @@
             podman secret ls --format "{{ '{{' }}.Name{{ '}}' }}" 2>/dev/null > "$LIVE_BEFORE" || true
           fi
         else
-          # Positional fallback (no manifest, no mapping): do NOT blanket-remove; the
-          # per-secret decrypt-then-`--replace` below verifies before it overwrites.
-          echo "No secret manifest or mapping; positional fallback verifies-then-replaces per secret (no blanket removal)."
+          # HAVE_CONTRACT=0. There is NO positional create path: the create block below
+          # only runs for a present manifest, or a present mapping WITH its vault dir. So
+          # if a contract FILE exists but was unusable (e.g. secret_mapping.txt present but
+          # etc_lme/vault absent), restoring nothing and exiting 0 would be "listing is not
+          # restoration". Fail closed on that; only a genuine no-manifest-and-no-mapping
+          # backup is a legitimate no-op.
+          if [ -f "$MANIFEST_FILE" ] || [ -f "$MAPPING_FILE" ]; then
+            echo "ERROR: a secret manifest/mapping is present but unusable (no decryptable vault payloads); refusing to proceed (fail-closed)." >&2
+            exit 2
+          fi
+          echo "No secret manifest or mapping present; no secrets to restore (none removed)."
         fi
 
         create_secret_from_vault() {
@@ -578,7 +586,12 @@
             if [ -f "$BACKUP_VAULT_FILE" ]; then
               SECRET_VALUE=$(ansible-vault view "$BACKUP_VAULT_FILE")
               if [ $? -eq 0 ] && [ -n "$SECRET_VALUE" ]; then
-                if printf '%s' "$SECRET_VALUE" | podman secret create --driver shell --replace "$secret_name" -; then
+                # Legacy value pipe keeps `echo` (matches ansible/rollback_lme.yml legacy
+                # branch + this file's prior behavior). Whether echo's trailing newline or
+                # a newline-free printf reproduces the ORIGINAL secret bytes depends on how
+                # the legacy install created each secret; changing it here would silently
+                # alter restored bytes. Byte fidelity is a LEGACY-BUNDLE residual, not fixed.
+                if echo "$SECRET_VALUE" | podman secret create --driver shell --replace "$secret_name" -; then
                   CREATE_OK=$((CREATE_OK + 1)); printf '%s\n' "$secret_name" >> "$RESTORED_NAMES"
                 else
                   echo "Failed to create secret: $secret_name" >&2; CREATE_FAILURES=$((CREATE_FAILURES + 1))

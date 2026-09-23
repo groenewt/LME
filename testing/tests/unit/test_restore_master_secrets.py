@@ -87,7 +87,8 @@ def _make_exec(path: Path, content: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _run_case(tmp_path, manifest_lines, vault_files, live_names, fail_name=None):
+def _run_case(tmp_path, manifest_lines, vault_files, live_names, fail_name=None,
+              mapping_lines=None, make_vault=True):
     """Set up a sandbox backup + stub bin, run the rendered body, return
     (returncode, podman_log_lines, final_secret_names)."""
     bindir = tmp_path / "bin"
@@ -96,12 +97,16 @@ def _run_case(tmp_path, manifest_lines, vault_files, live_names, fail_name=None)
     _make_exec(bindir / "ansible-vault", VAULT_STUB)
 
     backup = tmp_path / "backup"
-    (backup / "etc_lme" / "vault").mkdir(parents=True)
+    (backup / "etc_lme").mkdir(parents=True)
     (backup / "etc_lme" / "pass.sh").write_text("#!/bin/sh\necho x\n")
-    for rel, content in vault_files.items():
-        (backup / "etc_lme" / "vault" / rel).write_text(content)
+    if make_vault:
+        (backup / "etc_lme" / "vault").mkdir()
+        for rel, content in vault_files.items():
+            (backup / "etc_lme" / "vault" / rel).write_text(content)
     if manifest_lines is not None:
         (backup / "secret_manifest.txt").write_text("\n".join(manifest_lines) + "\n")
+    if mapping_lines is not None:
+        (backup / "secret_mapping.txt").write_text("\n".join(mapping_lines) + "\n")
 
     state = tmp_path / "secret_state"
     state.write_text(("\n".join(live_names) + "\n") if live_names else "")
@@ -179,6 +184,38 @@ def test_clean_restore_prunes_stale_after_creates(tmp_path):
     assert first_rm is not None, "stale secret was not pruned"
     assert first_rm > last_create, "prune ran BEFORE creates completed (early destruction)"
     assert set(final) == {"alpha"}, f"final secret set wrong: {final}"
+
+
+def test_unusable_mapping_present_fails_closed(tmp_path):
+    # secret_mapping.txt present but etc_lme/vault absent -> HAVE_CONTRACT=0 with a
+    # contract file present. Must fail closed (rc 2), never silently exit 0 having
+    # restored nothing while live secrets exist.
+    rc, log, final, stderr = _run_case(
+        tmp_path,
+        manifest_lines=None,
+        vault_files={},
+        live_names=["alpha", "stale"],
+        mapping_lines=["alpha=alpha.vault"],
+        make_vault=False,
+    )
+    assert rc == 2, f"expected rc 2 on unusable contract, got {rc}; stderr={stderr}"
+    assert _first_index(log, "secret rm") is None, "destruction ran on an unusable contract"
+    assert _first_index(log, "secret create") is None, "create ran on an unusable contract"
+    assert set(final) == {"alpha", "stale"}, "live secrets mutated on a refused restore"
+
+
+def test_no_contract_and_no_live_is_clean_noop(tmp_path):
+    # Genuinely no manifest and no mapping, nothing live -> legitimate no-op, rc 0.
+    rc, log, final, stderr = _run_case(
+        tmp_path,
+        manifest_lines=None,
+        vault_files={},
+        live_names=[],
+        make_vault=False,
+    )
+    assert rc == 0, f"expected rc 0 on empty no-op, got {rc}; stderr={stderr}"
+    assert _first_index(log, "secret rm") is None
+    assert _first_index(log, "secret create") is None
 
 
 def test_stale_prune_targets_only_names_absent_from_restore(tmp_path):

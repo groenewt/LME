@@ -153,10 +153,11 @@ def rebuild(config, domain, request, *, root=Path('/var/lib/postgresql/member'),
     # member must be REVOKED (absent) before the rename. The inhibit marker alone does NOT
     # stop a restart -- the container-restart fence ADMITS a start whenever a valid
     # authorization is present, so an unexpired authorization would let the fenced member
-    # restart onto the OLD datadir during the rename. When deployment_identity is resolved,
-    # quarantine() requires the authorize file absent. The authoritative revoke/consume is the
-    # guardian control.sock seam (absent); this absence check + the member flock are the local
-    # corroboration (see fencing-protocol.contract.yaml rejoin.authorization_revoked).
+    # restart onto the OLD datadir during the rename. deployment_identity is now REQUIRED
+    # (fail-closed below), so quarantine() UNCONDITIONALLY requires the authorize file absent.
+    # The authoritative revoke/consume is the guardian control.sock seam (absent); this absence
+    # check + the member flock are the local corroboration (see fencing-protocol.contract.yaml
+    # rejoin.authorization_revoked).
     # D-FENCING-ACTUAL-CALLER-VALIDATION-BYPASS / REJOIN-RESTART-SERIALIZATION (codex-0630):
     # a MISSING deployment_identity must FAIL CLOSED, not silently disable the revoked-
     # authorization guard. Previously `authorize = ... if deployment_identity else None`

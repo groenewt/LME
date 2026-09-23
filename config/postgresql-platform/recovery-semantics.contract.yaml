@@ -59,13 +59,17 @@ recovery_union:
     no_destruction_before_verification:
       rule: >-
         No existing secret is removed and no live store is mutated until the
-        backup payloads are proven decryptable. An empty/degenerate contract
-        must not be able to wipe live secrets.
+        backup payloads are proven decryptable. An empty/degenerate/unusable
+        contract must not be able to wipe live secrets or silently no-op.
       landed: true
       evidence: >-
         ansible/restore_lme_master.yml secret preverify (PREVERIFY_FAILURES ->
-        exit 2) + LIVE_SECRETS guard + positional-fallback verify-then-replace
-        (RESTORE-EMPTY-SECRET-PREFLIGHT, RESTORE-EARLY-DESTRUCTION-AND-STOP-SCOPE).
+        exit 2) + LIVE_SECRETS guard + unusable-contract guard (a manifest/mapping
+        present but with no decryptable payloads -> exit 2, NOT a silent exit 0;
+        there is NO positional create path) + create-first/prune-stale-after the
+        create-failure gate (RESTORE-EMPTY-SECRET-PREFLIGHT,
+        RESTORE-EARLY-DESTRUCTION-AND-STOP-SCOPE). Proven by
+        testing/tests/unit/test_restore_master_secrets.py.
     content_and_ownership_verified:
       rule: >-
         Each restored payload matches its recorded content digest, and each
@@ -146,16 +150,23 @@ findings:
       THIS WAVE: (1) secret restore no longer blanket-removes live secrets up
       front -- it snapshots live names, create/replaces the backup set, and
       prunes only the stale remainder AFTER the create-failure gate, so no
-      destruction happens on a failed restore; (2) a fail-closed guard now
-      refuses to overwrite /opt/lme, /etc/lme, quadlets and secrets while LME
-      containers are still RUNNING (the wait probe now filters status=running,
-      and a new fail task fires if any remain). The installation-tree restore is
-      fail-closed (set -euo pipefail).
+      destruction happens on a failed restore [BEHAVIORAL-TESTED]; (2) a
+      fail-closed guard now refuses to overwrite /opt/lme, /etc/lme, quadlets and
+      secrets while LME containers are still RUNNING (the wait probe now filters
+      status=running, and a new fail task fires if any remain) [SYNTAX-CHECKED
+      ONLY -- the rendered-shell tests cover the secret task, not this Ansible
+      task]. The installation-tree restore is fail-closed (set -euo pipefail).
+    blast_radius: >-
+      Verified every container-kind service in manifests/services/*.yml declares
+      partof: [lme], so `systemctl stop lme` cascades to all of them and the
+      running-container probe finds no straggler under the standard topology; the
+      hard fail does not over-block a normal deployment.
     residual: >-
       The container-stop grep still matches any name containing "lme" (co-tenant
-      name-scoping residual, flagged inline); the destructive volume-restore step
-      is not yet covered by the recovery_union content check. Gated on
-      content_and_ownership_verified.
+      name-scoping residual, flagged inline -- a NON-lme container merely named
+      with "lme" that stop-lme does not stop would block restore); the destructive
+      volume-restore step is not yet covered by the recovery_union content check.
+      Gated on content_and_ownership_verified.
   RESTORE-CONTENT-DIGEST:
     status: RESIDUAL
     owner: D_database (authoring) + B (backup-side manifest digest producer)
@@ -196,6 +207,13 @@ findings:
       an unqualifiable bundle is refused, not force-restored. The current
       mapping-file fallback creates secrets but does not qualify/preserve; this
       is the seam to close.
+    byte_fidelity_note: >-
+      The legacy value pipe deliberately keeps `echo "$SECRET_VALUE"` (matching
+      ansible/rollback_lme.yml and this file's prior behavior). Whether echo's
+      trailing newline or a newline-free printf reproduces the ORIGINAL secret
+      bytes depends on how each legacy secret was installed (some install paths
+      use `echo -n`, some pipe raw); settling that byte question is part of this
+      residual, NOT silently changed here.
   FENCE-CURRENT-GENERATION-AND-AUTHORITY:
     status: PARTIAL
     wave: this session (commit 7dbf6e7)
