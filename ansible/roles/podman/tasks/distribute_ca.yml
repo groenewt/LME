@@ -164,12 +164,29 @@
 # On a fresh install these units are inactive and the normal site.yml start occurs
 # later. On a re-run, restart only running consumers whose CA changed, after the
 # readable replacement is fully installed, so cached SSL contexts pick it up.
+#
+# SEAM (0200 -- validate before the first affected mutation): site.yml runs this
+# include (distribute_ca) BEFORE the secrets_distribution role, whose activation
+# guard (roles/secrets_distribution/tasks/main.yml) asserts lme.service is INACTIVE
+# and aborts otherwise ("Refuse unsafe live secret reconfiguration"). With BOTH
+# lme_distribute_ca and lme_distribute_secrets armed on an already-active stack, the
+# certs role in site.yml's `roles:` re-writes ca/elasticsearch-ca.crt every pass, so
+# the copy above always reports `changed` and this step would restart the live
+# consumers -- a runtime mutation -- only for the play to abort at the secrets guard
+# immediately after. That is mutation-before-validation. So skip the restart branch
+# whenever secret distribution is co-enabled: on the VALID co-run the stack is
+# inactive and these consumers are down (this branch is a no-op anyway), and on the
+# INVALID active-stack co-run the secrets_distribution guard is left to adjudicate
+# activation with its canonical, no-side-effect refusal. CA-only runs
+# (lme_distribute_secrets unset) keep the in-place restart-on-rotation behavior.
 - name: "GAP-2: inspect changed CA consumers before restart"
   ansible.builtin.command: "systemctl is-active lme-{{ item.item.id }}.service"
   loop: "{{ lme_ca_install_results.results | default([]) }}"
   loop_control:
     label: "{{ item.item.id }}"
-  when: item.changed | default(false)
+  when:
+    - item.changed | default(false)
+    - not (lme_distribute_secrets | default(false) | bool)
   register: lme_ca_active_consumers
   changed_when: false
   failed_when: false
@@ -182,6 +199,7 @@
   loop_control:
     label: "{{ item.item.item.id }}"
   when:
+    - not (lme_distribute_secrets | default(false) | bool)
     - not (item.skipped | default(false))
     - item.rc | default(1) == 0
   become: true
