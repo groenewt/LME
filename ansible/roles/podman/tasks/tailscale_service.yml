@@ -18,9 +18,11 @@
 #     (both facts come from load_manifests.yml — see the wiring note re: order)
 #   * which services are VIP-fronted -> ONLY those whose manifest declares a top-level
 #     `tailnet_service:` OPT-IN key. That key's value is the svc name published+approved,
-#     so today the set is svc:lme-kibana, svc:lme-dashboard, svc:lme-log-analyzer and
-#     svc:lme-litellm -- NOT every loopback-bound service; internal DBs like pgvector and
-#     backends like fleet-distribution are deliberately excluded.
+#     so today the set is svc:lme-elasticsearch, svc:lme-kibana, svc:lme-dashboard,
+#     svc:lme-log-analyzer and svc:lme-litellm -- NOT every loopback-bound service;
+#     internal DBs like pgvector and backends like fleet-distribution are deliberately
+#     excluded. lme-elasticsearch is fronted as raw TCP (its 9200 publish_port carries
+#     `serve: tcp`, see the raw-TLS CONTRACT below); the other four are HTTPS.
 #   * which of their ports are host-facing -> publish_ports with bind: 127.0.0.1. The
 #     tailscale profile (manifests/profiles/tailscale.yml) flips the UI/API binds to
 #     loopback so they are fronted here and NOT exposed on the LAN; the loopback bind
@@ -40,12 +42,15 @@
 # MUST declare `serve: tcp` on its publish_port, so this leg fronts it as a raw TCP
 # passthrough (`--tcp`) instead of `--https`. Terminating TLS at tailscale in front
 # of such a listener would hand it plaintext — the exact hazard the ingress file
-# calls out for logstash beats. KNOWN CASES to mark when their manifests land:
-# `logstash_beats` (5044) and `logstash_http` (8085) are `bind: 127.0.0.1` in
-# global.yml in EVERY profile (they are NOT a tailscale-profile signal); their
-# publish_ports must carry `serve: tcp` or they will be mis-fronted as HTTPS. The
-# per-target debug at the end prints the chosen mode so a wrong mode is visible at
-# run time rather than silent.
+# calls out for logstash beats. THE LANDED VIP RAW-TLS CASE is svc:lme-elasticsearch:
+# elasticsearch's 9200 publish_port carries `serve: tcp` (it terminates TLS itself with
+# the internal CA), so this leg fronts it with `--tcp`, preserving end-to-end internal-CA
+# TLS. (logstash's beats :5044 / http :8085 are `bind: 127.0.0.1` in global.yml in EVERY
+# profile, but they are fronted by the INGRESS leg via `tailnet_ingress: raw-tcp`, NOT
+# this VIP leg -- they become a VIP concern only if ever given a top-level
+# `tailnet_service:`, in which case their publish_ports MUST carry `serve: tcp` or they
+# would be mis-fronted as HTTPS.) The per-target debug at the end prints the chosen mode
+# so a wrong mode is visible at run time rather than silent.
 #
 # ACL / VIP allocation: a `svc:<name>` must be defined + granted in the tailnet
 # policy (VIP allocation) before a real VIP is allocated. That policy is out of scope
@@ -133,7 +138,7 @@
 
 # Fail-loud on a VIP-opted-in service that derives ZERO loopback front ports
 # (route-independent -- protects ANY tailnet_service, not just ES). The derivation
-# below is gated `when: (_ts_lo | length) > 0` (L171), so a service that sets a
+# below is gated `when: (_ts_lo | length) > 0` (the Derive task's when-clause), so a service that sets a
 # top-level `tailnet_service:` (VIP opt-in) but exposes NO 127.0.0.1 front port is
 # SILENTLY DROPPED: no VIP target, no error (the K1 silent-green class). This fires
 # when an overlay full-replaces a tailnet service's ports with only non-loopback
@@ -168,7 +173,8 @@
          | selectattr('bind', 'defined')
          | selectattr('bind', 'equalto', '127.0.0.1')
          | list }}
-    # ... minus any UDP port, lowest host port first -- the exact set the L171 guard tests.
+    # ... minus any UDP port, lowest host port first -- the exact set the Derive task's
+    # `(_ts_lo | length) > 0` when-clause tests.
     _ts_lo: >-
       {{ ((_ts_loop | selectattr('protocol', 'undefined') | list)
           + (_ts_loop | rejectattr('protocol', 'undefined') | rejectattr('protocol', 'equalto', 'udp') | list))
@@ -188,17 +194,18 @@
 # not a shortcut). A raw-TLS backend (one that terminates TLS itself, e.g. ES:
 # `xpack.security.http.ssl.enabled: true`) fronted via a VIP MUST carry `serve: tcp` on
 # its front publish_port, or the derivation defaults the scheme to `--https`
-# (L138 `(_ts_pick).serve | default('https')`) and tailscale TERMINATES TLS with this
+# (the Derive task's `(_ts_pick).serve | default('https')`) and tailscale TERMINATES TLS with this
 # node's ts.net leaf -> the consumer sees the ts.net cert, NOT the internal-CA leaf ->
 # CA-pinned clients break and ES's optional client-cert auth is silently dropped. This
 # CANNOT be a mechanical assert here: `https` is a *valid* mode for the services that
 # legitimately use it (kibana/dashboard/log-analyzer/litellm), so a "must be tcp" assert
 # would false-positive on every one of them. Authority: this file's header doctrine
-# L34-44 ("publish_ports must carry `serve: tcp` or they will be mis-fronted as HTTPS"),
-# corroborated by the design (gap-designs.md L40 "No assert catches it (`https` is a
-# valid mode)"; address-targets.md GAP-1 row 3 "pairs with a serve-scheme sanity NOTE").
-# The contract is enforced by manifest authorship; the resolved mode is PRINTED at run
-# time by the publish-task loop labels (`--https=<port>` L279 / `--tcp=<port>` L292), so a
+# (the raw-TLS CONTRACT section above: "publish_ports must carry `serve: tcp` or they
+# will be mis-fronted as HTTPS"), corroborated by the design (gap-designs.md "No assert
+# catches it (`https` is a valid mode)"; address-targets.md GAP-1 "pairs with a
+# serve-scheme sanity NOTE"). The contract is enforced by manifest authorship; the
+# resolved mode is PRINTED at run time by the HTTPS/raw-TCP publish-task loop labels
+# (`--https=<port>` / `--tcp=<port>`), so a
 # mis-front is visible in run output (printed, not guarded). The real exposure is
 # cluster.yml's full-list replace stripping a base `serve: tcp` marker -- fix that in the
 # OVERLAY data, not with a scheme assert that cannot tell a legitimate https VIP from a
@@ -591,11 +598,12 @@
 # ── WIRING (DONE — G2/G6 both landed) ────────────────────────────────────────────
 # This leg needs `lme_services` + `lme_enable_flags` (from load_manifests.yml, now
 # wired into the live path). It is included (gated on the enable var) after
-# render_units.yml at ansible/roles/podman/tasks/main.yml:329 (gate :331):
+# quadlet_setup.yml (which invokes load_manifests.yml to produce those facts) at
+# ansible/roles/podman/tasks/main.yml:329 (gate :331):
 #
 #   - name: Publish tailnet VIP services (opt-in)
 #     ansible.builtin.include_tasks: tailscale_service.yml
 #     when: tailscale_serve_services | default(false) | bool
 #
-# and manifests/profiles/tailscale.yml:37 sets `tailscale_serve_services: true` so the
+# and manifests/profiles/tailscale.yml:41 sets `tailscale_serve_services: true` so the
 # tailscale profile turns it on without a manual -e.
