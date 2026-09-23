@@ -885,9 +885,17 @@ def lme_validate_material_catalog(catalog, catalog_schema, context=None):
                                      % (dwhere, fname))
                 continue
             val = defn[fname]
-            if fdecl.get('type') == 'str' and (not isinstance(val, str) or not val):
+            ftype = fdecl.get('type')
+            if ftype == 'str' and (not isinstance(val, str) or not val):
                 raise ValueError('lme: material_catalog%s field %r must be a non-empty '
                                  'string, got %r' % (dwhere, fname, val))
+            # A4: a declared bool/int catalog field must be that exact type, never a list.
+            if ftype == 'bool' and not isinstance(val, bool):
+                raise ValueError('lme: material_catalog%s field %r must be a boolean, got %r'
+                                 % (dwhere, fname, val))
+            if ftype == 'int' and (isinstance(val, bool) or not isinstance(val, int)):
+                raise ValueError('lme: material_catalog%s field %r must be an integer, got %r'
+                                 % (dwhere, fname, val))
             vocab = fdecl.get('vocab')
             if vocab and val not in vocab:
                 raise ValueError('lme: material_catalog%s field %r value %r not in vocab %r'
@@ -942,6 +950,16 @@ def _require_material_schema(schema):
     if not isinstance(pcv, list) or not pcv:
         raise ValueError('lme: material_requirements_schema.profile_condition_vocab must be a '
                          'non-empty list')
+    # trust_ref_namespaces: the DECLARED set of namespaces a colon-form trust_ref
+    # (`<ns>:<name>`) may use (C1-MATERIAL-REFERENCE-INPUT-AND-EMPTY-POLICY / A3). Read from
+    # the schema, not hardcoded (filter-plugin literal ban); an ABSENT/empty list means NO
+    # colon namespace is declared, so EVERY colon-form trust_ref is unresolved and REJECTED
+    # (previously the `:` form silently bypassed reference closure).
+    trust_ns = schema.get('trust_ref_namespaces')
+    trust_ns = [] if trust_ns is None else trust_ns
+    if not isinstance(trust_ns, list) or any(not isinstance(n, str) or not n for n in trust_ns):
+        raise ValueError('lme: material_requirements_schema.trust_ref_namespaces must be a list '
+                         'of non-empty namespace strings')
     # empty_semantics: ALL three keys REQUIRED, each boolean true. A non-bool, an omitted
     # key, or a value that DISABLES a required failure is an unsupported policy -> reject
     # (C1-MATERIAL-REFERENCE-INPUT-AND-EMPTY-POLICY -- never silently honored/ignored).
@@ -966,6 +984,7 @@ def _require_material_schema(schema):
         'placement_vocab': set(placement_vocab),
         'forms': forms,
         'profile_condition_vocab': set(pcv),
+        'trust_ref_namespaces': set(trust_ns),
         'vocabs': {k: set(f['vocab']) for k, f in record.items() if f.get('vocab')},
         'base_required': [k for k, f in record.items() if f.get('required')],
         'form_fields': set(('destination', 'owner_role', 'mode')),
@@ -1060,18 +1079,35 @@ def lme_validate_material_requirements(catalog, obligations, schema, catalog_sch
             if fname not in rec:
                 raise ValueError('lme: material_requirements%s missing required field %r'
                                  % (rwhere, fname))
-        # typed + vocab + nonempty per declared field.
+        # typed + vocab + nonempty per declared field (C1-MATERIAL-* A3/A4).
         for fname, fdecl in S['record'].items():
             if fname not in rec:
                 continue
             val = rec[fname]
-            if fdecl.get('type') == 'str':
+            ftype = fdecl.get('type')
+            if ftype == 'str':
                 if not isinstance(val, str):
                     raise ValueError('lme: material_requirements%s field %r must be a '
                                      'string, got %r' % (rwhere, fname, val))
-                if fdecl.get('required') and not val:
-                    raise ValueError('lme: material_requirements%s required field %r is '
-                                     'empty' % (rwhere, fname))
+                # A3: a PRESENT str field must be non-empty -- required OR optional. An empty
+                # optional producer_ref/custody_ref/consumer/trust_ref is not a value; omit the
+                # field instead of declaring it empty (an empty ref silently resolved to nothing).
+                if not val:
+                    raise ValueError('lme: material_requirements%s field %r is present but '
+                                     'empty -- omit an optional field rather than declaring it '
+                                     'empty (an empty reference resolves to nothing)'
+                                     % (rwhere, fname))
+            elif ftype == 'bool':
+                # A4: a declared bool field must be a real bool, never a list/int/str.
+                if not isinstance(val, bool):
+                    raise ValueError('lme: material_requirements%s field %r must be a boolean, '
+                                     'got %r' % (rwhere, fname, val))
+            elif ftype == 'int':
+                # A4: a declared int field must be an int and NOT a bool (bool is an int subclass)
+                # and NOT a list.
+                if isinstance(val, bool) or not isinstance(val, int):
+                    raise ValueError('lme: material_requirements%s field %r must be an integer, '
+                                     'got %r' % (rwhere, fname, val))
             if fname in S['vocabs'] and val not in S['vocabs'][fname]:
                 raise ValueError('lme: material_requirements%s field %r value %r not in '
                                  'declared vocab %r' % (rwhere, fname, val,
@@ -1111,14 +1147,24 @@ def lme_validate_material_requirements(catalog, obligations, schema, catalog_sch
                              'is NOT distributable %r -- a catalog reference cannot authorize '
                              'distributing private material' % (rwhere, mref, kind,
                                                                 sorted(distributable)))
-        # trust_ref, when it NAMES a catalog def, must resolve; producer/custody references
-        # are shape-validated now (nonempty str), their closure arms when C/D declare the
-        # producer/custody registries (C1-MATERIAL-LIFECYCLE-AND-RETENTION -- reported owed).
+        # trust_ref closure (A3). A BARE name must resolve to a catalog definition or a sibling
+        # obligation. A COLON-FORM `<ns>:<name>` must use a namespace DECLARED in the schema's
+        # trust_ref_namespaces -- an undeclared namespace (the default, since none are declared
+        # yet) is UNRESOLVED and REJECTED (previously the `:` form silently bypassed closure).
+        # The producer/custody registries C/D still owe will declare their namespaces here.
         tref = rec.get('trust_ref')
-        if isinstance(tref, str) and tref and ':' not in tref and tref not in catalog \
-                and tref not in obligations:
-            raise ValueError('lme: material_requirements%s trust_ref %r resolves to no '
-                             'catalog definition or sibling obligation' % (rwhere, tref))
+        if isinstance(tref, str) and tref:
+            if ':' in tref:
+                ns = tref.split(':', 1)[0]
+                if ns not in S['trust_ref_namespaces']:
+                    raise ValueError(
+                        'lme: material_requirements%s trust_ref %r uses namespace %r which is '
+                        'not in the declared trust_ref_namespaces %r -- a colon-form reference '
+                        'to an undeclared namespace is unresolved'
+                        % (rwhere, tref, ns, sorted(S['trust_ref_namespaces'])))
+            elif tref not in catalog and tref not in obligations:
+                raise ValueError('lme: material_requirements%s trust_ref %r resolves to no '
+                                 'catalog definition or sibling obligation' % (rwhere, tref))
 
     # --- reference resolution: every referenced obligation id must resolve ------
     unresolved = sorted(r for r in refs if r not in obligations)

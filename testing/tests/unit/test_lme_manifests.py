@@ -1024,6 +1024,61 @@ def test_material_empty_string_required_field_rejected():
     assert "empty" in str(e.value)
 
 
+def test_material_empty_optional_string_field_rejected_A3():
+    # A3: a PRESENT-but-empty OPTIONAL str field (producer_ref) is rejected -- omit it instead
+    # of declaring it empty (an empty reference silently resolved to nothing).
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["producer_ref"] = ""
+    with pytest.raises(ValueError) as e:
+        _vm(bad)
+    assert "empty" in str(e.value)
+
+
+def test_material_colon_trust_ref_undeclared_namespace_rejected_A3():
+    # A3: a colon-form trust_ref whose namespace is absent from the declared (empty)
+    # trust_ref_namespaces is unresolved and rejected -- no silent `:` bypass of closure.
+    bad = _good_obligation()
+    bad["guardian_pub_proxy"]["trust_ref"] = "producer:some_ca"
+    with pytest.raises(ValueError) as e:
+        _vm(bad)
+    assert "trust_ref_namespaces" in str(e.value) or "namespace" in str(e.value)
+
+
+def test_material_record_bool_int_instance_types_enforced_A4():
+    # A4: a declared bool/int record field rejects a list / wrong type (synthetic schema, since
+    # the current real record declares only str fields). Correct types pass.
+    schema = {
+        "record": {
+            "material_ref": {"type": "str", "required": True},
+            "placement_class": {"type": "str", "required": True, "vocab": ["env"]},
+            "consumer": {"type": "str", "required": True},
+            "profile_condition": {"type": "str", "required": True},
+            "flag": {"type": "bool", "required": False},
+            "count": {"type": "int", "required": False},
+        },
+        "obligation_id_pattern": r"\A[a-z][a-z0-9_-]*\Z",
+        "mode_pattern": r"\A[0-7]{3,4}\Z",
+        "placement_forms": {"env": {"requires": [], "forbids": ["destination", "mode"]}},
+        "profile_condition_vocab": ["always"],
+        "empty_semantics": {"declared_none_passes": True, "missing_field_fails": True,
+                            "empty_contradicting_refs_invalid": True},
+    }
+    cat = {"m": {"kind": "public_key", "payload_validity": "x"}}
+    cat_schema = {
+        "definition": {"kind": {"type": "str", "required": True, "vocab": ["public_key"]},
+                       "payload_validity": {"type": "str", "required": True}},
+        "distributable_kinds": ["public_key"],
+    }
+    base = {"material_ref": "m", "placement_class": "env", "consumer": "c",
+            "profile_condition": "always"}
+    with pytest.raises(ValueError):   # bool field given a list
+        validate_material(cat, {"o": dict(base, flag=[1, 2])}, schema, cat_schema, context="s")
+    with pytest.raises(ValueError):   # int field given a bool
+        validate_material(cat, {"o": dict(base, count=True)}, schema, cat_schema, context="s")
+    assert validate_material(cat, {"o": dict(base, flag=True, count=3)},
+                             schema, cat_schema, context="s")
+
+
 @pytest.mark.parametrize("bad_refs", ["ghost", {"a": 1}, 5, True])
 def test_material_referenced_ids_must_be_a_list(bad_refs):
     with pytest.raises(ValueError) as e:
