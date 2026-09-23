@@ -469,11 +469,109 @@ def strict_enable_bool(value):
     raise ValueError('lme: enable flag must be true or false')
 
 
+def _coerce_declared(value, field):
+    """Coerce a resolved value to its DECLARED type, preserving an explicit
+    False / 0 / '' as a real selection. Value-pure: the type token comes from the
+    registry field, never a hardcoded config value.
+
+      * null: kept only if the field is nullable, else a loud error.
+      * bool: via strict_enable_bool (rejects non-bool, non-'true'/'false').
+      * str:  kept as-is (stringified only if a non-str slipped through)."""
+    if value is None:
+        if field.get('nullable'):
+            return None
+        raise ValueError('lme: config value is null but field is not nullable')
+    t = field.get('type')
+    if t == 'bool':
+        return strict_enable_bool(value)
+    if t == 'str':
+        return value if isinstance(value, str) else str(value)
+    raise ValueError('lme: unknown declared config type %r' % (t,))
+
+
+def lme_resolve_config(registry, profile_vars=None, selections=None,
+                       observations=None, origins=None):
+    """Resolve every declared config field by DECLARED PRECEDENCE into one dict,
+    with NO snapshot and NO self-capture: this function reads ONLY its explicit
+    arguments and returns namespaced outputs, so a caller that materialises the
+    result under lme_resolved.* / lme_enable_flags never feeds an output back in.
+
+    Precedence (registry.precedence, high -> low):
+      extra_var > inventory  (both arrive in `selections`; true source in `origins`)
+        > profile            (`profile_vars`, the active profile_overlay.vars)
+        > observation        (`observations`, ONLY where field.upgrade_fallback)
+        > default            (field.default)
+
+    A REQUIRED field with no value at any tier raises (fail-closed, before any
+    mutation). An OPTIONAL field with no value is ABSENT from `resolved` -- never a
+    fabricated default. Membership (not truthiness) selects a tier, so an explicit
+    False/0/'' at a higher tier is honoured and detection cannot overwrite it.
+
+    Returns {resolved, origins, enable_flags}. `enable_flags` is the subset the
+    registry marks enable_flag: true, for is_enabled()/lme_enable_flags.
+    """
+    fields = (registry or {}).get('fields') or {}
+    profile_vars = profile_vars or {}
+    selections = selections or {}
+    observations = observations or {}
+    origins = origins or {}
+
+    # Managed-key assert (symmetric with is_enabled()'s typo guard): a profile var
+    # that names no declared field is a YAML authoring error -- adding a field must
+    # be a registry change, not a silent new key that no schema governs.
+    unknown = [k for k in profile_vars if k not in fields]
+    if unknown:
+        raise ValueError(
+            'lme: profile declares undeclared config key(s) %r; declare them in '
+            'manifests/global.yml lme_config_registry.fields' % (sorted(unknown),))
+
+    resolved = {}
+    out_origins = {}
+    for key, field in fields.items():
+        if key in selections:
+            value, origin = selections[key], origins.get(key, 'operator')
+        elif key in profile_vars:
+            value, origin = profile_vars[key], 'profile'
+        elif field.get('upgrade_fallback') and key in observations:
+            value, origin = observations[key], 'observation'
+        elif 'default' in field:
+            value, origin = field['default'], 'default'
+        else:
+            if field.get('required'):
+                raise ValueError(
+                    'lme: required config field %r has no value from any tier '
+                    '(extra_var/inventory/profile/observation/default)' % (key,))
+            continue  # optional + unset -> absent from resolved (intended "unset")
+        resolved[key] = _coerce_declared(value, field)
+        out_origins[key] = origin
+
+    enable_flags = {k: resolved[k] for k, f in fields.items()
+                    if f.get('enable_flag') and k in resolved}
+    return {'resolved': resolved, 'origins': out_origins, 'enable_flags': enable_flags}
+
+
+def lme_validate_config(registry, resolved):
+    """Assert a resolved config dict satisfies the registry: every required field
+    present, every present field the declared type / nullability. Returns the dict
+    unchanged on success; raises on violation. Lets a task gate resolution with
+    `resolved | lme_validate_config(registry)` before any mutation."""
+    fields = (registry or {}).get('fields') or {}
+    resolved = resolved or {}
+    for key, field in fields.items():
+        if key not in resolved:
+            if field.get('required'):
+                raise ValueError('lme: required config field %r missing from resolved set' % (key,))
+            continue
+        _coerce_declared(resolved[key], field)  # raises on type / nullability violation
+    return resolved
+
 
 class FilterModule(object):
     def filters(self):
         return {
             'strict_enable_bool': strict_enable_bool,
+            'lme_resolve_config': lme_resolve_config,
+            'lme_validate_config': lme_validate_config,
             'render_userns': render_userns,
             'userns_base': userns_base,
             'cert_owner': cert_owner,
