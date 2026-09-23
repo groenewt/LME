@@ -73,3 +73,132 @@ health:
   timeout: 5s
   retries: 5
   start_period: 30s
+
+# =============================================================================
+# CLIENT-TRUST CONTRACT (D-side of the pgvector endpoint; codex-manager-check-0300
+# + D contract-deltas). DECLARATIVE documentation-as-data: it states what this POC
+# store MUST present so an E-owned client connects with the SAME security posture the
+# HA path uses (mutual TLS, internal CA), and it FORBIDS a silent plaintext downgrade
+# to paper over the current mismatch. NO renderer accessor reads these keys, so this
+# changes no rendered unit byte. Every field carries target / current / gap /
+# closing-seam so NOTHING reads as already satisfied.
+# OVERRIDE HAZARD: load_manifests.yml:298-306 combines lme_service_overrides[pgvector]
+# over every key here, so these are NON-authoritative EXPECTATIONS; the authoritative,
+# non-overridable enforcement is the C1 seam named under `authority`, never this data.
+client_trust:
+  # DATA-SAFETY (blocking): NO sslmode=disable/allow/prefer/verify-ca path may ever be
+  # declared to compensate for the endpoint mismatch below. The clients pin
+  # sslmode=verify-full (testing/tests/unit/test_application_postgresql_tls.py); the
+  # server MUST meet that or the connection MUST fail closed. A plaintext or verify-ca
+  # downgrade is FORBIDDEN -- it is NOT a permitted HA-to-POC fallback.
+  forbid_plaintext_fallback: true
+  posture: mutual-tls-verify-full           # target trust model, identical across profiles
+  endpoint:
+    target_alias: pg-vector-rw              # the logical writer alias every client pins
+    current_alias: lme-pgvector             # the only alias this POC container advertises today
+    gap: >-
+      POC clients (litellm / dashboard / ingesters) resolve pg-vector-rw, which in the
+      single-node POC has no home (it is the HA proxy alias). This container answers
+      only at lme-pgvector, so the client endpoint is UNSATISFIED in POC.
+    closing_seam: >-
+      C1 must publish a DERIVED authority flag (see `authority` / D3a mutual-exclusion)
+      and bind pg-vector-rw to this container ONLY when pgvector is the derived
+      authority. It is deliberately NOT added to network_aliases here: an ungated alias
+      would give pg-vector-rw two homes the moment HA is wired, and is_enabled is
+      AND-only (no negation) so nothing can gate it yet.
+  databases:
+    # litellm db is created out-of-band by llama_cpp_setup.yml:200-205 (idempotent on
+    # db-existence ONLY) as superuser lme -- NOT owned by litellm_app.
+    lme_vectors: {authority_target: derived-vector-owner, current: initialized-here-as-superuser-lme}
+    litellm:     {authority_target: derived-vector-owner, current: created-out-of-band-as-lme}
+  principals:
+    target: {lme_vectors: lme_vectors_app, litellm: litellm_app}   # per-db app roles the clients authenticate as
+    current: {bootstrap_superuser: lme}                            # POSTGRES_USER only; app roles NOT created
+    gap: >-
+      The env bootstrap (POSTGRES_USER=lme) is initdb-only and creates just the
+      superuser; the per-db app roles lme_vectors_app / litellm_app the clients present
+      do not exist on this POC store.
+    closing_seam: >-
+      Server-side role + per-db grant creation is F1/platform init
+      (scripts/postgresql_platform + the llama_cpp_setup out-of-band path), NOT this
+      manifest. DOCUMENTED DEBT -- not an accepted fallback.
+  server_tls:
+    target: >-
+      Postgres serves TLS (ssl=on) with a server certificate whose SAN covers the
+      logical alias(es) it answers for, and pg_hba requires hostssl
+      clientcert=verify-full for network roles.
+    current: none                           # this POC container serves plaintext today
+    gap: DOCUMENTED DEBT -- the POC store presents no server certificate and no hostssl rule.
+    closing_seam: >-
+      the certs role (roles/certs) must issue a pgvector SERVER bundle
+      (SAN: pg-vector-rw + lme-pgvector) and F1/scripts/postgresql_platform must enable
+      ssl + pg_hba hostssl clientcert=verify-full. Named, NOT implemented here -- no
+      cert:pgvector mount is added, because a mounted cert without ssl=on and the
+      hostssl rule would look secured without being secured.
+  trust_root:
+    target: >-
+      the CA that issues the pgvector SERVER cert is the SAME CA the clients verify
+      against at /run/secrets/postgresql/ca.crt.
+    current_mismatch: >-
+      clients trust /run/secrets/postgresql/ca.crt; the lme_certs workspace CA is
+      ca/ca.crt; scripts/postgresql_platform/platform.py uses /run/secrets/pg-ca.crt.
+      These are NOT proven to be one CA -- reconciling them is itself a seam.
+    closing_seam: certs role + F1 credential provider must bind ONE CA across server issue and client trust.
+  client_credentials:
+    target: >-
+      the POC client mounts /run/secrets/postgresql/{ca.crt,tls.crt,tls.key,.pgpass},
+      provisioned by the F1 credential provider, matching the server's mTLS + trust root.
+    current: nothing provisions or mounts these files on the POC path.
+    gap: DOCUMENTED DEBT -- without them a verify-full client cannot present a client cert; it fails closed.
+    closing_seam: >-
+      F1 credential provider issues the client keypair + .pgpass; E declares the mount
+      (manifests/services/lme-litellm.yml + lme-dashboard.yml). Named, NOT implemented here.
+  # E-side seam (do NOT edit from D): the matching client declarations live in
+  #   manifests/services/lme-litellm.yml   (PGVECTOR_* env; user litellm_app)
+  #   manifests/services/lme-dashboard.yml (PGVECTOR_* env; user lme_vectors_app)
+  #   scripts/ingest_docs.py + lme-dashboard/scripts/ingest_docs.py (PG_* constants)
+  #   plus the legacy `pgvector` podman secret litellm mounts at /run/secrets/pgvector-legacy
+  # all pinned by testing/tests/unit/test_application_postgresql_tls.py.
+
+# =============================================================================
+# AUTHORITY (task D3 / D3a mutual-exclusion). Exactly ONE service owns the
+# lme_vectors + litellm databases per selected profile. This is the DERIVATION RULE,
+# NOT an authoritative value: a bare value here would be overridable via
+# lme_service_overrides[pgvector].authority (load_manifests.yml:298-306), so the
+# authoritative, non-overridable resolution is the C1 seam named below. Physical-name-
+# free (no graph / trixie): the rule keys on the profile selector, never a host.
+authority:
+  status: proposed                         # derived resolution + non-override enforcement are a C1 seam; NOT live
+  databases: [lme_vectors, litellm]
+  # keyed on the real selector lme_database_profile (load_manifests asserts length==0
+  # means UNSET -- so the empty string, NOT a symbolic "unset" that reads as a profile).
+  derivation:
+    - when: {lme_database_profile: "", install_llm: true}
+      owner: pgvector                      # THIS single-node POC store
+    - when: {lme_database_profile: "", install_llm: false}
+      owner: none                          # LLM stack off: NO authority renders -> initialized storage must be PRESERVED, not orphaned
+    - when: {lme_database_profile: "dual-owned-ha"}
+      owner: "postgresql_platform:vector"  # HA `vector` domain, fronted by pg-vector-rw
+    - when: {lme_database_profile: "shared-ha"}
+      owner: "postgresql_platform:shared"  # HA `shared` domain, fronted by pg-vector-rw
+  mutual_exclusion: >-
+    pgvector and the HA vector/shared domain MUST NEVER both be authoritative (two
+    homes for the same two databases = the dual-authority data hazard). enabled_when:
+    [install_llm] is a SAFE sole gate ONLY while load_manifests.yml hard-asserts
+    lme_database_profile is empty; once HA is a real selector the gate MUST also
+    require "no HA domain owns lme_vectors" via the C1-derived positive flag.
+  current_enforcement: >-
+    NONE beyond load_manifests.yml asserting lme_database_profile is EMPTY. There is no
+    derived-owner resolution, no resolved==derived assert, and no override rejection
+    today. Flipping install_llm off STOPS rendering lme-pgvectordata.volume, leaving the
+    initialized podman volume on disk with no managed owner (an ordinary apply that
+    ORPHANS initialized storage) -- the exact case the migration contract's
+    authority-to-`none` trigger must reject.
+  enforcement_seam: >-
+    NON-OVERRIDABLE resolution is C1 (filter_plugins/lme_manifests.py resolver +
+    lme_config_registry in manifests/global.yml): the resolver must publish the derived
+    owner, assert the resolved owner EQUALS the derived owner, and REJECT any
+    lme_service_overrides attempt to change it. An ordinary apply that would change
+    already-initialized authority is REJECTED and routed to
+    config/postgresql-platform/migration-workflow.contract.yaml; that guard's
+    IMPLEMENTATION lives in scripts/postgresql_platform (F1/C1-dependent).
