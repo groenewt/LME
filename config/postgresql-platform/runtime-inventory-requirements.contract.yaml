@@ -1,0 +1,247 @@
+# LME PostgreSQL platform -- DB requirements for the runtime-inventory PROJECTION
+#
+# WHAT THIS IS (codex one_resolved_authority + coordinator reconcile 0410 retraction f +
+# codex-0415 shared_schema_delivery):
+#   `lme_runtime_inventory` is a VIEW / PROJECTION of the SINGLE validated versioned resolved
+#   config. It is NOT an independent producer, loader, or merge, and this file does NOT
+#   reintroduce the dissolved framework. This file DECLARES, once and in typed YAML, the
+#   DB-platform topology / owners / provider-resources / authority / backup / recovery
+#   REQUIREMENTS. C1 integrates the canonical schema/derivation (through lme_manifests.py)
+#   and PROJECTS these requirements into the runtime-inventory view; the DB helpers
+#   (platform.py resolved_role_config + render, malcolm co-consumer, credential_materializer,
+#   rollback recovery gate) CONSUME that projected artifact.
+#
+# DERIVATION: through lme_manifests.py (the sole hand-authored Python allowance). NO new
+#   handwritten Python caller, NO module-level Python required-file authority, NO __main__
+#   subcommand (codex representation_and_single_authority; coordinator reconcile retraction b).
+#
+# SHAPE PROVENANCE: the field paths/types below are the EXACT union of the three live
+#   consumer read-paths (verified by grep, with line refs in
+#   .communication/2026-09-23-claude-D-runtime-inventory-FROZEN-shape-0412.yaml):
+#   scripts/postgresql_platform/platform.py, ansible/roles/malcolm_platform/filter_plugins/
+#   lme_malcolm.py, ansible/roles/secrets_distribution/tasks/credential_materializer.yml.
+#
+# CONVENTIONS:
+#   origin: INVENTORY=operator/host_var | OBSERVATION=observed at runtime (never a profile
+#     default) | BUILD=image/build output | DERIVED=computed desired state (never shrinks) |
+#     PROFILE=explicit selection | DECLARED-POLICY=declared default overridable via tier chain
+#   Node identifiers are DATA (map keys), never schema field names (R2): the demonstration
+#     inventory happens to use graph/trixie/silmaril, but membership is derived, not fixed.
+
+schema_version: 1
+owner: D_database_coordinator
+projected_view: lme_runtime_inventory
+consumed_by:
+  - scripts/postgresql_platform/platform.py  # resolved_role_config(resolved,node,credential_material) + render(config)
+  - ansible/roles/malcolm_platform/filter_plugins/lme_malcolm.py  # co-consumer of the same view
+  - ansible/roles/secrets_distribution/tasks/credential_materializer.yml  # C leaf, running
+  - ansible/rollback_lme.yml  # required-secret recovery gate (F2)
+
+# ---------------------------------------------------------------------------------------
+# PROFILE (R3) -- sole DB-platform toggle
+# ---------------------------------------------------------------------------------------
+profile:
+  view_path: profiles.database
+  type: enum
+  values: [shared-ha, dual-owned-ha]
+  origin: PROFILE                # explicit operator lme_database_profile -> T1/T2 native precedence (Q2)
+  absence: not_activated_fail_closed
+  reject_if_not_in_values: true  # platform.py topology() rejects anything else
+  note: >-
+    'local' is NOT a value here. The single-node pgvector POC (manifests/services/lme-pgvector.yml,
+    enabled_when install_llm) is a SEPARATE manifest, not this platform.
+
+# ---------------------------------------------------------------------------------------
+# DERIVED DOMAIN MEMBERSHIP (R2) -- names-free; derived from the selected profile
+# ---------------------------------------------------------------------------------------
+domains_by_profile:
+  dual-owned-ha:
+    db_domains: [hertzbeat, vector]   # reciprocal logical replication between the two
+    reciprocal_replication: true
+  shared-ha:
+    db_domains: [shared]              # single domain; no reciprocal paths
+    reciprocal_replication: false
+  always:
+    control_domain: etcd              # DCS quorum member, both profiles
+membership_validation:
+  rule: >-
+    Validate required HA membership SEPARATELY from physical machine names and from total
+    inventory count (R2). Each db_domain must resolve to a member set of distinct physical
+    nodes; each member runs the same owner account for that domain.
+
+# ---------------------------------------------------------------------------------------
+# OWNER ACCOUNTS (DECLARED-POLICY defaults; overridable) -- account names, not host names
+# ---------------------------------------------------------------------------------------
+owners:
+  view_path: hosts.<node>.owners.<service-id>   # map service-id -> owner-account
+  type: "str [a-z_][a-z0-9_-]*"
+  origin: INVENTORY
+  declared_defaults:
+    db-hertzbeat: lmedbhb
+    db-vector: lmedbvector
+    db-shared: lmedbshared
+    etcd: lmedcs
+  coverage_rule: >-
+    owners MUST cover db-<domain> (per active domain), etcd, AND every proxy/service sid that
+    appears in this node's resolved_services and is a proxy client (materializer reads
+    owners[sid]). On the malcolm host also owners.malcolm (=lmemalcolm) + owners.malcolm-fixture
+    (=lmecapture) -- malcolm-owner sub-shape.
+  member_consistency: "all members of a domain share the SAME owner account (platform.py enforces; raises if a member differs)."
+
+# ---------------------------------------------------------------------------------------
+# PROVIDER RESOURCE ADMISSION (A4) -- int memory_mib, HARD minimums (never weakened)
+# ---------------------------------------------------------------------------------------
+providers:
+  view_path: providers.<provider>.memory_mib
+  type: int
+  origin: INVENTORY
+  coercion_dependency: "_coerce_declared must support int (A4), not only bool|str."
+  entries:
+    db-<domain>:        {min_mib: 256, declared_default: 768}
+    etcd:               {min_mib: 32,  declared_default: 256, required_key: true}
+    db-proxy-hertzbeat: {min_mib: 32,  declared_default: 64}
+  admission_rule: "memory_mib is a HARD minimum; admission is never weakened to pass. render() Python fallbacks are tightened to strict-required once the projection guarantees the keys."
+
+# ---------------------------------------------------------------------------------------
+# BACKUP (R5 atomic complete-map) -- off-host repo
+# ---------------------------------------------------------------------------------------
+backup:
+  view_path: database.backup
+  merge_semantics: atomic_replace         # never deep-merge; a partial overlay is invalid
+  origin: INVENTORY
+  fields:
+    repository_host: {type: "str [a-zA-Z0-9.-]+", rule: "MUST NOT equal any member address (off-host repo)"}
+    repository_path: {type: "abs path", rule: "startswith '/'"}
+    retention_full:  {type: int, rule: ">= 2 (at least two full generations)"}
+  early_reject: [partial_atomic_map, repository_host_is_member, repository_path_not_absolute, retention_full_lt_2]
+
+# ---------------------------------------------------------------------------------------
+# SLOT GUARD (R5 atomic per-domain) -- member -> standby MAP (not a list)
+# ---------------------------------------------------------------------------------------
+slot_guard_standby:
+  view_path: database.slot_guard_standby.<domain>
+  type: "map{ <member-node>: <standby-node> }"
+  merge_semantics: atomic_replace_per_domain
+  origin: PROFILE_plus_INVENTORY
+  rule: >-
+    Keys are exactly the domain's member set (platform.py asserts set(map)==member set); the
+    value slot_guard_standby[domain][member] is that member's distinct physical standby.
+    'member' is derived (R2), not a fixed name.
+  early_reject:
+    - member_missing_from_domain_map
+    - standby_equals_its_member
+    - two_members_share_a_standby
+    - standby_is_the_backup_repository_host
+
+# ---------------------------------------------------------------------------------------
+# DERIVED AUTHORITY (R1) -- profile-derived, NON-OVERRIDABLE; gates migration
+# ---------------------------------------------------------------------------------------
+authority:
+  target:
+    view_path: authority.vector_store_owner   # proposed key name; final spelling TBD with C1
+    type: "str|null"
+    origin: DERIVED
+    rule: >-
+      The selected profile declares the sole authoritative vector/LiteLLM database and DERIVES
+      local-vs-HA activation. install_llm=true WITH a valid HA profile is NOT intrinsically
+      invalid. null iff install_llm=false. NON-OVERRIDABLE: an operator attempt to SET authority
+      is rejected.
+  current_initialized:
+    view_path: current_initialized_authority   # NOT a resolver output
+    type: "str|null"
+    origin: OBSERVATION
+    rule: >-
+      On-disk operational state read at deploy time; GATES migration; NEVER redefines the target.
+      ABSENT observation => UNKNOWN => reject any ordinary apply that would initialize or change
+      authority. NEVER default to 'uninitialized' (that path is reinit + data loss).
+  migration_ref: config/postgresql-platform/migration-workflow.contract.yaml   # see D-MIGRATION-IDENTITY-SCOPE + D-MIGRATION-RESUME (open)
+
+# ---------------------------------------------------------------------------------------
+# REQUIRED MATERIAL (declared once; resolves the __main__/module-Python conflict)
+# ---------------------------------------------------------------------------------------
+required_material:
+  view_path: required_material.<owner-role>   # top-level, keyed by owner-role (NOT per host)
+  type: "list[file-basename:str]"
+  origin: DECLARED-POLICY
+  derivation: "through lme_manifests.py; consumed by the completeness check (platform.py, reshaped) + credential_materializer + rollback recovery gate via the permitted declaration/template mechanism -- NOT module-level Python, NOT __main__."
+  scope: >-
+    THIS declares only the DB/etcd/proxy owner-roles (one projection). The universal
+    recovery required-secret union ALSO covers non-DB declared applications, owned by C
+    (codex scope_of_required_material). The DB list is an INPUT, not the universal contract.
+  early_reject: "an owner present in owners with an EMPTY or ABSENT required_material set is rejected (empty makes completeness pass vacuously -- same class as the empty-manifest-then-wipe F2 closed)."
+  db_owner_files:            # render-required files per DB owner-role (from platform.py render + C change_1..3)
+    always: [guardian.pub, replicator.crt, replicator.key, physical.pgpass]
+    dual-owned-ha_extra: [logical.pgpass, "replication-<db>-ca.crt", "replication-<db>.crt", "replication-<db>.key"]
+    etcd_role: [etcd-ca.crt, etcd-server.crt, etcd-server.key]          # at /data/{etcd}/secrets/postgresql/
+    proxy_role: [guardian.pub]                                          # at /data/{owner}/config/postgresql/guardian.pub (CONFIG dir, not secrets dir)
+
+# ---------------------------------------------------------------------------------------
+# ARTIFACTS (BUILD origin) -- pinned immutable digests; a profile default cannot supply
+# ---------------------------------------------------------------------------------------
+artifacts:
+  view_path: artifacts.<name>
+  origin: BUILD
+  fields: "{reference:'(...@)?sha256:<64hex>', archive:abs-path, archive_sha256:<64hex>, source_digest:non-empty}"
+  db_required: [patroni, etcd]
+  malcolm_co_consumer: [python311, "malcolm-<image>"]   # malcolm-owner sub-shape
+
+# ---------------------------------------------------------------------------------------
+# PER-NODE VIEW FIELDS the DB projection consumes
+# ---------------------------------------------------------------------------------------
+host_view_fields:
+  fqdn:               {view_path: hosts.<node>.fqdn, type: "str [a-zA-Z0-9.-]+", origin: INVENTORY}
+  tailscale_address:  {view_path: hosts.<node>.tailscale_address, type: "ip (rendered /32)", origin: OBSERVATION}
+  qemu_generation:    {view_path: hosts.<node>.qemu_generation, type: "canonical UUID (str(uuid.UUID(x))==x)", origin: OBSERVATION,
+                       rule: "SINGLE source read by BOTH the rendered unit AND the fence authorizer; never defaulted."}
+  resolved_services:  {view_path: hosts.<node>.resolved_services, type: "map sid -> {secrets:[{name:str}], ...}", origin: DERIVED,
+                       rule: "derived desired state (R4), never shrinks; drives DB proxy_owners.",
+                       reconciled_collision: "malcolm reads bare `services` (membership) -> RENAME lme_malcolm.py L117/L122 host.get('services',()) -> host.get('resolved_services',{}); owner=F/malcolm; membership over map keys unchanged."}
+  guest:              {view_path: hosts.<node>.guest, note: "malcolm-owner sub-shape (vcpus/memory_mib/name/uuid); not D-owned; listed for projection completeness."}
+
+# ---------------------------------------------------------------------------------------
+# THREE-IDENTITY BINDING (codex-0330) -- keys must not float onto evidence/config identity
+# ---------------------------------------------------------------------------------------
+identity_binding:
+  deployment_identity:
+    view_path: deployment_identity
+    type: "str [a-zA-Z0-9_-]+ (stable across reapply and evidence runs)"
+    origin: INVENTORY               # operator/host_var only; resolver MUST NOT mint or config-derive it
+    keys: [fence_authorization, persistent_storage_root, credential_ownership]
+    absence: fail_closed            # render() deny-renders (F1, committed e1a4ec2)
+    named_consumer_edit: "resolved_role_config (platform.py L249) must read resolved['deployment_identity'] and thread it into config (D-owned)."
+  config_revision:
+    origin: DERIVED
+    role: provenance_only           # content-addressed, deterministic from config alone; NEVER a storage/credential/fence key
+  run_id:
+    view_path: run_id
+    origin: OBSERVATION
+    role: evidence_only             # MUST equal credential_material.run_id; NEVER a storage/credential/fence key
+    backup_repo_migration: >-
+      platform.py L438 (repo1-path .../{run_id}/{domain}) and postgresql_backup root
+      (root_prefix/<run_id>) currently key the pgBackRest repo on run_id -> the backup chain
+      breaks per evidence run and retention_full is meaningless across runs. D migrates both to
+      deployment_identity (D-owned consumer edits, named).
+
+# ---------------------------------------------------------------------------------------
+# EARLY-REJECT RULES enforced against the projected view (fail-closed; no override may bless)
+# ---------------------------------------------------------------------------------------
+production_early_reject:
+  - profile_not_in_enum
+  - deployment_identity_absent_or_config_derived
+  - provider_memory_below_minimum_or_non_int
+  - backup_repo_is_member_or_path_not_absolute_or_retention_lt_2
+  - incomplete_atomic_map_replacement
+  - slot_guard_keys_ne_members_or_selfguard_or_shared_standby_or_standby_is_backup_host
+  - operator_attempt_to_set_derived_authority
+  - owner_present_with_empty_required_material
+  - artifact_not_qualified_immutable_digest
+  - qemu_generation_not_canonical_uuid
+  - run_id_ne_credential_material_run_id
+
+# ---------------------------------------------------------------------------------------
+# OPEN field questions for C1 integration (codex-0415: record remaining field questions)
+# ---------------------------------------------------------------------------------------
+open_field_questions_for_c1:
+  - "exact key spelling of authority.vector_store_owner (D proposes; C1 confirms placement in the resolved view)."
+  - "membership-count relaxation: credential_materializer asserts hosts|length==3 -> declared member count (C edit); platform.py fixed HOSTS constant -> derived from the view (D edit). Both are the portable-inventory seam, not field-shape changes."
+  - "current_initialized_authority is a deploy-time OBSERVATION slot, not a resolver output -- confirm where the projection surfaces the observation vs where the migration workflow reads it."
