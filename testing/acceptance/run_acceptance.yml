@@ -200,29 +200,97 @@
         success_msg: "vanish-guard: all {{ cases | length }} cases produced a verdict"
         quiet: true
 
-    # --- "A RED must be earned": every RED's control is PASS ---------------------
+    # --- "A RED must be earned": DOWNGRADE any RED whose control is not PASS -----
+    # The schema declares this downgrade; the runner performs it here so the two
+    # agree. A downgraded case becomes ERROR-CONTROL, is written into the receipt,
+    # and is failed by the ERROR gate AFTER the receipt is durable.
     - name: Compute the set of PASSing case names
       ansible.builtin.set_fact:
         _pass_names: "{{ results | selectattr('verdict', 'equalto', 'PASS') | map(attribute='case') | list }}"
 
-    - name: Compute RED cases whose control is not PASS (unearned RED)
+    - name: Downgrade any unearned RED (control not PASS) to ERROR-CONTROL
       ansible.builtin.set_fact:
-        _unearned_red: >-
-          {{ results | selectattr('verdict', 'equalto', 'RED')
-                     | selectattr('control', 'defined') | rejectattr('control', 'equalto', '')
-                     | rejectattr('control', 'in', _pass_names)
-                     | map(attribute='case') | list }}
+        _results_dg: >-
+          {{ (_results_dg | default([])) + [
+               (item | combine({
+                  'verdict': 'ERROR-CONTROL',
+                  'downgrade_note': ('RED downgraded to ERROR-CONTROL: control ' ~ (item.control | default('')) ~ ' did not PASS -- a RED must be earned by a PASSing control differing only by the pin')
+               }))
+               if (item.verdict == 'RED' and (item.control | default('')) != '' and (item.control not in _pass_names))
+               else item ] }}
+      loop: "{{ results }}"
+      loop_control: {loop_var: item, label: "{{ item.case }}"}
 
-    - name: "EARNED-RED gate -- a RED whose control is not PASS is not a runtime RED"
-      ansible.builtin.assert:
-        that: "_unearned_red | length == 0"
-        fail_msg: >-
-          RED case(s) whose control did not PASS (harness/control broken, RED not earned):
-          {{ _unearned_red }} -- treat as ERROR-CONTROL and fix the control before trusting the RED.
-        success_msg: "earned-RED gate: every RED has a PASSing control"
-        quiet: true
+    - name: Adopt the downgraded results
+      ansible.builtin.set_fact:
+        results: "{{ _results_dg }}"
 
-    # --- Tallies + receipt ------------------------------------------------------
+    # --- Cross-run revision checks (revision_equals / revision_differs_from) -----
+    - name: Build case -> emitted resolved revision map (from the JSON emit dict)
+      ansible.builtin.set_fact:
+        _rev_by_case: "{{ (_rev_by_case | default({})) | combine({ item.case: (item.observed.revision | default('NONE')) }) }}"
+      loop: "{{ results }}"
+      loop_control: {loop_var: item, label: "{{ item.case }}"}
+
+    - name: Select the cases that declare a cross-run revision relation
+      ansible.builtin.set_fact:
+        _rev_check_cases: >-
+          {{ (results | selectattr('revision_equals', 'defined') | rejectattr('revision_equals', 'equalto', '') | list)
+             + (results | selectattr('revision_differs_from', 'defined') | rejectattr('revision_differs_from', 'equalto', '') | list) }}
+
+    - name: Evaluate each cross-run revision relation (a mismatch is a revision-check RED)
+      vars:
+        _is_eq: "{{ (item.revision_equals | default('')) != '' }}"
+        _other: "{{ item.revision_equals if ((item.revision_equals | default('')) != '') else item.revision_differs_from }}"
+        _this_rev: "{{ _rev_by_case[item.case] | default('NONE') }}"
+        _other_rev: "{{ _rev_by_case[item.revision_equals if ((item.revision_equals | default('')) != '') else item.revision_differs_from] | default('MISSING') }}"
+        _valid: "{{ (_this_rev not in ['NONE', 'MISSING', '']) and (_other_rev not in ['NONE', 'MISSING', '']) }}"
+      ansible.builtin.set_fact:
+        revision_checks: >-
+          {{ (revision_checks | default([])) + [ {
+               'case': item.case,
+               'relation': ('equals' if (_is_eq | bool) else 'differs'),
+               'other': _other,
+               'this_rev': _this_rev,
+               'other_rev': _other_rev,
+               'ok': ((_valid | bool) and ((_this_rev == _other_rev) if (_is_eq | bool) else (_this_rev != _other_rev)))
+            } ] }}
+      loop: "{{ _rev_check_cases }}"
+      loop_control:
+        loop_var: item
+        label: "{{ item.case }} ({{ 'eq ' ~ item.revision_equals if ((item.revision_equals | default('')) != '') else 'ne ' ~ item.revision_differs_from }})"
+
+    # --- Harness identity (the mechanism that produced this receipt) -------------
+    - name: List the mechanism files (harness self-identity; receipts excluded)
+      ansible.builtin.find:
+        paths:
+          - "{{ playbook_dir }}"
+          - "{{ playbook_dir }}/cases"
+          - "{{ playbook_dir }}/macros"
+        patterns: ["*.yml", "*.j2"]
+        recurse: false
+      register: _mech_files
+
+    - name: sha256 each mechanism file
+      ansible.builtin.stat: {path: "{{ item }}", checksum_algorithm: sha256}
+      register: _mech_stat
+      loop: "{{ _mech_files.files | map(attribute='path') | sort }}"
+      loop_control: {label: "{{ item | relpath(repo_root) }}"}
+
+    - name: Does the on-disk mechanism equal HEAD? (receipts excluded)
+      ansible.builtin.command:
+        argv: [git, diff, --quiet, HEAD, --, testing/acceptance, ":!testing/acceptance/receipts"]
+        chdir: "{{ repo_root }}"
+      register: _mech_diff
+      changed_when: false
+      failed_when: false
+
+    - name: Publish harness identity
+      ansible.builtin.set_fact:
+        mechanism_sha256: "{{ dict((_mech_stat.results | map(attribute='item') | map('relpath', repo_root) | list) | zip(_mech_stat.results | map(attribute='stat.checksum') | list)) }}"
+        harness_matches_head: "{{ _mech_diff.rc == 0 }}"
+
+    # --- Tallies + receipt (WRITTEN BEFORE THE GATES) ---------------------------
     - name: Compute tallies
       ansible.builtin.set_fact:
         tally:
@@ -231,6 +299,7 @@
           red: "{{ results | selectattr('verdict', 'equalto', 'RED') | list | length }}"
           blocked: "{{ results | selectattr('verdict', 'equalto', 'BLOCKED') | list | length }}"
           error: "{{ results | rejectattr('verdict', 'in', ['PASS', 'REJECTED-as-expected', 'RED', 'BLOCKED']) | list | length }}"
+          revision_check_fail: "{{ (revision_checks | default([])) | rejectattr('ok') | list | length }}"
 
     - name: Assemble the receipt document
       ansible.builtin.set_fact:
@@ -240,16 +309,20 @@
           run_id: "{{ run_id }}"
           head: "{{ head_rev.stdout }}"
           worktree_dirty: "{{ (git_porcelain.stdout_lines | length) > 0 }}"
+          harness_matches_head: "{{ harness_matches_head }}"
           runner_toolchain: "{{ runner_toolchain }}"
           probe_toolchain: "{{ probe_toolchain }}"
           toolchain_note: "probes execute under the scrubbed-env probe_toolchain (/usr/bin/ansible-playbook); the worktree default anaconda ansible-core 2.17.14 was not separately exercised (findings are engine-logic-level)"
+          mechanism_sha256: "{{ mechanism_sha256 }}"
           snapshot_head_blobs: "{{ snapshot_head_blobs }}"
           snapshot_sha256: "{{ snapshot_sha256 }}"
           tally: "{{ tally }}"
+          revision_checks: "{{ revision_checks | default([]) }}"
           verdict_legend:
             GREEN: "PASS / REJECTED-as-expected -- engine accepted a valid input or rejected an invalid one with the right cause"
             RED: "earned engine/domain gap (judge failed with a PASSing control, or reject-expected exited 0)"
             BLOCKED: "declared case whose dependency has not landed"
+            ERROR-CONTROL: "a RED whose control did not PASS -- downgraded; the RED is not trusted until the control passes"
           results: "{{ results }}"
 
     - name: Write the per-run results.yml (scratchpad work dir)
@@ -261,7 +334,7 @@
     - name: Ensure the receipts dir exists
       ansible.builtin.file: {path: "{{ playbook_dir }}/receipts", state: directory, mode: "0755"}
 
-    - name: Write the COMMITTED receipt (receipts/LATEST.yml)
+    - name: Write the COMMITTED receipt (receipts/LATEST.yml) BEFORE the gates
       ansible.builtin.copy:
         dest: "{{ playbook_dir }}/receipts/LATEST.yml"
         mode: "0644"
@@ -273,15 +346,30 @@
       loop: "{{ results }}"
       loop_control: {label: "{{ item.case }}"}
 
+    - name: Revision-check line(s)
+      ansible.builtin.debug:
+        msg: "{{ '%-46s %-7s %-46s this=%s other=%s ok=%s' | format(item.case, item.relation, item.other, item.this_rev[:12], item.other_rev[:12], item.ok) }}"
+      loop: "{{ revision_checks | default([]) }}"
+      loop_control: {label: "{{ item.case }}"}
+
     - name: Tally line
       ansible.builtin.debug:
-        msg: "GREEN={{ tally.green }} RED={{ tally.red }} BLOCKED={{ tally.blocked }} ERROR={{ tally.error }} total={{ tally.total }} (receipt: {{ playbook_dir }}/receipts/LATEST.yml; run: {{ work }})"
+        msg: "GREEN={{ tally.green }} RED={{ tally.red }} BLOCKED={{ tally.blocked }} ERROR={{ tally.error }} rev_fail={{ tally.revision_check_fail }} total={{ tally.total }} (receipt: {{ playbook_dir }}/receipts/LATEST.yml; run: {{ work }})"
 
-    - name: "ERROR gate -- no harness/unexpected verdicts"
+    - name: "ERROR gate -- no harness/unexpected verdicts (incl. downgraded ERROR-CONTROL)"
       ansible.builtin.assert:
         that: "tally.error | int == 0"
         fail_msg: >-
           harness/unexpected verdict(s):
           {{ results | rejectattr('verdict', 'in', ['PASS', 'REJECTED-as-expected', 'RED', 'BLOCKED']) | map(attribute='case') | list }}
         success_msg: "no ERROR verdicts; RED cases are engine findings, not harness faults"
+        quiet: true
+
+    - name: "REVISION-CHECK gate -- every declared cross-run revision relation holds"
+      ansible.builtin.assert:
+        that: "(revision_checks | default([])) | rejectattr('ok') | list | length == 0"
+        fail_msg: >-
+          revision-check RED(s) (complete revision not content-addressed as declared):
+          {{ (revision_checks | default([])) | rejectattr('ok') | list }}
+        success_msg: "revision checks: all {{ (revision_checks | default([])) | length }} cross-run relation(s) hold"
         quiet: true
