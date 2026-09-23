@@ -1,0 +1,257 @@
+---
+# =============================================================================
+# ansible/tasks/ledger/backup_generation_ledger.yml
+#
+# B-owned reusable Ansible task include: the bindable MECHANISM for the backup
+# generation/revision provenance ledger declared in
+# manifests/ledger/backup-generation.contract.yaml (+ .schema.yaml). Pure Ansible
+# module calls (stat / slurp / from_json / assert / copy) -- NO shell/Python runtime
+# engine, NO hand-authored Python. D CONSUMES this via include_tasks and passes
+# lme_gl_* vars; D's producer/restore bodies are D's to adapt (this file does not
+# rewrite them). Candidate is UNWIRED until D binds + G validates.
+#
+# The record SHAPE matches ansible/templates/ledger/backup_generation_record.json.j2
+# (the importable gen_record macro, the canonical renderer for consumers that render
+# in a template) and is validated by backup-generation.schema.yaml -- that schema is
+# the SINGLE source of truth both this include and the macro satisfy.
+#
+# SUPERSESSION is append-oriented + DERIVED here: commit REPLACES the op's `open`
+# record with a `committed` one and never rewrites prior committed records (they stay
+# recoverable); last_good picks the most-recent committed. The contract also permits an
+# explicit stored `superseded` transition if D prefers -- either satisfies the schema.
+#
+# ACTIONS (lme_gl_action): open | commit | abort | last_good | verify_bundle
+# =============================================================================
+
+- name: "ledger[{{ lme_gl_action | default('?') }}] -- validate action + required inputs"
+  ansible.builtin.assert:
+    that:
+      - lme_gl_action in ['open', 'commit', 'abort', 'last_good', 'verify_bundle']
+      - lme_gl_ledger_path is defined and (lme_gl_ledger_path | string) is match('^/')
+      - (lme_gl_action in ['last_good']) or (lme_gl_host is defined and (lme_gl_host | length) > 0)
+      - (lme_gl_action in ['last_good', 'verify_bundle']) or (lme_gl_op_id is defined and (lme_gl_op_id | length) > 0)
+      - (lme_gl_action != 'open') or (lme_gl_bundle_dir is defined and (lme_gl_bundle_dir | string) is match('^/'))
+      - (lme_gl_action != 'commit') or (lme_gl_bundle_sha256 is defined and (lme_gl_bundle_sha256 | string) is match('^[0-9a-f]{64}$'))
+      - (lme_gl_action != 'verify_bundle') or (lme_gl_bundle_sha256 is defined and (lme_gl_bundle_sha256 | string) is match('^[0-9a-f]{64}$'))
+    fail_msg: "backup_generation_ledger: missing/invalid inputs for action '{{ lme_gl_action | default('UNSET') }}'"
+    quiet: true
+
+- name: "ledger -- ensure the ledger directory exists (write actions only)"
+  ansible.builtin.file:
+    path: "{{ lme_gl_ledger_path | dirname }}"
+    state: directory
+    mode: "{{ lme_gl_dir_mode | default('0700') }}"
+    owner: root
+    group: root
+  become: true
+  when: lme_gl_action in ['open', 'commit', 'abort']
+
+- name: "ledger -- stat the ledger file (fail-closed gate)"
+  ansible.builtin.stat:
+    path: "{{ lme_gl_ledger_path }}"
+  register: _gl_stat
+
+# FAIL-CLOSED FILE GATE (mirrors resource_classes.yml state gates + the existing
+# tailscale-ingress-owned.json gate): if the ledger exists it MUST be a root-owned,
+# 0600, REGULAR, non-symlink file, else the anchor is untrusted -> refuse.
+- name: "ledger -- refuse an untrusted ledger file (root-owned 0600 regular non-symlink)"
+  ansible.builtin.assert:
+    that:
+      - not _gl_stat.stat.islnk
+      - _gl_stat.stat.isreg
+      - _gl_stat.stat.pw_name == 'root' or _gl_stat.stat.uid == 0
+      - (_gl_stat.stat.mode | string) == (lme_gl_file_mode | default('0600'))
+    fail_msg: "ledger {{ lme_gl_ledger_path }} failed the fail-closed file gate (owner/mode/type/symlink)"
+    quiet: true
+  when: _gl_stat.stat.exists
+
+# Ledgerless restore (DR / single bundle copied alone): fail-closed unless the operator
+# recorded an explicit admission (restore_without_ledger contract).
+- name: "ledger[verify_bundle] -- ledger absent: refuse unless an operator admission is recorded"
+  ansible.builtin.assert:
+    that:
+      - lme_backup_ledger_absent_admitted | default(false) | bool
+      - (lme_backup_ledger_absent_reason | default('') | length) > 0
+    fail_msg: >-
+      ledger {{ lme_gl_ledger_path }} is absent and no recorded operator admission
+      (lme_backup_ledger_absent_admitted + _reason) -- refusing to restore without an
+      out-of-bundle anchor. See backup-generation.contract.yaml restore_without_ledger.
+    quiet: true
+  when:
+    - lme_gl_action == 'verify_bundle'
+    - not _gl_stat.stat.exists
+
+- name: "ledger -- read the current ledger (empty when absent)"
+  ansible.builtin.slurp:
+    src: "{{ lme_gl_ledger_path }}"
+  register: _gl_raw
+  when: _gl_stat.stat.exists
+
+- name: "ledger -- parse the ledger array"
+  ansible.builtin.set_fact:
+    _gl_ledger: "{{ (_gl_raw.content | b64decode | from_json) if _gl_stat.stat.exists else [] }}"
+
+# ---------------------------------------------------------------------------
+# OPEN: append a new open generation (fail-closed on committed-dir immutability)
+# ---------------------------------------------------------------------------
+- name: "ledger[open] -- refuse to open onto a committed/superseded bundle_dir, or reuse an op_id"
+  ansible.builtin.assert:
+    that:
+      - (_gl_ledger | selectattr('bundle_dir', 'equalto', lme_gl_bundle_dir)
+         | selectattr('status', 'in', ['committed', 'superseded']) | list | length) == 0
+      - (_gl_ledger | selectattr('op_id', 'equalto', lme_gl_op_id) | list | length) == 0
+    fail_msg: >-
+      refusing OPEN: bundle_dir {{ lme_gl_bundle_dir }} already holds a committed
+      generation (immutable) or op_id {{ lme_gl_op_id }} is already recorded. Choose a
+      fresh bundle_dir/op_id (backup-generation.contract.yaml committed_is_immutable).
+    quiet: true
+  when: lme_gl_action == 'open'
+
+- name: "ledger[open] -- build the open record"
+  ansible.builtin.set_fact:
+    _gl_out: >-
+      {{ _gl_ledger + [ {
+           'schema': 1,
+           'host': lme_gl_host,
+           'op_id': lme_gl_op_id,
+           'bundle_dir': lme_gl_bundle_dir,
+           'backup_timestamp': lme_gl_backup_timestamp | default(none),
+           'status': 'open',
+           'opened_at': lme_gl_opened_at | default(now(true, '%Y-%m-%dT%H:%M:%SZ')),
+           'committed_at': none,
+           'revision': lme_gl_revision | default(none),
+           'revision_source': lme_gl_revision_source | default('unresolved_at_backup_path'),
+           'bundle_sha256': none,
+           'volume_set': lme_gl_volume_set | default([]),
+           'ledger_path': lme_gl_ledger_path,
+           'note': lme_gl_note | default(none),
+         } ] }}
+  when: lme_gl_action == 'open'
+
+# ---------------------------------------------------------------------------
+# COMMIT: transition the op's open record -> committed (idempotent; anchors recorded)
+# ---------------------------------------------------------------------------
+- name: "ledger[commit] -- gather this op's committed + open records"
+  ansible.builtin.set_fact:
+    _gl_op_committed: "{{ _gl_ledger | selectattr('op_id', 'equalto', lme_gl_op_id) | selectattr('status', 'equalto', 'committed') | list }}"
+    _gl_op_open: "{{ _gl_ledger | selectattr('op_id', 'equalto', lme_gl_op_id) | selectattr('status', 'equalto', 'open') | list }}"
+  when: lme_gl_action == 'commit'
+
+- name: "ledger[commit] -- idempotent reapply: same op + same digest is a no-op; different digest refuses"
+  ansible.builtin.assert:
+    that:
+      - (_gl_op_committed | map(attribute='bundle_sha256') | list | first) == lme_gl_bundle_sha256
+    fail_msg: >-
+      op_id {{ lme_gl_op_id }} is already committed with a DIFFERENT bundle_sha256 --
+      refusing to re-commit a changed payload under a completed identity
+      (idempotent_commit.same_op_different_digest = refuse).
+    quiet: true
+  when:
+    - lme_gl_action == 'commit'
+    - (_gl_op_committed | length) > 0
+
+- name: "ledger[commit] -- no-op success (already committed with the same digest)"
+  ansible.builtin.set_fact:
+    lme_gl_result: {action: commit, outcome: no_op_success, op_id: "{{ lme_gl_op_id }}"}
+  when:
+    - lme_gl_action == 'commit'
+    - (_gl_op_committed | length) > 0
+
+- name: "ledger[commit] -- require the op's open record + exact volume-set membership"
+  ansible.builtin.assert:
+    that:
+      - (_gl_op_open | length) == 1
+      # Exact membership vs the DECLARED selection recorded at open (names only; digests
+      # are filled at commit). A missing/extra volume is a MISMATCH, never a short set.
+      - (_gl_op_open | first).volume_set | map(attribute='name') | list | sort
+        == (lme_gl_volume_set | map(attribute='name') | list | sort)
+    fail_msg: >-
+      COMMIT refused: no single open record for op_id {{ lme_gl_op_id }}, or the certified
+      volume set does not equal the set recorded at open (volume_set completeness anchor).
+    quiet: true
+  when:
+    - lme_gl_action == 'commit'
+    - (_gl_op_committed | length) == 0
+
+- name: "ledger[commit] -- replace the open record with a committed one (prior committed retained)"
+  ansible.builtin.set_fact:
+    _gl_out: >-
+      {{ (_gl_ledger | rejectattr('op_id', 'equalto', lme_gl_op_id) | list)
+         + [ (_gl_op_open | first) | combine({
+               'status': 'committed',
+               'committed_at': lme_gl_committed_at | default(now(true, '%Y-%m-%dT%H:%M:%SZ')),
+               'bundle_sha256': lme_gl_bundle_sha256,
+               'volume_set': lme_gl_volume_set,
+               'revision': lme_gl_revision | default((_gl_op_open | first).revision),
+               'revision_source': lme_gl_revision_source | default((_gl_op_open | first).revision_source),
+             }) ] }}
+    lme_gl_result: {action: commit, outcome: committed, op_id: "{{ lme_gl_op_id }}"}
+  when:
+    - lme_gl_action == 'commit'
+    - (_gl_op_committed | length) == 0
+
+# ---------------------------------------------------------------------------
+# ABORT: transition the op's open record -> aborted (last committed untouched)
+# ---------------------------------------------------------------------------
+- name: "ledger[abort] -- transition the op's open record to aborted"
+  ansible.builtin.set_fact:
+    _gl_out: >-
+      {{ (_gl_ledger | rejectattr('op_id', 'equalto', lme_gl_op_id) | list)
+         + ( (_gl_ledger | selectattr('op_id', 'equalto', lme_gl_op_id) | selectattr('status', 'equalto', 'open') | list)
+             | map('combine', {'status': 'aborted', 'note': (lme_gl_note | default('aborted: interrupted before commit'))}) | list ) }}
+  when: lme_gl_action == 'abort'
+
+# ---------------------------------------------------------------------------
+# WRITE-BACK (open/commit/abort) -- atomic rename via copy. NB copy does NOT fsync
+# (durability.fsync_status = OPEN in the contract).
+# ---------------------------------------------------------------------------
+- name: "ledger -- write the updated ledger (atomic rename; fsync is a declared OPEN residual)"
+  ansible.builtin.copy:
+    content: "{{ _gl_out | to_nice_json }}\n"
+    dest: "{{ lme_gl_ledger_path }}"
+    mode: "{{ lme_gl_file_mode | default('0600') }}"
+    owner: root
+    group: root
+  become: true
+  when:
+    - lme_gl_action in ['open', 'commit', 'abort']
+    - _gl_out is defined
+    - not (lme_gl_result is defined and lme_gl_result.outcome == 'no_op_success')
+
+# ---------------------------------------------------------------------------
+# LAST_GOOD: the most-recent committed generation for the host (null if none)
+# ---------------------------------------------------------------------------
+- name: "ledger[last_good] -- select the most-recent committed generation for the host"
+  ansible.builtin.set_fact:
+    lme_gl_last_good: >-
+      {{ ((_gl_ledger | selectattr('host', 'equalto', lme_gl_host | default(inventory_hostname))
+           | selectattr('status', 'equalto', 'committed') | list)
+          | sort(attribute='committed_at') | last)
+         if (_gl_ledger | selectattr('host', 'equalto', lme_gl_host | default(inventory_hostname))
+             | selectattr('status', 'equalto', 'committed') | list | length) > 0
+         else none }}
+  when: lme_gl_action == 'last_good'
+
+# ---------------------------------------------------------------------------
+# VERIFY_BUNDLE: require a committed record anchoring THIS bundle_sha256 + volume set
+# ---------------------------------------------------------------------------
+- name: "ledger[verify_bundle] -- require a committed out-of-bundle anchor for this bundle"
+  ansible.builtin.assert:
+    that:
+      # A committed record whose bundle_sha256 == the bundle's certification digest,
+      # AND (when a volume_set is supplied) whose recorded names match the on-disk set.
+      - (_gl_ledger | selectattr('status', 'equalto', 'committed')
+         | selectattr('bundle_sha256', 'equalto', lme_gl_bundle_sha256) | list | length) >= 1
+      - (lme_gl_volume_set is not defined)
+        or ((_gl_ledger | selectattr('status', 'equalto', 'committed')
+             | selectattr('bundle_sha256', 'equalto', lme_gl_bundle_sha256)
+             | map(attribute='volume_set') | map('map', attribute='name') | map('sort') | list)
+            | select('equalto', (lme_gl_volume_set | map(attribute='name') | list | sort)) | list | length >= 1)
+    fail_msg: >-
+      restorability REFUSED: no committed ledger record anchors bundle_sha256
+      {{ lme_gl_bundle_sha256 }} (a bundle cannot self-certify; file existence does not
+      qualify restorability). See backup-generation.contract.yaml.
+    quiet: true
+  when:
+    - lme_gl_action == 'verify_bundle'
+    - _gl_stat.stat.exists

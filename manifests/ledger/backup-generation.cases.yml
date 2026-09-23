@@ -1,0 +1,230 @@
+---
+# =============================================================================
+# manifests/ledger/backup-generation.cases.yml
+#
+# B-owned DECLARATIVE test cases (DATA) for the backup-generation ledger, modelled on
+# G's loader_integration cases. B supplies the cases as DATA (fixture + action + inputs
+# + expected outcome); G owns the DRIVER/entry-point that renders + runs them (a
+# macro-rendered driver, NOT a Python test and NOT a bash body in a YAML scalar). If
+# wiring needs a G-owned file, this is the spec B sends -- B does not edit G's files.
+#
+# Two case families:
+#   schema_cases  -- validate an example ledger document against backup-generation.schema.yaml
+#   mechanism_cases -- drive ansible/tasks/ledger/backup_generation_ledger.yml with a
+#                      starting ledger + action + lme_gl_* inputs; assert the resulting
+#                      ledger state / outcome / refusal.
+# NB the mechanism cases run against a NON-root fixture ledger, so G's driver must
+# override the fail-closed root/0600 file gate for the fixture (the gate itself is
+# separately asserted by the two file_gate_cases, which G drives with a crafted file).
+# =============================================================================
+
+schema_cases:
+  - id: valid-open-then-committed
+    expect: valid
+    ledger:
+      - schema: 1
+        host: lme-host
+        op_id: op-aaa
+        bundle_dir: /opt/lme/backups/2026-09-23_04-40
+        backup_timestamp: "2026-09-23_04-40"
+        status: aborted            # a prior interrupted attempt, retained + marked not-recoverable
+        opened_at: "2026-09-23T04:40:01Z"
+        committed_at: null
+        revision: null
+        revision_source: unresolved_at_backup_path
+        bundle_sha256: null
+        volume_set: [{name: lme_esdata01}]
+        ledger_path: /opt/lme/backups/backup-generations.ledger.json
+        note: "aborted: interrupted before commit"
+      - schema: 1
+        host: lme-host
+        op_id: op-bbb
+        bundle_dir: /opt/lme/backups/2026-09-23_04-41
+        backup_timestamp: "2026-09-23_04-41"
+        status: committed
+        opened_at: "2026-09-23T04:41:00Z"
+        committed_at: "2026-09-23T04:42:10Z"
+        revision: null
+        revision_source: unresolved_at_backup_path
+        bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+        volume_set:
+          - {name: lme_esdata01, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000002"}
+        ledger_path: /opt/lme/backups/backup-generations.ledger.json
+        note: null
+
+  - id: invalid-committed-missing-bundle_sha256
+    expect: invalid           # committed MUST carry bundle_sha256 (allOf committed branch)
+    ledger:
+      - {schema: 1, host: h, op_id: op-c, bundle_dir: /b, status: committed,
+         opened_at: "t", committed_at: "t", revision: null,
+         revision_source: unresolved_at_backup_path, bundle_sha256: null,
+         volume_set: [{name: v, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000003"}],
+         ledger_path: /l}
+
+  - id: invalid-null-revision-without-source
+    expect: invalid           # a null revision REQUIRES revision_source
+    ledger:
+      - {schema: 1, host: h, op_id: op-d, bundle_dir: /b, status: open,
+         opened_at: "t", committed_at: null, revision: null, revision_source: null,
+         bundle_sha256: null, volume_set: [], ledger_path: /l}
+
+  - id: invalid-open-claims-bundle_sha256
+    expect: invalid           # an open/aborted generation MUST NOT claim a digest
+    ledger:
+      - {schema: 1, host: h, op_id: op-e, bundle_dir: /b, status: open,
+         opened_at: "t", committed_at: null, revision: null,
+         revision_source: unresolved_at_backup_path,
+         bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000004",
+         volume_set: [], ledger_path: /l}
+
+  - id: invalid-unknown-field
+    expect: invalid           # additionalProperties:false -- no desired-state leakage
+    ledger:
+      - {schema: 1, host: h, op_id: op-f, bundle_dir: /b, status: open,
+         opened_at: "t", committed_at: null, revision: null,
+         revision_source: unresolved_at_backup_path, bundle_sha256: null,
+         volume_set: [], ledger_path: /l, enabled: true}
+
+mechanism_cases:
+  - id: open-appends-in-progress
+    action: open
+    starting_ledger: []
+    inputs:
+      lme_gl_host: h
+      lme_gl_op_id: op-1
+      lme_gl_bundle_dir: /opt/lme/backups/2026-09-23_05-00
+      lme_gl_volume_set: [{name: lme_esdata01}]
+    expect:
+      outcome: written
+      ledger_len: 1
+      last_record: {status: open, bundle_sha256: null}
+
+  - id: open-refuses-committed-dir-reuse
+    action: open
+    starting_ledger:
+      - {schema: 1, host: h, op_id: op-old, bundle_dir: /dupe, status: committed,
+         opened_at: t, committed_at: t,
+         bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000009",
+         revision: null, revision_source: unresolved_at_backup_path,
+         volume_set: [{name: v, data_content_sha256: "000000000000000000000000000000000000000000000000000000000000000a"}],
+         ledger_path: /l}
+    inputs:
+      lme_gl_host: h
+      lme_gl_op_id: op-2
+      lme_gl_bundle_dir: /dupe            # reuse of a committed bundle_dir -> immutability refuse
+      lme_gl_volume_set: [{name: v}]
+    expect:
+      outcome: refuse
+
+  - id: commit-transitions-open-and-retains-prior
+    action: commit
+    starting_ledger:
+      - {schema: 1, host: h, op_id: op-prev, bundle_dir: /b0, status: committed,
+         opened_at: t, committed_at: "2026-09-23T05:00:00Z",
+         bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000010",
+         revision: null, revision_source: unresolved_at_backup_path,
+         volume_set: [{name: v, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000011"}],
+         ledger_path: /l}
+      - {schema: 1, host: h, op_id: op-3, bundle_dir: /b1, status: open,
+         opened_at: t, committed_at: null, bundle_sha256: null,
+         revision: null, revision_source: unresolved_at_backup_path,
+         volume_set: [{name: v}], ledger_path: /l}
+    inputs:
+      lme_gl_op_id: op-3
+      lme_gl_bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000020"
+      lme_gl_volume_set: [{name: v, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000021"}]
+    expect:
+      outcome: committed
+      ledger_len: 2                        # prior committed RETAINED (preserve prior generation)
+      op-prev_status: committed
+
+  - id: commit-volume-set-mismatch-refuses
+    action: commit
+    starting_ledger:
+      - {schema: 1, host: h, op_id: op-4, bundle_dir: /b, status: open,
+         opened_at: t, committed_at: null, bundle_sha256: null,
+         revision: null, revision_source: unresolved_at_backup_path,
+         volume_set: [{name: v1}, {name: v2}], ledger_path: /l}   # declared 2 at open
+    inputs:
+      lme_gl_op_id: op-4
+      lme_gl_bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000030"
+      lme_gl_volume_set: [{name: v1, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000031"}]  # only 1 certified
+    expect:
+      outcome: refuse                      # omitted v2 is a MISMATCH, never a short set
+
+  - id: commit-idempotent-same-digest-noop
+    action: commit
+    starting_ledger:
+      - {schema: 1, host: h, op_id: op-5, bundle_dir: /b, status: committed,
+         opened_at: t, committed_at: t,
+         bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000040",
+         revision: null, revision_source: unresolved_at_backup_path,
+         volume_set: [{name: v, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000041"}],
+         ledger_path: /l}
+    inputs:
+      lme_gl_op_id: op-5
+      lme_gl_bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000040"   # SAME digest
+      lme_gl_volume_set: [{name: v, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000041"}]
+    expect:
+      outcome: no_op_success
+
+  - id: commit-idempotent-different-digest-refuses
+    action: commit
+    starting_ledger:
+      - {schema: 1, host: h, op_id: op-6, bundle_dir: /b, status: committed,
+         opened_at: t, committed_at: t,
+         bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000050",
+         revision: null, revision_source: unresolved_at_backup_path,
+         volume_set: [{name: v, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000051"}],
+         ledger_path: /l}
+    inputs:
+      lme_gl_op_id: op-6
+      lme_gl_bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000059"   # DIFFERENT digest
+      lme_gl_volume_set: [{name: v, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000051"}]
+    expect:
+      outcome: refuse
+
+  - id: verify_bundle-anchors-committed-digest
+    action: verify_bundle
+    starting_ledger:
+      - {schema: 1, host: h, op_id: op-7, bundle_dir: /b, status: committed,
+         opened_at: t, committed_at: t,
+         bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000060",
+         revision: null, revision_source: unresolved_at_backup_path,
+         volume_set: [{name: v, data_content_sha256: "0000000000000000000000000000000000000000000000000000000000000061"}],
+         ledger_path: /l}
+    inputs:
+      lme_gl_bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000060"
+    expect:
+      outcome: pass
+
+  - id: verify_bundle-unanchored-digest-refuses
+    action: verify_bundle
+    starting_ledger: []                    # no committed record -> a bundle cannot self-certify
+    inputs:
+      lme_gl_bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000070"
+    expect:
+      outcome: refuse
+
+  - id: verify_bundle-ledger-absent-no-admission-refuses
+    action: verify_bundle
+    starting_ledger: ABSENT                 # G removes the fixture file entirely
+    inputs:
+      lme_gl_bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000080"
+    expect:
+      outcome: refuse                       # restore_without_ledger.default = refuse
+
+file_gate_cases:
+  # G crafts the fixture file with these attributes and asserts the gate REFUSES.
+  - id: reject-symlink-ledger
+    craft: {type: symlink}
+    expect: refuse
+  - id: reject-world-readable-ledger
+    craft: {type: regular, mode: '0644', owner: root}
+    expect: refuse
+  - id: reject-non-root-owned-ledger
+    craft: {type: regular, mode: '0600', owner: nonroot}
+    expect: refuse
+  - id: accept-root-0600-regular-ledger
+    craft: {type: regular, mode: '0600', owner: root}
+    expect: pass

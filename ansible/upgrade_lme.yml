@@ -1,4 +1,128 @@
 ---
+# =============================================================================
+# Play 0: PRE-MUTATION VALIDATION BARRIER (B-owned; C1-OTHER-CALLER-PREFLIGHT).
+#
+# Mirrors ansible/elasticsearch.yml's committed pre-mutation barrier onto this caller.
+# upgrade_lme.yml is a single localhost play, so "all-host" is one host; the barrier
+# still mints per-invocation evidence and resolves+validates BEFORE the earliest
+# mutation (the "Upgrade LME" play's first task, setup_lme_scripts.yml at ~line 29,
+# which writes /opt/lme/scripts). A dedicated pre-play (become:false, gather_facts:false)
+# keeps the read-only barrier cleanly separated from the become:yes mutating play, per
+# elasticsearch.yml's shape (codex-0700: do NOT copy the incomplete site.yml pre_task
+# barrier).
+#
+# OBSERVATION-DEPENDENT RESOLUTION (why this barrier gathers two stats). upgrade's
+# resolved config depends on host OBSERVATIONS: install_elastic_services (registry
+# default:false) is observed from the installed apm-server quadlet, and offline_mode
+# from the on-disk marker (see the main play ~148-193). A barrier that resolved WITHOUT
+# them would validate the WRONG config (a pack-installed host would resolve as disabled)
+# AND record a revision that could never match the main play's. So the barrier gathers
+# the SAME two READ-ONLY stats and builds the SAME namespaced lme_inputs before calling
+# the SHARED resolver (tasks_from: resolve -> validate_resolved_config.yml), exactly the
+# entrypoint the main play uses at ~196. The stats are read-only and independent of the
+# main play's podman detection, so gathering them first mutates nothing.
+#
+# NB the resolver captures _lme_operator_selections ONCE (pristine); this barrier's
+# resolve makes that capture (empty -- upgrade defines NO registry field as a bare play
+# var, comment ~171), and the main play's resolve reuses it and composes the SAME
+# observations, so both resolve the SAME revision (the Phase 0 -> main-play parity assert
+# below relies on this). HONEST RESIDUAL: lme_resolved_revision is the config-only
+# revision (C1-COMPLETE-RESOLVED-REVISION, open).
+# =============================================================================
+- name: "Phase 0: Pre-mutation resolve+validate barrier (fail-closed before any mutation)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  # Explicit LINEAR strategy so any_errors_fatal is honored regardless of a global
+  # strategy (codex-0915: do not rely on the global strategy).
+  strategy: linear
+  any_errors_fatal: true
+  vars:
+    clone_directory: "{{ clone_dir | default(playbook_dir + '/..') }}"
+  tasks:
+    - name: Barrier -- reject a pre-supplied / carried validation token, evidence or capture
+      ansible.builtin.assert:
+        that:
+          - _lme_upgrade_barrier_run_token is not defined
+          - _lme_upgrade_prevalidated is not defined
+          # Also refuse a foreign token from a chained site.yml/elasticsearch.yml play.
+          - _lme_es_barrier_run_token is not defined
+          - _lme_es_prevalidated is not defined
+          - _lme_site_barrier_run_token is not defined
+          - _lme_prevalidated is not defined
+          # A carried pristine operator-selection capture would validate a STALE capture;
+          # the barrier's own resolve mints it fresh.
+          - _lme_operator_selections is not defined
+          # lme_resolved_revision is OUTPUT-ONLY; an -e value would forge both the evidence
+          # and the parity comparison.
+          - lme_resolved_revision is not defined
+        fail_msg: >-
+          A barrier token / prevalidated evidence / _lme_operator_selections /
+          lme_resolved_revision must NOT be pre-supplied (-e) or carried from a prior play --
+          the barrier mints its own per-invocation evidence and resolves its own revision.
+        quiet: true
+
+    - name: Barrier -- mint this invocation's validation token (run_once)
+      ansible.builtin.set_fact:
+        _lme_upgrade_barrier_run_token: "upgrade-barrier-{{ lookup('pipe', 'date +%s%N') }}-{{ 999999999 | random }}"
+      run_once: true
+
+    # Read-only observations the resolver needs (SAME paths/registers as the main play).
+    - name: Barrier -- detect whether the optional Elastic services pack is installed
+      ansible.builtin.stat:
+        path: /etc/containers/systemd/lme-apm-server.container
+      register: elastic_pack_quadlet
+
+    - name: Barrier -- detect offline-mode marker for this upgrade
+      ansible.builtin.stat:
+        path: /opt/lme/OFFLINE_MODE
+      register: offline_marker
+
+    - name: Barrier -- load the config registry field list for caller-input construction
+      ansible.builtin.include_vars:
+        file: "{{ clone_directory }}/manifests/global.yml"
+        name: _upg_global_file
+
+    - name: Barrier -- build namespaced resolver inputs (selections operator-only; observations separate)
+      ansible.builtin.set_fact:
+        lme_inputs: >-
+          {{ {'selections': dict(_upg_sel_keys | zip(_upg_sel_keys | map('extract', vars) | list)),
+              'observations': {'install_elastic_services': elastic_pack_quadlet.stat.exists,
+                               'offline_mode': offline_marker.stat.exists},
+              'origins': {}} }}
+      vars:
+        _upg_reg_keys: "{{ _upg_global_file.lme_config_registry.fields.keys() | list }}"
+        _upg_sel_keys: "{{ _upg_reg_keys | select('in', vars) | list }}"
+
+    - name: Barrier -- resolve+validate declared config (shared resolver; the SAME entrypoint the main play uses)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: resolve
+
+    - name: Barrier -- record this invocation's pre-mutation validation evidence (token + resolved revision)
+      ansible.builtin.set_fact:
+        _lme_upgrade_prevalidated:
+          token: "{{ _lme_upgrade_barrier_run_token }}"
+          revision: "{{ lme_resolved_revision }}"
+
+    - name: Barrier -- validation completed THIS invocation before any mutation
+      ansible.builtin.assert:
+        that:
+          - (ansible_play_hosts_all | difference(ansible_play_hosts)) | length == 0
+          - >-
+            (ansible_play_hosts | map('extract', hostvars)
+             | map(attribute='_lme_upgrade_prevalidated', default={})
+             | selectattr('token', 'defined')
+             | selectattr('token', 'equalto', _lme_upgrade_barrier_run_token)
+             | selectattr('revision', 'defined')
+             | list | length) == (ansible_play_hosts | length)
+        fail_msg: >-
+          pre-mutation validation did not complete this invocation
+          (token {{ _lme_upgrade_barrier_run_token }}). No mutation proceeds until it does.
+        quiet: true
+      run_once: true
+
 - name: Upgrade LME
   hosts: localhost
   connection: local
@@ -196,6 +320,25 @@
       ansible.builtin.include_role:
         name: podman
         tasks_from: resolve
+
+    # PARITY GATE (B-owned, defense-in-depth): the Phase 0 barrier resolved+validated
+    # this SAME config (same read-only observations) before any mutation. Confirm the
+    # barrier ran this invocation and the main-play resolve matches its recorded revision
+    # BEFORE the heavy destructive upgrade steps (image pulls, unit re-render, container
+    # recreation) further down. setup_lme_scripts.yml (the only pre-resolve mutation) is
+    # already fronted by the Phase 0 barrier; this additionally fails closed on drift
+    # between validation and the destructive phase.
+    - name: Parity gate -- barrier validated THIS exact config this invocation (fail-closed)
+      ansible.builtin.assert:
+        that:
+          - _lme_upgrade_prevalidated is defined
+          - (_lme_upgrade_prevalidated.token | default('')) == (_lme_upgrade_barrier_run_token | default('__barrier_did_not_run__'))
+          - (_lme_upgrade_prevalidated.revision | default('')) == lme_resolved_revision
+        fail_msg: >-
+          No matching Phase 0 pre-mutation validation evidence for THIS upgrade (expected token
+          {{ _lme_upgrade_barrier_run_token | default('UNSET -- barrier play did not run') }} and
+          resolved revision {{ lme_resolved_revision }}). Refusing the destructive upgrade phase.
+        quiet: true
 
     - name: Display resolved optional-stack enablement (with provenance)
       debug:

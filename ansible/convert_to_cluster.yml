@@ -19,6 +19,142 @@
 #     -e skip_prompts=true
 
 ###############################################################################
+# Play 0: PRE-MUTATION VALIDATION BARRIER (B-owned; C1-OTHER-CALLER-PREFLIGHT).
+#
+# Mirrors ansible/elasticsearch.yml's committed pre-mutation ALL-HOST barrier onto
+# this caller so NO host enters a mutating phase until the COMPLETE elasticsearch
+# target set (master + every data node) has resolved+validated THIS invocation. The
+# earliest mutation on this caller is Phase 1's setup_lme_scripts.yml (writes
+# /opt/lme/scripts) followed by the backup -- both on the master -- so this barrier
+# MUST be the FIRST play, before Phase 1.
+#
+# Two deliberate hardenings over the incomplete site.yml barrier shape (codex-0700:
+# do NOT copy it) -- identical to elasticsearch.yml:
+#   * DEDICATED VALIDATION-ONLY PLAY across the COMPLETE inventory with NO `serial`,
+#     so it QUALIFIES valid batching instead of only rejecting carried facts
+#     (codex-0915 C1_source_review.site_barrier open item): every targeted host
+#     validates in ONE linear pass before any host mutates, and later batched/serial
+#     mutating phases (Phase 6 is `serial: 1`) are gated per-host by the barrier
+#     evidence, not by re-running this run_once completeness assert inside a batch.
+#   * STRUCTURED evidence bound to a per-INVOCATION token + the content-addressed
+#     resolved revision (NOT an unversioned boolean), so a stale/foreign
+#     `_lme_*prevalidated` fact from a prior play or another entrypoint in the same
+#     process cannot satisfy the gate (C1-SERIAL-BARRIER-STALE-FACT-ACCEPTANCE).
+#
+# NO REMOTE PYTHON / NO MUTATION: every task is controller-side (assert, set_fact,
+# include_role -> load_manifests). load_manifests resolves+validates from the synced
+# manifest tree (clone_directory) and reads each node's host_vars, so it validates the
+# whole `elasticsearch` group even before Phase 5a bootstraps Python on the data nodes,
+# and changes nothing on any host. become:false + gather_facts:false make that explicit.
+# lme_profile:cluster comes from inventory/group_vars/elasticsearch.yml (the SAME source
+# Phase 2/5b use), so this barrier resolves the SAME profile the mutating phases do.
+#
+# HONEST RESIDUALS (bound to C1, not claimed fixed here):
+#   * lme_resolved_revision is the config-only revision (C1-COMPLETE-RESOLVED-REVISION,
+#     open) -- binding to it does not yet cover the fully-composed consumer config.
+#   * this barrier is the all-host pre-first-mutation gate; a per-host render-parity
+#     re-check is added to Phase 1 (the earliest master mutation). Data-node deploy
+#     (Phase 5b) keeps its own resolve; extending per-host parity to every later phase
+#     is a documented residual (the barrier already gated the complete target set).
+###############################################################################
+- name: "Phase 0: Pre-mutation resolve+validate ALL-HOST barrier (fail-closed before any mutation)"
+  hosts: elasticsearch
+  gather_facts: false
+  become: false
+  # Pin the LINEAR strategy so any_errors_fatal is guaranteed effective even on a site
+  # that sets a non-default (e.g. free) strategy globally -- under `free` Ansible warns
+  # any_errors_fatal is unsupported and a failing host does not abort its peers.
+  strategy: linear
+  # Abort the WHOLE play the moment ANY targeted host errors, so no host advances into a
+  # mutating phase on a partial validation. The run_once completeness assert is the
+  # backstop for a host dropped WITHOUT a task failure (e.g. removed during connection).
+  any_errors_fatal: true
+  vars:
+    clone_directory: "{{ clone_dir | default(playbook_dir + '/..') }}"
+  tasks:
+    - name: Barrier -- reject a pre-supplied / carried validation token, evidence or capture
+      ansible.builtin.assert:
+        that:
+          # `-e` outranks set_fact and facts carry across plays; refuse this caller's own
+          # evidence AND any foreign token from a chained site.yml/elasticsearch.yml play
+          # in the same process, so an injected or historical value can never masquerade
+          # as THIS run's evidence.
+          - _lme_convert_barrier_run_token is not defined
+          - _lme_convert_prevalidated is not defined
+          - _lme_es_barrier_run_token is not defined
+          - _lme_es_prevalidated is not defined
+          - _lme_site_barrier_run_token is not defined
+          - _lme_prevalidated is not defined
+          # A carried resolver operator-selection capture would make the barrier validate
+          # a STALE capture. convert_to_cluster is its own ansible-playbook process, so a
+          # fresh run never pre-sets it; this only rejects a genuinely stale/injected one.
+          - _lme_operator_selections is not defined
+          # lme_resolved_revision is an OUTPUT-ONLY set_fact; an extra-var OUTRANKS a
+          # set_fact, so `-e lme_resolved_revision=X` would PIN a forged value into BOTH
+          # the recorded evidence AND the Phase 1 parity comparison. Never legitimately
+          # pre-supplied -> reject.
+          - lme_resolved_revision is not defined
+        fail_msg: >-
+          A barrier token / prevalidated evidence / _lme_operator_selections /
+          lme_resolved_revision must NOT be pre-supplied (-e) or carried from a prior play --
+          the barrier mints its own per-invocation evidence and resolves its own revision.
+        quiet: true
+      tags: ['always']
+
+    - name: Barrier -- mint this invocation's validation token (run_once; shared to every host)
+      ansible.builtin.set_fact:
+        _lme_convert_barrier_run_token: "convert-barrier-{{ lookup('pipe', 'date +%s%N') }}-{{ 999999999 | random }}"
+      run_once: true
+      tags: ['always']
+
+    - name: Barrier -- resolve+validate declared config + service/trust projections (per host, pre-mutation)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: load_manifests
+        apply:
+          tags: ['always']
+      tags: ['always']
+
+    - name: Barrier -- record this host's pre-mutation validation evidence (token + resolved revision)
+      ansible.builtin.set_fact:
+        _lme_convert_prevalidated:
+          token: "{{ _lme_convert_barrier_run_token }}"
+          revision: "{{ lme_resolved_revision }}"
+      tags: ['always']
+
+    - name: Barrier -- every targeted host validated THIS invocation before any peer mutates
+      ansible.builtin.assert:
+        that:
+          # No targeted host was silently dropped (any_errors_fatal already aborts on a
+          # task failure; this also catches a host removed for another reason) ...
+          - (ansible_play_hosts_all | difference(ansible_play_hosts)) | length == 0
+          # ... and EVERY surviving targeted host recorded evidence bound to THIS run's
+          # token AND carrying a resolved revision. The token (minted run_once, guarded
+          # against pre-supply) proves every host ran THIS invocation; `revision defined`
+          # proves each host completed resolve+validate. It does NOT require every host's
+          # revision to be EQUAL: heterogeneous per-host host_vars resolve DIFFERENT valid
+          # revisions, so coupling completeness to cross-host uniformity would wrongly
+          # reject a legitimate batch. Each host's OWN revision is bound to ITS OWN deploy
+          # by the Phase 1 parity gate; cross-host uniformity, if ever required, is a
+          # separate C1 resolver policy, not this completeness barrier's job.
+          - >-
+            (ansible_play_hosts | map('extract', hostvars)
+             | map(attribute='_lme_convert_prevalidated', default={})
+             | selectattr('token', 'defined')
+             | selectattr('token', 'equalto', _lme_convert_barrier_run_token)
+             | selectattr('revision', 'defined')
+             | list | length) == (ansible_play_hosts | length)
+        fail_msg: >-
+          pre-mutation validation did not succeed on every targeted elasticsearch host for THIS
+          invocation (token {{ _lme_convert_barrier_run_token }}; failed/removed:
+          {{ ansible_play_hosts_all | difference(ansible_play_hosts) }}). No host proceeds into
+          a mutating phase until the COMPLETE target set validates this run. NB `--limit` narrows
+          this target set; a limited run validates only the limited hosts (documented residual).
+        quiet: true
+      run_once: true
+      tags: ['always']
+
+###############################################################################
 # Play 1: Pre-checks and backup on master node
 ###############################################################################
 - name: "Phase 1: Pre-checks and backup"
@@ -29,6 +165,43 @@
     clone_directory: "{{ clone_dir | default(playbook_dir + '/..') }}"
     env_file_path: /opt/lme/lme-environment.env
     es_port: 9200
+
+  pre_tasks:
+    # --- PARITY GATE (B-owned): the validated config is STABLE into the first mutation ----
+    # Re-resolve+validate on the master and require the Phase 0 barrier's evidence to match
+    # (same per-invocation token AND same content-addressed revision) BEFORE the earliest
+    # mutation (setup_lme_scripts.yml, then the backup). Fail-closed: a missing token means
+    # the barrier did not run this invocation; a revision drift means the config changed
+    # between validation and mutation. any_errors_fatal on the BLOCK so a parity failure
+    # aborts before the mutating tasks; scoped to the block so an unrelated later task
+    # failure keeps normal semantics.
+    - name: Parity gate -- pre-mutation validation stop (master)
+      any_errors_fatal: true
+      block:
+        - name: Parity -- re-resolve+validate this host's declared config (matches the barrier)
+          ansible.builtin.include_role:
+            name: podman
+            tasks_from: load_manifests
+            apply:
+              tags: ['always']
+          tags: ['always']
+
+        - name: Parity -- refuse to mutate unless the barrier validated THIS exact config on THIS host
+          ansible.builtin.assert:
+            that:
+              - _lme_convert_prevalidated is defined
+              # token absent -> the Phase 0 barrier did not run this invocation (fail closed).
+              - (_lme_convert_prevalidated.token | default('')) == (_lme_convert_barrier_run_token | default('__barrier_did_not_run__'))
+              # revision drift -> the config changed between validation and mutation (fail closed).
+              - (_lme_convert_prevalidated.revision | default('')) == lme_resolved_revision
+            fail_msg: >-
+              {{ inventory_hostname }} has no matching pre-mutation validation evidence for THIS
+              conversion (expected token
+              {{ _lme_convert_barrier_run_token | default('UNSET -- barrier play did not run') }}
+              and resolved revision {{ lme_resolved_revision }}). Refusing to enter Phase 1.
+            quiet: true
+          tags: ['always']
+    # --- end PARITY GATE -----------------------------------------------------------------
 
   tasks:
     - name: Verify this is the master node (local connection)

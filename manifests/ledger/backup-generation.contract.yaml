@@ -1,0 +1,303 @@
+---
+# =============================================================================
+# manifests/ledger/backup-generation.contract.yaml
+#
+# B-owned (operational provenance). The DECLARED contract for a first-class BACKUP
+# GENERATION / REVISION identity model + an OUT-OF-BUNDLE provenance LEDGER anchor.
+# This is DATA + a bindable contract, NOT a runtime engine. D's producer
+# (ansible/roles/backup_lme/**) and the restore consumers (restore_lme_master.yml,
+# rollback_lme.yml) BIND to it by declaration (paths, field names, completeness
+# anchor); D adapts its own producer/restore bodies -- this file does not rewrite them.
+#
+# WHY THIS EXISTS (routed to B, codex-0915 D_source_review + D-backup-failclosed-wave):
+#   * integrity.yml certification.completeness_anchor.status == OPEN, routed_to:
+#       "B: record bundle_sha256 in the operational ledger as an out-of-bundle anchor"
+#     A bundle certification (bundle_sha256) is SELF-consistency only -- a bundle cannot
+#     certify its own completeness. The anchor MUST live OUTSIDE the bundle.
+#   * D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE (PARTIAL, open half routed to B):
+#       "First-class backup generation/revision + interrupted-operation identity model
+#        (preserve prior valid backups, distinguish incomplete new work)."
+#   * D-BACKUP-STATUS-PRESERVATION-AND-PUBLICATION-INCOMPLETE (high):
+#       "Bind status to verified committed generation state and retain the previous
+#        recoverable generation ... file existence must not qualify restorability.
+#        D integrates the B provenance contract."
+#   * D-BACKUP-EMPTY-RETRY-CERTIFIES-STALE-DATA / D-BACKUP-INCOMPLETE-VOLUME-DIRECTORY-
+#     OMITTED: the recorded volume-set membership anchor (below) is the out-of-bundle
+#     reference D verifies the restored/certified set against.
+#
+# HARD REPRESENTATION POSTURE: declared YAML + a genuine reusable Jinja record macro
+# (ansible/templates/ledger/backup_generation_record.json.j2) + reusable Ansible task
+# includes (ansible/tasks/ledger/backup_generation_ledger.yml). NO hand-authored Python;
+# NO new shell/Python runtime engine. The ledger append/read is pure Ansible module
+# calls (stat/slurp/from_json/assert/copy) plus a value-pure Jinja record render.
+#
+# NO SECRET VALUES: the ledger records digests + identities + counts only, never plaintext.
+# =============================================================================
+
+lme_backup_generation:
+  schema: 1
+
+  # ---------------------------------------------------------------------------
+  # 1. LEDGER FILE PLACEMENT (declared, out-of-bundle, fail-closed on read)
+  # ---------------------------------------------------------------------------
+  ledger:
+    # OUT-OF-BUNDLE by construction: a sibling of backups/, NOT inside any single
+    # timestamped bundle dir, so a bundle can never self-certify from a ledger it
+    # contains, and so the ledger travels with D's off-host backup export (the same
+    # rsync/scp target as backups/). default_until_hoisted mirrors the resource ledger's
+    # C1-consume pattern: C1 SHOULD hoist this to an lme_global.paths key
+    # (requested_key below); until then D binds this default and every ledger records
+    # its own ledger_path so a reader never re-derives it.
+    default_until_hoisted: "{{ backup_base_dir }}/backup-generations.ledger.json"
+    requested_c1_key: lme_global.paths.backup_generation_ledger
+    dir_mode: '0700'
+    file_mode: '0600'
+    # Non-negotiable on EVERY read (mirrors resource_classes.yml state gates + the
+    # existing tailscale-ingress-owned.json gate): a root-owned, 0600, REGULAR,
+    # non-symlink file, or the reader FAILS CLOSED. A ledger that fails these gates is
+    # REFUSED, never trusted -- it is the anchor, so it must not be attacker-swappable
+    # within the constraints of the threat model (see threat_scope below).
+    require_root_owned: true
+    require_regular_file: true
+    reject_symlink: true
+    # A JSON array of generation records (see schema). Newest-committed-last is NOT
+    # assumed; readers select by status + committed_at, never by array position.
+    format: json_array_of_generation_records
+
+  # ---------------------------------------------------------------------------
+  # 2. GENERATION / REVISION IDENTITY MODEL
+  # ---------------------------------------------------------------------------
+  generation_identity:
+    # OPERATION IDENTITY: a UNIQUE id minted per ATTEMPT (NOT the backup_timestamp).
+    # backup_timestamp has MINUTE granularity, so same-minute directory reuse is the
+    # root of D-BACKUP-EMPTY-RETRY-CERTIFIES-STALE-DATA and the tasks:173-177 stale-cert
+    # removal. op_id disambiguates two attempts in the same minute. Minted by the
+    # producer at OPEN (uuid4 or `date +%s%N`-plus-random); recorded verbatim; a retry
+    # of the SAME logical operation carries the SAME op_id (see interrupted_operation).
+    op_id_field: op_id
+    op_id_requirement: >-
+      Unique per attempt; stable across a resume/retry of the same interrupted operation.
+      NEVER derived from backup_timestamp alone.
+
+    # The generation identity tuple a reader/verifier keys on.
+    identity_fields: [host, op_id, bundle_dir]
+
+    # CONFIG REVISION: OPTIONAL / NULLABLE. The backup producer path
+    # (ansible/backup_lme.yml -> role backup_lme) does NOT run load_manifests/resolve
+    # today, so lme_resolved_revision is NOT in scope there (verified). Therefore a
+    # required ^[0-9a-f]{64}$ revision would be UNBINDABLE for D. It is recorded when
+    # available and null otherwise, WITH a required revision_source so a null is never a
+    # silent gap:
+    revision_field: revision                 # ^[0-9a-f]{64}$ OR null
+    revision_source_field: revision_source   # required whenever revision is null
+    revision_source_vocab:
+      - resolved_at_backup_path              # backup entrypoint ran resolve -> revision set
+      - unresolved_at_backup_path            # producer did not resolve (today's default) -> revision null
+      - projected_by_c1                      # C1 projected it into a restore-visible declaration
+    revision_binding_note: >-
+      ROUTED: if a backup generation MUST carry a config revision, either the backup
+      entrypoint runs the shared resolver (a B/D caller change) or C1 projects the
+      revision into a restore-visible declaration (mirrors the integrity.yml
+      completeness_anchor C1 route). Generation identity does NOT depend on revision --
+      it is a provenance tag, not a key.
+
+    # GENERATION STATE MACHINE. Aligned to the swarm's house vocabulary (the resource
+    # ledger uses statuses open|committed; per-resource attempted->observed->reaped).
+    states:
+      open:
+        meaning: >-
+          A new generation was opened (record written) BEFORE payload production. It has
+          NO bundle_sha256 and NO verified volume_set yet. An `open` generation is
+          IN-PROGRESS / not-yet-recoverable. It NEVER supersedes or invalidates the last
+          `committed` generation.
+      committed:
+        meaning: >-
+          Payload produced, certified, published AND re-verified. bundle_sha256 and the
+          complete volume_set membership are recorded. Only a `committed` generation is
+          RECOVERABLE. This transition is the ONLY writer of bundle_sha256/volume_set.
+      superseded:
+        meaning: >-
+          A previously `committed` generation that a NEWER `committed` generation
+          replaced. RETAINED (not deleted) -- it remains a recoverable prior generation
+          for rollback/DR until retention policy prunes it. Being superseded does NOT
+          make it unrecoverable.
+      aborted:
+        meaning: >-
+          An `open` generation whose operation failed/was interrupted before commit, or
+          whose commit was refused. Marks the interrupted work as NOT recoverable so a
+          resume/retry never mistakes it for a good generation. The last `committed`
+          generation is untouched.
+    terminal_states: [committed, superseded, aborted]
+
+    # IMMUTABILITY / PRESERVATION (the concrete meaning of "preserve the prior valid
+    # backups"): a bundle_dir recorded as `committed` is IMMUTABLE. OPENING a new
+    # generation onto a bundle_dir that already holds a `committed` record is a REFUSE
+    # (fail-closed) -- the producer must choose a fresh bundle_dir/op_id. This is what
+    # stops the same-minute directory-reuse overwrite (EMPTY-RETRY) and the stale-cert
+    # path at the SOURCE, rather than after the fact.
+    committed_is_immutable: true
+
+  # ---------------------------------------------------------------------------
+  # 3. OUT-OF-BUNDLE ANCHORS recorded AT COMMIT
+  # ---------------------------------------------------------------------------
+  commit_anchors:
+    # The bundle's self-consistency digest (integrity.yml certification.self_digest_field
+    # == bundle_sha256), copied into the LEDGER so restore anchors the bundle's claimed
+    # digest against an OUT-OF-BUNDLE record -> a bundle cannot self-certify. Restore's
+    # restorability check = a `committed` ledger record whose bundle_sha256 EQUALS the
+    # bundle's certification.bundle_sha256 (NOT: the certificate file merely exists).
+    bundle_sha256_field: bundle_sha256
+    binds_to: ansible/roles/backup_lme/vars/integrity.yml#lme_backup_integrity.certification.self_digest_field
+
+    # VOLUME-SET COMPLETENESS ANCHOR. Record the DECLARED selection captured AT OPEN
+    # (lme_backup_selected_volumes) -- NOT the set certify happens to enumerate. Deriving
+    # membership from certify's walk would inherit the template:200 "skip a volume dir
+    # missing its data subdir" defect (D-BACKUP-INCOMPLETE-VOLUME-DIRECTORY-OMITTED): an
+    # omitted volume would simply be absent from both sides and pass. Recording the
+    # intended selection at open makes an omission a MISMATCH at commit/restore.
+    volume_set:
+      recorded_at: open
+      source_of_truth: lme_backup_selected_volumes    # the producer's selected volume list
+      member_fields: [name, data_content_sha256]      # per volume: name + its recorded data digest
+      commit_requirement: >-
+        Commit REQUIRES the certified/produced volume set to EQUAL the volume_set names
+        recorded at open (exact membership; no missing, no extra). A mismatch REFUSES
+        commit (the generation stays open->aborted); it never certifies a short set.
+      restore_requirement: >-
+        Restore REQUIRES the on-disk bundle volume set to EQUAL the committed record's
+        volume_set names BEFORE any destructive volume step, and each member's
+        data_content_sha256 to match. This is the out-of-bundle backstop for the
+        pre-mutation volume qualification D already does inside the bundle.
+
+  # ---------------------------------------------------------------------------
+  # 4. INTERRUPTED-OPERATION IDENTITY / STATE MODEL (what a resume/retry sees)
+  # ---------------------------------------------------------------------------
+  interrupted_operation:
+    # Checkpoint order the producer follows so an interrupted op is always distinguishable
+    # from a committed one:
+    checkpoint_order:
+      - open           # write an `open` record (op_id, host, bundle_dir, selected volume names) FIRST
+      - produce        # copy trees/volumes, write per-volume content manifests
+      - certify        # compute per-payload digests + bundle_sha256 (integrity.yml producer)
+      - publish        # place the certificate + finalize the bundle on the publication FS
+      - verify         # re-read + re-verify the published artifact (integrity.yml re-verify)
+      - commit         # ONLY here: update the record to `committed` + record bundle_sha256 + volume_set
+    resume_semantics:
+      # What a NEW run / a resume sees when it reads the ledger:
+      sees_open_record_same_op: >-
+        A prior attempt was interrupted before commit. The interrupted bundle is NOT
+        trusted (no committed anchor). The prior `open` record is transitioned to
+        `aborted`; a fresh generation is opened (fresh bundle_dir; the same op_id MAY be
+        carried to tie the retry lineage). The last `committed` generation stays the
+        recoverable one throughout.
+      sees_committed_record: >-
+        A completed generation exists and is recoverable. Its bundle_dir is immutable.
+      failed_publication_vs_committed: >-
+        A failed/torn publication leaves the record `open` (no bundle_sha256) -> it is
+        distinguishable from `committed` purely by state + the presence of the recorded
+        bundle_sha256, NOT by whether a certificate file happens to exist on disk.
+    # IDEMPOTENT REAPPLY (custody lesson: C-CUSTODY-ROTATION-REQUEST-NOT-DISTINGUISHED).
+    # Committing the SAME op_id with the SAME bundle_sha256 is a NO-OP SUCCESS (a benign
+    # replay of an already-committed operation). Committing the same op_id with a
+    # DIFFERENT bundle_sha256 is a REFUSAL (a changed payload under a completed identity).
+    idempotent_commit:
+      same_op_same_digest: no_op_success
+      same_op_different_digest: refuse
+
+  # ---------------------------------------------------------------------------
+  # 5. RESTORE WITHOUT A LEDGER (DR / single bundle copied alone) -- MUST be explicit
+  # ---------------------------------------------------------------------------
+  restore_without_ledger:
+    # A restore may run on a NEW host, or against a single bundle copied off on its own,
+    # where the out-of-bundle ledger is absent. This CANNOT be left implicit.
+    default: refuse                                   # fail-closed: no anchor -> no restore ...
+    escape_hatch:
+      admission_var: lme_backup_ledger_absent_admitted   # ... UNLESS an operator explicitly admits it
+      admission_requirements:
+        - "explicit operator selection (never a default)"
+        - "the admission + operator + reason are RECORDED (audit), not silent"
+        - "the bundle's OWN certification (bundle_sha256 self-consistency) must still verify"
+      note: >-
+        With the ledger absent AND admitted, restore falls back to the bundle's
+        self-consistency certificate ONLY. It CANNOT detect bundle-side under-declaration
+        (that is exactly what the out-of-bundle anchor provides), so the operator is
+        accepting that reduced assurance knowingly.
+    recommendation: >-
+      D's off-host backup export SHOULD carry the ledger alongside the bundles (same
+      rsync/scp target) so DR onto a new host normally HAS the anchor and never needs the
+      escape hatch. Whether DR-without-ledger should instead be a hard refuse is an OPEN
+      question for MAIN (stated here rather than decided unilaterally).
+    open_question_for_main: >-
+      Is the recorded-operator-admission escape hatch acceptable, or must a ledgerless
+      restore be an unconditional refuse? B declares the fail-closed default + a recorded
+      escape; MAIN rules the policy.
+
+  # ---------------------------------------------------------------------------
+  # 6. HONEST SCOPE / RESIDUALS (do NOT overclaim)
+  # ---------------------------------------------------------------------------
+  threat_scope:
+    detects:
+      - "torn/truncated/interrupted generation (open never reached committed)"
+      - "a bundle whose bundle_sha256 does not match any committed ledger record"
+      - "a mixed-up host or bundle (identity tuple mismatch)"
+      - "bundle-side under-declaration of the recorded volume_set membership"
+      - "same-minute directory reuse / retry over a committed generation (immutability refuse)"
+    does_not_detect:
+      - >-
+        A root adversary who rewrites BOTH the bundle and the ledger (they share the same
+        root-owned tree). AUTHENTICITY against that remains the UNWIRED guardian signature
+        over bundle_sha256 (integrity.yml certification.signature, status UNWIRED). This
+        ledger is INTEGRITY/PROVENANCE, not authenticity.
+    certification_status: >-
+      BACKUP-MANIFEST-CERTIFICATION stays PARTIAL, not closed. This anchor closes the
+      self-certification + preservation + interrupted-state gaps; the EXPECTED-set
+      completeness half is C1's (project the expected owned material/secret set) and
+      authenticity is the UNWIRED signature.
+  durability:
+    # The reusable task include writes the ledger with ansible.builtin.copy, which renames
+    # atomically but does NOT fsync the file or its parent directory. A crash between the
+    # rename and the fs flush can lose the last committed record on some filesystems.
+    fsync_status: OPEN
+    fsync_note: >-
+      Declared, not claimed. Closing it needs an fsync (a `sync`/fsync step D adds at the
+      commit boundary, or a mount/journaling guarantee). Until then the ledger is
+      atomic-rename durable but not fsync-durable; recorded as a known limit.
+
+  # ---------------------------------------------------------------------------
+  # 7. BINDING MAP -- what D wires (D's adaptation, not authored here)
+  # ---------------------------------------------------------------------------
+  binding_map:
+    reusable_record_macro: ansible/templates/ledger/backup_generation_record.json.j2
+    reusable_task_include: ansible/tasks/ledger/backup_generation_ledger.yml
+    task_include_actions: [open, commit, abort, last_good, verify_bundle]
+    producer_binds:
+      - "backup_lme/tasks/main.yml: include the OPEN action BEFORE payload production (records op_id, host, bundle_dir, selected volume names)."
+      - "backup_lme/tasks/main.yml: after the integrity.yml certify+verify (tasks ~784-809) include the COMMIT action (records bundle_sha256 + volume_set; supersedes prior committed; enforces idempotent_commit)."
+      - "backup_lme/tasks/main.yml: on any produce/certify/publish failure include the ABORT action (transition the open generation to aborted; leave the last committed untouched)."
+      - "the backup_status.txt task (~759-782): bind restorability to the COMMITTED ledger state, not to file existence (D-BACKUP-STATUS-PRESERVATION)."
+    restore_binds:
+      - "restore_lme_master.yml (before the first destructive step, alongside the ~265 certification verify): include VERIFY_BUNDLE -> require a committed ledger record whose bundle_sha256 == the bundle's certification.bundle_sha256 AND whose volume_set matches; else refuse (or the restore_without_ledger escape)."
+      - "rollback_lme.yml: select the recoverable generation via LAST_GOOD (most-recent committed, or a named superseded generation for rollback)."
+    c1_binds:
+      - "C1 (optional): hoist ledger.default_until_hoisted to lme_global.paths.backup_generation_ledger."
+      - "C1 (the OPEN half of completeness): project the EXPECTED owned material/secret set so restore checks expected-vs-produced, not just produced-set self-consistency."
+
+  # ---------------------------------------------------------------------------
+  # 8. WHAT THIS CONTRACT FEEDS / WHAT D MUST STILL DO
+  # ---------------------------------------------------------------------------
+  feeds_findings:
+    - id: D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE
+      provides: "generation identity (op_id) + open/committed/superseded/aborted state + committed-dir immutability + idempotent_commit"
+      d_must_still: "wire OPEN before produce and ABORT on failure; carry op_id; choose a fresh bundle_dir per attempt"
+    - id: D-BACKUP-STATUS-PRESERVATION-AND-PUBLICATION-INCOMPLETE
+      provides: "restorability := committed ledger record matches bundle (not file existence); prior committed generation retained (superseded, not deleted)"
+      d_must_still: "bind backup_status.txt + restore restorability to committed ledger state; stop deleting the prior generation before the new one commits"
+    - id: D-BACKUP-EMPTY-RETRY-CERTIFIES-STALE-DATA
+      provides: "immutability refuse on reuse of a committed bundle_dir; volume_set recorded from the declared selection at open"
+      d_must_still: "open onto a FRESH bundle_dir; pass lme_backup_selected_volumes to OPEN"
+    - id: D-BACKUP-INCOMPLETE-VOLUME-DIRECTORY-OMITTED
+      provides: "out-of-bundle recorded volume_set membership to verify the certified/restored set against"
+      d_must_still: "call VERIFY_BUNDLE before any destructive volume step; enforce exact membership"
+    - id: integrity.yml#certification.completeness_anchor (OPEN, routed_to B)
+      provides: "the out-of-bundle bundle_sha256 anchor this field named"
+      d_must_still: "record it at commit; C1 still owns the expected-set half"
