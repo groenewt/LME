@@ -744,6 +744,90 @@ def lme_config_revision(payload):
     return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
 
+def _strip_resource_ids(status):
+    """Return required_material_status with the identity-derived, volatile `resource_ids`
+    removed from every node/service entry. resource_ids are content-addressed over the
+    STABLE deployment_identity (lme_material_resource_id), so leaving them in the revision
+    payload would churn the revision on an identity change -- which the three-identity
+    binding forbids (identity keys storage/fence, NOT the config revision). Everything else
+    in status (status/evidence/enabled) is config-derived and STAYS, so an
+    undeclared->declared_none transition still flips the revision."""
+    if not isinstance(status, dict):
+        return status
+    out = {}
+    for node, svcs in status.items():
+        if not isinstance(svcs, dict):
+            out[node] = svcs
+            continue
+        out[node] = {}
+        for sid, entry in svcs.items():
+            if isinstance(entry, dict):
+                out[node][sid] = {k: v for k, v in entry.items() if k != 'resource_ids'}
+            else:
+                out[node][sid] = entry
+    return out
+
+
+def _revision_payload(resolved, registry, profile_identities,
+                      services=None, global_manifest=None, host_rendered=None):
+    """Assemble the canonical revision payload from the COMPLETE composed desired/effective
+    state (codex-0645 C1-COMPLETE-RESOLVED-REVISION). Value-pure: the exclude set is READ from
+    the registry (`exclude_from_revision`), never hardcoded. Included: the declared config
+    fields (minus excluded), the ordered profile identities, and -- when supplied by the
+    post-projection loader call -- the composed lme_services + lme_global + the per-host
+    rendered-service roster + the required_material / datastore / membership projections. So a
+    service/material/endpoint/override change flips the revision (the config-only resolve.yml
+    call omits them and keeps the pre-projection revision for resolve-only callers).
+
+    EXCLUDED from the payload (deliberate): the STABLE deployment_identity (both the resolved
+    field, via exclude_from_revision, AND the `deployment_identity` projection key) and the
+    identity-derived required_material_status.resource_ids -- an identity change must NOT churn
+    the config revision, only the per-run evidence identity."""
+    resolved = resolved or {}
+    fields = (registry or {}).get('fields') or {}
+    excluded = set(k for k, f in fields.items()
+                   if isinstance(f, dict) and f.get('exclude_from_revision'))
+    # Declared flat config fields present in resolved, minus the excluded identity fields.
+    config = {k: resolved[k] for k in fields if k in resolved and k not in excluded}
+    payload = {
+        'schema_version': (registry or {}).get('schema_version', 1),
+        'ordered_profiles': profile_identities,
+        'config': config,
+    }
+    # Projections (present only in the post-projection loader call). deployment_identity is
+    # deliberately NOT copied in (identity is excluded); resource_ids are stripped from status.
+    if 'required_material' in resolved:
+        payload['required_material'] = resolved['required_material']
+    if 'required_material_status' in resolved:
+        payload['required_material_status'] = _strip_resource_ids(
+            resolved['required_material_status'])
+    if 'hosts' in resolved:
+        payload['hosts'] = resolved['hosts']
+    if 'database' in resolved:
+        payload['database'] = resolved['database']
+    # Composed artifacts that actually render (so an -e lme_service_overrides / lme_global_override
+    # that changes the rendered units is not invisible to the revision).
+    if services is not None:
+        payload['services'] = services
+    if global_manifest is not None:
+        payload['global'] = global_manifest
+    if host_rendered is not None:
+        payload['host_rendered_services'] = sorted(host_rendered)
+    return payload
+
+
+def lme_bind_revision(resolved, registry, profile_identities,
+                     services=None, global_manifest=None, host_rendered=None):
+    """The single untamperable revision binder (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN +
+    C1-COMPLETE-RESOLVED-REVISION). Assembles the canonical payload INSIDE this value-pure
+    filter (so there is NO named revision-only Ansible `vars:` intermediate an extra-var can
+    pin -- the resolve.yml/load_manifests.yml call sites pass broad facts + an INLINE profile
+    identity literal, and a read-back assert re-runs this same call to reject any pinned fact)
+    and returns the content-addressed sha256. OUTPUT-ONLY."""
+    return lme_config_revision(_revision_payload(
+        resolved, registry, profile_identities, services, global_manifest, host_rendered))
+
+
 def lme_known_enable_flags(_ignored=None):
     """The static KNOWN_ENABLE_FLAGS set is_enabled() guards against, as a sorted
     list, so a DECLARATIVE case can assert it equals the registry's enable_flag keys
@@ -1269,6 +1353,7 @@ class FilterModule(object):
             'lme_resolve_config': lme_resolve_config,
             'lme_validate_config': lme_validate_config,
             'lme_config_revision': lme_config_revision,
+            'lme_bind_revision': lme_bind_revision,
             'lme_known_enable_flags': lme_known_enable_flags,
             'lme_validate_material_requirements': lme_validate_material_requirements,
             'lme_validate_material_catalog': lme_validate_material_catalog,

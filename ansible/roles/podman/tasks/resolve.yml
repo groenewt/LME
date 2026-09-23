@@ -33,7 +33,11 @@
 #   lme_resolved         -- {<field>: <canonical value>} for every declared field.
 #   lme_resolved_origins -- {<field>: extra_var|inventory|operator|profile|observation|default}.
 #   lme_enable_flags     -- the enable-flag subset (is_enabled()'s input).
-#   lme_resolved_revision-- content-addressed configuration revision (OUTPUT-ONLY).
+#   lme_resolved_revision-- content-addressed CONFIG-ONLY revision (OUTPUT-ONLY). NOTE:
+#                           load_manifests.yml REBINDS this to the COMPLETE composed
+#                           revision (config + lme_services + lme_global + projections)
+#                           after it builds them; a resolve-only caller keeps the
+#                           config-only value (it derives no projections).
 #   <bare field names>   -- resolved values bridged under their bare names (OPEN debt).
 #
 # codex-manager-caller-contract-decisions-20260923-0200 / resolution_lifetime.
@@ -161,41 +165,64 @@
     lme_enable_flags: "{{ _lme_resolution.enable_flags }}"
 
 # CONFIGURATION revision (codex revision_identity (b)): content-addressed over the
-# canonical declared/resolved config -- the resolved VALUES, the ordered profile
-# identities and the schema version. It is deterministic from the CONFIG ALONE: it
-# EXCLUDES wall-clock, volatile observation timestamps, unrelated commits AND provenance
-# (origins). Origins are deliberately NOT hashed -- the same values reached two ways (via
-# -e vs the profile, or via the normalized entrypoint vs the compat auto-normalize, which
-# labels everything `operator`) MUST yield the SAME revision, so an unchanged config never
-# rewrites or restarts a healthy consumer. Provenance belongs in the per-run EVIDENCE
-# identity (c) (run id, digests, timestamps, observations, origins), a SEPARATE record --
-# see the versioned-artifact follow-on. OUTPUT-ONLY: never fed back as a resolution input.
-- name: Compute the content-addressed configuration revision (config-only; deterministic; OUTPUT-ONLY)
+# canonical declared/resolved config -- the resolved VALUES (minus registry
+# exclude_from_revision identity fields), the ordered profile identities and the schema
+# version. It is deterministic from the CONFIG ALONE: it EXCLUDES wall-clock, volatile
+# observation timestamps, unrelated commits AND provenance (origins). Origins are
+# deliberately NOT hashed -- the same values reached two ways MUST yield the SAME revision,
+# so an unchanged config never rewrites or restarts a healthy consumer. OUTPUT-ONLY.
+#
+# UNTAMPERABLE DERIVATION (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN, codex-0815 HIGH). The
+# previous form computed the hash from NAMED `vars:` intermediates (_lme_revision_resolved,
+# _lme_revision_excluded, _lme_profile_identities). An extra-var OUTRANKS a task `vars:`, so
+# `-e _lme_revision_resolved={}` pinned the hash input to an empty mapping while the real
+# resolver still flipped install_otel false->true -- the recorded revision stayed identical
+# and both peers reached deployment markers. There is now NO revision-only named
+# intermediate: the whole payload is assembled INSIDE the value-pure lme_bind_revision filter
+# (which reads the exclude set from the registry), and the profile-identity list is an INLINE
+# literal (not a variable, so -e cannot pin it). The immediately-following read-back guard
+# re-runs the SAME inline call and rejects any state where a pinned fact disagrees with the
+# freshly recomputed value -- so checking the final variable is not the only defence.
+# NB this is the CONFIG-ONLY revision (resolve.yml has no lme_services/projections yet);
+# load_manifests.yml REBINDS lme_resolved_revision to the COMPLETE composed revision after
+# the material/datastore/membership projections + lme_services/lme_global are built.
+- name: Compute the content-addressed configuration revision (config-only; deterministic; OUTPUT-ONLY; untamperable)
   ansible.builtin.set_fact:
     lme_resolved_revision: >-
-      {{ {'schema_version': (_lme_global_file.lme_config_registry.schema_version | default(1)),
-          'ordered_profiles': _lme_profile_identities,
-          'resolved': _lme_revision_resolved} | lme_config_revision }}
-  vars:
-    # ordered overlay identities + hashes are RETAINED even for the current single
-    # overlay (codex ordered_profiles). The multi-overlay chain merge is the declared
-    # follow-on; the resolver already accepts one merged mapping.
-    _lme_profile_identities:
-      - name: "{{ lme_profile }}"
-        sha256: "{{ lookup('file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | hash('sha256') }}"
-    # THREE-IDENTITY BINDING (D FROZEN codex-0330): the config revision hashes the desired
-    # CONFIG only. A field marked `exclude_from_revision` in the registry (lme_deployment_identity)
-    # is a STABLE IDENTITY that keys storage/fence/credential ownership -- it MUST NOT churn or
-    # be keyed into the config revision. It is dropped from the revision payload here (still
-    # resolved + projected to lme_resolved.deployment_identity). Membership stays IN (it is
-    # desired config). Absent for current deploys -> byte-identical revision either way.
-    _lme_revision_excluded: >-
-      {{ _lme_global_file.lme_config_registry.fields | dict2items
-         | selectattr('value.exclude_from_revision', 'defined')
-         | selectattr('value.exclude_from_revision') | map(attribute='key') | list }}
-    _lme_revision_resolved: >-
-      {{ _lme_resolution.resolved | dict2items
-         | rejectattr('key', 'in', _lme_revision_excluded) | items2dict }}
+      {{ _lme_resolution.resolved | lme_bind_revision(
+           _lme_global_file.lme_config_registry,
+           [{'name': lme_profile,
+             'sha256': lookup('file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | hash('sha256')}]) }}
+
+# READ-BACK GUARD (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN). Extra-vars outrank set_fact, so
+# ANY C1 fact name is pinnable -- not just the final revision. A pinned fact makes its
+# set_fact a no-op, so the fact then DISAGREES with the value recomputed inline here (the
+# inline filter calls are expressions, not variables, so they cannot be pinned). This closes
+# the narrow-desync class (a downstream fact pinned while the real resolver diverges):
+#   * _lme_resolution pinned  -> disagrees with the re-run of lme_resolve_config
+#   * lme_resolved / lme_enable_flags pinned -> disagree with _lme_resolution.*
+#   * lme_resolved_revision pinned -> disagrees with the re-run of lme_bind_revision
+# A wholesale pin of an upstream INPUT (e.g. the registry) changes every recompute
+# consistently AND the deploy that follows it, so it is not a silent desync and is out of
+# scope here. Runs on the supported path BEFORE any mutation (the site.yml / elasticsearch.yml
+# pre-mutation barriers include this file), so a pin fails closed pre-mutation.
+- name: Read-back guard -- reject an -e-pinned resolution / resolved config / revision (untamperable)
+  ansible.builtin.assert:
+    that:
+      - _lme_resolution == (_lme_global_file.lme_config_registry | lme_resolve_config((_lme_profile_file.profile_overlay.vars | default({})), _lme_eff_inputs.selections, _lme_eff_inputs.observations, _lme_eff_inputs.origins))
+      - lme_resolved == _lme_resolution.resolved
+      - lme_enable_flags == _lme_resolution.enable_flags
+      - >-
+        lme_resolved_revision == (_lme_resolution.resolved | lme_bind_revision(
+           _lme_global_file.lme_config_registry,
+           [{'name': lme_profile,
+             'sha256': lookup('file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | hash('sha256')}]))
+    fail_msg: >-
+      a resolver output fact (resolution, resolved config, enable flags or config revision) was
+      pre-supplied / -e-pinned and disagrees with its freshly recomputed value -- the canonical
+      derived artifact and its revision inputs must not be overridden by external state
+      (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
+    quiet: true
 
 # OPEN DEBT (codex resolution_lifetime -- explicitly transitional, removed as consumer
 # migrations land; no parallel legacy backend at acceptance): materialize the resolved
