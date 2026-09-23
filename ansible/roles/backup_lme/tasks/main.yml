@@ -556,21 +556,56 @@
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
     VOLUME_PATH=$(podman volume inspect {{ item }} --format "{{ '{{' }}.Mountpoint{{ '}}' }}")
     VOLUME_DIR="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes/{{ item }}"
-    
+
+    # Content manifest (durability integrity signal). Records file count + total
+    # bytes + a listing sha256 (covers relative paths and sizes, NOT file contents)
+    # computed from the SOURCE volume so a torn/partial backup copy can be detected
+    # at restore BEFORE any destructive volume removal -- existence/non-empty alone
+    # is insufficient because a partial data/ copy is still non-empty. LC_ALL=C keeps
+    # the sort order host-independent (cluster tarballs are restored on other hosts).
+    # Restore recomputes the identical values over the backup data/ dir and fails
+    # closed on mismatch. Written only in the SUCCESS/EMPTY branches: a FAILED copy is left
+    # with no manifest so restore refuses it.
+    write_content_manifest() {
+      local src="$1" out="$2"
+      local fc tb sha
+      fc=$(cd "$src" 2>/dev/null && find . -type f 2>/dev/null | wc -l | tr -d ' ')
+      tb=$(cd "$src" 2>/dev/null && find . -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+      sha=$(cd "$src" 2>/dev/null && find . -type f -printf '%P\t%s\n' 2>/dev/null | LC_ALL=C sort | sha256sum | awk '{print $1}')
+      {
+        echo "file_count=${fc:-0}"
+        echo "total_bytes=${tb:-0}"
+        echo "listing_sha256=${sha:-}"
+      } > "$out"
+    }
+
     # Create volume backup directory
     mkdir -p "$VOLUME_DIR"
-    
+
+    # Fail-closed: a real podman volume always resolves to a mountpoint directory.
+    # An empty/unresolved mountpoint means `podman volume inspect` failed -- do NOT let
+    # it fall through to the EMPTY branch, where it would be certified (0 files / 0 bytes
+    # manifest + EMPTY status) as a legitimately empty backup and later authorize
+    # destroying+recreating the live volume as empty at restore.
+    if [ -z "$VOLUME_PATH" ] || [ ! -d "$VOLUME_PATH" ]; then
+      echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+      echo "Failed to resolve mountpoint for volume {{ item }} (got '$VOLUME_PATH'); no manifest written"
+      exit 1
+    fi
+
     # Create a manifest of the volume contents
     echo "Volume: {{ item }}" > "$VOLUME_DIR/manifest.txt"
     echo "Location: $VOLUME_PATH" >> "$VOLUME_DIR/manifest.txt"
     echo "Backup Date: $(date)" >> "$VOLUME_DIR/manifest.txt"
     echo -e "\nContents:" >> "$VOLUME_DIR/manifest.txt"
     find "$VOLUME_PATH" -type f -o -type d | sort >> "$VOLUME_DIR/manifest.txt"
-    
+
     # Copy the volume contents
-    if [ -d "$VOLUME_PATH" ] && [ "$(ls -A $VOLUME_PATH)" ]; then
+    if [ -d "$VOLUME_PATH" ] && [ "$(ls -A "$VOLUME_PATH")" ]; then
       {{ cp_preserve_cmd }} "$VOLUME_PATH/." "$VOLUME_DIR/data/"
       if [ $? -eq 0 ]; then
+        # Fingerprint the SOURCE so a silently-torn copy is caught at restore.
+        write_content_manifest "$VOLUME_PATH" "$VOLUME_DIR/content_manifest.txt"
         echo "SUCCESS" > "$VOLUME_DIR/backup_status.txt"
         echo "Volume {{ item }} backed up successfully"
         exit 0
@@ -583,6 +618,9 @@
       echo "EMPTY" > "$VOLUME_DIR/backup_status.txt"
       echo "Volume {{ item }} is empty, creating empty data directory"
       mkdir -p "$VOLUME_DIR/data"
+      # Empty volume: manifest over the (empty) data dir records 0 files / 0 bytes,
+      # so restore verifies "expected empty" instead of treating empty as torn.
+      write_content_manifest "$VOLUME_DIR/data" "$VOLUME_DIR/content_manifest.txt"
       exit 0
     fi
   args:
