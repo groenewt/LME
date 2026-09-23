@@ -36,6 +36,11 @@
   hosts: elasticsearch
   gather_facts: false
   become: false
+  # Pin the LINEAR strategy so any_errors_fatal is guaranteed effective. Under the `free`
+  # strategy Ansible warns any_errors_fatal is unsupported and a failing host does not
+  # abort its peers, which would defeat this pre-mutation gate on a site that sets a
+  # non-default strategy globally (codex E-PREFLIGHT-STRATEGY-QUALIFICATION).
+  strategy: linear
   # Abort the WHOLE play the moment ANY targeted host errors (matches site.yml's block),
   # so no host advances to the bootstrap/deploy plays on a partial validation. The run_once
   # completeness assert below is the defense-in-depth backstop for a host dropped WITHOUT a
@@ -98,22 +103,30 @@
           # already aborts; this also catches a host removed for another reason) ...
           - (ansible_play_hosts_all | difference(ansible_play_hosts)) | length == 0
           # ... and EVERY surviving targeted host recorded evidence bound to THIS run's token
-          # AND to THIS run's resolved revision. A missing fact yields {} (version-safe
-          # extract), which fails the `token defined` test and drops the count below the
-          # target size -> fail_msg. A stale/foreign fact fails the token/revision equality.
+          # AND carrying a resolved revision. COMPLETENESS SCOPE (deliberate): the token
+          # (minted run_once, guarded against pre-supply) proves every host ran THIS
+          # invocation; `revision defined` proves each host actually completed resolve+validate
+          # (a host that errored has no fact -> {} -> fails `token defined` -> count drops).
+          # It does NOT require every host's revision to be EQUAL: two legitimately
+          # heterogeneous hosts (per-host host_vars feeding config fields) resolve DIFFERENT
+          # valid revisions, and coupling completeness to cross-host revision uniformity would
+          # reject them even though all validated (codex E-PREFLIGHT-HETEROGENEOUS-REVISION-
+          # REJECTION). Each host's OWN revision is still bound to ITS OWN deploy by the
+          # per-host parity gate in the Deploy play (barrier.revision == that host's deploy
+          # revision). Cross-host config-revision UNIFORMITY, if LME ever requires it, is a
+          # separate C1-owned resolver policy, not this completeness barrier's job.
           - >-
             (ansible_play_hosts | map('extract', hostvars)
              | map(attribute='_lme_es_prevalidated', default={})
              | selectattr('token', 'defined')
              | selectattr('token', 'equalto', _lme_es_barrier_run_token)
              | selectattr('revision', 'defined')
-             | selectattr('revision', 'equalto', lme_resolved_revision)
              | list | length) == (ansible_play_hosts | length)
         fail_msg: >-
           pre-mutation validation did not succeed on every targeted Elasticsearch host for THIS
-          invocation (token {{ _lme_es_barrier_run_token }}, revision {{ lme_resolved_revision }};
-          failed/removed: {{ ansible_play_hosts_all | difference(ansible_play_hosts) }}). No host
-          proceeds into the bootstrap/deploy plays until the COMPLETE target set validates this run.
+          invocation (token {{ _lme_es_barrier_run_token }}; failed/removed:
+          {{ ansible_play_hosts_all | difference(ansible_play_hosts) }}). No host proceeds into
+          the bootstrap/deploy plays until the COMPLETE target set validates this run.
         quiet: true
       run_once: true
       tags: ['always']
@@ -141,6 +154,14 @@
 - name: Deploy Elasticsearch
   hosts: elasticsearch
   become: yes
+  # Make the Deploy-play PARITY GATE (pre_tasks below) an ALL-HOST pre-mutation stop:
+  # any_errors_fatal aborts every host the moment one host's parity assert fails, so a
+  # peer whose config revision drifted between the barrier play and deploy cannot fail
+  # locally while another host proceeds into the mutating role (codex
+  # E-PREFLIGHT-DRIFT-AFTER-BOOTSTRAP-PEER-CONTINUES). strategy:linear guarantees
+  # any_errors_fatal is honored (see the barrier play).
+  any_errors_fatal: true
+  strategy: linear
   vars:
     # Common variables (same as site.yml)
     clone_directory: *lme_clone_directory   # shared with the barrier play (one source)
