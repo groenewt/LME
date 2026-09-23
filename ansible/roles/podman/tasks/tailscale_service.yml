@@ -569,7 +569,36 @@
       LIVE (allocated, resolves): {{ ts_live_vips | default([]) }} ;
       DEAD (published but NO Self.CapMap["services/<name>"] -> not policy-defined/approved,
       will NOT resolve): {{ ts_dead_vips | default([]) }}
-  when: ts_svc_targets | length > 0
+  # Gate on a SUCCESSFUL status read -- the SAME rc==0 + non-empty-stdout clauses the
+  # Derive task uses. Without them, a FAILED post-publish read in warn mode (require off)
+  # leaves ts_live_vips/ts_dead_vips UNDEFINED, and `| default([])` would print an
+  # affirmative "LIVE: [] ; DEAD: []" all-clear for a check that never ran (a false-green;
+  # CLAUDE.md: hostile rejection of false success). Under enforcement a failed read has
+  # already hard-failed at the Fail task above, so this only tightens the warn path.
+  when:
+    - ts_svc_targets | length > 0
+    - (ts_status_post.rc | default(1)) == 0
+    - (ts_status_post.stdout | default('')) | length > 0
+
+# Honest signal for the one remaining hole: status read FAILED and enforcement is OFF.
+# The Derive+Report above are now gated on a good read, and the enforce Fail task only
+# fires when require_vip_live is true -- so a failed warn-mode read would otherwise emit
+# NO liveness output at all. Emit an explicit UNKNOWN so an unverifiable read is never
+# silently taken as an all-clear.
+- name: Report tailnet VIP liveness UNKNOWN (status read failed, enforcement disabled)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: post-publish `tailscale status --json` failed
+      (rc={{ ts_status_post.rc | default('n/a') }},
+      stdout_len={{ (ts_status_post.stdout | default('')) | length }}), so tailnet VIP
+      liveness could NOT be determined for
+      {{ ts_svc_targets | map(attribute='service') | list }}. This is a warning because
+      tailscale_require_vip_live is false; set it true to make an unverifiable liveness
+      read a hard failure.
+  when:
+    - ts_svc_targets | length > 0
+    - not (tailscale_require_vip_live | default(false) | bool)
+    - (ts_status_post.rc | default(1)) != 0 or (ts_status_post.stdout | default('')) | length == 0
 
 - name: Fail loud on DEAD tailnet VIPs (liveness enforced)
   ansible.builtin.fail:
