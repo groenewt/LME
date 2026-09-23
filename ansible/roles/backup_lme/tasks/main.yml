@@ -184,7 +184,7 @@
     mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/etc_containers_systemd"
     mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/etc_systemd_system_lme"
     mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/secrets"
-    mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes"
+    mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.volume_layout.root_dir }}"
     
     # Copy the LME installation
     {{ cp_preserve_cmd }} "{{ lme_install_dir }}/." "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/lme/"
@@ -582,7 +582,10 @@
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
     {{ lme_integrity_lib }}
     VOLUME_PATH=$(podman volume inspect {{ item }} --format "{{ '{{' }}.Mountpoint{{ '}}' }}")
-    VOLUME_DIR="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes/{{ item }}"
+    # $LME_VOLUME_ROOT/$LME_VOLUME_DATA_DIR/$LME_VOLUME_MANIFEST_FILE come from the sourced
+    # library (single source = vars/integrity.yml volume_layout), so the producer path and
+    # the restore/verify path can never drift and a name change relocates both.
+    VOLUME_DIR="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/$LME_VOLUME_ROOT/{{ item }}"
 
     # Content manifest + torn-copy guard are provided by the shared rendered library
     # (lme_write_content_manifest / lme_finalize_volume_backup) so the producer and the
@@ -612,8 +615,24 @@
     echo -e "\nContents:" >> "$VOLUME_DIR/manifest.txt"
     find "$VOLUME_PATH" -type f -o -type d | sort >> "$VOLUME_DIR/manifest.txt"
 
+    # Distinguish a GENUINELY EMPTY source from a FAILED inspection: `[ "$(ls -A)" ]`
+    # alone treats an unreadable mountpoint (ls error, empty stdout) as empty and would
+    # certify an empty backup for a volume that actually has unreadable data. Capture the
+    # ls rc and fail closed on a non-zero enumeration.
+    SRC_ENTRIES="$(ls -A "$VOLUME_PATH" 2>/dev/null)"; LS_RC=$?
+    if [ "$LS_RC" -ne 0 ]; then
+      echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+      echo "Failed to enumerate volume {{ item }} mountpoint $VOLUME_PATH (ls rc=$LS_RC); no manifest written" >&2
+      exit 1
+    fi
+
     # Copy the volume contents
-    if [ -d "$VOLUME_PATH" ] && [ "$(ls -A "$VOLUME_PATH")" ]; then
+    if [ -n "$SRC_ENTRIES" ]; then
+      # Clear any pre-existing data/ from a reused backup dir FIRST so cp writes a fresh
+      # copy of the CURRENT source (cp -a merges into an existing tree, which would let
+      # prior-generation since-deleted files survive and be certified as current).
+      rm -rf "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
+      mkdir -p "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
       {{ cp_preserve_cmd }} "$VOLUME_PATH/." "$VOLUME_DIR/$LME_VOLUME_DATA_DIR/"
       if [ $? -eq 0 ]; then
         # Write the SOURCE manifest and FAIL the volume (no manifest -> restore refuses)
@@ -637,6 +656,9 @@
     else
       echo "EMPTY" > "$VOLUME_DIR/backup_status.txt"
       echo "Volume {{ item }} is empty, creating empty data directory"
+      # Clear any retained data from a reused backup dir so the empty manifest never
+      # certifies STALE payload from a prior generation as a successful empty backup.
+      rm -rf "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
       mkdir -p "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
       # Empty volume: manifest over the (empty) data dir records 0 files / 0 bytes,
       # so restore verifies expected-empty instead of treating empty as torn. Fail the
@@ -660,7 +682,7 @@
 
 - name: Collect volume backup statuses
   shell: |
-    find "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes" -name "backup_status.txt" -exec cat {} \; | grep -c -E "(SUCCESS|EMPTY)" || echo "0"
+    find "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.volume_layout.root_dir }}" -name "backup_status.txt" -exec cat {} \; | grep -c -E "(SUCCESS|EMPTY)" || echo "0"
   args:
     executable: /bin/bash
   register: successful_volumes
@@ -676,7 +698,7 @@
 
 - name: Find volumes that were empty during backup
   shell: |
-    find "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes" -name "backup_status.txt" -exec grep -l "EMPTY" {} \; | xargs -I {} dirname {} | xargs -I {} basename {}
+    find "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.volume_layout.root_dir }}" -name "backup_status.txt" -exec grep -l "EMPTY" {} \; | xargs -I {} dirname {} | xargs -I {} basename {}
   args:
     executable: /bin/bash
   register: empty_volumes

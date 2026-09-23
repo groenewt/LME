@@ -29,13 +29,24 @@
      lme_bundle_verify  <root>            fail-closed verify (COMPLETE, pre-mutation)
 ========================================================================= -#}
 {%- macro lme_integrity_library(bi) -%}
-{%- set vol = (bi.payload_classes | selectattr('kind','equalto','volume_data') | list | first) -%}
 # --- rendered from lme_backup_integrity (schema {{ bi.schema }}) ---
 LME_BUNDLE_CERT_FILE="{{ bi.certification.bundle_file }}"
 LME_BUNDLE_SELF_FIELD="{{ bi.certification.self_digest_field }}"
-LME_VOLUME_ROOT="{{ vol.path if vol else 'volumes' }}"
+LME_VOLUME_ROOT="{{ bi.volume_layout.root_dir }}"
 LME_VOLUME_DATA_DIR="{{ bi.volume_layout.data_dir }}"
 LME_VOLUME_MANIFEST_FILE="{{ bi.volume_layout.manifest_file }}"
+# Fail-closed on an under-declared contract: a missing volume_layout key would render
+# to an empty string (plain jinja2 emits "" for a missing attribute), turning
+# "$root/$LME_VOLUME_ROOT" into "$root/" (every payload tree read as an uncertified
+# volume, rc8) and, worse, "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" into "$VOLUME_DIR/" for a
+# become:yes rm -rf. `:?` aborts the sourcing shell (non-interactive bash exits on an
+# unset/null :? expansion even without set -e), so an incomplete declaration can never
+# produce a path that resolves to a parent directory.
+: "${LME_BUNDLE_CERT_FILE:?content_integrity: certification.bundle_file missing from declaration}" \
+  "${LME_BUNDLE_SELF_FIELD:?content_integrity: certification.self_digest_field missing from declaration}" \
+  "${LME_VOLUME_ROOT:?content_integrity: volume_layout.root_dir missing from declaration}" \
+  "${LME_VOLUME_DATA_DIR:?content_integrity: volume_layout.data_dir missing from declaration}" \
+  "${LME_VOLUME_MANIFEST_FILE:?content_integrity: volume_layout.manifest_file missing from declaration}"
 
 lme_tree_payloads=()
 lme_file_payloads=()
@@ -197,7 +208,12 @@ lme_bundle_certify() {
   done
 
   # Volume payloads: bind each volume's already-produced content_manifest content_sha256.
+  # Capture the enumeration rc (a find on volumes/ inside <(...) would let an unreadable
+  # dir silently omit volumes; podman volume names carry no newline so line-reading is safe).
   if [ -d "$root/$LME_VOLUME_ROOT" ]; then
+    local cert_voldirs
+    cert_voldirs="$(find "$root/$LME_VOLUME_ROOT" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)" \
+      || { echo "CERTIFY-REFUSED: cannot enumerate $root/$LME_VOLUME_ROOT" >&2; rm -f "$tmp"; return 1; }
     while IFS= read -r vdir; do
       [ -n "$vdir" ] || continue
       vname="$(basename "$vdir")"
@@ -220,7 +236,7 @@ lme_bundle_certify() {
         rm -f "$tmp"; return 1
       fi
       echo "payload=volume:$vname|kind=volume_data|content_sha256=$vsha" >> "$tmp" || { rm -f "$tmp"; return 1; }
-    done < <(find "$root/$LME_VOLUME_ROOT" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+    done <<< "$cert_voldirs"
   fi
 
   local self
@@ -228,9 +244,13 @@ lme_bundle_certify() {
   echo "$LME_BUNDLE_SELF_FIELD=$self" >> "$tmp" || { rm -f "$tmp"; return 1; }
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$cert" || { rm -f "$tmp"; echo "CERTIFY-REFUSED: publication mv failed for $cert" >&2; return 1; }
-  # Verify the COMMITTED artifact before reporting certification (no false success).
+  # Verify the COMMITTED artifact before reporting certification (no false success). If
+  # the just-published certificate does NOT verify, REMOVE it -- never leave an
+  # unverifiable certificate installed (an absent cert -> restore refuses rc3, which is
+  # the safe state; a bad-but-present cert is a worse footgun).
   if ! lme_bundle_verify "$root" >/dev/null; then
-    echo "CERTIFY-REFUSED: post-publication verification failed for $cert" >&2
+    rm -f "$cert"
+    echo "CERTIFY-REFUSED: post-publication verification failed for $cert (certificate removed)" >&2
     return 1
   fi
   echo "Bundle certified: $cert ($LME_BUNDLE_SELF_FIELD=$self)"
@@ -332,15 +352,20 @@ lme_bundle_verify() {
   done < <(grep -E '^payload=volume:' "$cert" || true)
 
   if [ -d "$vroot" ]; then
+    local ondisk_voldirs
+    ondisk_voldirs="$(find "$vroot" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)" \
+      || { echo "VERIFY-REFUSED(2): cannot enumerate $vroot" >&2; return 2; }
     while IFS= read -r d; do
       [ -n "$d" ] || continue
-      [ -d "$d/$LME_VOLUME_DATA_DIR" ] || continue
       dn="$(basename "$d")"
+      # Do NOT skip a dir that lacks data/: an on-disk volume dir that is not certified
+      # is an extra/undeclared member (a retained/injected volumes/<name> without data/
+      # would otherwise sneak past the gate and be discovered only after install copying).
       case "$seen" in
         *" $dn "*) ;;
-        *) echo "VERIFY-REFUSED(8): on-disk volume '$dn' is not in the certification (extra/undeclared member)." >&2; return 8;;
+        *) echo "VERIFY-REFUSED(8): on-disk volume '$dn' is not in the certification (extra/undeclared or incomplete member)." >&2; return 8;;
       esac
-    done < <(find "$vroot" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+    done <<< "$ondisk_voldirs"
   fi
 
   echo "Bundle certification OK: $cert"
