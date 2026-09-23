@@ -43,7 +43,15 @@
       logged in to the tailnet before enabling the egress leg.
   when: ts_cli.rc != 0
 
-# GUARD 2 (only-when-logged-in): mirror the ingress file's login check.
+# GUARD 2 (only-when-logged-in): `tailscale status --json` returns rc 0 whenever
+# tailscaled is reachable -- INCLUDING when the node is logged out (BackendState
+# "NeedsLogin"/"Stopped"): the --json branch prints and exits 0; only the human
+# output returns non-zero "Logged out." So rc alone does NOT prove the node is on
+# the tailnet -- also require BackendState == "Running" (mirrors ts_backend_running
+# in tailscale_install.yml). Unlike the ingress/service legs -- whose `tailscale
+# serve` calls hard-fail on a logged-out node -- `tailscale set --accept-routes`
+# below SUCCEEDS while logged out, so an rc-only guard would falsely report egress
+# as configured on a node that is not actually on the tailnet.
 - name: Read current tailscale node status
   ansible.builtin.command: tailscale status --json
   register: ts_status
@@ -51,13 +59,16 @@
   failed_when: false
   become: true
 
-- name: Fail clearly if tailscale is not logged in to the tailnet
+- name: Fail clearly if tailscale is not logged in / Running on the tailnet
   ansible.builtin.fail:
     msg: >-
-      tailscale_serve_egress is enabled but `tailscale status` failed
-      (rc={{ ts_status.rc }}). Ensure tailscaled is running and this node is
-      logged in to the tailnet.
-  when: ts_status.rc != 0
+      tailscale_serve_egress is enabled but this node is not Running on the
+      tailnet (rc={{ ts_status.rc }}). Ensure tailscaled is running and this
+      node is logged in (BackendState "Running") before enabling the egress leg.
+  when: >-
+    ts_status.rc != 0
+    or (('"BackendState": "Running"' not in (ts_status.stdout | default('')))
+        and ('"BackendState":"Running"' not in (ts_status.stdout | default(''))))
 
 # Read the daemon preferences once, so every `tailscale set` below is gated on the
 # CURRENT value rather than run blindly. RouteAll is the daemon field behind
@@ -84,7 +95,11 @@
 # exit-node: OPTIONAL. Only acts when an operator names an exit node; otherwise the
 # host keeps its direct egress. --exit-node-allow-lan-access keeps the host's own
 # LAN reachable while its internet egress goes via the exit node. Gated on the
-# named node not already being present in the current prefs.
+# named node not already being present in the current prefs, matched as a QUOTED
+# JSON value: a bare substring makes '100.64.0.1' match an already-set
+# '100.64.0.10' (prefix collision) and wrongly SKIP a real exit-node change,
+# leaving egress on the stale node. (A hostname/MagicDNS exit node is stored as
+# ExitNodeID, so it is re-applied each run -- an idempotent no-op, not a misroute.)
 - name: Route host egress through a tailnet exit node (opt-in)
   ansible.builtin.command: >-
     tailscale set
@@ -93,7 +108,7 @@
   when:
     - tailscale_exit_node is defined
     - (tailscale_exit_node | default('') | string | length) > 0
-    - (tailscale_exit_node | string) not in (ts_prefs.stdout | default(''))
+    - ('"' ~ (tailscale_exit_node | string) ~ '"') not in (ts_prefs.stdout | default(''))
   changed_when: true
   become: true
 
