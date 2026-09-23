@@ -7,10 +7,21 @@
 # deploy. Before this file existed the manifest mounted a NON-existent config, so enabling
 # install_otel could never start the collector; this is the missing real config.
 #
-# DURABILITY (do not weaken): every exporter uses a persistent file_storage-backed
-# sending_queue plus retry_on_failure, so OTLP data survives a collector or Elasticsearch
-# restart and is redelivered rather than dropped. The queue lives on the mounted rw volume
-# /var/lib/lme-telemetry (host /data/lme/telemetry, declared in the manifest).
+# DURABILITY (bounded -- do not overclaim): the exporter's persistent file_storage-backed
+# sending_queue plus retry_on_failure makes data DURABLE ONCE ENQUEUED -- items already in the
+# queue survive a collector or Elasticsearch restart and are redelivered on recovery (queue on the
+# mounted rw volume /var/lib/lme-telemetry, host /data/lme/telemetry). It is NOT end-to-end
+# lossless, per the collector resiliency docs:
+#   * the `batch` processor ahead of the queue holds items in memory and returns success to the
+#     receiver BEFORE export (upstream OTLP is acked on receipt, not on ES admission), so a crash
+#     loses batched-but-not-yet-enqueued data;
+#   * block_on_overflow is false below, so a full queue or a storage I/O error DROPS rather than
+#     blocks;
+#   * the exporter acks on ENQUEUE, not on the Elasticsearch bulk admission that Codex's delivery
+#     qualification asks for.
+# For end-to-end durability, move batching into the queue (sending_queue.batch) so it runs AFTER
+# persistence. That key is version-sensitive against the pinned digest and is an OPEN qualification
+# item (see the E milestone / contract request).
 #
 # AUTH (do not weaken to superuser): delivery uses a SCOPED, write-only Elasticsearch API
 # key read from /run/secrets/otel-elastic-api-key -- NOT the `elastic` superuser that the
