@@ -269,6 +269,13 @@
       if [ -e "$legacy_parent/guardian/guardian.pub" ] || [ -e "$legacy_parent/pki" ] || [ -e "$legacy_parent/secrets" ]; then
         receipt refuse "" legacy-unprefixed-material-route-adoption-through-B-ledger; echo "REFUSE legacy-unprefixed" >&2; exit 9; fi
 
+      # NB on epochs: D b7c60cd confirms rotation is EXPLICIT + bumps authority_epoch (a prior-epoch
+      # blob is refused), but NOT that ONLY rotation advances the epoch. If the LEASED authority epoch
+      # advances on failover independently of a key rotation, every advance would strand this
+      # epoch-bound durable at exit 27 (durable-not-decryptable-at-epoch). The leased-epoch vs
+      # ciphertext-wrapping-epoch distinction is the OPEN, viability-blocking joint C/D reconcile
+      # (see the C sitrep); guard (0b) below assumes the two coincide until that reconcile lands.
+      #
       # (0b) DEGRADE a stale ROTATE=true to convergence when the target-epoch identity is
       # ALREADY sealed in the durable (codex-0815 re-review C-CUSTODY reboot re-mint): if the
       # durable already decrypts at the current epoch to a valid key, this is NOT a fresh
@@ -277,10 +284,10 @@
       # still requires EXPECTED_FP to install from the durable, and NEVER mints over it. A
       # genuine rotation (target epoch not yet sealed) leaves ROTATE=true untouched. The ORIGINAL
       # request is retained in ROTATE_REQ so branch (1) can still REFUSE a same-epoch rotation
-      # REQUEST against a fully-converged epoch rather than swallow it as a silent noop
-      # (codex-0845 C-CUSTODY-ROTATION-REQUEST-NOT-DISTINGUISHED). NB: epoch-bound-durable design
-      # is D-CONFIRMED in b7c60cd (rotation is explicit + bumps authority_epoch, prior-epoch blob
-      # refused); the leased-vs-wrapping-epoch distinction is a joint C/D reconcile (see sitrep).
+      # REQUEST against a fully-converged epoch rather than swallow it as a silent noop. NB: this is
+      # an INTERIM distinguisher -- it only fires when the tmpfs runtime survived (branch 1); after a
+      # reboot the same unbumped request RECOVERS via (2). A complete distinguisher needs an
+      # operation record + the joint C/D semantics (codex-0845/0900 C-CUSTODY-ROTATION-REQUEST-NOT-DISTINGUISHED).
       ROTATE_REQ="$ROTATE"
       if [ "$ROTATE" = "true" ] && [ -f "$DURABLE" ] && try_decrypt "$EPOCH" "$work/rotchk"; then
         ROTATE=false; fi
@@ -366,6 +373,21 @@
         # handled EARLIER: guard (0b) degrades ROTATE=true to convergence when the target-epoch
         # identity already decrypts, so this branch runs only for a genuine, not-yet-sealed bump.)
         if [ -f "$MARKER" ]; then mepoch="$(sed -n 's/^epoch=//p' "$MARKER")"; [ "$mepoch" != "$EPOCH" ] || { receipt refuse "" rotate-epoch-not-bumped; echo "REFUSE rotate-same-epoch" >&2; exit 13; }; fi
+        # (codex-0900 C-CUSTODY-DECRYPTION-FAILURE-ALLOWS-REPLACEMENT) rotation REPLACES custody by
+        # minting a new identity and re-binding the durable; it must NOT do so over a prior it cannot
+        # prove is a verified RECOVERABLE state. Otherwise a decryption failure (wrong wrapping material,
+        # a corrupt current-epoch blob, or -- after a reboot -- a missing prior-epoch witness) would
+        # silently GRANT replacement and DESTROY the unresolved ciphertext. The verified-pair marker is
+        # the prior-epoch witness: require it, require the durable to decrypt AT THE MARKER'S (prior)
+        # epoch to the MARKER'S fp, and require expect_ok on that fp. A refusal WRITES NOTHING, so the
+        # prior ciphertext + recovery evidence are preserved. Fail-closed is C-ONLY (uses the marker we
+        # already hold); after a reboot the tmpfs marker is gone -> RECOVER the prior identity FIRST,
+        # then rotate. Only ISSUING the authorized from->to transition stays joint C/D (b7c60cd).
+        [ -f "$MARKER" ] || { receipt refuse "" rotate-requires-verified-recoverable-prior; echo "REFUSE rotate-no-prior-witness" >&2; exit 32; }
+        pmepoch="$(sed -n 's/^epoch=//p' "$MARKER")"; pmfp="$(sed -n 's/^fingerprint=//p' "$MARKER")"
+        if ! try_decrypt "$pmepoch" "$work/prior.key" || [ "$(fp_of_priv "$work/prior.key" 2>/dev/null || true)" != "$pmfp" ]; then
+          receipt refuse "$pmfp" rotate-prior-not-recoverable-preserve-ciphertext; echo "REFUSE rotate-prior-unrecoverable" >&2; exit 32; fi
+        expect_ok "$pmfp" || { receipt refuse "$pmfp" rotate-prior-fp-not-expected; echo "REFUSE rotate-prior-expected" >&2; exit 32; }
         slot="${RUNTIME_KEY}.epoch-${EPOCH}"
         openssl genpkey -algorithm ED25519 -out "$work/new.key" 2>/dev/null
         newfp="$(fp_of_priv "$work/new.key")"
