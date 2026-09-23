@@ -227,3 +227,96 @@ def test_validate_raises_on_missing_required():
     with pytest.raises(ValueError) as ei:
         validate(REGISTRY, bad)
     assert "missing from resolved" in str(ei.value)
+
+
+# --- durable regressions for the audit findings (Codex re-audit; pure-engine tier) ----
+# The integration-tier equivalents live in G's loader_integration suite; these are the
+# unit-tier pure-function guards so the findings cannot silently regress in the engine.
+
+def test_reversed_validate_args_fail_closed():
+    """A1 / C1-VALIDATE-CALL: the Jinja pipe `resolved | lme_validate_config(registry)`
+    reverses to lme_validate_config(resolved, registry) -- registry bound to the resolved
+    dict. A resolved dict has no `fields`, so the registry-shape gate RAISES rather than
+    passing silently. Fail-closed by construction, not merely by argument order."""
+    resolved = R("default")["resolved"]
+    with pytest.raises(ValueError) as ei:
+        validate(resolved, REGISTRY)  # arguments reversed on purpose
+    assert "no fields" in str(ei.value)
+
+
+def test_reordered_precedence_changes_selection():
+    """A2: the engine READS registry.precedence -- it is not a hardcoded ladder. With a
+    field carrying both a profile value and an observation, whichever tier is DECLARED
+    first wins. `default` stays last (shape-gate requirement)."""
+    fields = {"flag": {"type": "bool", "required": True, "nullable": False,
+                       "default": False, "upgrade_fallback": True}}
+    ch = {"profile": REGISTRY["channels"]["profile"],
+          "observation": REGISTRY["channels"]["observation"],
+          "default": REGISTRY["channels"]["default"]}
+    reg_pf = {"precedence": ["profile", "observation", "default"], "channels": ch, "fields": fields}
+    r = resolve(reg_pf, {"flag": False}, {}, {"flag": True})
+    assert r["resolved"]["flag"] is False and r["origins"]["flag"] == "profile"
+    reg_ob = {"precedence": ["observation", "profile", "default"], "channels": ch, "fields": fields}
+    r2 = resolve(reg_ob, {"flag": False}, {}, {"flag": True})
+    assert r2["resolved"]["flag"] is True and r2["origins"]["flag"] == "observation"
+
+
+def test_extended_types_preserve_declared_zero_values():
+    """A4 / RC-OPEN-6: int / list / map / nullable coverage. A declared 0 / [] / {} /
+    None is a real value, preserved by resolve and accepted canonical by validate; an
+    explicit non-zero selection is preserved and type-checked."""
+    reg = {"precedence": REGISTRY["precedence"], "channels": REGISTRY["channels"],
+           "fields": {
+               "count": {"type": "int", "required": True, "nullable": False, "default": 0},
+               "items": {"type": "list", "required": True, "nullable": False, "default": []},
+               "cfg":   {"type": "map", "required": True, "nullable": False, "default": {}},
+               "maybe": {"type": "str", "required": True, "nullable": True, "default": None}}}
+    r = resolve(reg, {})["resolved"]
+    assert r["count"] == 0 and r["items"] == [] and r["cfg"] == {} and r["maybe"] is None
+    assert validate(reg, r) is r
+    r2 = resolve(reg, {}, {"count": 5, "items": ["a"], "cfg": {"k": "v"}, "maybe": "x"})["resolved"]
+    assert r2 == {"count": 5, "items": ["a"], "cfg": {"k": "v"}, "maybe": "x"}
+
+
+def test_int_field_rejects_bool():
+    """A4: a bool is NOT an int -- an int field handed True must raise, not coerce to 1."""
+    reg = {"precedence": REGISTRY["precedence"], "channels": REGISTRY["channels"],
+           "fields": {"count": {"type": "int", "required": True, "nullable": False, "default": 0}}}
+    with pytest.raises(ValueError):
+        resolve(reg, {}, {"count": True})
+
+
+def test_caller_origin_lie_discarded_for_honest_operator():
+    """A5: a caller `origins` map claiming `default` for a value it SELECTED is a lie;
+    the engine discards it and records the honest combined `operator`, never `default`.
+    A truthful finer origin (extra_var / inventory) IS preserved."""
+    r = R("default", selections={"install_llm": False}, origins={"install_llm": "default"})
+    assert r["resolved"]["install_llm"] is False
+    assert r["origins"]["install_llm"] == "operator"
+    r2 = R("default", selections={"install_llm": False}, origins={"install_llm": "inventory"})
+    assert r2["origins"]["install_llm"] == "inventory"
+
+
+def test_validate_rejects_non_mapping_resolved_even_all_optional():
+    """C1-OPTIONAL-NONMAPPING: a non-mapping resolved input ([]/None/scalar) must be
+    rejected INDEPENDENTLY of whether any field is required -- it was silently coerced to
+    {} and 'validated' as empty when the registry had only optional fields."""
+    reg = {"precedence": REGISTRY["precedence"], "channels": REGISTRY["channels"],
+           "fields": {"maybe": {"type": "bool", "required": False, "nullable": False, "default": True}}}
+    for bad in ([], None, "x", 3):
+        with pytest.raises(ValueError) as ei:
+            validate(reg, bad)
+        assert "must be a mapping" in str(ei.value)
+
+
+def test_unsupported_type_rejected_even_when_nullable_null():
+    """C1-UNKNOWN-NULLABLE-TYPE: the schema (supported-type declaration) is validated by
+    the shape gate BEFORE any value, so a nullable field declaring an unsupported type can
+    no longer slip a null past resolve OR validate via the None short-circuit."""
+    reg = {"precedence": REGISTRY["precedence"], "channels": REGISTRY["channels"],
+           "fields": {"weird": {"type": "bogus", "required": False, "nullable": True}}}
+    with pytest.raises(ValueError) as ei:
+        resolve(reg, {}, {"weird": None})
+    assert "unsupported/absent type" in str(ei.value)
+    with pytest.raises(ValueError):
+        validate(reg, {"weird": None})
