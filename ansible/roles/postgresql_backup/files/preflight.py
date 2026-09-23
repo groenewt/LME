@@ -25,9 +25,21 @@ def reject_control_symlinks(root):
                 raise ValueError('unrecorded or unsafe backup configuration entry')
 
 
-def validate(run, capacity, reserve, expected_ip):
-    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,31}', run) or capacity != 100*1024**3:
-        raise ValueError('invalid run or capacity')
+def validate(run, capacity, reserve, expected_ip, min_capacity, owner, group, uid, gid, home, subid_start, subid_count, root_prefix):
+    # Declared policy is supplied by the caller (defaults reproduce the prior fixed
+    # values); validate its shape before it flows into paths, identity lookups and
+    # overlap arithmetic. Capacity is a HARD MINIMUM, not a fixed literal.
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,31}', run):
+        raise ValueError('invalid run identity')
+    if not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}[$]?', owner) or not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}[$]?', group):
+        raise ValueError('invalid backup owner or group identity')
+    if (not root_prefix.startswith('/') or not home.startswith('/')
+            or '..' in pathlib.PurePosixPath(root_prefix).parts
+            or str(pathlib.PurePosixPath(root_prefix)) != root_prefix
+            or root_prefix == '/' or '//' in root_prefix):
+        raise ValueError('invalid backup placement or home path')
+    if min_capacity <= 0 or capacity < min_capacity or reserve < 0 or uid < 0 or gid < 0 or subid_start < 0 or subid_count <= 0:
+        raise ValueError('invalid backup sizing or identity range')
     if os.geteuid() != 0:
         raise ValueError('physical preflight requires the scoped root installer')
     for executable in ('podman','fallocate','mkfs.ext4','systemctl','loginctl','tailscale','findmnt','losetup'):
@@ -35,34 +47,36 @@ def validate(run, capacity, reserve, expected_ip):
             raise ValueError('required backup runtime tool is absent: '+executable)
     addresses = subprocess.run(['tailscale','ip','-4'], check=True, capture_output=True, text=True).stdout.split()
     if addresses != [expected_ip]:
-        raise ValueError('physical host Tailscale identity does not match observed trixie')
-    for key in ('lmebackup', 2400):
+        raise ValueError('physical host Tailscale identity does not match the declared repository host')
+    for key in (owner, uid):
         try:
-            user = pwd.getpwnam(key) if isinstance(key,str) else pwd.getpwuid(key)
+            account = pwd.getpwnam(key) if isinstance(key,str) else pwd.getpwuid(key)
         except KeyError:
             continue
-        if (user.pw_name,user.pw_uid,user.pw_gid,user.pw_dir) != ('lmebackup',2400,2400,'/home/lmebackup'):
+        if (account.pw_name,account.pw_uid,account.pw_gid,account.pw_dir) != (owner,uid,gid,home):
             raise ValueError('backup account conflicts with an existing identity')
-    for key in ('lmebackup', 2400):
+    for key in (group, gid):
         try:
-            group = grp.getgrnam(key) if isinstance(key,str) else grp.getgrgid(key)
+            entry = grp.getgrnam(key) if isinstance(key,str) else grp.getgrgid(key)
         except KeyError:
             continue
-        if (group.gr_name,group.gr_gid) != ('lmebackup',2400):
+        if (entry.gr_name,entry.gr_gid) != (group,gid):
             raise ValueError('backup group conflicts with an existing identity')
     for filename in ('/etc/subuid','/etc/subgid'):
         for line in pathlib.Path(filename).read_text().splitlines():
             if not line.strip():
                 continue
-            owner, start, count = line.split(':')
+            entry_owner, start, count = line.split(':')
             start,count = int(start),int(count)
-            overlap = start < 20000000+65536 and start+count > 20000000
-            if owner == 'lmebackup' and (start,count) != (20000000,65536):
+            overlap = start < subid_start+subid_count and start+count > subid_start
+            if entry_owner == owner and (start,count) != (subid_start,subid_count):
                 raise ValueError('backup account has an incompatible subordinate mapping')
-            if overlap and owner != 'lmebackup':
+            if overlap and entry_owner != owner:
                 raise ValueError('backup subordinate range overlaps another identity')
-    root = pathlib.Path('/home/lme-backups') / run
-    for path in (pathlib.Path('/home'), root.parent, root):
+    root = pathlib.Path(root_prefix) / run
+    # Every ancestor of the run directory (up to /) must be root-owned and not a
+    # symlink, so an overridden prefix cannot smuggle a user-owned upper ancestor.
+    for path in (*reversed(root.parents), root):
         if path.is_symlink():
             raise ValueError('backup path contains a symlink')
         if path.exists() and path.stat().st_uid != 0:
@@ -74,7 +88,7 @@ def validate(run, capacity, reserve, expected_ip):
     if root.exists():
         if marker.is_symlink() or not marker.is_file():
             raise ValueError('existing run path has no ownership record')
-        if json.loads(marker.read_text()) != {'run_id':run,'capacity_bytes':capacity,'owner':'lmebackup'}:
+        if json.loads(marker.read_text()) != {'run_id':run,'capacity_bytes':capacity,'owner':owner}:
             raise ValueError('existing ownership record does not match this run')
         if set(p.name for p in root.iterdir()) - {'ownership.json','repository.img','config','data','image.oci.tar','runtime-identity.json','retired.json'}:
             raise ValueError('unrecorded files exist in the exact backup run directory')
@@ -99,14 +113,20 @@ def validate(run, capacity, reserve, expected_ip):
             raise ValueError('existing loop mount belongs to a different image')
     elif data.exists() and any(data.iterdir()):
         raise ValueError('unmounted target contains existing files')
-    available = shutil.disk_usage('/home').free
+    probe = root
+    while not probe.exists():
+        probe = probe.parent
+    available = shutil.disk_usage(str(probe)).free
     if available < reserve + (0 if image.exists() else capacity):
         raise ValueError('full backup commitment plus existing commitments and reserve do not fit')
 
 
 if __name__ == '__main__':
     try:
-        validate(sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),sys.argv[4])
+        validate(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4],
+                 int(sys.argv[5]), sys.argv[6], sys.argv[7],
+                 int(sys.argv[8]), int(sys.argv[9]), sys.argv[10],
+                 int(sys.argv[11]), int(sys.argv[12]), sys.argv[13])
     except (ValueError,OSError,KeyError,subprocess.SubprocessError) as error:
         print('Backup preflight rejected: '+str(error),file=sys.stderr)
         raise SystemExit(1)
