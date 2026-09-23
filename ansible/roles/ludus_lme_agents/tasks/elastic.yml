@@ -102,11 +102,16 @@
     - name: Gather service facts
       ansible.builtin.service_facts:
 
-    - name: Skip Elastic Agent installation if already running
-      ansible.builtin.meta: end_host
-      when:
-        - "'elastic-agent.service' in ansible_facts.services"
-        - ansible_facts.services['elastic-agent.service'].status == 'enabled'
+    # Scoped idempotency guard. Using `meta: end_host` here would end the whole
+    # play for this host, skipping the auditd block below AND the Wazuh agent
+    # include in main.yml -- which blocks re-runs and partial-failure recovery
+    # (e.g. Elastic installed but Wazuh failed). Gate only the fetch/extract
+    # tasks instead; the install task keeps its own `creates:` guard.
+    - name: Determine whether Elastic Agent is already installed and enabled
+      ansible.builtin.set_fact:
+        _elastic_agent_enabled: >-
+          {{ 'elastic-agent.service' in ansible_facts.services
+             and ansible_facts.services['elastic-agent.service'].status == 'enabled' }}
 
     - name: Download Elastic Agent tar.gz
       ansible.builtin.get_url:
@@ -115,12 +120,14 @@
         dest: "{{ ludus_lme_agents_linux_temp_dir }}/elastic-agent-{{ ludus_lme_agents_elastic_version }}-linux-{{ ludus_lme_agents_agent_arch }}.tar.gz"
         validate_certs: true
         mode: "0644"
+      when: not (_elastic_agent_enabled | bool)
 
     - name: Extract Elastic Agent tar.gz
       ansible.builtin.unarchive:
         src: "{{ ludus_lme_agents_linux_temp_dir }}/elastic-agent-{{ ludus_lme_agents_elastic_version }}-linux-{{ ludus_lme_agents_agent_arch }}.tar.gz"
         dest: "{{ ludus_lme_agents_linux_temp_dir }}"
         remote_src: true
+      when: not (_elastic_agent_enabled | bool)
 
     - name: Install Elastic Agent
       ansible.builtin.shell: |
@@ -148,15 +155,20 @@
         url: "{{ ludus_lme_agents_audit_rules_url }}"
         dest: /etc/audit/rules.d/audit.rules
         mode: "0644"
+      register: _audit_rules_download
 
+    # Only reload/restart when the rules actually changed, so re-runs are
+    # idempotent (augenrules and a restart otherwise fire on every run).
     - name: Load audit rules
       ansible.builtin.command: augenrules --load
       changed_when: false
+      when: _audit_rules_download is changed
 
     - name: Restart auditd service
       ansible.builtin.service:
         name: auditd
         state: restarted
+      when: _audit_rules_download is changed
 
 # ---------------------------------------------------------------------------
 # Windows: install Elastic Agent + Sysmon

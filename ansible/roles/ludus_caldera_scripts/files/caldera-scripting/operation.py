@@ -62,5 +62,4 @@ new_operation = {
 print("new operation config", new_operation)
 resp = requests.post("http://localhost:8888/api/v2/operations", headers={"KEY": api_key}, json=new_operation)
 
-print(f"Send request to create operation. Got back status code {
-      resp.status_code}")
+print(f"Send request to create operation. Got back status code {resp.status_code}")
