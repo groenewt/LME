@@ -499,24 +499,38 @@ codex_0845_recovery_audit_dispositions:
     open_part: >-
       A first-class backup GENERATION/REVISION identity + interrupted-operation state model (preserve
       prior valid backups, distinguish incomplete new work) is operational-provenance/ledger territory
-      -> routed to B. Also NOT closed: invalidating the stale certificate does NOT remove leftover files
-      from a prior run in a REUSED backup dir (cp -a merges into existing trees; a prior volumes/<Y>/ or
-      source-since-deleted files persist), so certification could bless mixed-generation content in a
-      reused dir. This needs the generation/revision model (fresh dir per generation) -> routed to B.
+      -> routed to B. PARTIALLY narrowed this wave (codex-0915 D-BACKUP-EMPTY-RETRY-CERTIFIES-STALE-DATA):
+      the producer now `rm -rf` clears each volume's data/ BEFORE cp (non-empty) and BEFORE the
+      empty-manifest write, so per-volume source-since-deleted files no longer survive in a reused dir,
+      and a whole prior volumes/<Y>/ dir left in a reused dir is now caught at restore (verify rc8,
+      extra/undeclared on-disk member). STILL open: the non-volume TREE payloads (lme/, etc_lme/, ...) are
+      still copied with cp -a into an existing tree, so a source-since-deleted file in THOSE trees could
+      persist in a reused dir; the durable fix is the generation model (fresh dir per generation) -> B.
   - id: D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE
     severity: high
-    status: PARTIAL
-    resolved_part: >-
-      content_integrity.sh.j2 is now a genuine parameterized Jinja macro (lme_integrity_library(bi));
-      write_content_manifest + the copy-vs-source guard are library functions (no hand-inlined digest
-      shell in the producer task); volume data-dir + manifest-file names are DECLARED in integrity.yml
-      (volume_layout) and consumed on BOTH sides via LME_VOLUME_DATA_DIR/_MANIFEST_FILE and the Jinja
-      declared values in restore. A name change in the declaration relocates the producer, the library,
-      the gate and the restore per-volume check.
-    open_part: >-
-      A few Ansible-level restore paths still spell 'volumes' literally (roster find/stat at
-      restore_lme_master ~716-736); full declaration-only relocation of the roster derivation remains.
-      The Python test mechanism (below) is superseded pending a declarative harness. F reviews.
+    status: RESOLVED   # for producer + restore_lme_master; rollback_lme.yml named residual (codex-0915 #5, commit d493a58)
+    how: >-
+      content_integrity.sh.j2 is a genuine parameterized Jinja macro (lme_integrity_library(bi)).
+      ALL volume-layout names AND manifest field names are now DECLARED in integrity.yml
+      (volume_layout.{root_dir,data_dir,manifest_file}; manifest_fields.{count,bytes,listing,content} --
+      previously a decorative flat list nothing consumed, now a role-keyed map the library reads) and
+      exported as LME_VOLUME_ROOT/_DATA_DIR/_MANIFEST_FILE and LME_MF_COUNT/_BYTES/_LISTING/_CONTENT.
+      The remaining 'volumes' Ansible-level literals in restore_lme_master (roster find/stat) and the
+      producer VOLUME_DIR now read volume_layout.root_dir (or the exported $LME_VOLUME_ROOT). The restore
+      per-volume manifest check no longer hand-inlines a "keep byte-identical to the producer" recompute:
+      it calls the shared lme_verify_content_manifest, the SAME library the producer is rendered from, so
+      producer and restore cannot drift on field names OR recompute formulas. A fail-closed `:?` guard
+      aborts sourcing if any declared name is under-declared (an empty render would make "$root/" a
+      rm -rf/verify target). PROOF: scratch rc matrix passes 20/20 on DEFAULT names AND 20/20 with
+      volume_layout AND manifest_fields FULLY RENAMED, with zero executable edits (relocation proof).
+    residual: >-
+      ansible/rollback_lme.yml is a SEPARATE parallel recovery consumer that loads no declaration, calls
+      no library function, hardcodes volumes/<name>/data literals, hand-inlines its own manifest check,
+      AND bypasses lme_bundle_verify entirely (no bundle-certification gate before its destructive
+      restore of /opt/lme + volume rm). Folding it onto this library + the certification gate is a
+      dedicated, separately validated change (it is architectural, not a literal swap) -- NOT done this
+      wave. See codex_0915 D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE below and open_items.
+      The frozen Python test mechanism is superseded pending a declarative harness (routed to G). F reviews.
   - id: immediate_representation_violation (Python test file)
     status: DISCLOSED_FROZEN
     how: >-
@@ -535,6 +549,86 @@ codex_0845_recovery_audit_dispositions:
       open refinement, not claimed closed.
 
 # -----------------------------------------------------------------------------
+# codex_0915_recovery_audit_dispositions -- disposition for the five D-BACKUP-*
+# findings in codex-manager-enforcement-return-evidence-and-recovery-reconciliation
+# -20260923-0915 (review of commit bba0d2a). Fixes land in commits 54bd054 (pile)
+# and d493a58 (consolidation). RESOLVED items are behaviorally checked in scratch
+# (non-durable, ansible-core 2.17.14; deploy target 2.19.11 UNVERIFIED here).
+# -----------------------------------------------------------------------------
+codex_0915_recovery_audit_dispositions:
+  - id: D-BACKUP-INCOMPLETE-VOLUME-DIRECTORY-OMITTED
+    severity: high
+    status: RESOLVED
+    commit: 54bd054
+    how: >-
+      Two sides closed. CERTIFY: a volume dir with no data/ (a failed/partial volume) is now REFUSED
+      (rc1, no certificate published) instead of silently skipped; the volume enumeration also captures
+      the `find` rc so an unreadable volumes/ dir refuses rather than certifying a short set. VERIFY:
+      the on-disk enumeration captures the `find` rc, and the `[ -d data ] || continue` was REMOVED, so
+      ANY uncertified on-disk volume dir -- including one with no data/ -- is an extra/undeclared member
+      and fails rc8 BEFORE any mutation. Scratch: certify-refuse-nodata-volume rc1 (+ leaves no cert);
+      extra-ondisk-volume-NO-data rc8; extra-ondisk-volume-with-data rc8.
+  - id: D-BACKUP-IO-FAILURE-STATUS-STILL-LOST
+    severity: high
+    status: RESOLVED
+    commit: 54bd054
+    how: >-
+      The producer 'Backup each volume' body captured `[ "$(ls -A)" ]` truthiness, which treats an
+      unreadable mountpoint (ls error, empty stdout) as an empty volume and would certify an empty
+      backup for a volume that actually holds unreadable data. It now captures the ls rc explicitly
+      (SRC_ENTRIES=...; LS_RC=$?) and fails closed (FAILED status, no manifest, exit 1) on a non-zero
+      enumeration. Combined with the existing mountpoint-resolve guard, an I/O failure can no longer be
+      laundered into a successful/empty status. (Verified by inspection + syntax-check; a live unreadable
+      mountpoint is not reproducible in scratch without root, so this is stated as code-level, not a
+      scratch rc case.)
+  - id: D-BACKUP-EMPTY-RETRY-CERTIFIES-STALE-DATA
+    severity: high
+    status: PARTIAL
+    commit: 54bd054
+    resolved_part: >-
+      The cheap, in-scope part is closed: the producer `rm -rf` clears each volume's data/ BEFORE the cp
+      (non-empty branch, so cp -a cannot merge a prior generation's since-deleted files into the current
+      copy) AND before the empty-manifest write (empty branch, so an empty manifest never certifies stale
+      retained payload). A reused backup dir therefore cannot certify mixed-generation VOLUME data.
+    open_part: >-
+      The durable fix -- a backup GENERATION/REVISION identity so a reused dir is never the mechanism --
+      and the analogous cp -a merge on the non-volume TREE payloads (lme/, etc_lme/, ...) remain routed
+      to B (see D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE open_part).
+  - id: D-BACKUP-STATUS-PRESERVATION-AND-PUBLICATION-INCOMPLETE
+    severity: high
+    status: PARTIAL
+    commit: 54bd054
+    resolved_part: >-
+      Publication is fail-closed: certify stages via mktemp on the publication FS, checks the mv, and on
+      post-publication verify FAILURE now `rm -f`s the just-written certificate (never leaves a
+      bad-but-present cert -- an absent cert is the safe rc3 state). The play still FAILS with no override
+      when the bundle was not certified. Status is preserved per-volume (SUCCESS/EMPTY/FAILED) and the
+      backup records the certification outcome.
+    open_part: >-
+      A first-class play-level pessimistic recovery-status record and the generation/interrupted-operation
+      state model are operational-provenance/ledger territory -> routed to B.
+  - id: D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE
+    severity: high
+    status: RESOLVED   # for producer + restore_lme_master; rollback_lme.yml is a named residual
+    commit: d493a58
+    how: >-
+      codex-0915 #5 requested finishing the declaration-driven producer AND restore consumers (not
+      routing production literals to G) and relocating manifest field names. Done: volume-root literals
+      relocated to volume_layout.root_dir / $LME_VOLUME_ROOT (producer + restore_lme_master);
+      manifest_fields promoted from a decorative flat list to a role-keyed map consumed by the library
+      (LME_MF_*); the restore per-volume manifest check now calls the shared lme_verify_content_manifest
+      instead of a hand-inlined "byte-identical" recompute. Relocation PROVEN: scratch rc matrix 20/20 on
+      default names AND 20/20 with volume_layout + manifest_fields fully renamed, zero executable edits.
+    residual: >-
+      ansible/rollback_lme.yml (parallel recovery consumer) is NOT converted this wave: it loads no
+      declaration, calls no library function, hardcodes volumes/<name>/data, hand-inlines its manifest
+      check, and -- most materially -- BYPASSES lme_bundle_verify (no certification gate before its
+      destructive restore). This is fail-closed-relevant and architectural; it needs a dedicated,
+      separately validated change (include the declaration + render the library + call
+      lme_verify_content_manifest + add the lme_bundle_verify pre-mutation gate). Named here + in the
+      sitrep + open_items so it is not lost. NOT routed to G (production consumer, D-owned).
+
+# -----------------------------------------------------------------------------
 # validation -- how this wave was checked (honest: behavioral vs syntax-only).
 # -----------------------------------------------------------------------------
 validation:
@@ -542,6 +636,7 @@ validation:
     - "testing/tests/unit/test_backup_integrity.py -- 10 cases (FROZEN, superseded-pending-declarative): non-vacuity rc5, self-consistency honest-limit, missing cert rc3, torn cert rc4, producer gate, ordering, no-listing-fallback rc3, real-producer-writes-matching-digest, real-torn-copy-refused, real producer->certify->restore-gate roundtrip. PASS (10/10) against the rewritten library."
     - "testing/tests/unit/test_restore_master_secrets.py -- secret restore create/preverify/prune. PASS. Full D suite 37/37 PASS."
     - "scratch (non-durable) fail-closed rc matrix on the ansible-lookup-rendered library: certify rc0 / verify rc0; tree tamper rc5; volume+manifest co-edit with intact cert rc5; deleted certified volume rc7; extra on-disk volume rc8; unreadable file in required tree -> certify REFUSES nonzero; empty volume certifiable. Real task-body roundtrip (producer happy SUCCESS+manifest / torn FAILED+no-manifest / certify rc0 / restore-gate rc0 / gate tamper rc5)."
+    - "scratch (non-durable) rc matrix, codex-0915 wave (commits 54bd054 + d493a58), 20 cases: the above PLUS certify-refuse-nodata-volume rc1 (+leaves no cert), extra-ondisk-volume-NO-data rc8, finalize-torn rc1 (no manifest), content-sha read-failure fail-closed (nonzero + EMPTY stdout), and the new lme_verify_content_manifest cases (clean rc0 / missing-manifest rc3 / missing-data rc3 / legacy-no-content-field rc3 / content-mismatch rc4). RESULT: 20/20 on DEFAULT names AND 20/20 with volume_layout AND manifest_fields FULLY RENAMED (relocation proof, zero executable edits). The fail-closed `:?` guard aborts sourcing on an under-declared declaration key (verified: body unreached)."
   syntax_only:
     - "ansible-playbook --syntax-check ansible/backup_lme.yml + ansible/restore_lme_master.yml + ansible/rollback_lme.yml -- PASS. cluster_backup_lme.yml needs an inventory (pre-existing hosts: group dependency, unmodified by D)."
     - "Ansible split_args balance scan over every shell/command body in both task files -- NONE unbalanced. yaml.safe_load(_all) -- PASS."
@@ -551,7 +646,7 @@ validation:
     - Required-secret completeness at the restore boundary (completeness_anchor) -- routed to C1.
     - Backup generation/revision + interrupted-operation identity model -- routed to B.
     - Declarative test harness to replace the frozen Python (modeled on G loader_integration) -- spec routed to G.
-    - Full declaration-only relocation of the restore roster derivation (a few 'volumes' literals remain).
+    - "rollback_lme.yml: fold the parallel recovery consumer onto the shared library (declaration + lme_verify_content_manifest) AND add the lme_bundle_verify pre-mutation certification gate it currently BYPASSES -- dedicated, separately validated change (D-owned, NOT routed to G). This is the material fail-closed residual from codex-0915 #5."
     - Per-secret content digest + owner assertion; RESTORE-PARTIAL-REPLACEMENT idempotency (native rehearsal).
     - LEGACY-BUNDLE isolated qualification + byte preservation; recovery-status-record (play-level pessimistic status).
     - Guardian authority seam (REJOIN/FENCE serialization) -- see fencing-protocol.contract.yaml; joint C/D transition contract (codex-0845).
