@@ -1310,17 +1310,43 @@ def lme_project_database_membership(membership):
     return {'database': out}
 
 
-def lme_selection_conflicts(operator_selections, caller_selections):
+def lme_selection_conflicts(operator_selections, caller_selections, registry=None):
     """C1-CONFLICTING-INPUT-PRECEDENCE: the sorted keys present in BOTH the pristine
     operator capture (native extra-var/inventory precedence already resolved this winner)
     AND a caller-normalized lme_inputs.selections, with DIFFERING values. A lower-tier
     namespaced selection may not silently override the operator's native selection; where
     the two disagree provenance cannot be established, so the resolver REJECTS (rather than
     combining one over the other and recreating consumer disagreement). Agreeing keys are
-    NOT conflicts. Value-pure."""
+    NOT conflicts. Value-pure.
+
+    C1-CONFLICT-GATE-BOOLEAN-REPRESENTATION-REGRESSION (codex-0645 HIGH): compare by the
+    DECLARED FIELD TYPE, not raw bytes. A representation difference is NOT a disagreement --
+    an `-e install_llm=false` (string 'false') or a JSON-typed CLI false and a namespaced
+    bool false all denote the SAME selection, so they must NOT be flagged as a conflict;
+    only a genuine value disagreement (true vs false) is. When a `registry` is supplied both
+    sides are canonicalized through _coerce_declared (the resolver's own coercion) before
+    comparison. A key absent from the registry, or a value that will not coerce, falls back
+    to a RAW compare -- fail-closed: an uncanonicalizable disagreement still surfaces as a
+    conflict, and the malformed value is caught by the resolver's typed validation anyway."""
     op = operator_selections or {}
     caller = caller_selections or {}
-    return sorted(k for k in op if k in caller and op[k] != caller[k])
+    fields = (registry or {}).get('fields') if isinstance(registry, dict) else None
+    fields = fields if isinstance(fields, dict) else {}
+    out = []
+    for k in op:
+        if k not in caller:
+            continue
+        ov, cv = op[k], caller[k]
+        field = fields.get(k)
+        if isinstance(field, dict):
+            try:
+                ov = _coerce_declared(op[k], field)
+                cv = _coerce_declared(caller[k], field)
+            except (ValueError, TypeError):
+                ov, cv = op[k], caller[k]  # raw fallback (fail-closed)
+        if ov != cv:
+            out.append(k)
+    return sorted(out)
 
 
 def lme_validate_dependency_closure(services, context=None):

@@ -1232,3 +1232,24 @@ def test_selection_conflicts_detects_only_disagreements():
     assert selection_conflicts(op, {"install_llm": False}) == []   # agrees
     assert selection_conflicts({}, caller) == []
     assert selection_conflicts(op, None) == []
+
+
+def test_selection_conflicts_canonicalize_by_declared_type():
+    """C1-CONFLICT-GATE-BOOLEAN-REPRESENTATION-REGRESSION: with the registry supplied, a
+    REPRESENTATION difference is not a conflict; only a real value disagreement is."""
+    reg = _registry()  # the real lme_config_registry (install_llm declared bool)
+    # -e install_llm=false yields the STRING 'false'; a namespaced/JSON caller yields bool
+    # False. Raw compare (no registry) FALSELY flags them; type-canonical compare does not.
+    assert selection_conflicts({"install_llm": "false"}, {"install_llm": False}) == ["install_llm"]
+    assert selection_conflicts({"install_llm": "false"}, {"install_llm": False}, reg) == []
+    assert selection_conflicts({"install_llm": "true"}, {"install_llm": True}, reg) == []
+    # a genuine disagreement is STILL a conflict after canonicalization
+    assert selection_conflicts({"install_llm": "true"}, {"install_llm": False}, reg) == ["install_llm"]
+    assert selection_conflicts({"install_llm": True}, {"install_llm": "false"}, reg) == ["install_llm"]
+    # an unknown key or an uncoercible value falls back to a raw compare (fail-closed)
+    assert selection_conflicts({"nope": "x"}, {"nope": "y"}, reg) == ["nope"]
+
+
+def _registry():
+    with open(GLOBAL_YML, "r") as fh:
+        return yaml.safe_load(fh)["lme_config_registry"]
