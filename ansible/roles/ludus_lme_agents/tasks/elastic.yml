@@ -157,18 +157,61 @@
         mode: "0644"
       register: _audit_rules_download
 
-    # Only reload/restart when the rules actually changed, so re-runs are
-    # idempotent (augenrules and a restart otherwise fire on every run).
+    - name: Record desired audit-rules checksum
+      ansible.builtin.stat:
+        path: /etc/audit/rules.d/audit.rules
+        checksum_algorithm: sha256
+      register: _audit_rules_desired
+
+    - name: Read the last-applied audit-rules marker
+      ansible.builtin.slurp:
+        src: /etc/audit/.lme-audit-rules-applied
+      register: _audit_rules_applied_marker
+      failed_when: false
+
+    - name: List audit rules currently loaded in the kernel
+      ansible.builtin.command: auditctl -l
+      register: _audit_rules_loaded
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    # Reconcile on the ACTUAL applied state, not just on whether the download
+    # changed this run. An interrupted first run can leave the rules file on
+    # disk while augenrules/restart never completed; the unchanged re-download
+    # would then skip activation forever (files present but unapplied). The
+    # applied marker is written only AFTER a successful load+restart, so a
+    # missing/stale marker -- or an empty running ruleset (e.g. after an
+    # external auditctl -D) -- forces (re)activation while a clean rerun stays
+    # idempotent.
+    - name: Decide whether audit rules need (re)activation
+      ansible.builtin.set_fact:
+        _audit_rules_need_activation: >-
+          {{ (_audit_rules_download is changed)
+             or (_audit_rules_applied_marker.content is not defined)
+             or ((_audit_rules_applied_marker.content | b64decode | trim)
+                  != (_audit_rules_desired.stat.checksum | default('')))
+             or ((_audit_rules_loaded.rc | default(1)) != 0)
+             or ((_audit_rules_loaded.stdout | default('') | trim | length) == 0)
+             or (_audit_rules_loaded.stdout | default('') is search('No rules')) }}
+
     - name: Load audit rules
       ansible.builtin.command: augenrules --load
       changed_when: false
-      when: _audit_rules_download is changed
+      when: _audit_rules_need_activation | bool
 
     - name: Restart auditd service
       ansible.builtin.service:
         name: auditd
         state: restarted
-      when: _audit_rules_download is changed
+      when: _audit_rules_need_activation | bool
+
+    - name: Record the applied audit-rules checksum after successful activation
+      ansible.builtin.copy:
+        content: "{{ _audit_rules_desired.stat.checksum }}"
+        dest: /etc/audit/.lme-audit-rules-applied
+        mode: "0644"
+      when: _audit_rules_need_activation | bool
 
 # ---------------------------------------------------------------------------
 # Windows: install Elastic Agent + Sysmon
