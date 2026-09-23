@@ -204,6 +204,15 @@ def resolved_role_config(resolved, node, credential_material):
     try:
         if node not in HOSTS or credential_material['run_id'] != resolved['run_id']:
             raise ValueError('credential material is not bound to this run')
+        # DEPLOYMENT-IDENTITY (codex-0445 decision_deployment_identity; FENCE-CURRENT-
+        # GENERATION-AND-AUTHORITY): the stable deployment identity keys the container
+        # restart fence, the persistent storage root and the credential ownership. It is
+        # INVENTORY-only (never minted, never run_id/config-derived). Missing or malformed
+        # REJECTS before any mutation (the ratified rule), so the ordinary resolved-role
+        # path no longer silently deny-renders every start for lack of an identity.
+        deployment_identity = resolved.get('deployment_identity')
+        if not isinstance(deployment_identity, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}', deployment_identity):
+            raise ValueError('stable deployment identity required before owned resource resolution')
         profile = resolved['profiles']['database']
         plan = topology(profile)
         images = {}
@@ -216,23 +225,41 @@ def resolved_role_config(resolved, node, credential_material):
                     or not re.fullmatch(r'[a-f0-9]{64}', artifact['archive_sha256']) or not artifact['source_digest']):
                 raise ValueError('local image qualification metadata missing')
             images[kind] = reference
-        hosts = {name: {'address': resolved['hosts'][name]['fqdn'],
-                        'cidr': str(ipaddress.ip_address(resolved['hosts'][name]['tailscale_address'])) + '/32'} for name in HOSTS}
+        # Address-family-aware host CIDR (D-PORTABILITY-CONSUMER-DEBT: the /32 literal
+        # assumed IPv4). Render the observed address per family so an IPv6 tailnet is not
+        # rejected; render() bracket-formats IPv6 bind hosts for PublishPort.
+        hosts = {}
+        for name in HOSTS:
+            observed = ipaddress.ip_address(resolved['hosts'][name]['tailscale_address'])
+            hosts[name] = {'address': resolved['hosts'][name]['fqdn'],
+                           'cidr': str(observed) + ('/32' if observed.version == 4 else '/128')}
+        # Per-host owner accounts are HONORED (D-PORTABILITY-CONSUMER-DEBT owners row:
+        # the old cross-member identical-owner assertion is dropped). Each node resolves
+        # and renders with ITS OWN owner account; required HA membership (HOSTS) is
+        # unchanged. No downstream path assumes members share an owner account (cross-member
+        # references use addresses/hostnames, not owner-derived paths).
         owners = {domain: resolved['hosts'][node]['owners']['db-' + domain] for domain in plan['domains']}
         owners['etcd'] = resolved['hosts'][node]['owners']['etcd']
-        # Physical members retain the same role/account names across guests.
-        for member in HOSTS:
-            for domain in plan['domains']:
-                if resolved['hosts'][member]['owners']['db-' + domain] != owners[domain]:
-                    raise ValueError('database owner differs across physical members')
         grants = {(entry['node'], entry['owner'], entry['destination']) for entry in credential_material['grants']}
+        # D-REQUIRED-MATERIAL-PLACEMENTS SUPERSET (codex-0445; SUPERSET RULE): the completeness
+        # gate is the existing db-owner authority PLUS guardian.pub in each db-owner secrets dir
+        # (member gate reads /run/secrets/guardian.pub, render L313 + rejoin L55) -- a DISTINCT
+        # obligation from the proxy config-dir guardian.pub, referencing the SAME canonical
+        # material_catalog.guardian_public_key. Grant presence is NECESSARY, not sufficient
+        # (C-MATERIAL-GRANT-EVIDENCE: content/permission validation is separate).
         for domain in plan['domains']:
             owner = owners[domain]
             for filename in ('pg-ca.crt', 'pg-server.crt', 'pg-server.key', 'admin.crt', 'admin.key', 'admin.pgpass',
                              'pg_service.conf', 'role-passwords.json', 'patroni.env', 'etcd-ca.crt', 'etcd-client.crt', 'etcd-client.key',
-                             'backup-ca.crt', 'backup-client.crt', 'backup-client.key'):
+                             'backup-ca.crt', 'backup-client.crt', 'backup-client.key', 'guardian.pub'):
                 if (node, owner, f'/data/{owner}/secrets/postgresql/{filename}') not in grants:
                     raise ValueError('database credential grant missing: ' + filename)
+        # etcd owner secrets dir had ZERO completeness coverage; the etcd server mounts it at
+        # /run/secrets (render L475) and reads etcd-ca.crt + the etcd-server pair (render L473).
+        etcd_owner = owners['etcd']
+        for filename in ('etcd-ca.crt', 'etcd-server.crt', 'etcd-server.key'):
+            if (node, etcd_owner, f'/data/{etcd_owner}/secrets/postgresql/{filename}') not in grants:
+                raise ValueError('etcd owner credential grant missing: ' + filename)
         services = {domain + '_admin': domain + '_admin' for domain in plan['domains']}
         services.update({db + '_source': db + '_source' for db in TABLES})
         if plan['paths']:
@@ -246,7 +273,8 @@ def resolved_role_config(resolved, node, credential_material):
                 clients.add(host['owners'][sid])
         if 'hertzbeat' in host['owners']:
             clients.add(host['owners']['hertzbeat'])
-        config = {'profile': profile, 'run_id': resolved['run_id'], 'node': node, 'qemu_generation': str(uuid.UUID(host['qemu_generation'])), 'hosts': hosts, 'images': images,
+        config = {'profile': profile, 'run_id': resolved['run_id'], 'node': node, 'qemu_generation': str(uuid.UUID(host['qemu_generation'])),
+                  'deployment_identity': deployment_identity, 'hosts': hosts, 'images': images,
                   'owners': owners, 'services': services, 'proxy_owners': sorted(clients),
                   'backup': resolved['database']['backup'], 'slot_guard_standby': resolved['database']['slot_guard_standby'],
                   'memory_mib': {domain: resolved['providers']['db-' + domain]['memory_mib'] for domain in plan['domains']},
@@ -297,6 +325,9 @@ def render(config):
     files = {'topology.json': json.dumps(plan, indent=2) + '\n'}
     address = config['hosts'][node]['address']
     bind_address = str(ipaddress.ip_network(config['hosts'][node]['cidr']).network_address)
+    # PublishPort needs [addr]:port for an IPv6 bind host (D-PORTABILITY-CONSUMER-DEBT
+    # address-family). IPv4 is unchanged.
+    bind_host = f'[{bind_address}]' if ':' in bind_address else bind_address
     owners = {'hertzbeat': 'lmedbhb', 'vector': 'lmedbvector', 'shared': 'lmedbshared', 'etcd': 'lmedcs', **config.get('owners', {})}
     for owner in owners.values():
         safe_token(owner, r'[a-z_][a-z0-9_-]*')
@@ -392,7 +423,13 @@ def render(config):
             fence_gate = "ExecStartPre=/bin/sh -c 'echo \"lme-fencing: stable deployment identity unresolved\" >&2; exit 255'"
         else:
             expected = f'authorize {fence_identity} {domain} {node} {config["qemu_generation"]}'
-            body = (f'a={authorization}; '
+            # FENCE-CURRENT-GENERATION-AND-AUTHORITY (codex-0415): also bind the CURRENTLY
+            # OBSERVED guest generation, not only the config-rendered literal. Read the live
+            # instance-id (same source reconcile_guest.py re-checks) and DENY on drift, so a
+            # guest that rebooted to a new generation is fenced until re-rendered. Unreadable
+            # instance-id -> deny (fail-closed).
+            body = (f'a={authorization}; g=/var/lib/cloud/data/instance-id; '
+                    f'[ -r "$$g" ] && [ "$$(cat "$$g")" = "{config["qemu_generation"]}" ] || exit 255; '
                     '[ -r "$$a" ] || exit 255; '
                     f'[ "$$(sed -n 1p "$$a")" = "{expected}" ] || exit 255; '
                     'e=$$(sed -n 2p "$$a") || exit 255; '
@@ -408,8 +445,8 @@ ContainerName={name}
 LogDriver=journald
 UserNS=keep-id:uid=999,gid=999
 Network=lme-{owner}.network
-PublishPort={bind_address}:{spec["port"]}:{spec["port"]}
-PublishPort={bind_address}:{spec["api_port"]}:{spec["api_port"]}
+PublishPort={bind_host}:{spec["port"]}:{spec["port"]}
+PublishPort={bind_host}:{spec["api_port"]}:{spec["api_port"]}
 Exec=patroni {path}/patroni.json
 Volume=/data/{owner}/config/postgresql/{domain}:{path}:ro
 Volume=/data/{owner}/volumes/postgresql/{domain}:/var/lib/postgresql/data:Z
@@ -468,8 +505,8 @@ Image={images['etcd']}
 ContainerName=pg-etcd
 LogDriver=journald
 Network=lme-{owners["etcd"]}.network
-PublishPort={bind_address}:2379:2379
-PublishPort={bind_address}:2380:2380
+PublishPort={bind_host}:2379:2379
+PublishPort={bind_host}:2380:2380
 Exec=etcd --name {node} --data-dir /var/lib/etcd --listen-client-urls https://0.0.0.0:2379 --advertise-client-urls https://{address}:2379 --listen-peer-urls https://0.0.0.0:2380 --initial-advertise-peer-urls https://{address}:2380 --initial-cluster {peers} --initial-cluster-state new --initial-cluster-token lme-{run_id} --client-cert-auth --trusted-ca-file /run/secrets/etcd-ca.crt --cert-file /run/secrets/etcd-server.crt --key-file /run/secrets/etcd-server.key --peer-client-cert-auth --peer-trusted-ca-file /run/secrets/etcd-ca.crt --peer-cert-file /run/secrets/etcd-server.crt --peer-key-file /run/secrets/etcd-server.key
 Volume=/data/{owners["etcd"]}/volumes/postgresql/etcd:/var/lib/etcd:Z
 Volume=/data/{owners["etcd"]}/secrets/postgresql:/run/secrets:ro

@@ -136,6 +136,7 @@ def _unalias(path):
 
 def rebuild(config, domain, request, *, root=Path('/var/lib/postgresql/member'),
             inhibitor_root=Path('/var/lib/lme-fencing/inhibit'), identity_path=Path('/run/lme-rejoin/instance-id'),
+            authorize_root=Path('/var/lib/lme-fencing/authorize'),
             command=_run, route_reader=read_route, replica_probe=isolated_replica):
     safe_token(config['run_id'], r'[a-z0-9][a-z0-9-]{0,31}')
     safe_token(request['request_nonce'], r'[a-f0-9]{32}')
@@ -148,6 +149,16 @@ def rebuild(config, domain, request, *, root=Path('/var/lib/postgresql/member'),
     data = root / domain
     inhibit = Path(inhibitor_root) / config['run_id'] / domain / config['node']
     identity_path = Path(identity_path)
+    # REJOIN-RESTART-SERIALIZATION (codex-0415): the positive restart authorization for this
+    # member must be REVOKED (absent) before the rename. The inhibit marker alone does NOT
+    # stop a restart -- the container-restart fence ADMITS a start whenever a valid
+    # authorization is present, so an unexpired authorization would let the fenced member
+    # restart onto the OLD datadir during the rename. When deployment_identity is resolved,
+    # quarantine() requires the authorize file absent. The authoritative revoke/consume is the
+    # guardian control.sock seam (absent); this absence check + the member flock are the local
+    # corroboration (see fencing-protocol.contract.yaml rejoin.authorization_revoked).
+    deployment_identity = config.get('deployment_identity')
+    authorize = Path(authorize_root) / deployment_identity / domain / config['node'] if deployment_identity else None
     for path in (root, data, inhibit, identity_path):
         _unalias(path)
     def quarantine():
@@ -160,11 +171,13 @@ def rebuild(config, domain, request, *, root=Path('/var/lib/postgresql/member'),
         # UNKNOWN stop evidence and is refused; that is a deliberately conservative
         # local stand-in for the guardian-attested stopped flag, and such cases need an
         # operator to confirm the old server is down and remove the pid file by hand.
+        # authorization_revoked: a live positive restart authorization must not exist.
         if (not inhibit.is_file() or inhibit.read_text() != request['qemu_generation']
                 or identity_path.read_text().strip() != request['qemu_generation']
                 or not data.is_dir() or (data / 'PG_VERSION').read_text().strip() != '17'
-                or (data / 'postmaster.pid').exists()):
-            raise ValueError('exact stopped PostgreSQL 17 member and matching persistent quarantine required')
+                or (data / 'postmaster.pid').exists()
+                or (authorize is not None and (authorize.exists() or authorize.is_symlink()))):
+            raise ValueError('exact stopped PostgreSQL 17 member, matching persistent quarantine and revoked restart authorization required')
     quarantine()
     nonce = request['request_nonce']
     stage, retained = root / (domain + '.rebuild-' + nonce), root / (domain + '.retained-' + nonce)
