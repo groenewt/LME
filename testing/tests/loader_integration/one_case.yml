@@ -1,0 +1,88 @@
+---
+# testing/tests/loader_integration/one_case.yml
+# Per-case dispatch. `case` is the loop var. Appends exactly one record to `results`.
+#
+# Three paths:
+#   static_scan  -> read-only entrypoint lint, RUNNABLE NOW (no contract).
+#   QUEUED       -> contract-dependent case at an unbound HEAD: fail-closed to QUEUED.
+#   bound        -> contract bound: render probe from macros/probe.j2 + run the REAL
+#                   loader through the entrypoint context, judge the invariant strictly.
+
+# --- static_scan (runnable now) -----------------------------------------------
+- name: "static_scan targets :: {{ case.name }}"
+  ansible.builtin.include_tasks: scan_target.yml
+  loop: "{{ case.targets | default([]) }}"
+  loop_control:
+    loop_var: target
+    label: "{{ target.entrypoint }}:{{ target.label }}"
+  when: case.kind == 'static_scan'
+
+- name: "static_scan verdict :: {{ case.name }}"
+  ansible.builtin.set_fact:
+    results: >-
+      {{ results + [ {
+           'case': case.name, 'kind': case.kind, 'invariant_task': case.invariant_task,
+           'verdict': ('PASS' if ((scan_findings | selectattr('case', 'equalto', case.name)
+                                    | rejectattr('ok') | list | length) == 0) else 'FAIL'),
+           'findings': (scan_findings | selectattr('case', 'equalto', case.name) | list)
+         } ] }}
+  when: case.kind == 'static_scan'
+
+# --- contract-dependent + UNBOUND -> QUEUED (fail-closed, always visible) ------
+- name: "QUEUED (C1 contract unbound) :: {{ case.name }}"
+  ansible.builtin.set_fact:
+    results: >-
+      {{ results + [ {
+           'case': case.name, 'kind': case.kind, 'invariant_task': case.invariant_task,
+           'verdict': 'QUEUED', 'requires_contract': true,
+           'queued_on': (case.queued_on | default(['C1'])),
+           'binding_status': contract_binding.status,
+           'entrypoints': (case.entrypoints | default([]))
+         } ] }}
+  when:
+    - case.kind != 'static_scan'
+    - (case.requires_contract | default(true))
+    - not contract_bound
+
+# --- contract BOUND -> render + run the probe (activated on C1 bind) -----------
+- name: "bound probe :: {{ case.name }}"
+  when:
+    - case.kind != 'static_scan'
+    - (case.requires_contract | default(true))
+    - contract_bound
+  block:
+    - name: "Prepare per-case work dir :: {{ case.name }}"
+      ansible.builtin.file:
+        path: "{{ work }}/{{ case.name }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Render probe playbook from macros/probe.j2 :: {{ case.name }}"
+      ansible.builtin.template:
+        src: probe_wrapper.yml.j2
+        dest: "{{ work }}/{{ case.name }}/probe.yml"
+        mode: "0644"
+
+    - name: "Run probe under scrubbed env :: {{ case.name }}"
+      ansible.builtin.command:
+        cmd: /usr/bin/env -i HOME={{ work }}/{{ case.name }} PATH=/usr/bin:/bin /usr/bin/ansible-playbook probe.yml
+        chdir: "{{ work }}/{{ case.name }}"
+      register: probe_run
+      changed_when: false
+      failed_when: false
+
+    - name: "Judge probe outcome strictly (task name + fail_msg) :: {{ case.name }}"
+      ansible.builtin.set_fact:
+        results: >-
+          {{ results + [ {
+               'case': case.name, 'kind': case.kind, 'invariant_task': case.invariant_task,
+               'verdict': ('PASS' if probe_run.rc == 0
+                           else ('REJECTED-as-expected' if ((case.expect.reject | default(false))
+                                 and (case.invariant_task in (probe_run.stdout | default(''))))
+                           else ('XFAIL-as-expected' if ((case.fail_msg | default('')) != ''
+                                 and (case.fail_msg in (probe_run.stdout | default('')))
+                                 and (case.invariant_task in (probe_run.stdout | default(''))))
+                           else 'FAIL'))),
+               'rc': probe_run.rc,
+               'log': (work ~ '/' ~ case.name ~ '/probe.yml')
+             } ] }}

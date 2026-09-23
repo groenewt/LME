@@ -1,0 +1,228 @@
+---
+# testing/tests/loader_integration/run_integration.yml
+#
+# Ansible RUNNER for the LME resolved-config INTEGRATION acceptance tier.
+# Reads CASE-SCHEMA.yml + contract_binding.yml + every cases/*.yml (data), then for
+# each case either (a) runs it read-only NOW (static_scan) or (b) fail-closes to
+# QUEUED until C1's resolved-config contract is bound. When bound, contract cases
+# render a probe from macros/probe.j2 and run the REAL loader through the actual
+# entrypoint context. No hand-authored Python. Mirrors C1's runner shape but at the
+# INTEGRATION scope (all four entrypoints, cross-consumer agreement, evidence matrix).
+#
+# Invoke (design/self-proof, RUNNABLE NOW at any HEAD):
+#   /usr/bin/ansible-playbook run_integration.yml
+# Invoke (acceptance, AFTER contract_binding.status == bound):
+#   /usr/bin/ansible-playbook run_integration.yml -e mode=acceptance
+#
+# mode=design (default): QUEUED cases are EXPECTED and reported; the gate fails only
+#                        on hard FAIL/ERROR/OFF-EXPECTATION.
+# mode=acceptance:       ANY QUEUED case FAILS the gate (codex-check-0015: xfail/queue
+#                        bookkeeping must never turn unresolved behavior into a pass).
+- name: LME resolved-config integration acceptance tier
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    repo_root: "{{ playbook_dir | dirname | dirname | dirname }}"
+    cases_glob: "{{ playbook_dir }}/cases/*.yml"
+    work_root: "{{ playbook_dir }}/runs"
+    mode: design
+    expected_bound_verdicts: [PASS, XFAIL-as-expected, REJECTED-as-expected]
+    hard_fail_verdicts: [FAIL, ERROR, OFF-EXPECTATION]
+    results: []
+    scan_findings: []
+  tasks:
+    - name: Load pinned case schema
+      ansible.builtin.include_vars:
+        file: CASE-SCHEMA.yml
+        name: case_schema
+
+    - name: Load C1 contract binding
+      ansible.builtin.include_vars:
+        file: contract_binding.yml
+        name: contract_binding
+
+    - name: Determine whether the C1 resolved-config contract is bound
+      ansible.builtin.set_fact:
+        contract_bound: "{{ (contract_binding.status | default('pending_c1_sitrep')) == 'bound' }}"
+
+    - name: Discover case files (disjoint, one writer per file; NN orders execution)
+      ansible.builtin.set_fact:
+        case_files: "{{ query('ansible.builtin.fileglob', cases_glob) | sort }}"
+
+    - name: Fail if no case files are present
+      ansible.builtin.assert:
+        that: "case_files | length > 0"
+        fail_msg: "no cases/*.yml found under {{ playbook_dir }}/cases -- nothing to run"
+
+    - name: Load and merge cases from every case file
+      ansible.builtin.set_fact:
+        cases: >-
+          {{ cases | default([])
+             + ((lookup('ansible.builtin.file', item) | from_yaml).cases | default([])) }}
+      loop: "{{ case_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+
+    - name: Fail on off-schema cases (missing name/kind/invariant_task, or unknown kind)
+      ansible.builtin.assert:
+        that:
+          - "cases | rejectattr('name', 'defined') | list | length == 0"
+          - "cases | rejectattr('kind', 'defined') | list | length == 0"
+          - "cases | rejectattr('invariant_task', 'defined') | list | length == 0"
+          - "cases | selectattr('kind', 'defined') | rejectattr('kind', 'in', case_schema.case_fields.kind.enum) | list | length == 0"
+          - "(cases | map(attribute='name') | list | length) == (cases | map(attribute='name') | list | unique | length)"
+        fail_msg: >-
+          off-schema or duplicate-named cases present:
+          {{ cases | selectattr('kind', 'defined') | rejectattr('kind', 'in', case_schema.case_fields.kind.enum) | map(attribute='name') | list }}
+
+    # --- Evidence identity (source-bound; test #8 infrastructure) ------------------
+    - name: Record HEAD under test (never a fabricated SHA)
+      ansible.builtin.command: git rev-parse HEAD
+      args: {chdir: "{{ repo_root }}"}
+      register: head_rev
+      changed_when: false
+
+    - name: Record worktree dirtiness
+      ansible.builtin.command: git status --porcelain
+      args: {chdir: "{{ repo_root }}"}
+      register: git_porcelain
+      changed_when: false
+
+    - name: Record run timestamp (UTC)
+      ansible.builtin.command: date -u +%Y%m%dT%H%M%SZ
+      register: run_ts
+      changed_when: false
+
+    - name: Compute source-bound run_id + per-run work dir (prior runs preserved)
+      ansible.builtin.set_fact:
+        run_id: "{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
+        work: "{{ work_root }}/{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
+
+    - name: Record toolchain versions
+      ansible.builtin.command: >-
+        /usr/bin/python3 -c "import sys,jinja2,yaml,subprocess;
+        print(sys.version.split()[0]); print(jinja2.__version__); print(yaml.__version__);
+        print(subprocess.run(['/usr/bin/ansible','--version'],capture_output=True,text=True).stdout.splitlines()[0])"
+      register: tool_raw
+      changed_when: false
+
+    - name: sha256 of the four real entrypoints (evidence identity)
+      ansible.builtin.stat:
+        path: "{{ repo_root }}/{{ item.value }}"
+        checksum_algorithm: sha256
+      register: entrypoint_stat
+      loop: "{{ contract_binding.entrypoints | dict2items }}"
+      loop_control: {label: "{{ item.key }}"}
+
+    - name: sha256 of authored case files + macro (evidence identity)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      register: authored_stat
+      loop: "{{ case_files + [ playbook_dir ~ '/macros/probe.j2' ] }}"
+      loop_control: {label: "{{ item | basename }}"}
+
+    - name: Pre-slurp entrypoint file lines once (read-only; feeds static_scan)
+      ansible.builtin.slurp:
+        src: "{{ repo_root }}/{{ item.value }}"
+      register: entrypoint_slurp
+      loop: "{{ contract_binding.entrypoints | dict2items }}"
+      loop_control: {label: "{{ item.key }}"}
+
+    - name: Build entrypoint_lines map keyed by short name (splitlines handles CRLF+LF; a '\n' literal is NOT honored inside a block scalar)
+      ansible.builtin.set_fact:
+        entrypoint_lines: >-
+          {{ entrypoint_lines | default({})
+             | combine({ item.item.key: (item.content | b64decode).splitlines() }) }}
+      loop: "{{ entrypoint_slurp.results }}"
+      loop_control: {label: "{{ item.item.key }}"}
+
+    - name: Publish evidence facts
+      ansible.builtin.set_fact:
+        toolchain:
+          python: "{{ tool_raw.stdout_lines[0] }}"
+          jinja2: "{{ tool_raw.stdout_lines[1] }}"
+          pyyaml: "{{ tool_raw.stdout_lines[2] }}"
+          ansible: "{{ tool_raw.stdout_lines[3] }}"
+        entrypoints_sha256: "{{ dict(entrypoint_stat.results | map(attribute='item.key') | list | zip(entrypoint_stat.results | map(attribute='stat.checksum') | list)) }}"
+        authored_sha256: "{{ dict(authored_stat.results | map(attribute='item') | map('basename') | list | zip(authored_stat.results | map(attribute='stat.checksum') | list)) }}"
+
+    - name: Create the per-run work dir
+      ansible.builtin.file:
+        path: "{{ work }}"
+        state: directory
+        mode: "0755"
+
+    - name: Refuse to reuse a prior run's evidence (fresh-by-construction guard)
+      ansible.builtin.find:
+        paths: "{{ work }}"
+        patterns: "results.yml"
+      register: preexisting
+      failed_when: "preexisting.files | length > 0"
+
+    - name: Run each case
+      ansible.builtin.include_tasks: one_case.yml
+      loop: "{{ cases }}"
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }} ({{ case.kind }})"
+
+    - name: Compute verdict tallies
+      ansible.builtin.set_fact:
+        n_total: "{{ results | length }}"
+        n_pass: "{{ results | selectattr('verdict', 'equalto', 'PASS') | list | length }}"
+        n_queued: "{{ results | selectattr('verdict', 'equalto', 'QUEUED') | list | length }}"
+        n_hardfail: "{{ results | selectattr('verdict', 'in', hard_fail_verdicts) | list | length }}"
+
+    - name: Write results.yml (source-bound evidence identity)
+      ansible.builtin.copy:
+        dest: "{{ work }}/results.yml"
+        mode: "0644"
+        content: >-
+          {{ {'run_id': run_id, 'mode': mode, 'head': head_rev.stdout,
+              'worktree_dirty': (git_porcelain.stdout_lines | length > 0),
+              'contract_binding_status': contract_binding.status,
+              'contract_bound': contract_bound,
+              'toolchain': toolchain,
+              'entrypoints_sha256': entrypoints_sha256,
+              'authored_sha256': authored_sha256,
+              'tally': {'total': n_total, 'pass': n_pass, 'queued': n_queued, 'hard_fail': n_hardfail},
+              'results': results} | to_nice_yaml }}
+
+    - name: Update runs/LATEST pointer
+      ansible.builtin.copy:
+        dest: "{{ work_root }}/LATEST"
+        content: "{{ run_id }}\n"
+        mode: "0644"
+
+    - name: Summary line per case
+      ansible.builtin.debug:
+        msg: "{{ '%-44s %-18s %s' | format(item.case, item.kind, item.verdict) }}{{ (' queued_on=' ~ (item.queued_on | join(','))) if item.verdict == 'QUEUED' else '' }}"
+      loop: "{{ results }}"
+      loop_control: {label: "{{ item.case }}"}
+
+    - name: Tally line
+      ansible.builtin.debug:
+        msg: "mode={{ mode }} total={{ n_total }} pass={{ n_pass }} QUEUED={{ n_queued }} hard_fail={{ n_hardfail }} (results under {{ work }})"
+
+    - name: ACCEPTANCE gate -- zero QUEUED, every case at an expected-bound verdict
+      ansible.builtin.assert:
+        that:
+          - "results | rejectattr('verdict', 'in', expected_bound_verdicts) | list | length == 0"
+        fail_msg: >-
+          acceptance gate NOT satisfied; still-unresolved/off-expectation cases:
+          {{ results | rejectattr('verdict', 'in', expected_bound_verdicts) | map(attribute='case') | list }}
+        success_msg: "acceptance: all {{ n_total }} cases at expected verdict, 0 QUEUED"
+      when: mode == 'acceptance'
+
+    - name: DESIGN gate -- no hard failures (QUEUED tolerated + reported, never counted pass)
+      ansible.builtin.assert:
+        that:
+          - "n_hardfail | int == 0"
+        fail_msg: >-
+          design run has hard failures:
+          {{ results | selectattr('verdict', 'in', hard_fail_verdicts) | map(attribute='case') | list }}
+        success_msg: "design: {{ n_pass }} runnable-now PASS, {{ n_queued }} QUEUED on implementations, 0 hard failures"
+      when: mode != 'acceptance'

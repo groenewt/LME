@@ -1,0 +1,81 @@
+{#
+  testing/tests/loader_integration/macros/probe.j2
+  Jinja MACRO library that RENDERS an Ansible probe playbook for one integration
+  case. No hand-authored Python. Activated only on the BOUND path (contract_binding
+  .status == bound); every C1 name comes from `binding.names.*` -- this macro never
+  hard-codes a guessed contract name.
+
+  render_probe(case, binding, repo_root):
+    emits a localhost playbook that (1) copies the loader + manifests + the real
+    entrypoint into an isolated, sha256-verified source tree, (2) applies the case's
+    declarative input layers (extra-vars / inventory / host_vars / profile(s) /
+    on-disk markers), (3) resolves through the real loader, and (4) asserts the
+    case.expect against the resolved dict named by binding.names.resolved_dict_var,
+    keyed to case.invariant_task (+ fail_msg) so a crash cannot masquerade as an
+    expected outcome.
+#}
+{% macro render_probe(case, binding, repo_root) -%}
+---
+# RENDERED probe for case: {{ case.name }} ({{ case.kind }})
+# provenance: cases -> macros/probe.j2 (no render timestamp, per artifact_provenance rule)
+# binds to the REAL HEAD recorded by the runner in results.yml -- NOT a fabricated SHA.
+- name: "integration probe :: {{ case.name }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    resolved: "{{ '{{' }} {{ binding.names.resolved_dict_var }} {{ '}}' }}"
+{% if case.inputs is defined and case.inputs.extra_vars is defined %}
+    # declarative extra-vars layer (highest precedence)
+{% for k, v in case.inputs.extra_vars.items() %}
+    {{ k }}: {{ v | to_json }}
+{% endfor %}
+{% endif %}
+  tasks:
+    - name: "load resolved config via the real loader ({{ (case.entrypoints | default(['site'])) | join(',') }})"
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: load_manifests
+{% if case.inputs is defined and case.inputs.profile is defined %}
+      vars:
+        lme_profile: {{ case.inputs.profile | to_json }}
+{% endif %}
+
+{% if case.expect is defined and case.expect.resolved is defined %}
+{% for field, want in case.expect.resolved.items() %}
+    - name: "{{ case.invariant_task }} [{{ field }}]"
+      ansible.builtin.assert:
+        that:
+          - "{{ binding.names.resolved_dict_var }}.{{ field }} == {{ want | to_json }}"
+        fail_msg: {{ (case.fail_msg | default('resolved ' ~ field ~ ' != expected')) | to_json }}
+{% endfor %}
+{% endif %}
+{% if case.expect is defined and case.expect.origin is defined %}
+{% for field, origin in case.expect.origin.items() %}
+    - name: "{{ case.invariant_task }} [origin:{{ field }}]"
+      ansible.builtin.assert:
+        that:
+          - "{{ binding.names.input_record_var }}.{{ field }}.{{ binding.names.origin_field }} == {{ origin | to_json }}"
+        fail_msg: {{ (case.fail_msg | default('origin of ' ~ field ~ ' != ' ~ origin)) | to_json }}
+{% endfor %}
+{% endif %}
+{% if case.expect is defined and case.expect.members_include is defined %}
+    - name: "{{ case.invariant_task }} [members_include]"
+      ansible.builtin.assert:
+        that:
+{% for m in case.expect.members_include %}
+          - "{{ m | to_json }} in {{ binding.names.services_field }}"
+{% endfor %}
+        fail_msg: {{ (case.fail_msg | default('expected service member missing')) | to_json }}
+{% endif %}
+{% if case.expect is defined and case.expect.members_exclude is defined %}
+    - name: "{{ case.invariant_task }} [members_exclude]"
+      ansible.builtin.assert:
+        that:
+{% for m in case.expect.members_exclude %}
+          - "{{ m | to_json }} not in {{ binding.names.services_field }}"
+{% endfor %}
+        fail_msg: {{ (case.fail_msg | default('excluded service still present')) | to_json }}
+{% endif %}
+{%- endmacro %}
