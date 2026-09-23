@@ -497,7 +497,10 @@
 - name: Wait for containers to stop
   shell: |
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman ps --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "lme" || true
+    # Anchor to LME-owned containers (lme-* prefix). A bare lme substring match would
+    # treat a co-tenant container whose name merely contains lme as an LME container,
+    # poisoning the clean-stop data-safety signal derived from this result.
+    podman ps --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E '^lme-' || true
   args:
     executable: /bin/bash
   register: running_containers
@@ -514,7 +517,10 @@
   # Remove all stopped lme-* containers to give podman a clean slate on restart.
   shell: |
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    STALE=$(podman ps -a --filter name=lme --format "{{ '{{' }}.Names{{ '}}' }}" 2>/dev/null || true)
+    # Anchor to LME-owned containers (lme-* prefix). A bare name=lme filter is an
+    # unanchored substring match and would force-remove co-tenant containers whose
+    # name merely contains lme, destroying unrelated services on a shared host.
+    STALE=$(podman ps -a --format "{{ '{{' }}.Names{{ '}}' }}" 2>/dev/null | grep -E '^lme-' || true)
     if [ -n "$STALE" ]; then
       echo "$STALE" | xargs -r podman rm -f 2>/dev/null || true
     fi
@@ -529,8 +535,15 @@
   # stop/wait window and were force-killed (crash-consistent) rather than stopped
   # cleanly, so a volume copy taken now may be torn/inconsistent. Capture this signal
   # so the run is never reported as a clean SUCCESS.
+  # Fail-safe: a clean stop is affirmative evidence only. A missing, undefined, or
+  # failed wait result is NOT proof of a clean stop -- it is treated as UNCLEAN so a
+  # swallowed error can never read as clean.
   set_fact:
-    lme_backup_clean_container_stop: "{{ (running_containers.stdout_lines | default([]) | length) == 0 }}"
+    lme_backup_clean_container_stop: >-
+      {{ (running_containers is defined)
+         and (running_containers is not failed)
+         and (running_containers.stdout_lines is defined)
+         and ((running_containers.stdout_lines | length) == 0) }}
     lme_backup_unclean_containers: "{{ running_containers.stdout_lines | default([]) }}"
 
 - name: Display any running containers
@@ -676,12 +689,12 @@
       - Quadlet files: {{ 'SUCCESS' if lme_backup_result is success else 'FAILED' }}
       - Host systemd units: {{ 'SUCCESS' if lme_systemd_units_backup_result is defined and lme_systemd_units_backup_result is success else ('SKIPPED' if lme_systemd_units_backup_result is not defined else 'FAILED') }}
       - Secret manifest: {{ 'SUCCESS' if secret_mapping_result is defined and secret_mapping_result is success else 'FAILED' }}
-      - Containers stopped cleanly before copy: {{ 'YES' if lme_backup_clean_container_stop | default(true) | bool else ('NO - volume copy may be torn/inconsistent (' ~ (lme_backup_unclean_containers | default([]) | join(', ')) ~ ')') }}
+      - Containers stopped cleanly before copy: {{ 'YES' if lme_backup_clean_container_stop | default(false) | bool else ('NO - volume copy may be torn/inconsistent (' ~ (lme_backup_unclean_containers | default([]) | join(', ')) ~ ')') }}
       - Volumes: {{ successful_volumes.stdout | int }} of {{ lme_backup_selected_volumes | length }} successful
       - Failed volumes: {{ volume_backup.results | default([]) | selectattr('failed', 'eq', true) | map(attribute='item') | list | join(', ') if volume_backup.results is defined and (volume_backup.results | selectattr('failed', 'eq', true) | list | length > 0) else 'None' }}
       - Service restart: {{ 'SKIPPED - Services left stopped for rollback' if skip_service_restart | default(false) else ('SUCCESS' if service_start_result is success and started_containers.stdout_lines | length > 0 else 'FAILED') }}
 
-      Overall status: {{ 'UNSAFE - containers did not stop before the volume copy; backup may be torn/inconsistent and must not be trusted for restore' if not (lme_backup_clean_container_stop | default(true) | bool) else ('SUCCESS' if lme_backup_result is success and successful_volumes.stdout | int == lme_backup_selected_volumes | length else 'PARTIAL - See details above') }}
+      Overall status: {{ 'UNSAFE - containers did not stop before the volume copy; backup may be torn/inconsistent and must not be trusted for restore' if not (lme_backup_clean_container_stop | default(false) | bool) else ('SUCCESS' if lme_backup_result is success and successful_volumes.stdout | int == lme_backup_selected_volumes | length else 'PARTIAL - See details above') }}
   become: yes
   
 - name: Read final backup status
@@ -711,5 +724,5 @@
       {{ backup_base_dir }}/backups/{{ backup_timestamp }}. Resolve the stuck containers and
       re-run, or set backup_fail_on_unclean_stop=false to proceed anyway at your own risk.
   when:
-    - not (lme_backup_clean_container_stop | default(true) | bool)
+    - not (lme_backup_clean_container_stop | default(false) | bool)
     - backup_fail_on_unclean_stop | default(true) | bool
