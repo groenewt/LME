@@ -571,16 +571,21 @@ codex_0915_recovery_audit_dispositions:
   - id: D-BACKUP-IO-FAILURE-STATUS-STILL-LOST
     severity: high
     status: RESOLVED
-    commit: 54bd054
+    commit: [54bd054, 2de95fd]
     how: >-
       The producer 'Backup each volume' body captured `[ "$(ls -A)" ]` truthiness, which treats an
       unreadable mountpoint (ls error, empty stdout) as an empty volume and would certify an empty
       backup for a volume that actually holds unreadable data. It now captures the ls rc explicitly
       (SRC_ENTRIES=...; LS_RC=$?) and fails closed (FAILED status, no manifest, exit 1) on a non-zero
-      enumeration. Combined with the existing mountpoint-resolve guard, an I/O failure can no longer be
-      laundered into a successful/empty status. (Verified by inspection + syntax-check; a live unreadable
-      mountpoint is not reproducible in scratch without root, so this is stated as code-level, not a
-      scratch rc case.)
+      enumeration. The certify + verify on-disk volume ENUMERATIONS also had a caller-dependent gap:
+      `x="$(find | sort)"` takes sort's rc unless the caller set pipefail; 2de95fd wraps each in a
+      local `set -o pipefail` subshell so a find failure is caught regardless of caller.
+    behavioral_evidence: >-
+      Reproduced in scratch as NON-root via chmod 000 (task-body harness, both default and relocated):
+      the real producer body against a chmod-000 mountpoint -> FAILED status, exit 1, NO manifest;
+      lme_bundle_verify with a chmod-000 volumes/ dir -> nonzero; lme_bundle_certify (starting
+      uncertified) with a chmod-000 volumes/ dir -> nonzero and leaves NO certificate. (The earlier
+      contract note that this was 'not reproducible without root' was WRONG and is corrected here.)
   - id: D-BACKUP-EMPTY-RETRY-CERTIFIES-STALE-DATA
     severity: high
     status: PARTIAL
@@ -659,7 +664,26 @@ codex_0930_recovery_audit_dispositions:
   new_finding_open:
     - id: D-RESTORE-UNCERTIFIED-CLASSIFICATION-INPUTS
       severity: high
-      status: OPEN   # scoped + remediation planned; NOT implemented this wave (destructive-path behavior change)
+      status: RESOLVED   # commit 2de95fd (checks A/B confirmed the fix is bounded + safe)
+      resolution: >-
+        The restore topology probe now derives ES-volume selection ONLY from the CERTIFIED
+        etc_containers_systemd elasticsearch quadlet (a required tree content-verified by the
+        pre-mutation gate). cluster_recovery_note.txt is now a certifiable OPTIONAL file payload
+        (integrity.yml id cluster_recovery_note); when present the probe REQUIRES its certification
+        line AND agreement with the certified quadlet, else FAILS CLOSED (exit 9) BEFORE the
+        destructive decision. The uncertified etc/containers/systemd fallback is dropped as an
+        authority. Two premises confirmed before implementing: (Check A) cluster_backup_lme.yml
+        certifies via include_role: backup_lme, so cluster tarballs are certified on the same path;
+        (Check B) backup_lme writes the note only under when: lme_backup_is_cluster_install and copies
+        the ES quadlet into the certified etc_containers_systemd tree, so whenever the note exists the
+        certified quadlet already gives the topology (the completeness_anchor is NOT needed to trust
+        the note's absence). Task-body harness (30/30): planted uncertified note -> exit9; certified
+        agreeing note -> cluster; planted etc/containers/systemd fallback quadlet -> ignored.
+      residual: >-
+        A note that is BOTH re-certified AND paired with a tampered quadlet (full bundle re-forgery)
+        is not caught by self-consistency alone -- that is the SAME under-declaration/authenticity gap
+        as completeness_anchor + signature (OPEN, routed to C1/B), not specific to this input.
+      superseded_status_note: "This entry previously read OPEN/deferred; implemented after checks A/B."
       evidence: >-
         restore_lme_master.yml "Detect Elasticsearch topology" (281-299) steers the DESTRUCTIVE ES-volume
         restore decision (restore_es_volumes, 305-308) from inputs that are NOT bound by the bundle
@@ -697,11 +721,17 @@ codex_0930_recovery_audit_dispositions:
 validation:
   behavioral:
     - "testing/tests/unit/test_backup_integrity.py -- 10 cases (FROZEN, superseded-pending-declarative): non-vacuity rc5, self-consistency honest-limit, missing cert rc3, torn cert rc4, producer gate, ordering, no-listing-fallback rc3, real-producer-writes-matching-digest, real-torn-copy-refused, real producer->certify->restore-gate roundtrip. PASS (10/10) against the rewritten library."
-    - "testing/tests/unit/test_restore_master_secrets.py -- secret restore create/preverify/prune. PASS. Full D suite 37/37 PASS."
+    - "testing/tests/unit/test_restore_master_secrets.py -- secret restore create/preverify/prune. PASS. D backup/restore unit files 16/16 (backup_integrity 10 + restore_master_secrets 6) after this wave. Full D-OWNED unit set (backup/restore + postgresql-platform) = 71 passed / 6 skipped. NOTE: the earlier '37/37' figure was STALE (suite grew); corrected here. The peer test_tailscale_composition.py has a pre-existing collection ImportError (network domain, NOT D-owned, untouched by this wave) that blocks a whole-dir pytest run -- the D files above were run explicitly."
     - "scratch (non-durable) fail-closed rc matrix on the ansible-lookup-rendered library: certify rc0 / verify rc0; tree tamper rc5; volume+manifest co-edit with intact cert rc5; deleted certified volume rc7; extra on-disk volume rc8; unreadable file in required tree -> certify REFUSES nonzero; empty volume certifiable. Real task-body roundtrip (producer happy SUCCESS+manifest / torn FAILED+no-manifest / certify rc0 / restore-gate rc0 / gate tamper rc5)."
     - "scratch (non-durable) rc matrix, codex-0915 wave (commits 54bd054 + d493a58), 20 cases: the above PLUS certify-refuse-nodata-volume rc1 (+leaves no cert), extra-ondisk-volume-NO-data rc8, finalize-torn rc1 (no manifest), content-sha read-failure fail-closed (nonzero + EMPTY stdout), and the new lme_verify_content_manifest cases (clean rc0 / missing-manifest rc3 / missing-data rc3 / legacy-no-content-field rc3 / content-mismatch rc4). RESULT: 20/20 on DEFAULT names AND 20/20 with volume_layout AND manifest_fields FULLY RENAMED (relocation proof, zero executable edits). The fail-closed `:?` guard aborts sourcing on an under-declared declaration key (verified: body unreached)."
+    - "scratch (non-durable) TASK-BODY harness (commit 2de95fd wave), 30/30, DEFAULT and FULLY-RENAMED: extracts the REAL Ansible task bodies (producer 'Backup each volume', 'Certify the backup bundle', restore 'Verify backup bundle certification' gate, restore 'Verify each selected volume matches ... content manifest', and 'Detect Elasticsearch topology') and runs them under their OWN set -euo pipefail (imports the frozen test helpers; does NOT edit the frozen file). Cases: producer IO-failure on a chmod-000 mountpoint -> FAILED/exit1/no-manifest; verify + certify enumeration on a chmod-000 volumes/ -> nonzero (certify leaves NO cert); restore gate rc0; per-volume manifest check clean rc0 / legacy-no-content rc3 / mismatch rc4; topology single-node -> single-node; certified agreeing note -> cluster; PLANTED uncertified note -> REFUSE exit9; planted etc/containers/systemd fallback quadlet -> ignored. Exercises the d493a58 restore consumer body and the 2de95fd topology probe that syntax-check alone did not run."
+  behavior_changes:
+    - "Pre-certification (legacy) bundles are REFUSED at restore (rc3) with an operator remedy message -- NO listing_sha256 fallback, no ignore-integrity switch. A pre-content-digest per-volume manifest is likewise rc3."
+    - "An UNCERTIFIED or PARTIAL backup now FAILS the backup play (no override) -- it can no longer report success to a consumer (rollback_lme.yml gates its destructive rm on the backup succeeding)."
+    - "content_integrity.sh.j2 aborts sourcing (`:?`) if the declaration under-declares a volume_layout/manifest_fields key -- an incomplete declaration fails closed instead of rendering an empty path."
+    - "Restore ES-volume topology is now decided ONLY from certified content; a present-but-uncertified or disagreeing cluster_recovery_note.txt fails the restore closed (exit 9) before the destructive volume decision."
   syntax_only:
-    - "ansible-playbook --syntax-check ansible/backup_lme.yml + ansible/restore_lme_master.yml + ansible/rollback_lme.yml -- PASS. cluster_backup_lme.yml needs an inventory (pre-existing hosts: group dependency, unmodified by D)."
+    - "ansible-playbook --syntax-check ansible/backup_lme.yml + ansible/restore_lme_master.yml -- PASS (rc=0) after every edit this wave (an apostrophe in a new producer comment tripped split_args once and was fixed). rollback_lme.yml also syntax-checks. cluster_backup_lme.yml needs an inventory (pre-existing hosts: group dependency, unmodified by D)."
     - "Ansible split_args balance scan over every shell/command body in both task files -- NONE unbalanced. yaml.safe_load(_all) -- PASS."
   version_caveat: "All renders/behavioral runs on ansible-core 2.17.14; the deploy target is 2.19.11 (data-tagging/templating) -- behavior there is UNVERIFIED (no 2.19 venv on this host). The ansible lookup('template') render was cross-checked functionally identical to the plain-jinja2 render used by the tests."
   runtime_acceptance: OPEN
@@ -710,7 +740,9 @@ validation:
     - Backup generation/revision + interrupted-operation identity model -- routed to B.
     - Declarative test harness to replace the frozen Python (modeled on G loader_integration) -- spec routed to G.
     - "rollback_lme.yml: fold the parallel recovery consumer onto the shared library (declaration + lme_verify_content_manifest) AND add the lme_bundle_verify pre-mutation certification gate it currently BYPASSES -- dedicated, separately validated change (D-owned, NOT routed to G). This is the material fail-closed residual from codex-0915 #5."
-    - "D-RESTORE-UNCERTIFIED-CLASSIFICATION-INPUTS (codex-0930, NEW HIGH): bind the restore topology-steering inputs (cluster_recovery_note.txt + the ES quadlet path) to the certified payload contract and fail closed on an uncertified/absent/disagreeing steering input BEFORE the destructive ES-volume decision. See codex_0930_recovery_audit_dispositions.new_finding_open for the fail-closed remediation plan; needs completeness_anchor (C1/B) + cluster-tarball layout coordination (B)."
+    # D-RESTORE-UNCERTIFIED-CLASSIFICATION-INPUTS (codex-0930 HIGH) is now RESOLVED (commit 2de95fd);
+    # see codex_0930_recovery_audit_dispositions.new_finding_open. Only the shared full-forgery residual
+    # (re-certified note + tampered quadlet) remains, folded into completeness_anchor/signature (C1/B).
     - Per-secret content digest + owner assertion; RESTORE-PARTIAL-REPLACEMENT idempotency (native rehearsal).
     - LEGACY-BUNDLE isolated qualification + byte preservation; recovery-status-record (play-level pessimistic status).
     - Guardian authority seam (REJOIN/FENCE serialization) -- see fencing-protocol.contract.yaml; joint C/D transition contract (codex-0845).
