@@ -311,44 +311,38 @@
       distributable set (C1-MATERIAL-CATALOG-DEFINITION-VALIDATION / A2).
     quiet: true
 
-- name: C1 -- derive the per-host node id + validated stable deployment identity
-  ansible.builtin.set_fact:
-    # Node id = the per-host map key for the projections. inventory_hostname is the demo
-    # value; node-id derivation from declared inventory is D/inventory-owned (D FROZEN R2).
-    _lme_node_id: "{{ inventory_hostname }}"
-    # deployment_identity is validated HERE (shape gate) when supplied; absent -> None, so
-    # material resource_ids emit null and a persistent-resource consumer rejects until it is
-    # declared (the hard 'required' gate arms with the DB selectors).
-    _lme_deployment_identity: >-
-      {{ (lme_resolved.lme_deployment_identity | lme_validate_deployment_identity)
-         if (lme_resolved.lme_deployment_identity is defined) else None }}
-
-- name: C1 -- compose the required_material / datastore / membership projections
-  ansible.builtin.set_fact:
-    _lme_required_material_proj: >-
-      {{ lme_services | lme_project_required_material(
-           _lme_node_id,
-           lme_global.material_catalog,
-           _lme_global_file.lme_config_registry.material_requirements_schema,
-           lme_global.material_catalog_schema,
-           lme_enable_flags | default({}),
-           lme_host_services | default([]),
-           _lme_deployment_identity) }}
-    _lme_datastore_proj: >-
-      {{ lme_services | lme_project_datastore_clients(
-           _lme_node_id, lme_enable_flags | default({}), lme_host_services | default([])) }}
-    _lme_membership_proj: >-
-      {{ lme_resolved.lme_database_membership | default(None) | lme_project_database_membership }}
-
-- name: C1 -- merge the projections into the single canonical artifact lme_resolved
+# C1 -- compose the required_material / datastore / membership projections and MERGE them
+# into the single canonical artifact lme_resolved. The three projections, the per-host node
+# id (inventory_hostname) AND the validated deployment identity are computed INLINE (as
+# expressions, NOT named set_facts). So an `-e _lme_required_material_proj={}` (and the
+# datastore/membership/node-id/deployment-identity siblings) can no longer SUPPRESS a
+# projection while the read-back below recomputes from that SAME pinned intermediate and
+# agrees -- there is no such intermediate to pin (C1-PROJECTION-READBACK-TRUSTS-PINNED-
+# INTERMEDIATES). Each projection is a FAITHFUL derivation from the admitted inputs
+# (lme_services, the material catalog, the enable flags, the host service scope, the resolved
+# membership). node-id derivation from declared inventory is D/inventory-owned (D FROZEN R2);
+# the deployment identity is shape-validated inline via lme_validated_deployment_identity, so
+# an -e-pinned intermediate cannot bypass the gate and emit null resource_ids for a real id.
+# RESIDUAL (same class, broader): lme_services / lme_host_services / lme_global / lme_host_
+# rendered_services are still set_facts -- but they are IN the revision payload, so a pin
+# MOVES the revision (not a silent desync); an anchor for those is owed.
+- name: C1 -- compose + merge the material/datastore/membership projections (inline; untamperable)
   ansible.builtin.set_fact:
     lme_resolved: >-
       {{ lme_resolved
-         | combine(_lme_required_material_proj, recursive=True)
-         | combine(_lme_datastore_proj, recursive=True)
-         | combine(_lme_membership_proj, recursive=True)
-         | combine({'deployment_identity': _lme_deployment_identity}
-                   if _lme_deployment_identity else {}) }}
+         | combine(lme_services | lme_project_required_material(
+                     inventory_hostname, lme_global.material_catalog,
+                     _lme_global_file.lme_config_registry.material_requirements_schema,
+                     lme_global.material_catalog_schema, lme_enable_flags | default({}),
+                     lme_host_services | default([]),
+                     _lme_resolution.resolved | lme_validated_deployment_identity), recursive=True)
+         | combine(lme_services | lme_project_datastore_clients(
+                     inventory_hostname, lme_enable_flags | default({}),
+                     lme_host_services | default([])), recursive=True)
+         | combine(_lme_resolution.resolved.lme_database_membership | default(None)
+                     | lme_project_database_membership, recursive=True)
+         | combine({'deployment_identity': (_lme_resolution.resolved | lme_validated_deployment_identity)}
+                   if (_lme_resolution.resolved | lme_validated_deployment_identity) else {}) }}
 
 # COMPLETE-REVISION REBIND (C1-COMPLETE-RESOLVED-REVISION, codex-0645). resolve.yml computed a
 # CONFIG-ONLY revision before lme_services / lme_global / the material+datastore+membership
@@ -372,18 +366,30 @@
 
 # READ-BACK GUARD for the complete revision + the post-projection artifact (mirrors resolve.yml).
 # A pinned lme_resolved (post-merge) or lme_resolved_revision is a set_fact no-op that then
-# disagrees with the inline recompute here. (An -e lme_service_overrides / lme_global_override is
-# NOT a silent desync: it changes lme_services/lme_global, which are now IN the revision payload,
-# so the revision moves with the rendered units.)
+# disagrees with the inline recompute here. The projections are RECOMPUTED from the admitted
+# inputs via _lme_resolution.resolved (NOT the post-merge lme_resolved, and NOT a pinnable
+# projection intermediate), so completeness is proven by FAITHFUL RECOMPUTATION, not by
+# equality between two uses of an overridable intermediate. (An -e lme_service_overrides /
+# lme_global_override is NOT a silent desync: it changes lme_services/lme_global, which are now
+# IN the revision payload, so the revision moves with the rendered units.)
 - name: C1 -- read-back guard for the complete revision + post-projection lme_resolved (reject -e pins)
   ansible.builtin.assert:
     that:
       - >-
         lme_resolved == (_lme_resolution.resolved
-           | combine(_lme_required_material_proj, recursive=True)
-           | combine(_lme_datastore_proj, recursive=True)
-           | combine(_lme_membership_proj, recursive=True)
-           | combine({'deployment_identity': _lme_deployment_identity} if _lme_deployment_identity else {}))
+           | combine(lme_services | lme_project_required_material(
+                       inventory_hostname, lme_global.material_catalog,
+                       _lme_global_file.lme_config_registry.material_requirements_schema,
+                       lme_global.material_catalog_schema, lme_enable_flags | default({}),
+                       lme_host_services | default([]),
+                       _lme_resolution.resolved | lme_validated_deployment_identity), recursive=True)
+           | combine(lme_services | lme_project_datastore_clients(
+                       inventory_hostname, lme_enable_flags | default({}),
+                       lme_host_services | default([])), recursive=True)
+           | combine(_lme_resolution.resolved.lme_database_membership | default(None)
+                       | lme_project_database_membership, recursive=True)
+           | combine({'deployment_identity': (_lme_resolution.resolved | lme_validated_deployment_identity)}
+                     if (_lme_resolution.resolved | lme_validated_deployment_identity) else {}))
       - >-
         lme_resolved_revision == (lme_resolved | lme_bind_revision(
            _lme_global_file.lme_config_registry,

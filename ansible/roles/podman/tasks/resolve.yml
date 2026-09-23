@@ -57,6 +57,28 @@
     file: "{{ lme_manifests_dir }}/profiles/{{ lme_profile }}.yml"
     name: _lme_profile_file
 
+# P2 -- BIND the loaded config facts to the declared SOURCE BYTES (codex-0915/0930). The
+# loader trusts _lme_global_file (the config registry + the material_catalog security
+# boundary) and _lme_profile_file, but both are include_vars FACTS and an extra-var OUTRANKS
+# include_vars: `-e _lme_global_file=<forged registry>` would replace the whole admitted
+# catalog/registry with an operator value, while every downstream check (the catalog-override
+# gate, the split-brain invariant below) reused that SAME overridable fact and agreed.
+# Independently re-read the two manifests from disk with an INLINE lookup (an expression, so
+# an extra-var cannot pin it) and assert the loaded facts EQUAL the declared file bytes. The
+# manifests are Jinja-free, so a whole-fact equality is exact. Fail-closed, pre-mutation.
+- name: Bind the loaded config facts to the declared manifest bytes (fail-closed, pre-mutation)
+  ansible.builtin.assert:
+    that:
+      - _lme_global_file == (lookup('ansible.builtin.file', lme_manifests_dir ~ '/global.yml') | from_yaml)
+      - _lme_profile_file == (lookup('ansible.builtin.file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | from_yaml)
+    fail_msg: >-
+      the loaded global.yml / profile overlay fact does not match the declared manifest bytes
+      on disk -- an -e _lme_global_file / _lme_profile_file (or a tampered load) replaced the
+      admitted registry / material_catalog / profile with external state. The declared manifest
+      file is the sole authority for the config registry and the material security boundary
+      (C1-CATALOG-BOUND-TO-DECLARED-BYTES).
+    quiet: true
+
 # --- C1 caller-input contract: capture pristine operator selections, compose, resolve ---
 # codex-manager-caller-contract-decisions-20260923-0200 + advisor split-brain correction.
 #
@@ -85,10 +107,15 @@
 # B/E normalizing their entrypoints to set lme_inputs.selections themselves.
 - name: Capture pristine operator selections once (C1-private fact; never lme_inputs)
   ansible.builtin.set_fact:
-    _lme_operator_selections: "{{ dict(_lme_sel_keys | zip(_lme_sel_keys | map('extract', vars) | list)) }}"
-  vars:
-    _lme_reg_keys: "{{ _lme_global_file.lme_config_registry.fields.keys() | list }}"
-    _lme_sel_keys: "{{ _lme_reg_keys | select('in', vars) | list }}"
+    # Registry field list + present-in-scope subset are computed INLINE (not task `vars:`):
+    # an extra-var outranks a task var, so `-e _lme_sel_keys=[]` / `-e _lme_reg_keys=[]`
+    # would otherwise empty the capture and discard every admitted selection while a
+    # read-back recomputed from the same pinned object agreed (C1-DERIVED-EFFECTIVE-INPUTS-
+    # PIN, one hop up). The split-brain invariant at the end of this file is the backstop.
+    _lme_operator_selections: >-
+      {{ dict((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list)
+              | zip((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list)
+                    | map('extract', vars) | list)) }}
   when: _lme_operator_selections is not defined
 
 # C1-CONFLICTING-INPUT-PRECEDENCE. Before composing, REJECT the ambiguous case where the
@@ -112,38 +139,28 @@
       one precedence contract or drop the conflicting namespaced key.
     quiet: true
 
-# Effective resolver inputs, recomputed EACH load (no snapshot): the pristine operator
-# capture supplies selections + honest `operator` origins; a NORMALIZED caller's explicit
-# lme_inputs parts combine ON TOP (its selections override per key -- but a CONFLICTING key
-# was already rejected above, so this combine only ADDS caller-only keys or reasserts an
-# AGREEING value; its observations and caller-verified finer origins are honoured).
-# combine() is per-key, so an unrelated observation never clears an operator selection --
-# the split-brain fix. A key present only in the caller's selections (not in bare scope)
-# carries no origin here and is honestly labelled `operator` by the engine (_honest_origin).
-- name: Compose effective resolver inputs (pristine operator capture + caller lme_inputs)
-  ansible.builtin.set_fact:
-    _lme_eff_inputs:
-      selections: "{{ _lme_operator_selections | combine(lme_inputs.selections | default({})) }}"
-      observations: "{{ lme_inputs.observations | default({}) }}"
-      origins: >-
-        {{ dict(_lme_operator_selections.keys() | zip(['operator'] * (_lme_operator_selections | length)))
-           | combine(lme_inputs.origins | default({})) }}
-
-# Resolve every declared field by ITERATING registry.precedence into a NAMESPACED
-# result (resolved + origins + enable_flags). The pure resolver reads ONLY the composed
-# effective inputs + the profile overlay + the registry, so re-running it each load is
-# self-capture-free. RE-RUN each load (NOT cached): a profile switch or an explicit
-# lme_inputs change on a subsequent load is reflected (codex resolution_lifetime / Q2.7).
-# Required-missing / undeclared-key / type violations RAISE here, before any mutation.
-- name: Resolve config (pure engine; iterates registry.precedence; re-run each load)
+# Resolve every declared field from the ADMITTED inputs, by ITERATING registry.precedence
+# into a NAMESPACED result (resolved + origins + enable_flags). The effective-input
+# COMPOSITION (pristine operator capture + caller lme_inputs: caller selections combine per
+# key over the operator capture -- a genuine disagreement was already rejected above; caller
+# observations + caller-verified finer origins are honoured; each operator key carries the
+# honest `operator` origin) is folded INTO the value-pure lme_resolve_from_admitted filter
+# and called INLINE here -- an expression, NOT a named `_lme_eff_inputs` set_fact. So an
+# `-e _lme_eff_inputs={selections:{},...}` can no longer DISCARD an admitted selection while
+# a read-back recomputed from the SAME pinned object agrees: there is no such intermediate
+# to pin (C1-DERIVED-EFFECTIVE-INPUTS-PIN). The resolver reads ONLY the registry, the
+# profile overlay, the pristine operator capture and the caller inputs, so re-running it
+# each load is self-capture-free (a profile switch / explicit lme_inputs change on a later
+# load is reflected -- codex resolution_lifetime / Q2.7). Required-missing / undeclared-key /
+# type violations RAISE here, before any mutation.
+- name: Resolve config from admitted inputs (pure engine; faithful derivation; re-run each load)
   ansible.builtin.set_fact:
     _lme_resolution: >-
       {{ _lme_global_file.lme_config_registry
-         | lme_resolve_config(
+         | lme_resolve_from_admitted(
              (_lme_profile_file.profile_overlay.vars | default({})),
-             _lme_eff_inputs.selections,
-             _lme_eff_inputs.observations,
-             _lme_eff_inputs.origins) }}
+             _lme_operator_selections,
+             lme_inputs | default({})) }}
 
 # VALIDATE via the LITERAL shared task (also run by the C1 A1 regression case) BEFORE any
 # mutation. registry-FIRST pipe; the engine's shape gate makes a reversed argument fail
@@ -199,18 +216,24 @@
 # set_fact a no-op, so the fact then DISAGREES with the value recomputed inline here (the
 # inline filter calls are expressions, not variables, so they cannot be pinned). This closes
 # the narrow-desync class (a downstream fact pinned while the real resolver diverges):
-#   * _lme_resolution pinned  -> disagrees with the re-run of lme_resolve_config
-#   * lme_resolved / lme_enable_flags pinned -> disagree with _lme_resolution.*
+#   * _lme_resolution pinned  -> disagrees with the re-run of lme_resolve_from_admitted
+#     (which recomputes from the pristine operator capture + lme_inputs, NOT from a pinnable
+#     _lme_eff_inputs intermediate)
+#   * lme_resolved / lme_resolved_origins / lme_enable_flags pinned -> disagree with
+#     _lme_resolution.* (origins is now checked too -- a pinned origin read 'default' where
+#     the admitted selection was 'operator')
 #   * lme_resolved_revision pinned -> disagrees with the re-run of lme_bind_revision
 # A wholesale pin of an upstream INPUT (e.g. the registry) changes every recompute
 # consistently AND the deploy that follows it, so it is not a silent desync and is out of
-# scope here. Runs on the supported path BEFORE any mutation (the site.yml / elasticsearch.yml
-# pre-mutation barriers include this file), so a pin fails closed pre-mutation.
-- name: Read-back guard -- reject an -e-pinned resolution / resolved config / revision (untamperable)
+# scope here (and _lme_global_file / _lme_profile_file are separately bound to the declared
+# manifest bytes above). Runs on the supported path BEFORE any mutation (the site.yml /
+# elasticsearch.yml pre-mutation barriers include this file), so a pin fails closed.
+- name: Read-back guard -- reject an -e-pinned resolution / resolved config / origins / revision (untamperable)
   ansible.builtin.assert:
     that:
-      - _lme_resolution == (_lme_global_file.lme_config_registry | lme_resolve_config((_lme_profile_file.profile_overlay.vars | default({})), _lme_eff_inputs.selections, _lme_eff_inputs.observations, _lme_eff_inputs.origins))
+      - _lme_resolution == (_lme_global_file.lme_config_registry | lme_resolve_from_admitted((_lme_profile_file.profile_overlay.vars | default({})), _lme_operator_selections, lme_inputs | default({})))
       - lme_resolved == _lme_resolution.resolved
+      - lme_resolved_origins == _lme_resolution.origins
       - lme_enable_flags == _lme_resolution.enable_flags
       - >-
         lme_resolved_revision == (_lme_resolution.resolved | lme_bind_revision(
@@ -218,10 +241,10 @@
            [{'name': lme_profile,
              'sha256': lookup('file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | hash('sha256')}]))
     fail_msg: >-
-      a resolver output fact (resolution, resolved config, enable flags or config revision) was
-      pre-supplied / -e-pinned and disagrees with its freshly recomputed value -- the canonical
-      derived artifact and its revision inputs must not be overridden by external state
-      (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
+      a resolver output fact (resolution, resolved config, origins, enable flags or config
+      revision) was pre-supplied / -e-pinned and disagrees with its freshly recomputed value --
+      the canonical derived artifact and its revision inputs must not be overridden by external
+      state (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN / C1-DERIVED-EFFECTIVE-INPUTS-PIN).
     quiet: true
 
 # OPEN DEBT (codex resolution_lifetime -- explicitly transitional, removed as consumer
@@ -262,3 +285,39 @@
        | rejectattr('key', 'in', _lme_resolution.resolved.keys() | list) | list }}
   loop_control:
     label: "{{ item.key }}"
+
+# POST-BRIDGE SPLIT-BRAIN INVARIANT (C1-DERIVED-EFFECTIVE-INPUTS-PIN closure). Inert-ing the
+# _lme_eff_inputs intermediate above defeats the exact `-e _lme_eff_inputs={}` counterexample,
+# but a pin can move ONE HOP UP (`-e _lme_operator_selections={}`, or a future derived
+# intermediate) and again DISCARD an admitted selection with an internally-consistent
+# read-back. This is the un-forgeable backstop: for EVERY registry field whose bare compat
+# fact is in scope, the bare value MUST agree (by DECLARED TYPE, so a valid equivalent
+# representation like the string 'false' is not a disagreement) with the canonical
+# lme_resolved value. A bare-name fact is a set_fact (Ansible var precedence 19), overwritten
+# by role/include params and extra-vars (20-22) -- so a bare != resolved key can ONLY come
+# from a higher-precedence operator input the resolution dropped, exactly the split-brain
+# (inventory/play/role-default values <=15 are overwritten by the bridge and can never
+# false-trip it). Runs on the supported path BEFORE any mutation (site.yml / elasticsearch.yml
+# barriers include this file), so a discarded declaration fails closed pre-mutation. The
+# registry-key subset of `vars` is built INLINE (no pinnable task var). NB an entrypoint that
+# passes a registry field as a BARE include_role var whose value the resolver then ignores
+# would trip this (correct behaviour: an entrypoint declares selections via lme_inputs, never
+# a bare role var); upgrade_lme's two resolve includes both build identical lme_inputs, so
+# they pass.
+- name: Read-back guard -- no split-brain between the bare compat facts and lme_resolved (untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_lme_global_file.lme_config_registry
+         | lme_split_brain_keys(
+             dict((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list)
+                  | zip((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list)
+                        | map('extract', vars) | list)),
+             lme_resolved)) | length == 0
+    fail_msg: >-
+      a bare config fact in scope disagrees with the canonical lme_resolved value for registry
+      field(s) {{ _lme_global_file.lme_config_registry | lme_split_brain_keys(dict((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list) | zip((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list) | map('extract', vars) | list)), lme_resolved) }}
+      -- a higher-precedence operator input (or a pinned derived intermediate) was admitted
+      into scope but DISCARDED from resolution (split-brain). The canonical artifact must
+      faithfully reflect every admitted declaration (C1-DERIVED-EFFECTIVE-INPUTS-PIN).
+    quiet: true

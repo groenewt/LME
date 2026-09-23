@@ -1237,6 +1237,20 @@ def lme_validate_deployment_identity(value, context=None):
     return value
 
 
+def lme_validated_deployment_identity(resolved):
+    """Return the VALIDATED stable deployment_identity from a resolved config dict, or None
+    when the optional field is unset. Lets load_manifests.yml derive the identity INLINE in
+    the projection compose + its read-back (no pinnable `_lme_deployment_identity` set_fact
+    that both reuse), so an `-e _lme_deployment_identity=<forged>` cannot bypass
+    lme_validate_deployment_identity (the shape gate still runs on the resolved value).
+    Value-pure."""
+    resolved = resolved or {}
+    val = resolved.get('lme_deployment_identity')
+    if val is None:
+        return None
+    return lme_validate_deployment_identity(val)
+
+
 def lme_material_resource_id(deployment_identity, node, svc, obligation_id):
     """Stable resource id for a material obligation: content-addressed over the DEPLOYMENT
     identity + node + service + obligation id (codex-0430: tied to deployment/declared
@@ -1402,9 +1416,13 @@ def lme_selection_conflicts(operator_selections, caller_selections, registry=Non
     bool false all denote the SAME selection, so they must NOT be flagged as a conflict;
     only a genuine value disagreement (true vs false) is. When a `registry` is supplied both
     sides are canonicalized through _coerce_declared (the resolver's own coercion) before
-    comparison. A key absent from the registry, or a value that will not coerce, falls back
-    to a RAW compare -- fail-closed: an uncanonicalizable disagreement still surfaces as a
-    conflict, and the malformed value is caught by the resolver's typed validation anyway."""
+    comparison. A key absent from the registry falls back to a RAW compare. A value that will
+    NOT canonicalize to the declared type (e.g. an int 0 for a bool field) is NOT compared
+    raw -- Python 0 == False would launder the malformed input into the caller's clean value
+    with NO conflict -- it is surfaced as a CONFLICT (fail-closed) so admission REJECTS the
+    invalid declared-type input (C1-CONFLICT-COERCION-FAILURE-RAW-EQUALITY). A valid
+    equivalent representation (string 'false' vs bool false) still canonicalizes and agrees,
+    so it is NOT a conflict."""
     op = operator_selections or {}
     caller = caller_selections or {}
     fields = (registry or {}).get('fields') if isinstance(registry, dict) else None
@@ -1420,9 +1438,96 @@ def lme_selection_conflicts(operator_selections, caller_selections, registry=Non
                 ov = _coerce_declared(op[k], field)
                 cv = _coerce_declared(caller[k], field)
             except (ValueError, TypeError):
-                ov, cv = op[k], caller[k]  # raw fallback (fail-closed)
+                # C1-CONFLICT-COERCION-FAILURE-RAW-EQUALITY: an operator (or caller) value
+                # that will NOT canonicalize to the DECLARED type (e.g. an int 0 for a bool
+                # field) cannot be proven equal to the other side. The prior raw fallback
+                # (ov, cv = op[k], caller[k]) was fail-OPEN, not fail-closed: Python 0 ==
+                # False (and '' == 0, etc.) let a malformed declared-type input be laundered
+                # into the caller's clean value with NO conflict raised, so combine() then
+                # replaced it and the resolver's typed validation only ever saw a valid bool.
+                # Surface it as a CONFLICT so admission REJECTS the invalid declared-type
+                # input at the pristine-selection gate; a VALID equivalent representation
+                # (string 'false' for a bool) still canonicalizes above and agrees.
+                out.append(k)
+                continue
         if ov != cv:
             out.append(k)
+    return sorted(out)
+
+
+def lme_resolve_from_admitted(registry, profile_vars=None, operator_selections=None,
+                              caller_inputs=None):
+    """Compose the effective resolver inputs from the PRISTINE admitted operator capture
+    (`operator_selections`) + the caller-normalized lme_inputs (`caller_inputs`), then
+    resolve -- in ONE value-pure call with NO overridable intermediate task fact
+    (C1-DERIVED-EFFECTIVE-INPUTS-PIN). Previously resolve.yml composed a NAMED
+    `_lme_eff_inputs` set_fact that both the resolver and its read-back guard read; an
+    `-e _lme_eff_inputs={selections:{},...}` outranked the set_fact and DISCARDED the
+    admitted selection, while the guard recomputed from that SAME pinned object and agreed
+    (an internally-consistent discard). Folding the composition HERE and calling this
+    filter inline (an expression, not a variable, so extra-vars cannot pin it) makes that
+    intermediate a dead name: the derivation is faithful to the admitted declarations +
+    operator inputs. Replicates resolve.yml's compose exactly: caller selections combine
+    over the operator capture per key (a genuine disagreement was already rejected by the
+    conflict gate); observations come only from the caller; each operator key carries the
+    honest `operator` origin and a caller-verified finer origin combines on top. Returns
+    {resolved, origins, enable_flags}."""
+    op = dict(operator_selections or {})
+    caller = caller_inputs if isinstance(caller_inputs, dict) else {}
+    caller_sel = caller.get('selections') or {}
+    caller_obs = caller.get('observations') or {}
+    caller_orig = caller.get('origins') or {}
+    selections = dict(op)
+    selections.update(caller_sel)
+    origins = {k: _COMBINED_OPERATOR for k in op}
+    origins.update(caller_orig)
+    return lme_resolve_config(registry, profile_vars or {}, selections, caller_obs, origins)
+
+
+def lme_split_brain_keys(registry, bare_scope, resolved):
+    """POST-BRIDGE split-brain invariant (C1-DERIVED-EFFECTIVE-INPUTS-PIN closure). After
+    resolve.yml materialises the bare-name compat facts, this returns every registry key
+    whose BARE value in scope disagrees with the canonical `resolved` value -- compared by
+    the DECLARED TYPE, so a valid equivalent representation (the string 'false' for a bool)
+    is NOT a disagreement. Such a key is a split-brain: a value the resolution DISCARDED
+    while a higher-precedence bare input kept it.
+
+    Why this catches EVERY pin hop in one place: a bare-name fact is written by set_fact
+    (Ansible var precedence 19), which is OVERWRITTEN by role/include params and extra-vars
+    (20-22). So a bare != resolved key can ONLY arise from a higher-precedence operator
+    input that the resolution dropped -- exactly the discarded-declaration condition,
+    whether the pin landed on `_lme_eff_inputs`, `_lme_operator_selections`,
+    `_lme_sel_keys`/`_lme_reg_keys`, or any future derived intermediate. Inventory/play/role
+    -default values (<=15) are overwritten by the bridge, so they can never false-trip it.
+
+    A declared OPTIONAL absent from `resolved` is allowed IFF its bare value equals the
+    field's declared `bridge_absent` (the sanctioned 'unset' compat value the loader resets
+    it to); a bare key present in scope but absent from `resolved` with no `bridge_absent`
+    sanction is itself a dropped selection. Value-pure; returns the sorted offending keys
+    (empty == consistent)."""
+    fields, _precedence, _channels = _require_registry_shape(registry)
+    bare_scope = bare_scope or {}
+    resolved = resolved or {}
+    out = []
+    for key, field in fields.items():
+        if key not in bare_scope:
+            continue
+        bv = bare_scope[key]
+        if key in resolved:
+            try:
+                if _coerce_declared(bv, field) != _coerce_declared(resolved[key], field):
+                    out.append(key)
+            except (ValueError, TypeError):
+                # the bare value is not even a valid declared-type representation of the
+                # resolved value -> a discarded/laundered declaration (fail-closed).
+                out.append(key)
+        elif 'bridge_absent' in field:
+            if bv != field['bridge_absent']:
+                out.append(key)
+        else:
+            # present in the bare scope, absent from resolved, no sanctioned 'unset' value:
+            # a selection was admitted into scope and then dropped from resolution.
+            out.append(key)
     return sorted(out)
 
 
@@ -1461,12 +1566,15 @@ class FilterModule(object):
             'lme_validate_material_requirements': lme_validate_material_requirements,
             'lme_validate_material_catalog': lme_validate_material_catalog,
             'lme_validate_deployment_identity': lme_validate_deployment_identity,
+            'lme_validated_deployment_identity': lme_validated_deployment_identity,
             'lme_material_resource_id': lme_material_resource_id,
             'lme_project_required_material': lme_project_required_material,
             'lme_project_datastore_clients': lme_project_datastore_clients,
             'lme_project_database_membership': lme_project_database_membership,
             'lme_validate_dependency_closure': lme_validate_dependency_closure,
             'lme_selection_conflicts': lme_selection_conflicts,
+            'lme_resolve_from_admitted': lme_resolve_from_admitted,
+            'lme_split_brain_keys': lme_split_brain_keys,
             'render_userns': render_userns,
             'userns_base': userns_base,
             'cert_owner': cert_owner,
