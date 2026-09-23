@@ -534,6 +534,21 @@ def _require_registry_shape(registry):
             raise ValueError(
                 'lme: field %r declares origin %r (inferred/derived) and therefore MUST NOT '
                 'carry a default -- an inferred value is not an explicit choice' % (key, field.get('origin')))
+        # OBSERVATION-ONLY shape (C1-OBSERVATION-ORIGIN-DOES-NOT-RESTRICT-CHANNEL). A field that
+        # may be filled ONLY by the observation channel must be self-consistent: it declares
+        # origin: observation (so it carries no default and its honest origin is `observation`)
+        # AND upgrade_fallback: true (the observation channel's requires_field -- without it the
+        # observation tier could never fill the field, making observation_only a dead declaration).
+        if field.get('observation_only'):
+            if field.get('origin') != 'observation':
+                raise ValueError(
+                    'lme: field %r is observation_only but does not declare origin: observation '
+                    '-- an observation-only field must be honestly labelled observed' % (key,))
+            if not field.get('upgrade_fallback'):
+                raise ValueError(
+                    'lme: field %r is observation_only but does not declare upgrade_fallback: true '
+                    '-- the observation channel (requires_field: upgrade_fallback) could otherwise '
+                    'never fill it' % (key,))
     return fields, precedence, channels
 
 
@@ -674,6 +689,22 @@ def lme_resolve_config(registry, profile_vars=None, selections=None,
             raise ValueError(
                 'lme: %s names undeclared config key(s) %r; declare them in '
                 'manifests/global.yml lme_config_registry.fields' % (label, sorted(unknown)))
+
+    # OBSERVATION-ONLY CHANNEL ENFORCEMENT (C1-OBSERVATION-ORIGIN-DOES-NOT-RESTRICT-CHANNEL). A
+    # field declared observation_only may be filled ONLY by the observation channel -- an
+    # origin=observation LABEL alone is insufficient. Reject it appearing in an operator
+    # selection (extra_var/inventory) or a profile overlay; only a verified read-only
+    # observation may supply it. (The observation channel itself still gates on upgrade_fallback,
+    # and _honest_origin labels the value `observation`.) The `default` channel cannot reach it
+    # either, because origin: observation forbids a declared default (registry-shape gate).
+    obs_only = set(k for k, f in fields.items() if f.get('observation_only'))
+    bad_channel = sorted(k for k in obs_only if k in selections or k in profile_vars)
+    if bad_channel:
+        raise ValueError(
+            'lme: observation-only field(s) %r were supplied via an operator selection '
+            '(extra_var/inventory) or a profile overlay -- an observation-only value may come '
+            'ONLY from the observation channel (a verified read-only observation), never from '
+            '-e / inventory / profile / default' % bad_channel)
 
     resolved = {}
     out_origins = {}

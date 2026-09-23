@@ -328,3 +328,49 @@ def test_unsupported_type_rejected_even_when_nullable_null():
     assert "unsupported/absent type" in str(ei.value)
     with pytest.raises(ValueError):
         validate(reg, {"weird": None})
+
+
+def _obs_only_registry(field):
+    """A synthetic registry with the full declared channels and one custom field, for the
+    observation-only channel tests (no real observation-only field exists yet -- E folds
+    lme_observed_cluster_uuid once its semantics are confirmed)."""
+    return {"schema_version": 1,
+            "precedence": REGISTRY["precedence"], "channels": REGISTRY["channels"],
+            "origin_vocabulary": REGISTRY["origin_vocabulary"],
+            "fields": {"observed_cluster_uuid": field}}
+
+
+def test_observation_only_field_accepts_only_the_observation_channel():
+    """C1-OBSERVATION-ORIGIN-DOES-NOT-RESTRICT-CHANNEL: an observation_only field is filled
+    ONLY by the observation channel; an operator selection or profile overlay is REJECTED,
+    and with no observation it is absent (never defaulted)."""
+    field = {"type": "str", "required": False, "nullable": True,
+             "origin": "observation", "upgrade_fallback": True, "observation_only": True}
+    reg = _obs_only_registry(field)
+    # valid observation control -> filled, honest origin
+    r = resolve(reg, {}, {}, {"observed_cluster_uuid": "cluuid-1"})
+    assert r["resolved"]["observed_cluster_uuid"] == "cluuid-1"
+    assert r["origins"]["observed_cluster_uuid"] == "observation"
+    # optional + no observation -> absent (not defaulted)
+    assert "observed_cluster_uuid" not in resolve(reg)["resolved"]
+    # NEGATIVE: an operator -e / inventory selection is rejected
+    with pytest.raises(ValueError) as e1:
+        resolve(reg, {}, {"observed_cluster_uuid": "forged"})
+    assert "observation-only" in str(e1.value)
+    # NEGATIVE: a profile overlay is rejected
+    with pytest.raises(ValueError) as e2:
+        resolve(reg, {"observed_cluster_uuid": "forged"})
+    assert "observation-only" in str(e2.value)
+
+
+def test_observation_only_shape_requires_origin_and_fallback():
+    """An observation_only field must self-declare origin: observation + upgrade_fallback:true,
+    else the registry-shape gate rejects it (a dead / mislabelled observation channel)."""
+    with pytest.raises(ValueError):   # missing origin: observation
+        resolve(_obs_only_registry({"type": "str", "required": False, "nullable": True,
+                                    "upgrade_fallback": True, "observation_only": True}),
+                {}, {}, {"observed_cluster_uuid": "x"})
+    with pytest.raises(ValueError):   # missing upgrade_fallback
+        resolve(_obs_only_registry({"type": "str", "required": False, "nullable": True,
+                                    "origin": "observation", "observation_only": True}),
+                {}, {}, {"observed_cluster_uuid": "x"})
