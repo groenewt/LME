@@ -1531,6 +1531,19 @@ def lme_split_brain_keys(registry, bare_scope, resolved):
     return sorted(out)
 
 
+def lme_observation_only_keys(registry):
+    """codex-1045 decision B: the sorted registry keys DECLARED observation_only, selected
+    GENERICALLY by the property (never by a field name). resolve.yml excludes these from the
+    compatibility bare-name bridge, so an observation_only value lives ONLY in lme_resolved and
+    NO bare alias is ever manufactured -- a repeated load without the observation leaves no stale
+    alias to trip the split-brain invariant, and no bridge_absent sentinel is needed. The
+    split-brain guard is NOT silenced for the class (an unexpected bare fact in scope is still
+    caught) and operator/inventory/profile injection is still rejected by the observation-only
+    channel guard. Value-pure."""
+    fields, _precedence, _channels = _require_registry_shape(registry)
+    return sorted(k for k, f in fields.items() if isinstance(f, dict) and f.get('observation_only'))
+
+
 def lme_validate_dependency_closure(services, context=None):
     """C1-COMPLETE-CONFIGURATION-VALIDATION (dependency half): every id in a service's
     dependencies (requires/after/wants/partof/binds_to) MUST resolve to a DECLARED manifest
@@ -1554,6 +1567,307 @@ def lme_validate_dependency_closure(services, context=None):
     return services
 
 
+def _deep_combine(base, over):
+    """Mirror Ansible's `combine(recursive=True)`: keys in `over` win; where BOTH sides are
+    dicts, merge recursively; otherwise `over` replaces `base` wholesale. Pure; returns a new
+    object and never mutates its inputs. A non-dict `base` (or `over`) is replaced by `over`."""
+    if not isinstance(base, dict) or not isinstance(over, dict):
+        return over
+    out = dict(base)
+    for k, v in over.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_combine(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _normalize_list_join(value):
+    """GENERIC `list_join` normalizer (declared by name in legacy_service_override_projection):
+    normalise a multi-host value to a trimmed, comma-joined bare string, replicating
+    load_manifests.yml's former _lme_es_seed_join / _lme_es_masters_join Jinja EXACTLY: a STRING
+    is bracket-stripped, comma-split, trimmed, empties dropped (the Jinja `select`), and joined;
+    a LIST is str-cast, trimmed and joined with NO empty-drop (matching the Jinja list branch);
+    None/absent -> ''. Value-pure; carries no deployment-specific literal."""
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        stripped = value.replace('[', '').replace(']', '')
+        parts = [p.strip() for p in stripped.split(',')]
+        return ','.join(p for p in parts if p)  # Jinja `select` drops empties (string branch)
+    return ','.join(str(p).strip() for p in value)  # list branch: no empty-drop (Jinja parity)
+
+
+# --- generic legacy service-override projection consumer ---------------------------------
+# C1-LEGACY-CONFIGURATION-MOVED-INTO-ENGINE (codex-1100): the service id, env keys, source
+# wiring and single-node master default are DECLARED in manifests/global.yml
+# (legacy_service_override_projection). This file evaluates only a small CLOSED, GENERIC vocab
+# of gates + normalizers; no deployment-specific literal lives here.
+
+_ABSENT = object()  # an es-context source that was NEVER defined -- distinct from an explicit null
+
+_NORMALIZERS = {
+    'list_join': _normalize_list_join,   # legacy multi-host value -> trimmed CSV string
+}
+
+
+def _projection_source(es_ctx, name):
+    """Return the es-context value for `name`, or the _ABSENT sentinel when the key is not
+    present. An EXPLICIT null is PRESENT (returns None), distinct from absence -- so a declared
+    default_when_absent fires ONLY on true absence and a supplied null is preserved
+    (C1-LEGACY-EXPLICIT-NULL-CONFLATED-WITH-ABSENCE, codex-1100)."""
+    if not isinstance(es_ctx, dict) or name not in es_ctx:
+        return _ABSENT
+    return es_ctx[name]
+
+
+def _projection_entry_value(entry, es_ctx):
+    """Evaluate ONE declared projection environment entry against the es context. Returns
+    (emit, value); emit False means the key is not written. Pure -- the gate/normalizer vocab
+    is fixed and generic, every deployment specific comes from `entry`. An unknown gate or
+    normalizer, or a malformed entry, RAISES (fail-closed, never a silent drop)."""
+    if not isinstance(entry, dict):
+        raise ValueError('lme: legacy_service_override_projection entry must be a mapping, got %r' % (entry,))
+    key = entry.get('key')
+    if not isinstance(key, str) or not key:
+        raise ValueError('lme: legacy_service_override_projection entry needs a non-empty string key, got %r' % (key,))
+    norm_name = entry.get('normalize')
+    if norm_name is not None and norm_name not in _NORMALIZERS:
+        raise ValueError('lme: legacy_service_override_projection key %r declares unknown normalize %r (known %r)'
+                         % (key, norm_name, sorted(_NORMALIZERS)))
+    normalize = _NORMALIZERS[norm_name] if norm_name is not None else (lambda v: v)
+    gate = entry.get('emit_when')
+    src = _projection_source(es_ctx, entry.get('source'))
+
+    if gate == 'present':
+        if src is _ABSENT or src is None:
+            return (False, None)
+        return (True, normalize(src))
+    if gate == 'truthy_not_omit':
+        if src is _ABSENT or not src or '__omit_place_holder__' in str(src):
+            return (False, None)
+        return (True, normalize(src))
+    if gate == 'nonempty':
+        if src is _ABSENT:
+            return (False, None)
+        val = normalize(src)
+        if not isinstance(val, str) or len(val) == 0:
+            return (False, None)
+        return (True, val)
+    if gate == 'flag':
+        flag_on = bool(es_ctx.get(entry.get('flag_source'))) if isinstance(es_ctx, dict) else False
+        if not flag_on:
+            return (False, None)
+        # branch active: default_when_absent ONLY on true absence; an EXPLICIT null is
+        # preserved (null-env-skip drops the key at render), a present value is normalized.
+        if src is _ABSENT:
+            return (True, entry.get('default_when_absent'))
+        if src is None:
+            return (True, None)
+        return (True, normalize(src))
+    raise ValueError('lme: legacy_service_override_projection key %r declares unknown emit_when %r' % (key, gate))
+
+
+def lme_effective_service_overrides(operator_overrides, es_ctx=None, projection=None):
+    """C1-SERVICE-OVERRIDE-INTERMEDIATE-DISCARDS-DECLARATION (codex-1015 HIGH). The SINGLE
+    value-pure source of the effective service-override map: the legacy shim BASE (built by
+    CONSUMING the declared `legacy_service_override_projection` -- codex-1100 architecture fix,
+    no embedded service id / env key / master default here) with the operator's
+    `lme_service_overrides` combined OVER it (operator wins LAST, recursive). Folded HERE and
+    called INLINE by load_manifests.yml's build loop AND its faithful-application invariant, so
+    NO pinnable task fact remains between the admitted declarations (es context +
+    lme_service_overrides + the byte-bound projection) and the composed lme_services.
+
+    C1-MALFORMED-OVERRIDE-SILENT-DISCARD (codex-1100): a None operator declaration is legitimate
+    ABSENCE (no overrides); a NONMAPPING shape (a scalar `lme_service_overrides=7`, a list) is a
+    MALFORMED declaration and is REJECTED before composition -- never silently coerced to {} --
+    and each per-service value must itself be a mapping (the offending id is named).
+
+    es_ctx carries the admitted legacy inputs, PRESENCE-PRESERVING (a key present with a null
+    value is distinct from an absent key). The projection is byte-bound (resolve.yml binds the
+    whole global.yml), so it cannot be pinned. Inert per service unless its declared gate_source
+    is present. Value-pure."""
+    if operator_overrides is None:
+        operator_overrides = {}
+    elif not isinstance(operator_overrides, dict):
+        raise ValueError('lme: lme_service_overrides must be a mapping of service-id -> override, '
+                         'got %r (%s)' % (operator_overrides, type(operator_overrides).__name__))
+    for sid, ov in operator_overrides.items():
+        if not isinstance(ov, dict):
+            raise ValueError('lme: lme_service_overrides[%r] must be a mapping, got %r (%s)'
+                             % (sid, ov, type(ov).__name__))
+    ctx = es_ctx if isinstance(es_ctx, dict) else {}
+    projection = projection if isinstance(projection, dict) else {}
+    legacy = {}
+    for svc, spec in projection.items():
+        if not isinstance(spec, dict):
+            raise ValueError('lme: legacy_service_override_projection[%r] must be a mapping' % (svc,))
+        gate_source = spec.get('gate_source')
+        if gate_source is not None:
+            gv = _projection_source(ctx, gate_source)
+            if gv is _ABSENT or gv is None:
+                continue  # projection inert for this service (no legacy inputs present)
+        env = {}
+        for entry in (spec.get('environment') or []):
+            emit, value = _projection_entry_value(entry, ctx)
+            if emit:
+                env[entry['key']] = value
+        if env:
+            legacy = _deep_combine(legacy, {svc: {'environment': env}})
+    return _deep_combine(legacy, operator_overrides)
+
+
+_OVERRIDE_LEAF_MISSING = object()
+
+
+def _canonical_kind(v):
+    """A comparison kind that does NOT conflate bool with int (Python True == 1) and keeps the
+    container/scalar distinction. isinstance-based (checking bool BEFORE int), so a data-tagged
+    str/int/dict subclass (Ansible 2.19 tagging) still compares as its base kind -- codex-1100
+    warns an exact `type(a) is type(b)` would false-reject ordinary overrides."""
+    if isinstance(v, bool):
+        return 'bool'
+    if isinstance(v, int):
+        return 'int'
+    if isinstance(v, float):
+        return 'float'
+    if isinstance(v, str):
+        return 'str'
+    if isinstance(v, dict):
+        return 'dict'
+    if isinstance(v, (list, tuple)):
+        return 'list'
+    if v is None:
+        return 'none'
+    return 'other'
+
+
+def _leaf_equal(a, b):
+    """C1-LIST-MAPPING-LEAF-BOOL-INT-CONFLATION (codex-1300; was codex-1100 #3): RECURSIVE
+    structural TYPE-AWARE equality at EVERY supported container depth (dict, list, and any
+    nesting). Two leaves must share a canonical kind AND be equal, so `0` != `false`, `[0]` !=
+    `[false]`, `{e: false}` != `{e: 0}`, and `[{e: true}]` != `[{e: 1}]` at ANY depth. Lists
+    compare element-by-element; dicts compare by TYPE-AWARE key pairing then recurse on each value.
+
+    The dict branch is what v3 lacked: v3 recursed lists but a MAPPING element inside a list (and a
+    dict leaf generally) fell through to Python `==`, which conflates False/0 and True/1 (and
+    1/1.0) inside a mapping. Key pairing is TYPE-AWARE on purpose -- a plain `set(a)==set(b)` /
+    `b[k]` lookup would reopen the SAME conflation at the KEY level, because a Python dict collapses
+    {True: x} and {1: x} (and {1: x} vs {1.0: x}) to a single key. A valid normalized
+    representation is NOT weakened: an ordinary str override (incl. an Ansible 2.19 data-tagged str
+    subclass, isinstance-based kind) still compares equal to the composed str. Value-pure."""
+    ka, kb = _canonical_kind(a), _canonical_kind(b)
+    if ka != kb:
+        return False
+    if ka == 'list':
+        if len(a) != len(b):
+            return False
+        return all(_leaf_equal(x, y) for x, y in zip(a, b))
+    if ka == 'dict':
+        if len(a) != len(b):
+            return False
+        # TYPE-AWARE key pairing: index b by (canonical_kind, key) so a bool key can never match an
+        # int key. Python's True==1 / False==0 / 1==1.0 key-collapse would otherwise defeat the very
+        # bool/int distinction this function exists to enforce.
+        b_by_typed_key = {(_canonical_kind(k), k): v for k, v in b.items()}
+        for k, av in a.items():
+            bv = b_by_typed_key.get((_canonical_kind(k), k), _OVERRIDE_LEAF_MISSING)
+            if bv is _OVERRIDE_LEAF_MISSING or not _leaf_equal(av, bv):
+                return False
+        return True
+    return a == b
+
+
+def _override_leaf_missing(ov, sv, path, out):
+    """Walk the override subtree `ov`; append to `out` each `path` where a leaf of `ov` is not
+    present-and-TYPED-equal (_leaf_equal) in the composed subtree `sv`. Dict keys are paired
+    TYPE-AWARELY (a bool key does not match an int key -- the same key-collapse hazard fixed in
+    _leaf_equal), so a missing typed key becomes a locator and FAILS CLOSED. List/scalar leaves are
+    compared by the now-fully-recursive _leaf_equal, so a mapping element inside a list is compared
+    type-awarely at every depth."""
+    if isinstance(ov, dict):
+        if not isinstance(sv, dict):
+            out.append(path or '.')
+            return
+        sv_by_typed_key = {(_canonical_kind(k), k): v for k, v in sv.items()}
+        for k in ov:
+            child = sv_by_typed_key.get((_canonical_kind(k), k), _OVERRIDE_LEAF_MISSING)
+            child_path = (path + '.' + str(k)) if path else str(k)
+            if child is _OVERRIDE_LEAF_MISSING:
+                out.append(child_path)
+            else:
+                _override_leaf_missing(ov[k], child, child_path, out)
+    elif not _leaf_equal(ov, sv):
+        out.append(path or '.')
+
+
+def lme_service_overrides_applied(services, effective_overrides):
+    """C1-SERVICE-OVERRIDE-INTERMEDIATE-DISCARDS-DECLARATION invariant (faithful-application
+    half). Return the sorted 'service_id.path' locators where a leaf of the EFFECTIVE
+    service-override map (legacy shim + operator lme_service_overrides, recomputed inline via
+    lme_effective_service_overrides -- NOT read from a pinnable intermediate) is NOT reflected in
+    the composed `services`. Empty == every admitted override was faithfully applied. A pin that
+    discarded an override leaves the declared leaf missing/different -> non-empty -> the loader
+    fails closed pre-mutation, so the revision can no longer silently equal a no-override control.
+
+    C1-OVERRIDE-MISSING-SERVICE-SKIP (codex-1100): an override id ABSENT from `services` is NO
+    LONGER skipped -- it is a discarded declaration (the admission + coverage gates guarantee
+    every declared service is composed, so an absent id can only mean a pinned/suppressed
+    projection) and yields an explicit locator. Leaf comparison is TYPED (0 != false). Value-pure."""
+    services = services if isinstance(services, dict) else {}
+    effective_overrides = effective_overrides if isinstance(effective_overrides, dict) else {}
+    out = []
+    for sid, ov in effective_overrides.items():
+        if sid not in services:
+            out.append('%s (absent from composed services)' % (sid,))
+            continue
+        _override_leaf_missing(ov, services[sid], str(sid), out)
+    return sorted(out)
+
+
+def lme_unknown_service_override_ids(operator_overrides, declared_universe):
+    """codex-1045 admission / C1-OVERRIDE-MISSING-SERVICE-SKIP (codex-1100): the sorted OPERATOR
+    override service ids that are NOT in the COMPLETE ADMITTED catalog `declared_universe` (every
+    declared service-manifest id, enumerated BEFORE activation + host filtering). A declared-but-
+    disabled or off-host id is IN the universe and stays a valid override target; a misspelled /
+    removed / renamed-away id is not, so it is rejected before mutation. Validates the OPERATOR
+    keys, not the effective/shim map (the shim only ever targets declared ids). Value-pure."""
+    ov = operator_overrides if isinstance(operator_overrides, dict) else {}
+    universe = set(declared_universe or [])
+    return sorted(str(sid) for sid in ov if sid not in universe)
+
+
+def lme_service_override_shape_errors(operator_overrides):
+    """codex-1100 #2 C1-MALFORMED-OVERRIDE-SILENT-DISCARD (admission half). Return the sorted
+    shape violations of the OPERATOR lme_service_overrides, evaluated at ADMISSION -- BEFORE any
+    composition. `None` is legitimate absence -> []. A nonmapping top-level value (scalar/list), or
+    ANY per-service value that is not a mapping, is a MALFORMED declaration named here so the loader
+    rejects it at admission and NEVER silently coerces it to {}; the defensive `isinstance ... else {}`
+    coercions in the downstream override helpers are thereby unreachable for a nonmapping once this
+    gate has run. Kept distinct in message + stage from the composition fold's 'must be a mapping'
+    raise so the two gates are separable by a classifier. Value-pure."""
+    if operator_overrides is None:
+        return []
+    if not isinstance(operator_overrides, dict):
+        return ['<top-level> is not a mapping (got %s)' % type(operator_overrides).__name__]
+    return sorted('%s is not a mapping (got %s)' % (sid, type(ov).__name__)
+                  for sid, ov in operator_overrides.items() if not isinstance(ov, dict))
+
+
+def lme_service_coverage_gap(declared_universe, services):
+    """codex-1100 C1-OVERRIDE-MISSING-SERVICE-SKIP (coverage half): the sorted SYMMETRIC
+    difference between the declared universe (a NON-pinnable inline enumeration of the service
+    manifests) and the composed `services` (lme_services) keys. A pinned or suppressed projection
+    -- `-e lme_services={}`, an `-e _lme_service_files=<subset>` (drops a declared service) or a
+    `<superset>` (composes an undeclared one) -- makes composed coverage diverge from the
+    declaration, so a NON-empty result fails closed BEFORE activation, INDEPENDENTLY of the
+    pinnable projection. A symmetric difference (not a one-way subset) catches BOTH the missing
+    and the extra case. Value-pure."""
+    universe = set(declared_universe or [])
+    composed = set((services or {}).keys()) if isinstance(services, dict) else set()
+    return sorted(str(x) for x in (universe ^ composed))
+
+
 class FilterModule(object):
     def filters(self):
         return {
@@ -1575,6 +1889,12 @@ class FilterModule(object):
             'lme_selection_conflicts': lme_selection_conflicts,
             'lme_resolve_from_admitted': lme_resolve_from_admitted,
             'lme_split_brain_keys': lme_split_brain_keys,
+            'lme_observation_only_keys': lme_observation_only_keys,
+            'lme_effective_service_overrides': lme_effective_service_overrides,
+            'lme_service_overrides_applied': lme_service_overrides_applied,
+            'lme_unknown_service_override_ids': lme_unknown_service_override_ids,
+            'lme_service_override_shape_errors': lme_service_override_shape_errors,
+            'lme_service_coverage_gap': lme_service_coverage_gap,
             'render_userns': render_userns,
             'userns_base': userns_base,
             'cert_owner': cert_owner,

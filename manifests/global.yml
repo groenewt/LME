@@ -343,6 +343,21 @@ lme_config_registry:
     # lme_deployment_identity). It must NOT be minted/derived from run_id/config/hostname. NB the LIVE
     # observation SOURCE (what supplies the observed value to the loader at resolve time) is NOT wired
     # by this fold -- only the canonical representation is declared here (see the sitrep).
+    #   REMOVAL/ABSENCE SEMANTICS (C1-OBSERVATION-FIELD-REPEATED-LOAD-STALE-BRIDGE, codex-1045
+    #   decision B -- select GENERICALLY by the observation_only property): an observation_only
+    #   field is EXCLUDED from the compatibility bare-name bridge entirely (resolve.yml never
+    #   set_facts a bare alias for it). So no stale bare alias is ever manufactured, a REPEATED
+    #   load where the observation is now ABSENT leaves NOTHING to reset, and no bridge_absent
+    #   sentinel is needed (a null sentinel in a consumerless legacy bridge would only add state).
+    #   The canonical value lives ONLY in lme_resolved.lme_observed_cluster_uuid (+ its origin);
+    #   lme_resolved stays ABSENT when unobserved (optional-absent contract preserved). Operator/
+    #   inventory/profile injection of this bare name is REJECTED fail-closed by the observation-
+    #   only channel guard (lme_manifests.py: obs_only in selections/profile -> raise), and an
+    #   UNEXPECTED preexisting bare fact in scope is still caught by the post-bridge split-brain
+    #   invariant (resolve.yml:307) -- decision B does NOT silence the split-brain check for the
+    #   observation_only class, it only stops manufacturing the alias. A FUTURE wired consumer
+    #   reads lme_resolved.lme_observed_cluster_uuid, never a bare name; the live observation
+    #   SOURCE remains UNWIRED by this fold.
     lme_observed_cluster_uuid: {type: str, required: false, nullable: true, enable_flag: false, origin: observation, observation_only: true, upgrade_fallback: true, exclude_from_revision: true}
 
   # --- typed material_requirements schema (SCHEMA-REQUIRED-MATERIAL) -----------
@@ -452,3 +467,50 @@ lme_config_registry:
         PRODUCES against these records; D's completeness loop + restore/rollback preflight
         VERIFY; F2's rollback gate CONSUMES the union. loader_wired flips (and
         missing_field arms) only when every selected service is migrated.
+
+# =============================================================================
+# legacy_service_override_projection -- DATA declaration of the legacy es_* ->
+# lme_service_overrides.<service>.environment.* compatibility shim
+# (C1-LEGACY-CONFIGURATION-MOVED-INTO-ENGINE, codex-1100 architecture finding).
+#
+# install.sh --cluster / ansible/inventory/cluster_example.yml supply LEGACY es_*
+# inventory vars (es_node_name, es_publish_host, es_cluster_seed_hosts,
+# es_initial_master_nodes, es_is_initial_master). This projection maps them into the
+# MODERN per-node lme_service_overrides.elasticsearch.environment.* form (the same form
+# host_vars/es1.yml authors by hand) so an `-i` run WITHOUT per-node host_vars still gets
+# the cluster discovery env. The SERVICE id, the env KEYS, the source WIRING and the
+# single-node master DEFAULT (`lme-elasticsearch`, the canonical single-node node.name --
+# see manifests/services/lme-elasticsearch.yml env node.name, convert_to_cluster.yml
+# es_initial_masters default, cluster_example.yml es_node_name) ALL live HERE as DATA.
+# lme_manifests.py::lme_effective_service_overrides is a GENERIC consumer that carries NO
+# embedded service id or deployment default -- the sole permitted Python file holds no
+# deployment configuration debt.
+#
+# Per-service value is {gate_source, environment:[<entry>...]}. The whole service block is
+# inert unless gate_source is PRESENT (defined and not null) in the es context, so a bare
+# localhost run with no es_* inventory produces NO legacy override. Each environment entry:
+#   key                 -- the flat dotted environment key written under <service>.environment.
+#   source              -- the es-context key (a legacy es_* inventory var) feeding this key.
+#   emit_when           -- generic gate the consumer evaluates (closed vocab):
+#                            present         = source defined and not null (absent OR null skip);
+#                            truthy_not_omit = source truthy AND not an Ansible omit placeholder;
+#                            nonempty        = the (normalized) value is a non-empty string;
+#                            flag            = ctx[flag_source] is truthy (the value MAY be empty;
+#                                              the branch still emits -- matches the legacy Jinja
+#                                              cluster.initial_master_nodes else-branch).
+#   normalize           -- optional generic transform: list_join = the legacy es list->CSV join
+#                            (a string is bracket-stripped / comma-split / trimmed / empty-dropped;
+#                            a list is str-cast / trimmed / joined, no empty-drop).
+#   flag_source         -- (emit_when: flag only) the es-context bool key gating the branch.
+#   default_when_absent -- (emit_when: flag only) the value emitted when source is ABSENT (never
+#                            defined). An EXPLICIT null source is PRESERVED as null (null-env-skip
+#                            drops the key at render), NOT replaced by this default
+#                            (C1-LEGACY-EXPLICIT-NULL-CONFLATED-WITH-ABSENCE, codex-1100).
+legacy_service_override_projection:
+  elasticsearch:
+    gate_source: node_name
+    environment:
+      - {key: 'node.name',                    source: node_name,            emit_when: present}
+      - {key: 'network.publish_host',         source: publish_host,         emit_when: truthy_not_omit}
+      - {key: 'discovery.seed_hosts',         source: seed_hosts,           emit_when: nonempty, normalize: list_join}
+      - {key: 'cluster.initial_master_nodes', source: initial_master_nodes, emit_when: flag, flag_source: is_initial_master, normalize: list_join, default_when_absent: lme-elasticsearch}

@@ -13,7 +13,7 @@
 #
 #   lme_services[<id>] = <service.yml>
 #                   | combine(<active profile>.services[<id>], recursive=True)
-#                   | combine(_lme_service_overrides_eff[<id>], recursive=True)  # operator LAST
+#                   | combine((lme_service_overrides | lme_effective_service_overrides(<es_ctx>))[<id>], recursive=True)  # operator LAST
 #
 #   lme_service_kinds[<id>] = <service.yml>.kind   (feeds the svc_unit/unit_refs filters)
 #
@@ -23,22 +23,31 @@
 # vars es_node_name / es_publish_host / es_cluster_seed_hosts (+ es_is_initial_master
 # on the master), NOT as lme_service_overrides. install.sh forwards them with -e but
 # nothing mapped them, so a true generator-driven cluster run got no node.name /
-# seed_hosts / publish_host into the rendered ES unit. This file bridges them:
+# seed_hosts / publish_host into the rendered ES unit. The EFFECTIVE service-override
+# map folds the shim BASE and the operator layer in ONE value-pure filter:
 #
-#   _lme_service_overrides_eff =
-#       { elasticsearch: { environment: <es_* -> ES settings> } }   # legacy shim BASE
-#       | combine(lme_service_overrides | default({}), recursive=True)   # operator LAST
+#   lme_service_overrides | lme_effective_service_overrides(<es_ctx>)
+#       = { elasticsearch: { environment: <es_* -> ES settings> } }   # legacy shim BASE
+#         | combine(lme_service_overrides | default({}), recursive=True)   # operator LAST
 #
-#   The shim reproduces lme-elasticsearch.container.j2's four discovery branches
+#   The filter reproduces lme-elasticsearch.container.j2's four discovery branches
 #   1:1 from identical legacy inputs (node.name<-es_node_name; discovery.seed_hosts
 #   <-es_cluster_seed_hosts normalised + comma-joined; cluster.initial_master_nodes
-#   <-es_initial_master_nodes|default(['lme-elasticsearch']) comma-joined, GATED on
+#   <-es_initial_master_nodes|default('lme-elasticsearch') comma-joined, GATED on
 #   es_is_initial_master like the .j2; network.publish_host<-es_publish_host with the
 #   .j2's truthiness/omit guard). It is a BASE only: the operator's own
-#   lme_service_overrides is READ, never shadowed (an -e extra-var outranks set_fact,
-#   so re-binding it would be silently ignored), and combines OVER the shim so the
-#   operator still wins LAST. When es_node_name is undefined the shim is inert by
-#   construction: _lme_service_overrides_eff == lme_service_overrides | default({}).
+#   lme_service_overrides combines OVER the shim so the operator still wins LAST. When
+#   es_node_name is absent the shim is inert: the filter returns lme_service_overrides
+#   verbatim. FAITHFUL-DERIVATION (C1-SERVICE-OVERRIDE-INTERMEDIATE-DISCARDS-DECLARATION,
+#   codex-1015): the whole derivation is folded into this filter and called INLINE (an
+#   expression, never a set_fact), so there is NO extra-var-overridable intermediate
+#   (the former _lme_service_overrides_eff / _lme_es_legacy_overrides / _lme_es_seed_join
+#   / _lme_es_masters_join) between the admitted declarations (es_* + lme_service_overrides)
+#   and the composed lme_services. An `-e _lme_service_overrides_eff={}` (or a pin one hop
+#   up) can no longer DISCARD an admitted override while the revision + read-back reuse the
+#   suppressed lme_services and agree -- those names are now inert, and the post-build
+#   faithful-application invariant (lme_service_overrides_applied) rejects any residual
+#   discard pre-mutation.
 #
 #   WARNING (R8-7 clobber): lme_service_overrides is ONE var with ordinary Ansible
 #   precedence, and host_vars is a valid SOURCE of it -- not just -e. A generator-driven
@@ -61,7 +70,8 @@
 # G1 provides this file; G2/G3 include it. The G2 cutover is DONE: this file is now
 # wired into the live install path -- quadlet_setup.yml:19 loads it (and
 # container_setup.yml:17 loads it defensively), both reached from podman main.yml
-# (:248 / :240), so lme_global / lme_services / _lme_service_overrides_eff render live.
+# (:248 / :240), so lme_global / lme_services render live (the effective overrides are
+# folded into lme_services by lme_effective_service_overrides; no bare eff fact renders).
 
 # The SHARED early-resolve entrypoint (CR-B3) loads global.yml + the active profile
 # overlay, normalizes caller inputs (lme_inputs), resolves every declared field by the
@@ -121,60 +131,20 @@
 # clause would then wipe out every unit). If a set_fact is ever needed to normalise, gate it
 # `when: lme_host_services is defined` and never default to [].
 
-# Legacy cluster-inventory shim (see header). Builds the elasticsearch environment
-# override BASE from the flat es_* vars the tree's own generators emit, matching
-# lme-elasticsearch.container.j2 branch-for-branch. Fires ONLY when es_node_name is
-# defined; otherwise _lme_es_legacy_overrides stays unset and the effective-override
-# task below degenerates to the operator's own lme_service_overrides (fully inert).
-- name: Build legacy es_* elasticsearch override base (inert unless es_node_name defined)
-  ansible.builtin.set_fact:
-    _lme_es_legacy_overrides: >-
-      {{ {'elasticsearch': {'environment':
-           {'node.name': es_node_name}
-           | combine({'network.publish_host': es_publish_host}
-                     if (es_publish_host is defined and es_publish_host
-                         and '__omit_place_holder__' not in (es_publish_host | string))
-                     else {})
-           | combine({'discovery.seed_hosts': _lme_es_seed_join}
-                     if ((_lme_es_seed_join | length) > 0)
-                     else {})
-           | combine({'cluster.initial_master_nodes': _lme_es_masters_join}
-                     if (es_is_initial_master | default(false) | bool)
-                     else {})
-         }} }}
-  vars:
-    # es_cluster_seed_hosts arrives as a real YAML list (inventory all.vars) OR as a
-    # string via -e (incl. the bracketed "[a, b]" form -e can produce) -- normalise
-    # both to a trimmed, comma-joined bare-host string (NO :9300; the generators emit
-    # bare IPs and the .j2 join(',')s them). Same regex_replace spelling as
-    # convert_to_cluster.yml. Leaf is a string, so no native-type dependency.
-    _lme_es_seed_join: >-
-      {{ (es_cluster_seed_hosts | regex_replace('\\[|\\]', '') | split(',') | map('trim') | select | join(','))
-         if (es_cluster_seed_hosts is defined and es_cluster_seed_hosts is string)
-         else (es_cluster_seed_hosts | map('string') | map('trim') | join(','))
-         if (es_cluster_seed_hosts is defined)
-         else '' }}
-    # cluster.initial_master_nodes takes NODE NAMES (match node.name), NOT hosts --
-    # confirmed by ansible/spec/CLUSTER_ELASTICSEARCH_SPEC.md and the .j2. Value +
-    # default mirror convert_to_cluster.yml: es_initial_master_nodes|default(['lme-elasticsearch']).
-    _lme_es_masters_join: >-
-      {{ (es_initial_master_nodes | regex_replace('\\[|\\]', '') | split(',') | map('trim') | select | join(','))
-         if (es_initial_master_nodes is defined and es_initial_master_nodes is string)
-         else (es_initial_master_nodes | map('string') | map('trim') | join(','))
-         if (es_initial_master_nodes is defined)
-         else 'lme-elasticsearch' }}
-  when: es_node_name is defined
-
-# Effective service overrides = legacy shim BASE, with the operator's own
-# lme_service_overrides combined OVER it (operator wins LAST). Computed
-# UNCONDITIONALLY so it always exists; degenerates to the operator layer when the
-# shim did not fire. The operator var is only READ here (never re-bound), so an -e
-# lme_service_overrides keeps its precedence and still overrides the shim.
-- name: Resolve effective service overrides (legacy shim base | operator override LAST)
-  ansible.builtin.set_fact:
-    _lme_service_overrides_eff: >-
-      {{ _lme_es_legacy_overrides | default({})
-         | combine(lme_service_overrides | default({}), recursive=True) }}
+# FAITHFUL-DERIVATION of the effective service overrides (C1-SERVICE-OVERRIDE-INTERMEDIATE-
+# DISCARDS-DECLARATION, codex-1015). The legacy es_* elasticsearch shim BASE + the operator
+# lme_service_overrides layer are now composed by ONE value-pure filter,
+# `lme_effective_service_overrides`, called INLINE at the build loop below (and re-derived
+# INLINE by the faithful-application invariant). There is deliberately NO set_fact / task var
+# holding the effective overrides, the legacy shim base, or the seed/masters joins: every one
+# of those (_lme_service_overrides_eff, _lme_es_legacy_overrides, _lme_es_seed_join,
+# _lme_es_masters_join) was extra-var-overridable, so an `-e _lme_service_overrides_eff={}` --
+# or a pin one hop up -- DISCARDED an admitted override while the revision + read-back reused
+# the suppressed lme_services and agreed. The filter reads ONLY the admitted declarations
+# (the es_* inventory context, assembled inline below, + lme_service_overrides), so it cannot
+# be pinned. The es_ctx literal appears in the build loop AND the invariant; keep the two in
+# sync (is_initial_master is `| bool`-coerced in Ansible so the filter never diverges from
+# Ansible's bool on the string 'false').
 
 - name: Enumerate service manifests
   ansible.builtin.find:
@@ -187,6 +157,100 @@
   become: false
   register: _lme_service_files
 
+# C1-OVERRIDE-MISSING-SERVICE-SKIP (codex-1100) -- BIND the enumerated manifest set to the
+# declared bytes on disk. `_lme_service_files` is a register result and an extra-var OUTRANKS
+# it: `-e _lme_service_files=<forged/subset/superset>` would otherwise let the admitted
+# CATALOG UNIVERSE (and the coverage check below) be pinned. Re-read the services dir with an
+# INLINE fileglob (an expression running on the same controller as the delegated find, so an
+# extra-var cannot pin it) and assert the enumerated FULL PATHS EQUAL the on-disk set. A subset
+# pin (drops a declared service), a superset pin (smuggles an undeclared one), OR a
+# same-basename/different-directory forgery (`-e _lme_service_files` naming external files under
+# matching basenames -- a basename-only bind would let this through; empirically confirmed) all
+# fail closed here, BEFORE the universe is derived. Fail-closed, pre-mutation.
+- name: Bind the enumerated service manifests to the declared services dir (fail-closed, pre-mutation)
+  ansible.builtin.assert:
+    that:
+      - (_lme_service_files.files | map(attribute='path') | sort)
+        == (query('ansible.builtin.fileglob', lme_manifests_dir ~ '/services/*.yml') | sort)
+    fail_msg: >-
+      the enumerated service manifest set does not match the declared services dir on disk --
+      an -e _lme_service_files (or a tampered enumeration) replaced the admitted service catalog
+      with external state (including a same-basename/different-directory forgery). The declared
+      manifest files at their on-disk paths are the sole authority for the service universe
+      (C1-OVERRIDE-MISSING-SERVICE-SKIP).
+    quiet: true
+
+# Derive the COMPLETE ADMITTED CATALOG UNIVERSE (every declared service id, BEFORE activation +
+# host filtering). This is the codex-1045 "declared universe": a declared-but-disabled or off-host
+# id is IN it (a valid override target); a misspelled/removed id is not. It is computed INLINE from
+# a NON-PINNABLE expression (`query('file', *fileglob(...))`, star-args verified under 2.19.11): the
+# fileglob runs on the controller and reads the manifests directly, so -- NON-PINNABLE RELATIVE TO
+# THE lme_manifests_dir TRUST ROOT -- an extra-var cannot repoint the SOURCE ids into that root (an
+# `-e lme_manifests_dir=<other>` relocates the whole trust root, it does not smuggle ids into the
+# declared one), and the read-back guard below rejects a pin of the RESULT variable
+# (`-e _lme_declared_service_ids`). Together these close
+# the previously-disclosed coordinated universe+lme_services double-pin residual: a lone OR double
+# pin of the universe now fails closed at the guard, and a lone pin of lme_services fails closed at
+# the coverage gate. Recomputed per load, so a prior load cannot carry a stale id.
+- name: Enumerate the declared service-id universe (inline, non-pinnable) from the declared manifests
+  ansible.builtin.set_fact:
+    _lme_declared_service_ids: >-
+      {{ query('file', *query('ansible.builtin.fileglob', lme_manifests_dir ~ '/services/*.yml'))
+         | map('from_yaml') | map(attribute='id') | list }}
+
+- name: C1 -- read-back guard the declared universe (reject -e _lme_declared_service_ids; closes the double-pin residual)
+  ansible.builtin.assert:
+    that:
+      - (_lme_declared_service_ids | sort)
+        == (query('file', *query('ansible.builtin.fileglob', lme_manifests_dir ~ '/services/*.yml'))
+            | map('from_yaml') | map(attribute='id') | sort)
+    fail_msg: >-
+      the declared service-id universe was pinned away from the disk-bound manifest ids
+      (-e _lme_declared_service_ids). The universe is derived inline from the declared service
+      manifests and is not operator-overridable; a coordinated universe+lme_services double-pin
+      that previously evaded coverage now fails closed here (C1-OVERRIDE-MISSING-SERVICE-SKIP).
+    quiet: true
+
+# ADMISSION -- SHAPE (codex-1100 #2 C1-MALFORMED-OVERRIDE-SILENT-DISCARD): reject a MALFORMED
+# lme_service_overrides at ADMISSION, BEFORE any composition/mutation, so a nonmapping is NEVER
+# silently coerced to {} (the coercion the downstream override helpers apply defensively is
+# unreachable for a nonmapping once this gate has run). A scalar/list at the top level, OR any
+# per-service value that is not a mapping, is a malformed declaration named here. This raise is
+# DISTINCT from the composition fold's 'must be a mapping' raise (message + stage) so the two
+# gates are separable: a shape violation fails HERE (pre-composition), not deep in the build loop.
+# `None` is legitimate absence and passes. Reads the OPERATOR keys, never a pinnable intermediate.
+- name: C1 -- reject malformed service overrides (nonmapping shape) at admission, before composition (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - (lme_service_overrides | default(None) | lme_service_override_shape_errors) | length == 0
+    fail_msg: >-
+      lme_service_overrides is MALFORMED and is rejected at admission before composition (never
+      coerced to {}) -- shape violation(s):
+      {{ lme_service_overrides | default(None) | lme_service_override_shape_errors }}. A scalar/list
+      lme_service_overrides, or a per-service value that is not a mapping, is a malformed declaration
+      (C1-MALFORMED-OVERRIDE-SILENT-DISCARD); fix the declaration, do not let it be discarded.
+    quiet: true
+
+# ADMISSION (codex-1045 + codex-1100 C1-OVERRIDE-MISSING-SERVICE-SKIP): reject an operator
+# service override whose id is NOT in the declared universe (a typo / removed / renamed-away
+# service), and reject a legacy_service_override_projection whose target service id is undeclared,
+# BEFORE any composition/mutation. A declared-but-inactive/off-host id stays valid (it IS in the
+# universe). Reads the OPERATOR keys, never the pinnable effective/shim map.
+- name: C1 -- reject service overrides / projection targets outside the declared catalog universe (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - (lme_service_overrides | default({}) | lme_unknown_service_override_ids(_lme_declared_service_ids)) | length == 0
+      - (_lme_global_file.legacy_service_override_projection | default({}) | list
+         | difference(_lme_declared_service_ids)) | length == 0
+    fail_msg: >-
+      service override / projection target id(s) are NOT in the declared catalog universe --
+      unknown override ids: {{ lme_service_overrides | default({}) | lme_unknown_service_override_ids(_lme_declared_service_ids) }};
+      unknown projection targets: {{ _lme_global_file.legacy_service_override_projection | default({}) | list | difference(_lme_declared_service_ids) }}.
+      A declared-but-disabled/off-host service is valid; a misspelled/removed/renamed-away id is
+      rejected before mutation (C1-OVERRIDE-MISSING-SERVICE-SKIP). Known service ids:
+      {{ _lme_declared_service_ids | sort }}.
+    quiet: true
+
 # Reset lme_services before the build loop so each load resolves the CURRENT service
 # set from scratch. Without this, `lme_services | default({})` in the build task below
 # combines into whatever a PRIOR load left behind -- so a service whose manifest was
@@ -197,18 +261,73 @@
   ansible.builtin.set_fact:
     lme_services: {}
 
-- name: Build lme_services map (service | profile.services[id] | operator override[id] LAST)
+- name: Build lme_services map (service | profile.services[id] | effective override[id] LAST)
   ansible.builtin.set_fact:
     lme_services: >-
       {{ lme_services | default({}) | combine({
            (lookup('file', item.path) | from_yaml).id:
              (lookup('file', item.path) | from_yaml)
              | combine(_lme_profile_file.profile_overlay.services[(lookup('file', item.path) | from_yaml).id] | default({}), recursive=True)
-             | combine(_lme_service_overrides_eff[(lookup('file', item.path) | from_yaml).id] | default({}), recursive=True)
+             | combine((lme_service_overrides | default({}) | lme_effective_service_overrides(({}
+                          | combine({'node_name': es_node_name} if es_node_name is defined else {})
+                          | combine({'publish_host': es_publish_host} if es_publish_host is defined else {})
+                          | combine({'seed_hosts': es_cluster_seed_hosts} if es_cluster_seed_hosts is defined else {})
+                          | combine({'initial_master_nodes': es_initial_master_nodes} if es_initial_master_nodes is defined else {})
+                          | combine({'is_initial_master': (es_is_initial_master | bool)} if es_is_initial_master is defined else {})),
+                          _lme_global_file.legacy_service_override_projection | default({})))[(lookup('file', item.path) | from_yaml).id] | default({}), recursive=True)
          }) }}
   loop: "{{ _lme_service_files.files }}"
   loop_control:
     label: "{{ item.path | basename }}"
+
+# COVERAGE (codex-1100 C1-OVERRIDE-MISSING-SERVICE-SKIP). The composed lme_services must cover
+# the declared universe EXACTLY -- validated INDEPENDENTLY of the pinnable projection. A
+# `-e lme_services={}` (or any pin/subset/superset) makes the composed key set diverge from the
+# disk-bound universe, so the symmetric difference is non-empty and this FAILS CLOSED before
+# activation + host-filtering. This closes the empty-projection evasion: a changed revision from a
+# pinned lme_services is no longer accepted as faithful application, and a missing admitted service
+# is rejected rather than skipped as "unrendered".
+- name: C1 -- assert the composed service set covers the declared universe (no pinned/suppressed projection)
+  ansible.builtin.assert:
+    that:
+      - (_lme_declared_service_ids | lme_service_coverage_gap(lme_services)) | length == 0
+    fail_msg: >-
+      the composed lme_services does not match the declared service universe on id(s)
+      {{ _lme_declared_service_ids | lme_service_coverage_gap(lme_services) }} -- a declared
+      service is missing from (or an undeclared one appears in) the composed set, so a pinned or
+      suppressed lme_services could pass the faithful-application check with a discarded override
+      (C1-OVERRIDE-MISSING-SERVICE-SKIP).
+    quiet: true
+
+# FAITHFUL-APPLICATION invariant (C1-SERVICE-OVERRIDE-INTERMEDIATE-DISCARDS-DECLARATION). The
+# EFFECTIVE override map is re-derived INLINE here from the admitted declarations (the SAME
+# es_ctx literal + byte-bound projection as the build loop + lme_service_overrides) -- never from
+# a pinnable intermediate -- and lme_service_overrides_applied asserts every effective override
+# leaf is reflected (TYPED: 0 != false) in the composed lme_services. So a pin that discarded an
+# override (a now-inert `-e _lme_service_overrides_eff={}`, a pinned upstream shim var, or a
+# directly pinned lme_services) leaves a declared leaf missing/different -- or, with coverage
+# guaranteeing the id is composed, an absent override id -- and FAILS CLOSED pre-mutation, before
+# the revision is bound. A legitimate override is never weakened (it is the last composition
+# layer, so it MUST appear).
+- name: C1 -- assert admitted service overrides are faithfully applied (no intermediate discard)
+  ansible.builtin.assert:
+    that:
+      - >-
+        (lme_services | lme_service_overrides_applied(
+           lme_service_overrides | default({}) | lme_effective_service_overrides(({}
+             | combine({'node_name': es_node_name} if es_node_name is defined else {})
+             | combine({'publish_host': es_publish_host} if es_publish_host is defined else {})
+             | combine({'seed_hosts': es_cluster_seed_hosts} if es_cluster_seed_hosts is defined else {})
+             | combine({'initial_master_nodes': es_initial_master_nodes} if es_initial_master_nodes is defined else {})
+             | combine({'is_initial_master': (es_is_initial_master | bool)} if es_is_initial_master is defined else {})),
+             _lme_global_file.legacy_service_override_projection | default({})))) | length == 0
+    fail_msg: >-
+      admitted service override leaf(s)
+      {{ lme_services | lme_service_overrides_applied(lme_service_overrides | default({}) | lme_effective_service_overrides(({} | combine({'node_name': es_node_name} if es_node_name is defined else {}) | combine({'publish_host': es_publish_host} if es_publish_host is defined else {}) | combine({'seed_hosts': es_cluster_seed_hosts} if es_cluster_seed_hosts is defined else {}) | combine({'initial_master_nodes': es_initial_master_nodes} if es_initial_master_nodes is defined else {}) | combine({'is_initial_master': (es_is_initial_master | bool)} if es_is_initial_master is defined else {})), _lme_global_file.legacy_service_override_projection | default({}))) }}
+      are NOT reflected in the composed lme_services -- a service override was discarded by a
+      pinned intermediate (e.g. -e _lme_service_overrides_eff={}) or a pinned lme_services, so
+      the revision could equal a no-override control (C1-SERVICE-OVERRIDE-INTERMEDIATE-DISCARDS-DECLARATION).
+    quiet: true
 
 - name: Build lme_service_kinds map (id -> kind) for dependency-name resolution
   ansible.builtin.set_fact:
