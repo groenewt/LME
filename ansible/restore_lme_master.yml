@@ -533,6 +533,37 @@
           - "Volume restore selection: {{ restore_selected_volume_names | default([]) | join(', ') if restore_selected_volume_names is defined and restore_selected_volume_names | length > 0 else 'None' }}"
       when: volume_backup_dir.stat.exists
 
+    # Pre-flight (verify-before-destroy): the next task removes and recreates each
+    # selected volume. backup_lme (single-node) and cluster_backup_lme (tarball) both
+    # always write volumes/<name>/data for every backed-up volume (empty volumes get an
+    # empty data/ dir). A missing data/ therefore means a corrupt/incomplete backup, and
+    # proceeding would silently leave that volume empty. Assert the payload exists BEFORE
+    # any destructive removal so the current volume is never wiped for an unrestorable backup.
+    - name: Verify each selected volume has restorable data in the backup
+      stat:
+        path: "{{ selected_backup_dir }}/volumes/{{ item }}/data"
+      loop: "{{ restore_selected_volume_names | default([]) }}"
+      register: restore_volume_data_stats
+      when:
+        - volume_backup_dir.stat.exists
+        - restore_selected_volume_names | default([]) | length > 0
+
+    - name: Fail if any selected volume is missing its backup data directory
+      assert:
+        that:
+          - item.stat.exists
+          - item.stat.isdir | default(false)
+        fail_msg: >-
+          Refusing to remove/recreate volumes: backup is missing data for volume
+          '{{ item.item }}' at {{ selected_backup_dir }}/volumes/{{ item.item }}/data.
+          Restoring would leave '{{ item.item }}' empty. Verify backup integrity before retrying.
+      loop: "{{ restore_volume_data_stats.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - volume_backup_dir.stat.exists
+        - restore_selected_volume_names | default([]) | length > 0
+
     - name: Remove existing selected volumes
       shell: |
         if {{ podman_cmd }} volume exists "{{ item }}"; then
