@@ -110,8 +110,8 @@ all:
   children:
     elasticsearch:
       hosts:
-        es1:
-          ansible_host: 10.0.0.5
+        lme-remote1:
+          ansible_host: 10.1.0.5
           ansible_user: admin
     # Future expansion:
     # kibana:
