@@ -58,6 +58,20 @@
              else 'lme-elasticsearch'
            ) }}
 
+# E-FLEET-REACHABILITY / E-EXISTING-WEAK-GATES (Codex ...-audits-0315): the data-flow gate at
+# the end of this role must prove FRESH documents (indexed since this run began), not merely that
+# an index name exists -- otherwise a re-run against an already-deployed host passes on stale docs
+# even if the repointed output never ships. Capture run start from the index host clock (not the
+# controller) to compare against @timestamp without skew.
+- name: Capture collection run-start timestamp (target-host clock)
+  ansible.builtin.command: date -u +%Y-%m-%dT%H:%M:%S.000Z
+  register: _fleet_run_start_raw
+  changed_when: false
+
+- name: Set collection run-start fact
+  ansible.builtin.set_fact:
+    fleet_run_start: "{{ _fleet_run_start_raw.stdout | trim }}"
+
 - name: Resolve separate Fleet enrollment and output URLs
   ansible.builtin.set_fact:
     fleet_enrollment_url: "{{ fleet_enrollment_url | default('https://' ~ fleet_enrollment_host ~ ':' ~ fleet_port) }}"
@@ -102,16 +116,23 @@
     - lme_lab_mode | default(false) | bool
     - lme_profile | default('default') == 'multinode'
 
-# D1 reachability contract: turn the silent "advertise an unreachable output" failure
-# (ES 9200 loopback-only while agents are told to ship elsewhere) into a hard, explanatory
-# assert. This is the reachability check the collection root-cause analysis found MISSING.
-- name: Assert the resolved Fleet default output is reachable by shipping agents
+# D1 STATIC TOPOLOGY VALIDATION (E-FLEET-REACHABILITY, Codex ...-audits-0315): this catches the
+# genuine D1 misconfiguration (output points at the raw loopback-unreachable host LAN IP), but it
+# is a STATIC check of the resolved topology -- a different hostname / multinode selection / Serve
+# boolean satisfies it WITHOUT proving a usable route or valid TLS. It therefore no longer claims
+# reachability. Real reachability + payload is proven downstream by the fresh, fleet-server-agent-
+# filtered data-flow gate ("Gate on FRESH elastic_agent ... documents") near the end of this role,
+# which requires documents actually indexed since this run began. (An earlier in-namespace probe --
+# podman exec into lme-fleet-server -- is deferred: the elastic-agent image has no confirmed curl
+# healthcheck and its TLS tooling is unverified without a deploy; see the E milestone.)
+- name: Validate the resolved Fleet default output topology (static configuration only)
   ansible.builtin.assert:
     that:
       # Fail ONLY the genuine D1 trap: the output points at the raw host LAN IP (ipvar) while
       # ES 9200 is loopback-bound and no profile opened it. The alias, an explicit operator
       # hostname (advertise/output), multinode, tailnet Serve, and an opened non-loopback bind
-      # all pass -- we do not second-guess an operator's explicit reachable topology.
+      # all pass -- we do not second-guess an operator's explicit topology. This is CONFIGURATION
+      # validation, NOT proof that a route exists.
       - >-
         (fleet_output_url | urlsplit('hostname')) != ipvar
         or ((lme_profile | default('default')) == 'multinode')
@@ -119,13 +140,14 @@
         or (fleet_output_bind_address | default('') | length > 0
             and fleet_output_bind_address not in ['127.0.0.1', '::1'])
     fail_msg: >-
-      Fleet default output {{ fleet_output_url }} is not reachable by shipping agents:
-      Elasticsearch 9200 binds loopback-only unless a profile opens it, so nothing could ship
-      here and the metrics/logs-elastic_agent.* data-flow gate would time out. Use the
-      in-network alias https://lme-elasticsearch:9200 for a single-host deploy (now the
-      default), or set fleet_output_bind_address (multinode) / enable tailnet Serve so remote
-      agents can reach Elasticsearch.
-    success_msg: "Fleet default output {{ fleet_output_url }} resolves to a reachable endpoint."
+      Fleet default output {{ fleet_output_url }} is statically misconfigured: it points at the
+      raw host LAN IP while Elasticsearch 9200 binds loopback-only unless a profile opens it, so
+      nothing could ship here. Use the in-network alias https://lme-elasticsearch:9200 for a
+      single-host deploy (now the default), or set fleet_output_bind_address (multinode) / enable
+      tailnet Serve so remote agents can reach Elasticsearch.
+    success_msg: >-
+      Fleet default output {{ fleet_output_url }} is a valid topology; a usable route + TLS are
+      NOT asserted here -- they are proven by the fresh data-flow gate at the end of this role.
     quiet: true
 
 - name: Debug - Display set variables (sensitive information redacted)
@@ -947,6 +969,19 @@
       not an acceptance pass.
   when: (lme_lab_mode | default(false) | bool) and not (lme_verify_collection | default(false) | bool)
 
+# E-EXISTING-WEAK-GATES: capture the fleet-server-policy agent id(s) so the data-flow gate can
+# require documents FROM that specific agent (the one that must ship self-monitoring), not merely
+# any elastic_agent index. Empty when the check-in gate was deferred (lab); the gate then falls
+# back to freshness-only.
+- name: Capture the fleet-server-policy agent id(s) for the fresh data-flow proof
+  ansible.builtin.set_fact:
+    fleet_server_agent_ids: >-
+      {{ (fleet_agents_result.json | default({})).get('items', [])
+         | selectattr('policy_id', 'defined')
+         | selectattr('policy_id', 'equalto', 'fleet-server-policy')
+         | map(attribute='id', default='')
+         | select('string') | reject('equalto', '') | list }}
+
 - name: Derive online Fleet agent hostnames on the configured policy
   ansible.builtin.set_fact:
     fleet_verified_agent_hostnames: >-
@@ -1037,34 +1072,78 @@
     state: present
   become: yes
 
-# Wait for metrics indices to be created (reduced timeout for single-node setup)
-- name: Wait for metrics indices to be created
-  uri:
-    url: "{{ local_es_url }}/_cat/indices/metrics-elastic_agent.*,logs-elastic_agent*?h=index&format=json"
-    method: GET
+# E-FLEET-REACHABILITY + E-EXISTING-WEAK-GATES (Codex ...-audits-0315): the previous gate matched
+# on _cat/indices -- it accepted that an index NAME exists, which an index template can satisfy with
+# ZERO documents, and it never proved a usable route or that THIS agent's payload arrived. Require
+# instead that FRESH documents (indexed since fleet_run_start) exist for BOTH the metrics and logs
+# elastic_agent data streams, filtered to the fleet-server-policy agent id(s) when known. This is
+# the real end-to-end reachability + payload proof (usable route + TLS + admitted documents),
+# executed against actually-indexed data, and it correctly FAILS a re-run whose repointed output
+# never ships (stale docs predate fleet_run_start). Note: validate_certs stays `no` here pending a
+# host-side CA path for the fleet role (the CA is read via `podman exec` from lme-elasticsearch, not
+# a host file; ES SAN already covers localhost/127.0.0.1) -- CR-E-13 tracks the CA-verified flip.
+- name: Gate on FRESH elastic_agent metrics documents (route + payload proof)
+  ansible.builtin.uri:
+    url: "{{ local_es_url }}/metrics-elastic_agent.*/_count"
+    method: POST
     user: "{{ elastic_username }}"
     password: "{{ elastic_password }}"
     force_basic_auth: yes
     validate_certs: no
+    headers:
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      query:
+        bool:
+          filter: "{{ _fleet_fresh_filter }}"
     status_code: [200, 404]
-  register: metrics_indices_result
-  until: >
-    metrics_indices_result.status == 200 and 
-    metrics_indices_result.json | length > 0 and
-    metrics_indices_result.json | map(attribute='index') | select('match', '.*metrics-elastic_agent.*') | list | length > 0 and
-    metrics_indices_result.json | map(attribute='index') | select('match', '.*logs-elastic_agent.*') | list | length > 0
+  vars:
+    _fleet_fresh_filter: >-
+      {{ [ {'range': {'@timestamp': {'gte': fleet_run_start}}} ]
+         + ([ {'terms': {'agent.id': fleet_server_agent_ids}} ]
+             if ((fleet_server_agent_ids | default([])) | length > 0) else []) }}
+  register: _fleet_metrics_fresh
+  until: (_fleet_metrics_fresh.status | default(0)) == 200 and ((_fleet_metrics_fresh.json | default({})).get('count', 0) | int) > 0
   retries: 30
   delay: 20
   no_log: true
 
-- name: Debug metrics indices result
-  debug:
-    msg: 
-      - "Total indices found: {{ metrics_indices_result.json | length }}"
-      - "All indices found: {{ metrics_indices_result.json | map(attribute='index') | list }}"
-      - "Metrics-elastic_agent indices: {{ metrics_indices_result.json | map(attribute='index') | select('match', '.*metrics-elastic_agent.*') | list }}"
-      - "Logs-elastic_agent indices: {{ metrics_indices_result.json | map(attribute='index') | select('match', '.*logs-elastic_agent.*') | list }}"
-  when: debug_mode | bool and metrics_indices_result.status == 200
+- name: Gate on FRESH elastic_agent log documents (route + payload proof)
+  ansible.builtin.uri:
+    url: "{{ local_es_url }}/logs-elastic_agent.*/_count"
+    method: POST
+    user: "{{ elastic_username }}"
+    password: "{{ elastic_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    headers:
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      query:
+        bool:
+          filter: "{{ _fleet_fresh_filter }}"
+    status_code: [200, 404]
+  vars:
+    _fleet_fresh_filter: >-
+      {{ [ {'range': {'@timestamp': {'gte': fleet_run_start}}} ]
+         + ([ {'terms': {'agent.id': fleet_server_agent_ids}} ]
+             if ((fleet_server_agent_ids | default([])) | length > 0) else []) }}
+  register: _fleet_logs_fresh
+  until: (_fleet_logs_fresh.status | default(0)) == 200 and ((_fleet_logs_fresh.json | default({})).get('count', 0) | int) > 0
+  retries: 30
+  delay: 20
+  no_log: true
+
+- name: Report fresh elastic_agent data-flow proof
+  ansible.builtin.debug:
+    msg:
+      - "Run start (target clock): {{ fleet_run_start }}"
+      - "Fleet-server agent id filter: {{ fleet_server_agent_ids | default([]) }}"
+      - "Fresh metrics-elastic_agent docs: {{ (_fleet_metrics_fresh.json | default({})).get('count', 0) }}"
+      - "Fresh logs-elastic_agent docs: {{ (_fleet_logs_fresh.json | default({})).get('count', 0) }}"
+  when: debug_mode | bool
 
 
 # Note: Kibana offline mode configuration now happens in podman role
