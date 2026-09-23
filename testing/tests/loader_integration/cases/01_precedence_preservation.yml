@@ -1,0 +1,218 @@
+# testing/tests/loader_integration/cases/01_precedence_preservation.yml
+#
+# INTEGRATION-tier behavior specification for the LME resolved-config contract,
+# exercised at the REAL DEPLOYMENT ENTRYPOINTS (site / upgrade / elasticsearch /
+# convert_to_cluster), NOT the isolated loader unit (that is C1's separate suite at
+# .superpowers/sdd/2026-09-22-observability-implementation/loader-tests/cases.yml).
+#
+# This file maps 1:1 to Codex required_contract_tests #1-#5 (PRECEDENCE + PRESERVATION).
+# It is the integration-tier COMPLEMENT of C1's unit cases: the unit suite drives the
+# loader in an isolated source copy; these cases assert the SAME laws once composed
+# through the actual entrypoint variable context, where -- per finding
+# codex-loader-regression-20260923-0100 -- play-level defaults
+# (elasticsearch.yml:28 offline_mode:false; convert_to_cluster.yml:386 offline_mode:false,
+# :263 lme_profile:cluster; upgrade_lme.yml:738-749 detection-composed install_*/offline/
+# profile) get incorrectly captured as operator overrides. Exercising that real context
+# is the entire reason this tier exists.
+#
+# Declared precedence (high -> low), from contract_binding.declared_precedence_high_to_low:
+#   explicit extra-vars
+#     > explicit inventory / host_vars
+#       > explicitly-selected ordered profile overlays
+#         > declared upgrade-preservation fallback (schema-permitted, observation-backed)
+#           > declared global defaults
+#
+# Declared enable-flag defaults (contract_binding.enable_flags.declared_defaults):
+#   install_llm=true  install_elastic_services=false  offline_mode=false
+#   install_otel=false  install_legacy_beats=true
+#
+# origin vocabulary (contract_binding.names.origin_field):
+#   extra_var | inventory | profile | preservation | default
+#
+# QUEUED-UNTIL-C1: The C1 lme_resolved.* public contract is NOT yet landed
+# (contract_binding.status == pending_c1_sitrep). EVERY case here is contract-dependent,
+# so each sets requires_contract:true and names its blocking deliverable(s) in queued_on.
+# The runner (run_integration.yml) marks all of these QUEUED -- never PASS, never SKIP --
+# until contract_binding.status flips to `bound`. That is CORRECT and fail-closed: these
+# are NOT meant to pass at this HEAD. queued_on legend:
+#   C1 = shared resolved-config contract (lme_resolved.* dict + origin record + schema)
+#   B  = upgrade/convert_to_cluster entrypoint migration to the contract (markers ->
+#        declared preservation-fallback tier; detection-as-default removed)
+#   E  = elasticsearch.yml entrypoint migration (incidental play-var offline_mode:false
+#        removed / demoted below profile)
+#
+# No secret VALUES appear anywhere in this file (authoring_rules): only synthetic
+# enable-flag booleans and on-disk marker presence flags.
+
+schema_version: 1
+cases:
+  # --- #1 PRESERVATION: installed on-disk state carries declared upgrade behavior ------
+  - name: installed-marker-preserves-upgrade-behavior
+    kind: preservation
+    requires_contract: true
+    queued_on: [C1, B]
+    entrypoints: [upgrade]
+    inputs:
+      # On-disk installed state only; NO explicit operator choices at any tier.
+      markers:
+        installed_pack_quadlet: true   # elastic pack quadlet present on disk (upgrade_lme.yml:738-749 detection input)
+        offline_marker: true           # offline marker present on disk
+    expect:
+      resolved:
+        install_elastic_services: true # preserved from the installed pack quadlet
+        offline_mode: true             # preserved from the offline marker
+      origin:
+        install_elastic_services: preservation
+        offline_mode: preservation
+    invariant_task: "preservation: upgrade with an installed pack quadlet + offline marker and no explicit choices carries pack-enabled/offline-true at the declared preservation-fallback tier"
+    fail_msg: "REGRESSION: upgrade dropped installed-state preservation (pack quadlet / offline marker) instead of carrying it as the declared preservation fallback"
+
+  # --- #2 PRESERVATION: absent markers fall through to declared baseline defaults ------
+  - name: absent-marker-baseline-upgrade-behavior
+    kind: preservation
+    requires_contract: true
+    queued_on: [C1, B]
+    entrypoints: [upgrade]
+    inputs:
+      markers: {}                      # no installed pack quadlet, no offline marker
+      # NO explicit operator choices at any tier.
+    expect:
+      resolved:
+        install_llm: true              # declared baseline default
+        install_elastic_services: false
+        offline_mode: false
+        install_otel: false
+        install_legacy_beats: true
+      origin:
+        install_elastic_services: default
+        offline_mode: default
+    invariant_task: "preservation: upgrade with no installed markers and no explicit choices resolves the declared baseline defaults (no fabricated preservation)"
+    fail_msg: "REGRESSION: absent-marker upgrade did not fall through to declared baseline defaults"
+
+  # --- #3 PRECEDENCE: explicit inventory beats detected/marker-composed value ----------
+  - name: inventory-false-beats-detected-true
+    kind: precedence
+    requires_contract: true
+    queued_on: [C1]
+    entrypoints: [upgrade]
+    inputs:
+      markers:
+        offline_marker: true           # detection/marker would compose offline_mode=true
+      inventory_vars:
+        offline_mode: false            # explicit operator inventory value (higher tier)
+    expect:
+      resolved:
+        offline_mode: false            # inventory wins over the marker/detection tier
+      origin:
+        offline_mode: inventory
+    invariant_task: "precedence: an explicit inventory offline_mode=false beats a detected/marker-composed offline_mode=true"
+    fail_msg: "REGRESSION: a marker/detection true clobbered an explicit inventory operator false"
+
+  # --- #4 PRECEDENCE: explicit extra-var beats explicit inventory ----------------------
+  - name: extra-var-false-beats-inventory-true
+    kind: precedence
+    requires_contract: true
+    queued_on: [C1]
+    entrypoints: [site]
+    inputs:
+      extra_vars:
+        offline_mode: false            # highest tier
+      inventory_vars:
+        offline_mode: true
+    expect:
+      resolved:
+        offline_mode: false
+      origin:
+        offline_mode: extra_var
+    invariant_task: "precedence: an explicit extra-var offline_mode=false beats an explicit inventory offline_mode=true"
+    fail_msg: "REGRESSION: an inventory value overrode an explicit extra-var operator false"
+
+  # --- #5 PRECEDENCE: the INVERSE of #4 (extra-var true beats inventory false) ---------
+  - name: extra-var-true-beats-inventory-false
+    kind: precedence
+    requires_contract: true
+    queued_on: [C1]
+    entrypoints: [site]
+    inputs:
+      extra_vars:
+        offline_mode: true             # highest tier
+      inventory_vars:
+        offline_mode: false
+    expect:
+      resolved:
+        offline_mode: true
+      origin:
+        offline_mode: extra_var
+    invariant_task: "precedence: an explicit extra-var offline_mode=true beats an explicit inventory offline_mode=false (inverse of extra-var-false-beats-inventory-true)"
+    fail_msg: "REGRESSION: an inventory value overrode an explicit extra-var operator true"
+
+  # --- #6 PRECEDENCE: an explicitly-selected profile field beats detection --------------
+  - name: explicit-profile-field-beats-detection
+    kind: precedence
+    requires_contract: true
+    queued_on: [C1]
+    entrypoints: [upgrade]
+    inputs:
+      profile: offline                 # ordered overlay explicitly sets offline_mode=true
+      markers:
+        offline_marker: false          # detection/marker composes offline_mode=false (contradictory)
+    expect:
+      resolved:
+        offline_mode: true             # profile overlay wins over the preservation/detection tier
+      origin:
+        offline_mode: profile
+    invariant_task: "precedence: an explicitly-selected profile field (offline overlay offline_mode=true) beats a contradictory detected/marker offline_mode=false"
+    fail_msg: "REGRESSION: a marker/detection value overrode an explicitly-selected ordered-profile-overlay field"
+
+  # --- #7 PRESERVATION: an omitted profile field leaves the preservation fallback -------
+  - name: omitted-profile-field-leaves-preservation-fallback
+    kind: preservation
+    requires_contract: true
+    queued_on: [C1, B]
+    entrypoints: [upgrade]
+    inputs:
+      profile: tailscale               # overlay that does NOT select install_elastic_services (field omitted)
+      markers:
+        installed_pack_quadlet: true   # schema-permitted installed-state preservation fallback for the omitted field
+    expect:
+      resolved:
+        install_elastic_services: true # preservation fallback remains available where the profile is silent
+      origin:
+        install_elastic_services: preservation
+    invariant_task: "preservation: a profile that OMITS install_elastic_services leaves the schema-permitted installed-state preservation fallback in effect (pack quadlet stays enabled)"
+    fail_msg: "REGRESSION: an omitted profile field wiped the schema-permitted preservation fallback instead of leaving it available"
+
+  # --- #8 PRECEDENCE: an entrypoint's incidental play default is never promoted ---------
+  - name: incidental-play-defaults-never-promoted-to-operator
+    kind: precedence
+    requires_contract: true
+    queued_on: [C1, B, E]
+    entrypoints: [elasticsearch, convert_to_cluster]
+    inputs:
+      profile: offline                 # ordered overlay sets offline_mode=true
+      play_var_overrides:
+        # the entrypoint's OWN incidental play var (elasticsearch.yml:28 /
+        # convert_to_cluster.yml:386 offline_mode:false) -- the opposite of the profile.
+        offline_mode: false
+    expect:
+      resolved:
+        offline_mode: true             # profile wins; the incidental play default does NOT beat it
+      origin:
+        offline_mode: profile          # recorded as profile, NOT as an operator override (extra_var)
+    invariant_task: "precedence: an entrypoint's incidental play default (elasticsearch/convert_to_cluster offline_mode:false) neither beats the selected profile nor is recorded as an operator override"
+    fail_msg: "REGRESSION: an incidental entrypoint play default (offline_mode:false) was promoted over the profile and/or captured as an operator override (codex-loader-regression-20260923-0100)"
+
+  # --- #9 ORIGIN: a declared default is recorded as default, never operator override ----
+  - name: install-llm-true-is-declared-default-not-operator-override
+    kind: origin
+    requires_contract: true
+    queued_on: [C1]
+    entrypoints: [site]
+    inputs: {}                         # no install_llm at any tier (no extra_var/inventory/profile/marker)
+    expect:
+      resolved:
+        install_llm: true              # the declared baseline default
+      origin:
+        install_llm: default           # origin is `default`, NOT `extra_var`/operator
+    invariant_task: "origin: with no explicit install_llm at any tier, install_llm resolves true and is recorded with origin=default (a declared default, never an operator override)"
+    fail_msg: "REGRESSION: the install_llm=true declared default was recorded as an operator override instead of origin=default"
