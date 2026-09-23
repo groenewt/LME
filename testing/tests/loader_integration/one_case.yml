@@ -44,13 +44,13 @@
     _unhandled_inputs: "{{ ((case.inputs | default({})).keys() | list) | difference(contract_binding.probe_handler.supported_input_keys) }}"
     _unhandled_expects: "{{ ((case.expect | default({})).keys() | list) | difference(contract_binding.probe_handler.supported_expect_keys) }}"
     _env_ok: "{{ (case.environment | default('localhost')) in contract_binding.probe_handler.supported_environments }}"
-  when: case.kind != 'static_scan'
+  when: case.kind not in ['static_scan', 'engine_regression']
 
 - name: "Compute _probe_ready / _handler_blocked :: {{ case.name }}"
   ansible.builtin.set_fact:
     _handler_blocked: "{{ (contract_binding.probe_handler.status != 'ready') or (_unhandled_inputs | length > 0) or (_unhandled_expects | length > 0) or (not _env_ok) }}"
     _probe_ready: "{{ contract_bound and (contract_binding.probe_handler.status == 'ready') and (_unhandled_inputs | length == 0) and (_unhandled_expects | length == 0) and _env_ok }}"
-  when: case.kind != 'static_scan'
+  when: case.kind not in ['static_scan', 'engine_regression']
 
 # --- QUEUED (unbound OR probe handler cannot render this case) -> fail-closed --
 - name: "QUEUED :: {{ case.name }}"
@@ -58,7 +58,7 @@
     results: >-
       {{ results + [ {
            'case': case.name, 'kind': case.kind, 'invariant_task': case.invariant_task,
-           'verdict': 'QUEUED', 'requires_contract': true,
+           'verdict': 'QUEUED', 'requires_contract': (case.requires_contract | default(true)),
            'queued_on': ((case.queued_on | default(['C1'])) + (['G_probe_handler'] if _handler_blocked else [])) | unique,
            'binding_status': contract_binding.status,
            'probe_handler_blocked': _handler_blocked,
@@ -67,14 +67,13 @@
            'entrypoints': (case.entrypoints | default([]))
          } ] }}
   when:
-    - case.kind != 'static_scan'
-    - (case.requires_contract | default(true))
+    - case.kind not in ['static_scan', 'engine_regression']
     - (not contract_bound) or (not _probe_ready)
 
 # --- BOUND + probe-handler-ready -> render + run the probe ---------------------
 - name: "bound probe :: {{ case.name }}"
   when:
-    - case.kind != 'static_scan'
+    - case.kind not in ['static_scan', 'engine_regression']
     - (case.requires_contract | default(true))
     - _probe_ready | default(false)
   block:
@@ -118,5 +117,50 @@
                            else 'FAIL')))),
                'assert_count': (_assert_count | int),
                'rc': (probe_run.rc | default('n/a')),
+               'log': (work ~ '/' ~ case.name ~ '/probe.yml')
+             } ] }}
+
+# --- engine_regression (RUNNABLE NOW) -> render + run against the immutable resolver copy ---
+# The probe invokes the REAL resolver filters via engine_probe.yml.j2 with ANSIBLE_FILTER_PLUGINS
+# pointed at the per-run copied resolver. expect.raises is asserted INSIDE the probe (rescue sets
+# _raised), so a fail-closed behavior PASSES the probe (rc==0). Zero rendered asserts is ERROR.
+- name: "engine_regression :: {{ case.name }}"
+  when: case.kind == 'engine_regression'
+  block:
+    - name: "Prepare per-case work dir :: {{ case.name }}"
+      ansible.builtin.file:
+        path: "{{ work }}/{{ case.name }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Render engine probe from engine_probe.yml.j2 :: {{ case.name }}"
+      ansible.builtin.template:
+        src: engine_probe.yml.j2
+        dest: "{{ work }}/{{ case.name }}/probe.yml"
+        mode: "0644"
+
+    - name: "Count rendered assertions (a zero-assertion engine probe must NOT pass)"
+      ansible.builtin.set_fact:
+        _eng_assert_count: "{{ (lookup('ansible.builtin.file', work ~ '/' ~ case.name ~ '/probe.yml')).splitlines() | select('search', 'ansible.builtin.assert') | list | length }}"
+
+    - name: "Run engine probe under scrubbed env against the immutable resolver copy :: {{ case.name }}"
+      ansible.builtin.command:
+        cmd: /usr/bin/env -i HOME={{ work }}/{{ case.name }} PATH=/usr/bin:/bin ANSIBLE_FILTER_PLUGINS={{ engine_filter_dir }} /usr/bin/ansible-playbook probe.yml
+        chdir: "{{ work }}/{{ case.name }}"
+      register: eng_run
+      changed_when: false
+      failed_when: false
+      when: (_eng_assert_count | int) > 0
+
+    - name: "Judge engine probe (zero-assert=ERROR; else rc) :: {{ case.name }}"
+      ansible.builtin.set_fact:
+        results: >-
+          {{ results + [ {
+               'case': case.name, 'kind': case.kind, 'invariant_task': case.invariant_task,
+               'verdict': ('ERROR' if (_eng_assert_count | int) == 0
+                           else ('PASS' if eng_run.rc == 0 else 'FAIL')),
+               'assert_count': (_eng_assert_count | int),
+               'rc': (eng_run.rc | default('n/a')),
+               'resolver_sha256': engine_resolver_sha256,
                'log': (work ~ '/' ~ case.name ~ '/probe.yml')
              } ] }}

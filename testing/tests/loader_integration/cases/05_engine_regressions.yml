@@ -1,0 +1,169 @@
+# testing/tests/loader_integration/cases/05_engine_regressions.yml
+#
+# RUNNABLE-NOW engine-level regression suite (kind: engine_regression). These are the
+# resolver regressions Codex's audit (codex-resolver-audit-0245) says are MISSING at the
+# unit tier; G carries them at the INTEGRATION tier by invoking the REAL resolver filters
+# through ACTUAL ansible-playbook Jinja (engine_probe.yml.j2) against an IMMUTABLE copied
+# resolver -- the same filter pipeline load_manifests.yml uses. That is the distinct
+# integration angle vs C1's isolated pytest: it catches Jinja argument-binding / filter
+# registration / error-propagation faults a pure unittest cannot see.
+#
+# These need NO C1 loader cutover (the engine exists at HEAD 8ceb297), so requires_contract
+# is false and they RUN now: they PASS while the engine is correct and go RED on regression.
+# The ENTRYPOINT-level faithful probe (real -e/-i through site/upgrade/elasticsearch/
+# convert_to_cluster via a resolve-only seam) is a SEPARATE, still-QUEUED deliverable
+# (contract_binding.probe_handler) -- a runnable engine leg never satisfies an entrypoint leg.
+#
+# Coordinate with C1: C1 FIXES the engine + owns its isolated unit suite; G owns these
+# integration-tier regressions (no duplication -- different invocation pipeline + scope).
+# No secret VALUES appear here (synthetic registries + synthetic booleans/ints only).
+
+schema_version: 1
+
+# Shared synthetic registry (mirrors the real registry SHAPE: fields{type,default,enable_flag,
+# upgrade_fallback,nullable}, precedence ending in 'default', channels mapping tiers to sources,
+# origin_vocabulary). Per-case variants override precedence / fields.
+_base_registry: &base_registry
+  fields:
+    offline_mode: {type: bool, default: false, enable_flag: true}
+    install_elastic_services: {type: bool, default: false, enable_flag: true, upgrade_fallback: true}
+    install_llm: {type: bool, default: true, enable_flag: true}
+    max_shards: {type: int, default: 0}
+    extra_hosts: {type: list, default: []}
+    overrides: {type: map, default: {}}
+    optional_note: {type: str, nullable: true, default: null}
+  precedence: [operator, profile, observation, default]
+  channels:
+    operator: {provenance: caller, source: selections}
+    profile: {source: profile_vars}
+    observation: {source: observations, requires_field: upgrade_fallback}
+    default: {source: field_default}
+  origin_vocabulary: [operator, profile, observation, default, extra_var, inventory]
+
+cases:
+  # --- argument-ORDER regression (A1 fail-open) ---------------------------------------
+  - name: reversed-validate-pipe-fails-closed
+    kind: engine_regression
+    requires_contract: false
+    call: validate_reversed
+    registry: *base_registry
+    resolved: {offline_mode: true}      # becomes the registry arg under the reversed pipe -> no 'fields'
+    expect: {raises: true}
+    invariant_task: "A1: the reversed pipe `resolved | lme_validate_config(registry)` fails closed (registry-shape gate rejects a no-fields registry), not a silent pass"
+    fail_msg: "A1 REGRESSION: a reversed lme_validate_config pipe validated silently instead of failing closed on the registry-shape gate"
+
+  - name: correct-validate-pipe-accepts-canonical
+    kind: engine_regression
+    requires_contract: false
+    call: validate
+    registry: *base_registry
+    resolved: {offline_mode: true, install_elastic_services: false, install_llm: true, max_shards: 0, extra_hosts: [], overrides: {}, optional_note: null}
+    expect: {valid: true}
+    invariant_task: "positive control: the CORRECT pipe `registry | lme_validate_config(resolved)` returns a canonical resolved dict unchanged"
+    fail_msg: "the correct-order validate pipe rejected a canonical resolved dict"
+
+  # --- reordered-precedence (A2: precedence is DECLARATION-driven, not hardcoded) ------
+  - name: precedence-is-declaration-driven-operator-first
+    kind: engine_regression
+    requires_contract: false
+    call: resolve
+    registry: *base_registry            # precedence [operator, profile, ...] -> operator wins
+    resolve:
+      selections: {offline_mode: true}
+      profile_vars: {offline_mode: false}
+    expect:
+      resolved: {offline_mode: true}
+      origins: {offline_mode: operator}
+    invariant_task: "A2: with declared precedence [operator, profile, ...] the operator value wins over a contradictory profile value"
+    fail_msg: "A2 REGRESSION: the resolver did not honor the declared operator>profile precedence"
+
+  - name: precedence-is-declaration-driven-profile-first
+    kind: engine_regression
+    requires_contract: false
+    call: resolve
+    registry:
+      <<: *base_registry
+      precedence: [profile, operator, observation, default]   # REORDERED -> profile wins
+    resolve:
+      selections: {offline_mode: true}
+      profile_vars: {offline_mode: false}
+    expect:
+      resolved: {offline_mode: false}
+      origins: {offline_mode: profile}
+    invariant_task: "A2: REORDERING the declared precedence to [profile, operator, ...] flips the winner to the profile value -- proving precedence is read from the registry, not hardcoded"
+    fail_msg: "A2 REGRESSION: reordering registry.precedence did NOT change the winner (the resolver consults a fixed order, not the declaration)"
+
+  # --- extended-type (int 0 / empty collection / nullable null preserved) --------------
+  - name: extended-types-explicit-falselike-preserved
+    kind: engine_regression
+    requires_contract: false
+    call: resolve
+    registry: *base_registry
+    resolve:
+      selections: {max_shards: 0, extra_hosts: [], overrides: {}, optional_note: null}
+    expect:
+      resolved:
+        max_shards: 0            # explicit int zero, NOT treated as absent
+        extra_hosts: []          # explicit empty list
+        overrides: {}            # explicit empty map
+        optional_note: null      # explicit null on a nullable field
+        install_llm: true        # untouched declared default
+    invariant_task: "extended-type: explicit false-like values (int 0, empty list, empty map, null on a nullable field) are preserved by membership, never overwritten as absent"
+    fail_msg: "extended-type REGRESSION: an explicit 0 / [] / {} / null was treated as absent and replaced by a default/detection"
+
+  # --- origin-rejection (A5 honest origins) -------------------------------------------
+  - name: false-origin-claim-discarded-as-operator
+    kind: engine_regression
+    requires_contract: false
+    call: resolve
+    registry: *base_registry
+    resolve:
+      selections: {offline_mode: true}
+      origins: {offline_mode: default}     # a LIE: value was selected at the caller tier, not defaulted
+    expect:
+      resolved: {offline_mode: true}
+      origins: {offline_mode: operator}    # false 'default' claim discarded -> honest combined label
+    invariant_task: "A5: a caller origin claim that lies about the tier (default for a selected value) is DISCARDED and recorded as the honest `operator`"
+    fail_msg: "A5 REGRESSION: a false caller origin claim was propagated instead of the honest operator label"
+
+  - name: finer-verified-origin-preserved
+    kind: engine_regression
+    requires_contract: false
+    call: resolve
+    registry: *base_registry               # origin_vocabulary includes inventory
+    resolve:
+      selections: {offline_mode: true}
+      origins: {offline_mode: inventory}   # caller-verified finer source, declared in vocab
+    expect:
+      resolved: {offline_mode: true}
+      origins: {offline_mode: inventory}   # finer label preserved because it is caller-verifiable AND declared
+    invariant_task: "A5: a caller-VERIFIED finer origin (inventory) that is declared in the vocabulary is PRESERVED (finer_when_exposed), not flattened to operator"
+    fail_msg: "A5 REGRESSION: a caller-verified declared finer origin (inventory) was flattened away"
+
+  # --- C1-OPTIONAL-NONMAPPING ---------------------------------------------------------
+  - name: optional-only-registry-rejects-nonmapping-resolved
+    kind: engine_regression
+    requires_contract: false
+    call: validate
+    registry:
+      fields: {note: {type: str, nullable: true, default: null}}   # ALL optional
+      precedence: [operator, default]
+      channels: {operator: {provenance: caller, source: selections}, default: {source: field_default}}
+    resolved: []              # a non-mapping resolved input
+    expect: {raises: true}
+    invariant_task: "C1-OPTIONAL-NONMAPPING: a non-mapping resolved input is rejected INDEPENDENTLY of whether any field is required (no silent coercion of [] -> {})"
+    fail_msg: "C1-OPTIONAL-NONMAPPING REGRESSION: a non-mapping resolved input validated because the registry had only optional fields"
+
+  # --- C1-UNKNOWN-NULLABLE-TYPE -------------------------------------------------------
+  - name: unsupported-declared-type-fails-schema-even-nullable
+    kind: engine_regression
+    requires_contract: false
+    call: validate
+    registry:
+      fields: {weird: {type: frobnicate, nullable: true}}   # unsupported type + nullable
+      precedence: [operator, default]
+      channels: {operator: {provenance: caller, source: selections}, default: {source: field_default}}
+    resolved: {}
+    expect: {raises: true}
+    invariant_task: "C1-UNKNOWN-NULLABLE-TYPE: a field declaring an unsupported type fails the registry-shape gate BEFORE any value is inspected, so a nullable unsupported-type field cannot slip a null past validation"
+    fail_msg: "C1-UNKNOWN-NULLABLE-TYPE REGRESSION: an unsupported declared type passed schema validation (the None short-circuit let a nullable field skip the type check)"

@@ -1,0 +1,126 @@
+# testing/tests/loader_integration/cases/06_caller_negative_recovery.yml
+#
+# CALLER-NEGATIVE + interrupted-operation acceptance requirements routed to G by D and B
+# (codex-check-0315 item 2b, codex-check-0330 items 1+2). These are LIFECYCLE negatives:
+# a destructive/recovery caller must REFUSE on unsafe evidence, and an interrupted
+# activation must be tracked + reconciled -- NOT silently skipped -- on rerun.
+#
+# None is engine-testable now: each needs D's rollback/restore playbooks (or B's agent
+# activation path) plus a lab VM to interrupt/fault a real run. They are therefore QUEUED
+# on their real owner(s) + a lab VM, fail-closed (codex-check-0015): a documented typed
+# obstruction NEVER counts as a completed acceptance. Durability-model specifics
+# (integrity manifest shape, restore content check) are pending D coordination -- authored
+# here against the DOCUMENTED defect surface (M1 checks only backup dir existence/type;
+# rollback can exit zero with required secrets absent).
+#
+# No secret VALUES appear here (identities + synthetic fault descriptions only).
+
+schema_version: 1
+cases:
+  # --- B2 interrupted-operation regression (codex-0330 #1) -----------------------------
+  - name: interrupted-augenrules-activation-reconciles-on-rerun
+    kind: security_probe
+    requires_contract: false
+    queued_on: [B]
+    environment: lab VM
+    spec_only: true       # needs a lab VM to interrupt augenrules loading mid-run
+    invariant_task: >-
+      interrupted-activation: in ludus_lme_agents/tasks/elastic.yml:153-171, when the rules DOWNLOAD
+      succeeds but augenrules LOADING fails/interrupts, the applied-vs-pending-activation state
+      is tracked so that a rerun with the UNCHANGED download still RECONCILES (re-runs
+      activation), never skips it as already-applied
+    fail_msg: >-
+      interrupted-activation REGRESSION: a rerun after a failed augenrules load skipped
+      activation because the (unchanged) rules download reported 'ok'/changed=false -- the
+      download's idempotency masked the un-activated state, leaving rules downloaded but not loaded
+
+  # --- RECOVERY-INTEGRITY-QUALIFICATION negatives (codex-0315 #2b + codex-0330 #2, D+G) -
+  - name: recovery-rejects-missing-stop-evidence
+    kind: caller_negative
+    requires_contract: false
+    queued_on: [D]
+    environment: lab VM
+    spec_only: true
+    invariant_task: "recovery-negative: the recovery/rollback path REFUSES to proceed when there is no evidence the services were stopped (no restore over a live/running deployment)"
+    fail_msg: "recovery proceeded without stop evidence, risking a restore over a live deployment (M1 gap: existence/type check only)"
+
+  - name: recovery-refuses-without-explicit-override
+    kind: caller_negative
+    requires_contract: false
+    queued_on: [D]
+    environment: lab VM
+    spec_only: true
+    invariant_task: "recovery-negative: a destructive rollback REFUSES (nonzero) unless the operator supplies the explicit override=true, i.e. it is not destructive-by-default"
+    fail_msg: "rollback performed destructive actions without the explicit operator override (override=false must fail closed)"
+
+  - name: rollback-does-not-destroy-on-unsafe-or-unverified-backup
+    kind: caller_negative
+    requires_contract: false
+    queued_on: [D]
+    environment: lab VM
+    spec_only: true
+    invariant_task: >-
+      recovery-negative (M1 verify-before-destroy, D3b/1f7a317): the rollback VERIFIES backup
+      integrity BEFORE destroying current state; an unsafe/unverified backup makes it REFUSE to
+      destroy, so a failed verification never leaves the host with neither current nor restorable state
+    fail_msg: "rollback destroyed current state before/without verifying the backup (M1 only checks the backup dir exists + is a dir), risking total loss on a bad backup"
+
+  - name: recovery-rejects-failed-pre-destruction-integrity
+    kind: caller_negative
+    requires_contract: false
+    queued_on: [D]
+    environment: lab VM
+    spec_only: true
+    invariant_task: "recovery-negative: a FAILED pre-destruction integrity check (e.g. checksum/manifest mismatch on the backup) makes recovery REJECT rather than proceed"
+    fail_msg: "recovery proceeded past a failed pre-destruction integrity check (integrity not gated -- existence/type only)"
+
+  - name: recovery-rejects-bad-restore-exit-or-content
+    kind: caller_negative
+    requires_contract: false
+    queued_on: [D]
+    environment: lab VM
+    spec_only: true
+    invariant_task: "recovery-negative: a nonzero restore exit OR restored content that fails a content/shape check makes recovery REJECT (a bad restore is a typed failure, not a green rollback)"
+    fail_msg: "recovery reported success on a bad restore (nonzero exit or content check failure) -- a false-success rollback"
+
+  - name: rollback-refuses-zero-exit-with-required-secrets-absent
+    kind: caller_negative
+    requires_contract: false
+    queued_on: [D, C]     # RECOVERY-MISSING-REQUIRED-SECRETS owners D+C (codex-0330)
+    environment: lab VM
+    spec_only: true
+    invariant_task: >-
+      recovery-negative (missing required secrets, rollback_lme.yml ~:503/:529/:543): required
+      secrets DERIVED from the declared recovery contract must all be accounted for -- missing
+      manifest payloads / missing legacy vault files / positional fallback create-failures must
+      increment the failure count so rollback CANNOT exit zero with required secrets absent
+    fail_msg: "rollback exited zero with required secrets absent (missing payloads/vault files/create-failures did not all increment SECRET_FAILURES) -- a silent broken recovery reported as success; preserve diagnostic evidence WITHOUT secret values"
+
+  # --- CR-B4 flip-timing coordination (codex-0315 #4) ---------------------------------
+  # The es/cluster incidental play-var (elasticsearch.yml:28 + convert_to_cluster.yml:386
+  # offline_mode:false) must NOT be captured as an operator override. At HEAD it IS (the
+  # regression codex-loader-regression-0100 named). This BEHAVIORAL case is the companion of
+  # the static_scan textual targets: it flips to PASS when the value is demoted below the
+  # profile in the RESOLVED contract. See flip_timing: B (convert_to_cluster.yml:386 delete)
+  # and E (elasticsearch.yml:28 delete) MUST land in the SAME wave so neither the design-mode
+  # static_scan tripwire nor this case goes red mid-flight (only one leg removed).
+  - name: loader-playvar-captured-as-operator-es-cluster
+    kind: precedence
+    requires_contract: true
+    queued_on: [C1, B, E]
+    entrypoints: [elasticsearch, convert_to_cluster]
+    flip_timing:
+      flips_to_pass_when: "B removes convert_to_cluster.yml:386 AND E removes elasticsearch.yml:28 (offline_mode:false demoted below profile in the resolved contract)"
+      sequence: "B convert-delete + E es-delete land TOGETHER (same wave) -- a single-leg removal reds the design-mode static_scan tripwire and leaves this behavioral case half-migrated"
+      companion_static_scan_targets: [elasticsearch:play-var-offline_mode-false, convert_to_cluster:play-var-offline_mode-false]
+    inputs:
+      profile: offline                 # selects offline_mode=true
+      play_var_overrides:
+        offline_mode: false            # elasticsearch.yml:28 / convert_to_cluster.yml:386 incidental play var
+    expect:
+      resolved:
+        offline_mode: true             # profile wins; the incidental es/cluster play var does NOT
+      origin:
+        offline_mode: profile          # recorded profile, NOT operator (the play var is not an operator choice)
+    invariant_task: "CR-B4: the elasticsearch/convert_to_cluster incidental play-var offline_mode:false neither beats the selected profile nor is captured as origin=operator"
+    fail_msg: "CR-B4 REGRESSION: the es/cluster play-var offline_mode:false was promoted over the profile and/or captured as an operator override (codex-loader-regression-0100); flip is gated on B+E landing together"
