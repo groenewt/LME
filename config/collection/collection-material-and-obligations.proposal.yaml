@@ -45,6 +45,10 @@ supersedes_on: loader_wired==true   # retire this transcription once C1 folds it
 #    credential/cert/private-key semantics (catalog_debts.owed_by_C), E authors the
 #    telemetry/app semantics (owed_by_E). Every kind is drawn from
 #    material_catalog_schema.definition.kind.vocab.
+#    FOLD NOTE: the `owner:` key is an E annotation, NOT a schema field --
+#    lme_validate_material_catalog rejects an undeclared catalog field, so `owner:` MUST be
+#    stripped when folding a definition into lme_global.material_catalog (the verification
+#    below strips it before validating).
 # ---------------------------------------------------------------------------
 e_material_catalog_definitions:
   # --- referenced by E services; SEMANTICS OWED_BY_C (distributable) ---------
@@ -67,13 +71,17 @@ e_material_catalog_definitions:
     payload_validity: non_empty_password
     description: The `kibana_system` service-account password.
   # --- E-OWNED telemetry / app material -------------------------------------
-  fleet_enrollment_token:
+  # GROUNDED in manifests/services/lme-otel-collector.yml: `secrets: [{name:
+  # otel_elastic_api_key, type: mount, target: /run/secrets/otel-elastic-api-key}]` --
+  # a SCOPED, write-only ES API key (NOT the elastic superuser), which that manifest
+  # already flags as an "E-domain contract request". Distributable to the collector host.
+  otel_elastic_api_key:
     owner: E
     kind: password_file
-    payload_validity: non_empty_token
+    payload_validity: non_empty_api_key
     description: >-
-      Fleet enrollment / service token used by elastic-agent / fleet-server to enroll agents.
-      App material E owns; distributable to an enrolling agent host.
+      Scoped write-only Elasticsearch API key the otel-collector's bearertokenauth/elastic
+      extension reads from /run/secrets/otel-elastic-api-key. NOT the elastic superuser.
   # --- host-local PRIVATE keys: DEFINITIONS ONLY (kind private_key is in the vocab
   #     but is NOT in distributable_kinds). NO obligation may reference these via
   #     material_ref -- a catalog reference does NOT authorize private-key distribution
@@ -118,14 +126,12 @@ service_obligations:
         placement_class: env          # -> KIBANA_PASSWORD / ELASTICSEARCH_PASSWORD env
         consumer: lme-elasticsearch
         profile_condition: always
-      internal_ca_trust:
-        material_ref: lme_internal_ca
-        placement_class: mount
-        consumer: lme-elasticsearch
-        destination: config/certs/ca/ca.crt
-        owner_role: elasticsearch
-        mode: "0644"
-        profile_condition: always
+      # NB: ES is the CA producer + TLS terminator -- it mounts the SHARED lme_certs
+      # workspace (manifest: "NOT a B4 per-service-bundle consumer"), so its ca.crt, leaf
+      # cert and private key are all HOST-LOCAL (setup-certs), NOT a distributed placement.
+      # So ES has NO internal_ca_trust obligation here; its private key is in
+      # consumer_local_tls_key_obligations. (The distributable CA obligation lives on the
+      # CONSUMERS below, which mount it via their B4 bundle / GAP-2 cross-host overlay.)
     datastore_clients: {}             # ES is the datastore, not a client
   kibana:
     material_requirements:
@@ -160,39 +166,45 @@ service_obligations:
         material_ref: lme_internal_ca
         placement_class: mount
         consumer: lme-fleet-server
-        destination: /certs/ca/ca.crt
+        destination: /certs/ca/ca.crt   # grounded: manifest FLEET_CA=/certs/ca/ca.crt, cert:fleet-server -> /certs
         owner_role: fleet-server
         mode: "0644"
-        profile_condition: always
-      fleet_enrollment_token:
-        material_ref: fleet_enrollment_token
-        placement_class: env
-        consumer: lme-fleet-server
         profile_condition: always
     datastore_clients:
       elasticsearch:
         domain_ref: lme-elasticsearch
         database_ref: lme-fleet-indices
-        principal_ref: elastic
+        principal_ref: elastic          # fleet-server authenticates with the elastic superuser (manifest: KIBANA_FLEET_PASSWORD<-elastic)
         endpoint_ref: es-https-9200
         material_requirement_refs: [elastic_fleet_password, internal_ca_trust]
   otel-collector:
+    # GROUNDED in manifests/services/lme-otel-collector.yml (read): cert:otel-collector -> /certs
+    # (ca/ca.crt only; host_userns:true, in_container_uid 10001); secret otel_elastic_api_key
+    # mounted at /run/secrets/otel-elastic-api-key; enabled_when [install_otel].
     material_requirements:
       internal_ca_trust:
         material_ref: lme_internal_ca
         placement_class: mount
         consumer: lme-otel-collector
-        destination: /etc/certs/ca/ca.crt
+        destination: /certs/ca/ca.crt   # grounded: cert:otel-collector -> /certs
         owner_role: otel-collector
         mode: "0644"
+        profile_condition: install_otel
+      otel_elastic_api_key:
+        material_ref: otel_elastic_api_key
+        placement_class: mount          # manifest: {name: otel_elastic_api_key, type: mount, target: /run/secrets/otel-elastic-api-key}
+        consumer: lme-otel-collector
+        destination: /run/secrets/otel-elastic-api-key
+        owner_role: otel-collector
+        mode: "0400"
         profile_condition: install_otel
     datastore_clients:
       elasticsearch:
         domain_ref: lme-elasticsearch
         database_ref: lme-otel-indices
-        principal_ref: elastic
+        principal_ref: otel_elastic_api_key   # scoped write-only API key, NOT the elastic superuser
         endpoint_ref: es-https-9200
-        material_requirement_refs: [internal_ca_trust]
+        material_requirement_refs: [internal_ca_trust, otel_elastic_api_key]
   # NOTE: the legacy beats (filebeat/metricbeat/heartbeat) + elastalert follow the same
   # shape (internal_ca_trust mount + an ES-principal env password + an es-https-9200
   # datastore_clients binding). Enumerated in the joint wave once C lands elastic /
@@ -218,9 +230,13 @@ consumer_local_tls_key_obligations:
     - {service: kibana,        material_def: kibana_tls_key,        in_container_path: config/certs/kibana/kibana.key,               owner_role: kibana}
     - {service: fleet-server,  material_def: fleet_server_tls_key,  in_container_path: /certs/fleet-server/fleet-server.key,          owner_role: fleet-server}
   requirement: >-
-    Each key MUST be present, host-local, mode 0600, owned by the cert-owner uid the
-    manifest `certs:` block derives (lme_manifests.cert_owner). It MUST NOT be distributed
-    and MUST NOT be dropped to make the distributable-kind restriction pass.
+    Each key MUST be present, host-local, owned by the cert-owner uid the manifest `certs:`
+    block derives (lme_manifests.cert_owner). VERIFIED modes from ansible/roles/certs/tasks/
+    main.yml: the setup-certs WORKSPACE key is mode 0600 (main.yml:155); the PUBLISHED B4
+    per-service bundle key is mode 0640 (main.yml:216, `install -m 0640 <svc>.key`). The key
+    MUST NOT be distributed and MUST NOT be dropped to make the distributable-kind restriction
+    pass. ca/ca.crt is published 0644 (main.yml:204) and the CA PRIVATE key ca/ca.key is NEVER
+    copied out of the workspace (main.yml:167).
 
 # ---------------------------------------------------------------------------
 # 4. cluster_uuid DISPOSITION (P3). cluster_uuid is CREATED by Elasticsearch at bootstrap
@@ -240,9 +256,15 @@ cluster_uuid_disposition:
       required: false
       nullable: false
       enable_flag: false
-      origin: observation        # channel observation; requires the field be upgrade_fallback-style observation-backed
-      default: OMITTED            # registry forbids a default on observation origin
+      origin: observation          # inferred/observed -- _require_registry_shape REJECTS any `default:` key here
+      upgrade_fallback: true       # so the observation channel's requires_field fires and the field can resolve
+      exclude_from_revision: true  # identity-like (mirrors lme_deployment_identity); must not churn the config revision
+      # NB: NO `default:` key -- the registry forbids a default on observation/build origin.
   owner: C1
+  validated: >-
+    Resolved through the REAL lme_resolve_config twice: WITH an observation it resolves with
+    origin `observation`; WITHOUT one it is ABSENT from lme_resolved (optional-absent contract).
+    See verification.result.
 
 # ---------------------------------------------------------------------------
 # 5. RESIDUALS + OWNERSHIP ROUTING (what is NOT closed and who closes it).
@@ -271,15 +293,28 @@ residuals:
 # 6. VERIFICATION (schema-validated proposal, NOT wired / NOT deploy-qualified).
 # ---------------------------------------------------------------------------
 verification:
+  ran: "2026-09-23 -- against filter_plugins/lme_manifests.py at HEAD (this worktree)"
   method: >-
-    Loaded this file + manifests/global.yml; ran the ACTUAL engine filters against the merged
-    catalog and every service obligation:
-    lme_validate_material_catalog(catalog, material_catalog_schema),
-    lme_validate_material_requirements(catalog, <svc>.material_requirements, material_requirements_schema,
-      material_catalog_schema, referenced_ids=<datastore_clients refs>),
-    lme_project_datastore_clients(<svc>).
+    Loaded this file + manifests/global.yml; reproduced a C1 fold (stripped the E `owner:`
+    annotation, merged e_material_catalog_definitions into lme_global.material_catalog) and ran
+    the ACTUAL engine filters -- imported, not re-implemented -- against the merged catalog and
+    every service obligation:
+    lme_validate_material_catalog(merged_catalog, material_catalog_schema),
+    lme_validate_material_requirements(merged_catalog, <svc>.material_requirements,
+      material_requirements_schema, material_catalog_schema, referenced_ids=<datastore_clients refs>),
+    lme_project_datastore_clients(<container-shaped svcs>), and lme_resolve_config for the
+    cluster_uuid field. Harness (not wired, scratchpad-only): validate_proposal.py.
   result: >-
-    PASS -- catalog (8 defs) valid; elasticsearch(3 obl)/kibana(2)/fleet-server(3)/otel-collector(1)
-    material_requirements valid; datastore_clients refs resolve. NEGATIVE control: an obligation whose
-    material_ref points at a private_key def is REJECTED (proves the distributable boundary is real).
+    PASS. catalog: 8 defs valid (7 E + guardian_public_key). material_requirements valid,
+    obligation counts: elasticsearch(2) / kibana(2) / fleet-server(2) / otel-collector(2).
+    datastore_clients: projected -- 3 client services bound (kibana, fleet-server, otel-collector;
+    ES declares {} as the datastore, not a client); every material_requirement_ref resolves to a
+    same-service obligation id. cluster_uuid double-test through the REAL lme_resolve_config:
+    WITHOUT an observation the field is ABSENT from lme_resolved (optional-absent); WITH an
+    observation it resolves value + origin=observation; and adding a `default:` key makes the
+    registry shape-gate REJECT it (proves the observation-origin no-default rule holds).
+  negative_controls: >-
+    (1) an obligation whose material_ref points at a private_key def (elasticsearch_tls_key) is
+    REJECTED with "NOT distributable" -- proves the distributable boundary is real, not asserted.
+    (2) a `default:` on the observation-origin cluster_uuid field is REJECTED by _require_registry_shape.
   not_claimed: [loader_wired, missing_field_enforced, activation_qualified, deploy_qualified]
