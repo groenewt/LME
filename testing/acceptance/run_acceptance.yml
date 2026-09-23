@@ -1,0 +1,287 @@
+---
+# testing/acceptance/run_acceptance.yml
+#
+# Ansible RUNNER for the LME real-caller ACCEPTANCE tier (value-pure task YAML; no
+# hand-authored Python; no embedded shell/python program bodies). It:
+#   1. loads CASE-SCHEMA.yml + every cases/*.yml (data) and runs the LOAD-TIME gates;
+#   2. snapshots the REAL caller (resolve.yml + validate_resolved_config.yml +
+#      load_manifests.yml), the resolver filter_plugins/ dir and the manifests tree
+#      from the git HEAD blob (git archive -> unarchive; no shell pipe);
+#   3. for each real-caller case renders the probe from macros/real_caller_probe.j2,
+#      invokes the REAL caller with the case pins at TRUE extra-var precedence, and
+#      classifies the verdict from the parsed Ansible JSON stdout callback;
+#   4. enforces "a RED must be earned" (its control differs only by the pin and must
+#      be PASS) and writes a committed receipt (receipts/LATEST.yml).
+#
+# Probes run mutation-free (become:false / gather_facts:false / connection:local);
+# an ACCEPT run proves stats.changed == 0. Per-run probe artifacts + full logs live
+# under work_root (default: the session scratchpad; pass -e work_root=<dir>).
+#
+# Invoke (from testing/acceptance/):
+#   ACCEPTANCE_WORK_ROOT=<scratchpad>/acceptance-runs \
+#   /usr/bin/ansible-playbook run_acceptance.yml -e work_root=$ACCEPTANCE_WORK_ROOT
+- name: LME real-caller acceptance tier
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    repo_root: "{{ playbook_dir | dirname | dirname }}"
+    cases_glob: "{{ playbook_dir }}/cases/*.yml"
+    work_root: "{{ playbook_dir }}/runs"
+    # the four real-caller sources snapshotted from HEAD (rel to repo_root):
+    caller_rels:
+      - ansible/roles/podman/tasks/resolve.yml
+      - ansible/roles/podman/tasks/validate_resolved_config.yml
+      - ansible/roles/podman/tasks/load_manifests.yml
+    filter_rel: ansible/roles/podman/filter_plugins
+    manifests_rel: manifests
+    evidence_rels:
+      - ansible/roles/podman/tasks/resolve.yml
+      - ansible/roles/podman/tasks/validate_resolved_config.yml
+      - ansible/roles/podman/tasks/load_manifests.yml
+      - ansible/roles/podman/filter_plugins/lme_manifests.py
+      - manifests/global.yml
+    results: []
+  tasks:
+    - name: Load the pinned case schema
+      ansible.builtin.include_vars: {file: CASE-SCHEMA.yml, name: case_schema}
+
+    - name: Discover case files (disjoint; NN orders execution)
+      ansible.builtin.set_fact:
+        case_files: "{{ query('ansible.builtin.fileglob', cases_glob) | sort }}"
+
+    - name: Fail if no case files are present
+      ansible.builtin.assert:
+        that: "case_files | length > 0"
+        fail_msg: "no cases/*.yml under {{ playbook_dir }}/cases -- nothing to run"
+        quiet: true
+
+    - name: Load and merge every case file
+      ansible.builtin.set_fact:
+        cases: >-
+          {{ cases | default([])
+             + ((lookup('ansible.builtin.file', item) | from_yaml).cases | default([])) }}
+      loop: "{{ case_files }}"
+      loop_control: {label: "{{ item | basename }}"}
+
+    # --- LOAD-TIME gates (fail the whole run BEFORE any case executes) ----------
+    - name: "LOAD-TIME gate -- required fields, known kinds, unique names, mandatory causes"
+      ansible.builtin.assert:
+        that:
+          - "cases | rejectattr('name', 'defined') | list | length == 0"
+          - "cases | rejectattr('kind', 'defined') | list | length == 0"
+          - "cases | rejectattr('discriminates', 'defined') | list | length == 0"
+          - "cases | rejectattr('predicted', 'defined') | list | length == 0"
+          - "cases | rejectattr('invariant_task', 'defined') | list | length == 0"
+          - "cases | selectattr('kind', 'defined') | rejectattr('kind', 'in', case_schema.case_fields.kind.enum) | list | length == 0"
+          - "(cases | map(attribute='name') | list | length) == (cases | map(attribute='name') | list | unique | length)"
+          # a reject-expected case MUST carry its cause substring
+          - >-
+            (cases | selectattr('expect', 'defined')
+                   | selectattr('expect.reject', 'defined') | selectattr('expect.reject')
+                   | rejectattr('expect.reject_cause', 'defined')
+                   | map(attribute='name') | list) == []
+          # a real-caller case MUST name its caller
+          - >-
+            (cases | selectattr('kind', 'in', ['resolve_admission', 'loader_projection'])
+                   | rejectattr('caller', 'defined') | map(attribute='name') | list) == []
+          # a declared/blocked case MUST carry queued_on + blocked_reason
+          - >-
+            (cases | selectattr('kind', 'in', ['backup_negative', 'custody_negative'])
+                   | rejectattr('queued_on', 'defined') | map(attribute='name') | list) == []
+          - >-
+            (cases | selectattr('kind', 'in', ['backup_negative', 'custody_negative'])
+                   | rejectattr('blocked_reason', 'defined') | map(attribute='name') | list) == []
+        fail_msg: >-
+          off-schema cases: missing required field / unknown kind / duplicate name /
+          reject w/o reject_cause / real-caller w/o caller / declared w/o queued_on+blocked_reason.
+        success_msg: "load-time gate: all {{ cases | length }} cases are well-formed"
+        quiet: true
+
+    # --- Evidence identity (source-bound) ---------------------------------------
+    - name: Record HEAD under test (never a fabricated SHA)
+      ansible.builtin.command: git rev-parse HEAD
+      args: {chdir: "{{ repo_root }}"}
+      register: head_rev
+      changed_when: false
+
+    - name: Record worktree dirtiness (provenance)
+      ansible.builtin.command: git status --porcelain
+      args: {chdir: "{{ repo_root }}"}
+      register: git_porcelain
+      changed_when: false
+
+    - name: Record run timestamp (UTC)
+      ansible.builtin.command: date -u +%Y%m%dT%H%M%SZ
+      register: run_ts
+      changed_when: false
+
+    # Toolchain, HONESTLY: the RUNNER's own ansible (magic var) AND the scrubbed-env
+    # ansible the PROBES actually execute under (/usr/bin/ansible-playbook). No
+    # python3 -c program-in-a-scalar (banned representation).
+    - name: Record the probe toolchain (the scrubbed-env ansible the real caller runs under)
+      ansible.builtin.command: /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/ansible-playbook --version
+      register: _probe_ver
+      changed_when: false
+
+    - name: Publish run identity + toolchain facts
+      ansible.builtin.set_fact:
+        run_id: "{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
+        work: "{{ work_root }}/{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
+        runner_toolchain: "ansible {{ ansible_version.full }}"
+        probe_toolchain: "{{ _probe_ver.stdout_lines[0] }}"
+
+    - name: Create the per-run work dir
+      ansible.builtin.file: {path: "{{ work }}", state: directory, mode: "0755"}
+
+    - name: Refuse to reuse a prior run's evidence (fresh-by-construction)
+      ansible.builtin.find: {paths: "{{ work }}", patterns: "results.yml"}
+      register: _pre
+      failed_when: "_pre.files | length > 0"
+
+    # --- Immutable HEAD snapshot of the REAL caller (git archive -> unarchive) ---
+    - name: Archive the real caller + resolver filters + manifests from the HEAD blob
+      ansible.builtin.command:
+        argv: >-
+          {{ ['git', 'archive', '-o', work ~ '/snap.tar', 'HEAD']
+             + caller_rels + [filter_rel, manifests_rel] }}
+        chdir: "{{ repo_root }}"
+      changed_when: false
+
+    - name: Create the snapshot dest dir
+      ansible.builtin.file: {path: "{{ work }}/_snapshot", state: directory, mode: "0755"}
+
+    - name: Unpack the snapshot (preserves repo paths so relative include_tasks resolve)
+      ansible.builtin.unarchive:
+        src: "{{ work }}/snap.tar"
+        dest: "{{ work }}/_snapshot"
+        remote_src: true
+
+    - name: Publish snapshot roots
+      ansible.builtin.set_fact:
+        snap_tasks: "{{ work }}/_snapshot/ansible/roles/podman/tasks"
+        snap_manifests: "{{ work }}/_snapshot/manifests"
+        engine_filter_dir: "{{ work }}/_snapshot/ansible/roles/podman/filter_plugins"
+
+    - name: sha256 of each snapshotted evidence file
+      ansible.builtin.stat:
+        path: "{{ work }}/_snapshot/{{ item }}"
+        checksum_algorithm: sha256
+      register: _snap_stat
+      loop: "{{ evidence_rels }}"
+      loop_control: {label: "{{ item | basename }}"}
+
+    - name: HEAD blob id of each evidence file (ref-bound provenance)
+      ansible.builtin.command: "git rev-parse HEAD:{{ item }}"
+      args: {chdir: "{{ repo_root }}"}
+      register: _snap_blob
+      changed_when: false
+      loop: "{{ evidence_rels }}"
+      loop_control: {label: "{{ item | basename }}"}
+
+    - name: Publish snapshot evidence identity
+      ansible.builtin.set_fact:
+        snapshot_sha256: "{{ dict(evidence_rels | zip(_snap_stat.results | map(attribute='stat.checksum') | list)) }}"
+        snapshot_head_blobs: "{{ dict(evidence_rels | zip(_snap_blob.results | map(attribute='stdout') | list)) }}"
+
+    # --- Run each case ----------------------------------------------------------
+    - name: Run each case
+      ansible.builtin.include_tasks: one_case_acceptance.yml
+      loop: "{{ cases }}"
+      loop_control: {loop_var: case, label: "{{ case.name }} ({{ case.kind }})"}
+
+    - name: Vanish-guard -- every case produced exactly one verdict
+      ansible.builtin.assert:
+        that: "(results | length) == (cases | length)"
+        fail_msg: >-
+          {{ (cases | length) - (results | length) }} case(s) produced NO verdict;
+          missing: {{ cases | map(attribute='name') | difference(results | map(attribute='case') | list) | list }}
+        success_msg: "vanish-guard: all {{ cases | length }} cases produced a verdict"
+        quiet: true
+
+    # --- "A RED must be earned": every RED's control is PASS ---------------------
+    - name: Compute the set of PASSing case names
+      ansible.builtin.set_fact:
+        _pass_names: "{{ results | selectattr('verdict', 'equalto', 'PASS') | map(attribute='case') | list }}"
+
+    - name: Compute RED cases whose control is not PASS (unearned RED)
+      ansible.builtin.set_fact:
+        _unearned_red: >-
+          {{ results | selectattr('verdict', 'equalto', 'RED')
+                     | selectattr('control', 'defined') | rejectattr('control', 'equalto', '')
+                     | rejectattr('control', 'in', _pass_names)
+                     | map(attribute='case') | list }}
+
+    - name: "EARNED-RED gate -- a RED whose control is not PASS is not a runtime RED"
+      ansible.builtin.assert:
+        that: "_unearned_red | length == 0"
+        fail_msg: >-
+          RED case(s) whose control did not PASS (harness/control broken, RED not earned):
+          {{ _unearned_red }} -- treat as ERROR-CONTROL and fix the control before trusting the RED.
+        success_msg: "earned-RED gate: every RED has a PASSing control"
+        quiet: true
+
+    # --- Tallies + receipt ------------------------------------------------------
+    - name: Compute tallies
+      ansible.builtin.set_fact:
+        tally:
+          total: "{{ results | length }}"
+          green: "{{ results | selectattr('verdict', 'in', ['PASS', 'REJECTED-as-expected']) | list | length }}"
+          red: "{{ results | selectattr('verdict', 'equalto', 'RED') | list | length }}"
+          blocked: "{{ results | selectattr('verdict', 'equalto', 'BLOCKED') | list | length }}"
+          error: "{{ results | rejectattr('verdict', 'in', ['PASS', 'REJECTED-as-expected', 'RED', 'BLOCKED']) | list | length }}"
+
+    - name: Assemble the receipt document
+      ansible.builtin.set_fact:
+        receipt:
+          tier: acceptance
+          owner: G_acceptance
+          run_id: "{{ run_id }}"
+          head: "{{ head_rev.stdout }}"
+          worktree_dirty: "{{ (git_porcelain.stdout_lines | length) > 0 }}"
+          runner_toolchain: "{{ runner_toolchain }}"
+          probe_toolchain: "{{ probe_toolchain }}"
+          toolchain_note: "probes execute under the scrubbed-env probe_toolchain (/usr/bin/ansible-playbook); the worktree default anaconda ansible-core 2.17.14 was not separately exercised (findings are engine-logic-level)"
+          snapshot_head_blobs: "{{ snapshot_head_blobs }}"
+          snapshot_sha256: "{{ snapshot_sha256 }}"
+          tally: "{{ tally }}"
+          verdict_legend:
+            GREEN: "PASS / REJECTED-as-expected -- engine accepted a valid input or rejected an invalid one with the right cause"
+            RED: "earned engine/domain gap (judge failed with a PASSing control, or reject-expected exited 0)"
+            BLOCKED: "declared case whose dependency has not landed"
+          results: "{{ results }}"
+
+    - name: Write the per-run results.yml (scratchpad work dir)
+      ansible.builtin.copy:
+        dest: "{{ work }}/results.yml"
+        mode: "0644"
+        content: "{{ receipt | to_nice_yaml(width=200) }}"
+
+    - name: Ensure the receipts dir exists
+      ansible.builtin.file: {path: "{{ playbook_dir }}/receipts", state: directory, mode: "0755"}
+
+    - name: Write the COMMITTED receipt (receipts/LATEST.yml)
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/receipts/LATEST.yml"
+        mode: "0644"
+        content: "{{ receipt | to_nice_yaml(width=200) }}"
+
+    - name: Summary line per case
+      ansible.builtin.debug:
+        msg: "{{ '%-46s %-18s pred=%-7s -> %-20s rc=%s changed=%s' | format(item.case, item.kind, item.predicted, item.verdict, (item.rc | default('n/a')), (item.changed | default('n/a'))) }}"
+      loop: "{{ results }}"
+      loop_control: {label: "{{ item.case }}"}
+
+    - name: Tally line
+      ansible.builtin.debug:
+        msg: "GREEN={{ tally.green }} RED={{ tally.red }} BLOCKED={{ tally.blocked }} ERROR={{ tally.error }} total={{ tally.total }} (receipt: {{ playbook_dir }}/receipts/LATEST.yml; run: {{ work }})"
+
+    - name: "ERROR gate -- no harness/unexpected verdicts"
+      ansible.builtin.assert:
+        that: "tally.error | int == 0"
+        fail_msg: >-
+          harness/unexpected verdict(s):
+          {{ results | rejectattr('verdict', 'in', ['PASS', 'REJECTED-as-expected', 'RED', 'BLOCKED']) | map(attribute='case') | list }}
+        success_msg: "no ERROR verdicts; RED cases are engine findings, not harness faults"
+        quiet: true

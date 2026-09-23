@@ -1,0 +1,157 @@
+---
+# testing/acceptance/one_case_acceptance.yml
+# Per-case dispatch. `case` is the loop var. Appends exactly one record to `results`.
+#
+#   backup_negative / custody_negative -> BLOCKED (declared; no probe; not faked).
+#   resolve_admission / loader_projection -> render the probe from the reusable
+#     macro, invoke the REAL caller with the case pins at TRUE extra-var precedence
+#     (`-e @pins.yml`), then classify the verdict from the parsed Ansible JSON
+#     stdout callback (task results + stats), NOT from stdout substrings.
+#
+# Verdict grammar (see OWNER.yml):
+#   PASS / REJECTED-as-expected = GREEN;  RED = earned engine gap;  BLOCKED;
+#   ERROR-* = harness/unexpected (JSON unparseable, host mutation, vacuous judge,
+#   nonzero-with-wrong-cause).
+
+# --- DECLARED / BLOCKED (dependency not landed) --------------------------------
+- name: "BLOCKED (declared) :: {{ case.name }}"
+  ansible.builtin.set_fact:
+    results: >-
+      {{ results + [ {
+           'case': case.name, 'kind': case.kind, 'discriminates': case.discriminates,
+           'predicted': case.predicted, 'verdict': 'BLOCKED',
+           'queued_on': (case.queued_on | default([])),
+           'blocked_reason': case.blocked_reason,
+           'invariant_task': case.invariant_task } ] }}
+  when: case.kind in ['backup_negative', 'custody_negative']
+
+# --- REAL-CALLER cases ---------------------------------------------------------
+- name: "real-caller case :: {{ case.name }}"
+  when: case.kind in ['resolve_admission', 'loader_projection']
+  block:
+    - name: "Prepare per-case work dir :: {{ case.name }}"
+      ansible.builtin.file:
+        path: "{{ work }}/{{ case.name }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Materialize the case pins to pins.yml (declared YAML; no secret values) :: {{ case.name }}"
+      ansible.builtin.copy:
+        dest: "{{ work }}/{{ case.name }}/pins.yml"
+        mode: "0644"
+        content: "{{ (case.pins | default({})) | to_nice_yaml }}"
+
+    - name: "sha256 of pins.yml (input evidence identity) :: {{ case.name }}"
+      ansible.builtin.stat:
+        path: "{{ work }}/{{ case.name }}/pins.yml"
+        checksum_algorithm: sha256
+      register: _pins_stat
+
+    - name: "Render the real-caller probe from macros/real_caller_probe.j2 :: {{ case.name }}"
+      ansible.builtin.template:
+        src: macros/real_caller_probe.j2
+        dest: "{{ work }}/{{ case.name }}/probe.yml"
+        mode: "0644"
+
+    - name: "Count rendered judge assertions (a zero-assertion probe must NOT run) :: {{ case.name }}"
+      ansible.builtin.set_fact:
+        _assert_count: "{{ (lookup('ansible.builtin.file', work ~ '/' ~ case.name ~ '/probe.yml')).splitlines() | select('search', 'ansible.builtin.assert') | list | length }}"
+        _pins_sha: "{{ _pins_stat.stat.checksum }}"
+
+    # Invoke the REAL caller under a SCRUBBED env with the Ansible JSON stdout
+    # callback. ANSIBLE_FILTER_PLUGINS points at the snapshot resolver so the engine
+    # under test is the HEAD blob. `-e @pins.yml` injects the case pins at TRUE
+    # extra-var precedence (this tier's distinguishing capability). rc + argv are
+    # captured LITERALLY; nothing is inferred from PLAY RECAP.
+    - name: "Invoke the REAL caller (pins at -e precedence; JSON callback) :: {{ case.name }}"
+      ansible.builtin.command:
+        cmd: >-
+          /usr/bin/env -i HOME={{ work }}/{{ case.name }} PATH=/usr/bin:/bin
+          ANSIBLE_FILTER_PLUGINS={{ engine_filter_dir }}
+          ANSIBLE_STDOUT_CALLBACK=json ANSIBLE_CALLBACK_RESULT_FORMAT=json
+          /usr/bin/ansible-playbook probe.yml -e @pins.yml
+        chdir: "{{ work }}/{{ case.name }}"
+      register: probe_run
+      changed_when: false
+      failed_when: false
+      when: (_assert_count | int) > 0
+
+    - name: "Persist the FULL probe stdout/stderr as a distinct execution log :: {{ case.name }}"
+      ansible.builtin.copy:
+        dest: "{{ work }}/{{ case.name }}/probe.execution.log"
+        mode: "0644"
+        content: |
+          # acceptance execution receipt :: {{ case.name }} ({{ case.kind }})
+          # rc={{ probe_run.rc | default('n/a') }}
+          # argv={{ probe_run.cmd | default([]) }}
+          # pins_sha256={{ _pins_sha }}
+          # snapshot_head={{ head_rev.stdout }}
+          # probe_toolchain={{ probe_toolchain }}
+          ==== STDOUT (JSON callback) ====
+          {{ probe_run.stdout | default('') }}
+          ==== STDERR ====
+          {{ probe_run.stderr | default('') }}
+      when: (probe_run is defined) and (probe_run.rc is defined)
+
+    # --- Parse the JSON callback (guarded: unparseable stdout => ERROR-JSON) ----
+    - name: "Does the probe stdout look like the JSON callback document? :: {{ case.name }}"
+      ansible.builtin.set_fact:
+        _looks_json: "{{ ((probe_run.stdout | default('')) | trim)[:1] == '{' }}"
+
+    - name: "Parse the JSON callback document :: {{ case.name }}"
+      ansible.builtin.set_fact:
+        _j: "{{ probe_run.stdout | from_json }}"
+      when: _looks_json | default(false)
+
+    - name: "Derive classification inputs from parsed task results + stats :: {{ case.name }}"
+      vars:
+        _tasks: "{{ _j.plays | map(attribute='tasks') | flatten }}"
+        _lh: "{{ _tasks | selectattr('hosts.localhost', 'defined') | map(attribute='hosts.localhost') | list }}"
+        _judge_name: "judge :: {{ case.name }}"
+        _judge_tasks: "{{ _tasks | selectattr('task.name', 'equalto', 'judge :: ' ~ case.name) | list }}"
+      ansible.builtin.set_fact:
+        _stats_changed: "{{ _j.stats.values() | map(attribute='changed') | list | sum }}"
+        _failed_msgs: "{{ _lh | selectattr('failed', 'defined') | selectattr('failed') | map(attribute='msg') | list }}"
+        _judge_present: "{{ (_judge_tasks | length) > 0 }}"
+        _judge_failed: "{{ (_judge_tasks | map(attribute='hosts.localhost') | selectattr('failed', 'defined') | selectattr('failed') | list | length) > 0 }}"
+      when: _looks_json | default(false)
+
+    # Classification. Conditional expressions are lazy, so the reject/accept branch
+    # bodies are only evaluated when their guard holds and _looks_json is true.
+    - name: "Classify the verdict (GREEN=correct accept/reject; RED=earned gap) :: {{ case.name }}"
+      ansible.builtin.set_fact:
+        _verdict: >-
+          {{ 'ERROR-JSON' if (not (_looks_json | default(false)))
+             else ('ERROR-MUTATION' if ((_stats_changed | int) != 0)
+             else ((
+                     ('REJECTED-as-expected' if ((_failed_msgs | select('search', case.expect.reject_cause) | list | length) > 0)
+                      else ('RED' if ((probe_run.rc | int) == 0)
+                      else 'ERROR-WRONG-CAUSE'))
+                   ) if (case.expect.reject | default(false))
+                   else (
+                     ('PASS' if (((probe_run.rc | int) == 0) and (_judge_present | default(false)) and (not (_judge_failed | default(false))))
+                      else ('RED' if (_judge_failed | default(false))
+                      else ('ERROR-VACUOUS' if (not (_judge_present | default(false)))
+                      else 'ERROR')))
+                   ))) }}
+
+    - name: "Append the real-caller verdict :: {{ case.name }}"
+      ansible.builtin.set_fact:
+        results: >-
+          {{ results + [ {
+               'case': case.name, 'kind': case.kind, 'discriminates': case.discriminates,
+               'predicted': case.predicted, 'verdict': _verdict,
+               'rc': (probe_run.rc | default('n/a')),
+               'changed': (_stats_changed | default('n/a')),
+               'control': (case.control | default('')),
+               'expect_reject': (case.expect.reject | default(false)),
+               'reject_cause': (case.expect.reject_cause | default('')),
+               'judge_present': (_judge_present | default('n/a')),
+               'judge_failed': (_judge_failed | default('n/a')),
+               'failed_task_msgs': (_failed_msgs | default([])),
+               'caller': (case.caller | default('resolve')),
+               'pins_sha256': _pins_sha,
+               'argv': (probe_run.cmd | default([])),
+               'rendered_probe': (work ~ '/' ~ case.name ~ '/probe.yml'),
+               'execution_log': (work ~ '/' ~ case.name ~ '/probe.execution.log'),
+               'invariant_task': case.invariant_task } ] }}
