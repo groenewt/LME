@@ -196,17 +196,50 @@
       the next run reaps it under bundle.staging_retention).
     quiet: true
 
+# RH-BUNDLE-CHECKSUM-NEWLINES: the line separator is a REAL newline bound in a {% set %} STATEMENT. ansible-core 2.19
+# (ansible/_internal/_templating/_jinja_bits.py AnsibleLexer.tokeniter) doubles every backslash of a string constant
+# INSIDE {{ }} when a task argument is templated (TemplateOptions.escape_backslashes defaults True, _engine.py), so a
+# '\n' literal inside {{ }} renders as the two characters backslash + n (the 9683d53d bundle.sha256: 1969 bytes, no
+# newline). Statement ({% %}) string constants are NOT escaped (same tokeniter: only between variable_begin/_end), so
+# Jinja unescapes '\n' there to a newline. The published file is re-read and refused below if it is not the exact
+# sha256sum --check form.
 - name: Write the Ansible-free consumer check (sha256sum --check format; seed + every artifact)
   ansible.builtin.copy:
     dest: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
     mode: '0400'
     content: >-
+      {% set nl = '\n' -%}
       {{ ([_rh_pkg_dst.results[-1].stat.checksum ~ '  ' ~ rh.controller.bootstrap.bundle.seed_file]
           + ((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
              | map(attribute='sha256')
              | zip((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
                    | map(attribute='file') | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/'))
-             | map('join', '  ') | list)) | join('\n') ~ '\n' }}
+             | map('join', '  ') | list)) | join(nl) ~ nl }}
+
+- name: Refuse a consumer check the seed would reject (exact declared lines, seed grammar, newline-terminated; before publish)
+  vars:
+    _rows: "{{ rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections }}"
+    _want: >-
+      {{ [_rh_pkg_dst.results[-1].stat.checksum ~ '  ' ~ rh.controller.bootstrap.bundle.seed_file]
+         + (_rows | map(attribute='sha256')
+            | zip(_rows | map(attribute='file') | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/'))
+            | map('join', '  ') | list) }}
+  ansible.builtin.assert:
+    # conditionals are evaluated with escape_backslashes=False (_engine.py evaluate_conditional), so '\n' below IS a
+    # newline; the file is read unstripped (rstrip=false) on the controller (genesis is localhost, connection local)
+    that:
+      - _want | length == 1 + (_rows | length)
+      # the seed's grammar (controller_seed.j2 bundle_check: grep -v -x -E '[0-9a-f]{64}  [A-Za-z0-9._/+-]+')
+      - _want | reject('match', '^[0-9a-f]{64}  [A-Za-z0-9._/+-]+$') | list | length == 0
+      - >-
+        lookup('ansible.builtin.file', _rh_pkg_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.checksum_file, rstrip=false)
+        == (_want | join('\n')) ~ '\n'
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.bundle.refusals.staged }}: the staged {{ rh.controller.bootstrap.bundle.checksum_file }}
+      is not exactly {{ _want | length }} newline-terminated lines '<64 hex>  <path>' in the declared order (seed, then
+      every artifact) -- the seed's bundle check would refuse it; nothing was published (staging
+      {{ _rh_pkg_stage.path }} is left for inspection; the next run reaps it under bundle.staging_retention).
+    quiet: true
 
 - name: Digest the consumer check file
   ansible.builtin.stat:
