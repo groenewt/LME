@@ -2818,15 +2818,25 @@ def _rh_endpoint(raw, rule, host, key):
     ssh configuration, never a guessed number); proxy_jump = per the declared inventory_forms (see below); owner =
     the owner var, absent -> the DECLARED owner rule's absent value (inventory.owner.absent, validated by
     _rh_endpoint_vars; not a resolver default). A value the declared rule refuses is refused here too (same rule, one
-    place)."""
-    a = raw.get('address')
-    a = host if a is None else a
-    if not isinstance(a, str) or not a:
-        raise ValueError('lme: %s endpoint of %r: address must be a non-empty string; got %r' % (key, host, a))
-    p, pt = raw.get('port'), rule['port']
-    if p is None:
-        pk = pt['absent_key']
+    place). C1-ENDPOINT-EXPLICIT-NULL (codex 063540): a role is ABSENT only when its key is missing from raw (see
+    lme_rh_connection_values); the absent rules above apply to absence only. A SUPPLIED null is a value, and no
+    declared field rule accepts it: address (non-empty string), port (explicit_regex decimal), common args (no
+    accepted inventory form holds for null) and owner (string) each refuse it."""
+    if 'address' in raw:
+        a = raw['address']
+        if not isinstance(a, str) or not a:
+            raise ValueError('lme: %s endpoint of %r: address %s was supplied as %r (%s); a supplied address must be a non-empty string (only an ABSENT address falls back to the inventory id)' % (
+                key, host, rule['address']['var'], a, type(a).__name__))
     else:
+        a = host
+    pt = rule['port']
+    if 'port' not in raw:
+        pk = pt['absent_key']
+    elif raw['port'] is None:
+        raise ValueError('lme: %s endpoint of %r: port %s was supplied as null; a supplied port must be an explicit port by the declared rule (%s, <= %d) -- only an ABSENT port delegates to ssh_config' % (
+            key, host, pt['var'], pt['explicit_regex'], pt['explicit_max']))
+    else:
+        p = raw['port']
         s = str(p) if (isinstance(p, int) and not isinstance(p, bool)) or isinstance(p, str) else None
         if s is None or not re.match(pt['explicit_regex'] + r'\Z', s) or int(s) > pt['explicit_max']:
             raise ValueError('lme: %s endpoint of %r: port %r (%s) is not an explicit port by the declared rule (%s, <= %d)' % (
@@ -2836,31 +2846,37 @@ def _rh_endpoint(raw, rule, host, key):
     # holds; equals_mode_args compares with the HOST's declared mode (mode_var) args -- admission (admit_transport.yml)
     # requires that mode to equal the run's selected mode, so under admission they are the same args. No accepted
     # form -> refuse (other: refuse). An absent or unknown host mode matches no equals_mode_args form.
+    # The `undefined` test holds for an ABSENT var only; a supplied null matches no accepted form and refuses.
+    jp = 'proxy_jump' in raw
     j = raw.get('proxy_jump')
     mode = rule['modes'].get(raw.get('mode')) if isinstance(raw.get('mode'), str) else None
     jump = None
     for form in rule['inventory_forms']['accepted']:
         t = form['test']
         m = re.match(rule['proxy_jump']['form_regex'] + r'\Z', j) if t == 'match_form_regex' and isinstance(j, str) else None
-        if (t == 'undefined' and j is None) or (t == 'equals_empty' and j == '') \
+        if (t == 'undefined' and not jp) or (t == 'equals_empty' and j == '') \
                 or (t == 'equals_mode_args' and mode is not None and isinstance(j, str) and j == mode['ssh_common_args']) or m:
             jump = m.group(1) if form['proxy_jump'] == 'form_regex_capture_1' else ''
             break
     if jump is None:
         raise ValueError('lme: %s endpoint of %r: %s %r is none of the declared accepted inventory forms %r (host mode %r)' % (
-            key, host, rule['inventory_forms']['var'], j, [f['form'] for f in rule['inventory_forms']['accepted']], raw.get('mode')))
-    o = raw.get('owner')
-    o = rule['owner_rule']['absent'] if o is None else o
+            key, host, rule['inventory_forms']['var'], j if jp else '<absent>', [f['form'] for f in rule['inventory_forms']['accepted']], raw.get('mode')))
+    # Owner: ABSENT -> the declared owner rule's absent value (a separate, declared policy); a SUPPLIED value (null
+    # included) must be a string.
+    o = raw['owner'] if 'owner' in raw else rule['owner_rule']['absent']
     if not isinstance(o, str):
-        raise ValueError('lme: %s endpoint of %r: owner must be a string; got %r' % (key, host, o))
+        raise ValueError('lme: %s endpoint of %r: a supplied owner must be a string; got %r (%s)' % (key, host, o, type(o).__name__))
     comp = {'address': a.lower(), 'port': pk, 'proxy_jump': jump, 'owner': o}
     return [comp[c] for c in rule['endpoint_key']]
 
 
 def lme_rh_connection_values(hostvars, ids, composed, schema):
     """C1-EFFECTIVE-ENDPOINT-BINDING: a SELECTION (no derivation) of the inventory values the declared endpoint rule
-    names, for each host id: {vars: {role: var name}, values: {id: {role: value or None}}}; {} when no remote-harness
-    policy is declared. The scope projection derives each target's endpoint from them (_rh_endpoint)."""
+    names, for each host id: {vars: {role: var name}, values: {id: {role: value}}}; {} when no remote-harness
+    policy is declared. The scope projection derives each target's endpoint from them (_rh_endpoint).
+    C1-ENDPOINT-EXPLICIT-NULL (codex 063540): PRESENCE is kept separate from the value -- a role whose var the host
+    does not define is OMITTED from values[id]; a defined var is carried as supplied, a null included, so a supplied
+    null never shares the binding of an absent input."""
     key = schema['policy_key']
     pol = composed.get(key) if isinstance(composed, dict) else None
     if not isinstance(pol, dict):
@@ -2869,7 +2885,7 @@ def lme_rh_connection_values(hostvars, ids, composed, schema):
     values = {}
     for h in ids:
         hv = hostvars[h]
-        values[h] = dict((role, hv[v] if v in hv else None) for role, v in sorted(names.items()))
+        values[h] = dict((role, hv[v]) for role, v in sorted(names.items()) if v in hv)
     return {'vars': names, 'values': values}
 
 
