@@ -2760,13 +2760,15 @@ _RH_FORM_TESTS = frozenset(('undefined', 'equals_empty', 'equals_mode_args', 'ma
 def _rh_endpoint_vars(pol, hs, key):
     """C1-EFFECTIVE-ENDPOINT-BINDING (codex 035141): the ONE declared connection rule (registry host_scope.endpoint
     names where it lives in the policy: rule_path = ssh_auth.composition {address, port, proxy_jump}, owner_var_path =
-    inventory.owner_var) -- the same rule the route's endpoint key and B consume. Returns the inventory variable name
-    per endpoint role and the rule; refuses a rule this resolver cannot apply exactly as declared."""
+    inventory.owner_var, owner_rule_path = inventory.owner {var, absent}) -- the same rule the route's endpoint key
+    and B consume. Returns the inventory variable name per endpoint role and the rule (with the declared owner rule
+    as 'owner_rule'); refuses a rule this resolver cannot apply exactly as declared."""
     ep = hs.get('endpoint')
-    if not isinstance(ep, dict) or set(ep) != {'rule_path', 'owner_var_path', 'auth_path'}:
-        raise ValueError('lme: registry host_scope.endpoint must be {rule_path, owner_var_path, auth_path}; got %r' % (ep,))
+    if not isinstance(ep, dict) or set(ep) != {'rule_path', 'owner_var_path', 'owner_rule_path', 'auth_path'}:
+        raise ValueError('lme: registry host_scope.endpoint must be {rule_path, owner_var_path, owner_rule_path, auth_path}; got %r' % (ep,))
     f, rule = _rh_get(pol, ep['rule_path'])
     fo, owner_var = _rh_get(pol, ep['owner_var_path'])
+    fr, owner_rule = _rh_get(pol, ep['owner_rule_path'])
     fa, auth = _rh_get(pol, ep['auth_path'])
     if not f or not isinstance(rule, dict) or any(not isinstance(rule.get(r), dict) or not isinstance(rule[r].get('var'), str) or not rule[r]['var']
                                                   for r in ('address', 'port', 'proxy_jump', 'inventory_forms')):
@@ -2775,6 +2777,15 @@ def _rh_endpoint_vars(pol, hs, key):
         raise ValueError('lme: %s.%s.endpoint_key must be %r (the components this resolver binds); got %r' % (key, ep['rule_path'], list(_RH_ENDPOINT_KEY), rule.get('endpoint_key')))
     if not fo or not isinstance(owner_var, str) or not owner_var:
         raise ValueError('lme: %s.%s must name the owner inventory variable' % (key, ep['owner_var_path']))
+    # OWNER-ABSENT RULE (route r3h): the owner component's absent value is DECLARED by the policy, never a resolver
+    # default. One rule, one place: owner.var must be the same variable owner_var names.
+    if not fr or not isinstance(owner_rule, dict) or set(owner_rule) != {'var', 'absent'} \
+            or not isinstance(owner_rule['var'], str) or not owner_rule['var'] or not isinstance(owner_rule['absent'], str):
+        raise ValueError('lme: %s.%s must be the owner rule {var: <non-empty string>, absent: <string>}; got %r' % (
+            key, ep['owner_rule_path'], owner_rule if fr else '<absent>'))
+    if owner_rule['var'] != owner_var:
+        raise ValueError('lme: %s.%s.var %r must equal %s %r (one owner rule, one place)' % (
+            key, ep['owner_rule_path'], owner_rule['var'], ep['owner_var_path'], owner_var))
     if not fa or not isinstance(auth, dict) or not isinstance(auth.get('mode_var'), str) or not auth['mode_var'] \
             or not isinstance(auth.get('modes'), dict) or any(not isinstance(m, dict) or not isinstance(m.get('ssh_common_args'), str) for m in auth['modes'].values()):
         raise ValueError('lme: %s.%s must declare mode_var and modes, each mode with its ssh_common_args' % (key, ep['auth_path']))
@@ -2797,7 +2808,7 @@ def _rh_endpoint_vars(pol, hs, key):
     if not isinstance(pj.get('form_regex'), str) or re.compile(pj['form_regex']).groups != 1:
         raise ValueError('lme: %s.%s.proxy_jump.form_regex must capture exactly the jump; got %r' % (key, ep['rule_path'], pj.get('form_regex')))
     return ({'address': ad['var'], 'port': pt['var'], 'proxy_jump': fm['var'], 'owner': owner_var, 'mode': auth['mode_var']},
-            dict(rule, modes=auth['modes']))
+            dict(rule, modes=auth['modes'], owner_rule=owner_rule))
 
 
 def _rh_endpoint(raw, rule, host, key):
@@ -2805,7 +2816,9 @@ def _rh_endpoint(raw, rule, host, key):
     address = the address var, absent -> the inventory id, lower-cased; port_key = an explicit port as its canonical
     decimal (explicit_regex, <= explicit_max; bool/float/null refuse), absent -> absent_key (DELEGATED to the owner's
     ssh configuration, never a guessed number); proxy_jump = per the declared inventory_forms (see below); owner =
-    the owner var, absent -> ''. A value the declared rule refuses is refused here too (same rule, one place)."""
+    the owner var, absent -> the DECLARED owner rule's absent value (inventory.owner.absent, validated by
+    _rh_endpoint_vars; not a resolver default). A value the declared rule refuses is refused here too (same rule, one
+    place)."""
     a = raw.get('address')
     a = host if a is None else a
     if not isinstance(a, str) or not a:
@@ -2837,7 +2850,7 @@ def _rh_endpoint(raw, rule, host, key):
         raise ValueError('lme: %s endpoint of %r: %s %r is none of the declared accepted inventory forms %r (host mode %r)' % (
             key, host, rule['inventory_forms']['var'], j, [f['form'] for f in rule['inventory_forms']['accepted']], raw.get('mode')))
     o = raw.get('owner')
-    o = '' if o is None else o
+    o = rule['owner_rule']['absent'] if o is None else o
     if not isinstance(o, str):
         raise ValueError('lme: %s endpoint of %r: owner must be a string; got %r' % (key, host, o))
     comp = {'address': a.lower(), 'port': pk, 'proxy_jump': jump, 'owner': o}
