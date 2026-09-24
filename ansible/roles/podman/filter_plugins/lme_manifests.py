@@ -2741,13 +2741,19 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
         return _rh_ca_words(s, arg, pats)
     if kind == 'equals_registry':
         # one literal, owned by the registry (remote_harness_schema): the policy value must equal it; a registry
-        # path that is absent (or an index outside its list) refuses, never admits vacuously
+        # path that is absent (or an index outside its list) refuses, never admits vacuously. C1-EQUALS-REGISTRY-
+        # NESTED-TYPES (codex 203817): SCALARS ONLY (str / int / bool, compared type-exact by _rh_ca_same); a
+        # container (or any other kind) on either side refuses, since _rh_ca_same is type-exact at the top level only
         where = arg['path'] + ('[%d]' % arg['index'] if 'index' in arg else '')
         fg, want = _rh_get(schema, arg['path'])
         if fg and 'index' in arg:
             fg, want = (True, want[arg['index']]) if isinstance(want, list) and arg['index'] < len(want) else (False, None)
         if not fg:
             return 'requires registry %s declared (missing dependency)' % (where,)
+        if _rh_kind(want) not in ('str', 'int', 'bool'):
+            return 'compares scalars only (str, int, bool): registry %s is a %s' % (where, _rh_kind(want))
+        if _rh_kind(s) not in ('str', 'int', 'bool'):
+            return 'must be a scalar (str, int, bool) to equal registry %s; got a %s' % (where, _rh_kind(s))
         return None if _rh_ca_same(s, want) else 'must equal registry %s (%r)' % (where, want)
     if kind == 'ere':
         return _rh_ca_ere(s, arg, chk.get('sed_delimited', False))
