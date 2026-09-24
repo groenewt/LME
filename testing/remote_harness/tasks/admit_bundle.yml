@@ -11,7 +11,9 @@
 # Admitted only when the bundle holds EXACTLY: the seed (0500), the seed launcher (bundle.launcher_file,
 # bundle.launcher_mode = the seed's custody; byte-identical to a fresh render and recorded in bundle.json), bundle.json and bundle.sha256 (0400), and
 # artifacts/ (0700) with exactly the class's declared files (0400), no links, no other entry; every artifact has its
-# declared sha256; the seed is byte-identical to a FRESH render of the class policy; bundle.json names that seed
+# declared sha256; bundle.sha256 holds EXACTLY the canonical N+2 lines (seed, launcher, then the declared rows, each
+# '<digest><separator><name>', every line terminated; re-derived from bundle.checksum_format and the admitted digests);
+# the seed is byte-identical to a FRESH render of the class policy; bundle.json names that seed
 # digest, the declared artifact rows and THIS class key (a bundle of another class, or a stale one, refuses: never a
 # fallback to the controller bundle).
 
@@ -75,6 +77,15 @@
     src: "{{ rh_admit_dir }}/{{ rh.controller.bootstrap.bundle.manifest_file }}"
   register: _rh_bnd_manifest
 
+# ROUTE-ADMIT-CHECKFILE-CONTENT-UNBOUND (codex 212700 / 212758, route F-A): the check file's BYTES are admitted here, not
+# only its digest's self-consistency with bundle.json. Read without failing on absence: an absent check file refuses in
+# the member-set assertion below (evaluated first), never as a module error.
+- name: Read the consumer check file (its bytes are compared with the re-derived canonical lines below)
+  ansible.builtin.slurp:
+    src: "{{ rh_admit_dir }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
+  register: _rh_bnd_sum
+  failed_when: false
+
 - name: Refuse a bundle that is not exactly the declared one of this class
   vars:
     _rows: "{{ rh_admit_policy.controller.bootstrap.artifacts + rh_admit_lock.packages + rh_admit_lock.collections }}"
@@ -89,6 +100,23 @@
                 template_vars={'lme_seed_bs': rh_admit_policy.controller.bootstrap, 'lme_seed_ctl': rh_admit_policy.controller,
                                'lme_seed_lock': rh_admit_lock}) | hash('sha256') }}
     _m: "{{ _rh_bnd_manifest.content | b64decode | from_json }}"
+    # The canonical N+2 check-file TEXT, re-derived independently of the file: bundle.checksum_format (separator,
+    # terminator), the declared order (seed, launcher, then every artifact / lock package / lock collection row) and the
+    # member digests admitted above (seed = results[0], launcher = results[3], both fresh-render-bound below; rows =
+    # the declared sha256). The terminator is bound in a {% set %} STATEMENT whose string constant holds a REAL line
+    # feed: this value is a YAML DOUBLE-QUOTED scalar, so the loader turns the escape into U+000A before Jinja sees it
+    # (PyYAML scanner.py ESCAPE_REPLACEMENTS 'n' -> '\x0A', :1164, the loader of 2.17.14 and 2.19.11 alike). Jinja
+    # admits a raw line feed in a string constant (jinja2/lexer.py string_re, :29-31, re.S; 3.1.6), and the template
+    # therefore holds NO backslash: the 2.19 AnsibleLexer doubling (_jinja_bits.py; _engine.py TemplateOptions
+    # escape_backslashes, :75) and the 2.17 _escape_backslashes (template/__init__.py :112, :924-926) have nothing to
+    # act on. Trailing line feeds of the result are kept (2.17 do_template :979-992 and 2.19 _post_render_mutation
+    # :389-405 only ever ADD newlines). No vars lookup; the ONE grammar stays package_bundle.yml's / the seed's.
+    _want: "{% set cf = rh.controller.bootstrap.bundle.checksum_format %}{% set nl = {'newline': '\n'}[cf.terminator] %}{{
+      ([_rh_bnd_stat.results[0].stat.checksum ~ cf.separator ~ rh.controller.bootstrap.bundle.seed_file,
+        _rh_bnd_stat.results[3].stat.checksum ~ cf.separator ~ rh.controller.bootstrap.bundle.launcher_file]
+       + (_rows | map(attribute='sha256')
+          | zip(_rows | map(attribute='file') | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/'))
+          | map('join', cf.separator) | list)) | join(nl) ~ nl }}"
   ansible.builtin.assert:
     that:
       - (_rh_bnd_list.files | map(attribute='path') | map('regex_replace', '^' ~ (rh_admit_dir | regex_escape) ~ '/', '') | sort) == _expect_members
@@ -111,11 +139,15 @@
       - _m.schema == rh.controller.bootstrap.bundle.schema
       - _m.seed_sha256 == _fresh_seed_sha256
       - _m.checksum_file_sha256 == _rh_bnd_stat.results[2].stat.checksum
+      # the check file's BYTES: exactly the canonical N+2 terminated lines in the declared order (a reordered,
+      # duplicated, missing, extra, malformed or unterminated line refuses HERE, before pack_class.yml packs or
+      # publishes a transfer identity; a reorder is refused ONLY here -- the seed's name check is order-insensitive)
+      - (_rh_bnd_sum.content | default('') | b64decode) == _want
       - _m.artifacts == (_rows | map(attribute='file') | zip(_rows | map(attribute='sha256')) | map('join', '  ') | list)
       - _m.class_key | default('') == rh_admit_key
     fail_msg: >-
       REFUSED RH-TARGET-BOOTSTRAP: {{ rh_admit_dir }} is not exactly a package.yml bundle of class {{ rh_admit_key }}
-      (members, modes, links, artifact digests, fresh-render seed digest, bundle.json, or its recorded class_key
+      (members, modes, links, artifact digests, fresh-render seed digest, check-file content, bundle.json, or its recorded class_key
       {{ _m.class_key | default('absent') }}: a stale or other-class bundle). Rebuild it with package.yml.
     quiet: true
 
