@@ -170,7 +170,19 @@ exit $_fail
      B includes must be written "{{ '{{' }} tr_dir {{ '}}' }}/<tasks_dir>/<file>" and are loaded and walked; route includes must be
      written with the rh_repo_root or playbook_dir-based repository prefix and are emitted (not walked) for binding
      by path + sha256; anything else is emitted as UNRESOLVED and refused by check.yml. -#}
-{%- macro walk(tasks, via, tr, tr_dir, depth) -%}
+{#- ---- execution scope (codex 163642 B-CONTROLLER-LEDGER-ANCESTRY-REFRESH): '1' when a task / block / include `apply`
+     runs on the OWNER CONTROLLER -- delegate_to == controller_scope.delegate_to AND every controller_scope.pin_vars
+     key bound as a task var whose expression names the declared source (controller_delegation.* / TMPDIR). -#}
+{%- macro ctl_pinned(cs, d, vs) -%}
+{%- set vs = vs if vs is mapping else {} -%}
+{%- if d is not none and d == cs.delegate_to and (cs.pin_vars.keys() | reject('in', vs) | list | length) == 0 -%}
+{%- set ns = namespace(ok=true) -%}
+{%- for k, want in cs.pin_vars.items() -%}{%- if want not in (vs[k] | string) -%}{%- set ns.ok = false -%}{%- endif -%}{%- endfor -%}
+{{ '1' if ns.ok else '' }}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro walk(tasks, via, tr, tr_dir, depth, ctl=false) -%}
 {%- set kw = ['name', 'when', 'register', 'vars', 'loop', 'loop_control', 'changed_when', 'failed_when', 'tags',
               'delegate_to', 'run_once', 'environment', 'no_log', 'become', 'become_user', 'args', 'until', 'retries',
               'delay', 'ignore_errors', 'check_mode', 'notify', 'any_errors_fatal', 'listen', 'throttle', 'timeout',
@@ -178,12 +190,15 @@ exit $_fail
 {%- set bprefix = '{' ~ '{ tr_dir }' ~ '}/' ~ tr.tasks_dir ~ '/' -%}
 {%- set rprefix = '^\\{\\{ (rh_repo_root|playbook_dir \\| dirname \\| dirname \\| dirname) \\}\\}/' -%}
 {%- for t in (tasks or []) -%}
+{%- set tctl = ctl or (ctl_pinned(tr.controller_scope, t.delegate_to | default(none), t.vars | default({})) | trim == '1') -%}
 {%- if t.block is defined -%}
-{{ walk(t.block, via, tr, tr_dir, depth) }}{{ walk(t.rescue | default([]), via, tr, tr_dir, depth) }}{{ walk(t.always | default([]), via, tr, tr_dir, depth) }}
+{{ walk(t.block, via, tr, tr_dir, depth, tctl) }}{{ walk(t.rescue | default([]), via, tr, tr_dir, depth, tctl) }}{{ walk(t.always | default([]), via, tr, tr_dir, depth, tctl) }}
 {%- else -%}
 {%- set mods = t.keys() | reject('in', kw) | list -%}
 {%- set mod = (mods | first) if (mods | length == 1) else 'AMBIGUOUS:' ~ (mods | join(',')) -%}
-{%- set row = {'module': mod, 'task': t.name | default(''), 'via': via,
+{%- set ap = (t[mod].apply | default({})) if (t[mod] is defined and t[mod] is mapping) else {} -%}
+{%- set cctl = tctl or (ctl_pinned(tr.controller_scope, ap.delegate_to | default(none), ap.vars | default({})) | trim == '1') -%}
+{%- set row = {'module': mod, 'task': t.name | default(''), 'via': via, 'ctl': cctl,
                'delegate_to': t.delegate_to | default(none),
                'changed_when': (t.changed_when | string) if t.changed_when is defined else none,
                'ivars': ((t.vars | default({})).keys() | list) if mod in ['ansible.builtin.include_tasks', 'ansible.builtin.import_tasks'] else [],
@@ -193,7 +208,7 @@ exit $_fail
 {%- set f = t[mod] if t[mod] is string else (t[mod].file | default('')) -%}
 {%- if f.startswith(bprefix) and depth < 6 -%}
 {{ (row | combine({'include': 'b', 'file': f[bprefix | length:]}) | to_json) ~ '\n' }}
-{{- walk(lookup('ansible.builtin.file', tr_dir ~ '/' ~ tr.tasks_dir ~ '/' ~ f[bprefix | length:]) | from_yaml, via ~ '>' ~ f[bprefix | length:], tr, tr_dir, depth + 1) -}}
+{{- walk(lookup('ansible.builtin.file', tr_dir ~ '/' ~ tr.tasks_dir ~ '/' ~ f[bprefix | length:]) | from_yaml, via ~ '>' ~ f[bprefix | length:], tr, tr_dir, depth + 1, cctl) -}}
 {%- elif f is match(rprefix) -%}
 {{ (row | combine({'include': 'route', 'file': f | regex_replace(rprefix, '')}) | to_json) ~ '\n' }}
 {%- else -%}
@@ -253,7 +268,7 @@ exit $_fail
 {%- elif r.include | default('') == 'route' and r.file not in ic.pre_contact_route -%}{{ v.append(at ~ 'route include ' ~ r.file ~ ' before INITIAL CONTACT') or '' }}
 {%- elif r.module not in ic.contact_free_modules -%}{{ v.append(at ~ 'module ' ~ r.module ~ ' before INITIAL CONTACT') or '' }}
 {%- endif -%}
-{%- elif r.include | default('') == 'route' and r.file in ic.owner_only_route -%}{{ v.append(at ~ 'owner-only route include ' ~ r.file ~ ' after the PRIVILEGED contact') or '' }}
+{%- elif r.include | default('') == 'route' and r.file in ic.owner_only_route and not (r.ctl | default(false)) -%}{{ v.append(at ~ 'owner-only route include ' ~ r.file ~ ' in target context after the PRIVILEGED contact') or '' }}
 {%- endif -%}
 {%- endfor -%}
 {%- if not icn.seen -%}{{ v.append(pa ~ ': target play never includes ' ~ ic.route_rel ~ ' (INITIAL CONTACT)') or '' }}{%- endif -%}
