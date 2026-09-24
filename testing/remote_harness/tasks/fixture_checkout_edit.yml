@@ -1,0 +1,180 @@
+---
+# testing/remote_harness/tasks/fixture_checkout_edit.yml -- kind `edit` of the ONE checkout-fixture producer
+# (tasks/fixture_checkout.yml includes it after the common admission: inputs, the clone's full ancestry, the Route 3
+# binding; never included on its own). ONE exact, bounded text replacement of a checkout_cases entry
+# {file_rel, anchor, replacement} in ONE declared source file of the clone.
+# Refused (REFUSED RH-FIXTURE-UNSUPPORTED, nothing written) unless: file_rel is a normalized repository-relative path
+# that is NOT the profile (profile variants are G's variant_clone patch) and not under the work root, whose every
+# component in the clone is a real directory and the file itself a regular file (no link); the clone's file equals the
+# canonical checkout's file (bytes and mode; source custody); the anchor occurs EXACTLY ONCE in the file; the
+# replacement differs from the anchor. At the USE boundary the clone's ancestry is re-admitted and the chain re-stated
+# unchanged. Component admission (the file's chain below the clone, before the read and at the USE boundary) is the
+# ONE rule of tasks/fixture_components.yml, shared with the relocate kind (codex 223517). After the write the file must equal the source with that one span replaced (sha256 of the expected text)
+# and keep its mode; otherwise REFUSED (the caller discards the clone with its run dir). The text never passes through
+# a template: the expected text and the written content are ONE expression each over the slurped bytes (jinja2
+# filters.py do_replace = str.replace(old, new, count), count 1).
+# Output (derived fact): rh_fx_result = {schema fixture-checkout-result/1, catalog, kind edit, case, lifecycle, expect,
+#   route3 {ctl, vclone, head}, head, clone, file_rel, path, mode, before_sha256, after_sha256,
+#   mutations [{op modify, path <file_rel>, sha256_before, sha256_after, mode_before, mode_after}],
+#   expected_status [' M <file_rel>'] (status_lines: the same list, kept), source {checkout, file_rel, sha256, mode}}.
+#   mutations / expected_status are the cross-kind fields agreed with G (variant_clone clone_status: sorted exact set).
+
+- name: Refuse a case outside the declared shape (repository-relative file, not the profile, a real span)
+  ansible.builtin.assert:
+    that:
+      - _rh_fx_c.file_rel is string and _rh_fx_c.file_rel is match('^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$')
+      - _rh_fx_c.file_rel.split('/') | select('in', ['.', '..']) | list | length == 0
+      - _rh_fx_c.file_rel != rh.controller.bootstrap.work_roots.checkout_binding.file_rel
+      - not _rh_fx_c.file_rel.startswith(rh.controller.bootstrap.work_roots.root_rel ~ '/')
+      - _rh_fx_c.anchor is string and _rh_fx_c.anchor | length > 0
+      - _rh_fx_c.replacement is string and _rh_fx_c.replacement != _rh_fx_c.anchor
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: checkout case {{ rh_fx_case }} is not a declared single-span edit of a non-profile source file: {{ _rh_fx_c | to_json }}"
+    quiet: true
+
+- name: Stat every component of the target file inside the clone, the file last (no link followed)
+  ansible.builtin.stat:
+    path: "{{ rh_fx_clone ~ '/' ~ (_rh_fx_c.file_rel.split('/')[:item] | join('/')) }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ range(1, (_rh_fx_c.file_rel.split('/') | length) + 1) | list }}"
+  register: _rh_fx_st
+
+- name: Admit the target inside the clone by the ONE component rule (tasks/fixture_components.yml; codex 223517)
+  ansible.builtin.include_tasks: fixture_components.yml
+  vars:
+    rh_fc_rel: "{{ _rh_fx_c.file_rel }}"
+    rh_fc_leaf: reg
+
+- name: Stat the same file in the canonical run checkout (source custody; read only)
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root }}/{{ _rh_fx_c.file_rel }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _rh_fx_canon
+
+- name: Refuse a clone file that is not the canonical checkout's bytes and mode (the edit starts from the source)
+  ansible.builtin.assert:
+    that:
+      - _rh_fx_canon.stat.exists and _rh_fx_canon.stat.isreg and not _rh_fx_canon.stat.islnk
+      - _rh_fx_canon.stat.checksum == _rh_fx_st.results[-1].stat.checksum
+      - _rh_fx_canon.stat.mode == _rh_fx_st.results[-1].stat.mode
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: {{ rh_fx_clone }}/{{ _rh_fx_c.file_rel }} ({{ _rh_fx_st.results[-1].stat.checksum }},
+      mode {{ _rh_fx_st.results[-1].stat.mode }}) is not the canonical {{ rh_repo_root }}/{{ _rh_fx_c.file_rel }}
+      ({{ _rh_fx_canon.stat.checksum | default('absent') }}, mode {{ _rh_fx_canon.stat.mode | default('?') }}): already edited or foreign.
+    quiet: true
+
+- name: Read the target file (the ONE source of the edit)
+  ansible.builtin.slurp:
+    src: "{{ rh_fx_clone }}/{{ _rh_fx_c.file_rel }}"
+  register: _rh_fx_read
+
+- name: Refuse unless the anchor occurs exactly once (the edit is bounded to that span)
+  ansible.builtin.assert:
+    that:
+      - ((_rh_fx_read.content | b64decode).split(_rh_fx_c.anchor) | length) == 2
+      - (_rh_fx_read.content | b64decode) | hash('sha256') == _rh_fx_st.results[-1].stat.checksum
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: the anchor of case {{ rh_fx_case }} occurs
+      {{ ((_rh_fx_read.content | b64decode).split(_rh_fx_c.anchor) | length) - 1 }} times in {{ rh_fx_clone }}/{{ _rh_fx_c.file_rel }}
+      (exactly one required; an already-applied or foreign edit refuses), or the file is not valid UTF-8 text.
+    quiet: true
+
+- name: USE BOUNDARY -- re-admit the full ancestry through the actual clone right before the write
+  ansible.builtin.include_tasks: admit_ancestry.yml
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ rh_fx_clone }}"
+    rh_anc_refusal: RH-FIXTURE-UNSUPPORTED
+
+- name: USE BOUNDARY -- re-admit the target inside the clone by the ONE component rule
+  ansible.builtin.include_tasks: fixture_components.yml
+  vars:
+    rh_fc_rel: "{{ _rh_fx_c.file_rel }}"
+    rh_fc_leaf: reg
+
+- name: USE BOUNDARY -- re-stat every component of the target file inside the clone (no link, unchanged since read)
+  ansible.builtin.stat:
+    path: "{{ rh_fx_clone ~ '/' ~ (_rh_fx_c.file_rel.split('/')[:item] | join('/')) }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ range(1, (_rh_fx_c.file_rel.split('/') | length) + 1) | list }}"
+  register: _rh_fx_use
+
+- name: USE BOUNDARY -- refuse a changed chain or file
+  vars:
+    _dirs: "{{ _rh_fx_use.results[:-1] | map(attribute='stat') | list }}"
+    _f: "{{ _rh_fx_use.results[-1].stat }}"
+  ansible.builtin.assert:
+    that:
+      - _dirs | selectattr('exists') | selectattr('isdir') | rejectattr('islnk') | list | length == _dirs | length
+      - _f.exists and _f.isreg and not _f.islnk
+      - _f.checksum == _rh_fx_st.results[-1].stat.checksum and _f.mode == _rh_fx_st.results[-1].stat.mode
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: {{ rh_fx_clone }}/{{ _rh_fx_c.file_rel }} or a directory above it changed before the write"
+    quiet: true
+
+- name: Write the file with exactly that span replaced (its mode kept)
+  ansible.builtin.copy:
+    dest: "{{ rh_fx_clone }}/{{ _rh_fx_c.file_rel }}"
+    content: "{{ (_rh_fx_read.content | b64decode) | replace(_rh_fx_c.anchor, _rh_fx_c.replacement, 1) }}"
+    mode: "{{ _rh_fx_st.results[-1].stat.mode }}"
+    follow: false
+
+- name: Re-stat the file
+  ansible.builtin.stat:
+    path: "{{ rh_fx_clone }}/{{ _rh_fx_c.file_rel }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _rh_fx_post
+
+- name: Refuse a written file that is not exactly the source with that one span replaced
+  vars:
+    _want_sha: "{{ ((_rh_fx_read.content | b64decode) | replace(_rh_fx_c.anchor, _rh_fx_c.replacement, 1)) | hash('sha256') }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_fx_post.stat.exists and _rh_fx_post.stat.isreg and not _rh_fx_post.stat.islnk
+      - _rh_fx_post.stat.checksum == _want_sha
+      - _rh_fx_post.stat.checksum != _rh_fx_st.results[-1].stat.checksum
+      - _rh_fx_post.stat.mode == _rh_fx_st.results[-1].stat.mode
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: {{ rh_fx_clone }}/{{ _rh_fx_c.file_rel }} is {{ _rh_fx_post.stat.checksum | default('absent') }}
+      (mode {{ _rh_fx_post.stat.mode | default('?') }}), not the expected {{ _want_sha }} (mode {{ _rh_fx_st.results[-1].stat.mode }}).
+    quiet: true
+
+- name: Publish the fixture evidence (derived output; the caller records it)
+  ansible.builtin.set_fact:
+    rh_fx_result:
+      schema: fixture-checkout-result/1
+      catalog: bundle-fixtures/1
+      kind: edit
+      case: "{{ rh_fx_case }}"
+      lifecycle: "{{ _rh_fx_c.lifecycle }}"
+      expect: "{{ _rh_fx_c.expect }}"
+      # the G Route 3 clone record this fixture was bound to (asserted: vclone == clone, .git/HEAD == head)
+      route3: {ctl: "{{ rh_fx_route3.ctl }}", vclone: "{{ rh_fx_route3.vclone }}", head: "{{ rh_fx_route3.head }}"}
+      head: "{{ rh_fx_route3.head }}"
+      clone: "{{ rh_fx_clone }}"
+      # the ONE edited path (G's clone admission: exactly this path modified, with this mode and post digest)
+      file_rel: "{{ _rh_fx_c.file_rel }}"
+      path: "{{ rh_fx_clone }}/{{ _rh_fx_c.file_rel }}"
+      mode: "{{ _rh_fx_post.stat.mode }}"
+      before_sha256: "{{ _rh_fx_st.results[-1].stat.checksum }}"
+      after_sha256: "{{ _rh_fx_post.stat.checksum }}"
+      # the exact porcelain lines this fixture adds to the clone's status against head (G: declared mutation set)
+      status_lines: ["{{ ' M ' ~ _rh_fx_c.file_rel }}"]
+      # the agreed cross-kind fields (G: expected porcelain set + old-to-new input map); an edit is one modify
+      mutations:
+        - op: modify
+          path: "{{ _rh_fx_c.file_rel }}"
+          sha256_before: "{{ _rh_fx_st.results[-1].stat.checksum }}"
+          sha256_after: "{{ _rh_fx_post.stat.checksum }}"
+          mode_before: "{{ _rh_fx_st.results[-1].stat.mode }}"
+          mode_after: "{{ _rh_fx_post.stat.mode }}"
+      expected_status: ["{{ ' M ' ~ _rh_fx_c.file_rel }}"]
+      # source custody: the canonical checkout's file the edit started from (equal to before_sha256, asserted)
+      source: {checkout: "{{ rh_repo_root }}", file_rel: "{{ _rh_fx_c.file_rel }}", sha256: "{{ _rh_fx_canon.stat.checksum }}", mode: "{{ _rh_fx_canon.stat.mode }}"}

@@ -1,0 +1,515 @@
+---
+# testing/remote_harness/tasks/fixture_checkout_relocate.yml -- kind `relocate` of the ONE checkout-fixture producer
+# (codex 220953 REQUIRED canonical relocation positive; tasks/fixture_checkout.yml includes it after the common
+# admission: inputs, the clone's full ancestry, the Route 3 binding; never included on its own). Modules only.
+# Case shape (tests/bundle_fixtures.yml checkout_cases, kind relocate):
+#   relocate        {from_dir, to_dir, entries}: entries = the COMPLETE subtree of from_dir, sorted, each '<d|f> <rel>'
+#   registry_edits  [{file_rel, count}]: every occurrence of '<from_dir>/' in file_rel becomes '<to_dir>/', exactly count
+#   profile_case    the profile_cases id G's Route 3 patch applied to this clone (the producer never writes the profile)
+#   profile_refs    the exact number of '<to_dir>/...' strings the clone's remote_harness profile must carry
+# ONE component rule (codex 223517 H3-RELOCATE-REGISTRY-ANCESTOR-ESCAPE): every declared path it reads or mutates --
+# from_dir (dir), to_dir (absent), the profile and every registry file (reg) -- is admitted inside the clone by
+# tasks/fixture_components.yml (every component below the clone a real directory, no link; the leaf in its state)
+# before the first read, at the USE boundary, again right before the registry rewrite and the removal, and on the
+# written state; afterwards the canonical checkout's declared entries and registry files are re-read unchanged.
+# Refused (REFUSED RH-FIXTURE-UNSUPPORTED, nothing written) unless: both directories are normalized repository-relative,
+# disjoint, outside the work root and not holding the profile; every component of from_dir in the clone is a real
+# directory; to_dir is ABSENT under a real directory chain; from_dir holds EXACTLY the declared entries (find, no link
+# followed; types as declared) and each equals the canonical checkout's entry (type, mode, sha256; source custody);
+# each registry file is a regular non-profile file equal to the canonical one, holding '<from_dir>/' exactly count
+# times and '<to_dir>/' never; the clone's profile carries no '<from_dir>/' and exactly profile_refs '<to_dir>/'
+# strings, each a moved file (G's patch is complete). At the USE boundary the clone's ancestry is re-admitted and the
+# subtree, the registry files and the absence of to_dir are re-read unchanged. Then: to_dir and its declared
+# directories are created with the source modes, every file is copied byte- and mode-identical, the registry files
+# are rewritten, and from_dir is REMOVED -- its absence is what makes the positive meaningful: the template module and
+# lookup search <playbook_dir>/templates (= testing/remote_harness/templates), so a surviving old tree could quietly
+# satisfy the relative 'macros/controller_seed.j2' imports. Verified after: to_dir holds exactly the entries with the
+# source types, modes and digests, from_dir is absent, each registry file is exactly the replaced text, mode kept.
+# Output (derived fact): rh_fx_result = {schema fixture-checkout-result/1, catalog, kind relocate, case, lifecycle,
+#   expect, route3 {ctl, vclone, head}, clone, relocate {from_dir, to_dir, entries}, profile_case, moved_sha256
+#   {<to_dir>/<f>: sha256}, moved_mode {<to_dir>/<entry>: mode}, edited_count / edited_mode / edited_before_sha256 /
+#   edited_after_sha256 {<file_rel>: value}, status_lines (sorted), source {checkout, from_dir, sha256
+#   {<from_dir>/<f>: sha256}}, head, mutations, expected_status}. status_lines (porcelain
+#   v1, --untracked-files=all): ' D <from_dir>/<f>' per moved file, ' M <file_rel>' per registry edit, '?? <to_dir>/<f>'
+#   per moved file. The cross-kind fields agreed with G: mutations = one {op rename, from <from_dir>/<f>, path
+#   <to_dir>/<f>, sha256_before == sha256_after, mode_before == mode_after} per moved FILE (entries order; a directory is
+#   no git entry) then one {op modify, path <file_rel>, sha256_before, sha256_after, mode_before, mode_after} per
+#   registry edit; expected_status = status_lines (sorted). A rename is NOT a git mv: nothing is staged, so porcelain v1
+#   shows ' D <from>' plus '?? <path>', never 'R'.
+
+- name: Refuse a relocation outside the declared shape
+  vars:
+    _rl: "{{ _rh_fx_c.relocate }}"
+    _rx: '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$'
+    _rr: "{{ rh.controller.bootstrap.work_roots.root_rel }}"
+    _prof: "{{ rh.controller.bootstrap.work_roots.checkout_binding.file_rel }}"
+    _names: "{{ _rh_fx_c.relocate.entries | map('split') | map('last') | list }}"
+    _cat: "{{ lookup('ansible.builtin.file', rh_repo_root ~ '/testing/remote_harness/tests/bundle_fixtures.yml') | from_yaml }}"
+  ansible.builtin.assert:
+    that:
+      - (_rh_fx_c.keys() | map('string') | sort | list) == ['expect', 'id', 'kind', 'lifecycle', 'profile_case', 'profile_refs', 'registry_edits', 'relocate']
+      - _rl is mapping and (_rl.keys() | map('string') | sort | list) == ['entries', 'from_dir', 'to_dir']
+      - _rl.from_dir is string and _rl.from_dir is match(_rx) and _rl.to_dir is string and _rl.to_dir is match(_rx)
+      - (_rl.from_dir.split('/') + _rl.to_dir.split('/')) | select('in', ['.', '..']) | list | length == 0
+      - _rl.from_dir != _rl.to_dir
+      - not (_rl.to_dir ~ '/').startswith(_rl.from_dir ~ '/') and not (_rl.from_dir ~ '/').startswith(_rl.to_dir ~ '/')
+      - not (_rl.from_dir ~ '/').startswith(_rr ~ '/') and not (_rl.to_dir ~ '/').startswith(_rr ~ '/')
+      - _rl.from_dir != _rr and _rl.to_dir != _rr
+      - not _prof.startswith(_rl.from_dir ~ '/') and not _prof.startswith(_rl.to_dir ~ '/')
+      - _rl.to_dir.split('/') | length > 1
+      - _rl.entries is sequence and _rl.entries is not string and _rl.entries | length > 0
+      - _rl.entries | reject('match', '^[df] [A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$') | list | length == 0
+      - _names | map('split', '/') | flatten | select('in', ['.', '..']) | list | length == 0
+      - _names | unique | list | length == _names | length
+      - _names == (_names | sort)
+      - _rl.entries | select('match', '^f ') | list | length > 0
+      - _rh_fx_c.registry_edits is sequence and _rh_fx_c.registry_edits is not string and _rh_fx_c.registry_edits | length > 0
+      - _rh_fx_c.registry_edits | map(attribute='file_rel') | unique | list | length == _rh_fx_c.registry_edits | length
+      - _rh_fx_c.profile_case is string and _cat.profile_cases | selectattr('id', 'equalto', _rh_fx_c.profile_case) | list | length == 1
+      - _rh_fx_c.profile_refs is integer and _rh_fx_c.profile_refs > 0
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: checkout case {{ rh_fx_case }} is not a declared relocation of a complete source subtree: {{ _rh_fx_c | to_json }}"
+    quiet: true
+
+- name: Refuse a registry edit outside the declared shape (a counted edit of one non-profile file outside both directories)
+  vars:
+    _rl: "{{ _rh_fx_c.relocate }}"
+    _rr: "{{ rh.controller.bootstrap.work_roots.root_rel }}"
+  ansible.builtin.assert:
+    that:
+      - item is mapping and (item.keys() | map('string') | sort | list) == ['count', 'file_rel']
+      - item.file_rel is string and item.file_rel is match('^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$')
+      - item.file_rel.split('/') | select('in', ['.', '..']) | list | length == 0
+      - item.file_rel != rh.controller.bootstrap.work_roots.checkout_binding.file_rel
+      - not item.file_rel.startswith(_rr ~ '/') and not item.file_rel.startswith(_rl.from_dir ~ '/') and not item.file_rel.startswith(_rl.to_dir ~ '/')
+      - item.count is integer and item.count > 0
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: relocation {{ rh_fx_case }} declares a registry edit outside the shape: {{ item | to_json }}"
+    quiet: true
+  loop: "{{ _rh_fx_c.registry_edits }}"
+  loop_control:
+    label: "{{ item.file_rel | default('?') }}"
+
+- name: Bind every declared path this relocation reads or mutates, with its leaf state (ONE admission rule, codex 223517)
+  ansible.builtin.set_fact:
+    _rh_fx_adm: >-
+      {{ ['dir ' ~ _rh_fx_c.relocate.from_dir, 'absent ' ~ _rh_fx_c.relocate.to_dir,
+          'reg ' ~ rh.controller.bootstrap.work_roots.checkout_binding.file_rel]
+         + (_rh_fx_c.registry_edits | map(attribute='file_rel') | map('regex_replace', '^', 'reg ') | list) }}
+
+- name: Admit every declared path inside the clone before any read (tasks/fixture_components.yml)
+  ansible.builtin.include_tasks: fixture_components.yml
+  vars:
+    rh_fc_leaf: "{{ _rh_fx_adm_item.split(' ')[0] }}"
+    rh_fc_rel: "{{ _rh_fx_adm_item.split(' ')[1] }}"
+  loop: "{{ _rh_fx_adm }}"
+  loop_control:
+    loop_var: _rh_fx_adm_item
+
+- name: Stat every component of from_dir inside the clone (its mode is to_dir's mode; admitted above)
+  ansible.builtin.stat:
+    path: "{{ rh_fx_clone ~ '/' ~ (_rh_fx_c.relocate.from_dir.split('/')[:item] | join('/')) }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ range(1, (_rh_fx_c.relocate.from_dir.split('/') | length) + 1) | list }}"
+  register: _rh_fx_rfrom
+
+- name: List the clone's from_dir completely (no links followed)
+  ansible.builtin.find:
+    paths: "{{ rh_fx_clone }}/{{ _rh_fx_c.relocate.from_dir }}"
+    recurse: true
+    file_type: any
+    hidden: true
+    follow: false
+  register: _rh_fx_rfind
+
+- name: Stat every declared entry in the clone and in the canonical checkout (source custody)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ (_rh_fx_c.relocate.entries | map('split') | map('last') | map('regex_replace', '^', rh_fx_clone ~ '/' ~ _rh_fx_c.relocate.from_dir ~ '/') | list)
+       + (_rh_fx_c.relocate.entries | map('split') | map('last') | map('regex_replace', '^', rh_repo_root ~ '/' ~ _rh_fx_c.relocate.from_dir ~ '/') | list) }}
+  register: _rh_fx_rst
+
+- name: Refuse a subtree that is not exactly the declared one or not the canonical one
+  vars:
+    _names: "{{ _rh_fx_c.relocate.entries | map('split') | map('last') | list }}"
+    _types: "{{ _rh_fx_c.relocate.entries | map('split') | map('first') | list }}"
+    _n: "{{ _rh_fx_c.relocate.entries | length }}"
+    _s: "{{ _rh_fx_rst.results[:(_n | int)] | map(attribute='stat') | list }}"
+    _k: "{{ _rh_fx_rst.results[(_n | int):] | map(attribute='stat') | list }}"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_rh_fx_rfind.files | map(attribute='path')
+         | map('regex_replace', '^' ~ ((rh_fx_clone ~ '/' ~ _rh_fx_c.relocate.from_dir ~ '/') | regex_escape), '') | sort | list)
+        == (_names | sort | list)
+      - _rh_fx_rfind.files | selectattr('islnk') | list | length == 0
+      - _s | selectattr('exists') | rejectattr('islnk') | list | length == _n | int
+      - _k | selectattr('exists') | rejectattr('islnk') | list | length == _n | int
+      - (_s | map(attribute='isdir') | map('ternary', 'd', 'f') | list) == _types
+      - (_k | map(attribute='isdir') | map('ternary', 'd', 'f') | list) == _types
+      - _s | rejectattr('isdir') | rejectattr('isreg') | list | length == 0
+      - _s | map(attribute='mode') | list == _k | map(attribute='mode') | list
+      - _s | map(attribute='checksum', default='') | list == _k | map(attribute='checksum', default='') | list
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: {{ rh_fx_clone }}/{{ _rh_fx_c.relocate.from_dir }} is not exactly the declared subtree
+      {{ _names }} (real, link-free, the canonical checkout's types, modes and digests).
+    quiet: true
+
+- name: Stat every registry file in the clone and in the canonical checkout (source custody)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ (_rh_fx_c.registry_edits | map(attribute='file_rel') | map('regex_replace', '^', rh_fx_clone ~ '/') | list)
+       + (_rh_fx_c.registry_edits | map(attribute='file_rel') | map('regex_replace', '^', rh_repo_root ~ '/') | list) }}
+  register: _rh_fx_est
+
+- name: Read every registry file in the clone (the ONE source of each edit)
+  ansible.builtin.slurp:
+    src: "{{ rh_fx_clone }}/{{ item.file_rel }}"
+  loop: "{{ _rh_fx_c.registry_edits }}"
+  loop_control:
+    label: "{{ item.file_rel }}"
+  register: _rh_fx_eread
+
+- name: Refuse a registry file that is not the canonical one or does not hold the old prefix exactly count times
+  vars:
+    _txt: "{{ _rh_fx_eread.results[_rh_fx_i].content | b64decode }}"
+    _cs: "{{ _rh_fx_est.results[_rh_fx_i].stat }}"
+    _ks: "{{ _rh_fx_est.results[_rh_fx_i + (_rh_fx_c.registry_edits | length)].stat }}"
+  ansible.builtin.assert:
+    that:
+      - _cs.exists and _cs.isreg and not _cs.islnk and _ks.exists and _ks.isreg and not _ks.islnk
+      - _cs.checksum == _ks.checksum and _cs.mode == _ks.mode
+      - _txt | hash('sha256') == _cs.checksum
+      - ((_txt.split(_rh_fx_c.relocate.from_dir ~ '/') | length) - 1) == item.count
+      - (_txt.split(_rh_fx_c.relocate.to_dir ~ '/') | length) == 1
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: {{ rh_fx_clone }}/{{ item.file_rel }} is not the canonical file, or holds
+      '{{ _rh_fx_c.relocate.from_dir }}/' {{ (_txt.split(_rh_fx_c.relocate.from_dir ~ '/') | length) - 1 }} times (declared {{ item.count }})
+      or already names '{{ _rh_fx_c.relocate.to_dir }}/'.
+    quiet: true
+  loop: "{{ _rh_fx_c.registry_edits }}"
+  loop_control:
+    index_var: _rh_fx_i
+    label: "{{ item.file_rel }}"
+
+- name: Read the clone's profile (G's Route 3 patch applied profile_case; the producer never writes it)
+  ansible.builtin.slurp:
+    src: "{{ rh_fx_clone }}/{{ rh.controller.bootstrap.work_roots.checkout_binding.file_rel }}"
+  register: _rh_fx_rprof
+
+- name: Refuse a clone profile that still names the old directory or does not name exactly the moved files
+  vars:
+    _pj: "{{ (_rh_fx_rprof.content | b64decode | from_yaml).profile_overlay.lme_global.remote_harness | to_json }}"
+    _moved: >-
+      {{ _rh_fx_c.relocate.entries | select('match', '^f ') | map('split') | map('last')
+         | map('regex_replace', '^', _rh_fx_c.relocate.to_dir ~ '/') | list }}
+    _refs: >-
+      {{ _pj | regex_findall('"' ~ ((_rh_fx_c.relocate.to_dir ~ '/') | regex_escape) ~ '[^"]*"') | map('regex_replace', '"', '') | list }}
+  ansible.builtin.assert:
+    that:
+      - _pj is not search((_rh_fx_c.relocate.from_dir ~ '/') | regex_escape)
+      - _refs | length == _rh_fx_c.profile_refs
+      - _refs | reject('in', _moved) | list | length == 0
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: the clone's profile is not G's patch {{ _rh_fx_c.profile_case }}: it must name no
+      '{{ _rh_fx_c.relocate.from_dir }}/' path and exactly {{ _rh_fx_c.profile_refs }} moved files (got {{ _refs }}).
+    quiet: true
+
+- name: USE BOUNDARY -- re-admit the full ancestry through the actual clone right before the first write
+  ansible.builtin.include_tasks: admit_ancestry.yml
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ rh_fx_clone }}"
+    rh_anc_refusal: RH-FIXTURE-UNSUPPORTED
+
+- name: USE BOUNDARY -- re-admit every declared path inside the clone (tasks/fixture_components.yml)
+  ansible.builtin.include_tasks: fixture_components.yml
+  vars:
+    rh_fc_leaf: "{{ _rh_fx_adm_item.split(' ')[0] }}"
+    rh_fc_rel: "{{ _rh_fx_adm_item.split(' ')[1] }}"
+  loop: "{{ _rh_fx_adm }}"
+  loop_control:
+    loop_var: _rh_fx_adm_item
+
+- name: USE BOUNDARY -- re-list from_dir (no links followed)
+  ansible.builtin.find:
+    paths: "{{ rh_fx_clone }}/{{ _rh_fx_c.relocate.from_dir }}"
+    recurse: true
+    file_type: any
+    hidden: true
+    follow: false
+  register: _rh_fx_rufind
+
+- name: USE BOUNDARY -- re-stat the subtree, the registry files and to_dir
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ (_rh_fx_c.relocate.entries | map('split') | map('last') | map('regex_replace', '^', rh_fx_clone ~ '/' ~ _rh_fx_c.relocate.from_dir ~ '/') | list)
+       + (_rh_fx_c.registry_edits | map(attribute='file_rel') | map('regex_replace', '^', rh_fx_clone ~ '/') | list)
+       + [rh_fx_clone ~ '/' ~ _rh_fx_c.relocate.to_dir] }}
+  register: _rh_fx_ruse
+
+- name: USE BOUNDARY -- refuse any change since the reads
+  vars:
+    _n: "{{ _rh_fx_c.relocate.entries | length }}"
+    _m: "{{ _rh_fx_c.registry_edits | length }}"
+    _u: "{{ _rh_fx_ruse.results | map(attribute='stat') | list }}"
+    _s: "{{ _rh_fx_rst.results[:(_n | int)] | map(attribute='stat') | list }}"
+    _e: "{{ _rh_fx_est.results[:(_m | int)] | map(attribute='stat') | list }}"
+  ansible.builtin.assert:
+    that:
+      - (_rh_fx_rufind.files | map(attribute='path') | sort | list) == (_rh_fx_rfind.files | map(attribute='path') | sort | list)
+      - _rh_fx_rufind.files | selectattr('islnk') | list | length == 0
+      - _u[:(_n | int) + (_m | int)] | selectattr('exists') | rejectattr('islnk') | list | length == (_n | int) + (_m | int)
+      - _u[:(_n | int)] | map(attribute='checksum', default='') | list == _s | map(attribute='checksum', default='') | list
+      - _u[:(_n | int)] | map(attribute='mode') | list == _s | map(attribute='mode') | list
+      - _u[(_n | int):(_n | int) + (_m | int)] | map(attribute='checksum') | list == _e | map(attribute='checksum') | list
+      - _u[(_n | int):(_n | int) + (_m | int)] | map(attribute='mode') | list == _e | map(attribute='mode') | list
+      - not _u[-1].exists
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: the subtree, a registry file or the destination {{ _rh_fx_c.relocate.to_dir }} changed before the first write"
+    quiet: true
+
+- name: Create to_dir with from_dir's mode
+  ansible.builtin.file:
+    path: "{{ rh_fx_clone }}/{{ _rh_fx_c.relocate.to_dir }}"
+    state: directory
+    mode: "{{ _rh_fx_rfrom.results[-1].stat.mode }}"
+    follow: false
+
+- name: Create every declared directory entry with its source mode (entries sorted, so parents come first)
+  ansible.builtin.file:
+    path: "{{ rh_fx_clone }}/{{ _rh_fx_c.relocate.to_dir }}/{{ item.split()[-1] }}"
+    state: directory
+    mode: "{{ _rh_fx_rst.results[_rh_fx_i].stat.mode }}"
+    follow: false
+  loop: "{{ _rh_fx_c.relocate.entries }}"
+  loop_control:
+    index_var: _rh_fx_i
+  when: item.split()[0] == 'd'
+
+- name: Copy every declared file byte- and mode-identical (remote_src; the old tree is only read)
+  ansible.builtin.copy:
+    src: "{{ rh_fx_clone }}/{{ _rh_fx_c.relocate.from_dir }}/{{ item.split()[-1] }}"
+    dest: "{{ rh_fx_clone }}/{{ _rh_fx_c.relocate.to_dir }}/{{ item.split()[-1] }}"
+    remote_src: true
+    mode: "{{ _rh_fx_rst.results[_rh_fx_i].stat.mode }}"
+  loop: "{{ _rh_fx_c.relocate.entries }}"
+  loop_control:
+    index_var: _rh_fx_i
+  when: item.split()[0] == 'f'
+
+- name: WRITE BOUNDARY -- re-admit every declared regular-file path (registry files, profile) right before the rewrite
+  ansible.builtin.include_tasks: fixture_components.yml
+  vars:
+    rh_fc_leaf: "{{ _rh_fx_adm_item.split(' ')[0] }}"
+    rh_fc_rel: "{{ _rh_fx_adm_item.split(' ')[1] }}"
+  loop: "{{ _rh_fx_adm | select('match', '^reg ') | list }}"
+  loop_control:
+    loop_var: _rh_fx_adm_item
+
+- name: Rewrite every registry file ('<from_dir>/' -> '<to_dir>/', every occurrence; its mode kept)
+  ansible.builtin.copy:
+    dest: "{{ rh_fx_clone }}/{{ item.file_rel }}"
+    content: "{{ (_rh_fx_eread.results[_rh_fx_i].content | b64decode) | replace(_rh_fx_c.relocate.from_dir ~ '/', _rh_fx_c.relocate.to_dir ~ '/') }}"
+    mode: "{{ _rh_fx_est.results[_rh_fx_i].stat.mode }}"
+    follow: false
+  loop: "{{ _rh_fx_c.registry_edits }}"
+  loop_control:
+    index_var: _rh_fx_i
+    label: "{{ item.file_rel }}"
+
+- name: WRITE BOUNDARY -- re-admit from_dir right before its removal
+  ansible.builtin.include_tasks: fixture_components.yml
+  vars:
+    rh_fc_leaf: dir
+    rh_fc_rel: "{{ _rh_fx_c.relocate.from_dir }}"
+
+- name: Remove the old subtree (its complete, declared content now lives at to_dir)
+  ansible.builtin.file:
+    path: "{{ rh_fx_clone }}/{{ _rh_fx_c.relocate.from_dir }}"
+    state: absent
+
+- name: List to_dir completely (no links followed)
+  ansible.builtin.find:
+    paths: "{{ rh_fx_clone }}/{{ _rh_fx_c.relocate.to_dir }}"
+    recurse: true
+    file_type: any
+    hidden: true
+    follow: false
+  register: _rh_fx_rpfind
+
+- name: Re-stat the moved entries, from_dir, the registry files and to_dir
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ (_rh_fx_c.relocate.entries | map('split') | map('last') | map('regex_replace', '^', rh_fx_clone ~ '/' ~ _rh_fx_c.relocate.to_dir ~ '/') | list)
+       + [rh_fx_clone ~ '/' ~ _rh_fx_c.relocate.from_dir]
+       + (_rh_fx_c.registry_edits | map(attribute='file_rel') | map('regex_replace', '^', rh_fx_clone ~ '/') | list)
+       + [rh_fx_clone ~ '/' ~ _rh_fx_c.relocate.to_dir] }}
+  register: _rh_fx_rpost
+
+- name: Refuse a relocation that is not exactly the declared one
+  vars:
+    _names: "{{ _rh_fx_c.relocate.entries | map('split') | map('last') | list }}"
+    _types: "{{ _rh_fx_c.relocate.entries | map('split') | map('first') | list }}"
+    _n: "{{ _rh_fx_c.relocate.entries | length }}"
+    _m: "{{ _rh_fx_c.registry_edits | length }}"
+    _p: "{{ _rh_fx_rpost.results | map(attribute='stat') | list }}"
+    _s: "{{ _rh_fx_rst.results[:(_n | int)] | map(attribute='stat') | list }}"
+    _want: >-
+      {{ _rh_fx_eread.results | map(attribute='content') | map('b64decode')
+         | map('replace', _rh_fx_c.relocate.from_dir ~ '/', _rh_fx_c.relocate.to_dir ~ '/') | map('hash', 'sha256') | list }}
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_rh_fx_rpfind.files | map(attribute='path')
+         | map('regex_replace', '^' ~ ((rh_fx_clone ~ '/' ~ _rh_fx_c.relocate.to_dir ~ '/') | regex_escape), '') | sort | list)
+        == (_names | sort | list)
+      - _rh_fx_rpfind.files | selectattr('islnk') | list | length == 0
+      - _p[:(_n | int)] | selectattr('exists') | rejectattr('islnk') | list | length == _n | int
+      - (_p[:(_n | int)] | map(attribute='isdir') | map('ternary', 'd', 'f') | list) == _types
+      - _p[:(_n | int)] | map(attribute='mode') | list == _s | map(attribute='mode') | list
+      - _p[:(_n | int)] | map(attribute='checksum', default='') | list == _s | map(attribute='checksum', default='') | list
+      - not _p[_n | int].exists
+      - _p[(_n | int) + 1:(_n | int) + 1 + (_m | int)] | map(attribute='checksum') | list == _want
+      - _p[(_n | int) + 1:(_n | int) + 1 + (_m | int)] | map(attribute='mode') | list == _rh_fx_est.results[:(_m | int)] | map(attribute='stat.mode') | list
+      - _p[-1].exists and _p[-1].isdir and not _p[-1].islnk and _p[-1].mode == _rh_fx_rfrom.results[-1].stat.mode
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: the relocation {{ _rh_fx_c.relocate.from_dir }} -> {{ _rh_fx_c.relocate.to_dir }} in
+      {{ rh_fx_clone }} is not exactly the declared one (entries, types, modes, digests; old directory absent; registry text).
+    quiet: true
+
+- name: Admit the written state by the same rule (from_dir absent, to_dir a real directory, every regular-file path)
+  ansible.builtin.include_tasks: fixture_components.yml
+  vars:
+    rh_fc_leaf: "{{ _rh_fx_adm_item.split(' ')[0] }}"
+    rh_fc_rel: "{{ _rh_fx_adm_item.split(' ')[1] }}"
+  loop: >-
+    {{ ['absent ' ~ _rh_fx_c.relocate.from_dir, 'dir ' ~ _rh_fx_c.relocate.to_dir]
+       + (_rh_fx_adm | select('match', '^reg ') | list) }}
+  loop_control:
+    loop_var: _rh_fx_adm_item
+
+- name: Re-stat the canonical checkout's declared entries and registry files (the source is never written)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ (_rh_fx_c.relocate.entries | map('split') | map('last') | map('regex_replace', '^', rh_repo_root ~ '/' ~ _rh_fx_c.relocate.from_dir ~ '/') | list)
+       + (_rh_fx_c.registry_edits | map(attribute='file_rel') | map('regex_replace', '^', rh_repo_root ~ '/') | list) }}
+  register: _rh_fx_kpost
+
+- name: Refuse unless the canonical checkout is unchanged (types, modes, digests as read before any write)
+  vars:
+    _n: "{{ _rh_fx_c.relocate.entries | length }}"
+    _m: "{{ _rh_fx_c.registry_edits | length }}"
+    _q: "{{ _rh_fx_kpost.results | map(attribute='stat') | list }}"
+    _k: "{{ _rh_fx_rst.results[(_n | int):] | map(attribute='stat') | list }}"
+    _ke: "{{ _rh_fx_est.results[(_m | int):] | map(attribute='stat') | list }}"
+  ansible.builtin.assert:
+    that:
+      - _q | selectattr('exists') | rejectattr('islnk') | list | length == (_n | int) + (_m | int)
+      - _q[:(_n | int)] | map(attribute='isdir') | list == _k | map(attribute='isdir') | list
+      - _q[:(_n | int)] | map(attribute='mode') | list == _k | map(attribute='mode') | list
+      - _q[:(_n | int)] | map(attribute='checksum', default='') | list == _k | map(attribute='checksum', default='') | list
+      - _q[(_n | int):] | map(attribute='mode') | list == _ke | map(attribute='mode') | list
+      - _q[(_n | int):] | map(attribute='checksum') | list == _ke | map(attribute='checksum') | list
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: the canonical checkout {{ rh_repo_root }} changed during relocation {{ rh_fx_case }} (a write escaped the clone)"
+    quiet: true
+
+- name: Start the mutation list (derived; filled from the verified stats only)
+  ansible.builtin.set_fact:
+    _rh_fx_mut: []
+
+- name: Record one rename per moved file (clone stats before the move and after it; digest and mode preserved, asserted)
+  ansible.builtin.set_fact:
+    _rh_fx_mut: >-
+      {{ _rh_fx_mut + [{'op': 'rename',
+                        'from': _rh_fx_c.relocate.from_dir ~ '/' ~ item.split()[-1],
+                        'path': _rh_fx_c.relocate.to_dir ~ '/' ~ item.split()[-1],
+                        'sha256_before': _rh_fx_rst.results[_rh_fx_i].stat.checksum,
+                        'sha256_after': _rh_fx_rpost.results[_rh_fx_i].stat.checksum,
+                        'mode_before': _rh_fx_rst.results[_rh_fx_i].stat.mode,
+                        'mode_after': _rh_fx_rpost.results[_rh_fx_i].stat.mode}] }}
+  loop: "{{ _rh_fx_c.relocate.entries }}"
+  loop_control:
+    index_var: _rh_fx_i
+  when: item.split()[0] == 'f'
+
+- name: Record one modify per registry edit (clone stats before the rewrite and after it)
+  vars:
+    _n: "{{ _rh_fx_c.relocate.entries | length }}"
+    _post: "{{ _rh_fx_rpost.results[(_n | int) + 1 + _rh_fx_i].stat }}"
+  ansible.builtin.set_fact:
+    _rh_fx_mut: >-
+      {{ _rh_fx_mut + [{'op': 'modify',
+                        'path': item.file_rel,
+                        'sha256_before': _rh_fx_est.results[_rh_fx_i].stat.checksum,
+                        'sha256_after': _post.checksum,
+                        'mode_before': _rh_fx_est.results[_rh_fx_i].stat.mode,
+                        'mode_after': _post.mode}] }}
+  loop: "{{ _rh_fx_c.registry_edits }}"
+  loop_control:
+    index_var: _rh_fx_i
+    label: "{{ item.file_rel }}"
+
+- name: Publish the fixture evidence (derived output; the caller records it)
+  vars:
+    _rl: "{{ _rh_fx_c.relocate }}"
+    _n: "{{ _rh_fx_c.relocate.entries | length }}"
+    _m: "{{ _rh_fx_c.registry_edits | length }}"
+    _files: "{{ _rh_fx_c.relocate.entries | select('match', '^f ') | map('split') | map('last') | list }}"
+    _to_all: "{{ _rh_fx_c.relocate.entries | map('split') | map('last') | map('regex_replace', '^', _rh_fx_c.relocate.to_dir ~ '/') | list }}"
+    _p: "{{ _rh_fx_rpost.results | map(attribute='stat') | list }}"
+    _st: >-
+      {{ ((_files | map('regex_replace', '^', ' D ' ~ _rh_fx_c.relocate.from_dir ~ '/') | list)
+          + (_rh_fx_c.registry_edits | map(attribute='file_rel') | map('regex_replace', '^', ' M ') | list)
+          + (_files | map('regex_replace', '^', '?? ' ~ _rh_fx_c.relocate.to_dir ~ '/') | list)) | sort | list }}
+  ansible.builtin.set_fact:
+    rh_fx_result:
+      schema: fixture-checkout-result/1
+      catalog: bundle-fixtures/1
+      kind: relocate
+      case: "{{ rh_fx_case }}"
+      lifecycle: "{{ _rh_fx_c.lifecycle }}"
+      expect: "{{ _rh_fx_c.expect }}"
+      route3: {ctl: "{{ rh_fx_route3.ctl }}", vclone: "{{ rh_fx_route3.vclone }}", head: "{{ rh_fx_route3.head }}"}
+      head: "{{ rh_fx_route3.head }}"
+      clone: "{{ rh_fx_clone }}"
+      relocate: {from_dir: "{{ _rl.from_dir }}", to_dir: "{{ _rl.to_dir }}", entries: "{{ _rl.entries }}"}
+      profile_case: "{{ _rh_fx_c.profile_case }}"
+      moved_sha256: >-
+        {{ dict(_to_all | zip(_p[:(_n | int)] | map(attribute='checksum', default='')))
+           | dict2items | rejectattr('value', 'equalto', '') | items2dict }}
+      moved_mode: "{{ dict(_to_all | zip(_p[:(_n | int)] | map(attribute='mode'))) }}"
+      edited_count: "{{ dict(_rh_fx_c.registry_edits | map(attribute='file_rel') | zip(_rh_fx_c.registry_edits | map(attribute='count'))) }}"
+      edited_mode: "{{ dict(_rh_fx_c.registry_edits | map(attribute='file_rel') | zip(_p[(_n | int) + 1:(_n | int) + 1 + (_m | int)] | map(attribute='mode'))) }}"
+      edited_before_sha256: "{{ dict(_rh_fx_c.registry_edits | map(attribute='file_rel') | zip(_rh_fx_est.results[:(_m | int)] | map(attribute='stat.checksum'))) }}"
+      edited_after_sha256: "{{ dict(_rh_fx_c.registry_edits | map(attribute='file_rel') | zip(_p[(_n | int) + 1:(_n | int) + 1 + (_m | int)] | map(attribute='checksum'))) }}"
+      status_lines: "{{ _st }}"
+      # the agreed cross-kind fields (G: expected porcelain set, compared sorted exact; old-to-new input map)
+      mutations: "{{ _rh_fx_mut }}"
+      expected_status: "{{ _st }}"
+      source:
+        checkout: "{{ rh_repo_root }}"
+        from_dir: "{{ _rl.from_dir }}"
+        sha256: >-
+          {{ dict(_rh_fx_c.relocate.entries | map('split') | map('last') | map('regex_replace', '^', _rl.from_dir ~ '/')
+                  | zip(_rh_fx_rst.results[(_n | int):] | map(attribute='stat.checksum', default='')))
+             | dict2items | rejectattr('value', 'equalto', '') | items2dict }}
