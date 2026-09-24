@@ -836,6 +836,10 @@ def _revision_payload(resolved, registry, profile_identities,
         payload['hosts'] = resolved['hosts']
     if 'database' in resolved:
         payload['database'] = resolved['database']
+    # SEED-06 (codex-232517): the effective remote-harness policy section is part of the execution revision.
+    rh_key = ((registry or {}).get('remote_harness_schema') or {}).get('policy_key')
+    if rh_key and rh_key in resolved:
+        payload[rh_key] = resolved[rh_key]
     # Composed artifacts that actually render (so an -e lme_service_overrides / lme_global_override
     # that changes the rendered units is not invisible to the revision).
     if services is not None:
@@ -2368,10 +2372,194 @@ def lme_service_coverage_gap(declared_universe, services):
     return sorted(str(x) for x in (universe ^ composed))
 
 
+def _rh_kind(v):
+    if isinstance(v, bool):
+        return 'bool'
+    if isinstance(v, int):
+        return 'int'
+    if isinstance(v, str):
+        return 'str'
+    if isinstance(v, float):
+        return 'float'
+    if isinstance(v, dict):
+        return 'mapping'
+    if isinstance(v, (list, tuple)):
+        return 'list'
+    return 'null' if v is None else type(v).__name__
+
+
+def _rh_get(tree, dotted):
+    cur = tree
+    for k in dotted.split('.'):
+        if not isinstance(cur, dict) or k not in cur:
+            return False, None
+        cur = cur[k]
+    return True, cur
+
+
+def _rh_leaves(x, prefix):
+    if isinstance(x, dict) and x:
+        out = []
+        for k in sorted(x):
+            if not isinstance(k, str) or not k or '.' in k:
+                raise ValueError('lme: remote_harness override key %r under %r must be a non-empty string without "."' % (k, '.'.join(prefix)))
+            out.extend(_rh_leaves(x[k], prefix + [k]))
+        return out
+    return [(prefix, x)]
+
+
+def _rh_prefix(path, pattern):
+    return len(path) >= len(pattern) and all(p == '*' or p == q for p, q in zip(pattern, path))
+
+
+def _rh_expand(tree, pattern):
+    """Concrete dotted paths in tree matching pattern ('*' = every key of a mapping)."""
+    found = [([], tree)]
+    for seg in pattern.split('.'):
+        nxt = []
+        for path, node in found:
+            if not isinstance(node, dict):
+                continue
+            for k in (sorted(node) if seg == '*' else [seg]):
+                if k in node:
+                    nxt.append((path + [k], node[k]))
+        found = nxt
+    return found
+
+
+def _rh_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _rh_validate(composed, declared, override, schema):
+    key = schema['policy_key']
+    ov = (override or {}).get(key) if isinstance(override, dict) else None
+    if not isinstance(declared, dict) or key not in declared:
+        if ov is not None:
+            raise ValueError('lme: lme_global_override.%s supplied but no %s policy is declared (global/profile)' % (key, key))
+        return None, []
+    decl, pol = declared[key], (composed or {}).get(key)
+    if not isinstance(decl, dict) or not isinstance(pol, dict):
+        raise ValueError('lme: %s must be a mapping (declared %s, composed %s)' % (key, _rh_kind(decl), _rh_kind(pol)))
+    ver = pol.get('schema_version')
+    if not _rh_int(ver) or ver != schema['policy_schema_version']:
+        raise ValueError('lme: %s.schema_version %r != %r' % (key, ver, schema['policy_schema_version']))
+    for retired in schema['retired_policy_paths']:
+        if _rh_get(pol, retired)[0]:
+            raise ValueError('lme: %s.%s is retired (registry remote_harness_schema owns it); remove it from the declaration' % (key, retired))
+    # -- override: deny-by-default tunable paths, declared-leaf types, path+identity together --
+    tunables = [t.split('.') for t in schema['tunable_paths']]
+    overridden = []
+    if ov is not None:
+        if not isinstance(ov, dict):
+            raise ValueError('lme: lme_global_override.%s must be a mapping, got %s' % (key, _rh_kind(ov)))
+        for path, val in _rh_leaves(ov, []):
+            dotted = '.'.join(path)
+            if not any(_rh_prefix(path, t) for t in tunables):
+                raise ValueError('lme: lme_global_override.%s.%s is not a tunable path (registry remote_harness_schema.tunable_paths %s); the declared value is pinned' % (key, dotted, schema['tunable_paths']))
+            found, dval = _rh_get(decl, dotted)
+            if found and _rh_kind(dval) != _rh_kind(val):
+                raise ValueError('lme: lme_global_override.%s.%s is %s; the declared leaf is %s' % (key, dotted, _rh_kind(val), _rh_kind(dval)))
+            if not found and not any(_rh_prefix(path, e.split('.')) for e in schema['extensible_paths']):
+                raise ValueError('lme: lme_global_override.%s.%s names no declared leaf (only %s accept new keys); an override may only retune a declaration' % (key, dotted, schema['extensible_paths']))
+            overridden.append(dotted)
+        for pattern, sibling in sorted(schema['path_requires'].items()):
+            pat = pattern.split('.')
+            for path, _v in _rh_leaves(ov, []):
+                if len(path) == len(pat) and _rh_prefix(path, pat):
+                    if not _rh_get(ov, '.'.join(path[:-1] + [sibling]))[0]:
+                        raise ValueError('lme: lme_global_override.%s.%s changes an executable location without its %s; selecting an admitted executable elsewhere requires its declared identity in the same override' % (key, '.'.join(path), sibling))
+    # -- composed-policy checks (declaration AND override) --
+    for pattern in schema['path_leaves']:
+        for path, v in _rh_expand(pol, pattern):
+            segs = v.split('/')[1:] if isinstance(v, str) else []
+            if not isinstance(v, str) or not v.startswith('/') or v == '/' or any(x in ('', '.', '..') for x in segs):
+                raise ValueError('lme: %s.%s %r must be an absolute normalized path' % (key, '.'.join(path), v))
+    ei = schema['executable_identity']
+    fe, entries = _rh_get(pol, ei['entries'])
+    if not fe or not isinstance(entries, dict):
+        raise ValueError('lme: %s.%s must be a mapping of executables' % (key, ei['entries']))
+    for tool in sorted(entries):
+        ident = (entries[tool] or {}).get(ei['field']) if isinstance(entries[tool], dict) else None
+        kind = ident.get('kind') if isinstance(ident, dict) else None
+        spec = ei['kinds'].get(kind) if isinstance(kind, str) else None
+        val = ident.get(spec['value_field']) if spec else None
+        if spec is None or not isinstance(val, str) or not re.match(spec['value_pattern'], val) \
+                or set(ident) != {'kind', spec['value_field']}:
+            raise ValueError('lme: %s.%s.%s.%s must be {kind: <one of %s>, <value>} (executable identity); got %r' % (key, ei['entries'], tool, ei['field'], sorted(ei['kinds']), ident))
+    for dotted in schema['positive_int_paths']:
+        f, v = _rh_get(pol, dotted)
+        if not f or not _rh_int(v) or v < 1:
+            raise ValueError('lme: %s.%s %r must be an integer >= 1' % (key, dotted, v))
+    for bnd in schema['bounds']:
+        (fv, v), (fm, m) = _rh_get(pol, bnd['path']), _rh_get(pol, bnd['max'])
+        if not (fv and fm and _rh_int(v) and _rh_int(m)) or v > m * bnd['scale']:
+            raise ValueError('lme: %s.%s %r exceeds %s.%s %r x %r' % (key, bnd['path'], v, key, bnd['max'], m, bnd['scale']))
+    pm = schema['package_mapping']
+    ff, fams = _rh_get(pol, pm['families'])
+    fr, req = _rh_get(pol, pm['required'])
+    if not ff or not isinstance(fams, dict) or not fams or any(not isinstance(m, dict) for m in fams.values()):
+        raise ValueError('lme: %s.%s must map each os family to a package mapping' % (key, pm['families']))
+    def _pkg_check(names, where):
+        if not isinstance(names, list):
+            raise ValueError('lme: %s.%s must be a list' % (key, where))
+        for fam in sorted(fams):
+            miss = sorted(n for n in names if n not in fams[fam])
+            if miss:
+                raise ValueError('lme: %s.%s names %s with no %s.%s.%s mapping' % (key, where, miss, key, pm['families'], fam))
+    _pkg_check(req if fr else None, pm['required'])
+    ad = schema['adapter']
+    (fs, sel), (fm, members) = _rh_get(pol, ad['selector']), _rh_get(pol, ad['members'])
+    if not fs or not isinstance(sel, str) or not fm or not isinstance(members, dict) or sel not in members:
+        raise ValueError('lme: %s.%s %r must name a key of the composed %s.%s %s' % (key, ad['selector'], sel, key, ad['members'], sorted(members) if isinstance(members, dict) else members))
+    adecl = members[sel]
+    if not isinstance(adecl, dict) or adecl.get(ad['status_field']) in ad['refused_statuses']:
+        raise ValueError('lme: %s.%s %r is %s (%s)' % (key, ad['selector'], sel, (adecl or {}).get(ad['status_field']) if isinstance(adecl, dict) else adecl, ad['refused_statuses']))
+    for tl in ad['tool_lists']:
+        f, tools = _rh_get(adecl, tl)
+        if f:
+            if not isinstance(tools, list) or any(t not in entries for t in tools):
+                raise ValueError('lme: %s adapter %s.%s %r names executables outside %s.%s' % (key, sel, tl, tools, key, ei['entries']))
+    for pl in ad['package_lists']:
+        f, pk = _rh_get(adecl, pl)
+        if f:
+            _pkg_check(pk, '%s.%s.%s' % (ad['members'], sel, pl))
+    fi, inv = _rh_get(pol, schema['inventory_var_path'])
+    for name, want in sorted(schema['inventory_vars'].items()):
+        got = inv.get(name) if fi and isinstance(inv, dict) else None
+        if got != want:
+            raise ValueError('lme: %s.%s.%s is %r; the registry declares %r' % (key, schema['inventory_var_path'], name, got, want))
+    section = {'schema_version': schema['projection_schema_version'], 'policy': pol, 'policy_sha256': _digest(pol)}
+    return section, sorted(overridden)
+
+
+def lme_project_remote_harness(composed, declared, override, schema):
+    """SEED-06 (codex-tick121-223811, codex-232517): the typed lme_resolved.<policy_key> section
+    {schema_version, policy, policy_sha256}, or None when no policy is declared.
+
+    composed = lme_global as composed (global | profile | operator override LAST); declared = the same
+    composition WITHOUT the operator override; override = lme_global_override; schema =
+    lme_config_registry.remote_harness_schema. MERGES NOTHING. Validates, deny-by-default: override leaves only
+    under declared tunable paths with the declared leaf type; an executable location override only together with
+    its identity; absolute normalized executable paths; a well-formed identity of a declared kind for every
+    executable; positive integers and resource bounds inside the declared envelope; package mappings for every
+    required and adapter package in every os family; an admitted adapter whose executables are declared;
+    registry inventory variable names; retired profile paths absent. The section is revision-bound; override
+    provenance is NOT in it (lme_remote_harness_overridden_paths is the unhashed audit view)."""
+    return _rh_validate(composed, declared, override, schema)[0]
+
+
+def lme_remote_harness_overridden_paths(composed, declared, override, schema):
+    """Audit view (not revision-bound): sorted dotted leaf paths the operator override set; same validation."""
+    return _rh_validate(composed, declared, override, schema)[1]
+
+
 class FilterModule(object):
     def filters(self):
         return {
             'strict_enable_bool': strict_enable_bool,
+            'lme_project_remote_harness': lme_project_remote_harness,
+            'lme_remote_harness_overridden_paths': lme_remote_harness_overridden_paths,
             'lme_resolve_config': lme_resolve_config,
             'lme_validate_config': lme_validate_config,
             'lme_config_revision': lme_config_revision,
