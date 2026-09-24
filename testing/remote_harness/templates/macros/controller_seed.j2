@@ -818,22 +818,49 @@ if [ "$MODE" = {{ shq(rl.mode) }} ]; then
     '') lme_refuse RH-SEED-USAGE {{ shq(rl.mode ~ ' needs --runner <key> (no default): ' ~ (rl.runners | list | sort | join(', '))) }} ;;
     *) lme_refuse RH-SEED-USAGE "unknown runner key: $RUNNER" ;;
   esac
-  # RH-RUNLOCAL-OVERRIDES: every caller -e value (inline, or an @file's content) is screened before any effect; an
-  # executor / interpreter / privilege / temp selector or the reserved lme_resolved_run refuses
-  _pair=''
+  # RH-RUNLOCAL-OVERRIDES (codex 152001): the CLOSED caller grammar (run_local.caller_vars). Each caller -e value is
+  # exactly ONE of the declared forms, each carrying exactly one top-level key whose bytes the seed checks, and every
+  # other form (@file, multi-key or nested mappings, several pairs, quoting, escapes, whitespace) is unsupported and
+  # refuses. No free structured text is screened, so nothing here relies on a pattern proving a key's absence:
+  #   name_eq_value    <name>=<value>                   value of value_chars only (Ansible's key=value form)
+  #   json_single_key  {"<name>":[<flat>]} / {"<name>":{<flat>}}   <flat> of value_chars and `"` only, so no
+  #                    bracket, brace, escape, quote style, anchor, tag or comment can open or close a structure:
+  #                    the top-level mapping has exactly the one key <name>, spelled literally
+{% set cv = rl.caller_vars %}
+{% if cv.forms != ['name_eq_value', 'json_single_key'] or cv.name_first_chars is not match('^[a-z]+$') or cv.name_chars is not match('^[a-z0-9_]+$')
+      or cv.value_chars is not match('^[A-Za-z0-9_./:@,+=]+-?$') or (cv.reserved_name_globs | reject('match', '^[a-z_][a-z_*]*$') | list | length) > 0 %}{{ caller_vars_declaration_unsupported_by_the_seed_generator }}{% endif %}
+  _pair=''; _seen=' '
   for _a in "$@"; do
     if [ -n "$_pair" ]; then
       _pair=''
       case "$_a" in
-        @*)
-          _sf=${_a#@}
-          [ -f "$_sf" ] && [ ! -L "$_sf" ] || lme_refuse RH-SEED-USAGE "{{ rl.mode }}: extra-vars file is not a regular file: $_sf"
-          ! {{ x(bs, 'grep') }} -E -q -- {{ shq(rl.forbidden_selector_regex) }} "$_sf" || lme_refuse RH-SEED-USAGE "{{ rl.mode }}: extra-vars file $_sf sets a pinned selector (executor/interpreter/privilege/temp or lme_resolved_run)"
+        '{"'*)
+          _j=${_a#'{"'}; _n=${_j%%'"'*}; _b=${_j#"$_n"}
+          case "$_b" in
+            '":['*']}'|'":{'*'}}') _i=${_b#'":'?}; _i=${_i%?'}'} ;;
+            *) lme_refuse {{ cv.refusal }} "{{ rl.mode }}: unsupported JSON extra-var (only {\"<name>\":[...]} or {\"<name>\":{...}}, one key, no whitespace): $_a" ;;
+          esac
+          case "$_i" in
+            *[!\"{{ cv.value_chars }}]*) lme_refuse {{ cv.refusal }} "{{ rl.mode }}: JSON extra-var $_n holds a character outside run_local.caller_vars.value_chars and the double quote (no nesting, escape, whitespace or template)" ;;
+          esac
           ;;
-        *)
-          ! printf '%s\n' "$_a" | {{ x(bs, 'grep') }} -E -q -- {{ shq(rl.forbidden_selector_regex) }} || lme_refuse RH-SEED-USAGE "{{ rl.mode }}: extra-var sets a pinned selector (executor/interpreter/privilege/temp or lme_resolved_run): $_a"
+        *=*)
+          _n=${_a%%=*}; _v=${_a#*=}
+          case "$_v" in
+            *[!{{ cv.value_chars }}]*) lme_refuse {{ cv.refusal }} "{{ rl.mode }}: extra-var $_n value holds a character outside run_local.caller_vars.value_chars (no whitespace, quote, escape, brace or template)" ;;
+          esac
           ;;
+        *) lme_refuse {{ cv.refusal }} "{{ rl.mode }}: unsupported extra-var form (<name>=<value> or {\"<name>\":[...]} / {\"<name>\":{...}} only; no @file, YAML or multi-key mapping): $_a" ;;
       esac
+      case "$_n" in
+        ''|[!{{ cv.name_first_chars }}]*|*[!{{ cv.name_chars }}]*) lme_refuse {{ cv.refusal }} "{{ rl.mode }}: unsupported extra-var name (quoted, escaped, or outside run_local.caller_vars name_first_chars/name_chars): $_a" ;;
+      esac
+      case "$_n" in
+        {{ cv.reserved_name_globs | join('|') }}) lme_refuse {{ cv.refusal }} "{{ rl.mode }}: extra-var $_n is a reserved selector (executor/interpreter/privilege/temp, magic variable or {{ rl.resolved_run.var }})" ;;
+      esac
+      [ "$_n" != "$_rl_var" ] || lme_refuse {{ cv.refusal }} "{{ rl.mode }}: extra-var $_n is the runner work root the seed supplies"
+      case "$_seen" in *" $_n "*) lme_refuse {{ cv.refusal }} "{{ rl.mode }}: extra-var $_n given twice (ambiguous)" ;; esac
+      _seen="$_seen$_n "
       continue
     fi
     case "$_a" in

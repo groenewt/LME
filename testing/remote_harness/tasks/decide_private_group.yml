@@ -1,14 +1,25 @@
 ---
 # testing/remote_harness/tasks/decide_private_group.yml -- the owner-private-group DECISION for one directory, on the
 # controller, with the ONE generated program (path_admission.ancestry.owner_private_group; the seed embeds the same
-# text). No gathering here: the caller supplies the private-group-facts/1 stream it gathered with the declared tools.
+# text). No gathering here: the caller supplies the private-group-facts/1 stream it gathered with the declared tools
+# of the host that owns the directory (the TARGET's os_tools on a target; the controller's on the controller).
+# RH-ANCESTRY-CONTROLLER-TOOL (codex 152001): the decision runs on the controller (delegate_to localhost), so its
+# executable is the CONTROLLER's admitted tool -- hostvars['localhost'].rh.controller.bootstrap.os_tools[<decision_tool>]
+# (the delegate's own resolved policy, set by its resolve_policy.yml), stat-hashed against that entry's declared
+# identity before it runs -- NEVER rh_pg_bs.os_tools (on a target play that is the target's selection, which stays
+# legitimate for the target-side fact gathering and for the seed the target runs itself). The rule
+# (owner_private_group, not a tunable path) must be identical in both policies; the program is rendered from the
+# controller's.
 # Inputs (no defaults):
-#   rh_pg_bs         the resolved remote_harness.controller.bootstrap map
+#   rh_pg_bs         the resolved remote_harness.controller.bootstrap map of the host that owns the directory
 #   rh_pg_repo_root  the checkout that holds program_template_rel (absolute)
 #   rh_pg_facts      the facts stream (text, `<tag>TAB<value>` lines)
 #   rh_pg_refusal    the caller's refusal code (its own vocabulary; the verdict text is the program's)
-# Output: _rh_pg_decision (command result; stdout `ADMIT <dir>` on admission). A refusal fails the play.
-- name: Admit the decision inputs (no default)
+# Output: _rh_pg_decision (command result; stdout `ADMIT <dir>` on admission; cmd[0] = the controller tool that ran).
+# A refusal fails the play.
+- name: Admit the decision inputs and the controller's resolved policy (no default)
+  vars:
+    _cb: "{{ hostvars['localhost'].rh.controller.bootstrap | default(none) }}"
   ansible.builtin.assert:
     that:
       - rh_pg_bs is mapping and rh_pg_bs.path_admission.ancestry.owner_private_group is mapping
@@ -16,23 +27,54 @@
       - rh_pg_repo_root is string and rh_pg_repo_root is match(rh_pg_bs.path_admission.regex)
       - rh_pg_facts is string and rh_pg_facts | length > 0
       - rh_pg_refusal is string and rh_pg_refusal | length > 0
+      - _cb is mapping and _cb.path_admission.ancestry.owner_private_group is mapping
+      - _cb.path_admission.ancestry.owner_private_group == rh_pg_bs.path_admission.ancestry.owner_private_group
+      - _cb.os_tools[_cb.path_admission.ancestry.owner_private_group.decision_tool] is mapping
+      - _cb.os_tools[_cb.path_admission.ancestry.owner_private_group.decision_tool].identity.kind == 'file_sha256'
     fail_msg: >-
       REFUSED {{ rh_pg_refusal | default('RH-SEED-ROOT-NOT-OWNED') }}: decide_private_group.yml needs rh_pg_bs (with
-      path_admission.ancestry.owner_private_group enabled), rh_pg_repo_root, rh_pg_facts and rh_pg_refusal (no defaults).
+      path_admission.ancestry.owner_private_group enabled), rh_pg_repo_root, rh_pg_facts and rh_pg_refusal (no defaults),
+      and the controller's resolved policy (hostvars['localhost'].rh, set by resolve_policy.yml on localhost) with the
+      SAME owner_private_group rule and a file_sha256-admitted decision tool (RH-ANCESTRY-CONTROLLER-TOOL).
     quiet: true
 
-- name: Decide the owner-private-group admission with the ONE generated program (declared awk; controller; read-only)
+- name: Hash the controller's decision tool before it runs (controller; stat sha256, links followed; read-only)
   vars:
-    _pg: "{{ rh_pg_bs.path_admission.ancestry.owner_private_group }}"
+    _cb: "{{ hostvars['localhost'].rh.controller.bootstrap }}"
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') or '~/.ansible/tmp' }}"
+  ansible.builtin.stat:
+    path: "{{ _cb.os_tools[_cb.path_admission.ancestry.owner_private_group.decision_tool].path }}"
+    follow: true
+    get_checksum: true
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  register: _rh_pg_tool
+
+- name: Refuse a controller decision tool that is not its declared identity
+  vars:
+    _t: "{{ hostvars['localhost'].rh.controller.bootstrap.os_tools[hostvars['localhost'].rh.controller.bootstrap.path_admission.ancestry.owner_private_group.decision_tool] }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_pg_tool.stat.exists and _rh_pg_tool.stat.isreg and _rh_pg_tool.stat.executable
+      - _rh_pg_tool.stat.checksum == _t.identity.sha256
+    fail_msg: >-
+      REFUSED {{ rh_pg_refusal }} (RH-ANCESTRY-CONTROLLER-TOOL): the controller decision tool {{ _t.path }} is absent,
+      not executable or not its declared identity ({{ _rh_pg_tool.stat.checksum | default('absent') }} vs {{ _t.identity.sha256 }}).
+    quiet: true
+
+- name: Decide the owner-private-group admission with the ONE generated program (controller's admitted tool; read-only)
+  vars:
+    _cb: "{{ hostvars['localhost'].rh.controller.bootstrap }}"
+    _pg: "{{ _cb.path_admission.ancestry.owner_private_group }}"
     # delegated to the controller: the controller's own run temp (seed run / run-local TMPDIR), never a target-derived
     # play value (same pin as reap_staging.yml)
     ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') or '~/.ansible/tmp' }}"
   ansible.builtin.command:
     argv:
-      - "{{ rh_pg_bs.os_tools[_pg.decision_tool].path }}"
+      - "{{ _cb.os_tools[_pg.decision_tool].path }}"
       - >-
         {{ lookup('ansible.builtin.template', rh_pg_repo_root ~ '/' ~ _pg.program_template_rel,
-                  template_vars={'rh_pg_bs': rh_pg_bs, 'rh_pg_part': 'program'}) }}
+                  template_vars={'rh_pg_bs': _cb, 'rh_pg_part': 'program'}) }}
     stdin: "{{ rh_pg_facts | replace('\r', '') }}"
     stdin_add_newline: true
   delegate_to: localhost
@@ -41,11 +83,15 @@
   failed_when: false
 
 - name: Refuse a group-writable directory that is not an admitted owner-private group
+  vars:
+    _cb: "{{ hostvars['localhost'].rh.controller.bootstrap }}"
   ansible.builtin.assert:
     that:
+      - _rh_pg_decision.cmd[0] | default('') == _cb.os_tools[_cb.path_admission.ancestry.owner_private_group.decision_tool].path
       - _rh_pg_decision.rc == 0
       - _rh_pg_decision.stdout is match('^ADMIT /')
     fail_msg: >-
       REFUSED {{ rh_pg_refusal }}: {{ _rh_pg_decision.stdout | default('') }} {{ _rh_pg_decision.stderr | default('') }}
-      (path_admission.ancestry.owner_private_group; facts schema {{ rh_pg_bs.path_admission.ancestry.owner_private_group.facts_schema }})
+      (path_admission.ancestry.owner_private_group; facts schema {{ rh_pg_bs.path_admission.ancestry.owner_private_group.facts_schema }};
+      decided by {{ _rh_pg_decision.cmd[0] | default('?') }})
     quiet: true
