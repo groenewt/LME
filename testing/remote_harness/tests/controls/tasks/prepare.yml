@@ -6,6 +6,57 @@
   ansible.builtin.set_fact:
     rhc_decl: "{{ lookup('ansible.builtin.file', rhc_controls_dir ~ '/controls.yml') | from_yaml }}"
 
+# G-CLONE-DECLARED-PROFILE-PATH (codex 220352 / 220515): the profile a declaration variant patches (Route 3 clone,
+# override route, bundle-input comparison) is bound to the AUTHORITATIVE source relationship, never a path literal: the
+# engine's effective lme_manifests_dir / lme_profile (resolve_policy.yml refused any other binding) through the declared
+# path form variant_clone.profile_source.form (the engine's own include_vars file, ansible/roles/podman/tasks/resolve.yml).
+# The bound path is confined (repository-relative, no '..', a plain profile name), a regular non-link file owned by the
+# checkout's owner, and it is proven to be EXACTLY the source the engine resolved: its parsed content equals the engine's
+# loaded _lme_profile_file and its bytes digest equals rh_profile_sha256. Any mismatch refuses (RHC-PROFILE-BINDING).
+- name: Derive the profile path from the engine's effective binding and the declared form
+  vars:
+    _ps: "{{ rhc_decl.variant_clone.profile_source }}"
+    _md: "{{ lookup('ansible.builtin.vars', _ps.manifests_dir_var, default='') }}"
+    _pn: "{{ lookup('ansible.builtin.vars', _ps.profile_var, default='') }}"
+  ansible.builtin.set_fact:
+    rhc_profile_bind:
+      manifests_dir: "{{ _md }}"
+      profile: "{{ _pn }}"
+      rel: >-
+        {{ (_ps.form | replace('{manifests_dir}', (_md[(rh_repo_root | length) + 1:]) if (_md is string and _md.startswith(rh_repo_root ~ '/')) else '/UNCONFINED')
+                     | replace('{profile}', _pn)) }}
+
+- name: Stat the bound profile and the checkout (ownership and type; never followed)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ rh_repo_root }}/{{ rhc_profile_bind.rel }}", "{{ rh_repo_root }}"]
+  register: _rhc_pb_st
+
+- name: Refuse a profile binding that is unconfined, not a regular owned file, or not exactly the source the engine resolved
+  vars:
+    _f: "{{ _rhc_pb_st.results[0].stat }}"
+    _r: "{{ _rhc_pb_st.results[1].stat }}"
+  ansible.builtin.assert:
+    that:
+      - rhc_profile_bind.profile is match(rhc_decl.variant_clone.profile_source.profile_regex)
+      - not rhc_profile_bind.rel.startswith('/')
+      - "'..' not in rhc_profile_bind.rel.split('/')"
+      - "'{' not in rhc_profile_bind.rel"
+      - _f.exists and _f.isreg and not _f.islnk
+      - _r.exists and _r.isdir and _f.uid == _r.uid
+      - (lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ rhc_profile_bind.rel) | from_yaml) == _lme_profile_file
+      - (lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ rhc_profile_bind.rel) | hash('sha256')) == rh_profile_sha256
+    fail_msg: >-
+      REFUSED RHC-PROFILE-BINDING: {{ rhc_profile_bind | to_json }} (form {{ rhc_decl.variant_clone.profile_source.form }}) is not a
+      confined, regular, checkout-owned file equal to the profile the engine resolved (_lme_profile_file / rh_profile_sha256)
+    quiet: true
+
+- name: Publish the bound profile path (the one path every declaration-variant task uses)
+  ansible.builtin.set_fact:
+    rhc_profile_rel: "{{ rhc_profile_bind.rel }}"
+
 # G-E77-PARTIAL-COVERAGE (ported from m1-1g): besides the ids, each row's own declared `variants` mapping KEYS (the row
 # model's components; only rows whose variants is a mapping) -- controls.j2 coverage / coverage_of report a row covered
 # by components as PARTIAL until its components cover every declared variant key.
@@ -19,6 +70,12 @@
           'variants': dict(_rows | selectattr('variants', 'defined') | selectattr('variants', 'mapping') | map(attribute='id')
                            | zip(_rows | selectattr('variants', 'defined') | selectattr('variants', 'mapping') | map(attribute='variants') | map('list')))}] }}
   loop: "{{ rhc_decl.cases_refs }}"
+
+# G-EXPORT-AVAILABILITY-ORDER (codex 220515 / 220352): the route export is admitted (declared / confined / present regular
+# file) BEFORE it is rendered, and only a correctly shaped rendering becomes ctx.launch_params (export_availability.yml;
+# already evaluated by selftest.yml -- evaluated once).
+- name: Admit the route launch-parameter export before any render of it
+  ansible.builtin.include_tasks: export_availability.yml
 
 - name: Derive the run-independent tokens and the planning context
   vars:
@@ -87,13 +144,12 @@
       # every seed_launch mode's positional parameters AS THE ROUTE CLASSIFIES THEM -- the route's machine export
       # seed_launcher.params_rel (a route template next to seed_launcher.template_rel that imports controller_seed.j2 and
       # returns {mode: launch_params(words)} over seed_launch.mode_args), rendered under this checkout's resolved bootstrap.
-      # No usage text is parsed. REQUESTED ROUTE HUNK (not yet landed): params_rel undeclared -> null, and controls.j2
-      # launch_values leaves every seed act unresolved (RHC-SEED-LAUNCH) while every non-seed control still runs; a declared
-      # but absent file is a lookup error of this checkout (a route defect, never a default)
-      launch_params: >-
-        {{ (lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ rh.controller.bootstrap.seed_launcher.params_rel,
-                   template_vars={'lme_seed_bs': rh.controller.bootstrap}) | from_json)
-           if (rh.controller.bootstrap.seed_launcher.params_rel | default('') | length > 0) else none }}
+      # No usage text is parsed. G-EXPORT-AVAILABILITY-ORDER (codex 220515): the value is rhc_export.params, bound by
+      # export_availability.yml ONLY for an admitted (declared, confined, present regular file), rendered and correctly
+      # shaped export; otherwise null -- controls.j2 launch_values then leaves every seed launch unresolved (RHC-SEED-LAUNCH)
+      # and plan_status QUEUES every launcher consumer on route_launch_params_export, while every other control still runs
+      # (a declared-but-missing file no longer aborts the whole plan)
+      launch_params: "{{ rhc_export.params }}"
       tools: "{{ rhc_decl.runner_tools }}"
       repo: "{{ rh_repo_root }}"
       variant_repo: ''
@@ -213,22 +269,21 @@
       {{ rhc_deps | combine({'pin_names_declared': rhc_deps.pin_names_declared | combine({'met': rhc_ctx_static.pin_names | length > 0,
           'why': 'no declared pin-name source is present: ' ~ (rhc_decl.pin_name_sources | map(attribute='path') | join(' | '))}) }) }}
 
-- name: route_launch_params_export is met when the profile declares seed_launcher.params_rel and its route template exists (codex 212700)
-  vars:
-    _rel: "{{ rh.controller.bootstrap.seed_launcher.params_rel | default('') }}"
+- name: route_launch_params_export is met only by an admitted, rendered, correctly shaped export (codex 212700 / 220515)
   ansible.builtin.set_fact:
     rhc_deps: >-
       {{ rhc_deps | combine({'route_launch_params_export': rhc_deps.route_launch_params_export | combine({
-          'met': _rel | length > 0 and (rh_repo_root ~ '/' ~ _rel) is file,
-          'why': ('controller.bootstrap.seed_launcher.params_rel undeclared in the resolved profile' if _rel | length == 0
-                  else 'route template ' ~ _rel ~ ' absent from this checkout')}) }) }}
+          'met': rhc_export.met | bool, 'state': rhc_export.state,
+          'why': rhc_export.state ~ ': ' ~ rhc_export.why}) }) }}
 
 # variant:<id> is met only when a route that declaration may ACTUALLY take is available (tasks/variant_admit.yml): the
-# override (SEED-06 projection) never carries a profile_bytes_differ declaration, so those need the MAIN-staged copy
-# rhc_variants.<id> (a variant_checkout: clone control requires variant_clone_fixture instead of variant:<id>; controls.j2
-# plan_status). A met variant:<id> whose route variant_admit.yml then cannot take would be a READY control that FAILs.
-# The rule is the pure macro controls.j2 variant_dep (selftested: selftests.yml gate variant_dep).
-- name: A declaration variant is available through a route it may take (override unless profile_bytes_differ; MAIN-staged copy)
+# override (SEED-06 projection) never carries a profile_bytes_differ declaration, so those are reachable only by a
+# variant_checkout: clone control (Route 3; it requires variant_clone_fixture instead of variant:<id>; controls.j2
+# plan_status). Route 2 (a MAIN-staged rhc_variants copy) is RETIRED from the execution path (codex 220352 / 212700): a
+# supplied copy never meets a dependency and is named as refused. A met variant:<id> whose route variant_admit.yml then
+# cannot take would be a READY control that FAILs. The rule is the pure macro controls.j2 variant_dep (selftested:
+# selftests.yml gate variant_dep).
+- name: A declaration variant is available through the override route it may take (Route 2 MAIN-staged copies retired)
   ansible.builtin.set_fact:
     rhc_deps: >-
       {{ rhc_deps | combine({'variant:' ~ item.key: lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'variant_dep',

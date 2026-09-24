@@ -143,18 +143,21 @@
 {%- set req = (c.requires | default([])) + (variant.requires | default([]))
               + (((['variant_clone_fixture'] if (c.variant_checkout | default('')) == 'clone' else ['variant:' ~ (variant.declaration | default(c.declaration))]))
                  if (variant.declaration | default(c.declaration | default(''))) else []) -%}
-{#- codex 212700 dependency scope: a control/variant with a seed act IMPLICITLY requires route_launch_params_export (its
-    launch parameters come only from the route export seed_launcher.params_rel), so without it the control is visibly
-    QUEUED on that dependency -- never dropped from coverage, never a PASS; non-seed controls keep their own binding -#}
-{%- set req = req + (['route_launch_params_export']
-      if (((c.steps | default([])) + (variant.steps | default([]))) | selectattr('act', 'defined') | map(attribute='act')
-          | selectattr('kind', 'defined') | selectattr('kind', 'equalto', 'seed') | list | length > 0) else []) -%}
+{#- codex 212700 dependency scope + codex 220515 G-EXPORT-CONSUMER-COVERAGE: a control/variant with ANY launcher-consuming
+    path (launcher_consumers below: seed acts, playbook acts via seed_run, repeat-nested and sweep-generated steps, and the
+    cleanup seed launches of finish_variant.yml, including the {vroot} purge a step's install makes necessary)
+    IMPLICITLY requires route_launch_params_export (its launch parameters come only from the route export
+    seed_launcher.params_rel), so without it the control is visibly QUEUED on that dependency, naming the consuming paths
+    -- never dropped from coverage, never a PASS; every other control keeps its own binding -#}
+{%- set lc = launcher_consumers(c, variant) | from_json -%}
+{%- set req = req + (['route_launch_params_export'] if lc else []) -%}
 {%- set ns = namespace(queued = [], after = [], main = false) -%}
 {%- for r in req -%}
 {%- set d = deps[r] | default({'met': false, 'kind': 'undeclared', 'why': 'undeclared dependency'}) -%}
 {%- if d.kind == 'main_only' -%}{%- set ns.main = true -%}{%- endif -%}
 {%- if d.kind == 'control' and not d.met -%}{%- set ns.after = ns.after + ['after ' ~ d.control] -%}
-{%- elif not d.met -%}{%- set ns.queued = ns.queued + [r ~ ': ' ~ d.why] -%}{%- endif -%}
+{%- elif not d.met -%}{%- set ns.queued = ns.queued + [r ~ ': ' ~ d.why
+      ~ ((' [launcher consumers: ' ~ (lc | join('; ')) ~ ']') if r == 'route_launch_params_export' else '')] -%}{%- endif -%}
 {%- endfor -%}
 {%- set aw = c.applies_when | default(none) -%}
 {%- set ad = (deps[aw.ruling] | default({'met': false, 'kind': 'undeclared', 'why': 'undeclared ruling'})) if aw else none -%}
@@ -179,17 +182,103 @@
 {%- endif -%}
 {%- endmacro -%}
 
+{#- ------------------------------------------------------------ launcher consumers + route export ------------ -#}
+{#- G-EXPORT-CONSUMER-COVERAGE (codex 220515 / 220352; the same macros as m1-1g): every path of a control/variant that
+    launches the seed through the bundle's generated launcher (plan_act -> seed_launch) and therefore consumes
+    ctx.launch_params. Derived from the SAME shapes the runner executes, never from a list of control ids:
+      steps       c.steps + variant.steps, and every repeat.steps nested at any depth (flatten), each step whose act is
+                  kind seed (any op / invoke) OR a playbook-shaped act with via seed_run (plan_act: `seed run`)
+      generated   sweep phases / declared_points (sweep_phases / sweep_points generate seed apply / verify / purge steps);
+                  sweep pins: each per_point_expect.entrypoints entry with via seed_run (sweep_pins)
+      cleanup     finish_variant.yml: root fresh -> the cleanup purge of {root}; root shared -> the cleanup re-verify of
+                  {shared}; variant cleanup_purge -> that purge (a declared deviation of the same launch). The {vroot} purge
+                  (cleanup-purge-vroot) runs only for a clone root a step installed -- that step is itself a consumer
+    Returns the consuming paths (strings, stable order); [] = the control consumes no launcher. -#}
+{%- macro _step_launches(steps, prefix) -%}
+{%- set ns = namespace(r = []) -%}
+{%- for s in steps | default([]) -%}
+{%- if s is mapping -%}
+{%- if s.repeat is defined -%}{%- set ns.r = ns.r + (_step_launches(s.repeat.steps | default([]), prefix ~ s.id ~ ' > ') | from_json) -%}{%- endif -%}
+{%- set a = s.act | default({}) -%}
+{%- if a is mapping and (a.kind | default('')) == 'seed' -%}{%- set ns.r = ns.r + ['step ' ~ prefix ~ s.id ~ ' (seed ' ~ (a.op | default('?')) ~ ')'] -%}
+{%- elif a is mapping and (a.via | default('')) == 'seed_run' -%}{%- set ns.r = ns.r + ['step ' ~ prefix ~ s.id ~ ' (' ~ (a.playbook | default(a.kind | default('?'))) ~ ' via seed_run)'] -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{%- macro launcher_consumers(c, variant) -%}
+{%- set v = variant if variant is mapping else {} -%}
+{%- set ns = namespace(r = _step_launches((c.steps | default([])) + (v.steps | default([])), '') | from_json) -%}
+{%- set sw = (c.sweep | default({})).kind | default('') -%}
+{%- if sw in ['phases', 'declared_points'] -%}{%- set ns.r = ns.r + ['sweep ' ~ sw ~ ' (generated seed apply / verify / purge steps)'] -%}{%- endif -%}
+{%- if sw == 'pins' -%}
+{%- for e in (c.per_point_expect | default({})).entrypoints | default([]) if (e.via | default('')) == 'seed_run' -%}
+{%- set ns.r = ns.r + ['sweep pins entrypoint ' ~ e.playbook ~ ' via seed_run'] -%}
+{%- endfor -%}
+{%- endif -%}
+{%- if (c.root | default('')) == 'fresh' -%}{%- set ns.r = ns.r + ['cleanup purge of the fresh root (finish_variant)'] -%}{%- endif -%}
+{%- if (c.root | default('')) == 'shared' -%}{%- set ns.r = ns.r + ['cleanup re-verify of the shared root (finish_variant)'] -%}{%- endif -%}
+{%- if v.cleanup_purge is defined and (c.root | default('')) != 'fresh' -%}{%- set ns.r = ns.r + ['variant cleanup_purge (finish_variant)'] -%}{%- endif -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- G-EXPORT-AVAILABILITY-ORDER (codex 220515 / 220352): the route export's availability, decided BEFORE anything renders
+    it (tasks/export_availability.yml gathers the stat; this judges it). rel = the resolved seed_launcher.params_rel;
+    st = the registered stat result of <checkout>/<rel> (follow false; skipped or {} when not stat-ed). A repository-relative
+    path is required for the stat to be confined to the checkout (an absolute or '..' path is never stat-ed); the loader's
+    own admission of params_rel (C1 contract_admission) is not restated or relaxed here.
+    Returns {state: undeclared | declared-unconfined | declared-missing | declared-not-regular | available, met, why}. -#}
+{%- macro export_availability(rel, st) -%}
+{%- set r = rel if (rel is string) else '' -%}
+{%- set s = (st.stat | default({})) if (st is mapping) else {} -%}
+{%- set k = 'controller.bootstrap.seed_launcher.params_rel' -%}
+{%- if r | length == 0 -%}{{ {'state': 'undeclared', 'met': false, 'why': k ~ ' undeclared in the resolved profile'} | to_json }}
+{%- elif r.startswith('/') or ('..' in r.split('/')) -%}{{ {'state': 'declared-unconfined', 'met': false,
+      'why': k ~ ' = ' ~ r ~ ' is not a repository-relative path (never stat-ed or rendered)'} | to_json }}
+{%- elif not (s.exists | default(false)) -%}{{ {'state': 'declared-missing', 'met': false,
+      'why': k ~ ' = ' ~ r ~ ' is declared but absent from this checkout (route defect; no guessed export, no default parameter list)'} | to_json }}
+{%- elif (s.islnk | default(false)) or not (s.isreg | default(false)) -%}{{ {'state': 'declared-not-regular', 'met': false,
+      'why': k ~ ' = ' ~ r ~ ' is not a regular file (link or other type; never followed or rendered)'} | to_json }}
+{%- else -%}{{ {'state': 'available', 'met': true, 'why': k ~ ' = ' ~ r ~ ' declared and present'} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- the rendered export is consumed only in its declared shape: a mapping whose keys are EXACTLY the resolved
+    seed_launch.mode_args modes, each value a list of non-empty strings (the mode's positional parameter names, in order).
+    Returns {met, why}; anything else is shape-invalid (a route defect; nothing is defaulted or repaired). -#}
+{%- macro export_shape(params, modes) -%}
+{%- set ns = namespace(bad = []) -%}
+{%- if params is not mapping -%}{%- set ns.bad = ['not a mapping'] -%}
+{%- else -%}
+{%- set pk = params | list | sort -%}
+{%- set mk = modes | list | sort -%}
+{%- if pk != mk -%}{%- set ns.bad = ns.bad + ['modes ' ~ (pk | to_json) ~ ' != seed_launch.mode_args modes ' ~ (mk | to_json)] -%}{%- endif -%}
+{%- for m in pk -%}
+{%- set v = params[m] -%}
+{%- if v is string or v is mapping or v is not iterable -%}{%- set ns.bad = ns.bad + [m ~ ': not a list'] -%}
+{%- elif (v | reject('string') | list | length > 0) or (v | select('string') | reject('match', '.') | list | length > 0) -%}{%- set ns.bad = ns.bad + [m ~ ': an entry is not a non-empty string'] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{ {'met': ns.bad | length == 0, 'why': ('shape-invalid: ' ~ (ns.bad | join('; '))) if ns.bad else 'shape as declared'} | to_json }}
+{%- endmacro -%}
+
 {#- variant:<id> dependency (tasks/prepare.yml): met only when a route that declaration may ACTUALLY take is available
-    (tasks/variant_admit.yml). The override (SEED-06 projection) never carries a profile_bytes_differ declaration, so that
-    one needs the MAIN-staged copy (copy_ids = keys of rhc_variants). decl = rhc_decl.declarations[id].
+    (tasks/variant_admit.yml). The override (SEED-06 projection) never carries a profile_bytes_differ declaration; such a
+    declaration is reachable ONLY by a variant_checkout: clone control (Route 3, which requires variant_clone_fixture, not
+    variant:<id>). ROUTE 2 RETIRED (codex 220352 / 212700): copy_ids (keys of a supplied rhc_variants) NEVER meet the
+    dependency; a supplied copy is only named in `why` as refused. decl = rhc_decl.declarations[id].
     Returns {kind: variant, met, why}. (codex-rev8-route-B-G-source-audits-20260924-163642: selftested bytes-only rule) -#}
 {%- macro variant_dep(id, decl, seed06_met, copy_ids) -%}
 {%- set bytes = decl.profile_bytes_differ | default(false) | bool -%}
 {{- {'kind': 'variant',
-     'met': ((seed06_met | bool) and not bytes) or (id in copy_ids),
+     'met': (seed06_met | bool) and not bytes,
      'why': 'declaration variant ' ~ id ~ ' needs '
-            ~ ('rhc_variants.' ~ id ~ ' (profile_bytes_differ: the override cannot carry it) or a variant_checkout: clone control'
-               if bytes else 'the SEED-06 projection or rhc_variants.' ~ id)} | to_json -}}
+            ~ ('a variant_checkout: clone control (profile_bytes_differ: the override cannot carry it)'
+               if bytes else 'the SEED-06 projection or a variant_checkout: clone control')
+            ~ (('; rhc_variants.' ~ id ~ ' supplied but REFUSED: Route 2 (MAIN-staged copy) is retired') if id in copy_ids else '')} | to_json -}}
 {%- endmacro -%}
 
 {#- ------------------------------------------------------------ case binding ------------------------------ -#}

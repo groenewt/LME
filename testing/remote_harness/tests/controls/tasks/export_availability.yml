@@ -1,0 +1,86 @@
+---
+# G-EXPORT-AVAILABILITY-ORDER (codex 220515 / 220352; owner G; the same file as m1-1g). The route's launch-parameter
+# export (controller.bootstrap.seed_launcher.params_rel) is ADMITTED before anything renders it, in this order:
+#   1. declared?  (the resolved profile; resolve_policy.yml already ran the loader's admission -- untouched here)
+#   2. confined?  (repository-relative, no '..': otherwise it is never stat-ed)
+#   3. present as a regular file? (stat, follow false; a link or another type is never followed or rendered)
+#   -> controls.j2 export_availability decides the state; ONLY `available` is rendered (template lookup under the
+#   resolved bootstrap), and ONLY a rendering whose shape is exactly {<every seed_launch.mode_args mode>: [<name>, ...]}
+#   (controls.j2 export_shape) is consumed as ctx.launch_params.
+# Anything else leaves rhc_export.params null and rhc_export.met false: prepare.yml then QUEUES every launcher-consuming
+# control on route_launch_params_export with rhc_export.why (controls.j2 plan_status / launcher_consumers) while every other
+# control keeps running. No guessed export and no default parameter list. A render or parse failure of a present export
+# is a ROUTE / LOADER defect: it is reported SEPARATELY (rhc_export.render_error; summary.yml RHC-EXPORT-RENDER), never
+# folded into a control verdict and never a PASS. Included by selftest.yml (first) and prepare.yml; evaluated once.
+
+- name: Admit and render the route launch-parameter export (once; availability before render)
+  when: rhc_export is not defined
+  block:
+    - name: The declared export path of the resolved profile
+      ansible.builtin.set_fact:
+        _rhc_ex_rel: "{{ rh.controller.bootstrap.seed_launcher.params_rel | default('') }}"
+        _rhc_ex_out: null
+        _rhc_ex_err: ''
+
+    - name: Stat the declared export (confined to the checkout, never followed)
+      ansible.builtin.stat:
+        path: "{{ rh_repo_root }}/{{ _rhc_ex_rel }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: _rhc_ex_st
+      when: >-
+        _rhc_ex_rel is string and _rhc_ex_rel | length > 0 and not _rhc_ex_rel.startswith('/')
+        and '..' not in _rhc_ex_rel.split('/')
+
+    - name: The export's availability, decided BEFORE any render
+      ansible.builtin.set_fact:
+        _rhc_ex_av: >-
+          {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'export_availability',
+               'args': [_rhc_ex_rel, (_rhc_ex_st if (_rhc_ex_st.stat is defined) else {})]}}) | from_json }}
+
+    - name: Render the AVAILABLE export under the resolved bootstrap (a failure is reported separately, never defaulted)
+      when: _rhc_ex_av.met | bool
+      block:
+        - name: Render and parse the export
+          ansible.builtin.set_fact:
+            _rhc_ex_out: >-
+              {{ lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ _rhc_ex_rel,
+                        template_vars={'lme_seed_bs': rh.controller.bootstrap}) | from_json }}
+      rescue:
+        - name: Keep the render failure as route / loader evidence (RHC-EXPORT-RENDER)
+          ansible.builtin.set_fact:
+            _rhc_ex_out: null
+            _rhc_ex_err: "{{ (ansible_failed_result.msg | default('render failed') | string)[:600] }}"
+
+    - name: Judge the rendered shape against the resolved seed_launch.mode_args modes
+      ansible.builtin.set_fact:
+        _rhc_ex_shape: >-
+          {{ (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'export_shape',
+               'args': [_rhc_ex_out, rh.controller.bootstrap.seed_launch.mode_args | default({}) | list]}}) | from_json)
+             if ((_rhc_ex_av.met | bool) and (_rhc_ex_err | length == 0)) else {'met': false, 'why': ''} }}
+
+    - name: Bind rhc_export (state, evidence, the consumed parameters or null)
+      vars:
+        _state: >-
+          {{ _rhc_ex_av.state if not (_rhc_ex_av.met | bool)
+             else ('render-failed' if (_rhc_ex_err | length > 0) else ('available' if (_rhc_ex_shape.met | bool) else 'shape-invalid')) }}
+      ansible.builtin.set_fact:
+        rhc_export:
+          state: "{{ _state }}"
+          met: "{{ _state == 'available' }}"
+          rel: "{{ _rhc_ex_rel }}"
+          sha256: "{{ (_rhc_ex_st.stat | default({})).checksum | default('') }}"
+          render_error: "{{ _rhc_ex_err }}"
+          why: >-
+            {{ _rhc_ex_av.why if not (_rhc_ex_av.met | bool)
+               else (('controller.bootstrap.seed_launcher.params_rel = ' ~ _rhc_ex_rel ~ ' failed to render (route / loader defect,'
+                      ~ ' reported separately as RHC-EXPORT-RENDER)') if (_rhc_ex_err | length > 0)
+                     else (_rhc_ex_av.why if (_rhc_ex_shape.met | bool)
+                           else ('controller.bootstrap.seed_launcher.params_rel = ' ~ _rhc_ex_rel ~ ' rendered ' ~ _rhc_ex_shape.why))) }}
+          params: "{{ _rhc_ex_out if _state == 'available' else none }}"
+
+- name: A present export that failed to render is reported separately (RHC-EXPORT-RENDER; route / loader evidence, not a control verdict)
+  ansible.builtin.debug:
+    msg: "RHC-EXPORT-RENDER {{ rhc_export.rel }} ({{ rhc_export.sha256 }}): {{ rhc_export.render_error }}"
+  when: rhc_export.state == 'render-failed'
