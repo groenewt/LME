@@ -7,20 +7,52 @@
 # package imported from the declared directory, NO ansible config file discovered, and no ANSIBLE_* variable
 # outside env_allow. No search, no fallback. Nothing is written before this passes. Non-root only.
 # Requires refuse_pinned_outputs.yml and resolve_policy.yml earlier in the play (localhost, connection local).
+#
+# INTERPRETER BINDING (RH-BUILDER-UNSUPPORTED; e0c0aa51 genesis acquire refusal): the module interpreter is BOUND to the
+# declared builder.python, never discovered. Without a binding, 2.19 interpreter discovery runs at the first module
+# (setup below) and picks the first INTERPRETER_PYTHON_FALLBACK hit (/usr/bin/python3.13), not the declared
+# /usr/bin/python3. Everything before this point in both genesis plays (refuse_pinned_outputs, admit_controller,
+# resolve_policy incl. the engine resolve role) is assert / set_fact / include_* / debug -- action plugins on the
+# controller, no module, no discovery. This file is the single point both genesis plays (acquire.yml, package.yml)
+# include before their first module, and set_fact is host-persistent, so the binding covers every later module of the
+# play. A pre-supplied binding (inventory, extra-var) is admitted only when EQUAL to the declared one (an extra-var
+# would outrank set_fact; an inventory value would be silently masked by it): it refuses here, still before any
+# module. Under genesis the set_fact also outranks the task-var pins of reap_staging.yml / decide_private_group.yml
+# (ansible_playbook_python): equal values, since the builder assert below requires ansible_playbook_python ==
+# builder.python. set_fact does not outlive this process.
+
+- name: Refuse a pre-supplied module interpreter other than the declared builder python (before any module)
+  ansible.builtin.assert:
+    that:
+      - (ansible_python_interpreter | default(rh.controller.bootstrap.genesis.builder.python)) == rh.controller.bootstrap.genesis.builder.python
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: the genesis module interpreter is bound by the harness
+      to the declared builder python {{ rh.controller.bootstrap.genesis.builder.python }}; a pre-supplied
+      ansible_python_interpreter (inventory or extra-var) must be absent or equal to it (got
+      '{{ ansible_python_interpreter | default('unset') }}'). Nothing was staged.
+    quiet: true
+
+- name: Bind the module interpreter to the declared builder python (derived after the resolve; before the first module)
+  ansible.builtin.set_fact:
+    ansible_python_interpreter: "{{ rh.controller.bootstrap.genesis.builder.python }}"
 
 - name: Refuse a privileged builder and read the builder's environment and interpreter facts (no writes)
   ansible.builtin.setup:
     gather_subset: ['!all', '!min', 'env', 'python', 'user']
 
+# results[0] the executable (not followed), results[1] the declared python path itself (not followed: a Debian
+# /usr/bin/python3 is a symlink -> lnk_source, and stat gives NO checksum for a link), results[2] the same path
+# followed (the regular file it resolves to: the measured python_sha256).
 - name: Read the declared builder executable and interpreter (no writes)
   ansible.builtin.stat:
-    path: "{{ item }}"
-    follow: false
+    path: "{{ item.path }}"
+    follow: "{{ item.follow }}"
     get_checksum: true
     checksum_algorithm: sha256
   loop:
-    - "{{ rh.controller.bootstrap.genesis.builder.executable }}"
-    - "{{ rh.controller.bootstrap.genesis.builder.python }}"
+    - {path: "{{ rh.controller.bootstrap.genesis.builder.executable }}", follow: false}
+    - {path: "{{ rh.controller.bootstrap.genesis.builder.python }}", follow: false}
+    - {path: "{{ rh.controller.bootstrap.genesis.builder.python }}", follow: true}
   register: _rh_bld_stat
 
 - name: Read the builder executable's first line (its interpreter binding)
@@ -48,9 +80,16 @@
       - ansible_facts.user_uid | int != 0
       - _rh_bld_stat.results[0].stat.exists and _rh_bld_stat.results[0].stat.isreg and _rh_bld_stat.results[0].stat.executable
       - _rh_bld_stat.results[1].stat.exists and _rh_bld_stat.results[1].stat.executable
+      - _rh_bld_stat.results[2].stat.exists and _rh_bld_stat.results[2].stat.isreg and _rh_bld_stat.results[2].stat.checksum is defined
       - (_rh_bld_head.content | b64decode).splitlines()[0] == rh.controller.bootstrap.genesis.builder.shebang
       - ansible_playbook_python == rh.controller.bootstrap.genesis.builder.python
       - ansible_version.full == rh.controller.bootstrap.genesis.builder.core
+      # the binding held (an extra-var would outrank the set_fact; refused before setup, re-checked here) and no module
+      # ran interpreter discovery (2.19 records it as ansible_facts.discovered_interpreter_python)
+      - ansible_python_interpreter == rh.controller.bootstrap.genesis.builder.python
+      - "'discovered_interpreter_python' not in ansible_facts"
+      # STRICT path equality, no realpath: the module runs as '<bound path> AnsiballZ_*.py' and CPython reports argv0
+      # unresolved as sys.executable (the same property ansible_playbook_python == builder.python relies on)
       - ansible_facts.python.executable == rh.controller.bootstrap.genesis.builder.python
       - (ansible_facts.python.version.major ~ '.' ~ ansible_facts.python.version.minor) == rh.controller.bootstrap.genesis.builder.python_major_minor
       - _rh_bld_pkg.rc == 0 and _rh_bld_pkg.stdout == rh.controller.bootstrap.genesis.builder.ansible_package_dir
@@ -67,15 +106,23 @@
       file (found: {{ ansible_config_file | default('none') }}) and no ANSIBLE_* variables besides
       {{ rh.controller.bootstrap.genesis.builder.env_allow }} (found:
       {{ ansible_facts.env | dict2items | map(attribute='key') | select('match', '^ANSIBLE_') | list }}).
-      Running: core {{ ansible_version.full }} on {{ ansible_playbook_python }}. A missing builder is installed by
+      Observed: core {{ ansible_version.full }}; controller python (ansible_playbook_python) {{ ansible_playbook_python }};
+      bound module interpreter {{ ansible_python_interpreter | default('unset') }}; module python (ansible_facts.python.executable)
+      {{ ansible_facts.python.executable | default('?') }} {{ ansible_facts.python.version.major | default('?') }}.{{ ansible_facts.python.version.minor | default('?') }};
+      discovered {{ ansible_facts.discovered_interpreter_python | default('none') }}; declared python resolves to
+      {{ (_rh_bld_stat.results[1].stat.lnk_source | default(rh.controller.bootstrap.genesis.builder.python)) if (_rh_bld_stat.results[1].stat.islnk | default(false)) else rh.controller.bootstrap.genesis.builder.python }}
+      (regular {{ _rh_bld_stat.results[2].stat.isreg | default('?') }}); ansible package
+      {{ _rh_bld_pkg.stdout | default('?') }} (rc {{ _rh_bld_pkg.rc | default('?') }}). A missing builder is installed by
       MAIN (root step) from packages {{ rh.controller.bootstrap.genesis.builder.packages }}; nothing else is searched.
     quiet: true
 
 # GENESIS contract reconciliation (codex 143844 bootstrap note; authority genesis.decision.ref, execution binding
-# genesis.builder). ENFORCED above: executable path + regular/executable + exact first line, python path (as run AND
-# as reported) + major.minor, core, ansible package dir, no config file, ANSIBLE_* confined to env_allow, non-root.
-# RECORDED below, NOT enforced: executable_sha256 and python_sha256 are MEASUREMENTS of the files at those paths
-# (stat sha256) written into bundle.json for later audit; no declared digest exists to compare them with, so they do
+# genesis.builder). ENFORCED above: executable path + regular/executable + exact first line, python path (as run, as
+# BOUND module interpreter with no discovery, AND as reported) + major.minor, core, ansible package dir, no config
+# file, ANSIBLE_* confined to env_allow, non-root.
+# RECORDED below, NOT enforced: executable_sha256 and python_sha256 are MEASUREMENTS (stat sha256) of the executable
+# and of the regular file the declared python path resolves to (python_resolved), written into bundle.json for later
+# audit; no declared digest exists to compare them with, so they do
 # not establish tool identity beyond the enforced facts. identity_basis says so in the record itself.
 - name: Record the admitted builder identity (derived output)
   ansible.builtin.set_fact:
@@ -84,7 +131,9 @@
       executable: "{{ rh.controller.bootstrap.genesis.builder.executable }}"
       executable_sha256: "{{ _rh_bld_stat.results[0].stat.checksum }}"
       python: "{{ ansible_playbook_python }}"
-      python_sha256: "{{ _rh_bld_stat.results[1].stat.checksum }}"
+      # the regular file the declared python path resolves to (the path itself may be a link: stat checksums no link)
+      python_resolved: "{{ _rh_bld_stat.results[1].stat.lnk_source if _rh_bld_stat.results[1].stat.islnk else rh.controller.bootstrap.genesis.builder.python }}"
+      python_sha256: "{{ _rh_bld_stat.results[2].stat.checksum }}"
       python_version: "{{ ansible_facts.python.version.major }}.{{ ansible_facts.python.version.minor }}.{{ ansible_facts.python.version.micro }}"
       ansible_core: "{{ ansible_version.full }}"
       ansible_package_dir: "{{ _rh_bld_pkg.stdout }}"
