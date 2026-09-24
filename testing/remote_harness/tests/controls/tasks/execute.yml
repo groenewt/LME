@@ -29,7 +29,22 @@
   register: _rhc_id
   changed_when: false
 
-- name: Stat the work root and each ancestor below $HOME (no link, owned, not group/other-writable)
+# The ancestry rule is the route's ONE resolved rule (path_admission.ancestry incl. owner_private_group; codex 143342),
+# included here at the use boundary -- before the first write under rhc_work_root -- instead of a private copy: every
+# existing component from / down is a real directory owned by 0 or this uid, never other-writable, and group-writable
+# only as an owner-private group the generated program admits. On a controller whose nsswitch lists sources other than
+# files/systemd (e.g. sss, winbind) a group-writable component refuses BY DESIGN (the run location is codex's decision).
+- name: Admit the work root's ancestry by the ONE resolved rule (tasks/admit_ancestry.yml; RHC-WORK-ROOT)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ rhc_work_root }}"
+    rh_anc_refusal: RHC-WORK-ROOT
+
+# What the shared rule does NOT say, kept here (not a duplicate): the work root and every ancestor below $HOME EXIST and
+# are owned by THIS uid (the shared rule admits uid 0 and only judges existing components).
+- name: Stat the work root and each ancestor below $HOME (existence and runner ownership)
   ansible.builtin.stat:
     path: "{{ item }}"
     follow: false
@@ -37,17 +52,13 @@
   loop: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'ancestry', 'args': [rhc_work_root, lookup('ansible.builtin.env', 'HOME')]}}) | from_json }}"
   register: _rhc_work_stat
 
-- name: Refuse an unsafe work root or ancestry
+- name: Refuse a missing work root or an ancestor below $HOME not owned by the runner
   ansible.builtin.assert:
     that:
       - _rhc_work_stat.results | length > 0
       - _rhc_work_stat.results | map(attribute='stat.exists') | reject | list | length == 0
-      - _rhc_work_stat.results | map(attribute='stat.islnk') | select | list | length == 0
-      - _rhc_work_stat.results | map(attribute='stat.isdir') | reject | list | length == 0
       - _rhc_work_stat.results | map(attribute='stat.uid') | map('string') | reject('in', [_rhc_id.stdout]) | list | length == 0
-      - _rhc_work_stat.results | map(attribute='stat.wgrp') | select | list | length == 0
-      - _rhc_work_stat.results | map(attribute='stat.woth') | select | list | length == 0
-    fail_msg: "REFUSED RHC-WORK-ROOT: {{ rhc_work_root }} and every ancestor below $HOME must be real directories owned by uid {{ _rhc_id.stdout }}, not group/other-writable"
+    fail_msg: "REFUSED RHC-WORK-ROOT: {{ rhc_work_root }} and every ancestor below $HOME must exist and be owned by uid {{ _rhc_id.stdout }} (link / type / group / other rules: tasks/admit_ancestry.yml above)"
     quiet: true
 
 - name: Bind the candidate head and the bytes this run executes against (evidence)
@@ -105,7 +116,7 @@
 - name: Write the run marker
   ansible.builtin.copy:
     dest: "{{ rhc_run_dir }}/{{ rhc_decl.state.run_marker }}"
-    content: "{{ {'release': rhc_release, 'head': _rhc_head.stdout, 'bound': rhc_evidence_bound} | to_nice_json }}\n"
+    content: "{{ {'release': rhc_release, 'head': _rhc_head.stdout, 'bound': rhc_evidence_bound, 'admitted_private_groups': rh_anc_admitted_private_groups} | to_nice_json }}\n"
     mode: '0600'
 
 - name: Read the free bytes of the work root filesystem
