@@ -37,13 +37,16 @@ harness:
   flock: /usr/bin/flock                            # hold_lock runs (D09c): the runner holds the target's state lock
   work_root_rule: >-
     default <checkout>/<work_roots.root_rel>/<sub_roots.run>/<runners.transfer_controls> from the RESOLVED policy
-    (resolve_work_root.yml; -e work_root overrides); admitted by path_admission (regex, forbidden segments, ancestry:
-    no link, not group/other-writable, owned by uid 0 or the runner) and work_roots.admission.refused_prefixes;
+    (resolve_work_root.yml; -e work_root overrides); admitted by path_admission (regex, forbidden segments; ancestry
+    through the route's ONE rule testing/remote_harness/tasks/admit_ancestry.yml incl. owner_private_group) and
+    work_roots.admission.refused_prefixes;
     inside the checkout it must be git-ignored; SOURCE-REF's "inside the source" excludes <source>/<root_rel>/
     (CONTROLS-WORK-ROOT; free bytes, inodes and fs type are the run-local seed's admission, not this runner's)
   check_copy:                                     # paths copied for check cases (repository-relative)
     - testing/e2e/deploy_gate.sh
     - testing/e2e/transfer
+    - testing/remote_harness/tasks/admit_ancestry.yml
+    - testing/remote_harness/tasks/decide_private_group.yml
     - testing/remote_harness/tasks/refuse_pinned_outputs.yml
     - testing/remote_harness/tasks/resolve_policy.yml
     - testing/remote_harness/tasks/resolve_harness.yml
@@ -530,6 +533,47 @@ cases:
       file_lacks: [{path: '@cd@/state/operations.log', text: 'abandon 20260101T000000Z-eeeeeeeeeeee'},
                    {path: '@cd@/state/operations.log', text: 'abandon 20260101T000000Z-cccccccccccc'}]
 
+  # B-CROSS-ROOT-RECOVERY residual (codex 150646): shared-ledger PRESERVATION under concurrent roots.
+  # L05: two controller roots (distinct writer tokens, own labels and remote dirs) run the whole pipeline AT THE
+  # SAME TIME against ONE controller state dir; both roots' `start` and `complete` rows must survive (4 rows, one start
+  # per token). Honest limit: a lost-update race is timing-dependent, so L05 alone would rarely fail on the old
+  # unlocked lineinfile; L06 is the deterministic discriminator.
+  - id: L05-two-roots-concurrent-ledger-rows-preserved
+    kind: phase
+    neighbour: L04-two-roots-sharing-state-uncertain-writers-preserved
+    phase:
+      concurrent: true
+      runs:
+        - {ctl_root: ctlroot, label: ctl-a, remote_dir: '@cd@/tgt/srv/lme', rc: 0}
+        - {ctl_root: ctlroot-b, label: ctl-b, remote_dir: '@cd@/tgt/srv/lme-b', rc: 0}
+    expect:
+      rc: 0
+      present: ['@cd@/tgt/srv/lme/install.sh', '@cd@/tgt/srv/lme-b/install.sh']
+      line_count: [{path: '@cd@/state/operations.log', regex: '^start [0-9TZ-]+ [0-9a-f]{64}$', n: 2},
+                   {path: '@cd@/state/operations.log', regex: '^start [0-9TZ-]+ @token@$', n: 1},
+                   {path: '@cd@/state/operations.log', regex: '^complete ', n: 2},
+                   {path: '@cd@/state/operations.log', regex: '.', n: 4}]
+      dir_empty: ['@cd@/state/pending']
+      modes: [{path: '@cd@/state/operations.log', mode: '0600'}, {path: '@cd@/state/.ledger.lock', mode: '0600'}]
+
+  # L06 (deterministic): another root holds the shared ledger lock for the whole run. The ledger writer must wait
+  # (ledger_wait_s, narrowed to 1s here) and then refuse with nothing written -- the old unlocked lineinfile would
+  # have appended its `start` regardless. No artifact is created before the start row exists.
+  - id: L06-shared-ledger-lock-held-by-another-root
+    kind: phase
+    neighbour: L05-two-roots-concurrent-ledger-rows-preserved
+    setup:
+      - {file: '@cd@/state/.ledger.lock', content: '', mode: '0600'}
+    phase:
+      hold_lock: '@cd@/state/.ledger.lock'
+      runs: [{hold_lock: true}]
+      decl_overrides: {controller_state: {ledger_wait_s: 1}}
+    expect:
+      rc: fail
+      out: [TRANSFER-STATE-LEDGER-BUSY, 'rc=75']
+      absent: ['@cd@/state/operations.log', '@cd@/tgt/srv/lme/install.sh']
+      dir_empty: ['@cd@/state/pending']
+
   - id: L03-target-interruption-after-promote
     kind: phase
     neighbour: P01-first-place-preserves-unrelated
@@ -829,7 +873,7 @@ cases:
     phase:
       steps: {observe_controller_steps: [resolve_contract], observe_target_steps: [], stage_controller_steps: [], place_target_steps: []}
       k_vars: {lme_ssh_auth_mode: explicit_key, lme_privileged_key: '@cd@/id_priv', ansible_ssh_private_key_file: '@cd@/id_owner'}
-    expect: {rc: 0, out: ['KKEY=@cd@/id_priv|@cd@/id_priv KCLR=|| KEND'], out_absent: [id_owner, TRANSFER-CONTRACT]}
+    expect: {rc: 0, out: ['KKEY=@cd@/id_priv|@cd@/id_priv KCLR=||||||| KEND'], out_absent: [id_owner, TRANSFER-CONTRACT]}
 
   - id: K18-inherited-owner-key-cleared-when-mode-takes-none
     kind: phase
@@ -840,7 +884,66 @@ cases:
       steps: {observe_controller_steps: [resolve_contract], observe_target_steps: [], stage_controller_steps: [], place_target_steps: []}
       k_vars: {lme_ssh_auth_mode: tailnet_identity, ansible_ssh_private_key_file: '@cd@/id_owner'}
       auth_mode: tailnet_identity
-    expect: {rc: 0, out: ['KKEY=| KCLR=|| KEND'], out_absent: [id_owner, IdentityFile, TRANSFER-CONTRACT]}
+    expect: {rc: 0, out: ['KKEY=| KCLR=||||||| KEND'], out_absent: [id_owner, IdentityFile, TRANSFER-CONTRACT]}
+
+  # B-INHERITED-OWNER-KEY residual (codex 150646): the host inherits the owner profile's FILE key AND a 2.19 INLINE
+  # key (ansible_ssh_private_key; checked before private_key_file by the plugin). The consume-contract play runs ONE raw
+  # task through the real ssh connection plugin with the target plays' exact bindings; contract.ssh_client is a
+  # recording client (fixture: writes its argv, exits 0; nothing is contacted). Discriminating: with the inline key
+  # NOT cleared the plugin refuses before the client runs (SSH_AGENT none: 'Failed to add configured private key'),
+  # so ssh.argv is absent; cleared, the argv carries the plugin's own IdentityFile="<contract key>" (bind_key), never
+  # the owner key, and PasswordAuthentication=no (password selectors cleared). The key marker is never printed.
+  - id: K19-plugin-consumes-only-contract-key-inline-owner-key-cleared
+    kind: phase
+    neighbour: K17-inherited-owner-key-bound-to-privileged-key
+    setup:
+      - {file: '@cd@/id_priv', content: 'not a real key', mode: '0600'}
+      - {file: '@cd@/id_owner', content: 'not a real key (owner profile)', mode: '0600'}
+      - {file: '@cd@/rec-ssh', mode: '0755', content: "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done >> '@cd@/ssh.argv'\nexit 0"}
+    phase:
+      steps: {observe_controller_steps: [resolve_contract], observe_target_steps: [], stage_controller_steps: [], place_target_steps: []}
+      k_vars: {lme_ssh_auth_mode: explicit_key, lme_privileged_key: '@cd@/id_priv', ansible_ssh_private_key_file: '@cd@/id_owner',
+               ansible_ssh_private_key: 'OWNER-INLINE-KEY-MARKER', ansible_private_key_passphrase: 'OWNER-INLINE-PASS-MARKER'}
+      decl_overrides: {contract: {ssh_client: '@cd@/rec-ssh'}}
+      consume_probe: true
+    expect:
+      rc: 0
+      out: [KCONSUMED]
+      out_absent: [OWNER-INLINE-KEY-MARKER, OWNER-INLINE-PASS-MARKER, id_owner, 'Failed to add configured private key', TRANSFER-CONTRACT]
+      file_has: [{path: '@cd@/ssh.argv', text: 'IdentityFile="@cd@/id_priv"'},
+                 {path: '@cd@/ssh.argv', text: 'PasswordAuthentication=no'}]
+      file_lacks: [{path: '@cd@/ssh.argv', text: 'id_owner'}, {path: '@cd@/ssh.argv', text: 'MARKER'}]
+
+  - id: K20-plugin-consumes-no-key-when-mode-takes-none-inline-owner-key-cleared
+    kind: phase
+    neighbour: K18-inherited-owner-key-cleared-when-mode-takes-none
+    setup:
+      - {file: '@cd@/id_owner', content: 'not a real key (owner profile)', mode: '0600'}
+      - {file: '@cd@/rec-ssh', mode: '0755', content: "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done >> '@cd@/ssh.argv'\nexit 0"}
+    phase:
+      steps: {observe_controller_steps: [resolve_contract], observe_target_steps: [], stage_controller_steps: [], place_target_steps: []}
+      k_vars: {lme_ssh_auth_mode: tailnet_identity, ansible_ssh_private_key_file: '@cd@/id_owner', ansible_private_key: 'OWNER-INLINE-KEY-MARKER'}
+      auth_mode: tailnet_identity
+      decl_overrides: {contract: {ssh_client: '@cd@/rec-ssh'}}
+      consume_probe: true
+    expect:
+      rc: 0
+      out: [KCONSUMED]
+      out_absent: [OWNER-INLINE-KEY-MARKER, id_owner, 'Failed to add configured private key', TRANSFER-CONTRACT]
+      file_has: [{path: '@cd@/ssh.argv', text: 'PubkeyAuthentication=no'}, {path: '@cd@/ssh.argv', text: 'PasswordAuthentication=no'}]
+      file_lacks: [{path: '@cd@/ssh.argv', text: 'IdentityFile'}, {path: '@cd@/ssh.argv', text: 'id_owner'}, {path: '@cd@/ssh.argv', text: 'MARKER'}]
+
+  # the third password alias (ansible_ssh_password outranks ansible_password / ansible_ssh_pass in 2.19) is refused
+  # on the contract host like the other two, and cleared on every target play.
+  - id: K21-ssh-password-alias-refused
+    kind: phase
+    neighbour: K05-refused-connection-var
+    setup:
+      - {file: '@cd@/id_priv', content: 'not a real key', mode: '0600'}
+    phase:
+      steps: {observe_controller_steps: [resolve_contract], observe_target_steps: [], stage_controller_steps: [], place_target_steps: []}
+      k_vars: {lme_ssh_auth_mode: explicit_key, lme_privileged_key: '@cd@/id_priv', ansible_ssh_password: 'OWNER-PASSWORD-MARKER'}
+    expect: {rc: fail, out: [TRANSFER-CONTRACT-UNSUPPORTED], out_absent: [KARGV, OWNER-PASSWORD-MARKER]}
 
   - id: K08-agent-mode-refused
     kind: phase

@@ -1,9 +1,10 @@
 ---
 # testing/e2e/transfer/tasks/admit_state_dir.yml -- the controller state directory (localhost, observe-only).
-# Admitted with the route's ONE path-admission rule (tr_bs.path_admission: regex, forbidden segments, ancestry:
-# no link, directories only, not group/other-writable, owned by uid 0 or the gate user). It must already exist,
-# owned by the gate user, mode 0700 (the operator creates it like the toolchain root; no default, never created here).
-# Inputs: tr, tr_bs, lme_transfer_state_dir, lme_transfer_label. Outputs: tr_state, tr_out (output file paths).
+# Admitted with the route's ONE path-admission rule (tr_bs.path_admission: regex, forbidden segments; ancestry via
+# the route's testing/remote_harness/tasks/admit_ancestry.yml). It must already exist, owned by the gate user, mode
+# 0700 (the operator creates it like the toolchain root; no default, never created here). The ledger writer
+# (controller_ledger.yml) re-admits the ancestry at the use boundary before each write.
+# Inputs: tr, tr_bs, rh_repo_root, lme_transfer_state_dir, lme_transfer_label. Outputs: tr_state, tr_out.
 
 - name: Admit the state directory path and the label (no default)
   ansible.builtin.assert:
@@ -23,28 +24,31 @@
   register: _tr_me
   changed_when: false
 
-- name: Stat the state directory and every ancestor (no link following)
+# The ancestry (links, directories, owners, other-writable, group-writable only under owner_private_group) is the
+# route's ONE rule, testing/remote_harness/tasks/admit_ancestry.yml (route revision 5; codex 143342). No local copy.
+- name: Admit the state directory's ancestry through the route's ONE rule
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+  vars:
+    rh_anc_bs: "{{ tr_bs }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ lme_transfer_state_dir }}"
+    rh_anc_refusal: TRANSFER-STATE-DIR
+
+- name: Stat the state directory itself (no link following)
   ansible.builtin.stat:
-    path: "{{ '/' ~ (lme_transfer_state_dir.split('/')[1:item] | join('/')) }}"
+    path: "{{ lme_transfer_state_dir }}"
     follow: false
     get_checksum: false
-  loop: "{{ range(1, (lme_transfer_state_dir.split('/') | length) + 1) | list }}"
-  register: _tr_sanc
+  register: _tr_sdir
 
-- name: Refuse linked, foreign-owned or group/other-writable ancestry, or a state dir not owned 0700 by the gate user
+- name: Refuse a state dir that is absent, or not a directory owned 0700 by the gate user (ancestry admitted above)
   ansible.builtin.assert:
     that:
-      - _tr_sanc.results | map(attribute='stat') | selectattr('exists') | list | length == _tr_sanc.results | length
-      - _tr_sanc.results | map(attribute='stat') | selectattr('islnk') | list | length == 0
-      - _tr_sanc.results | map(attribute='stat') | selectattr('isdir') | list | length == _tr_sanc.results | length
-      - _tr_sanc.results | map(attribute='stat') | selectattr('wgrp') | list | length == 0
-      - _tr_sanc.results | map(attribute='stat') | selectattr('woth') | list | length == 0
-      - (_tr_sanc.results | map(attribute='stat') | map(attribute='uid') | unique | reject('in', [0, _tr_me.stdout | int]) | list) == []
-      - _tr_sanc.results[-1].stat.uid == (_tr_me.stdout | int)
-      - _tr_sanc.results[-1].stat.mode == '0700'
+      - _tr_sdir.stat.exists and _tr_sdir.stat.isdir and not _tr_sdir.stat.islnk
+      - _tr_sdir.stat.uid == (_tr_me.stdout | int)
+      - _tr_sdir.stat.mode == '0700'
     fail_msg: >-
-      TRANSFER-STATE-DIR: {{ lme_transfer_state_dir }} or an ancestor is missing, a link, not a directory,
-      group/other-writable (sticky /tmp included), owned by another account, or the directory is not owned by uid
+      TRANSFER-STATE-DIR: {{ lme_transfer_state_dir }} is missing, a link, not a directory, or not owned by uid
       {{ _tr_me.stdout }} with mode 0700. Create it once: install -d -m 0700 <dir>.
     quiet: true
 

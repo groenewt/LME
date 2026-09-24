@@ -8,9 +8,10 @@
 # is recorded `abandon`. An unfinished op with ANOTHER token, or a legacy `start <op>` line without a token, is an
 # UNCERTAIN writer: its artifacts are preserved and it is never abandoned by this controller (it may be live under
 # another root). Nothing is found by globbing; a ledger line outside the declared grammar refuses.
-# Ledger appends use lineinfile (read-modify-write, no lock): a lost line under a concurrent writer can only hide a
-# `start` (its artifacts are then never removed) or re-surface THIS controller's own finished op as dead (its
-# recorded paths are already gone) -- never delete another writer's artifacts.
+# Ledger writes (codex 150646 residual): every controller-ledger line is appended through tasks/controller_ledger.yml
+# under the ONE shared lock <state_dir>/<controller_state.ledger_lock> with O_APPEND -- never a read-modify-write --
+# so a concurrent root's `start` / terminal rows are never lost. This file READS the ledger without the lock: a row
+# appended after the read is simply not seen by this run (its op is younger than this observation), never lost.
 # Inputs: tr, tr_state, tr_ctl_token. Outputs: tr_recovered {abandoned, uncertain} (effects: exact removals + ledger lines).
 
 - name: Admit this controller's writer token (the start-line grammar)
@@ -72,12 +73,14 @@
     state: absent
   loop: "{{ _tr_interrupted | product(['.tar.gz', '.d']) | list }}"
 
-- name: Record the abandonment (this controller's dead ops only)
-  ansible.builtin.lineinfile:
-    path: "{{ tr_state.ledger }}"
-    line: "{{ tr.controller_state.verbs.abandon }} {{ item }}"
-    insertafter: EOF
-  loop: "{{ _tr_interrupted }}"
+- name: Record the abandonment (this controller's dead ops only; shared ledger lock, append-only)
+  ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/controller_ledger.yml"
+  vars:
+    _cl_state: "{{ tr_state }}"
+    _cl_flock: "{{ tr_bs.os_tools.flock }}"
+    _cl_bs: "{{ tr_bs }}"
+    _cl_lines: "{{ _tr_interrupted | map('regex_replace', '^', tr.controller_state.verbs.abandon ~ ' ') | list }}"
+  when: _tr_interrupted | length > 0
 
 - name: Report the preserved uncertain writers (never removed here)
   ansible.builtin.debug:

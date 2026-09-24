@@ -174,19 +174,21 @@
     - name: Driver variables per run
       ansible.builtin.copy:
         content: >-
-          {{ {'transfer_dir': transfer_dir, 'drv_ctl_root': cd ~ '/ctlroot', 'drv_stand_in': C.harness.stand_in.host,
+          {{ {'transfer_dir': transfer_dir, 'drv_ctl_root': cd ~ '/' ~ (item.ctl_root | default('ctlroot')), 'drv_stand_in': C.harness.stand_in.host,
+              'drv_consume_probe': _ph.consume_probe | default(false),
               'drv_candidate_root': sr.path, 'drv_load_paths_out': cd ~ '/load_paths.json',              'drv_clone_dirs': [wr ~ '/src'] + ([cd ~ '/src'] if ((_ph.src | default('shared')) == 'clone') else []),
               'tr_repo_root': (wr ~ '/src') if (_ph.substitute | default(false) or (_ph.src | default('shared')) == 'shared') else (cd ~ '/src'),
               'lme_transfer_src': (cd ~ '/src') if ((_ph.src | default('shared')) == 'clone') else (wr ~ '/src'),
-              'lme_transfer_state_dir': cd ~ '/state', 'lme_transfer_label': _ph.label,
-              'lme_transfer_remote_dir': _ph.remote_dir, 'lme_transfer_target': _ph.target,
+              'lme_transfer_state_dir': cd ~ '/state', 'lme_transfer_label': item.label | default(_ph.label),
+              'lme_transfer_remote_dir': item.remote_dir | default(_ph.remote_dir), 'lme_transfer_target': _ph.target,
               'lme_transfer_ssh_key': _ph.ssh_key,
               'observe_controller_steps': _ph.observe_controller_steps, 'observe_target_steps': _ph.observe_target_steps,
               'stage_controller_steps': _ph.stage_controller_steps, 'place_target_steps': _ph.place_target_steps,
               'tamper': item.tamper | default(''), 'drv_tool_subst': _ph.tool_subst | default({}),
               'decl_overrides': {'contract': {'privilege': {'uid': me_uid | int}},
                                  'target': {'owner_uids': [0, me_uid | int],
-                                            'tools_used': T.target.tools_used + (_ph.tools_extra | default([]))}}} | to_nice_json }}
+                                            'tools_used': T.target.tools_used + (_ph.tools_extra | default([]))}}
+                                | combine(_ph.decl_overrides | default({}), recursive=true)} | to_nice_json }}
         dest: "{{ cd }}/vars.{{ idx }}.json"
         mode: '0644'
       loop: "{{ _ph.runs | default([{}]) }}"
@@ -213,6 +215,63 @@
       register: _rs
       changed_when: false
       failed_when: false
+      when: not (_ph.concurrent | default(false))
+
+    # concurrent: true -- every declared run is launched at once (two controller roots writing ONE shared state dir);
+    # the same argv as above, started asynchronously and then awaited. Each run's rc must match its declared rc.
+    - name: Run the driver concurrently (all declared runs started together)
+      ansible.builtin.command:
+        argv: >-
+          {{ ['/bin/sh', '-c', 'umask 022 && exec "$0" -i "$1" "$2" -e "@$3" 2>&1', C.harness.ansible_playbook,
+              cd ~ '/inventory.json', transfer_dir ~ '/phase_driver.yml', cd ~ '/vars.' ~ idx ~ '.json'] }}
+        chdir: "{{ sr.path }}"
+      environment:
+        ANSIBLE_NOCOLOR: '1'
+        ANSIBLE_RETRY_FILES_ENABLED: '0'
+        ANSIBLE_HOST_KEY_CHECKING: 'False'
+        LME_SSH_AUTH_MODE: "{{ _ph.auth_mode }}"
+      loop: "{{ _ph.runs | default([{}]) }}"
+      loop_control:
+        index_var: idx
+        label: "run {{ idx }} (concurrent)"
+      async: 1800
+      poll: 0
+      register: _rsa
+      changed_when: false
+      when: _ph.concurrent | default(false)
+
+    - name: Await the concurrent runs
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ _rsa.results | default([]) }}"
+      loop_control:
+        label: "{{ item.ansible_job_id | default('') }}"
+      register: _rsw
+      until: _rsw.finished
+      retries: 360
+      delay: 5
+      failed_when: false
+      when: _ph.concurrent | default(false)
+
+    - name: Concurrent runs -- each must end as declared; the verdict run carries the combined output
+      ansible.builtin.set_fact:
+        _rs: >-
+          {{ {'results': [{'rc': (_rsw.results | map(attribute='rc', default=-1) | map('int') | reject('equalto', 0) | list | first | default(0)),
+                           'stdout': _rsw.results | map(attribute='stdout', default='(run did not finish)') | join('\n'), 'item': {}}]} }}
+        _rs_each: "{{ _rsw.results | map(attribute='rc', default=-1) | map('int') | list }}"
+      when: _ph.concurrent | default(false)
+
+    - name: Concurrent runs -- a run whose rc differs from its declared rc fails the case
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['concurrent run ' ~ idx ~ ' rc ' ~ item.0 ~ ' != declared ' ~ item.1.rc] }}"
+      loop: "{{ (_rs_each | default([])) | zip(_ph.runs | default([])) | list }}"
+      loop_control:
+        index_var: idx
+        label: "run {{ idx }}"
+      when:
+        - _ph.concurrent | default(false)
+        - item.1.rc is defined
+        - (item.1.rc == 'fail') != ((item.0 | int) != 0)
 
     - name: Intermediate runs must end as declared
       ansible.builtin.set_fact:
