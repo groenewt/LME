@@ -285,26 +285,57 @@ cases:
         replace: '\1'
     expect: {rc: fail, out: ['transfer.yml:place-target: connection var ansible_ssh_private_key_file not bound to the contract']}
 
-  # B-INITIAL-CONTACT-CONSUMPTION (route revision 6, transfer.decl.yml initial_contact): an earlier play's admission is
-  # not carried over, so a target play without its own INITIAL CONTACT is refused ...
+  # B-INITIAL-CONTACT-CONSUMPTION + B-PRIVILEGED-LEG-VS-OWNER-ONLY-CONTACT (route revision 8, codex 155203;
+  # transfer.decl.yml initial_contact): an earlier play's admission is not carried over, so a root target play without
+  # its own PRIVILEGED INITIAL CONTACT is refused ...
   - id: C14-place-target-without-initial-contact
     kind: check
     neighbour: C00-check-neighbour
     mutate:
       - file: testing/e2e/transfer/transfer.yml
-        regexp: '^    - name: Pre-contact declaration check \+ the route''s INITIAL CONTACT \(raw only; first, before any module\)\n      ansible\.builtin\.include_tasks: [^\n]*\n'
+        regexp: '^    - name: The route''s PRIVILEGED INITIAL CONTACT \(raw only; first, before any module\)\n      ansible\.builtin\.include_tasks: [^\n]*\n'
         replace: ''
     expect: {rc: fail, out: ['transfer.yml:place-target: target play never includes testing/remote_harness/tasks/initial_contact.yml (INITIAL CONTACT)']}
 
-  # ... and so is a module staged on the target before it (here a stat ahead of the contact in the observe prelude).
+  # ... so is a module staged on the target before it (here a stat ahead of the contact in the observe prelude) ...
   - id: C15-module-before-initial-contact
     kind: check
     neighbour: C00-check-neighbour
     mutate:
       - file: testing/e2e/transfer/tasks/bind_target.yml
-        regexp: '^(- name: Pre-contact declaration check \+ the route''s INITIAL CONTACT)'
+        regexp: '^(- name: The route''s PRIVILEGED INITIAL CONTACT)'
         replace: "- name: early stat\n  ansible.builtin.stat: {path: /srv}\n\n\\1"
     expect: {rc: fail, out: ['bind_target.yml] early stat: module ansible.builtin.stat before INITIAL CONTACT']}
+
+  # ... so is the OWNER variant on a root play (owner trust: uid 0 is never the owner principal) ...
+  - id: C16-owner-contact-variant-on-root-play
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/transfer/tasks/target_contact.yml
+        regexp: '^    rh_ic_variant: privileged$'
+        replace: '    rh_ic_variant: owner'
+    expect: {rc: fail, out: ['target_contact.yml] PRIVILEGED INITIAL CONTACT (route author; raw only, nothing staged) before this play''s first module: INITIAL CONTACT variant owner on a root target play (declared privileged)']}
+
+  # ... so is an owner-only route file after the privileged contact (here the owner receipt verification) ...
+  - id: C17-owner-receipt-verification-on-root-play
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/transfer/tasks/target_observe.yml
+        regexp: '\Z'
+        replace: "\n- name: owner receipt on a root leg\n  ansible.builtin.include_tasks: \"{{ rh_repo_root }}/testing/remote_harness/tasks/verify_toolchain_receipt.yml\"\n"
+    expect: {rc: fail, out: ['owner receipt on a root leg: owner-only route include testing/remote_harness/tasks/verify_toolchain_receipt.yml after the PRIVILEGED contact']}
+
+  # ... and so is a root play that binds the module temp the contact owns (a play var would be a second authority).
+  - id: C18-root-play-binds-remote-tmp
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/transfer/transfer.yml
+        regexp: '^(- name: place-target\n(?:  [^\n]*\n)*?  vars:\n)'
+        replace: "\\1    ansible_remote_tmp: /var/tmp/x\n"
+    expect: {rc: fail, out: ['transfer.yml:place-target: root target play binds ansible_remote_tmp (the PRIVILEGED contact owns it)']}
 
   # ---------------- exclusions (the one macro) ----------------
   - id: X01-nested-exclusions
@@ -410,12 +441,14 @@ cases:
     expect: {rc: fail, out: [TRANSFER-TARGET-DEPENDENCY-DECL, lme-no-such-tool-t04], out_absent: [TRANSFER-TARGET-TOOL-IDENTITY],
              absent: ['@cd@/tgt/srv/lme'], dir_empty: ['@cd@/state/pending']}
 
+  # codex 155203: the root leg no longer verifies the owner receipt, so the owner root is the inventory DECLARATION
+  # (route inventory.root_var, lme_toolchain_root) read as a string only; an interpreter inside it is refused.
   - id: T05-owner-interpreter-on-privileged-tasks
     kind: phase
     neighbour: P01-first-place-preserves-unrelated
     phase:
       tgt_vars:
-        rh_toolchain: {root: '@cd@/tc', python: '@cd@/tc/gen/venv/bin/python'}
+        lme_toolchain_root: '@cd@/tc'
         ansible_python_interpreter: '@cd@/tc/gen/venv/bin/python'
     expect: {rc: fail, out: [TRANSFER-TARGET-INTERPRETER], absent: ['@cd@/tgt/srv/lme']}
 
@@ -1443,8 +1476,9 @@ cases:
 
   # Honest scope of PS09: it proves the SAME reuse key never admits a target whose resolved policy (which carries
   # its per-target tool identities and renders its expected seed) differs from the controller-resolved one. It does
-  # NOT exercise different artifact BYTES: that consumer is verify_toolchain_receipt.yml (route-owned, included by
-  # bind_target.yml after scope_admit.yml), declared as PS09r.
+  # NOT exercise different artifact BYTES. Since codex 155203 B's ROOT legs never read the owner toolchain (owner
+  # trust), so installed-seed bytes are the OWNER legs' concern (verify_toolchain_receipt.yml, route-owned); B keeps
+  # only its own tool identities (target_observe.yml), declared as PS09r.
   - id: PS09-same-artifact-key-other-policy-refused
     kind: scope
     neighbour: PS00-scope-neighbour
@@ -1583,13 +1617,11 @@ cases:
     kind: integration
     evidence_class: real
     run: >-
-      the PS01 flow twice: (1) the target's installed seed differs in bytes from the fresh render of its admitted
-      policy while shared_artifact_inputs_sha256 is unchanged (e.g. the lock-file content, which the key omits);
-      (2) an installed tool file (e.g. tar) differs in bytes from the identity its own scope's adapter declares
+      the PS01 flow with an installed tool file (e.g. tar) that differs in bytes from the identity its own scope's
+      adapter declares. (Installed-seed byte drift is no longer a B root-leg case: codex 155203, the root legs never
+      read or verify the owner toolchain; it belongs to the owner legs' verify_toolchain_receipt.yml.)
     expect: >-
-      (1) RH-TOOLCHAIN-RECEIPT in verify_toolchain_receipt.yml (seed_sha256 != the fresh render; artifact checksums);
-      (2) TRANSFER-TARGET-TOOL-IDENTITY in target_observe.yml; the reuse key admits nothing on its own; no target
-      mutation in either run
+      TRANSFER-TARGET-TOOL-IDENTITY in target_observe.yml; the reuse key admits nothing on its own; no target mutation
 
   - id: PS01-heterogeneous-target-admitted
     kind: integration
