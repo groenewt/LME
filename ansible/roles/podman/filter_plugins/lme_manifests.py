@@ -2475,6 +2475,22 @@ def _rh_validate(composed, declared, override, schema):
                 if len(path) == len(pat) and _rh_prefix(path, pat):
                     if not _rh_get(ov, '.'.join(path[:-1] + [sibling]))[0]:
                         raise ValueError('lme: lme_global_override.%s.%s changes an executable location without its %s; selecting an admitted executable elsewhere requires its declared identity in the same override' % (key, '.'.join(path), sibling))
+        # C1-EXPLICIT-IDENTITY-OVERRIDE (codex 022716): an override that touches an executable identity must carry
+        # the COMPLETE identity itself ({kind, <value_field>} of a declared kind). A partial one ({} or only kind)
+        # would inherit the declared digest through the recursive merge and pass the merged-identity check below.
+        ei0 = schema['executable_identity']
+        fo, ov_entries = _rh_get(ov, ei0['entries'])
+        if fo and isinstance(ov_entries, dict):
+            for tool in sorted(ov_entries):
+                if not isinstance(ov_entries[tool], dict) or ei0['field'] not in ov_entries[tool]:
+                    continue
+                oid = ov_entries[tool][ei0['field']]
+                okind = oid.get('kind') if isinstance(oid, dict) else None
+                ospec = ei0['kinds'].get(okind) if isinstance(okind, str) else None
+                oval = oid.get(ospec['value_field']) if ospec else None
+                if ospec is None or set(oid) != {'kind', ospec['value_field']} or not isinstance(oval, str) \
+                        or not re.match(ospec['value_pattern'], oval):
+                    raise ValueError('lme: lme_global_override.%s.%s.%s.%s must be a COMPLETE identity {kind: <one of %s>, <value>} in the override itself; got %r (a partial identity would inherit the declared digest)' % (key, ei0['entries'], tool, ei0['field'], sorted(ei0['kinds']), oid))
     # -- composed-policy checks (declaration AND override) --
     for pattern in schema['path_leaves']:
         for path, v in _rh_expand(pol, pattern):
