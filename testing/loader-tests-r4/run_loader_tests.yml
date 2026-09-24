@@ -1,0 +1,472 @@
+---
+# run_loader_tests.yml -- Ansible RUNNER for the resolved-config loader tests (C1-owned instrument).
+# Reads a DECLARED cases file (data), renders each probe from macros/probe.j2 (Jinja macro), runs
+# the REAL loader in an isolated, sha256-verified copy under a scrubbed env with the DECLARED probe
+# ansible-playbook binary, and judges each outcome fail-closed (return code + failed task + cause).
+# No hand-authored Python, no shell pipelines, no script-body scalars.
+#
+# v6.2 instrument revision (codex-1812 C1-DRIVER-EVIDENCE-AND-REPRESENTATION + C1-NEUTRALITY-SELF-
+# COMPARISON): every input is EXPLICIT (no private defaults); the toolchain is MEASURED from the exact
+# probe binary (`<probe> --version`), not from a fixed /usr/bin path; every instrument file actually
+# used is hashed at run time (never a hardcoded digest); the manifests tree digest is computed with
+# the find module; each run lands in its own source+version-bound directory (prior runs preserved).
+# The pre-v6.2 instrument bytes are preserved under instrument-history/.
+#
+# r4 instrument revision (codex-213359 C1 loader-harness r3 review; this copy is loader-tests-r4, r3 is retained
+# unchanged with its 19/20/21-entry indexes):
+#   R3-CASE-SENSITIVE-KEYS  macros/diff.j2 compares keys case-sensitively; non-string keys fail closed (+controls)
+#   R3-MANAGED-IDENTITY     managed_only binds every executable to a pinned, instrument-ACCEPTED bootstrap receipt
+#   R3-COPIED-MANIFEST-BYTES one_case.yml binds each copied tree to the run-level manifests_tree before overlay and
+#                           binds/records the post-overlay bytes (only declared overlay targets may change)
+#   R3-OVERLAY-ALIASES      overlay paths must be canonical relative paths; targets realpath-contained
+# r2 instrument revision (codex-1931 harness_repairs_remaining; STATUS: UNEXECUTED -- authored only):
+#   C1-AGGREGATE-MANIFEST-DIGEST  the manifests-tree digest hashes the ACTUAL "<relpath>\t<sha256>\n"
+#                                 member lines, code-point sorted (macros/manifest_digest.j2, scheme
+#                                 path-tab-sha256-v1, the G-1933 recipe); the
+#                                 individual member hashes stay in results.yml (manifests_tree).
+#   C1-PRIVATE-PROBE-DEFAULTS     fixture_config.yml (probe_fixture) is loaded, shape-asserted, hashed as
+#                                 an instrument and passed to macros/probe.j2.
+#   C1-CAUSE-TYPE / REV-SIGNER-ADMISSION extension: see one_case.yml.
+#
+# r3 instrument revision (codex-1954; STATUS: AUTHORED ONLY -- no execution until route v2 is reviewed):
+#   RH-ACTUAL-EXECUTABLE-SELECTION  the DECLARED controller executables are propagated (the runner's
+#       own core, the probe binary, the probe core, the probe interpreter path + version); the runner
+#       MEASURES itself and the probe binary and REFUSES a mismatch; every NESTED probe self-reports the
+#       core + interpreter it actually ran under (macros/probe.j2) and one_case.yml refuses a mismatch.
+#       The probe binary and interpreter are hashed into the consumed-input manifest.
+#   RH-REPRODUCTION-VERSUS-INTEGRATION  run_mode is declared: `reproduction` (re-execute a published
+#       source_commit; baseline_commit must be omitted) or `integration` (source_commit on top of a
+#       declared baseline_commit, which must be a strict ancestor). HEAD must equal source_commit and
+#       the tree must be CLEAN in both modes, so results bind to the EXECUTED checkpoint. A complete
+#       consumed-input manifest (consumed-inputs.yml) is written and its sha256 bound into results.yml.
+#
+# Invoke (ALL REQUIRED; absent => the run refuses):
+#   <runner ansible-playbook> run_loader_tests.yml \
+#     -e repo_root=<clone root> -e cases_file=<cases yml in this dir> \
+#     -e probe_ansible_playbook=<abs path of the ansible-playbook the probes run under> \
+#     -e run_label=<short label> \
+#     -e expected_runner_ansible_core=<x.y.z> -e expected_probe_ansible_core=<x.y.z> \
+#     -e expected_probe_python_executable=<abs> -e expected_probe_python_version=<x.y.z> \
+#     -e run_mode=reproduction|integration -e source_commit=<40-hex> [-e baseline_commit=<40-hex>] \
+#     -e managed_interpreter_root=<abs> [-e interpreter_policy=managed_only|unmanaged_diagnostic]
+#
+#   codex-2017 (OPERATOR DIRECT: uv-managed interpreters; system Python is NOT a test-leg fallback):
+#       interpreter_policy defaults to NOTHING (required). managed_only: the RESOLVED (symlink-followed)
+#       probe interpreter AND the runner interpreter must lie under managed_interpreter_root (e.g. the uv
+#       python install dir); anything else refuses. unmanaged_diagnostic: allowed only to reproduce a
+#       historical run; results.yml records qualifies_leg: false and it can never qualify a leg.
+- name: LME resolved-config loader tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  # C1_runner_location (codex 143342) ATTRIBUTED CHANGE vs the loader-tests-r4 instrument (sha256 3987d133...): the
+  # work root no longer defaults to "{{ playbook_dir }}/runs". It defaults to the DECLARED work root, read from THIS
+  # checkout's profile (the checkout that holds this runner, testing/loader-tests-r4 -> two levels up; NOT repo_root,
+  # which is the clone under test): <checkout>/<root_rel>/<sub_roots.run>/<runners.loader_cases>, from
+  # manifests/profiles/remote-harness.yml controller.bootstrap.work_roots (same shape as loader_integration and
+  # acceptance). work_root_var = work_root: the declared launcher passes -e work_root=<same path> last, and an
+  # explicit -e work_root still overrides a direct invocation. Nonzero exit: the Overall gate below fails the play.
+  vars:
+    lme_runner_checkout: "{{ playbook_dir | dirname | dirname }}"
+    lme_work_roots: "{{ (lookup('ansible.builtin.file', lme_runner_checkout ~ '/manifests/profiles/remote-harness.yml') | from_yaml).profile_overlay.lme_global.remote_harness.controller.bootstrap.work_roots }}"
+    work_root: "{{ lme_runner_checkout ~ '/' ~ lme_work_roots.root_rel ~ '/' ~ lme_work_roots.sub_roots.run ~ '/' ~ lme_work_roots.runners.loader_cases }}"
+  tasks:
+    - name: Refuse a run whose inputs are not all explicit (no private defaults)
+      ansible.builtin.assert:
+        that:
+          - repo_root is defined and (repo_root | string | length) > 0
+          - cases_file is defined and (cases_file | string | length) > 0
+          - probe_ansible_playbook is defined and (probe_ansible_playbook | string) is match('^/')
+          - run_label is defined and (run_label | string) is match('^[A-Za-z0-9._-]+$')
+        fail_msg: "repo_root, cases_file, probe_ansible_playbook (absolute) and run_label are all required"
+
+    - name: "r3 -- refuse undeclared executables or an undeclared reproduction/integration identity"
+      ansible.builtin.assert:
+        that:
+          - expected_runner_ansible_core is defined and (expected_runner_ansible_core | string) is match('^[0-9]+[.][0-9]+[.][0-9]+')
+          - expected_probe_ansible_core is defined and (expected_probe_ansible_core | string) is match('^[0-9]+[.][0-9]+[.][0-9]+')
+          - expected_probe_python_executable is defined and (expected_probe_python_executable | string) is match('^/')
+          - expected_probe_python_version is defined and (expected_probe_python_version | string) is match('^[0-9]+[.][0-9]+[.][0-9]+$')
+          - run_mode is defined and run_mode in ['reproduction', 'integration']
+          - interpreter_policy is defined and interpreter_policy in ['managed_only', 'unmanaged_diagnostic']
+          - managed_interpreter_root is defined and (managed_interpreter_root | string) is match('^/.+[^/]$')
+          - source_commit is defined and (source_commit | string) is match('^[0-9a-f]{40}$')
+          - (run_mode == 'reproduction' and baseline_commit is not defined)
+            or (run_mode == 'integration' and baseline_commit is defined and (baseline_commit | string) is match('^[0-9a-f]{40}$')
+                and baseline_commit != source_commit)
+        fail_msg: >-
+          declare expected_runner_ansible_core, expected_probe_ansible_core, expected_probe_python_executable,
+          expected_probe_python_version, run_mode (reproduction|integration), source_commit (40-hex) and, for
+          integration only, a distinct baseline_commit (40-hex)
+
+    - name: "r3 -- refuse a runner that is not the declared controller core"
+      ansible.builtin.assert:
+        that: ansible_version.full == expected_runner_ansible_core
+        fail_msg: "runner is core {{ ansible_version.full }} under {{ ansible_playbook_python }}; declared {{ expected_runner_ansible_core }}"
+
+    - name: Load case data
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/{{ cases_file }}"
+
+    - name: Refuse a cases file that does not declare its binding blocks
+      ansible.builtin.assert:
+        that:
+          - loader_entry is defined
+          - isolated_source is defined and isolated_source.files | length > 0
+          - play_vars_source is defined
+          - cases is defined and cases | length > 0
+        fail_msg: "cases file must declare loader_entry, isolated_source, play_vars_source and cases"
+
+    - name: Load the DECLARED fixture configuration (probe sentinels/labels/protocol constants; no private defaults)
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/fixture_config.yml"
+
+    - name: Refuse a fixture configuration that is incomplete or unsafe to interpolate
+      ansible.builtin.assert:
+        that:
+          - probe_fixture is defined and probe_fixture is mapping
+          # interpolated into a single-quoted Jinja string literal in the rendered probe
+          - probe_fixture.undefined_sentinel is string and probe_fixture.undefined_sentinel is match('^[A-Za-z0-9_]+$')
+          - probe_fixture.control_task_label is string and (probe_fixture.control_task_label | length) > 0
+          - probe_fixture.control_task_label is match('^[A-Za-z0-9 ._:-]+$')
+          - probe_fixture.msg_source_captured is string and probe_fixture.msg_source_captured is match('^[A-Za-z0-9_]+$')
+          - probe_fixture.msg_source_uncaptured is string and probe_fixture.msg_source_uncaptured is match('^[A-Za-z0-9_]+$')
+          - probe_fixture.msg_source_captured != probe_fixture.msg_source_uncaptured
+          # rendered as a plain YAML scalar for the play's hosts keyword
+          - probe_fixture.probe_hosts_default is string and probe_fixture.probe_hosts_default is match('^[A-Za-z0-9_.-]+$')
+        fail_msg: "fixture_config.yml must declare probe_fixture.{undefined_sentinel, control_task_label, msg_source_captured, msg_source_uncaptured, probe_hosts_default} with safe values"
+
+    - name: Read the real entrypoint to derive its flag play-vars (mechanical; never hand-copied)
+      ansible.builtin.slurp:
+        src: "{{ repo_root }}/{{ play_vars_source.file }}"
+      register: _entrypoint_raw
+
+    - name: Derive site_flag_playvars = entrypoint first-play vars intersected with flag keys
+      ansible.builtin.set_fact:
+        site_flag_playvars: >-
+          {{ ((_entrypoint_raw.content | b64decode | from_yaml)[play_vars_source.play_index].vars | default({}))
+             | dict2items | selectattr('key', 'in', play_vars_source.restrict_to_flag_keys) | list | items2dict }}
+
+    - name: Record HEAD under test
+      ansible.builtin.command:
+        argv: [git, rev-parse, HEAD]
+        chdir: "{{ repo_root }}"
+      register: head_rev
+      changed_when: false
+
+    - name: Record worktree dirtiness (a dirty tree must be visible)
+      ansible.builtin.command:
+        argv: [git, status, --porcelain]
+        chdir: "{{ repo_root }}"
+      register: git_porcelain
+      changed_when: false
+
+    - name: "r3 -- refuse a run whose executed checkpoint is not the declared source_commit, or is dirty"
+      ansible.builtin.assert:
+        that:
+          - head_rev.stdout == source_commit
+          - git_porcelain.stdout_lines | length == 0
+        fail_msg: "HEAD {{ head_rev.stdout }} (dirty={{ git_porcelain.stdout_lines | length > 0 }}) is not the clean declared source_commit {{ source_commit }}"
+
+    - name: "r3 -- integration: the declared baseline_commit must be an ancestor of source_commit"
+      ansible.builtin.command:
+        argv: [git, merge-base, --is-ancestor, "{{ baseline_commit }}", "{{ source_commit }}"]
+        chdir: "{{ repo_root }}"
+      register: baseline_ancestry
+      changed_when: false
+      failed_when: baseline_ancestry.rc != 0
+      when: run_mode == 'integration'
+
+    - name: Record run timestamp (UTC)
+      ansible.builtin.command:
+        argv: [date, -u, '+%Y%m%dT%H%M%SZ']
+      register: run_ts
+      changed_when: false
+
+    - name: Measure the EXACT probe binary's toolchain (version, controller python, jinja, pyyaml)
+      ansible.builtin.command:
+        argv: ["{{ probe_ansible_playbook }}", --version]
+      register: probe_version_raw
+      changed_when: false
+
+    - name: Parse the measured probe toolchain
+      ansible.builtin.set_fact:
+        toolchain:
+          probe_binary: "{{ probe_ansible_playbook }}"
+          probe_version_first_line: "{{ probe_version_raw.stdout_lines[0] }}"
+          probe_ansible_core: "{{ probe_version_raw.stdout | regex_search('\\[core ([^\\]]+)\\]', '\\1') | first }}"
+          probe_python_line: "{{ probe_version_raw.stdout_lines | select('search', '^\\s*python version = ') | first | default('') | trim }}"
+          probe_python_executable: "{{ ((probe_version_raw.stdout_lines | select('search', '^\\s*python version = ') | first | default('')) | regex_search('\\(([^()]*)\\)\\s*$', '\\1') | default([''], true)) | first }}"
+          probe_jinja: "{{ (probe_version_raw.stdout_lines | select('search', '^\\s*jinja version = ') | first | default('')) | regex_replace('^\\s*jinja version = ', '') }}"
+          # the YAML line the binary itself reports: 2.19 prints "pyyaml version = X", 2.17 prints "libyaml = <bool>"
+          probe_yaml_line: "{{ probe_version_raw.stdout_lines | select('search', '^\\s*(pyyaml version|libyaml) = ') | first | default('') | trim }}"
+          runner_ansible_core: "{{ ansible_version.full }}"
+          runner_python: "{{ ansible_playbook_python }}"
+
+    - name: Refuse an unmeasured toolchain (a blank version is not evidence)
+      ansible.builtin.assert:
+        that:
+          - toolchain.probe_ansible_core | length > 0
+          - toolchain.probe_python_executable is match('^/')
+          - toolchain.probe_jinja | length > 0
+          - toolchain.probe_yaml_line | length > 0
+        fail_msg: "probe toolchain could not be measured: {{ toolchain }}"
+
+    - name: "r3 -- refuse a probe binary whose MEASURED core / interpreter / python version is not the declared one"
+      ansible.builtin.assert:
+        that:
+          - toolchain.probe_ansible_core == expected_probe_ansible_core
+          - toolchain.probe_python_executable == expected_probe_python_executable
+          - (toolchain.probe_python_line | regex_search('^python version = ([^ ]+)', '\\1') | default([''], true) | first) == expected_probe_python_version
+        fail_msg: >-
+          probe binary {{ probe_ansible_playbook }} measures core {{ toolchain.probe_ansible_core }},
+          {{ toolchain.probe_python_line }}; declared core {{ expected_probe_ansible_core }},
+          python {{ expected_probe_python_version }} at {{ expected_probe_python_executable }}
+
+    - name: "r3 -- hash the executables actually selected (probe binary, probe interpreter; symlinks resolved and recorded)"
+      ansible.builtin.stat: {path: "{{ item }}", checksum_algorithm: sha256, follow: true}
+      register: exec_stat
+      loop: ["{{ probe_ansible_playbook }}", "{{ expected_probe_python_executable }}", "{{ ansible_playbook_python }}"]
+
+    - name: "r3 -- resolve the probe and runner interpreters (symlinks followed; venv links land in their managed install)"
+      ansible.builtin.stat: {path: "{{ item }}", follow: false, get_checksum: false}
+      register: interp_link
+      loop: ["{{ expected_probe_python_executable }}", "{{ ansible_playbook_python }}"]
+
+    - name: "r3 -- resolved interpreter identities"
+      ansible.builtin.set_fact:
+        interpreter_resolved: >-
+          {{ dict(['probe_python', 'runner_python'] | zip(interp_link.results
+                  | map(attribute='stat') | map('dict2items') | map('selectattr', 'key', 'eq', 'lnk_source')
+                  | map('map', attribute='value') | map('join') | list)) }}
+        # '' = not a symlink (stat returns lnk_source only for links); consumers fall back to the declared path.
+        interpreter_declared: >-
+          {{ dict(['probe_python', 'runner_python'] | zip([expected_probe_python_executable, ansible_playbook_python])) }}
+
+    - name: "r3 -- codex-2017 managed_only: both interpreters resolve under the declared managed root (no system fallback)"
+      ansible.builtin.assert:
+        that:
+          - (interpreter_resolved[item] | default(interpreter_declared[item], true)) is match('^' ~ (managed_interpreter_root | regex_escape) ~ '/')
+        fail_msg: >-
+          {{ item }} {{ interpreter_declared[item] }} resolves to {{ interpreter_resolved[item] | default(interpreter_declared[item], true) }},
+          outside the managed interpreter root {{ managed_interpreter_root }} (interpreter_policy=managed_only)
+      loop: [probe_python, runner_python]
+      when: interpreter_policy == 'managed_only'
+
+    # r4 R3-MANAGED-IDENTITY (codex-213359): a caller-selected managed root is NOT installation identity (/usr
+    # could be declared). managed_only now binds every selected executable (resolved path + sha256) to a
+    # REVIEWED bootstrap receipt, itself pinned by sha256. The receipt is data produced by the reviewed
+    # bootstrap job (tick112 acquired archives only; no installed-executable receipt exists yet), so today
+    # managed_only fails closed. The receipt shape:
+    #   {kind: managed_interpreter_bootstrap_receipt, review: {message_id, sha256},
+    #    executables: {probe_ansible_playbook|probe_python|runner_python: {path, sha256}}}
+    - name: "r4 -- managed_only requires a pinned reviewed bootstrap receipt"
+      ansible.builtin.assert:
+        that:
+          - managed_bootstrap_receipt is defined and managed_bootstrap_receipt is string and managed_bootstrap_receipt is match('^/')
+          - managed_bootstrap_receipt_sha256 is defined and managed_bootstrap_receipt_sha256 is match('^[0-9a-f]{64}$')
+          - managed_bootstrap_receipt_sha256 in ((lookup('ansible.builtin.file', playbook_dir ~ '/managed-bootstrap-receipts.yml') | from_yaml).accepted | map(attribute='sha256') | list)
+        fail_msg: >-
+          interpreter_policy=managed_only requires -e managed_bootstrap_receipt=<abs path> and
+          -e managed_bootstrap_receipt_sha256=<hex> naming a receipt ACCEPTED in the hashed instrument
+          managed-bootstrap-receipts.yml: a directory-name claim (managed_interpreter_root) is not
+          approved installation identity (R3-MANAGED-IDENTITY)
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- measure the bootstrap receipt bytes"
+      ansible.builtin.stat: {path: "{{ managed_bootstrap_receipt }}", checksum_algorithm: sha256, follow: false}
+      register: receipt_stat
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- bind the selected executables to the reviewed bootstrap receipt"
+      vars:
+        receipt: "{{ lookup('ansible.builtin.file', managed_bootstrap_receipt) | from_yaml }}"
+        measured: >-
+          {{ dict(['probe_ansible_playbook', 'probe_python', 'runner_python']
+                  | zip(exec_stat.results | map(attribute='stat'))) }}
+        measured_path:
+          probe_ansible_playbook: "{{ probe_ansible_playbook }}"
+          probe_python: "{{ interpreter_resolved.probe_python | default(interpreter_declared.probe_python, true) }}"
+          runner_python: "{{ interpreter_resolved.runner_python | default(interpreter_declared.runner_python, true) }}"
+      ansible.builtin.assert:
+        that:
+          - receipt_stat.stat.exists and receipt_stat.stat.isreg and not receipt_stat.stat.islnk
+          - receipt_stat.stat.checksum == managed_bootstrap_receipt_sha256
+          - receipt is mapping and receipt.kind | default('') == 'managed_interpreter_bootstrap_receipt'
+          - receipt.review is mapping and receipt.review.message_id is string and receipt.review.sha256 is match('^[0-9a-f]{64}$')
+          - (receipt.executables.keys() | sort | list) == ['probe_ansible_playbook', 'probe_python', 'runner_python']
+          - receipt.executables[item].path == measured_path[item]
+          - receipt.executables[item].sha256 == measured[item].checksum
+        fail_msg: >-
+          {{ item }} measured {{ measured_path[item] }} sha256 {{ measured[item].checksum | default('?') }} does not
+          match the reviewed bootstrap receipt {{ managed_bootstrap_receipt }} (R3-MANAGED-IDENTITY)
+      loop: [probe_ansible_playbook, probe_python, runner_python]
+      when: interpreter_policy == 'managed_only'
+
+    - name: Enumerate the manifests input tree with sha256 checksums (find module; no shell)
+      ansible.builtin.find:
+        paths: "{{ repo_root }}/manifests"
+        recurse: true
+        file_type: file
+        hidden: true
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: manifests_found
+
+    - name: Hash every instrument file actually used by this run
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/{{ item }}"
+        checksum_algorithm: sha256
+      register: instrument_stat
+      loop: [run_loader_tests.yml, one_case.yml, macros/probe.j2, macros/manifest_digest.j2, macros/classify.j2,
+             macros/diff.j2, macros/dump_integrity.j2, fixture_config.yml, managed-bootstrap-receipts.yml, "{{ cases_file }}"]
+
+    - name: sha256 of loader inputs BEFORE the run (source-unchanged baseline)
+      ansible.builtin.stat: {path: "{{ repo_root }}/{{ item }}", checksum_algorithm: sha256}
+      register: src_before
+      loop: "{{ isolated_source.files }}"
+
+    - name: Publish evidence facts + a source/version-bound run id
+      ansible.builtin.set_fact:
+        manifests_tree: >-
+          {{ dict(manifests_found.files | map(attribute='path') | map('regex_replace', '^' ~ (repo_root | regex_escape) ~ '/', '')
+                  | zip(manifests_found.files | map(attribute='checksum'))) }}
+        instruments: >-
+          {{ dict(instrument_stat.results | map(attribute='item') | zip(instrument_stat.results | map(attribute='stat.checksum'))) }}
+        src_before_map: "{{ dict(isolated_source.files | zip(src_before.results | map(attribute='stat.checksum') | list)) }}"
+        run_id: >-
+          {{ head_rev.stdout[:12] }}-{{ run_mode }}-{{ run_label }}-core{{ toolchain.probe_ansible_core }}-{{ run_ts.stdout }}
+
+    # r2 C1-AGGREGATE-MANIFEST-DIGEST: the v6.2 expression joined each dict2items RECORD, and joining a
+    # dict joins its KEYS ('key', 'value'), so every same-size manifest set produced the same digest.
+    # The canonical serialization now lives in macros/manifest_digest.j2 (shared with the self-test).
+    - name: Canonical member serialization of the manifests tree (macros/manifest_digest.j2, path-tab-sha256-v1)
+      ansible.builtin.set_fact:
+        manifests_digest_render: >-
+          {{ lookup('ansible.builtin.template', playbook_dir ~ '/macros/manifest_digest.j2',
+                    template_vars={'members': manifests_tree}) | from_json }}
+
+    - name: Refuse an empty, partial or malformed manifests member set
+      ansible.builtin.assert:
+        that:
+          - manifests_tree | length > 0
+          - manifests_digest_render.invalid | length == 0
+          - manifests_digest_render.count == manifests_tree | length
+          - manifests_digest_render.scheme == 'path-tab-sha256-v1'
+        fail_msg: "manifests member set not digestable: invalid={{ manifests_digest_render.invalid }} count={{ manifests_digest_render.count }}/{{ manifests_tree | length }}"
+
+    - name: Aggregate digest of the manifests tree = sha256 of the canonical member serialization
+      ansible.builtin.set_fact:
+        manifests_tree_sha256: "{{ manifests_digest_render.serialization | hash('sha256') }}"
+        work: "{{ work_root }}/{{ run_id }}"
+
+    - name: Create the per-run work dir (fresh by construction; prior runs preserved under runs/)
+      ansible.builtin.file:
+        path: "{{ work }}"
+        state: directory
+
+    - name: Retain the raw measured probe --version output
+      ansible.builtin.copy:
+        dest: "{{ work }}/probe-version.txt"
+        content: "{{ probe_version_raw.stdout }}\n"
+
+    - name: "r3 -- consumed-input manifest (everything this run reads; bound into results.yml by sha256)"
+      ansible.builtin.set_fact:
+        consumed_inputs:
+          schema: 1
+          run_mode: "{{ run_mode }}"
+          source_commit: "{{ source_commit }}"
+          baseline_commit: "{{ baseline_commit | default(none) }}"
+          executed_checkpoint: "{{ head_rev.stdout }}"
+          repo_root: "{{ repo_root }}"
+          loader_inputs_sha256: "{{ src_before_map }}"
+          entrypoint_play_vars_source: "{{ play_vars_source }}"
+          manifests_tree_sha256: "{{ manifests_tree_sha256 }}"
+          manifests_tree_digest_scheme: "{{ manifests_digest_render.scheme }}"
+          manifests_tree: "{{ manifests_tree }}"
+          instruments_sha256: "{{ instruments }}"
+          cases_file: "{{ cases_file }}"
+          executables: >-
+            {{ dict(['probe_ansible_playbook', 'probe_python', 'runner_python']
+                    | zip(exec_stat.results | map(attribute='stat')
+                          | map('dict2items') | map('selectattr', 'key', 'in', ['path', 'lnk_source', 'checksum', 'exists'])
+                          | map('items2dict'))) }}
+          declared_toolchain:
+            runner_ansible_core: "{{ expected_runner_ansible_core }}"
+            probe_ansible_core: "{{ expected_probe_ansible_core }}"
+            probe_python_executable: "{{ expected_probe_python_executable }}"
+            probe_python_version: "{{ expected_probe_python_version }}"
+          measured_toolchain: "{{ toolchain }}"
+          interpreter_policy: "{{ interpreter_policy }}"
+          managed_interpreter_root: "{{ managed_interpreter_root }}"
+          interpreters_resolved: "{{ interpreter_resolved }}"
+          managed_bootstrap_receipt: >-
+            {{ {'path': managed_bootstrap_receipt, 'sha256': managed_bootstrap_receipt_sha256}
+               if interpreter_policy == 'managed_only' else none }}
+          qualifies_leg: "{{ interpreter_policy == 'managed_only' }}"
+
+    - name: "r3 -- write consumed-inputs.yml"
+      ansible.builtin.copy:
+        dest: "{{ work }}/consumed-inputs.yml"
+        content: "{{ consumed_inputs | to_nice_yaml(sort_keys=True) }}"
+
+    - name: "r3 -- sha256 of the written consumed-input manifest"
+      ansible.builtin.stat: {path: "{{ work }}/consumed-inputs.yml", checksum_algorithm: sha256}
+      register: consumed_stat
+
+    - name: Run each case
+      ansible.builtin.include_tasks: one_case.yml
+      loop: "{{ cases }}"
+      loop_control: {loop_var: case, label: "{{ case.name }}"}
+
+    - name: sha256 of loader inputs AFTER the run
+      ansible.builtin.stat: {path: "{{ repo_root }}/{{ item }}", checksum_algorithm: sha256}
+      register: src_after
+      loop: "{{ isolated_source.files }}"
+
+    - name: Assert loader inputs unchanged by the run
+      ansible.builtin.assert:
+        that: "src_before_map == dict(isolated_source.files | zip(src_after.results | map(attribute='stat.checksum') | list))"
+        fail_msg: "a loader input changed during the run (source not read-only)"
+
+    - name: Write results.yml (source-, instrument- and version-bound)
+      ansible.builtin.copy:
+        dest: "{{ work }}/results.yml"
+        content: >-
+          {{ {'run_id': run_id, 'repo_root': repo_root, 'head': head_rev.stdout,
+              'run_mode': run_mode, 'source_commit': source_commit, 'baseline_commit': baseline_commit | default(none),
+              'executed_checkpoint': head_rev.stdout,
+              'interpreter_policy': interpreter_policy, 'qualifies_leg': (interpreter_policy == 'managed_only'),
+              'consumed_inputs_sha256': consumed_stat.stat.checksum,
+              'worktree_dirty': (git_porcelain.stdout_lines | length > 0),
+              'git_status_porcelain': git_porcelain.stdout_lines, 'toolchain': toolchain,
+              'cases_file': cases_file, 'instruments_sha256': instruments,
+              'site_flag_playvars_derived_from_entrypoint': site_flag_playvars,
+              'manifests_tree_sha256': manifests_tree_sha256,
+              'manifests_tree_digest_scheme': manifests_digest_render.scheme,
+              'manifests_tree': manifests_tree,
+              'probe_fixture': probe_fixture,
+              'loader_inputs_before': src_before_map, 'loader_inputs_unchanged_after': true,
+              'results': results} | to_nice_yaml }}
+
+    - name: Update the runs/LATEST pointer (convenience; each run is preserved by run_id)
+      ansible.builtin.copy:
+        dest: "{{ work_root }}/LATEST"
+        content: "{{ run_id }}\n"
+
+    - name: Summary line per case
+      ansible.builtin.debug:
+        msg: "{{ '%-48s expected=%-7s rc=%-3s verdict=%s' | format(item.case, item.expected_now, item.probe_rc, item.verdict) }}"
+      loop: "{{ results }}"
+      loop_control: {label: "{{ item.case }}"}
+
+    - name: Overall gate -- every case at its expected verdict (fail-closed)
+      ansible.builtin.assert:
+        that:
+          - "results | length == cases | length"
+          - "results | selectattr('verdict', 'in', ['PASS','XFAIL-as-expected','REJECTED-as-expected']) | list | length == results | length"
+        fail_msg: >-
+          loader-test suite has off-expectation verdicts:
+          {{ results | rejectattr('verdict', 'in', ['PASS','XFAIL-as-expected','REJECTED-as-expected']) | map(attribute='case') | list }}
+        success_msg: "all {{ results | length }} loader cases at expected verdict ({{ run_id }})"

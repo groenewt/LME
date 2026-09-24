@@ -1,0 +1,72 @@
+{#- macros/c1_iso5.j2 -- C1 iso5 case expressions (C1-owned macro library; DATA = cases-c1-iso5-*.yml, MACRO = this file).
+    Case YAML calls these at runner render time:  "{% import 'c1_iso5.j2' as m %}{{ m.check('...') }}"
+    check(name) -> a bare Ansible assert expression (probe evaluates it);
+    pin(name)   -> a LAZY template string "{{ ... }}" passed via -e (the probe evaluates it at each read).
+    Nothing here reads a variable: every macro returns TEXT only, so the probe, not the runner, evaluates it. -#}
+
+{%- macro C() -%}(_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)){%- endmacro -%}
+{%- macro SCH() -%}_lme_global_file.lme_config_registry.remote_harness_schema{%- endmacro -%}
+{%- macro OV() -%}(lme_global_override | default({})){%- endmacro -%}
+{%- macro COMP() -%}({{ C() }} | combine({{ OV() }}, recursive=True)){%- endmacro -%}
+{#- the section as the loader projects it: scoped when a scope context exists (head), unscoped at the base (43c92f9) -#}
+{%- macro SEC() -%}(({{ COMP() }} | lme_project_remote_harness({{ C() }}, {{ OV() }}, {{ SCH() }}, _lme_rh_scope)) if (_lme_rh_scope is defined) else ({{ COMP() }} | lme_project_remote_harness({{ C() }}, {{ OV() }}, {{ SCH() }}))){%- endmacro -%}
+{%- macro SEC4() -%}({{ COMP() }} | lme_project_remote_harness({{ C() }}, {{ OV() }}, {{ SCH() }})){%- endmacro -%}
+{%- macro REAL() -%}(_lme_resolution.resolved | combine({'remote_harness': {{ SEC() }}})){%- endmacro -%}
+{%- macro H() -%}lme_resolved.remote_harness{%- endmacro -%}
+{%- macro ENT() -%}[{{ H() }}.scopes.controller, {{ H() }}.scopes.targets.t1, {{ H() }}.scopes.targets.t2]{%- endmacro -%}
+{%- macro MINE() -%}({{ H() }}.scopes.controller if {{ H() }}.scope.kind == 'controller' else {{ H() }}.scopes.targets[inventory_hostname]){%- endmacro -%}
+{%- macro FILESHA(rel) -%}(lookup('ansible.builtin.file', lme_manifests_dir ~ '/{{ rel }}') | hash('sha256')){%- endmacro -%}
+{%- macro ES() -%}lme_services['elasticsearch'].publish_ports[0]{%- endmacro -%}
+{%- macro FS() -%}lme_services['fleet-server'].publish_ports[0]{%- endmacro -%}
+
+{#- SCOPE0(): the loader's own scope context with THIS host's composition = the declared composition and its override = {}
+    (the scope argument an expected no-override projection needs; PER-HOST-SCOPE-CONTRACT publishes a scoped section) -#}
+{%- macro SCOPE0() -%}(_lme_rh_scope | combine({'composed': (_lme_rh_scope.composed | combine({inventory_hostname: (_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True))})), 'overrides': (_lme_rh_scope.overrides | combine({inventory_hostname: {}}))})){%- endmacro -%}
+
+{%- macro lazy(expr) -%}{{ '{{ ' ~ expr ~ ' }}' }}{%- endmacro -%}
+
+{%- macro pin(name) -%}
+{%- if name == 'identical' -%}{{ lazy(REAL()) }}
+{%- elif name == 'schema_float' -%}{{ lazy("_lme_resolution.resolved | combine({'remote_harness': (" ~ SEC() ~ " | combine({'schema_version': 3.0}))})") }}
+{%- elif name == 'bool_int' -%}{{ lazy(REAL() ~ " | combine({'install_llm': (1 if _lme_resolution.resolved.install_llm else 0)})") }}
+{%- elif name == 'policy_float' -%}{{ lazy("_lme_resolution.resolved | combine({'remote_harness': (" ~ SEC() ~ " | combine({'policy': (" ~ SEC() ~ ".policy | combine({'controller': {'local_envelope': {'vcpu': (" ~ SEC() ~ ".policy.controller.local_envelope.vcpu | float)}}}, recursive=True))}))})") }}
+{%- elif name == 'profile_multinode' -%}{{ lazy("lookup('ansible.builtin.file', lme_manifests_dir ~ '/profiles/multinode.yml') | from_yaml") }}
+{%- elif name == 'global_manifest' -%}{{ lazy("lookup('ansible.builtin.file', lme_manifests_dir ~ '/global.yml') | from_yaml") }}
+{%- else -%}UNKNOWN-PIN-{{ name }}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro check(name, arg='') -%}
+{%- if name == 'verified' -%}lme_resolved | lme_verify_resolved(_lme_global_file.lme_config_registry)
+{%- elif name == 'schema_int' -%}{{ H() }}.schema_version is integer and {{ H() }}.schema_version == 3
+{#- PER-HOST-SCOPE-CONTRACT (3-host inventory: localhost controller + t1/t2 in lme_toolchain_targets) -#}
+{%- elif name == 'scope_self' -%}{{ H() }}.scope.id == inventory_hostname and {{ H() }}.scope.kind == ('controller' if inventory_hostname == 'localhost' else 'target')
+{%- elif name == 'scopes_members' -%}{{ H() }}.scopes.controller.id == 'localhost' and {{ H() }}.scopes.controller.kind == 'controller' and ({{ H() }}.scopes.targets | list | sort) == ['t1', 't2']
+{%- elif name == 'binding_deployment' -%}{{ H() }}.binding.deployment == {'profile': 'remote-harness', 'controller': 'localhost', 'target_group': 'lme_toolchain_targets', 'targets': ['t1', 't2']} and {{ H() }}.binding.operation == 'deploy_transfer'
+{%- elif name == 'binding_edition' -%}{{ H() }}.binding.source_edition == {'global_sha256': {{ FILESHA('global.yml') }}, 'profile_sha256': {{ FILESHA('profiles/remote-harness.yml') }}}
+{%- elif name == 'controller_neutral' -%}{{ H() }}.scopes.controller.policy_sha256 == ({{ C() }} | lme_project_remote_harness({{ C() }}, {}, {{ SCH() }})).policy_sha256
+{%- elif name == 'hetero_admitted' -%}{{ H() }}.scopes.targets.t1.policy.controller.bootstrap.os_tools.sha256sum.identity.sha256 == '{{ arg }}' and {{ H() }}.scopes.targets.t2.policy.controller.bootstrap.os_tools.sh.path == '/usr/bin/sh' and {{ H() }}.scopes.controller.policy.controller.bootstrap.os_tools.sh.path == '/bin/sh'
+{%- elif name == 'policies_distinct' -%}({{ ENT() }} | map(attribute='policy_sha256') | unique | list | length) == 3
+{%- elif name == 'compat_same_exact_distinct' -%}({{ ENT() }} | map(attribute='scope_invariant_sha256') | unique | list | length) == 1 and ({{ ENT() }} | map(attribute='scope_sha256') | unique | list | length) == 3
+{%- elif name == 'shared_artifact' -%}{{ H() }}.scopes.targets.t1.shared_artifact_inputs_sha256 == {{ H() }}.scopes.controller.shared_artifact_inputs_sha256 and {{ H() }}.scopes.targets.t2.shared_artifact_inputs_sha256 != {{ H() }}.scopes.controller.shared_artifact_inputs_sha256
+{%- elif name == 'own_entry' -%}{{ H() }}.policy_sha256 == {{ MINE() }}.policy_sha256 and {{ H() }}.scope_sha256 == {{ MINE() }}.scope_sha256
+{%- elif name == 'same_view_all_hosts' -%}(groups['all'] | map('extract', hostvars) | map(attribute='lme_resolved') | map(attribute='remote_harness') | map(attribute='scopes_sha256') | unique | list | length) == 1
+{#- C1-EXPLICIT-IDENTITY-OVERRIDE -#}
+{%- elif name == 'ei_complete' -%}{{ H() }}.policy.controller.bootstrap.os_tools.sha256sum.path == '/usr/local/bin/sha256sum' and {{ H() }}.policy.controller.bootstrap.os_tools.sha256sum.identity == {'kind': 'file_sha256', 'sha256': '{{ arg }}'}
+{%- elif name == 'ei_adapter' -%}('sha256sum' not in {{ H() }}.adapter.tools['target.tools']) or ({{ H() }}.adapter.tools['target.tools'].sha256sum.path == '/usr/local/bin/sha256sum' and {{ H() }}.adapter.tools['target.tools'].sha256sum.identity.sha256 == '{{ arg }}')
+{%- elif name == 'ei_audit' -%}lme_remote_harness_overridden_paths == ['controller.bootstrap.os_tools.sha256sum.identity.kind', 'controller.bootstrap.os_tools.sha256sum.identity.sha256', 'controller.bootstrap.os_tools.sha256sum.path']
+{%- elif name == 'bd_inherits_declared_digest' -%}{{ H() }}.policy.controller.bootstrap.os_tools.sha256sum.path == '/usr/local/bin/sha256sum' and {{ H() }}.policy.controller.bootstrap.os_tools.sha256sum.identity.sha256 == {{ C() }}.remote_harness.controller.bootstrap.os_tools.sha256sum.identity.sha256
+{%- elif name == 'bd_path_moved' -%}{{ H() }}.policy.controller.bootstrap.os_tools.sha256sum.path == '/usr/local/bin/sha256sum'
+{#- C1-TYPED-OUTPUT-REVISION base holes -#}
+{%- elif name == 'bd_schema_float' -%}{{ H() }}.schema_version is float
+{%- elif name == 'bd_bool_not_bool' -%}lme_resolved.install_llm is not boolean
+{%- elif name == 'bd_policy_float_stale' -%}{{ H() }}.policy.controller.local_envelope.vcpu is float and {{ H() }}.policy_sha256 == {{ SEC4() }}.policy_sha256
+{#- C1-MULTINODE-REAL-PATH -#}
+{%- elif name == 'mn_default' -%}{{ ES() }}.host == 9200 and {{ ES() }}.bind == '0.0.0.0' and {{ ES() }}.tailnet_port == 9200 and {{ FS() }}.bind == '0.0.0.0' and {{ FS() }}.host == 8220
+{%- elif name == 'mn_bind' -%}{{ ES() }}.bind == '{{ arg }}' and {{ ES() }}.host == 9200
+{%- elif name == 'mn_fleet_bind' -%}{{ FS() }}.bind == '{{ arg }}'
+{%- elif name == 'mn_tailscale' -%}{{ ES() }}.host == 19200 and {{ ES() }}.bind == '127.0.0.1' and {{ ES() }}.tailnet_port == 9200
+{%- elif name == 'mn_profile_bound' -%}_lme_profile_file.profile_overlay.services['fleet-server'] is defined and {{ ES() }}.bind == '0.0.0.0'
+{%- else -%}UNKNOWN-CHECK-{{ name }}
+{%- endif -%}
+{%- endmacro -%}
