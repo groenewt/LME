@@ -862,6 +862,18 @@ lme_config_registry:
           checkout_inputs: {lme_seed_lock: controller.lock_file_rel}
           consumers: [seed, uv_installer]            # consumer_field names whose executables this artifact runs
           not_embedded_fields: [identity]            # scoped_fields the templates never read (proved per template)
+        # SEED LAUNCHER (codex-tick217 R1; controller.bootstrap.seed_launcher): the generated caller entry of
+        # seed_launch, rendered next to the seed by testing/remote_harness/tasks/package_bundle.yml from the SAME
+        # macros file (macro seed_launcher) with ONE template var; no checkout input. It execs the seed only, so its
+        # consumer is `seed` (the os_tools it runs: realpath / id / getent / env and the sh interpreter).
+        launcher:
+          templates:
+            - testing/remote_harness/templates/lme-seed-launcher.sh.j2
+            - testing/remote_harness/templates/macros/controller_seed.j2
+          inputs: {lme_seed_bs: controller.bootstrap}
+          checkout_inputs: {}
+          consumers: [seed]
+          not_embedded_fields: [identity]
       # C1-EFFECTIVE-ENDPOINT-BINDING (codex 035141, 040323): binding.deployment.endpoints = {<target id>: the
       # rule's endpoint_key components} derived by the ONE declared connection rule the route and B consume (named
       # here by path, never copied): address var (absent -> inventory id, lower-cased); port var (explicit -> its
@@ -910,9 +922,22 @@ lme_config_registry:
     #     COMPONENT codex 193337: a configurable pattern can never admit an empty / '.' / '..' / multi-component value)
     #   umask_yields <path relative to the contract root>: 0666 & ~value == that octal mode
     #   not_in [names of lists of THIS schema]: the value is none of their members
-    # Modifier each: the check applies to every list element / mapping value. `path` is relative to the contract root
-    # ('' = the root); `at` is an absolute policy path. when_present: the contract applies only when that policy path
-    # is declared (genesis is declared on the m1-1g lineage only); otherwise its root is REQUIRED.
+    #   matches_ere <path relative to the contract root>: the value fully matches '^' + that ERE fragment + '$'
+    #   distinct_from [paths relative to the contract root]: each is declared and the value equals none of them
+    #   placeholder_words {known, whole_word, params, refused} (codex-tick217 R1 launcher; controller_seed.j2
+    #     launch_word / launch_params / launch_exec): the value is a list of argv words; every '{' opens a
+    #     placeholder closed by the next '}' (unterminated or empty refuses); a whole_word name only as an entire
+    #     word '{name}'; a known name anywhere; a refused name never; any other name is a positional parameter only
+    #     when `params` names a pattern it fully matches (the launcher re-splits parameter names on whitespace), else
+    #     undeclared.
+    # Modifier each: the check applies to every list element / mapping value; with `where {field, equals_at}` only
+    # the mapping entries whose <field> equals the value at equals_at count, and selecting none REFUSES (never
+    # vacuous). within modifiers: key_at <absolute path>: each referenced node is a mapping and only its entry keyed
+    # by the value at key_at counts (absent -> missing dependency); placeholders [excluded]: the members a word list
+    # contributes are its placeholder names minus the excluded ones. `path` is relative to the contract root
+    # ('' = the root); `at` is an absolute policy path; a '*' segment expands every mapping key (no match refuses).
+    # when_present: the contract applies only when that policy path is declared (genesis is declared on the m1-1g
+    # lineage only); otherwise its root is REQUIRED.
     # derive.runtime / derive.names are pinned (enum) to the pointers controller_seed.j2 actually reads
     # (bs.target_bootstrap.user_manager, bs.work_roots.run_local.user_manager_env): a resolvable but different pointer
     # would be silently ignored by the template, so it refuses here; the pointed-to nodes are admitted by `at`.
@@ -928,7 +953,45 @@ lme_config_registry:
         dir_mode: '^[0-7]{3,4}$'                    # stat %a form
         uid_rule: '^/[^{}]*\{uid\}[^{}]*$'          # absolute, exactly one {uid} placeholder
         literal_separator: '^[^\n\\/.\[\]()*+?{}|^$]+$'   # composed literally into ERE and sed: no metacharacter
+        abs_word: '^/\S*$'                          # absolute and ONE whitespace-free word (a #! interpreter path)
       contracts:
+        # SEED LAUNCHER MEMBER (codex-tick217 R1): bundle.launcher_file is a bundle member with seed_file's custody.
+        # has_keys, not keys: the bundle carries further route-owned fields (no exact-key sequencing hazard here).
+        bundle_launcher:
+          root: controller.bootstrap.bundle
+          checks:
+            - {path: '', has_keys: [seed_file, launcher_file, launcher_mode, launcher_custody, artifacts_dir, manifest_file, checksum_file, checksum_format]}
+            - {path: launcher_file, pattern: rel_segment}
+            - {path: launcher_file, matches_ere: checksum_format.name}     # a line of checksum_file names it
+            - {path: launcher_file, distinct_from: [seed_file, manifest_file, checksum_file, artifacts_dir]}
+            - {path: launcher_mode, enum: ['0500']}
+            - {path: launcher_custody, enum: [seed_file]}
+        # SEED LAUNCHER (codex-tick217 R1): the shape macro seed_launcher implements (controller_seed.j2 guard) plus the
+        # resolve-time mirrors of its render errors (launch_word / launch_params / launch_exec), so a declaration the
+        # macro cannot render refuses HERE, at resolve, before any package. template_rel is pinned to the entry
+        # template of host_scope.shared_artifacts.launcher (the one whose inputs the loader proves). The argv check
+        # admits only the launcher's fixed values and the apply check admits no mode parameter: they hold TOGETHER
+        # (the macro renders every argv word for every mode, apply included, so an argv placeholder that is a mode
+        # parameter breaks apply's render); neither is relaxed alone. `refused` names are the launcher's fixed values
+        # that launch_params would ALSO count as positional mode parameters (stricter than the macro, which renders
+        # them but then demands an unused positional).
+        seed_launcher:
+          root: controller.bootstrap.seed_launcher
+          checks:
+            - {path: '', keys: [template_rel, member, caller_argv, mode_params, carried_param, self_path]}
+            - {path: template_rel, enum: [testing/remote_harness/templates/lme-seed-launcher.sh.j2]}
+            - {path: member, enum: [bundle.launcher_file]}
+            - {path: caller_argv, enum: [['{bundle_dir}/{bundle.launcher_file}', '{mode}', '{root}', '{mode_params}', '{args}']]}
+            - {path: mode_params, enum: [mode_args_placeholders]}
+            - {path: self_path, enum: [absolute_realpath_dirname]}
+            - {path: carried_param, pattern: var_name}
+            - {path: carried_param, subject: scalar, within: [controller.bootstrap.seed_launch.mode_args], key_at: controller.bootstrap.seed_launch.env.carried.when.mode, placeholders: [root, args]}
+            - {at: controller.bootstrap.seed_launch.argv, placeholder_words: {known: [os_tools.env.path, bundle_dir, bundle.seed_file, mode, root], whole_word: [env_pairs, mode_args]}}
+            - {at: controller.bootstrap.seed_launch.mode_args, each: true, placeholder_words: {known: [root], whole_word: [args], params: var_name, refused: [os_tools.env.path, bundle_dir, bundle.seed_file, mode]}}
+            - {at: controller.bootstrap.seed_launch.mode_args.apply, placeholder_words: {known: [root]}}
+            - {at: 'controller.bootstrap.ssh_auth.modes.*.socket_env', pattern: env_name}
+            - {at: controller.bootstrap.ssh_auth.modes, each: true, where: {field: agent, equals_at: controller.bootstrap.seed_launch.env.carried.when.ssh_auth_agent}, has_keys: [socket_env]}
+            - {at: controller.bootstrap.os_tools.sh.path, pattern: abs_word}
         seed_launch:
           root: controller.bootstrap.seed_launch
           checks:
@@ -1031,7 +1094,14 @@ lme_config_registry:
     # rh_pub_{dir,key,lock,policy}, _rh_class = the package.yml / target_bootstrap.yml loop_var), -0 = 186;
     # codex-tick213-215 191017 (1) (route derived names of the codex 183510 wave: target_bootstrap _rh_tb_pw,
     # reap_staging lock custody _rh_reap_lock / _rh_reap_lock_rb / rh_reap_sh / _lf, package_bundle _cf, admit_builder
-    # _act): +7 = 193. Task vars, register/set_fact and include parameters are NOT protection from extra-vars.
+    # _act): +7 = 193; codex-tick217 R1 launcher-schema slice (route hunk for C1): +_rh_pkg_lnch (package_bundle
+    # launcher stat register), +_act_req / +_act_ok (admit_builder genesis act admission task vars), -_rh_tb_pw (no
+    # longer derived on either lineage) = 195; C1 call on the rest of admit_builder.yml's task vars (every one feeds
+    # the genesis temp-binding / custody asserts, and an -e pin outranks a task var): +_sr, _paths, _l, _w, _bad,
+    # _chain (route-named) and +_wr, _ltmp, _home, _rtmp, _u, _above, _within, _wdev, _wm, register _rh_bld_gen_stat
+    # (C1 sweep) = 211. _act_req, _act_ok and the admit_builder genesis names are derived on m1-1g only; reserving a
+    # name a lineage does not derive refuses only its pin (one byte-identical list on both lineages).
+    # Task vars, register/set_fact and include parameters are NOT protection from extra-vars.
     # rh_gen_act is NOT reserved: it is the genesis launch's EXTERNAL input (genesis.launch.stage_root.act.var); its
     # declaration is admitted by contract_admission (var grammar, not a reserved/resolver output) and its VALUE by the
     # route's admit_builder.yml (act.regex, fullmatch).
@@ -1066,7 +1136,10 @@ lme_config_registry:
       _rh_tb_left, _rh_tb_present, _tg,
       _rh_bnd_dir, _rh_cls_sib, rh_classes, rh_tb_xfer, _cls, _pc, _r, _s, rh_admit_dir, rh_admit_key,
       rh_admit_lock, rh_admit_policy, rh_pub_dir, rh_pub_key, rh_pub_lock, rh_pub_policy, _rh_class,
-      _rh_tb_pw, _rh_reap_lock, _rh_reap_lock_rb, rh_reap_sh, _lf, _cf, _act]
+      _rh_reap_lock, _rh_reap_lock_rb, rh_reap_sh, _lf, _cf, _act,
+      _rh_pkg_lnch, _act_req, _act_ok,
+      _sr, _paths, _l, _w, _bad, _chain,
+      _wr, _ltmp, _home, _rtmp, _u, _above, _within, _wdev, _wm, _rh_bld_gen_stat]
     # C1-TYPED-OUTPUT-REVISION (codex 022716) defence in depth: the names the C1 LOADER publishes (resolve.yml /
     # load_manifests.yml set_fact / include_vars / register). reserved_outputs omits them, so a route entry guard
     # did not refuse e.g. -e lme_resolved; the loader's type-aware read-back guards + lme_verify_resolved refuse
@@ -1074,7 +1147,7 @@ lme_config_registry:
     # before any loader include in the run: set_facts persist per host across plays (site.yml / elasticsearch.yml
     # include the loader repeatedly), so a later play legitimately sees them -- there the loader read-backs are
     # the defence, not a `select('in', vars)` refusal. Kept SEPARATE from reserved_outputs (route-owned, exactly
-    # 193). Every name is an OUTPUT: the loader asserts none is a declared config field; declared caller inputs
+    # 211). Every name is an OUTPUT: the loader asserts none is a declared config field; declared caller inputs
     # (lme_profile, lme_manifests_dir, lme_inputs, lme_global_override, lme_service_overrides,
     # lme_runtime_inventory, the bare registry field names) are deliberately NOT listed and stay usable.
     resolver_outputs: [lme_resolved, lme_resolved_origins, lme_enable_flags, lme_resolved_revision,

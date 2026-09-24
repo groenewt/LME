@@ -2500,9 +2500,12 @@ def _rh_int(v):
 # remote_harness_schema.contract_admission. Generic: every contract, path, enum, pattern and reference is registry
 # DATA; this code names no contract, tool, env name or deployment value.
 _RH_CA_KINDS = frozenset(('keys', 'has_keys', 'enum', 'pattern', 'key_pattern', 'positive_int', 'strings', 'within',
-                          'ere', 'ere_compose', 'umask_yields', 'not_in', 'rejects'))
-_RH_CA_MODS = {'each': frozenset(('enum', 'pattern', 'strings', 'positive_int')),
-               'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',)), 'subject': frozenset(('within',))}
+                          'ere', 'ere_compose', 'umask_yields', 'not_in', 'rejects',
+                          'matches_ere', 'distinct_from', 'placeholder_words'))
+_RH_CA_EACH = frozenset(('enum', 'pattern', 'strings', 'positive_int', 'has_keys', 'placeholder_words'))
+_RH_CA_MODS = {'each': _RH_CA_EACH, 'where': _RH_CA_EACH,
+               'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',)), 'subject': frozenset(('within',)),
+               'key_at': frozenset(('within',)), 'placeholders': frozenset(('within',))}
 # C1-CONTRACT-SCALAR-SHAPE (codex 193253): the declared shape of a `within` value (REQUIRED on every within check):
 # scalar = one non-empty string; list = a non-empty list of strings; keys = a non-empty mapping (its keys checked).
 _RH_CA_SUBJECTS = ('scalar', 'list', 'keys')
@@ -2518,6 +2521,39 @@ def _rh_ca_members(x):
     if isinstance(x, (dict, list)):
         return list(x)
     return [x]
+
+
+def _rh_ca_placeholders(w):
+    """The placeholder names of one argv word exactly as controller_seed.j2 launch_word splits it (every '{' opens a
+    name closed by the next '}'); None when a placeholder is unterminated (a launch_word render error)."""
+    names = []
+    for p in w.split('{')[1:]:
+        kv = p.split('}', 1)
+        if len(kv) != 2:
+            return None
+        names.append(kv[0])
+    return names
+
+
+def _rh_ca_words(s, arg, pats):
+    """placeholder_words: None when every placeholder of the word list s renders under the declared vocabulary."""
+    if not isinstance(s, list) or any(not isinstance(w, str) for w in s):
+        return 'must be a list of strings (argv words)'
+    known, whole, refused = (arg.get(k, []) for k in ('known', 'whole_word', 'refused'))
+    for w in s:
+        names = _rh_ca_placeholders(w)
+        if names is None:
+            return 'word %r has an unterminated placeholder' % (w,)
+        for n in names:
+            if n in whole:
+                if w != '{' + n + '}':
+                    return 'word %r carries {%s}, admitted only as a whole word' % (w, n)
+            elif n in refused:
+                return 'word %r names {%s}, a fixed launcher value the launcher would also count as a positional mode parameter' % (w, n)
+            elif n not in known and not ('params' in arg and pats[arg['params']].fullmatch(n)):
+                return 'word %r names an undeclared placeholder {%s} (known %s, whole-word %s%s)' % (
+                    w, n, known, whole, ', parameters fully matching patterns.%s' % (arg['params'],) if 'params' in arg else ', no parameters')
+    return None
 
 
 def _rh_ca_ere(v, form, sed):
@@ -2584,11 +2620,21 @@ def _rh_ca_registry(ca, schema):
                   'ere': arg in ('fragment', 'anchored'),
                   'umask_yields': isinstance(arg, str) and bool(arg),
                   'not_in': strs(arg) and all(isinstance(schema.get(n), list) for n in arg),
-                  'rejects': isinstance(arg, list) and bool(arg) and all(isinstance(x, str) for x in arg)}[kind]
+                  'rejects': isinstance(arg, list) and bool(arg) and all(isinstance(x, str) for x in arg),
+                  'matches_ere': isinstance(arg, str) and bool(arg),
+                  'distinct_from': strs(arg),
+                  'placeholder_words': isinstance(arg, dict) and 'known' in arg and not set(arg) - {'known', 'whole_word', 'params', 'refused'}
+                  and all(isinstance(arg[k], list) and all(isinstance(x, str) and x for x in arg[k]) for k in ('known', 'whole_word', 'refused') if k in arg)
+                  and ('params' not in arg or (isinstance(arg['params'], str) and arg['params'] in pats))}[kind]
             for m in mods:
-                ok = ok and kind in _RH_CA_MODS[m] and (
-                    isinstance(chk[m], dict) and set(chk[m]) == {'field', 'contains'} and all(isinstance(x, str) and x for x in chk[m].values())
-                    if m == 'having' else chk[m] in _RH_CA_SUBJECTS if m == 'subject' else isinstance(chk[m], bool))
+                v = chk[m]
+                ok = ok and kind in _RH_CA_MODS[m] and {
+                    'having': lambda: isinstance(v, dict) and set(v) == {'field', 'contains'} and all(isinstance(x, str) and x for x in v.values()),
+                    'where': lambda: isinstance(v, dict) and set(v) == {'field', 'equals_at'} and all(isinstance(x, str) and x for x in v.values())
+                    and chk.get('each') is True,
+                    'subject': lambda: v in _RH_CA_SUBJECTS,
+                    'key_at': lambda: isinstance(v, str) and bool(v),
+                    'placeholders': lambda: isinstance(v, list) and all(isinstance(x, str) and x for x in v)}.get(m, lambda: isinstance(v, bool))()
             if kind == 'within' and 'subject' not in chk:
                 ok = False    # C1-CONTRACT-SCALAR-SHAPE: a membership check must declare its value's shape
             if not ok:
@@ -2643,13 +2689,24 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
             return 'must be a non-empty list of non-empty strings (subject: list); got a %s' % (_rh_kind(s),)
         if shape == 'keys' and not (isinstance(s, dict) and s and all(isinstance(x, str) and x for x in s)):
             return 'must be a non-empty mapping with string keys (subject: keys); got a %s' % (_rh_kind(s),)
-        allowed, hv = [], chk.get('having')
+        allowed, hv, excl = [], chk.get('having'), chk.get('placeholders')
+        if 'key_at' in chk:
+            fk, sel = _rh_get(pol, chk['key_at'])
+            if not fk or not isinstance(sel, str) or not sel:
+                return 'selects its reference entry by %s, which the policy does not declare as a string (missing dependency)' % (chk['key_at'],)
         for ref in arg:
             nodes = _rh_expand(pol, ref)
             if not nodes:
                 return 'references %s, which the policy does not declare (missing dependency)' % (ref,)
             for _p, node in nodes:
-                if isinstance(node, dict):
+                if 'key_at' in chk:
+                    if not isinstance(node, dict) or sel not in node:
+                        return 'references %s.%s (key_at %s), which the policy does not declare (missing dependency)' % (ref, sel, chk['key_at'])
+                    node = node[sel]
+                if excl is not None:
+                    for w in (node if isinstance(node, list) else [node]):
+                        allowed.extend(n for n in (_rh_ca_placeholders(w) or [] if isinstance(w, str) else []) if n not in excl)
+                elif isinstance(node, dict):
                     allowed.extend(k for k in node if hv is None or (
                         isinstance(node[k], dict) and isinstance(node[k].get(hv['field']), list) and hv['contains'] in node[k][hv['field']]))
                 elif isinstance(node, list):
@@ -2657,7 +2714,29 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
                 else:
                     allowed.append(node)
         miss = [m for m in _rh_ca_members(s) if isinstance(m, (dict, list)) or not any(_rh_ca_same(m, a) for a in allowed)]
-        return 'names %r outside %s%s (missing dependency)' % (miss, arg, ' with %s containing %r' % (hv['field'], hv['contains']) if hv else '') if miss else None
+        return 'names %r outside %s%s%s%s (missing dependency)' % (
+            miss, arg, ' with %s containing %r' % (hv['field'], hv['contains']) if hv else '',
+            ' at the entry keyed by %s (%r)' % (chk['key_at'], sel) if 'key_at' in chk else '',
+            ' (placeholder names, excluding %s)' % (excl,) if excl is not None else '') if miss else None
+    if kind == 'matches_ere':
+        fe, frag = _rh_get(pol, root + '.' + arg)
+        if not fe or not isinstance(frag, str) or not frag:
+            return 'requires %s declared as an ERE fragment (missing dependency)' % (arg,)
+        try:
+            rx = re.compile('^' + frag + '$')
+        except re.error as e:
+            return 'cannot be judged: ^%s$ does not compile: %s' % (arg, e)
+        return None if isinstance(s, str) and rx.fullmatch(s) else 'must fully match ^<%s>$ %r' % (arg, rx.pattern)
+    if kind == 'distinct_from':
+        for p in arg:
+            fd, other = _rh_get(pol, root + '.' + p)
+            if not fd:
+                return 'requires %s declared (missing dependency)' % (p,)
+            if _rh_ca_same(s, other):
+                return 'equals %s (%r); it must be distinct from %s' % (p, other, arg)
+        return None
+    if kind == 'placeholder_words':
+        return _rh_ca_words(s, arg, pats)
     if kind == 'ere':
         return _rh_ca_ere(s, arg, chk.get('sed_delimited', False))
     if kind == 'ere_compose':
@@ -2713,12 +2792,25 @@ def _rh_admit_contracts(pol, schema, key):
         for chk in c['checks']:
             kind = [k for k in chk if k in _RH_CA_KINDS][0]
             dotted = chk['at'] if 'at' in chk else '.'.join(p for p in (c['root'], chk['path']) if p)
-            found, v = _rh_get(pol, dotted)
+            if '*' in dotted.split('.'):
+                # a '*' segment: every expanded node is a subject; expanding to nothing refuses (never vacuous)
+                vals = [n for _p, n in _rh_expand(pol, dotted)]
+                found, v = bool(vals), vals
+            else:
+                found, v = _rh_get(pol, dotted)
+                vals = [v]
             why = 'is not declared' if not found else None
-            if why is None:
-                subjects = (list(v.values()) if isinstance(v, dict) else v if isinstance(v, list) else None) if chk.get('each') else [v]
+            for val in (vals if why is None else []):
+                subjects = (list(val.values()) if isinstance(val, dict) else val if isinstance(val, list) else None) if chk.get('each') else [val]
                 if subjects is None:
-                    why = 'must be a list or mapping (each)'
+                    why = why or 'must be a list or mapping (each)'
+                elif 'where' in chk:
+                    fw, want = _rh_get(pol, chk['where']['equals_at'])
+                    if not fw:
+                        why = why or 'selects entries by %s, which the policy does not declare (missing dependency)' % (chk['where']['equals_at'],)
+                    subjects = [x for x in subjects if isinstance(x, dict) and chk['where']['field'] in x and _rh_ca_same(x[chk['where']['field']], want)]
+                    if not subjects:
+                        why = why or 'selects no entry whose %s equals %s (%r); the selection must not be empty' % (chk['where']['field'], chk['where']['equals_at'], want)
                 for sub in subjects or []:
                     why = why or _rh_ca_check(kind, chk[kind], sub, chk, pol, pats, schema, c['root'])
             if why:
