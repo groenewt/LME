@@ -1,0 +1,184 @@
+---
+# testing/remote_harness/package.yml -- artifact admission + seed packaging (SEED-07 / SEED-08). Local, offline.
+#
+#   ansible-playbook -i <operator inventory> testing/remote_harness/package.yml
+# with localhost host vars (inputs, no defaults):
+#   rh_artifact_source  directory holding the declared artifact files (controller.bootstrap.artifacts + the lock's
+#                       wheels and collections), e.g. an acquisition directory; never fetched, never downloaded
+#   rh_bundle_dir       the bundle destination (its parent owned by the invoking account; absent, or already holding
+#                       the byte-identical bundle -> UNCHANGED). It becomes:
+#                         <bundle>/lme-controller-seed.sh   rendered seed (build output, mode 0500)
+#                         <bundle>/artifacts/<file>         admitted copies, sha256-verified, mode 0400
+#                         <bundle>/bundle.json              schema, seed/profile/lock digests, artifact rows, renderer
+# Then: <bundle>/lme-controller-seed.sh apply --root <owned root>   and
+#       <bundle>/lme-controller-seed.sh run --root <owned root> --ssh-auth <mode> -- -i <inventory> testing/remote_harness/controller.yml
+#
+# Offline behaviour: every declared file must already be in rh_artifact_source with its declared sha256; ALL
+# missing and ALL mismatched files are named in one refusal before anything is written.
+# SEED2-PACKAGE-RESERVATION: every component of the destination's ancestry is admitted (real dirs, owned by 0 or the
+# builder, not group/other-writable; the parent owned by the builder) and the destination, if present, is an owned real
+# dir -- all BEFORE any write. The bundle is built ONLY inside an exclusively reserved sibling staging dir
+# (ansible.builtin.tempfile = mkdtemp, `.<name>.<bundle.staging_infix>.<holder lease>.<random>`) and published by ONE
+# declared `mv -T` rename; concurrent builders at one destination each own a private staging dir, and exactly one
+# rename can land (a rename onto a non-empty directory fails), so mixed identities can never be published. A destination
+# already holding the byte-identical bundle.sha256 AND bundle.json (same provenance: profile, lock, class key,
+# builder, source) is UNCHANGED; any other content refuses and is preserved. A failed or interrupted run leaves only
+# its staging dir and lease record; the NEXT attempt reaps them only when that run's writers are PROVABLY QUIESCENT
+# (tasks/reap_staging.yml, bundle.staging_retention: owned-manifest admission + lease record + the recorded holder
+# absent AND its cgroup gone/empty in an admitted namespace view; every reap mutation under `flock -x -n` on the
+# destination lock; a LIVE, busy or unprovable entry is never touched, it is preserved, reported and charged; free
+# space checked after the reap, before reserving), so no quiescent staging accumulates and rerunning at the SAME
+# destination resumes. PUBLISH FENCE: the one publish rename runs under `flock -x -w` on the SAME destination lock,
+# so a staging path a reaper moved away can never be published (mv finds no source), and a lock held past
+# lease.publish_wait_seconds refuses RH-STAGING-BUSY. PUBLICATION AUTHORITY (r3f, lease.authority): the token-named
+# staging path is the authority, checked atomically by the NO-REPLACE rename while the lock is held; a revoker renames
+# it away under the lock only after proving quiescence, so a resumed old writer refuses RH-STAGING-REVOKED and never
+# touches the revoker's staging; a destination that appeared (even empty) is never replaced; a present different
+# bundle is refused with its recorded class_key reported. A concurrent builder at the same destination keeps its
+# staging: one PUBLISHED, the other UNCHANGED (same bundle) or REFUSED (different bundle), each releasing only its own.
+# bundle.json is written last inside the staging dir; the
+# seed's `apply` independently refuses an incomplete bundle (SEED2-BUNDLE-COMPLETION).
+# GENESIS (codex-tick127, controller.bootstrap.genesis): this playbook IS the declared package-builder stage. Before
+# any write it admits EXACTLY the declared builder (tasks/admit_builder.yml: executable + shebang, python, core,
+# ansible package dir, no config file, no stray ANSIBLE_* env, non-root; no search/fallback), and binds the source
+# edition with the declared git (os_tools.git, conditional prerequisite of package_source_binding). bundle.json
+# records builder, source, input and output identities. The bundle is the distributable bootstrap artifact: a fresh
+# consumer needs NO Ansible -- `sha256sum --check bundle.sha256` inside it, then the seed. controller.yml's managed
+# re-render is a SECOND check, not retroactive authorization.
+# Missing artifacts: testing/remote_harness/acquire.yml (MAIN, network stage, sha256-pinned, declared sources only).
+# The per-destination body (input admission -> reap -> reserve -> render -> readback -> publish -> admit_bundle) lives
+# in tasks/package_bundle.yml (r3g step 1, a pure move) and runs ONCE PER ARTIFACT CLASS (r3g step 2,
+# controller.bootstrap.bundle.per_class): tasks/scope_classes.yml binds the controller scope and partitions the
+# deployment's scopes by C1's published class key; the controller's class publishes at rh_bundle_dir, every other class
+# at its declared sibling. Run package.yml with the SAME inventory as target_bootstrap.yml so every class exists.
+# bundle.json records class_key (identity = class key + artifact digests), not a policy digest (r3g change: the former
+# config_revision field is replaced; seed, artifacts and bundle.sha256 of a homogeneous deployment are unchanged).
+- name: Package the managed-controller bundle (admit artifacts, render the seed)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
+
+    - name: Bind the effective controller connection before any effect (local, localhost, no become; r3g)
+      ansible.builtin.include_tasks: tasks/admit_controller.yml
+
+    - name: Resolve the harness policy through the engine
+      ansible.builtin.include_tasks: tasks/resolve_policy.yml
+
+    - name: Admit exactly the declared builder before any write (GENESIS)
+      ansible.builtin.include_tasks: tasks/admit_builder.yml
+
+    - name: Hash every declared executable this controller runs, independently of the tools (stat sha256, links followed)
+      ansible.builtin.stat:
+        path: "{{ item.value.path }}"
+        follow: true
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: "{{ rh.controller.bootstrap.os_tools | dict2items | rejectattr('value.required_by', 'equalto', ['target_adapter']) | list }}"
+      loop_control:
+        label: "{{ item.key }}"
+      register: _rh_pkg_ident
+
+    # r3f (G D05): identity is judged on PRESENT files only; an absent tool is a MISSING tool (git: the source-binding
+    # refusal below, D05; any other: RH-OS-TOOL-MISSING), never an identity refusal. All still before any tool runs.
+    - name: Refuse any declared executable whose content is not its declared identity (SEED-06 file_sha256; before any tool runs)
+      vars:
+        _tst: "{{ _rh_pkg_ident.results | selectattr('stat.exists') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_ident.results | map(attribute='item.value.identity.kind') | unique | list == ['file_sha256']
+          - >-
+            _tst | map(attribute='stat') | map(attribute='checksum', default='') | list
+            == _tst | map(attribute='item.value.identity.sha256') | list
+        fail_msg: >-
+          REFUSED RH-OS-TOOL-IDENTITY: declared executables whose resolved content differs from the declared file_sha256
+          (or is unreadable):
+          {% for r in _tst if (r.stat.checksum | default('')) != r.item.value.identity.sha256 %}{{ r.item.key }}={{ r.item.value.path }}({{ r.stat.checksum | default('unreadable') }}) {% endfor %}.
+          Nothing was written; re-hash the declaration only after MAIN verifies the new file.
+        quiet: true
+
+    - name: Check the conditional source-binding prerequisite (os_tools.git, package_source_binding)
+      ansible.builtin.stat:
+        path: "{{ rh.controller.bootstrap.os_tools.git.path }}"
+      register: _rh_src_tool
+
+    - name: Refuse a missing source-binding tool (never installed ad hoc)
+      ansible.builtin.assert:
+        that:
+          - "'package_source_binding' in rh.controller.bootstrap.os_tools.git.required_by"
+          - _rh_src_tool.stat.exists and _rh_src_tool.stat.executable
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: package_source_binding needs
+          {{ rh.controller.bootstrap.os_tools.git.path }} (packages.by_os_family.<family>.git; installed by MAIN).
+        quiet: true
+
+    - name: Refuse missing or non-executable controller tools, named with their packages, before any of them runs (read-only)
+      vars:
+        _missing_names: >-
+          {{ _rh_pkg_ident.results | rejectattr('stat.exists') | map(attribute='item.key') | list
+             + (_rh_pkg_ident.results | selectattr('stat.exists') | rejectattr('stat.executable') | map(attribute='item.key') | list) }}
+        _pkgs: >-
+          {% set ns = namespace(p=[]) %}{% for kv in rh.packages.provides | dict2items %}{% if kv.value | intersect(_missing_names) | length > 0 %}{% set ns.p = ns.p + [kv.key] %}{% endif %}{% endfor %}{{ ns.p }}
+      ansible.builtin.assert:
+        that:
+          - _missing_names | length == 0
+        fail_msg: >-
+          REFUSED RH-OS-TOOL-MISSING: missing or non-executable controller tools {{ _missing_names }} at
+          {{ _missing_names | map('extract', rh.controller.bootstrap.os_tools) | map(attribute='path') | list }} -> logical
+          packages {{ _pkgs }} = Debian {{ _pkgs | map('extract', rh.packages.by_os_family.Debian) | list }} / RedHat
+          {{ _pkgs | map('extract', rh.packages.by_os_family.RedHat) | list }} (MAIN installs them; never ad hoc; an
+          admitted os_tools path override names its own location). Nothing was written.
+        quiet: true
+
+    - name: Bind the source edition (read-only git)
+      ansible.builtin.command:
+        argv: "{{ [rh.controller.bootstrap.os_tools.git.path, '-C', rh_repo_root] + item }}"
+      loop:
+        - [rev-parse, HEAD]
+        - [status, --porcelain=v1, --untracked-files=all, --, manifests/profiles/remote-harness.yml, testing/remote_harness, ansible/roles/podman]
+      register: _rh_src_git
+      changed_when: false
+
+    - name: List the engine filter plugins the builder loads (filter closure)
+      ansible.builtin.find:
+        paths: "{{ rh.controller.bootstrap.genesis.builder.filter_plugins_rel | map('regex_replace', '^', rh_repo_root ~ '/') | list }}"
+        patterns: ['*.py']
+        file_type: file
+      register: _rh_src_filters
+
+    - name: Digest every source input of the render (profile, lock, templates, playbook, tasks, filter plugins)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: >-
+        {{ ([rh.controller.bootstrap.template_rel, rh.controller.bootstrap.macros_rel, rh.controller.bootstrap.package_playbook_rel,
+             rh.controller.lock_file_rel, 'manifests/profiles/remote-harness.yml', 'testing/remote_harness/tasks/admit_builder.yml',
+             'testing/remote_harness/tasks/resolve_policy.yml', 'testing/remote_harness/tasks/refuse_pinned_outputs.yml',
+             'testing/remote_harness/tasks/admit_controller.yml', 'testing/remote_harness/tasks/scope_classes.yml',
+             'testing/remote_harness/tasks/package_bundle.yml']
+            | map('regex_replace', '^', rh_repo_root ~ '/') | list)
+           + (_rh_src_filters.files | map(attribute='path') | sort) }}
+      register: _rh_src_inputs
+
+    - name: Bind the controller scope and derive the deployment's artifact classes (RH-SCOPE-BINDING; tasks/scope_classes.yml)
+      ansible.builtin.include_tasks: tasks/scope_classes.yml
+
+    # r3g per-class publication: ONE full publication destination per class (bundle.per_class); the controller's class
+    # at rh_bundle_dir. The CONTENT view is the class scope's own policy and lock; the EXECUTION view (tools, path
+    # admission, staging/lease policy) stays this controller's rh. Include params are registry-reserved names.
+    - name: Publish each class's bundle destination (input admission, reap, reserve, render, readback, publish, admission)
+      ansible.builtin.include_tasks: tasks/package_bundle.yml
+      loop: "{{ rh_classes }}"
+      loop_control:
+        loop_var: _rh_class
+        label: "{{ _rh_class.key }} {{ _rh_class.dir }} controller={{ _rh_class.controller }} targets={{ _rh_class.targets }}"
+      vars:
+        rh_pub_dir: "{{ _rh_class.dir }}"
+        rh_pub_key: "{{ _rh_class.key }}"
+        rh_pub_policy: "{{ _rh_class.policy }}"
+        rh_pub_lock: "{{ lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ _rh_class.policy.controller.lock_file_rel) | from_yaml }}"

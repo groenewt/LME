@@ -1,0 +1,69 @@
+---
+# testing/remote_harness/tasks/refuse_pinned_outputs.yml -- FIRST task of every harness entrypoint (SEED-05).
+#
+# Extra-vars outrank set_fact and register, so any harness-derived name supplied from outside (-e, inventory)
+# would supersede the value the harness derives. This guard refuses that at play entry: the name list is
+# C1's REGISTRY list (manifests/global.yml lme_config_registry.remote_harness_schema.reserved_outputs; the profile's
+# former controller.bootstrap.derived_outputs is retired and refused by the projection), read INLINE from the
+# repository located INLINE from the magic variable playbook_dir (magic variables outrank extra-vars), so no
+# variable can pin the list or its location. After this guard passes, every later set_fact/register of those names
+# is authoritative for the play (only an extra-var could outrank it, and none is present).
+#
+# SEED-06 raw-read justification (codex-232517 raw_readers): the list is read from the RAW global.yml BEFORE any
+# resolve because the guard must run first. That equals the resolved value because the registry is not part of
+# lme_global: no lme_global_override can reach it, and global.yml is byte-bound by the engine (_lme_global_file).
+# A new internal name is added to reserved_outputs by C1 in the same joint slice, never to the profile.
+# An unreadable or empty list refuses (never an empty guard).
+#
+# Interface revision 5 (r3g; C1 field contract 033500): the guard also refuses C1's registry resolver_outputs
+# (lme_resolved, lme_global, _lme_rh_scope, ... -- the engine resolve's own set_fact/include_vars/register names),
+# which C1 says to refuse only at a host's FIRST entry. Every harness include of this guard IS a first entry: each
+# entrypoint (controller.yml, package.yml, acquire.yml, target_bootstrap.yml) has exactly ONE play per host (the
+# controller play on localhost; the target play on lme_toolchain_targets, which C1's projection keeps disjoint from
+# the controller), and this guard is that play's first task, before any resolve. A caller that re-enters a host in
+# a later play after resolving must not include this guard there (B's CASES re-entry is restructured accordingly).
+#
+# Supported inputs (inventory host vars lme_toolchain_root / lme_toolchain_owner, package inputs
+# rh_artifact_source / rh_bundle_dir / rh_acquisition_receipt) are NOT reserved outputs and still compose.
+
+- name: Refuse pre-supplied harness derived outputs (extra-vars / inventory cannot pin them)
+  # the list expression is INLINE in every use: a task var could itself be outranked by an extra-var
+  ansible.builtin.assert:
+    that:
+      - >-
+        ((lookup('ansible.builtin.file',
+            ([playbook_dir, playbook_dir | dirname, playbook_dir | dirname | dirname, playbook_dir | dirname | dirname | dirname]
+             | map('regex_replace', '$', '/manifests/profiles/remote-harness.yml') | select('file') | first)
+            | dirname | dirname | regex_replace('$', '/global.yml')) | from_yaml).lme_config_registry.remote_harness_schema.reserved_outputs
+         | default([])) | length > 0
+      - >-
+        ((lookup('ansible.builtin.file',
+            ([playbook_dir, playbook_dir | dirname, playbook_dir | dirname | dirname, playbook_dir | dirname | dirname | dirname]
+             | map('regex_replace', '$', '/manifests/profiles/remote-harness.yml') | select('file') | first)
+            | dirname | dirname | regex_replace('$', '/global.yml')) | from_yaml).lme_config_registry.remote_harness_schema.resolver_outputs
+         | default([])) | length > 0
+      - >-
+        (((lookup('ansible.builtin.file',
+            ([playbook_dir, playbook_dir | dirname, playbook_dir | dirname | dirname, playbook_dir | dirname | dirname | dirname]
+             | map('regex_replace', '$', '/manifests/profiles/remote-harness.yml') | select('file') | first)
+            | dirname | dirname | regex_replace('$', '/global.yml')) | from_yaml).lme_config_registry.remote_harness_schema
+           | dict2items | selectattr('key', 'in', ['reserved_outputs', 'resolver_outputs']) | map(attribute='value') | flatten | list)
+         + ['rh_repo_root']) | select('in', vars) | list | length == 0
+    fail_msg: >-
+      REFUSED RH-DERIVED-OUTPUT-PINNED: harness-derived or resolver-derived names were supplied from outside the
+      harness (extra-var or inventory): {{ (((lookup('ansible.builtin.file',
+            ([playbook_dir, playbook_dir | dirname, playbook_dir | dirname | dirname, playbook_dir | dirname | dirname | dirname]
+             | map('regex_replace', '$', '/manifests/profiles/remote-harness.yml') | select('file') | first)
+            | dirname | dirname | regex_replace('$', '/global.yml')) | from_yaml).lme_config_registry.remote_harness_schema
+           | dict2items | selectattr('key', 'in', ['reserved_outputs', 'resolver_outputs']) | map(attribute='value') | flatten | list)
+         + ['rh_repo_root']) | select('in', vars) | list }} -- they are outputs of the harness or of the engine
+      resolve, never inputs; or a registry list (manifests/global.yml lme_config_registry.remote_harness_schema
+      reserved_outputs / resolver_outputs) is missing or empty.
+    quiet: true
+
+- name: Derive the repository root from the declared profile location (inline; not an input)
+  ansible.builtin.set_fact:
+    rh_repo_root: >-
+      {{ ([playbook_dir, playbook_dir | dirname, playbook_dir | dirname | dirname, playbook_dir | dirname | dirname | dirname]
+          | map('regex_replace', '$', '/manifests/profiles/remote-harness.yml') | select('file') | first)
+         | dirname | dirname | dirname }}

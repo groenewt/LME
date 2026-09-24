@@ -1,0 +1,163 @@
+---
+# testing/remote_harness/tasks/admit_transport.yml -- per TARGET host, BEFORE any effect (S3 / codex-tick127).
+# Runs in a target play (the play host is the target) under `seed run`. Requires resolve_policy.yml. Read-only;
+# nothing here contacts the host (connection variables and the controller-side managed env only).
+#
+# One declared SSH authentication mode (controller.bootstrap.ssh_auth) for every stage:
+#   - the host's mode variable (no default) equals the mode `seed run --ssh-auth` exported (LME_SSH_AUTH_MODE);
+#   - the managed env carries exactly the mode's declared ssh arguments (ANSIBLE_SSH_COMMON_ARGS);
+#   - the INVENTORY ansible_ssh_common_args is one of the declared accepted forms (ssh_auth.composition.inventory_forms:
+#     absent, empty, the mode's own args exactly, or B's ONE admitted ProxyJump form proxy_jump.form_regex; proxy_jump
+#     '' for the no-jump forms); the EFFECTIVE value equals the controller projection
+#     (hostvars.localhost.rh_conn: mode args + that ProxyJump clause), so an extra-var override refuses; no extra args;
+#   - explicit_key: the key reference (path only; the key is never read) is set and admitted;
+#     agent: the carried socket reference is set and admitted (the seed validated socket + owner);
+#     tailnet_identity: no key reference and no agent socket are used;
+#   - the connection user is the declared owner and privilege escalation is off (no become anywhere).
+# Any other state refuses (RH-TRANSPORT-AUTH / RH-TARGET-BOOTSTRAP) and nothing is attempted.
+
+- name: Refuse an undeclared, mismatched or overridden SSH authentication mode (RH-TRANSPORT-AUTH)
+  vars:
+    _sa: "{{ rh.controller.bootstrap.ssh_auth }}"
+    _mode: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.ssh_auth.mode_var, default='') }}"
+    _run_mode: "{{ lookup('ansible.builtin.env', rh.controller.bootstrap.ssh_auth.env_mode) }}"
+  ansible.builtin.assert:
+    that:
+      - _mode in _sa.modes
+      - _mode == _run_mode
+      - lookup('ansible.builtin.env', 'ANSIBLE_SSH_COMMON_ARGS') == _sa.modes[_mode].ssh_common_args
+      - hostvars['localhost'].rh_conn is defined and inventory_hostname in hostvars['localhost'].rh_conn
+      # r3g ACCEPTED-FORMS (codex 040323): the declared rule ssh_auth.composition.inventory_forms, in its only defined
+      # vocabulary (a changed or extended rule refuses rather than being half-applied); absent reads as ''
+      - _sa.composition.inventory_forms.var == _sa.composition.proxy_jump.var
+      - _sa.composition.inventory_forms.other == 'refuse'
+      - >-
+        _sa.composition.inventory_forms.accepted | map(attribute='test') | list
+        == ['undefined', 'equals_empty', 'equals_mode_args', 'match_form_regex']
+      - >-
+        _sa.composition.inventory_forms.accepted | map(attribute='proxy_jump') | list
+        == ['', '', '', 'form_regex_capture_1']
+      # absent and empty (projected as ''), the selected mode's own args exactly, or the ProxyJump form
+      - >-
+        hostvars['localhost'].rh_conn[inventory_hostname].inventory_common_args in ['', _sa.modes[_mode].ssh_common_args]
+        or hostvars['localhost'].rh_conn[inventory_hostname].inventory_common_args is match(_sa.composition.proxy_jump.form_regex)
+      - >-
+        ansible_ssh_common_args == _sa.modes[_mode].ssh_common_args
+        ~ ((' -o ProxyJump=' ~ hostvars['localhost'].rh_conn[inventory_hostname].proxy_jump)
+           if hostvars['localhost'].rh_conn[inventory_hostname].proxy_jump | length > 0 else '')
+      - ansible_ssh_extra_args is not defined or ansible_ssh_extra_args | length == 0
+      - >-
+        _mode != 'explicit_key' or (lookup('ansible.builtin.vars', _sa.modes.explicit_key.key_var, default='') is string
+        and lookup('ansible.builtin.vars', _sa.modes.explicit_key.key_var, default='') is match(rh.controller.bootstrap.path_admission.regex))
+      - >-
+        _mode != 'agent' or lookup('ansible.builtin.env', _sa.modes.agent.socket_env) is match(rh.controller.bootstrap.path_admission.regex)
+      - >-
+        _mode == 'agent' or lookup('ansible.builtin.env', _sa.modes.agent.socket_env) | length == 0
+      - >-
+        _mode != 'tailnet_identity' or lookup('ansible.builtin.vars', _sa.modes.explicit_key.key_var, default='') | length == 0
+    fail_msg: >-
+      REFUSED {{ _sa.refusal }} on {{ inventory_hostname }}: host mode '{{ _mode }}' (var {{ _sa.mode_var }}, no default),
+      run mode '{{ _run_mode }}' (seed run --ssh-auth); declared modes {{ _sa.modes | list | sort }}. The inventory's
+      ansible_ssh_common_args may only be absent, the mode's args, or `-o ProxyJump=<jump>` (B's admitted form), and the
+      effective value must be the controller's composition (no extra-var override, no extra args); explicit_key needs {{ _sa.modes.explicit_key.key_var }} (a path reference),
+      agent needs the seed-validated {{ _sa.modes.agent.socket_env }}, tailnet_identity uses neither.
+    quiet: true
+
+- name: Refuse a connection that is not the declared non-root owner, or any privilege escalation (RH-TARGET-BOOTSTRAP)
+  vars:
+    _owner: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.owner_var, default='') }}"
+  ansible.builtin.assert:
+    that:
+      - _owner is string and _owner is match('^[a-z_][a-z0-9_-]*$') and _owner != 'root'
+      - (ansible_user | default('')) == _owner
+      - not (ansible_become | default(false) | bool)
+      - (ansible_become_user | default('')) in ['', _owner]
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }}: the target bootstrap
+      connects AS the declared owner ({{ rh.controller.bootstrap.inventory.owner_var }}='{{ _owner }}', never root) with
+      ansible_user equal to it and become off (connection user '{{ ansible_user | default('') }}').
+    quiet: true
+
+# r3f DECLARED-INPUTS (codex-tick144): the connection plugin, the target address and the SSH session knobs are
+# DECLARED INPUTS (inventory; never reserved outputs), validated here on their EFFECTIVE values before any contact.
+# The ssh plugin is the only admitted transport (a local/other connection would run the target play elsewhere); the
+# ControlPath/ssh_args knobs stay unset so each run's ControlMaster lives in the seed's fresh per-run ANSIBLE_HOME
+# (the target session-separation premise of staging_retention.target_quiescence). ProxyJump composition is admitted above.
+# r3g ENDPOINT COLLISION (codex 023332 TRANSPORT-COMPOSITION-REMAINDERS; codex tick150 025151): declared targets are
+# told apart by their declared EFFECTIVE connection key (r3g/codex 035141: ONE declared rule, ssh_auth.composition
+# .{address, port, proxy_jump, endpoint_key} + inventory.owner_var, which C1's scope binding consumes too; no inline
+# literal here), not by address alone: address (composition.address, lowercased) + the port per
+# the declared rule ssh_auth.composition.port (explicit value, or the absent_key token when absence delegates to the
+# owner's ssh configuration -- the same rule the ssh plugin and B's contract apply) + the ProxyJump route (controller
+# projection rh_conn) + the admitted owner (inventory.owner_var, which the play binds as ansible_user). Two inventory
+# names with one key are the same declared connection under two names (alias collapse) and both refuse; an
+# extra-var repoint that makes hosts coincide refuses the same way. Distinct explicit ports or distinct jump routes
+# behind one address pass. The deprecated port/host/user aliases stay refused so the key reads the effective vars.
+# EVIDENCE LIMIT (codex tick150): this detects DECLARED connection collisions only. It does not prove distinct
+# machines or failure domains, nor the absence of DNS or ssh_config aliases (two alias strings that ssh_config or DNS
+# map to one HostName/Port; an absent port whose ssh_config Port equals another host's explicit port). An owner or
+# route difference alone is never reported as a different machine; actual endpoint readback stays an explicit
+# later check. A legitimate edit of a declared endpoint is supported configuration: the per-target policy and
+# artifact binding to deployment, edition and operation (C1 contract, E40-E43) binds it; no identity input is added.
+- name: Refuse an effective transport other than the admitted SSH connection to a distinct target endpoint (RH-TARGET-BOOTSTRAP)
+  vars:
+    _tg: "{{ groups[rh.controller.bootstrap.inventory.target_group] | default([]) }}"
+    # every component read from the ONE declared endpoint rule (ssh_auth.composition.{address, port, proxy_jump,
+    # endpoint_key} + inventory.owner_var); the key order is composition.endpoint_key
+    _ep: >-
+      {%- set c = rh.controller.bootstrap.ssh_auth.composition -%}
+      {%- set ns = namespace(a=[]) -%}
+      {%- for h in _tg -%}
+      {%- set parts = {
+            'address': (hostvars[h][c.address.var] if hostvars[h][c.address.var] is defined else hostvars[h][c.address.absent]) | string | lower,
+            'port': (hostvars[h][c.port.var] | string) if hostvars[h][c.port.var] is defined else c.port.absent_key,
+            'proxy_jump': hostvars['localhost'].rh_conn[h].proxy_jump
+                          if (hostvars['localhost'].rh_conn is defined and h in hostvars['localhost'].rh_conn) else c.proxy_jump.unprojected_key,
+            'owner': hostvars[h][rh.controller.bootstrap.inventory.owner.var] | default(rh.controller.bootstrap.inventory.owner.absent)} -%}
+      {%- set ns.a = ns.a + [c.endpoint_key | map('extract', parts) | list | to_json] -%}
+      {%- endfor -%}
+      {{ ns.a }}
+  ansible.builtin.assert:
+    that:
+      # the declared rule uses only the defined vocabulary (a normalization or component the task cannot apply refuses)
+      - rh.controller.bootstrap.ssh_auth.composition.address.normalize == 'lower'
+      - rh.controller.bootstrap.ssh_auth.composition.endpoint_key | sort == ['address', 'owner', 'port', 'proxy_jump']
+      # the declared owner-absent rule (inventory.owner) names the same variable as inventory.owner_var
+      - rh.controller.bootstrap.inventory.owner.var | default('') == rh.controller.bootstrap.inventory.owner_var
+      - rh.controller.bootstrap.inventory.owner.absent is defined and rh.controller.bootstrap.inventory.owner.absent is string
+      - (ansible_connection | default('ssh')) in ['ssh', 'ansible.builtin.ssh']
+      - ansible_ssh_args is not defined
+      - ansible_control_path is not defined
+      - ansible_control_path_dir is not defined
+      - ansible_ssh_executable is not defined
+      # aliases that could bypass the admitted user/key/address/port, and password auth (same refused set as B's contract)
+      - ansible_ssh_host is not defined and ansible_ssh_user is not defined and ansible_private_key_file is not defined
+      - ansible_ssh_port is not defined
+      - ansible_password is not defined and ansible_ssh_pass is not defined
+      - >-
+        (hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.address.var]
+         | default(hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.address.absent])) is string
+      - >-
+        (hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.address.var]
+         | default(hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.address.absent])) | length > 0
+      - >-
+        (hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.address.var]
+         | default(hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.address.absent])) | lower
+        is not match('^(localhost|127[.]|::1$|0[.]0[.]0[.]0$)')
+      - >-
+        hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.port.var] is not defined
+        or ((hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.port.var] | string) is match(rh.controller.bootstrap.ssh_auth.composition.port.explicit_regex)
+            and (hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.port.var] | int) <= rh.controller.bootstrap.ssh_auth.composition.port.explicit_max)
+      - _ep | length == _tg | length and _ep | unique | length == _ep | length
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }}: the effective connection
+      must be the ssh plugin (got '{{ ansible_connection | default('ssh') }}') to a non-loopback target address
+      (got '{{ hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.address.var] | default(hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.address.absent]) }}',
+      port '{{ hostvars[inventory_hostname][rh.controller.bootstrap.ssh_auth.composition.port.var] | default(rh.controller.bootstrap.ssh_auth.composition.port.absent_key) }}')
+      whose declared connection key ({{ rh.controller.bootstrap.ssh_auth.composition.endpoint_key | join(', ') }}; the
+      declared rule ssh_auth.composition + inventory.owner_var) collides with no other declared target (no alias
+      collapse), without
+      ansible_ssh_args / ansible_control_path / ansible_control_path_dir / ansible_ssh_executable (the per-run
+      ControlMaster is part of the admitted transport) and without the alias or password variables ansible_ssh_host /
+      ansible_ssh_user / ansible_ssh_port / ansible_private_key_file / ansible_password / ansible_ssh_pass.
+    quiet: true

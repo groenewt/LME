@@ -1,0 +1,85 @@
+---
+# testing/remote_harness/tasks/admit_builder.yml -- GENESIS builder admission (codex-tick127 genesis).
+#
+# The package-builder stage (package.yml, acquire.yml) runs on an executor that exists BEFORE any managed
+# generation. It is admitted ONLY when it is exactly the declared builder (controller.bootstrap.genesis.builder):
+# declared executable (exact shebang line), declared python (path + major.minor), declared core, the ansible
+# package imported from the declared directory, NO ansible config file discovered, and no ANSIBLE_* variable
+# outside env_allow. No search, no fallback. Nothing is written before this passes. Non-root only.
+# Requires refuse_pinned_outputs.yml and resolve_policy.yml earlier in the play (localhost, connection local).
+
+- name: Refuse a privileged builder and read the builder's environment and interpreter facts (no writes)
+  ansible.builtin.setup:
+    gather_subset: ['!all', '!min', 'env', 'python', 'user']
+
+- name: Read the declared builder executable and interpreter (no writes)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop:
+    - "{{ rh.controller.bootstrap.genesis.builder.executable }}"
+    - "{{ rh.controller.bootstrap.genesis.builder.python }}"
+  register: _rh_bld_stat
+
+- name: Read the builder executable's first line (its interpreter binding)
+  ansible.builtin.slurp:
+    src: "{{ rh.controller.bootstrap.genesis.builder.executable }}"
+  register: _rh_bld_head
+  when: _rh_bld_stat.results[0].stat.exists
+
+- name: Ask the declared interpreter where its ansible package lives (read-only)
+  ansible.builtin.command:
+    argv:
+      - "{{ rh.controller.bootstrap.genesis.builder.python }}"
+      - -I
+      - -B
+      - -c
+      - import ansible, os; print(os.path.dirname(ansible.__file__))
+  register: _rh_bld_pkg
+  changed_when: false
+  failed_when: false
+  when: _rh_bld_stat.results[1].stat.exists
+
+- name: Refuse any builder that is not exactly the declared one (RH-BUILDER-UNSUPPORTED)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.user_uid | int != 0
+      - _rh_bld_stat.results[0].stat.exists and _rh_bld_stat.results[0].stat.isreg and _rh_bld_stat.results[0].stat.executable
+      - _rh_bld_stat.results[1].stat.exists and _rh_bld_stat.results[1].stat.executable
+      - (_rh_bld_head.content | b64decode).splitlines()[0] == rh.controller.bootstrap.genesis.builder.shebang
+      - ansible_playbook_python == rh.controller.bootstrap.genesis.builder.python
+      - ansible_version.full == rh.controller.bootstrap.genesis.builder.core
+      - ansible_facts.python.executable == rh.controller.bootstrap.genesis.builder.python
+      - (ansible_facts.python.version.major ~ '.' ~ ansible_facts.python.version.minor) == rh.controller.bootstrap.genesis.builder.python_major_minor
+      - _rh_bld_pkg.rc == 0 and _rh_bld_pkg.stdout == rh.controller.bootstrap.genesis.builder.ansible_package_dir
+      - ansible_config_file is none or ansible_config_file | length == 0
+      - >-
+        ansible_facts.env | dict2items | map(attribute='key') | select('match', '^ANSIBLE_')
+        | reject('in', rh.controller.bootstrap.genesis.builder.env_allow) | list | length == 0
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: the package-builder stage runs only on the declared
+      builder {{ rh.controller.bootstrap.genesis.builder.executable }} (first line
+      '{{ rh.controller.bootstrap.genesis.builder.shebang }}', core {{ rh.controller.bootstrap.genesis.builder.core }},
+      python {{ rh.controller.bootstrap.genesis.builder.python }} {{ rh.controller.bootstrap.genesis.builder.python_major_minor }},
+      ansible from {{ rh.controller.bootstrap.genesis.builder.ansible_package_dir }}), non-root, with NO ansible config
+      file (found: {{ ansible_config_file | default('none') }}) and no ANSIBLE_* variables besides
+      {{ rh.controller.bootstrap.genesis.builder.env_allow }} (found:
+      {{ ansible_facts.env | dict2items | map(attribute='key') | select('match', '^ANSIBLE_') | list }}).
+      Running: core {{ ansible_version.full }} on {{ ansible_playbook_python }}. A missing builder is installed by
+      MAIN (root step) from packages {{ rh.controller.bootstrap.genesis.builder.packages }}; nothing else is searched.
+    quiet: true
+
+- name: Record the admitted builder identity (derived output)
+  ansible.builtin.set_fact:
+    rh_builder:
+      executable: "{{ rh.controller.bootstrap.genesis.builder.executable }}"
+      executable_sha256: "{{ _rh_bld_stat.results[0].stat.checksum }}"
+      python: "{{ ansible_playbook_python }}"
+      python_sha256: "{{ _rh_bld_stat.results[1].stat.checksum }}"
+      python_version: "{{ ansible_facts.python.version.major }}.{{ ansible_facts.python.version.minor }}.{{ ansible_facts.python.version.micro }}"
+      ansible_core: "{{ ansible_version.full }}"
+      ansible_package_dir: "{{ _rh_bld_pkg.stdout }}"
+      config_file: none
+      uid: "{{ ansible_facts.user_uid }}"

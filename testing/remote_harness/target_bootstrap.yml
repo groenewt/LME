@@ -1,0 +1,717 @@
+---
+# testing/remote_harness/target_bootstrap.yml -- the managed TARGET bootstrap (S1 / codex-tick127): the SAME one
+# operation as the controller bootstrap (same package.yml bundle, same seed bytes, same `apply`, same receipt schema,
+# same verifier), transported by the declared adapter (remote_harness.transfer.managed_archive) and applied by the
+# declared NON-ROOT owner on every host of the declared role group. No host-name branch, no become anywhere.
+#
+#   <bundle>/lme-controller-seed.sh run --root <controller root> --ssh-auth <mode> -- \
+#       -i <inventory> testing/remote_harness/target_bootstrap.yml
+# Inventory (no defaults):
+#   localhost: lme_toolchain_root / lme_toolchain_owner (controller), rh_bundle_dir (the package.yml bundle of the
+#              controller's class; other classes at its declared siblings, bundle.per_class)
+#   group lme_toolchain_targets (= controller.bootstrap.inventory.target_group), per host:
+#     lme_toolchain_root, lme_toolchain_owner, lme_toolchain_bundle_dir, lme_ssh_auth_mode, ansible_user (= owner)
+#     and, for explicit_key, lme_toolchain_owner_key (a path reference; never read by the harness); optionally
+#     ansible_ssh_common_args in B's ONE admitted proxy form `-o ProxyJump=<jump>` (M1-TRANSPORT-COMPOSITION)
+#
+# Order (every refusal happens BEFORE the first target effect):
+#   controller: refuse pinned outputs -> effective local connection, no become (admit_controller) -> managed executor
+#               + receipt (resolve_harness) -> controller scope binding + artifact classes (scope_classes, r3g) ->
+#               per targeted class (pack_class): bundle admission (admit_bundle: exact members, modes, digests,
+#               fresh-render seed of the class policy, recorded class_key; missing/stale/other-class refuses) ->
+#               archive into this run's TMPDIR (inside <controller root>/run, under the seed's retention)
+#   target:     refuse pinned outputs -> policy -> transport/auth + owner/no-become admission + declared connection
+#               key collision check (address, port rule, ProxyJump route, owner; no contact)
+#               -> read-only preflight: owner identity (declared id), every seed/uv_installer os_tool and adapter
+#                  tool present AND admitted by identity (root-owned, not group/other-writable, regular; declared
+#                  known answers, e.g. /usr/bin/true as sha256sum refuses), user manager runtime dir + bus,
+#                  bundle-dir and root-parent ancestry
+#               -> REFUSE listing each missing tool with its package (packages.provides / by_os_family) -- MAIN's
+#                  privileged package step is the remedy; this playbook never installs anything
+#               -> reap this bundle dir's QUIESCENT owned staging (tasks/reap_staging.yml: the recorded controller run's
+#                  processes provably gone AND no other owner session on this target; live, busy and unknown entries
+#                  preserved, reported and charged; free-space backpressure), then
+#               -> effects, ONLY when the bundle dir is absent: reserve a private sibling staging dir (tempfile),
+#                  copy the archive there, extract with the DECLARED tar + gzip by path (command argv), read the
+#                  extraction back IN STAGING (exact members/modes, `sha256sum --check bundle.sha256`, check file
+#                  identical to the controller's), then publish with ONE declared `mv -T` rename; a present bundle
+#                  dir gets the same readback and nothing else
+#               -> `seed apply --root <target root>` as the owner (INSTALLED | UNCHANGED)
+#               -> verify_toolchain_receipt under the target's system python (read-only), expected generation equal
+#                  to the controller bundle's.
+# An interrupted transfer/extraction or a failed readback leaves only its staging dir and lease record, which the NEXT
+# run reaps only when the reserving controller run's processes are provably gone (lease record, admitted view) AND no
+# other session of the owner has processes on this target (a stale remote tar/mv/module would be in one); a live or
+# unprovable run's staging is never touched. The bundle dir stays absent, so a rerun resumes at the same path. A present
+# bundle dir that differs refuses and is preserved. Two concurrent runs at one target: each keeps its own staging (each
+# sees the other's session, so neither reaps); one publish lands and the other fails its publish rename (bundle dir
+# present), leaving its staging for a later attempt. PUBLISH FENCE: the publish rename runs under `flock -x -w` on the
+# destination lock that every reap mutation takes, so a staging path a reaper moved away can never be published; a lock
+# held past lease.publish_wait_seconds refuses RH-STAGING-BUSY (staging and lease record kept together).
+# PUBLICATION AUTHORITY (r3f, codex-tick144 E26; lease.authority): the authority is this run's token-named staging
+# path, checked atomically by the no-replace rename(2) itself while the lock is held; a revoker (recovery, teardown,
+# retirement) revokes only by renaming that path away under the same lock after proving the writers quiescent. A
+# publish lands iff the rename exits 0 AND consumed its source; a revoked source refuses RH-STAGING-REVOKED, a
+# destination that appeared (even an empty dir) is never replaced. A present bundle that differs is refused with its
+# recorded config_revision reported (next-run readback).
+# TOOLS (r3f CANONICAL-TOOL-OVERRIDES, C1 SEED-06 schema 3): the adapter's target.tools NAMES os_tools entries (used_by
+# only); C1's projection DERIVES each one's path and identity from the effective os_tools into THIS host's
+# lme_resolved.remote_harness.adapter.tools['target.tools'] (the key is the dotted string 'target.tools'), which every
+# adapter tool invocation here reads (never hostvars.localhost); seed/uv_installer tools use the same host's
+# rh.controller.bootstrap.os_tools. One admitted os_tools override therefore reaches package and target alike.
+# SSH composition (controller.bootstrap.ssh_auth.composition): the controller play projects, per target, the effective
+# ansible_ssh_common_args = the run mode's args + B's admitted ProxyJump clause (if the inventory sets it); the target
+# play binds that projection as a PLAY var, and admit_transport.yml admits the inventory value and the effective one.
+- name: Managed target bootstrap -- controller side (admit and pack the bundle)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
+
+    - name: Bind the effective controller connection before any effect (local, localhost, no become; r3g)
+      ansible.builtin.include_tasks: tasks/admit_controller.yml
+
+    - name: Resolve the harness policy, verify the controller receipt and bind the managed executor
+      ansible.builtin.include_tasks: tasks/resolve_harness.yml
+
+    - name: Bind the controller scope and derive the deployment's artifact classes (RH-SCOPE-BINDING; tasks/scope_classes.yml)
+      ansible.builtin.include_tasks: tasks/scope_classes.yml
+
+    - name: Refuse a target group other than the declared one (this play file names it literally)
+      ansible.builtin.assert:
+        that:
+          - rh.controller.bootstrap.inventory.target_group == 'lme_toolchain_targets'
+          - rh.controller.bootstrap.applies_to is contains('target')
+          - rh.transfer.adapter == 'managed_archive'
+          - lookup('ansible.builtin.env', 'TMPDIR') is match('^' ~ (rh_owned_root | regex_escape) ~ '/' ~ rh.controller.bootstrap.layout.run_dir ~ '/[^/]+/tmp$')
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }}: target group, adapter or run scratch dir is not
+          the declared one (TMPDIR must be this seed run's <root>/{{ rh.controller.bootstrap.layout.run_dir }}/<run>/tmp).
+        quiet: true
+
+    # r3g ACCEPTED-FORMS (codex 040323): the inventory value is read per the declared ssh_auth.composition.inventory_forms
+    # (var; absent reads as ''); proxy_jump is the form_regex capture for the ProxyJump form and '' for the three
+    # no-jump forms (absent, empty, the mode's own args). Admission of the form itself is tasks/admit_transport.yml.
+    - name: Project each target's effective SSH common args (run mode args + B's admitted ProxyJump form; derived output)
+      vars:
+        _sa: "{{ rh.controller.bootstrap.ssh_auth }}"
+        _mode_args: "{{ (_sa.modes[lookup('ansible.builtin.env', _sa.env_mode)] | default({})).ssh_common_args | default('') }}"
+      ansible.builtin.set_fact:
+        rh_conn: >-
+          {% set ns = namespace(d={}) %}{% for h in groups[rh.controller.bootstrap.inventory.target_group] | default([]) %}{% set raw
+          = hostvars[h][_sa.composition.inventory_forms.var] | default('') %}{% set jump = (raw | regex_replace(_sa.composition.proxy_jump.form_regex, '\\1'))
+          if raw is match(_sa.composition.proxy_jump.form_regex) else '' %}{% set ns.d = ns.d | combine({h: {'inventory_common_args': raw,
+          'proxy_jump': jump, 'ansible_ssh_common_args': _mode_args ~ ((' -o ProxyJump=' ~ jump) if jump | length > 0 else '')}}) %}{% endfor
+          %}{{ ns.d }}
+
+    # r3g per-class transfer: every class with at least one target is admitted and packed; a missing, stale or
+    # other-class bundle refuses here (admit_bundle), before any target contact; never a controller-bundle fallback
+    - name: Admit and pack each targeted class's bundle (tasks/pack_class.yml; rh_transfer.classes keyed by class key)
+      ansible.builtin.include_tasks: tasks/pack_class.yml
+      loop: "{{ rh_classes | selectattr('targets') | list }}"
+      loop_control:
+        loop_var: _rh_class
+        label: "{{ _rh_class.key }} {{ _rh_class.dir }} {{ _rh_class.targets }}"
+
+    - name: Refuse a transfer set that does not cover exactly the targeted classes (derived output check)
+      ansible.builtin.assert:
+        that:
+          - (rh_transfer | default({})).classes | default({}) | list | sort == (rh_classes | selectattr('targets') | map(attribute='key') | sort | list)
+        fail_msg: >-
+          REFUSED RH-SCOPE-BINDING on {{ inventory_hostname }}: packed classes
+          {{ (rh_transfer | default({})).classes | default({}) | list | sort }} are not the targeted classes
+          {{ rh_classes | selectattr('targets') | map(attribute='key') | sort | list }}.
+        quiet: true
+
+- name: Managed target bootstrap -- target side (same seed, applied by the declared non-root owner)
+  hosts: lme_toolchain_targets
+  gather_facts: false
+  become: false
+  # R-B2: this play's connection profile is `owner` (inventory.connection_profiles.owner). PLAY vars outrank inventory
+  # host vars, so an inventory whose ansible_user serves MAIN's privileged legs cannot change this play's privilege.
+  # The names are the registry-pinned inventory names (inventory.owner_var / connection_profiles.owner.key_var);
+  # admit_transport.yml re-checks the effective values against the declarations before any contact.
+  vars:
+    ansible_user: "{{ lme_toolchain_owner | default('') }}"
+    ansible_ssh_private_key_file: "{{ lme_toolchain_owner_key | default('') }}"
+    ansible_ssh_common_args: "{{ hostvars['localhost'].rh_conn[inventory_hostname].ansible_ssh_common_args | default('') }}"
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
+
+    - name: Resolve the harness policy through the engine
+      ansible.builtin.include_tasks: tasks/resolve_policy.yml
+
+    - name: Admit transport authentication, owner connection and no-become (no contact yet)
+      ansible.builtin.include_tasks: tasks/admit_transport.yml
+
+    # PER-HOST-SCOPE-CONTRACT (codex 023332; C1 field contract 033500; lifecycle E40-E43). Each target binds its OWN
+    # full expected policy, never the controller's by equality: this host's resolve (lme_resolved.remote_harness,
+    # verified by C1's lme_verify_resolved) must be the target scope of THIS inventory identity, and it must equal
+    # the entry the CONTROLLER's resolve holds for this id (scopes.targets[id]) -- same scope_sha256 (= digest of
+    # scope, binding, policy_sha256), same policy_sha256, same scopes_sha256 and binding (deployment: profile,
+    # controller, target group, targets; source_edition; operation). The binding's source_edition must be THIS
+    # checkout's global.yml / profile (lookup('file') convention, trailing whitespace stripped) and its operation the
+    # policy's transfer.operation. scope_invariant_sha256 is checked ONLY as an additional compatibility check; it
+    # never substitutes for the exact identity. Wrong target, wrong edition/deployment/operation, an incomplete
+    # identity or a stale controller view refuses here, before any target contact. Inline (no task vars): an
+    # extra-var cannot outrank an inline expression. Artifact binding (per shared_artifact_inputs_sha256) follows.
+    - name: Refuse a target scope that is not this inventory identity's exact expected scope (RH-SCOPE-BINDING)
+      ansible.builtin.assert:
+        that:
+          - hostvars['localhost'].lme_resolved.remote_harness.scopes_sha256 | default('') is match('^[0-9a-f]{64}$')
+          - lme_resolved.remote_harness.scope | default({}) == dict(kind='target', id=inventory_hostname)
+          - lme_resolved.remote_harness.scope_sha256 | default('') is match('^[0-9a-f]{64}$')
+          - lme_resolved.remote_harness.scopes_sha256 | default('') == hostvars['localhost'].lme_resolved.remote_harness.scopes_sha256
+          - lme_resolved.remote_harness.binding | default({}) == hostvars['localhost'].lme_resolved.remote_harness.binding
+          - hostvars['localhost'].lme_resolved.remote_harness.scopes.targets | default(none) is mapping
+          - inventory_hostname in hostvars['localhost'].lme_resolved.remote_harness.scopes.targets
+          - hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname] is mapping
+          - lme_resolved.remote_harness.scope_sha256 == hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname].scope_sha256 | default('')
+          - lme_resolved.remote_harness.policy_sha256 | default('') is match('^[0-9a-f]{64}$')
+          - lme_resolved.remote_harness.policy_sha256 == hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname].policy_sha256 | default('')
+          - rh_config_revision == lme_resolved.remote_harness.policy_sha256
+          - lme_resolved.remote_harness.scopes.targets | default(none) is mapping
+          - lme_resolved.remote_harness.scopes.targets[inventory_hostname].scope_sha256 | default('') == lme_resolved.remote_harness.scope_sha256
+          - lme_resolved.remote_harness.binding is mapping and lme_resolved.remote_harness.binding.deployment is mapping
+          - lme_resolved.remote_harness.binding.source_edition is mapping
+          - lme_resolved.remote_harness.binding.deployment.controller == 'localhost'
+          - lme_resolved.remote_harness.binding.deployment.target_group == rh.controller.bootstrap.inventory.target_group
+          - lme_resolved.remote_harness.binding.deployment.targets == (groups[rh.controller.bootstrap.inventory.target_group] | default([]) | unique | sort)
+          - lme_resolved.remote_harness.binding.source_edition.profile_sha256 == rh_profile_sha256
+          - lme_resolved.remote_harness.binding.source_edition.global_sha256 == (lookup('ansible.builtin.file', rh_repo_root ~ '/manifests/global.yml') | hash('sha256'))
+          - lme_resolved.remote_harness.binding.operation == rh.transfer.operation
+          # ADDITIONAL compatibility check only (never identity); both sides present 64-hex, never absent == absent
+          - lme_resolved.remote_harness.scope_invariant_sha256 | default('') is match('^[0-9a-f]{64}$')
+          - hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname].scope_invariant_sha256 | default('') is match('^[0-9a-f]{64}$')
+          - lme_resolved.remote_harness.scope_invariant_sha256 == hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname].scope_invariant_sha256
+        fail_msg: >-
+          REFUSED RH-SCOPE-BINDING on {{ inventory_hostname }}: this host's resolved scope
+          {{ lme_resolved.remote_harness.scope | default('absent') }} (scope_sha256
+          {{ lme_resolved.remote_harness.scope_sha256 | default('absent') }}) is not the controller's expected
+          target scope for this inventory identity (expected
+          {{ ((hostvars['localhost'].lme_resolved.remote_harness.scopes | default({})).targets | default({}))[inventory_hostname].scope_sha256 | default('none: not a declared target') }}),
+          or the deployment / source edition / operation binding differs (scopes_sha256
+          {{ lme_resolved.remote_harness.scopes_sha256 | default('absent') }} vs controller
+          {{ hostvars['localhost'].lme_resolved.remote_harness.scopes_sha256 | default('absent') }}), or the
+          compatibility digest differs. Nothing was contacted.
+        quiet: true
+
+    - name: Admit the target inputs (the ONE path-admission rule; no defaults) and the controller's admitted bundle
+      vars:
+        _root: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.root_var, default='') }}"
+        _bdir: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var, default='') }}"
+      ansible.builtin.assert:
+        that:
+          - _root is string and _root is match(rh.controller.bootstrap.path_admission.regex) and _root is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+          - _bdir is string and _bdir is match(rh.controller.bootstrap.path_admission.regex) and _bdir is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+          - not (_bdir == _root or _bdir.startswith(_root ~ '/') or _root.startswith(_bdir ~ '/'))
+          - hostvars['localhost'].rh_transfer is defined
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }}:
+          {{ rh.controller.bootstrap.inventory.root_var }} and {{ rh.controller.bootstrap.inventory.bundle_var }} must be
+          normalized absolute paths, disjoint, and the controller play must have admitted the bundle.
+        quiet: true
+
+    # r3g PER-CLASS ARTIFACT BINDING (coordinator B step 2; bundle.per_class). This target's class is ITS OWN published
+    # key (C1's per_class.key_field on this host's resolve), which must equal the key the controller holds for this id;
+    # the controller must have admitted and packed exactly that class, whose bundle records that class_key (staleness:
+    # own key vs the class record, never this target's policy_sha256, which legitimately differs inside a class). A
+    # missing class or another class's bundle refuses here, before any target contact; never the controller bundle
+    # instead. DEFENCE IN DEPTH: the seed re-rendered under THIS target's own policy must equal the class bundle's seed;
+    # an equal key that renders unequally refuses and names C1's key as insufficient (never a silent reuse).
+    - name: Refuse a target whose class bundle is missing, stale or of another class (RH-SCOPE-BINDING; before any contact)
+      ansible.builtin.assert:
+        that:
+          - lme_resolved.remote_harness[rh.controller.bootstrap.bundle.per_class.key_field] | default('') is match(rh.controller.bootstrap.bundle.per_class.key_regex)
+          - >-
+            lme_resolved.remote_harness[rh.controller.bootstrap.bundle.per_class.key_field]
+            == hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname][rh.controller.bootstrap.bundle.per_class.key_field] | default('')
+          - hostvars['localhost'].rh_transfer.classes | default(none) is mapping
+          - lme_resolved.remote_harness[rh.controller.bootstrap.bundle.per_class.key_field] in hostvars['localhost'].rh_transfer.classes
+          - >-
+            hostvars['localhost'].rh_transfer.classes[lme_resolved.remote_harness[rh.controller.bootstrap.bundle.per_class.key_field]].bundle.class_key | default('')
+            == lme_resolved.remote_harness[rh.controller.bootstrap.bundle.per_class.key_field]
+          - inventory_hostname in hostvars['localhost'].rh_transfer.classes[lme_resolved.remote_harness[rh.controller.bootstrap.bundle.per_class.key_field]].targets | default([])
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.bundle.per_class.refusal }} on {{ inventory_hostname }}: this target's class
+          {{ lme_resolved.remote_harness[rh.controller.bootstrap.bundle.per_class.key_field] | default('absent') }} is not
+          the controller's view of it, or the controller admitted no bundle of that class (admitted classes
+          {{ (hostvars['localhost'].rh_transfer | default({})).classes | default({}) | list }}), or that bundle records
+          another class key. Nothing was contacted; the controller bundle is never substituted.
+        quiet: true
+
+    - name: Refuse a class bundle whose seed is not this target's own fresh render (defence in depth; C1 key sufficiency)
+      vars:
+        _cls: "{{ hostvars['localhost'].rh_transfer.classes[lme_resolved.remote_harness[rh.controller.bootstrap.bundle.per_class.key_field]] }}"
+      ansible.builtin.assert:
+        that:
+          - >-
+            _cls.bundle.seed_sha256
+            == lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ rh.controller.bootstrap.template_rel,
+                      template_vars={'lme_seed_bs': rh.controller.bootstrap, 'lme_seed_ctl': rh.controller,
+                                     'lme_seed_lock': rh_seed_lock}) | hash('sha256')
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.bundle.per_class.refusal }} on {{ inventory_hostname }}: the bundle of class
+          {{ _cls.bundle.class_key }} carries seed {{ _cls.bundle.seed_sha256 }}, which is not this target's own fresh
+          render of its resolved policy: C1's {{ rh.controller.bootstrap.bundle.per_class.key_field }} is INSUFFICIENT
+          (equal key, unequal declared seed inputs). Nothing was contacted; report it to C1, never reuse the bundle.
+        quiet: true
+
+    - name: Select this target's class transfer (derived output; every later read uses it, never the controller bundle)
+      ansible.builtin.set_fact:
+        rh_tb_xfer: "{{ hostvars['localhost'].rh_transfer.classes[lme_resolved.remote_harness[rh.controller.bootstrap.bundle.per_class.key_field]] }}"
+
+    - name: Hash every selected executable on the target BEFORE any of them runs (stat sha256, links followed; read-only)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: true
+        get_checksum: true
+        checksum_algorithm: sha256
+      # r3f CANONICAL-TOOL-OVERRIDES (codex-tick144): an adapter tool is a NAME of the effective os_tools; its path and
+      # identity are derived from that one declaration, so one admitted override reaches package and target alike
+      loop: >-
+        {{ ((rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'seed') | list)
+            + (rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'uv_installer') | list)
+            + (lme_resolved.remote_harness.adapter.tools['target.tools'] | dict2items | list))
+           | map(attribute='value.path') | unique | list }}
+      register: _rh_tb_ident
+
+    - name: Refuse any selected executable whose content is not its declared identity, or an adapter tool set the engine did not derive (SEED-06 file_sha256; stat sha256, never a declared tool)
+      vars:
+        # present files only: an absent tool is refused (named with its package) by the next check, still before any tool runs
+        _tst: "{{ _rh_tb_ident.results | selectattr('stat.exists') | list }}"
+        _ot: "{{ rh.controller.bootstrap.os_tools }}"
+        _at: "{{ rh.transfer.adapters.managed_archive.target.tools }}"
+        _ad: "{{ lme_resolved.remote_harness.adapter.tools['target.tools'] | default({}) }}"
+        # declared identity per selected path: seed/uv_installer from os_tools, adapter tools from C1's derivation
+        _want: >-
+          {% set ns = namespace(m={}) %}{% for n, t in _ot.items() %}{% set ns.m = ns.m | combine({t.path: t.identity.sha256}) %}{% endfor %}{% for n, t in _ad.items() %}{% set ns.m = ns.m | combine({t.path: t.identity.sha256}) %}{% endfor %}{{ ns.m }}
+      ansible.builtin.assert:
+        that:
+          # the engine derived exactly the declared adapter names (C1 refuses declared copies and names outside os_tools)
+          - (_ad | list | sort) == (_at | list | sort)
+          # every adapter tool is provided by a package the ONE target bootstrap owns (adapter target.packages)
+          - _at | list | reject('in', rh.transfer.adapters.managed_archive.target.packages | map('extract', rh.packages.provides) | flatten) | list | length == 0
+          - (_ot.values() | list + _ad.values() | list) | map(attribute='identity.kind') | unique | list == ['file_sha256']
+          # one path, one identity (seed/uv and adapter views agree; a path can never carry two identities)
+          - >-
+            (_ot.values() | list + _ad.values() | list) | map(attribute='path') | unique | list | length
+            == (_ot.values() | list + _ad.values() | list) | map(attribute='path') | zip((_ot.values() | list + _ad.values() | list) | map(attribute='identity.sha256')) | map('join', ' ') | unique | list | length
+          - _tst | map(attribute='stat') | map(attribute='checksum', default='') | list == _tst | map(attribute='item') | map('extract', _want) | list
+        fail_msg: >-
+          REFUSED RH-OS-TOOL-IDENTITY on {{ inventory_hostname }} (nothing was changed): every selected executable's stat
+          sha256 must equal its declared file_sha256:
+          {% for r in _tst if (r.stat.checksum | default('')) != (_want[r.item] | default('undeclared')) %}{{ r.item }}({{ r.stat.checksum | default('absent') }}) {% endfor %};
+          derived adapter tools {{ _ad | list | sort }} vs declared names {{ _at | list | sort }} (lme_resolved.remote_harness.adapter
+          schema 3); adapter tools no adapter package provides {{ _at | list | reject('in', rh.transfer.adapters.managed_archive.target.packages | map('extract', rh.packages.provides) | flatten) | list }}.
+        quiet: true
+
+    - name: Refuse missing or non-executable tools, named with their packages, before any of them runs (read-only)
+      vars:
+        _tools: >-
+          {{ ((rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'seed') | list)
+              + (rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'uv_installer') | list)
+              + (lme_resolved.remote_harness.adapter.tools['target.tools'] | dict2items | list))
+             | unique(attribute='value.path') | list }}
+        _missing_paths: >-
+          {{ _rh_tb_ident.results | rejectattr('stat.exists') | map(attribute='item') | list
+             + (_rh_tb_ident.results | selectattr('stat.exists') | rejectattr('stat.executable') | map(attribute='item') | list) }}
+        _missing_names: "{{ _tools | selectattr('value.path', 'in', _missing_paths) | map(attribute='key') | list }}"
+        _pkgs: >-
+          {% set ns = namespace(p=[]) %}{% for kv in rh.packages.provides | dict2items %}{% if kv.value | intersect(_missing_names) | length > 0 %}{% set ns.p = ns.p + [kv.key] %}{% endif %}{% endfor %}{{ ns.p }}
+      ansible.builtin.assert:
+        that:
+          - _missing_paths | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }} (nothing was changed):
+          missing or non-executable tools {{ _missing_names }} at {{ _missing_paths }} -> logical packages
+          {{ _pkgs }} = Debian {{ _pkgs | map('extract', rh.packages.by_os_family.Debian) | list }} / RedHat
+          {{ _pkgs | map('extract', rh.packages.by_os_family.RedHat) | list }} (MAIN's privileged package step installs
+          them; never ad hoc; an admitted os_tools path override names its own location).
+        quiet: true
+
+    - name: Read the owner identity on the target with the declared tool (read-only)
+      ansible.builtin.command:
+        argv: ["{{ lme_resolved.remote_harness.adapter.tools['target.tools'].id.path }}", -u]
+      register: _rh_tb_uid
+      changed_when: false
+
+    - name: Preflight (read-only) -- every seed/uv_installer os_tool and every adapter tool, the user manager
+      vars:
+        _rt: "{{ rh.controller.bootstrap.target_bootstrap.user_manager.runtime_dir | replace('{uid}', _rh_tb_uid.stdout) }}"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: true
+      loop: >-
+        {{ ((rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'seed') | list)
+            + (rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'uv_installer') | list)
+            + (lme_resolved.remote_harness.adapter.tools['target.tools'] | dict2items | list))
+           | map(attribute='value.path') | unique | list
+           + [_rt, _rt ~ '/' ~ rh.controller.bootstrap.target_bootstrap.user_manager.bus] }}
+      register: _rh_tb_pre
+
+    - name: Preflight (read-only) -- ancestry of the bundle dir and of the root (every existing component, no links)
+      vars:
+        _p: "{{ lookup('ansible.builtin.vars', item.0) }}"
+      ansible.builtin.stat:
+        path: "{{ '/' ~ (_p.split('/')[1:item.1] | join('/')) }}"
+        follow: false
+      loop: >-
+        {{ [rh.controller.bootstrap.inventory.bundle_var] | product(range(1, (lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var).split('/') | length) + 1)) | list
+           + [rh.controller.bootstrap.inventory.root_var] | product(range(1, (lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.root_var).split('/') | length) + 1)) | list }}
+      loop_control:
+        label: "{{ item.0 }}[{{ item.1 }}]"
+      register: _rh_tb_anc
+
+    - name: Refuse before any target effect -- missing tools (named with their packages), no user manager, unsafe paths
+      vars:
+        _tools: >-
+          {{ ((rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'seed') | list)
+              + (rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'uv_installer') | list)
+              + (lme_resolved.remote_harness.adapter.tools['target.tools'] | dict2items | list))
+             | unique(attribute='value.path') | list }}
+        _missing_paths: >-
+          {{ _rh_tb_pre.results[:-2] | rejectattr('stat.exists') | map(attribute='item') | list
+             + (_rh_tb_pre.results[:-2] | selectattr('stat.exists') | rejectattr('stat.executable') | map(attribute='item') | list) }}
+        _missing_names: "{{ _tools | selectattr('value.path', 'in', _missing_paths) | map(attribute='key') | list }}"
+        _pkgs: >-
+          {% set ns = namespace(p=[]) %}{% for kv in rh.packages.provides | dict2items %}{% if kv.value | intersect(_missing_names) | length > 0 %}{% set ns.p = ns.p + [kv.key] %}{% endif %}{% endfor %}{{ ns.p }}
+        _anc_exist: "{{ _rh_tb_anc.results | selectattr('stat.exists') | list }}"
+        _uid: "{{ _rh_tb_uid.stdout | int }}"
+      ansible.builtin.assert:
+        that:
+          - _uid | int != 0
+          - _missing_names | length == 0
+          - _rh_tb_pre.results[-2].stat.exists and _rh_tb_pre.results[-2].stat.isdir and _rh_tb_pre.results[-2].stat.uid == _uid | int and _rh_tb_pre.results[-2].stat.mode == '0700'
+          - _rh_tb_pre.results[-1].stat.exists and _rh_tb_pre.results[-1].stat.issock
+          - _anc_exist | selectattr('stat.islnk') | list | length == 0
+          - _anc_exist | rejectattr('stat.isdir') | list | length == 0
+          - _anc_exist | map(attribute='stat.uid') | reject('in', [0, _uid | int]) | list | length == 0
+          - _anc_exist | selectattr('stat.wgrp') | list | length == 0
+          - _anc_exist | selectattr('stat.woth') | list | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }} (nothing was changed):
+          uid {{ _uid }} (root refused); missing or non-executable tools {{ _missing_names }} -> logical packages
+          {{ _pkgs }} = Debian {{ _pkgs | map('extract', rh.packages.by_os_family.Debian) | list }} / RedHat
+          {{ _pkgs | map('extract', rh.packages.by_os_family.RedHat) | list }} (MAIN's privileged package step installs
+          them; never ad hoc);
+          user manager {{ _rh_tb_pre.results[-2].item }} (owned 0700 dir) with socket {{ _rh_tb_pre.results[-1].item }}
+          (an SSH login session as the owner provides it; linger only for jobs outside a session);
+          path components must be real directories owned by 0 or the owner and not group/other-writable.
+        quiet: true
+
+    - name: Refuse any selected executable that fails owner/mode admission (SEED-06 os_tools_integrity complement; read-only)
+      vars:
+        _ti: "{{ rh.controller.bootstrap.os_tool_identity }}"
+        _tst: "{{ _rh_tb_pre.results[:-2] | list }}"
+      ansible.builtin.assert:
+        that:
+          - _tst | rejectattr('stat.isreg') | list | length == 0
+          - _tst | map(attribute='stat.uid') | reject('equalto', _ti.owner_uid) | list | length == 0
+          - _tst | selectattr('stat.wgrp') | list | length == 0
+          - _tst | selectattr('stat.woth') | list | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }} (nothing was changed):
+          executables must be regular files owned by uid {{ _ti.owner_uid }} and not group/other-writable; offending:
+          {{ _tst | rejectattr('stat.isreg') | map(attribute='item') | list
+             + (_tst | selectattr('stat.isreg') | rejectattr('stat.uid', 'equalto', _ti.owner_uid) | map(attribute='item') | list)
+             + (_tst | selectattr('stat.wgrp') | map(attribute='item') | list) + (_tst | selectattr('stat.woth') | map(attribute='item') | list) }}.
+        quiet: true
+
+    - name: Run the declared known-answer identity checks against the ONE declared path of each tool (effective os_tools; read-only)
+      ansible.builtin.command:
+        argv: ["{{ item.path }}"]
+        stdin: "{{ item.stdin }}"
+        stdin_add_newline: false
+      loop: >-
+        {% set ns = namespace(l=[]) %}{% for k in rh.controller.bootstrap.os_tool_identity.known_answers %}{% set ns.l = ns.l
+        + [{'tool': k.tool, 'path': (lme_resolved.remote_harness.adapter.tools['target.tools'][k.tool] if k.tool in lme_resolved.remote_harness.adapter.tools['target.tools'] else rh.controller.bootstrap.os_tools[k.tool]).path, 'stdin': k.stdin, 'stdout': k.stdout}] %}{% endfor %}{{ ns.l }}
+      loop_control:
+        label: "{{ item.tool }} {{ item.path }}"
+      register: _rh_tb_kat
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse a tool whose known answer differs (e.g. /usr/bin/true supplied as sha256sum)
+      ansible.builtin.assert:
+        that:
+          - _rh_tb_kat.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+          - _rh_tb_kat.results | map(attribute='stdout') | list == _rh_tb_kat.results | map(attribute='item.stdout') | list
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }} (nothing was changed):
+          known-answer identity check failed; (path, rc, stdout):
+          {{ _rh_tb_kat.results | map(attribute='item.path') | zip(_rh_tb_kat.results | map(attribute='rc'), _rh_tb_kat.results | map(attribute='stdout')) | list }}.
+        quiet: true
+
+    - name: Read the target bundle dir (absent -> staged transfer + publish; present -> readback only)
+      ansible.builtin.stat:
+        path: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+        follow: false
+      register: _rh_tb_bdir
+
+    - name: Refuse a present bundle path that is not an owned real directory (preserved)
+      ansible.builtin.assert:
+        that:
+          - not _rh_tb_bdir.stat.exists or (_rh_tb_bdir.stat.isdir and not _rh_tb_bdir.stat.islnk and _rh_tb_bdir.stat.uid == _rh_tb_uid.stdout | int)
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }}:
+          {{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }} exists but is not a real
+          directory owned by uid {{ _rh_tb_uid.stdout }}; preserved.
+        quiet: true
+
+    - name: Reap this bundle dir's quiescent owned staging, preserve live, busy and unknown entries, check free space (M1-STAGING-RECOVERY)
+      ansible.builtin.include_tasks: tasks/reap_staging.yml
+      vars:
+        rh_reap_dest: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+        rh_reap_uid: "{{ _rh_tb_uid.stdout | int }}"
+        rh_reap_mv: "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].mv.path }}"
+        rh_reap_df: "{{ rh.controller.bootstrap.os_tools.df.path }}"
+        rh_reap_rm: "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].rm.path }}"
+        rh_reap_flock: "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].flock.path }}"
+        rh_reap_remote: true
+        rh_reap_reserve: "{{ not _rh_tb_bdir.stat.exists }}"
+        rh_reap_need: >-
+          {{ 0 if _rh_tb_bdir.stat.exists else ((rh_tb_xfer.bundle.bytes | int)
+             * rh.controller.bootstrap.bundle.staging_retention.budget.free_bytes_factor_target) }}
+        rh_reap_members: >-
+          {{ [rh.controller.bootstrap.bundle.staging_retention.target_members.archive,
+              rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir]
+             + (rh_tb_xfer.bundle.members
+                | map('regex_replace', '^[a-z] [0-7]+ ', rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir ~ '/')
+                | list) }}
+
+    - name: Reserve a private staging dir next to the bundle dir (mkdtemp; the controller run's holder lease in its name; first target effect)
+      vars:
+        _bd: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ _bd | dirname }}"
+        prefix: ".{{ _bd | basename }}.{{ rh.controller.bootstrap.bundle.staging_infix }}.{{ rh_staging_lease }}."
+      register: _rh_tb_stage
+      when: not _rh_tb_bdir.stat.exists
+
+    - name: Transfer the archive into the staging dir (owner only)
+      ansible.builtin.copy:
+        src: "{{ rh_tb_xfer.archive }}"
+        dest: "{{ _rh_tb_stage.path }}/{{ rh.controller.bootstrap.bundle.staging_retention.target_members.archive }}"
+        mode: '0400'
+      when: not _rh_tb_bdir.stat.exists
+
+    - name: Create the extraction dir inside the staging dir (declared mkdir, no -p)
+      ansible.builtin.command:
+        argv:
+          - "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].mkdir.path }}"
+          - -m
+          - '0700'
+          - --
+          - "{{ _rh_tb_stage.path }}/{{ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir }}"
+      when: not _rh_tb_bdir.stat.exists
+
+    - name: Extract with the DECLARED tar and gzip by path (no PATH lookup; the archive's top directory is stripped)
+      ansible.builtin.command:
+        argv:
+          - "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].tar.path }}"
+          - -x
+          - -f
+          - "{{ _rh_tb_stage.path }}/{{ rh.controller.bootstrap.bundle.staging_retention.target_members.archive }}"
+          - "--use-compress-program={{ lme_resolved.remote_harness.adapter.tools['target.tools'].gzip.path }}"
+          - --strip-components=1
+          - --no-same-owner
+          - -C
+          - "{{ _rh_tb_stage.path }}/{{ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir }}"
+      register: _rh_tb_extract
+      changed_when: true
+      when: not _rh_tb_bdir.stat.exists
+
+    - name: Read back the members with the declared find (in staging when transferring; type, mode, path; no links followed)
+      vars:
+        _src: "{{ (_rh_tb_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir) if not _rh_tb_bdir.stat.exists else lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].find.path }}"
+          - -P
+          - "{{ _src }}"
+          - -mindepth
+          - '1'
+          - -printf
+          - '%y %m %P\n'
+      register: _rh_tb_list
+      changed_when: false
+
+    - name: Read back every digest with the declared sha256sum against the bundle's own check file
+      vars:
+        _src: "{{ (_rh_tb_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir) if not _rh_tb_bdir.stat.exists else lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].sha256sum.path }}"
+          - --check
+          - --strict
+          - --quiet
+          - "{{ rh.controller.bootstrap.bundle.checksum_file }}"
+        chdir: "{{ _src }}"
+      register: _rh_tb_sum
+      changed_when: false
+      failed_when: false
+
+    - name: Digest the check file that is read back
+      vars:
+        _src: "{{ (_rh_tb_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir) if not _rh_tb_bdir.stat.exists else lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+      ansible.builtin.stat:
+        path: "{{ _src }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: _rh_tb_sumfile
+
+    - name: Digest the manifest that is read back (a present bundle must carry THIS bundle's provenance, not only its bytes)
+      vars:
+        _src: "{{ (_rh_tb_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir) if not _rh_tb_bdir.stat.exists else lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+      ansible.builtin.stat:
+        path: "{{ _src }}/{{ rh.controller.bootstrap.bundle.manifest_file }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: _rh_tb_manfile
+
+    - name: Read back a present bundle's recorded revision (E26 next-run readback; read-only, reported, never accepted silently)
+      ansible.builtin.slurp:
+        src: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}/{{ rh.controller.bootstrap.bundle.manifest_file }}"
+      register: _rh_tb_present
+      failed_when: false
+      when:
+        - _rh_tb_bdir.stat.exists
+        - _rh_tb_manfile.stat.checksum | default('') != rh_tb_xfer.bundle.manifest_sha256
+
+    - name: Refuse a bundle that is not byte-identical to the admitted controller bundle (never published; preserved)
+      ansible.builtin.assert:
+        that:
+          - _rh_tb_list.stdout_lines | sort == rh_tb_xfer.bundle.members
+          - _rh_tb_sum.rc == 0
+          - _rh_tb_sumfile.stat.exists and not _rh_tb_sumfile.stat.islnk
+          - _rh_tb_sumfile.stat.checksum == rh_tb_xfer.bundle.checksum_file_sha256
+          - _rh_tb_manfile.stat.exists and not _rh_tb_manfile.stat.islnk
+          - _rh_tb_manfile.stat.checksum == rh_tb_xfer.bundle.manifest_sha256
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }}: the
+          {{ 'staged extraction' if not _rh_tb_bdir.stat.exists else 'present bundle dir' }} differs from the admitted
+          controller bundle (members/modes {{ _rh_tb_list.stdout_lines | sort | symmetric_difference(rh_tb_xfer.bundle.members) }},
+          sha256sum rc {{ _rh_tb_sum.rc }}{% if _rh_tb_present is not skipped %}; present class_key
+          {{ ((_rh_tb_present.content | default('') | b64decode | from_json) if (_rh_tb_present.content | default('') | length) > 0 else {}).class_key | default('unreadable') }}
+          vs admitted {{ rh_tb_xfer.bundle.class_key }}{% endif %}). Nothing was published; a present bundle dir is preserved.
+        quiet: true
+
+    - name: Publish the verified extraction by ONE rename onto the absent bundle dir under the destination lock (publish fence; declared flock + mv)
+      vars:
+        _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+        _bd: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].flock.path }}"
+          - -x
+          - -w
+          - "{{ _lz.publish_wait_seconds | string }}"
+          - -E
+          - "{{ _lz.busy_rc | string }}"
+          - "{{ (_bd | dirname) ~ '/.' ~ (_bd | basename) ~ '.' ~ _lz.lock_suffix }}"
+          - "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].mv.path }}"
+          - -T
+          - "{{ rh.controller.bootstrap.bundle.staging_retention.lease.authority.noreplace_arg }}"
+          - --
+          - "{{ _rh_tb_stage.path }}/{{ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir }}"
+          - "{{ _bd }}"
+      register: _rh_tb_publish
+      changed_when: _rh_tb_publish.rc == 0
+      failed_when: false
+      when: not _rh_tb_bdir.stat.exists
+
+    - name: Observe whether the publish rename consumed this run's staging source (landed iff rc 0 AND the source is gone)
+      ansible.builtin.stat:
+        path: "{{ _rh_tb_stage.path }}/{{ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir }}"
+        follow: false
+        get_checksum: false
+      register: _rh_tb_left
+      when: not _rh_tb_bdir.stat.exists
+
+    - name: Refuse a publish that did not land (staging AND lease record both kept for the next run's reap)
+      vars:
+        _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_tb_publish is skipped or (_rh_tb_publish.rc == 0 and not _rh_tb_left.stat.exists)
+        fail_msg: >-
+          REFUSED {{ _lz.busy_refusal if (_rh_tb_publish.rc | default(0)) == _lz.busy_rc | int
+          else (_lz.authority.revoked_refusal if (_rh_tb_publish.rc | default(0)) != 0 and not (_rh_tb_left.stat.exists | default(true))
+          else rh.controller.bootstrap.target_bootstrap.refusal) }}
+          on {{ inventory_hostname }}: the publish rename did not land (rc {{ _rh_tb_publish.rc | default('?') }}; source
+          {{ 'still present: the destination appeared concurrently and was NOT replaced (no-replace rename), or the rename failed' if _rh_tb_left.stat.exists | default(false)
+          else 'gone: this run''s publication authority was revoked (its staging was moved away under the lock)' }}).
+          Nothing was published by this run; whatever of its staging dir and lease record remains is kept for a later
+          run's reap once this run is provably quiescent.
+        quiet: true
+
+    - name: Release this run's staging dir (archive copy; ours alone)
+      ansible.builtin.file:
+        path: "{{ _rh_tb_stage.path }}"
+        state: absent
+      when: not _rh_tb_bdir.stat.exists
+
+    - name: Release this run's lease record on this target (its staging is published and released)
+      vars:
+        _bd: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+      ansible.builtin.file:
+        path: "{{ (_bd | dirname) ~ '/.' ~ (_bd | basename) ~ '.' ~ rh.controller.bootstrap.bundle.staging_retention.lease.lease_infix ~ '.' ~ rh_staging_lease }}"
+        state: absent
+      when: not _rh_tb_bdir.stat.exists
+
+    - name: Re-read the published check file
+      ansible.builtin.stat:
+        path: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: _rh_tb_final
+
+    - name: Refuse if the published bundle is not the verified one
+      ansible.builtin.assert:
+        that:
+          - _rh_tb_final.stat.exists and not _rh_tb_final.stat.islnk
+          - _rh_tb_final.stat.checksum == rh_tb_xfer.bundle.checksum_file_sha256
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }}: the published bundle
+          check file differs from the controller's; staging reaped before this run: {{ _rh_reap_rm.results | default([]) | map(attribute='item') | list }}.
+        quiet: true
+
+    - name: Apply the SAME seed as the declared owner (one operation; unprivileged, offline, budgeted, locked)
+      ansible.builtin.command:
+        argv:
+          - "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}/{{ rh.controller.bootstrap.bundle.seed_file }}"
+          - apply
+          - --root
+          - "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.root_var) }}"
+      environment:
+        XDG_RUNTIME_DIR: "{{ rh.controller.bootstrap.target_bootstrap.user_manager.runtime_dir | replace('{uid}', _rh_tb_uid.stdout) }}"
+      register: _rh_tb_apply
+      changed_when: _rh_tb_apply.stdout is search('^INSTALLED ', multiline=true)
+      failed_when: >-
+        _rh_tb_apply.rc != 0
+        or not (_rh_tb_apply.stdout is search('^(INSTALLED|UNCHANGED) ' ~ (rh_tb_xfer.bundle.expected_generation | regex_escape) ~ ' ', multiline=true))
+
+    - name: Verify the target receipt under the target's system python (read-only; same verifier as the controller)
+      ansible.builtin.include_tasks: tasks/verify_toolchain_receipt.yml
+      vars:
+        rh_tc_root: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.root_var, default='') }}"
+        rh_tc_owner: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.owner_var, default='') }}"
+
+    - name: Refuse a target generation other than the controller bundle's
+      ansible.builtin.assert:
+        that:
+          - rh_toolchain.generation == rh_tb_xfer.bundle.expected_generation
+          - rh_toolchain.seed_sha256 == rh_tb_xfer.bundle.seed_sha256
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }}: target generation
+          {{ rh_toolchain.generation }} is not the controller bundle's {{ rh_tb_xfer.bundle.expected_generation }}.
+        quiet: true

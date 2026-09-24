@@ -1,0 +1,249 @@
+{#- testing/e2e/transfer/macros/transfer.j2 -- genuine macros for the deploy_gate TARGET CONTRACT + TRANSFER.
+    Every value comes from transfer.decl.yml (tr) or from a resolved contract (k); no free-standing policy literal.
+    Consumers call them through lookup('ansible.builtin.template', templates/<t>.j2, template_vars=...), so each
+    template is a one-line dispatcher and the logic lives here, once.
+    Values reaching a shell body are regex-admitted before (paths, members, op ids); shq() quotes anyway. -#}
+
+{#- ---- POSIX single-quote ---- -#}
+{%- macro shq(s) -%}
+'{{ s | string | replace("'", "'\\''") }}'
+{%- endmacro -%}
+
+{#- ---- ssh words of the contract (B's transport options, then the auth mode's ssh_common_args words, then port,
+     key, proxy), identical for Ansible and for deploy_gate. k.mode_args = rh ssh_auth.modes[<mode>].ssh_common_args. -#}
+{%- macro ssh_words(tr, k) -%}
+{%- set w = [] -%}
+{%- for o in tr.contract.options -%}{{ w.extend(['-o', o]) or '' }}{%- endfor -%}
+{{- w.extend(k.mode_args.split()) or '' -}}
+{%- if k.port is not none -%}{{ w.extend(['-o', 'Port=' ~ k.port]) or '' }}{%- endif -%}
+{%- if k.key is not none -%}{{ w.extend(['-o', 'IdentityFile=' ~ k.key]) or '' }}{%- endif -%}
+{%- if k.proxy is not none -%}{{ w.extend(['-o', 'ProxyJump=' ~ k.proxy]) or '' }}{%- endif -%}
+{{ w | to_json }}
+{%- endmacro -%}
+
+{#- ---- the complete ssh argv deploy_gate runs (client, words, user@address) ---- -#}
+{%- macro ssh_argv(tr, k) -%}
+{{ ([tr.contract.ssh_client] + (ssh_words(tr, k) | from_json) + [k.user ~ '@' ~ k.address]) | to_json }}
+{%- endmacro -%}
+
+{#- ---- Ansible connection vars of the SAME contract (play vars outrank inventory host vars) ---- -#}
+{%- macro ansible_conn(tr, k) -%}
+{{ {'ansible_connection': 'ssh', 'ansible_host': k.address, 'ansible_user': k.user,
+    'ansible_ssh_executable': tr.contract.ssh_client,
+    'ansible_ssh_common_args': (ssh_words(tr, k) | from_json) | join(' '),
+    'ansible_ssh_extra_args': ''} | to_json }}
+{%- endmacro -%}
+
+{#- ---- the transfer manifest as ONE regex over repository-relative member paths ---- -#}
+{%- macro exclusion_regex(excludes) -%}
+{%- set a = [] -%}
+{%- for e in excludes -%}
+{%- if e.name is defined -%}{{ a.append('(^|/)' ~ (e.name | regex_escape) ~ '(/|$)') or '' }}
+{%- elif e.path is defined -%}{{ a.append('^' ~ (e.path | regex_escape) ~ '(/|$)') or '' }}
+{%- elif e.prefix is defined -%}{{ a.append('^' ~ (e.prefix | regex_escape)) or '' }}
+{%- else -%}{{ a.append((e.suffix | regex_escape) ~ '$') or '' }}{%- endif -%}
+{%- endfor -%}
+{{ a | join('|') }}
+{%- endmacro -%}
+
+{#- ---- a parent walk that refuses a symlink or non-directory component below the deployment root ---- -#}
+{%- macro sh_parent_guard() -%}
+guard_parents() {  # $1 = member path relative to the deployment root
+  _p=${1%/*}; [ "$_p" = "$1" ] && return 0
+  _acc=.
+  _IFS=$IFS; IFS=/
+  for _c in $_p; do
+    _acc=$_acc/$_c
+    if [ -L "$_acc" ]; then echo "TRANSFER-TARGET-PARENT-LINK $_acc" >&2; IFS=$_IFS; return 1; fi
+    if [ -e "$_acc" ] && [ ! -d "$_acc" ]; then echo "TRANSFER-TARGET-PARENT-NOT-DIR $_acc" >&2; IFS=$_IFS; return 1; fi
+  done
+  IFS=$_IFS
+}
+{%- endmacro -%}
+
+{#- ---- promotion: set each verified staged member to its declared mode and rename it over its live path
+     (per-member atomic, same filesystem), then prune the previously owned members the new edition no longer has
+     (regular files only; every parent walked without following links first). cwd = the deployment root.
+     Reads <state>/<ops>/<op>.modes ("<mode> <path>") and <op>.prune ("<path>"). -#}
+{#- tl = {tool: canonical path} (rh os_tools, admitted in target_observe.yml); no PATH lookup below. -#}
+{%- macro sh_promote(tr, op, tl) -%}
+set -eu
+{{ sh_parent_guard() }}
+_st={{ shq(tr.target.state_dir ~ '/' ~ tr.target.staging_dir ~ '/' ~ op) }}
+_ops={{ shq(tr.target.state_dir ~ '/' ~ tr.target.ops_dir ~ '/' ~ op) }}
+while IFS=' ' read -r _mode m; do
+  guard_parents "$m"
+  _d=${m%/*}; [ "$_d" = "$m" ] || {{ tl.mkdir }} -p -m {{ tr.target.dir_mode }} -- "$_d"
+  if [ -L "$m" ] || { [ -e "$m" ] && [ ! -f "$m" ]; }; then echo "TRANSFER-TARGET-MEMBER-NOT-FILE $m" >&2; exit 1; fi
+  {{ tl.chmod }} "$_mode" -- "$_st/$m"
+  {{ tl.mv }} -f -- "$_st/$m" "$m"
+done < "$_ops.modes"
+while IFS= read -r m; do
+  guard_parents "$m"
+  if [ -L "$m" ]; then echo "TRANSFER-TARGET-PRUNE-LINK $m" >&2; exit 1; fi
+  if [ -f "$m" ]; then
+    {{ tl.rm }} -f -- "$m"
+    _d=${m%/*}; [ "$_d" = "$m" ] || {{ tl.rmdir }} -p --ignore-fail-on-non-empty -- "$_d" 2>/dev/null || true
+  elif [ -e "$m" ]; then echo "TRANSFER-TARGET-PRUNE-NOT-FILE $m" >&2; exit 1; fi
+done < "$_ops.prune"
+{%- endmacro -%}
+
+{#- ---- remove EXACTLY the given staging entries (paths relative to the deployment root, each under the owned
+     state's staging/, incoming/ or ops/, classified by the observe play: dead ops of THIS controller or finished ops'
+     residue). Never a glob, never an age rule. -#}
+{%- macro sh_reap(tr, paths, tl) -%}
+{% for p in paths %}
+{{ tl.rm }} -rf -- {{ shq(p) }}
+{% endfor %}
+{%- endmacro -%}
+
+{#- ---- run a body under the owned state lock (route E25-E27 lease/flock model): claim/reap never wait
+     (flock -x -n), publish waits a bounded time (flock -x -w <publish_wait_s>); both exit <busy_rc> when the lock
+     is held. cwd = the deployment root. rc busy_rc -> TRANSFER-TARGET-BUSY (the caller refuses). -#}
+{%- macro sh_locked(tr, tl, body, wait) -%}
+{{ tl.flock }} -x {{ ('-w ' ~ tr.target.publish_wait_s) if wait else '-n' }} -E {{ tr.target.busy_rc }} -- {{ shq(tr.target.state_dir ~ '/' ~ tr.target.lock) }} /bin/sh -c {{ shq(body) }}
+{%- endmacro -%}
+
+{#- ---- append ledger lines (inside a locked body; printf is the shell builtin). -#}
+{%- macro sh_append(tr, lines) -%}
+{% for l in lines %}
+printf '%s\n' {{ shq(l) }} >> {{ shq(tr.target.state_dir ~ '/' ~ tr.target.ledger) }}
+{% endfor %}
+{%- endmacro -%}
+
+{#- ---- the claim (compare-and-swap on the ledger): the ledger must still be byte-identical to the one the observe
+     play classified (sha256, or 'absent'); otherwise another writer moved it -> exit busy_rc, nothing changed.
+     Then reap EXACTLY the observed reap set, record the abandon of this controller's dead ops, and record `start <op> <token>`. From here
+     every other writer's observation sees this op as a foreign unfinished op and refuses. -#}
+{%- macro sh_claim(tr, tl, observed, reap, dead, op, token) -%}
+set -eu
+_l={{ shq(tr.target.state_dir ~ '/' ~ tr.target.ledger) }}
+if [ -e "$_l" ]; then _h=$({{ tl.sha256sum }} < "$_l"); _h=${_h%% *}; else _h=absent; fi
+if [ "$_h" != {{ shq(observed) }} ]; then echo "TRANSFER-TARGET-LEDGER-MOVED $_h" >&2; exit {{ tr.target.busy_rc }}; fi
+{{ sh_reap(tr, reap, tl) }}
+{{ sh_append(tr, dead | map('regex_replace', '^', tr.target.verbs.abandon ~ ' ') | list + [tr.target.verbs.start ~ ' ' ~ op ~ ' ' ~ token]) }}
+{%- endmacro -%}
+
+
+
+{#- ---- readback of a tree against the op's expected manifest. cwd = the deployment root; tree = the tree to read
+     (the staging tree or '.'). staging: exact digests + exact member set (unexpected members fail). live: exact
+     digests + declared modes + every pruned path absent (unowned files are not members, so not checked). -#}
+{%- macro sh_readback(tr, op, tree, staging, tl) -%}
+set -eu
+_ops="$PWD/"{{ shq(tr.target.state_dir ~ '/' ~ tr.target.ops_dir ~ '/' ~ op) }}
+_fail=0
+cd -- {{ shq(tree) }}
+{{ tl.sha256sum }} --check --strict --quiet -- "$_ops.sha256" || { echo "TRANSFER-READBACK-DIGEST" >&2; _fail=1; }
+{% if staging %}
+{{ tl.find }} . -mindepth 1 ! -type d -printf '%P\n' | LC_ALL=C {{ tl.sort }} > "$_ops.found"
+LC_ALL=C {{ tl.sort }} -- "$_ops.members" | {{ tl.cmp }} -s - "$_ops.found" || { echo "TRANSFER-READBACK-MEMBER-SET staging differs" >&2; _fail=1; }
+{% else %}
+while IFS=' ' read -r _m _p; do
+  if [ -L "$_p" ] || [ ! -f "$_p" ]; then echo "TRANSFER-READBACK-MISSING $_p" >&2; _fail=1; continue; fi
+  [ "$({{ tl.find }} "$_p" -maxdepth 0 -printf '%m')" = "$_m" ] || { echo "TRANSFER-READBACK-MODE $_p" >&2; _fail=1; }
+done < "$_ops.modes"
+while IFS= read -r _p; do
+  if [ -e "$_p" ] || [ -L "$_p" ]; then echo "TRANSFER-READBACK-PRUNED-PRESENT $_p" >&2; _fail=1; fi
+done < "$_ops.prune"
+{% endif %}
+exit $_fail
+{%- endmacro -%}
+
+{#- ---- check.yml: walk a task list, following blocks and B includes, and emit one JSON line per task.
+     B includes must be written "{{ '{{' }} tr_dir {{ '}}' }}/<tasks_dir>/<file>" and are loaded and walked; route includes must be
+     written with the rh_repo_root or playbook_dir-based repository prefix and are emitted (not walked) for binding
+     by path + sha256; anything else is emitted as UNRESOLVED and refused by check.yml. -#}
+{%- macro walk(tasks, via, tr, tr_dir, depth) -%}
+{%- set kw = ['name', 'when', 'register', 'vars', 'loop', 'loop_control', 'changed_when', 'failed_when', 'tags',
+              'delegate_to', 'run_once', 'environment', 'no_log', 'become', 'become_user', 'args', 'until', 'retries',
+              'delay', 'ignore_errors', 'check_mode', 'notify', 'any_errors_fatal', 'listen', 'throttle', 'timeout',
+              'diff', 'module_defaults', 'collections', 'connection', 'block', 'rescue', 'always', 'with_items'] -%}
+{%- set bprefix = '{' ~ '{ tr_dir }' ~ '}/' ~ tr.tasks_dir ~ '/' -%}
+{%- set rprefix = '^\\{\\{ (rh_repo_root|playbook_dir \\| dirname \\| dirname \\| dirname) \\}\\}/' -%}
+{%- for t in (tasks or []) -%}
+{%- if t.block is defined -%}
+{{ walk(t.block, via, tr, tr_dir, depth) }}{{ walk(t.rescue | default([]), via, tr, tr_dir, depth) }}{{ walk(t.always | default([]), via, tr, tr_dir, depth) }}
+{%- else -%}
+{%- set mods = t.keys() | reject('in', kw) | list -%}
+{%- set mod = (mods | first) if (mods | length == 1) else 'AMBIGUOUS:' ~ (mods | join(',')) -%}
+{%- set row = {'module': mod, 'task': t.name | default(''), 'via': via,
+               'delegate_to': t.delegate_to | default(none),
+               'changed_when': (t.changed_when | string) if t.changed_when is defined else none} -%}
+{%- if mod in ['ansible.builtin.include_tasks', 'ansible.builtin.import_tasks'] -%}
+{%- set f = t[mod] if t[mod] is string else (t[mod].file | default('')) -%}
+{%- if f.startswith(bprefix) and depth < 6 -%}
+{{ (row | combine({'include': 'b', 'file': f[bprefix | length:]}) | to_json) ~ '\n' }}
+{{- walk(lookup('ansible.builtin.file', tr_dir ~ '/' ~ tr.tasks_dir ~ '/' ~ f[bprefix | length:]) | from_yaml, via ~ '>' ~ f[bprefix | length:], tr, tr_dir, depth + 1) -}}
+{%- elif f is match(rprefix) -%}
+{{ (row | combine({'include': 'route', 'file': f | regex_replace(rprefix, '')}) | to_json) ~ '\n' }}
+{%- else -%}
+{{ (row | combine({'include': 'UNRESOLVED', 'file': f}) | to_json) ~ '\n' }}
+{%- endif -%}
+{%- elif mod == 'ansible.builtin.include_role' or mod == 'ansible.builtin.import_role' -%}
+{{ (row | combine({'include': 'UNRESOLVED', 'file': t[mod] | string}) | to_json) ~ '\n' }}
+{%- else -%}
+{{ (row | to_json) ~ '\n' }}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endmacro -%}
+
+{#- ---- check.yml: every structural violation of the entry playbooks against the declaration, as a JSON list.
+     Entry files are read here by lookup (their "{{ }}" strings stay data). -#}
+{%- macro violations(tr, tr_dir, repo_root) -%}
+{%- set v = [] -%}
+{%- set n = namespace(rows=0) -%}
+{%- set bfiles = [] -%}
+{%- for ename, decl in tr.entries.items() -%}
+{%- set plays = lookup('ansible.builtin.file', tr_dir ~ '/' ~ ename) | from_yaml -%}
+{%- if (plays | map(attribute='name') | list) != (decl | map(attribute='id') | list) -%}
+{{ v.append(ename ~ ': plays ' ~ (plays | map(attribute='name') | list | to_json) ~ ' != declared ' ~ (decl | map(attribute='id') | list | to_json)) or '' }}
+{%- endif -%}
+{%- for p in plays -%}
+{%- set d = decl | selectattr('id', 'equalto', p.name | default('')) | first | default({'hosts': 'UNDECLARED', 'kind': 'UNDECLARED'}) -%}
+{%- set placed = 'localhost' if (p.hosts == 'localhost' and p.connection | default('') == 'local')
+                  else ('target' if p.hosts == tr.target_hosts_expr else 'OTHER:' ~ p.hosts) -%}
+{%- set pa = ename ~ ':' ~ (p.name | default('?')) -%}
+{%- if placed != d.hosts -%}{{ v.append(pa ~ ': placed on ' ~ placed ~ ', declared ' ~ d.hosts) or '' }}{%- endif -%}
+{%- if p.any_errors_fatal | default(false) is not sameas true -%}{{ v.append(pa ~ ': not any_errors_fatal') or '' }}{%- endif -%}
+{%- if p.gather_facts | default(true) is not sameas false -%}{{ v.append(pa ~ ': gathers facts') or '' }}{%- endif -%}
+{%- set rows = walk(p.tasks | default([]), pa, tr, tr_dir, 0) | trim | split('\n') | select | map('from_json') | list -%}
+{%- set n.rows = n.rows + (rows | length) -%}
+{{- bfiles.extend(rows | selectattr('include', 'defined') | selectattr('include', 'equalto', 'b') | map(attribute='file') | list) or '' -}}
+{%- for r in rows -%}
+{%- set at = pa ~ ' [' ~ r.via ~ '] ' ~ r.task ~ ': ' -%}
+{%- if r.include | default('') == 'UNRESOLVED' -%}{{ v.append(at ~ 'unresolved include ' ~ r.file) or '' }}{%- endif -%}
+{%- if r.include | default('') == 'route' -%}
+{%- set ri = tr.route_includes | selectattr('rel', 'equalto', r.file) | first | default(none) -%}
+{%- if ri is none -%}{{ v.append(at ~ 'undeclared route include ' ~ r.file) or '' }}
+{%- elif lookup('ansible.builtin.file', repo_root ~ '/' ~ r.file, rstrip=false) | hash('sha256') != ri.sha256 -%}{{ v.append(at ~ 'route include sha256 drift ' ~ r.file) or '' }}
+{%- endif -%}
+{%- endif -%}
+{%- if d.kind == 'observe' -%}
+{%- if r.module not in tr.observe_modules -%}{{ v.append(at ~ 'module ' ~ r.module ~ ' in an observe play') or '' }}{%- endif -%}
+{%- if r.module == 'ansible.builtin.command' and r.changed_when != 'False' -%}{{ v.append(at ~ 'command without changed_when false in an observe play') or '' }}{%- endif -%}
+{%- if r.delegate_to is not none -%}{{ v.append(at ~ 'delegation in an observe play') or '' }}{%- endif -%}
+{%- else -%}
+{%- if r.module not in (tr.observe_modules + tr.effect_modules) -%}{{ v.append(at ~ 'undeclared module ' ~ r.module) or '' }}{%- endif -%}
+{%- if r.delegate_to is not none and r.delegate_to != 'localhost' -%}{{ v.append(at ~ 'delegation to ' ~ r.delegate_to) or '' }}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- set gate = lookup('ansible.builtin.file', tr_dir ~ '/../deploy_gate.sh') -%}
+{%- for k in ['contract_json', 'ssh_argv', 'machine_id', 'transfer_receipt'] -%}
+{%- if (tr.outputs.prefix not in gate) or (tr.outputs[k] not in gate) -%}{{ v.append('deploy_gate.sh does not name output ' ~ tr.outputs.prefix ~ '<label>' ~ tr.outputs[k]) or '' }}{%- endif -%}
+{%- endfor -%}
+{%- if 'root@${HOST}' in gate or 'root@$HOST' in gate -%}{{ v.append('deploy_gate.sh builds its own root@HOST ssh target') or '' }}{%- endif -%}
+{%- set il = [] -%}
+{%- for ri in tr.route_includes | sort(attribute='rel') -%}
+{{ il.append((lookup('ansible.builtin.file', repo_root ~ '/' ~ ri.rel, rstrip=false) | hash('sha256')) ~ '  ' ~ ri.rel[(tr.route_interface.base | length) + 1:] ~ '\n') or '' }}
+{%- endfor -%}
+{%- if (il | join('')) | hash('sha256') != tr.route_interface.interface_sha256 -%}{{ v.append('route consumer interface drift: computed ' ~ ((il | join('')) | hash('sha256')) ~ ' != declared revision ' ~ tr.route_interface.revision ~ ' ' ~ tr.route_interface.interface_sha256) or '' }}{%- endif -%}
+{%- for f in (tr.entries.keys() | list) + (bfiles | unique | map('regex_replace', '^', tr.tasks_dir ~ '/') | list) -%}
+{%- if 'profiles/remote-harness.yml' in lookup('ansible.builtin.file', tr_dir ~ '/' ~ f) -%}{{ v.append(f ~ ' reads the raw remote-harness profile (consume the resolved policy rh)') or '' }}{%- endif -%}
+{%- endfor -%}
+{%- if n.rows == 0 -%}{{ v.append('no task walked') or '' }}{%- endif -%}
+{{ {'rows': n.rows, 'violations': v} | to_json }}
+{%- endmacro -%}

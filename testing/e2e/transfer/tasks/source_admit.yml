@@ -1,0 +1,130 @@
+---
+# testing/e2e/transfer/tasks/source_admit.yml -- B2-OWNED-SOURCE-EDITION source admission (localhost, observe-only).
+# The shipped edition is the COMMITTED tree of the repository the harness itself runs from: src must be that
+# repository (no substitution), no tracked path may be staged or modified (dirty refuses), members are the index
+# (== HEAD when clean) minus the declared transfer manifest, with admitted names and modes only.
+# Inputs: tr, tr_bs, tr_repo_root (the harness repository root), lme_transfer_src.
+# R-B3: the PATH tar/gzip the binding extraction (unarchive) uses is proven to be the admitted os_tools file.
+# Outputs: tr_source {commit, members: [{path, mode, blob}]}.
+
+- name: Admit the source input (no default)
+  ansible.builtin.assert:
+    that:
+      - lme_transfer_src is defined and lme_transfer_src is string
+      - lme_transfer_src is match(tr_bs.path_admission.regex)
+      - lme_transfer_src is not search(tr_bs.path_admission.forbidden_segment_regex)
+    fail_msg: "TRANSFER-SOURCE-INPUT: lme_transfer_src ({{ lme_transfer_src | default('') }}) must be a normalized absolute path"
+    quiet: true
+
+- name: Stat the source, the harness repository and the declared git client
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ lme_transfer_src }}", "{{ tr_repo_root }}", "{{ tr.source.git }}"]
+  register: _tr_sst
+
+- name: Refuse a substituted source (not the harness repository) or an absent git client
+  ansible.builtin.assert:
+    that:
+      - _tr_sst.results[0].stat.exists and _tr_sst.results[0].stat.isdir and not _tr_sst.results[0].stat.islnk
+      - (lme_transfer_src | realpath) == (tr_repo_root | realpath)
+      - _tr_sst.results[2].stat.exists and _tr_sst.results[2].stat.executable
+    fail_msg: >-
+      TRANSFER-SOURCE-SUBSTITUTED: {{ lme_transfer_src }} is not the repository the harness runs from
+      ({{ tr_repo_root }}), or {{ tr.source.git }} is absent (controller dependency; {{ tr.remedy }}).
+    quiet: true
+
+- name: Read the tracked-path status, the HEAD commit and the index (read-only git plumbing)
+  ansible.builtin.command:
+    argv: "{{ [tr.source.git, '-C', lme_transfer_src] + item }}"
+  environment:
+    LC_ALL: C
+    GIT_OPTIONAL_LOCKS: '0'
+  loop:
+    - [status, --porcelain=v1, --untracked-files=no, --ignore-submodules=none]
+    - [rev-parse, --verify, 'HEAD^{commit}']
+    - [ls-files, --stage]
+  register: _tr_git
+  changed_when: false
+
+- name: Refuse dirty source (any staged or unstaged change to a tracked path)
+  ansible.builtin.assert:
+    that:
+      - _tr_git.results[0].stdout == ''
+    fail_msg: >-
+      TRANSFER-SOURCE-DIRTY: {{ lme_transfer_src }} has tracked changes; only a committed edition is shipped:
+      {{ _tr_git.results[0].stdout_lines[:20] }}
+    quiet: true
+
+- name: Derive the committed members (index minus the declared transfer manifest)
+  ansible.builtin.set_fact:
+    tr_source:
+      commit: "{{ _tr_git.results[1].stdout }}"
+      excluded_regex: >-
+        {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                  template_vars={'lme_macro': 'exclusion_regex', 'lme_args': [tr.excludes]}) | trim }}
+    _tr_index: >-
+      {{ _tr_git.results[2].stdout_lines
+         | map('regex_replace', '^([0-7]{6}) ([0-9a-f]{40,64}) ([0-3])\t(.*)$', '{"mode": "\1", "blob": "\2", "stage": "\3", "path": "\4"}')
+         | map('from_json') | list }}
+
+- name: Publish the member list
+  ansible.builtin.set_fact:
+    tr_source: >-
+      {{ tr_source | combine({'members': _tr_index | rejectattr('path', 'search', tr_source.excluded_regex) | list,
+                              'excluded_count': _tr_index | selectattr('path', 'search', tr_source.excluded_regex) | list | length}) }}
+
+- name: Refuse unmerged entries, unadmitted modes (links, gitlinks) and unadmitted member names
+  ansible.builtin.assert:
+    that:
+      - tr_source.commit is match('^[0-9a-f]{40,64}$')
+      - tr_source.members | length > 0
+      - tr_source.members | rejectattr('stage', 'equalto', '0') | list | length == 0
+      - tr_source.members | map(attribute='mode') | reject('in', tr.source.admitted_modes.keys() | list) | list | length == 0
+      - tr_source.members | map(attribute='path') | map('regex_replace', '^', '/') | reject('match', tr_bs.path_admission.regex) | list | length == 0
+      - tr_source.members | map(attribute='path') | select('search', tr_bs.path_admission.forbidden_segment_regex) | list | length == 0
+    fail_msg: >-
+      TRANSFER-SOURCE-MEMBERS: commit {{ tr_source.commit }}; refused members (unmerged, mode in
+      {{ tr.source.refused_modes }} or not in {{ tr.source.admitted_modes.keys() | list }}, or a name outside the
+      path-admission rule): {{ (tr_source.members | rejectattr('mode', 'in', tr.source.admitted_modes.keys() | list) | map(attribute='path') | list)[:20] }}
+    quiet: true
+
+- name: Resolve the tools the controller binding extraction's unarchive finds through PATH (R-B3)
+  ansible.builtin.command:
+    argv: [/bin/sh, -c, 'command -v -- "$1"', sh, "{{ item }}"]
+  loop: "{{ tr.target.path_resolved.values() | flatten | unique }}"
+  register: _tr_cpath
+  changed_when: false
+  failed_when: false
+
+- name: Stat the PATH-resolved tools and their canonical os_tools files (following links; sha256 identity)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ (_tr_cpath.results | map(attribute='stdout') | map('regex_replace', '^(?!/).*$', '/nonexistent') | list)
+       + (_tr_cpath.results | map(attribute='item') | map('extract', tr_bs.os_tools) | map(attribute='path') | list) }}
+  register: _tr_cpst
+
+- name: Refuse a controller PATH tar/gzip that is not the admitted os_tools file (unarchive_path_equality)
+  vars:
+    _n: "{{ _tr_cpath.results | length }}"
+    _res: "{{ _tr_cpst.results[:(_n | int)] | map(attribute='stat') | list }}"
+    _dec: "{{ _tr_cpst.results[(_n | int):] | map(attribute='stat') | list }}"
+  ansible.builtin.assert:
+    that:
+      - _res | rejectattr('exists') | list | length == 0
+      - _dec | rejectattr('exists') | list | length == 0
+      - _res | map(attribute='dev') | list == _dec | map(attribute='dev') | list
+      - _res | map(attribute='inode') | list == _dec | map(attribute='inode') | list
+      - >-
+        _dec | map(attribute='checksum') | list
+        == _tr_cpath.results | map(attribute='item') | map('extract', tr_bs.os_tools) | map(attribute='identity') | map(attribute='sha256') | list
+    fail_msg: >-
+      TRANSFER-CONTROLLER-PATH-TOOL: unarchive resolves
+      {{ _tr_cpath.results | map(attribute='item') | zip(_tr_cpath.results | map(attribute='stdout')) | list }} through PATH,
+      which is not the admitted rh os_tools file of the same name (same device + inode + identity sha256 required).
+    quiet: true

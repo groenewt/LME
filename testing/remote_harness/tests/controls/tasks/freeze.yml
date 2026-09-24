@@ -1,0 +1,59 @@
+---
+# freeze or thaw one background act (_rhc_step.freeze: {step} | _rhc_step.thaw: {step}) through the cgroup v2 freezer of
+# the act's OWN transient scope (plan.unit, never the runner's scope and never a scope the runner did not create).
+# A frozen run keeps its holder process, its start time and a populated cgroup: to the route it is a LIVE writer stopped
+# at an arbitrary point, which is the before-lock hold point strace cannot give (E09 phase order, E26 outcome (i)).
+# The freeze must be observed (cgroup.events frozen 1) before the step passes.
+
+- name: The act scope to freeze or thaw
+  ansible.builtin.set_fact:
+    _rhc_fz_step: "{{ (_rhc_step.freeze | default(_rhc_step.thaw)).step }}"
+    _rhc_fz_verb: "{{ 'freeze' if _rhc_step.freeze is defined else 'thaw' }}"
+    _rhc_fz_unit: "{{ _rhc_jobs[(_rhc_step.freeze | default(_rhc_step.thaw)).step].plan.unit | default('') }}"
+
+- name: Refuse a freeze of anything but an act scope this runner created
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [_rhc_step.id ~ ': ' ~ _rhc_fz_verb ~ ' needs a background act with its own scope; ' ~ _rhc_fz_step ~ ' has none'] }}"
+  when: not (_rhc_fz_unit is match('^' ~ (rhc_decl.act_scope.unit_prefix | regex_escape) ~ '[0-9a-f]{20}\.scope$'))
+
+- name: "{{ _rhc_fz_verb | capitalize }} the act scope"
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.systemctl }}", --user, "{{ _rhc_fz_verb }}", "{{ _rhc_fz_unit }}"]
+  environment:
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
+  register: _rhc_fz
+  changed_when: true
+  failed_when: false
+  when: _rhc_fz_unit is match('^' ~ (rhc_decl.act_scope.unit_prefix | regex_escape) ~ '[0-9a-f]{20}\.scope$')
+
+- name: Read the scope's control group
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.systemctl }}", --user, show, --property=ControlGroup, --value, "{{ _rhc_fz_unit }}"]
+  environment:
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
+  register: _rhc_fz_cg
+  changed_when: false
+  failed_when: false
+  when: _rhc_fz is not skipped and _rhc_fz.rc | default(1) == 0
+
+- name: The freezer state must be the requested one (cgroup.events frozen 1 after freeze, 0 after thaw)
+  ansible.builtin.slurp:
+    src: "/sys/fs/cgroup{{ _rhc_fz_cg.stdout | trim }}/cgroup.events"
+  register: _rhc_fz_ev
+  until: >-
+    (_rhc_fz_ev.content | default('') | b64decode) is search('^frozen ' ~ ('1' if _rhc_fz_verb == 'freeze' else '0') ~ '$', multiline=true)
+  retries: "{{ rhc_decl.state.timeouts_s.kill_settle }}"
+  delay: 1
+  failed_when: false
+  when: _rhc_fz_cg is not skipped and (_rhc_fz_cg.stdout | default('') | trim) is match('/')
+
+- name: A freeze or thaw that did not take effect fails the step
+  ansible.builtin.set_fact:
+    _rhc_fail: >-
+      {{ _rhc_fail + [_rhc_step.id ~ ': ' ~ _rhc_fz_verb ~ ' of ' ~ _rhc_fz_unit ~ ' not observed (rc '
+         ~ (_rhc_fz.rc | default('skipped')) ~ ', ' ~ (_rhc_fz.stderr | default('') | trim) ~ ')'] }}
+  when: >-
+    _rhc_fz is skipped or _rhc_fz.rc | default(1) != 0 or _rhc_fz_ev is skipped
+    or not ((_rhc_fz_ev.content | default('') | b64decode) is search('^frozen ' ~ ('1' if _rhc_fz_verb == 'freeze' else '0') ~ '$', multiline=true))

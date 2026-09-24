@@ -1,0 +1,70 @@
+---
+# testing/e2e/transfer/tasks/bind_controller.yml -- the controller prelude of BOTH entry playbooks (localhost,
+# observe-only): the route author's entry guard + resolved policy + executor binding, then B's bindings to it.
+# Everything B reads from the route comes from the RESOLVED `rh` (resolve_policy.yml), never the raw profile.
+# Outputs: tr_bs, tr_adapter, tr_repo_root, tr_scope_expect, tr_ctl_token, tr_contract, tr_ssh_argv, tr_conn, tr_state, tr_out.
+
+- name: Resolve the harness policy, verify the controller receipt and bind the executor (route author)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_harness.yml"
+
+- name: Bind B to the resolved policy
+  ansible.builtin.set_fact:
+    tr_bs: "{{ rh.controller.bootstrap }}"
+    tr_adapter: "{{ rh.transfer.adapters[rh.transfer.adapter] }}"
+    tr_repo_root: "{{ rh_repo_root }}"
+
+- name: Refuse an adapter B does not implement, or a moved consumer verification (seam bindings)
+  ansible.builtin.assert:
+    that:
+      - rh.transfer.adapter == tr.implements_adapter
+      - rh.controller.bootstrap.consumer_verification.tasks_rel in (tr.route_includes | map(attribute='rel') | list)
+    fail_msg: >-
+      TRANSFER-ROUTE-SEAM: declared adapter {{ rh.transfer.adapter }} (B implements {{ tr.implements_adapter }}) or
+      consumer verification {{ rh.controller.bootstrap.consumer_verification.tasks_rel }} is not a bound route include.
+    quiet: true
+
+- name: Refuse a route consumer interface, publish model or proxy form other than the ones B binds (R-B4, R-B3)
+  ansible.builtin.assert:
+    that:
+      - rh.controller.bootstrap.consumer_interface.revision == tr.route_interface.revision
+      - rh.controller.bootstrap.consumer_interface.interface_sha256 == tr.route_interface.interface_sha256
+      - >-
+        (rh.controller.bootstrap.consumer_interface.files | dict2items
+         | map(attribute='key') | map('regex_replace', '^', tr.route_interface.base ~ '/') | sort | list)
+        == (tr.route_includes | map(attribute='rel') | sort | list)
+      - tr_adapter.publish_models.deploy_edition.model == tr.edition.model
+      - tr_adapter.publish_models.deploy_edition.owner == 'B'
+      - tr_adapter.publish_models.deploy_edition.unarchive_path_equality == 'required'
+      - rh.controller.bootstrap.ssh_auth.composition.proxy_jump.form_regex == tr.contract.proxy_regex
+      - rh.controller.bootstrap.inventory.connection_profiles[tr.contract.connection_profile].user == tr.contract.privilege.remote_user
+    fail_msg: >-
+      TRANSFER-ROUTE-INTERFACE: resolved consumer interface revision
+      {{ rh.controller.bootstrap.consumer_interface.revision | default('?') }}
+      {{ rh.controller.bootstrap.consumer_interface.interface_sha256 | default('?') }} != B's bound revision
+      {{ tr.route_interface.revision }} {{ tr.route_interface.interface_sha256 }}, or its file set differs from the route
+      includes, or publish_models.deploy_edition is not {{ tr.edition.model }}/B/unarchive_path_equality, or the proxy
+      form or the {{ tr.contract.connection_profile }} profile user differs from B's contract.
+    quiet: true
+
+- name: Expect the transfer target's controller-resolved scope (B-PER-HOST-POLICY-BINDING)
+  ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/scope_expect.yml"
+  vars:
+    tr_scope_target: "{{ lme_transfer_target }}"
+
+- name: Read the controller identity (for the writer token of target ops)
+  ansible.builtin.slurp:
+    src: "{{ tr.contract.identity_file }}"
+  register: _tr_ctl_id
+
+- name: Bind the controller writer token (machine-id + owned controller root; the seed holds that root's lock)
+  ansible.builtin.set_fact:
+    tr_ctl_token: "{{ ((_tr_ctl_id.content | b64decode | trim) ~ ':' ~ rh_owned_root) | hash('sha256') }}"
+
+- name: Resolve the ONE target/connection contract
+  ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/resolve_contract.yml"
+
+- name: Bind the contract endpoint to the endpoint in the target's scope (B-PER-HOST-POLICY-BINDING)
+  ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/endpoint_bind.yml"
+
+- name: Admit the controller state directory
+  ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/admit_state_dir.yml"

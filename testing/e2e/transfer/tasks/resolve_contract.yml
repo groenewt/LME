@@ -1,0 +1,126 @@
+---
+# testing/e2e/transfer/tasks/resolve_contract.yml -- B2-TARGET-BINDING (localhost, observe-only).
+# Resolves the ONE admitted target/connection contract from the inventory host lme_transfer_target, the route's
+# `privileged` connection profile and ONE auth mode (rh ssh_auth), plus the one supported override (deploy_gate
+# --ssh-key), refusing anything it cannot carry identically on every stage.
+# Inputs: tr (transfer.decl.yml), tr_bs (resolved rh.controller.bootstrap), lme_transfer_target, lme_transfer_ssh_key.
+# Outputs: tr_contract, tr_ssh_argv (deploy_gate's argv), tr_conn (the Ansible connection vars of the same contract).
+
+- name: Admit the target alias and the override input (no default)
+  ansible.builtin.assert:
+    that:
+      - lme_transfer_target is defined and lme_transfer_target is string
+      - lme_transfer_target is match(tr.inputs.host_regex)
+      - lme_transfer_target in groups['all'] and lme_transfer_target != 'localhost'
+      - lme_transfer_ssh_key is defined and lme_transfer_ssh_key is string
+      - >-
+        lme_transfer_ssh_key == '' or (lme_transfer_ssh_key is match(tr_bs.path_admission.regex)
+        and lme_transfer_ssh_key is not search(tr_bs.path_admission.forbidden_segment_regex))
+    fail_msg: >-
+      TRANSFER-CONTRACT-INPUT: lme_transfer_target must be an inventory host (not localhost) matching
+      {{ tr.inputs.host_regex }}; lme_transfer_ssh_key must be '' or a normalized absolute path.
+    quiet: true
+
+- name: Name the route's privileged connection profile and the ONE auth mode of this deployment
+  ansible.builtin.set_fact:
+    _tr_prof: "{{ tr_bs.inventory.connection_profiles[tr.contract.connection_profile] }}"
+    _tr_mode: "{{ hostvars[lme_transfer_target][tr_bs.ssh_auth.mode_var] | default('') }}"
+    _tr_run_mode: "{{ lookup('ansible.builtin.env', tr_bs.ssh_auth.env_mode) }}"
+    _tr_common: "{{ hostvars[lme_transfer_target][tr.contract.proxy_var] | default('') }}"
+
+- name: Refuse an auth mode B's privileged legs do not carry (route matrix disposition; never silently dropped)
+  ansible.builtin.assert:
+    that:
+      - _tr_mode in tr_bs.ssh_auth.modes
+      - _tr_mode == _tr_run_mode
+      - _tr_mode in tr.contract.auth_modes_admitted
+    fail_msg: >-
+      TRANSFER-CONTRACT-AUTH-MODE: {{ lme_transfer_target }} {{ tr_bs.ssh_auth.mode_var }}='{{ _tr_mode }}', seed run
+      mode ({{ tr_bs.ssh_auth.env_mode }})='{{ _tr_run_mode }}'; B's privileged legs admit {{ tr.contract.auth_modes_admitted }}
+      ({{ tr.contract.auth_modes_refused }}).
+    quiet: true
+
+- name: Refuse connection settings the contract cannot carry on every stage (present means refused, never ignored)
+  ansible.builtin.assert:
+    that:
+      - tr.contract.refused_vars | select('in', hostvars[lme_transfer_target]) | list | length == 0
+      - (hostvars[lme_transfer_target][tr.contract.connection_var] | default('ssh')) in tr.contract.connection_admitted
+      - >-
+        _tr_common in ['', tr_bs.ssh_auth.modes[_tr_mode].ssh_common_args] or _tr_common is match(tr.contract.proxy_regex)
+    fail_msg: >-
+      TRANSFER-CONTRACT-UNSUPPORTED: {{ lme_transfer_target }} sets
+      {{ tr.contract.refused_vars | select('in', hostvars[lme_transfer_target]) | list }}, a connection other than
+      {{ tr.contract.connection_admitted }}, or {{ tr.contract.proxy_var }} other than absent, the mode's args or
+      {{ tr.contract.proxy_regex }}.
+    quiet: true
+
+- name: Refuse an --ssh-key that conflicts with the privileged profile's key (translate only when the profile has none)
+  ansible.builtin.assert:
+    that:
+      - >-
+        hostvars[lme_transfer_target][_tr_prof.key_var] is not defined or lme_transfer_ssh_key == ''
+        or hostvars[lme_transfer_target][_tr_prof.key_var] == lme_transfer_ssh_key
+    fail_msg: >-
+      TRANSFER-CONTRACT-CONFLICT: {{ tr.contract.overrides.ssh_key.flag }} {{ lme_transfer_ssh_key }} differs from
+      {{ lme_transfer_target }} {{ _tr_prof.key_var }}={{ hostvars[lme_transfer_target][_tr_prof.key_var] | default('') }}.
+    quiet: true
+
+- name: Resolve the contract (one value per field; no invented default)
+  ansible.builtin.set_fact:
+    tr_contract: >-
+      {{ {'schema': tr.contract_schema,
+          'alias': lme_transfer_target,
+          'address': hostvars[lme_transfer_target][tr.contract.address_var] | default(lme_transfer_target),
+          'user': _tr_prof.user,
+          'profile': tr.contract.connection_profile,
+          'auth_mode': _tr_mode,
+          'mode_args': tr_bs.ssh_auth.modes[_tr_mode].ssh_common_args,
+          'port': hostvars[lme_transfer_target][tr.contract.port_var] | default(none),
+          'key': hostvars[lme_transfer_target][_tr_prof.key_var] | default(lme_transfer_ssh_key if lme_transfer_ssh_key != '' else none, true),
+          'key_source': ('profile' if hostvars[lme_transfer_target][_tr_prof.key_var] is defined
+                         else ('flag' if lme_transfer_ssh_key != '' else 'none')),
+          'proxy': (_tr_common | regex_replace(tr.contract.proxy_regex, '\1')) if _tr_common is match(tr.contract.proxy_regex) else none,
+          'privilege': tr.contract.privilege} }}
+
+- name: Admit every contract field (address, declared privilege, port, key per auth mode, proxy)
+  ansible.builtin.assert:
+    that:
+      - tr_contract.address is string and tr_contract.address is match(tr.contract.address_regex)
+      - tr_contract.user == tr.contract.privilege.remote_user
+      - tr_contract.port is none or ((tr_contract.port | string) is match('^[1-9][0-9]{0,4}$') and (tr_contract.port | int) <= 65535)
+      - >-
+        tr_contract.key is none or (tr_contract.key is match(tr_bs.path_admission.regex)
+        and tr_contract.key is not search(tr_bs.path_admission.forbidden_segment_regex))
+      - (tr_contract.auth_mode != 'explicit_key') or (tr_contract.key is not none)
+      - (tr_contract.auth_mode != 'tailnet_identity') or (tr_contract.key is none)
+      - tr_contract.proxy is none or tr_contract.proxy is match('^[A-Za-z0-9._@:-]+$')
+    fail_msg: >-
+      TRANSFER-CONTRACT-FIELD: {{ lme_transfer_target }} resolves to {{ tr_contract | to_json }}; the privileged profile
+      user must be {{ tr.contract.privilege.remote_user }}, explicit_key needs {{ _tr_prof.key_var }} (or
+      {{ tr.contract.overrides.ssh_key.flag }}), tailnet_identity takes no key, and every value must be admitted.
+    quiet: true
+
+- name: Stat the credential reference (a key must be a readable regular file, not a link)
+  ansible.builtin.stat:
+    path: "{{ tr_contract.key }}"
+    follow: false
+    get_checksum: false
+  register: _tr_key
+  when: tr_contract.key is not none
+
+- name: Refuse a missing or linked key
+  ansible.builtin.assert:
+    that:
+      - _tr_key.stat.exists and _tr_key.stat.isreg and _tr_key.stat.readable
+    fail_msg: "TRANSFER-CONTRACT-KEY: {{ tr_contract.key }} is not a readable regular file"
+    quiet: true
+  when: tr_contract.key is not none
+
+- name: Render deploy_gate's ssh argv and the Ansible connection vars from the SAME contract (one macro)
+  ansible.builtin.set_fact:
+    tr_ssh_argv: >-
+      {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                template_vars={'lme_macro': 'ssh_argv', 'lme_args': [tr, tr_contract]}) | from_json }}
+    tr_conn: >-
+      {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                template_vars={'lme_macro': 'ansible_conn', 'lme_args': [tr, tr_contract]}) | from_json }}

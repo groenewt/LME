@@ -1,0 +1,118 @@
+---
+# one predicate (rhc_p): expand with the current tokens, observe (read-only; links never followed), judge, bind.
+
+- name: Expand the predicate
+  ansible.builtin.set_fact:
+    _rhc_pj: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [rhc_p, _rhc_t]}}) }}"
+
+- name: Parse the predicate
+  ansible.builtin.set_fact:
+    _rhc_pp: "{{ _rhc_pj | from_json }}"
+    _rhc_presid: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'residual', 'args': [_rhc_pj]}}) | from_json }}"
+    _rhc_pobs: {}
+
+- name: A predicate with an unbound token fails (its binding glob did not match exactly once)
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [rhc_preds_label ~ '[' ~ rhc_pi ~ ']: unbound tokens ' ~ (_rhc_presid | join(' '))] }}"
+  when: _rhc_presid | length > 0
+
+- name: Observe
+  when: _rhc_presid | length == 0
+  block:
+    - name: path
+      ansible.builtin.stat:
+        path: "{{ _rhc_pp.path }}"
+        follow: false
+        get_checksum: false
+      register: _rhc_o_path
+      when: _rhc_pp.path is defined
+
+    - name: glob
+      ansible.builtin.find:
+        paths: "{{ _rhc_pp.glob.dir }}"
+        patterns: ["{{ _rhc_pp.glob.pattern }}"]
+        hidden: true
+        file_type: any
+        recurse: false
+      register: _rhc_o_glob
+      failed_when: false
+      when: _rhc_pp.glob is defined
+
+    - name: file (read only when it is a regular file; a fifo or link is never opened)
+      ansible.builtin.stat:
+        path: "{{ _rhc_pp.file }}"
+        follow: false
+        get_checksum: false
+      register: _rhc_o_fstat
+      when: _rhc_pp.file is defined
+
+    - name: file content
+      ansible.builtin.slurp:
+        src: "{{ _rhc_pp.file }}"
+      register: _rhc_o_file
+      failed_when: false
+      when: _rhc_pp.file is defined and (_rhc_o_fstat.stat.isreg | default(false))
+
+    - name: same_bytes
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        checksum_algorithm: sha256
+      loop: "{{ _rhc_pp.same_bytes | default([]) }}"
+      register: _rhc_o_same
+      when: _rhc_pp.same_bytes is defined
+
+    - name: implies (both sides)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: "{{ [_rhc_pp.implies.if_exists] + ([_rhc_pp.implies.then_exists] if _rhc_pp.implies.then_exists is defined else []) }}"
+      register: _rhc_o_impl
+      when: _rhc_pp.implies is defined
+
+    - name: The tree a snapshot comparison lists
+      ansible.builtin.set_fact:
+        _rhc_o_snapof: >-
+          {{ (_rhc_snaps[_rhc_pp.snapshot] | default({})) if _rhc_pp.snapshot is defined
+             else ((_rhc_snaps[_rhc_pp.implies.then_snapshot_equal] | default({})) | combine({'of': _rhc_pp.implies.if_exists})
+                   if (_rhc_pp.implies is defined and _rhc_pp.implies.then_snapshot_equal is defined) else {}) }}
+
+    - name: List it now
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.find }}", -P, "{{ _rhc_o_snapof.of }}", -printf, "%P %y %m %s %U %T@ %l\\n"]
+      register: _rhc_o_list
+      changed_when: false
+      failed_when: false
+      when: _rhc_o_snapof.of is defined
+
+    - name: Collect the observations
+      ansible.builtin.set_fact:
+        _rhc_pobs:
+          exists: "{{ _rhc_o_path.stat.exists | default(false) }}"
+          count: "{{ _rhc_o_glob.matched | default(-1) }}"
+          matches: "{{ _rhc_o_glob.files | default([]) | map(attribute='path') | sort | list }}"
+          text: "{{ (_rhc_o_file.content | b64decode) if (_rhc_o_file.content is defined) else none }}"
+          checksums: "{{ _rhc_o_same.results | default([]) | map(attribute='stat') | map(attribute='checksum', default='ABSENT') | list }}"
+          if_exists: "{{ (_rhc_o_impl.results[0].stat.exists) if (_rhc_o_impl.results is defined) else false }}"
+          then_exists: "{{ (_rhc_o_impl.results[1].stat.exists) if (_rhc_o_impl.results is defined and _rhc_o_impl.results | length > 1) else false }}"
+          lines: >-
+            {{ ((lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'snapshot_lines',
+                   'args': [_rhc_o_list.stdout, _rhc_o_snapof.exclude_regex | default([]), _rhc_o_snapof.include_regex | default([])]}}) | from_json)
+                 if _rhc_o_list.rc == 0 else ['ABSENT']) if (_rhc_o_list.rc is defined) else [] }}
+
+    - name: Judge
+      ansible.builtin.set_fact:
+        _rhc_fail: >-
+          {{ _rhc_fail + (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_state',
+               'args': [[_rhc_pp], [_rhc_pobs], _rhc_snaps]}}) | from_json | map('regex_replace', '^', rhc_preds_label ~ '[' ~ rhc_pi ~ ']: ') | list) }}
+
+    - name: Bind the single match of a binding glob (a staging binding also binds its reaping name)
+      vars:
+        _m: "{{ _rhc_pobs.matches[0] }}"
+        _sr: "{{ rh.controller.bootstrap.bundle }}"
+        _reap: "{{ (_m | dirname) ~ '/' ~ ((_m | basename) | regex_replace('^(\\.[^/]*?)\\.' ~ (_sr.staging_infix | regex_escape) ~ '\\.', '\\1.' ~ _sr.reaping_infix ~ '.')) }}"
+      ansible.builtin.set_fact:
+        _rhc_t: "{{ _rhc_t | combine({_rhc_pp.glob.bind: _m} | combine({'reaping': _reap} if _rhc_pp.glob.bind == 'staging' else {})) }}"
+        _rhc_ctx: "{{ _rhc_ctx | combine({'t': _rhc_t | combine({_rhc_pp.glob.bind: _m})}) }}"
+      when: _rhc_pp.glob is defined and _rhc_pp.glob.bind is defined and (_rhc_pobs.matches | length) == 1

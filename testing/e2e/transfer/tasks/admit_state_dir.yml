@@ -1,0 +1,62 @@
+---
+# testing/e2e/transfer/tasks/admit_state_dir.yml -- the controller state directory (localhost, observe-only).
+# Admitted with the route's ONE path-admission rule (tr_bs.path_admission: regex, forbidden segments, ancestry:
+# no link, directories only, not group/other-writable, owned by uid 0 or the gate user). It must already exist,
+# owned by the gate user, mode 0700 (the operator creates it like the toolchain root; no default, never created here).
+# Inputs: tr, tr_bs, lme_transfer_state_dir, lme_transfer_label. Outputs: tr_state, tr_out (output file paths).
+
+- name: Admit the state directory path and the label (no default)
+  ansible.builtin.assert:
+    that:
+      - lme_transfer_state_dir is defined and lme_transfer_state_dir is string
+      - lme_transfer_state_dir is match(tr_bs.path_admission.regex)
+      - lme_transfer_state_dir is not search(tr_bs.path_admission.forbidden_segment_regex)
+      - lme_transfer_label is defined and lme_transfer_label is string and lme_transfer_label is match(tr.inputs.label_regex)
+    fail_msg: >-
+      TRANSFER-STATE-INPUT: lme_transfer_state_dir ({{ lme_transfer_state_dir | default('') }}) must be a normalized
+      absolute path matching {{ tr_bs.path_admission.regex }}; lme_transfer_label must match {{ tr.inputs.label_regex }}.
+    quiet: true
+
+- name: The gate user's uid
+  ansible.builtin.command:
+    argv: ["{{ tr_bs.os_tools.id.path }}", -u]
+  register: _tr_me
+  changed_when: false
+
+- name: Stat the state directory and every ancestor (no link following)
+  ansible.builtin.stat:
+    path: "{{ '/' ~ (lme_transfer_state_dir.split('/')[1:item] | join('/')) }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ range(1, (lme_transfer_state_dir.split('/') | length) + 1) | list }}"
+  register: _tr_sanc
+
+- name: Refuse linked, foreign-owned or group/other-writable ancestry, or a state dir not owned 0700 by the gate user
+  ansible.builtin.assert:
+    that:
+      - _tr_sanc.results | map(attribute='stat') | selectattr('exists') | list | length == _tr_sanc.results | length
+      - _tr_sanc.results | map(attribute='stat') | selectattr('islnk') | list | length == 0
+      - _tr_sanc.results | map(attribute='stat') | selectattr('isdir') | list | length == _tr_sanc.results | length
+      - _tr_sanc.results | map(attribute='stat') | selectattr('wgrp') | list | length == 0
+      - _tr_sanc.results | map(attribute='stat') | selectattr('woth') | list | length == 0
+      - (_tr_sanc.results | map(attribute='stat') | map(attribute='uid') | unique | reject('in', [0, _tr_me.stdout | int]) | list) == []
+      - _tr_sanc.results[-1].stat.uid == (_tr_me.stdout | int)
+      - _tr_sanc.results[-1].stat.mode == '0700'
+    fail_msg: >-
+      TRANSFER-STATE-DIR: {{ lme_transfer_state_dir }} or an ancestor is missing, a link, not a directory,
+      group/other-writable (sticky /tmp included), owned by another account, or the directory is not owned by uid
+      {{ _tr_me.stdout }} with mode 0700. Create it once: install -d -m 0700 <dir>.
+    quiet: true
+
+- name: Publish the state layout and the output files deploy_gate reads
+  ansible.builtin.set_fact:
+    tr_state:
+      dir: "{{ lme_transfer_state_dir }}"
+      ledger: "{{ lme_transfer_state_dir }}/{{ tr.controller_state.ledger }}"
+      pending: "{{ lme_transfer_state_dir }}/{{ tr.controller_state.pending_dir }}"
+      uid: "{{ _tr_me.stdout | int }}"
+    tr_out: >-
+      {{ dict(['contract_json', 'ssh_argv', 'machine_id', 'transfer_receipt']
+              | zip(['contract_json', 'ssh_argv', 'machine_id', 'transfer_receipt']
+                    | map('extract', tr.outputs)
+                    | map('regex_replace', '^', lme_transfer_state_dir ~ '/' ~ tr.outputs.prefix ~ lme_transfer_label))) }}

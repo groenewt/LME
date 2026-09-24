@@ -1,0 +1,521 @@
+---
+# testing/e2e/transfer/controls/run_one_case.yml -- run ONE declared case (loop var `case`) and write its verdict.
+# Every ansible-playbook and bash subprocess runs under `umask 022`, which is the root default, so ancestry and
+# modes match a real target rather than this workstation's umask.
+# Placeholders in case data: @cd@ is the case directory, @src@ the shared clean clone, @repo@ the repository,
+# @token@ the phase driver's controller writer token (sha256 of /etc/machine-id + ':' + @cd@/ctlroot, the same
+# derivation bind_controller.yml uses with the seed's owned root).
+
+- name: "{{ case.id }} -- name the case paths, reset per-case facts"
+  ansible.builtin.set_fact:
+    cd: "{{ wr }}/cases/{{ case.id }}"
+    _run: {rc: -1, out: ''}
+    _fail: []
+    _xc: {}
+    _case_src: {commit: null, tree: null}
+    _case_lp: null
+
+- name: "{{ case.id }} -- expand placeholders in the case"
+  ansible.builtin.set_fact:
+    _xc: >-
+      {{ case | to_json | replace('@token@', ((lookup('ansible.builtin.file', '/etc/machine-id') | trim) ~ ':' ~ cd ~ '/ctlroot') | hash('sha256'))
+         | replace('@cd@', cd) | replace('@src@', wr ~ '/src') | replace('@repo@', repo_root)
+         | from_json }}
+
+- name: "{{ case.id }} -- fresh case directory"
+  ansible.builtin.file:
+    path: "{{ cd }}"
+    state: absent
+
+- name: "{{ case.id }} -- case directory (0755)"
+  ansible.builtin.file:
+    path: "{{ cd }}"
+    state: directory
+    mode: '0755'
+  when: case.kind != 'integration'
+
+# ============================ check ============================
+- name: "{{ case.id }} -- check: copy the declared paths to their real relative paths"
+  when: case.kind == 'check'
+  block:
+    - name: Parent directories of the copied paths
+      ansible.builtin.file:
+        path: "{{ cd }}/repo/{{ item | dirname }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ C.harness.check_copy }}"
+
+    - name: Copy
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/{{ item }}{{ '/' if (repo_root ~ '/' ~ item) is directory else '' }}"
+        dest: "{{ cd }}/repo/{{ item }}{{ '/' if (repo_root ~ '/' ~ item) is directory else '' }}"
+        mode: preserve
+      loop: "{{ C.harness.check_copy }}"
+
+    - name: Apply the declared mutations
+      ansible.builtin.replace:
+        path: "{{ cd }}/repo/{{ item.file }}"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop: "{{ case.mutate }}"
+      register: _mut
+
+    - name: A mutation that did not apply makes the case vacuous
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['mutation did not apply: ' ~ item.item.file] }}"
+      loop: "{{ _mut.results | default([]) }}"
+      when: not item.changed
+
+    - name: Run check.yml on the copy
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, 'umask 022 && exec "$0" -i localhost, "$1" 2>&1', "{{ C.harness.ansible_playbook }}",
+               "{{ cd }}/repo/testing/e2e/transfer/check.yml"]
+      environment: {ANSIBLE_NOCOLOR: '1', ANSIBLE_RETRY_FILES_ENABLED: '0'}
+      register: _r
+      changed_when: false
+      failed_when: false
+
+    - name: Record the run
+      ansible.builtin.set_fact:
+        _run: {rc: "{{ _r.rc }}", out: "{{ _r.stdout }}"}
+
+# ============================ regex ============================
+- name: "{{ case.id }} -- regex: the exclusion macro against declared paths"
+  when: case.kind == 'regex'
+  block:
+    - name: Render the one exclusion regex
+      ansible.builtin.set_fact:
+        _rx: >-
+          {{ lookup('ansible.builtin.template', transfer_dir ~ '/templates/call.j2',
+                    template_vars={'lme_macro': 'exclusion_regex', 'lme_args': [T.excludes]}) | trim }}
+
+    - name: Compare
+      ansible.builtin.set_fact:
+        _fail: >-
+          {{ _fail + (case.excluded | reject('search', _rx) | map('regex_replace', '^', 'not excluded: ') | list)
+                   + (case.kept | select('search', _rx) | map('regex_replace', '^', 'wrongly excluded: ') | list) }}
+        _run: {rc: 0, out: "{{ _rx }}"}
+
+# ============================ phase ============================
+- name: "{{ case.id }} -- phase"
+  when: case.kind == 'phase'
+  block:
+    - name: Resolve the phase parameters
+      ansible.builtin.set_fact:
+        _ph: >-
+          {{ C.harness.phase_defaults | combine(C.harness.phase_steps)
+             | combine(_xc.phase | default({}) | dict2items | rejectattr('key', 'equalto', 'steps') | items2dict)
+             | combine(_xc.phase.steps | default({}) if _xc.phase is defined else {})
+             | to_json | replace('@cd@', cd) | from_json }}
+
+    - name: Target ancestry and the controller state dir (explicit modes)
+      ansible.builtin.file:
+        path: "{{ item.p }}"
+        state: directory
+        mode: "{{ item.m }}"
+      loop:
+        - {p: "{{ cd }}/tgt", m: '0755'}
+        - {p: "{{ cd }}/tgt/srv", m: '0755'}
+        - {p: "{{ cd }}/state", m: '0700'}
+      loop_control:
+        label: "{{ item.p }}"
+
+    - name: A per-case clone at the admitted commit (only when the case edits or substitutes its source)
+      ansible.builtin.include_tasks: source_clone.yml
+      vars:
+        sr_dest: "{{ cd }}/src"
+        sr_decl: "{{ T }}"
+      when: (_ph.src | default('shared')) == 'clone'
+
+    - name: The source this phase case runs on (the shared clone, or its own clone; same admitted commit)
+      ansible.builtin.set_fact:
+        _case_src: >-
+          {{ sr_clone if ((_ph.src | default('shared')) == 'clone')
+             else (sr.clones | selectattr('dir', 'equalto', wr ~ '/src') | first | default({'commit': none, 'tree': none})) }}
+
+    - name: Setup -- directories
+      ansible.builtin.file:
+        path: "{{ item.dir }}"
+        state: directory
+        mode: "{{ item.mode }}"
+      loop: "{{ _xc.setup | default([]) | selectattr('dir', 'defined') | list }}"
+
+    - name: Setup -- files
+      ansible.builtin.copy:
+        content: "{{ item.content }}\n"
+        dest: "{{ item.file }}"
+        mode: "{{ item.mode }}"
+      loop: "{{ _xc.setup | default([]) | selectattr('file', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.file }}"
+
+    - name: Setup -- links
+      ansible.builtin.file:
+        src: "{{ item.to }}"
+        path: "{{ item.link }}"
+        state: link
+      loop: "{{ _xc.setup | default([]) | selectattr('link', 'defined') | list }}"
+
+    # The stand-in is a DECLARED member of the deployment's target group (CASES harness.stand_in), never a bypass:
+    # C1's projection refuses a host that is neither the controller nor a member, so it gets its own target scope.
+    # `k` stays outside the group (contract rendering only, never contacted, never scoped).
+    - name: Inventory (localhost, the declared stand-in target in its target group, the never-contacted contract host `k`)
+      ansible.builtin.copy:
+        content: >-
+          {{ {'all': {'hosts': {
+                'localhost': {'ansible_connection': 'local', 'ansible_python_interpreter': C.harness.python},
+                C.harness.stand_in.host: {'ansible_connection': 'local', 'ansible_python_interpreter': C.harness.python} | combine(_ph.tgt_vars | default({})),
+                'k': _ph.k_vars | default({})},
+              'children': {C.harness.stand_in.target_group: {'hosts': {C.harness.stand_in.host: {}}}}}} | to_nice_json }}
+        dest: "{{ cd }}/inventory.json"
+        mode: '0644'
+
+    - name: Driver variables per run
+      ansible.builtin.copy:
+        content: >-
+          {{ {'transfer_dir': transfer_dir, 'drv_ctl_root': cd ~ '/ctlroot', 'drv_stand_in': C.harness.stand_in.host,
+              'drv_candidate_root': sr.path, 'drv_load_paths_out': cd ~ '/load_paths.json',
+              'drv_clone_dirs': [wr ~ '/src'] + ([cd ~ '/src'] if ((_ph.src | default('shared')) == 'clone') else []),
+              'tr_repo_root': (wr ~ '/src') if (_ph.substitute | default(false) or (_ph.src | default('shared')) == 'shared') else (cd ~ '/src'),
+              'lme_transfer_src': (cd ~ '/src') if ((_ph.src | default('shared')) == 'clone') else (wr ~ '/src'),
+              'lme_transfer_state_dir': cd ~ '/state', 'lme_transfer_label': _ph.label,
+              'lme_transfer_remote_dir': _ph.remote_dir, 'lme_transfer_target': _ph.target,
+              'lme_transfer_ssh_key': _ph.ssh_key,
+              'observe_controller_steps': _ph.observe_controller_steps, 'observe_target_steps': _ph.observe_target_steps,
+              'stage_controller_steps': _ph.stage_controller_steps, 'place_target_steps': _ph.place_target_steps,
+              'tamper': item.tamper | default(''),
+              'decl_overrides': {'contract': {'privilege': {'uid': me_uid | int}},
+                                 'target': {'owner_uids': [0, me_uid | int],
+                                            'tools_used': T.target.tools_used + (_ph.tools_extra | default([]))}}} | to_nice_json }}
+        dest: "{{ cd }}/vars.{{ idx }}.json"
+        mode: '0644'
+      loop: "{{ _ph.runs | default([{}]) }}"
+      loop_control:
+        index_var: idx
+        label: "run {{ idx }}"
+
+    - name: Run the driver (each declared run, in order; hold_lock runs it while this runner holds that flock)
+      ansible.builtin.command:
+        argv: >-
+          {{ ([C.harness.flock, '-x', _ph.hold_lock] if (item.hold_lock | default(false)) else [])
+             + ['/bin/sh', '-c', 'umask 022 && exec "$0" -i "$1" "$2" -e "@$3" 2>&1', C.harness.ansible_playbook,
+                cd ~ '/inventory.json', transfer_dir ~ '/phase_driver.yml', cd ~ '/vars.' ~ idx ~ '.json'] }}
+        chdir: "{{ sr.path }}"                     # the directory whose ansible config SOURCE-REF check A admitted
+      environment:
+        ANSIBLE_NOCOLOR: '1'
+        ANSIBLE_RETRY_FILES_ENABLED: '0'
+        ANSIBLE_HOST_KEY_CHECKING: 'False'
+        LME_SSH_AUTH_MODE: "{{ _ph.auth_mode }}"
+      loop: "{{ _ph.runs | default([{}]) }}"
+      loop_control:
+        index_var: idx
+        label: "run {{ idx }}"
+      register: _rs
+      changed_when: false
+      failed_when: false
+
+    - name: Intermediate runs must end as declared
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['run ' ~ idx ~ ' rc ' ~ item.rc ~ ' != declared ' ~ item.item.rc] }}"
+      loop: "{{ _rs.results[:-1] }}"
+      loop_control:
+        index_var: idx
+        label: "run {{ idx }}"
+      when: item.item.rc is defined and ((item.item.rc == 'fail') != (item.rc != 0))
+
+    - name: Record the last run
+      ansible.builtin.set_fact:
+        _run: {rc: "{{ _rs.results[-1].rc }}", out: "{{ _rs.results | map(attribute='stdout') | join('\n') }}"}
+
+    - name: The loaded roots the driver asserted (SOURCE-REF check B; absent when the run refused before them)
+      ansible.builtin.slurp:
+        src: "{{ cd }}/load_paths.json"
+      register: _lpj
+      failed_when: false
+
+    - name: Keep them for the verdict
+      ansible.builtin.set_fact:
+        _case_lp: "{{ (_lpj.content | b64decode | from_json) if (_lpj.content is defined) else none }}"
+
+# ============================ scope ============================
+- name: "{{ case.id }} -- scope (synthetic schema-3 projections through B's real scope task files)"
+  when: case.kind == 'scope'
+  block:
+    - name: Inventory (localhost and the fixture's targets, all local connections) and the case variables
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ cd }}/{{ item.dest }}"
+        mode: '0644'
+      loop:
+        - dest: inventory.json
+          content: >-
+            {{ {'all': {'vars': {'ansible_connection': 'local', 'ansible_python_interpreter': C.harness.python},
+                        'hosts': dict((['localhost'] + (C.harness.scope_fixture.targets | list))
+                                      | zip([{}] * ((C.harness.scope_fixture.targets | length) + 1)))}} | to_nice_json }}
+        - dest: vars.json
+          content: "{{ {'transfer_dir': transfer_dir, 'sc_fixture': C.harness.scope_fixture, 'sc': _xc.scope, 'sc_out': cd} | to_nice_json }}"
+      loop_control:
+        label: "{{ item.dest }}"
+
+    - name: Run the scope case
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, 'umask 022 && exec "$0" -i "$1" "$2" -e "@$3" 2>&1', "{{ C.harness.ansible_playbook }}",
+               "{{ cd }}/inventory.json", "{{ ctl_dir }}/scope_case.yml", "{{ cd }}/vars.json"]
+      environment: {ANSIBLE_NOCOLOR: '1', ANSIBLE_RETRY_FILES_ENABLED: '0'}
+      register: _r
+      changed_when: false
+      failed_when: false
+
+    - name: Record the run
+      ansible.builtin.set_fact:
+        _run: {rc: "{{ _r.rc }}", out: "{{ _r.stdout }}"}
+
+# ============================ source ============================
+- name: "{{ case.id }} -- source (SOURCE-REF admission against a local fixture clone of this repository)"
+  when: case.kind == 'source'
+  block:
+    - name: The case variables
+      ansible.builtin.copy:
+        content: >-
+          {{ {'ctl_dir': ctl_dir, 'sc': _xc.source, 'sc_out': cd, 'sc_repo': repo_root,
+              'sc_ansible_config': C.harness.ansible_config, 'sc_ansible_playbook': C.harness.ansible_playbook} | to_nice_json }}
+        dest: "{{ cd }}/vars.json"
+        mode: '0644'
+
+    - name: Run the source case
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, 'umask 022 && exec "$0" -i localhost, "$1" -e "@$2" 2>&1', "{{ C.harness.ansible_playbook }}",
+               "{{ ctl_dir }}/source_case.yml", "{{ cd }}/vars.json"]
+      environment: {ANSIBLE_NOCOLOR: '1', ANSIBLE_RETRY_FILES_ENABLED: '0'}
+      register: _r
+      changed_when: false
+      failed_when: false
+
+    - name: Record the run
+      ansible.builtin.set_fact:
+        _run: {rc: "{{ _r.rc }}", out: "{{ _r.stdout }}"}
+
+# ============================ gate ============================
+- name: "{{ case.id }} -- gate (fake seed + fake ssh; wrapper logic only)"
+  when: case.kind == 'gate'
+  block:
+    - name: Controller state dir (0700)
+      ansible.builtin.file:
+        path: "{{ cd }}/state"
+        state: directory
+        mode: '0700'
+
+    - name: Render the test doubles and the scenario
+      ansible.builtin.template:
+        src: "{{ ctl_dir }}/{{ item.src }}"
+        dest: "{{ cd }}/{{ item.dest }}"
+        mode: '0755'
+      loop:
+        - {src: fake_seed.j2, dest: fake_seed}
+        - {src: fake_ssh.j2, dest: fake_ssh}
+        - {src: gate_case.sh.j2, dest: gate_case.sh}
+
+    - name: Run the scenario
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, 'umask 022 && exec /bin/bash "$0" 2>&1', "{{ cd }}/gate_case.sh"]
+      register: _r
+      changed_when: false
+      failed_when: false
+
+    - name: Record the run
+      ansible.builtin.set_fact:
+        _run: {rc: "{{ _r.rc }}", out: "{{ _r.stdout }}"}
+
+# ============================ expectations (every runnable kind) ============================
+- name: "{{ case.id }} -- evaluate"
+  when: case.kind != 'integration'
+  block:
+    - name: rc and output
+      ansible.builtin.set_fact:
+        _fail: >-
+          {{ _fail
+             + ([] if ((_xc.expect.rc | string) == 'fail') == ((_run.rc | int) != 0) else ['rc ' ~ _run.rc ~ ' != expected ' ~ _xc.expect.rc])
+             + (_xc.expect.out | default([]) | reject('in', _run.out) | map('regex_replace', '^', 'output lacks: ') | list)
+             + (_xc.expect.out_absent | default([]) | select('in', _run.out) | map('regex_replace', '^', 'output has: ') | list) }}
+
+    - name: Stat the named paths
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: >-
+        {{ (_xc.expect.present | default([])) + (_xc.expect.absent | default([]))
+           + (_xc.expect.modes | default([]) | map(attribute='path') | list) }}
+      register: _st
+
+    - name: Presence, absence, modes
+      ansible.builtin.set_fact:
+        _fail: >-
+          {{ _fail
+             + (_st.results | selectattr('item', 'in', _xc.expect.present | default([])) | rejectattr('stat.exists') | map(attribute='item') | map('regex_replace', '^', 'missing: ') | list)
+             + (_st.results | selectattr('item', 'in', _xc.expect.absent | default([])) | selectattr('stat.exists') | map(attribute='item') | map('regex_replace', '^', 'present: ') | list) }}
+
+    - name: Modes
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['mode of ' ~ item.path ~ ' is ' ~ (_st.results | selectattr('item', 'equalto', item.path) | map(attribute='stat') | map(attribute='mode') | first | default('absent')) ~ ', expected ' ~ item.mode] }}"
+      loop: "{{ _xc.expect.modes | default([]) }}"
+      when: (_st.results | selectattr('item', 'equalto', item.path) | map(attribute='stat') | map(attribute='mode') | first | default('absent')) != item.mode
+
+    - name: Read the files named by file_has / file_lacks
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: "{{ ((_xc.expect.file_has | default([])) + (_xc.expect.file_lacks | default([]))) | map(attribute='path') | unique | list }}"
+      register: _sl
+      failed_when: false
+
+    - name: File contents -- has
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['file ' ~ item.path ~ ' lacks: ' ~ item.text] }}"
+      loop: "{{ _xc.expect.file_has | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: item.text not in (_sl.results | selectattr('item', 'equalto', item.path) | map(attribute='content') | map('b64decode') | first | default(''))
+
+    - name: File contents -- lacks
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['file ' ~ item.path ~ ' has: ' ~ item.text] }}"
+      loop: "{{ _xc.expect.file_lacks | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: item.text in (_sl.results | selectattr('item', 'equalto', item.path) | map(attribute='content') | map('b64decode') | first | default(''))
+
+    - name: Directories that must hold no files
+      ansible.builtin.find:
+        paths: "{{ item }}"
+        recurse: true
+        file_type: any
+        hidden: true
+      loop: "{{ _xc.expect.dir_empty | default([]) }}"
+      register: _de
+
+    - name: No files left
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['not empty: ' ~ item.item ~ ' ' ~ (item.files | rejectattr('isdir') | map(attribute='path') | list | string)] }}"
+      loop: "{{ _de.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.files | default([]) | rejectattr('isdir') | list | length > 0
+
+    - name: Read the files named by line_count
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: "{{ _xc.expect.line_count | default([]) | map(attribute='path') | unique | list }}"
+      register: _lc
+      failed_when: false
+
+    - name: File contents -- exact count of lines matching a regex
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['file ' ~ item.path ~ ' has ' ~ _n ~ ' lines matching ' ~ item.regex ~ ', expected ' ~ item.n] }}"
+      vars:
+        _n: >-
+          {{ (_lc.results | selectattr('item', 'equalto', item.path) | map(attribute='content') | map('b64decode') | first | default('')).splitlines()
+             | select('search', item.regex) | list | length }}
+      loop: "{{ _xc.expect.line_count | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: (_n | int) != (item.n | int)
+
+    - name: The owned manifest verifies against the placed tree
+      ansible.builtin.command:
+        argv: [sha256sum, --check, --strict, --quiet, .lme-transfer/owned.sha256]
+        chdir: "{{ _xc.expect.owned_check }}"
+      register: _oc
+      changed_when: false
+      failed_when: false
+      when: _xc.expect.owned_check is defined
+
+    - name: Owned check result
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['owned manifest does not verify: ' ~ _oc.stdout ~ _oc.stderr] }}"
+      when: _xc.expect.owned_check is defined and _oc.rc != 0
+
+    - name: Archive -- the single pending archive, its members, HEAD's members
+      when: _xc.expect.archive is defined
+      block:
+        - name: Find the archive
+          ansible.builtin.find:
+            paths: "{{ cd }}/state/pending"
+            patterns: ['*.tar.gz']
+          register: _af
+
+        - name: Exactly one archive
+          ansible.builtin.set_fact:
+            _fail: "{{ _fail + ['expected exactly one pending archive, found ' ~ (_af.files | length)] }}"
+          when: _af.files | length != 1
+
+        - name: List members (tar) and HEAD's committed paths (git ls-tree, independent of the index walk)
+          ansible.builtin.command:
+            argv: "{{ item }}"
+          loop:
+            - [tar, -tzf, "{{ (_af.files | first).path }}"]
+            - ["{{ T.source.git }}", -C, "{{ wr }}/src", ls-tree, -r, --name-only, HEAD]
+          register: _al
+          changed_when: false
+          when: _af.files | length == 1
+
+        - name: Member bytes equal HEAD's blobs
+          ansible.builtin.command:
+            argv: [/bin/bash, -c, 'set -o pipefail; tar -xzOf "$1" "$2" | "$4" -C "$3" hash-object --no-filters --stdin && "$4" -C "$3" rev-parse "HEAD:$2"',
+                   blob, "{{ (_af.files | first).path }}", "{{ item }}", "{{ wr }}/src", "{{ T.source.git }}"]
+          loop: "{{ _xc.expect.archive.blob_equal }}"
+          register: _ab
+          changed_when: false
+          failed_when: false
+          when: _af.files | length == 1
+
+        - name: Compare members
+          ansible.builtin.set_fact:
+            _members: "{{ _al.results[0].stdout_lines | reject('match', '.*/$') | map('regex_replace', '^\\./', '') | list }}"
+            _head: "{{ _al.results[1].stdout_lines }}"
+          when: _af.files | length == 1
+
+        - name: Member verdicts
+          ansible.builtin.set_fact:
+            _fail: >-
+              {{ _fail
+                 + (_members | select('match', '^(' ~ (_xc.expect.archive.excluded_prefixes | map('regex_escape') | join('|')) ~ ')') | list | length > 0)
+                   | ternary(['archive holds an excluded member'], [])
+                 + ((_members | sort) != (_head | reject('match', '^(' ~ (_xc.expect.archive.excluded_prefixes | map('regex_escape') | join('|')) ~ ')') | sort | list))
+                   | ternary(['archive members != HEAD minus the excluded prefixes: extra '
+                              ~ ((_members | reject('in', _head) | list)[:5] | string) ~ ' missing '
+                              ~ ((_head | reject('in', _members) | reject('match', '^(' ~ (_xc.expect.archive.excluded_prefixes | map('regex_escape') | join('|')) ~ ')') | list)[:5] | string)], [])
+                 + (_xc.expect.archive.must_contain | reject('in', _members) | map('regex_replace', '^', 'archive lacks: ') | list)
+                 + (_ab.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | map('regex_replace', '^', 'blob read failed: ') | list) }}
+          when: _af.files | length == 1
+
+        - name: Blob equality
+          ansible.builtin.set_fact:
+            _fail: "{{ _fail + ['member bytes differ from HEAD blob: ' ~ item.item] }}"
+          loop: "{{ _ab.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item | default('') }}"
+          when: item.rc | default(1) == 0 and (item.stdout_lines | length != 2 or item.stdout_lines[0] != item.stdout_lines[1])
+
+# ============================ verdict ============================
+- name: "{{ case.id }} -- write the verdict"
+  ansible.builtin.copy:
+    content: >-
+      {{ {'id': case.id, 'kind': case.kind, 'ok': (_fail | length == 0) if case.kind != 'integration' else none,
+          'rc': _run.rc | int, 'failures': _fail, 'status': case.status | default('declared'),
+          'narrower': {'phase': 'local stand-in target; resolved rh via resolve_policy but no managed generation (resolve_harness/receipt not run); uid overrides',
+                       'gate': 'fake seed + fake ssh; wrapper logic only',
+                       'check': 'static structural check on a mutated copy',
+                       'regex': 'macro evaluation only',
+                       'scope': 'synthetic schema-3 projections (harness.scope_fixture) through the real scope task files; no resolver, no transport',
+                       'source': 'source_ref.yml admission against a local fixture clone of this repository; the fixture is not the candidate',
+                       'integration': 'declared, not run'}[case.kind],
+          'out_tail': (_run.out | string)[-1500:] if (_fail | length > 0) else ''}
+         | combine({'source_commit': _case_src.commit, 'source_tree': _case_src.tree, 'load_paths': _case_lp} if case.kind == 'phase' else {})
+         | to_nice_json }}
+    dest: "{{ wr }}/verdicts/{{ case.id }}.json"
+    mode: '0644'
+  when: case.kind != 'integration'
+
+- name: "{{ case.id }} -- line"
+  ansible.builtin.debug:
+    msg: "{{ case.id }}: {{ 'DECLARED-UNRUN' if case.kind == 'integration' else ('OK' if _fail | length == 0 else 'FAIL ' ~ (_fail | string)) }}"

@@ -1,0 +1,124 @@
+---
+# after every variant that ran (always): stop stray background operations, purge a fresh root through bundle A (the
+# seed's own purge; fallback = control-owned removal inside this marked run dir, recorded as a cleanup finding), re-verify
+# the shared root (a failure taints it: later shared-root controls are BLOCKED), and drop the variant's bulky scratch
+# (bundles, source copies, staging) so the run stays inside its declared storage budget. Evidence files are kept.
+
+- name: Stop any background operation of this variant that is still running
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.pkill }}", -KILL, -f, --, "{{ item.value.plan.kill_token | regex_escape }}"]
+  loop: "{{ _rhc_jobs | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: _rhc_stray
+  changed_when: _rhc_stray.rc == 0
+  failed_when: false
+
+- name: A stray operation is a cleanup finding
+  ansible.builtin.set_fact:
+    rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': killed a stray ' ~ item.item.key] }}"
+  loop: "{{ _rhc_stray.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Purge the fresh root through bundle A (and the root of a variant token, when one names another path)
+  vars:
+    _plan: >-
+      {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_act',
+           'args': [{'id': 'cleanup-purge', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'purge', 'root': _rhc_t.root}}, _rhc_ctx]}}) | from_json }}
+  ansible.builtin.shell:
+    cmd: "exec {{ _plan.argv | map('quote') | join(' ') }} </dev/null >{{ _plan.out | quote }} 2>{{ _plan.err | quote }}"
+    chdir: "{{ _rhc_t.ctl }}/cwd"
+  register: _rhc_purge
+  changed_when: true
+  failed_when: false
+  when: (rhc_c.root | default('')) == 'fresh' and rhc_deps.bundle_a.met
+
+- name: Is anything left in the fresh root's parent?
+  ansible.builtin.find:
+    paths: "{{ _rhc_t.parent }}"
+    patterns: ['*']
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _rhc_left
+  failed_when: false
+
+- name: Fallback removal inside this marked run dir (a cleanup finding; the seed's purge left or refused it)
+  when: _rhc_left.matched | default(0) > 0
+  block:
+    - name: The run marker must be present (never remove outside a marked run dir)
+      ansible.builtin.stat:
+        path: "{{ rhc_run_dir }}/{{ rhc_decl.state.run_marker }}"
+        follow: false
+        get_checksum: false
+      register: _rhc_mk
+      failed_when: not (_rhc_mk.stat.exists and _rhc_mk.stat.isreg and _rhc_left.files | map(attribute='path') | reject('match', (rhc_run_dir | regex_escape) ~ '/') | list | length == 0)
+
+    - name: Record the finding
+      ansible.builtin.set_fact:
+        rhc_cleanup_findings: >-
+          {{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': seed purge rc ' ~ (_rhc_purge.rc | default('not run')) ~ ' left '
+             ~ (_rhc_left.files | map(attribute='path') | map('basename') | join(' '))] }}
+
+    - name: Owner write on the leftovers (chmod -R does not follow links)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.chmod }}", -R, u+w, --, "{{ item.path }}"]
+      loop: "{{ _rhc_left.files | rejectattr('islnk') | list }}"
+      loop_control:
+        label: "{{ item.path }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Remove the leftovers
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _rhc_left.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+- name: Re-verify the shared root after a control that used it
+  vars:
+    _plan: >-
+      {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_act',
+           'args': [{'id': 'cleanup-verify', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'verify', 'root': rhc_base_tokens.shared}}, _rhc_ctx]}}) | from_json }}
+  ansible.builtin.shell:
+    cmd: "exec {{ _plan.argv | map('quote') | join(' ') }} </dev/null >{{ _plan.out | quote }} 2>{{ _plan.err | quote }}"
+    chdir: "{{ _rhc_t.ctl }}/cwd"
+  register: _rhc_sv
+  changed_when: false
+  failed_when: false
+  when: (rhc_c.root | default('')) == 'shared' and rhc_deps.shared_root.met
+
+- name: A shared root that no longer verifies taints every later shared-root control
+  ansible.builtin.set_fact:
+    rhc_shared_tainted: true
+    rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': shared root verify rc ' ~ _rhc_sv.rc ~ ' (tainted)'] }}"
+  when: _rhc_sv.rc is defined and _rhc_sv.rc != 0
+
+- name: Drop the variant's bulky scratch (declared names only; evidence files stay)
+  ansible.builtin.find:
+    paths: "{{ _rhc_t.ctl }}"
+    patterns: "{{ rhc_decl.state.variant_scratch }}"
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _rhc_scratch
+
+- name: Owner write on the scratch
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.chmod }}", -R, u+w, --, "{{ item.path }}"]
+  loop: "{{ _rhc_scratch.files | rejectattr('islnk') | selectattr('isdir') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+  changed_when: true
+  failed_when: false
+
+- name: Remove the scratch
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _rhc_scratch.files }}"
+  loop_control:
+    label: "{{ item.path }}"

@@ -1,0 +1,41 @@
+---
+# self-tests of the runner's macro and regex gates (G): controls/selftests.yml. Pure (every case is one macro call on
+# declared inputs and a fixture ctx); runs in both modes before any planning. A failing case, or a gate without both an
+# accepting and a rejecting case, is a runner defect and fails the play: no control is judged by an untested gate.
+
+- name: Load the gate self-tests
+  ansible.builtin.set_fact:
+    rhc_selftests: "{{ lookup('ansible.builtin.file', rhc_controls_dir ~ '/selftests.yml') | from_yaml }}"
+    rhc_selftest_fail: []
+
+- name: Evaluate every gate self-test
+  vars:
+    _raw: >-
+      {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': item.fn,
+           'args': item.args + ([rhc_selftests.ctx] if item.with_ctx | default(false) else [])}}) }}
+    _ok: >-
+      {{ (item.expect.equals is not defined or (_raw | from_json) == item.expect.equals)
+         and (item.expect.search is not defined or (_raw is search(item.expect.search)))
+         and (item.expect.not_search is not defined or not (_raw is search(item.expect.not_search))) }}
+  ansible.builtin.set_fact:
+    rhc_selftest_fail: "{{ rhc_selftest_fail + ([] if _ok | bool else [item.id ~ ' (' ~ item.fn ~ ') returned ' ~ _raw ~ ', expected ' ~ (item.expect | to_json)]) }}"
+  loop: "{{ rhc_selftests.cases }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Every gate has an accepting and a rejecting case, and every case passed
+  vars:
+    _neg: "{{ rhc_selftests.cases | selectattr('negative') | map(attribute='gate') | unique | list }}"
+    _pos: "{{ rhc_selftests.cases | rejectattr('negative') | map(attribute='gate') | unique | list }}"
+  ansible.builtin.assert:
+    that:
+      - rhc_selftest_fail | length == 0
+      - rhc_selftests.gates | reject('in', _neg) | list | length == 0
+      - rhc_selftests.gates | reject('in', _pos) | list | length == 0
+      - rhc_selftests.cases | map(attribute='gate') | reject('in', rhc_selftests.gates) | list | length == 0
+      - rhc_selftests.cases | map(attribute='id') | list | length == rhc_selftests.cases | map(attribute='id') | unique | list | length
+    fail_msg: >-
+      REFUSED RHC-GATE-SELFTEST: failing {{ rhc_selftest_fail | to_json }}; gates without a rejecting case
+      {{ rhc_selftests.gates | reject('in', _neg) | list | to_json }}; without an accepting case
+      {{ rhc_selftests.gates | reject('in', _pos) | list | to_json }}
+    quiet: true

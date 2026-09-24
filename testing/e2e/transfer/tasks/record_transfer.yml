@@ -1,0 +1,54 @@
+---
+# testing/e2e/transfer/tasks/record_transfer.yml -- the transfer receipt (localhost, effect: one atomic file).
+# Written ONLY after the target's live readback passed; deploy_gate treats rc 0 without this receipt as failure.
+# The target's edition record must equal this controller's edition, policy revision and writer token (P01/P03/P07).
+# Inputs: tr, tr_edition, tr_contract, tr_out, tr_ctl_token, tr_scope_expect, rh_config_revision, rh_engine_revision,
+#         hostvars[lme_transfer_target].tr_placed, lme_transfer_remote_dir.
+
+- name: Refuse a target edition record that is not this controller's edition, policy and writer (no substitution)
+  vars:
+    _rec: "{{ hostvars[lme_transfer_target].tr_placed.edition }}"
+  ansible.builtin.assert:
+    that:
+      - _rec.op == tr_edition.op
+      - _rec.commit == tr_edition.commit
+      - _rec.owned_sha256_digest == (tr_edition.sha256_text | hash('sha256'))
+      - (_rec.member_count | int) == (tr_edition.member_count | int)
+      - _rec.policy_sha256 == hostvars[lme_transfer_target].rh_config_revision
+      - _rec.completed_by == tr_ctl_token
+      # the record names THIS target's controller-resolved scope (B-PER-HOST-POLICY-BINDING)
+      - _rec.scope_id == tr_scope_expect.target.id
+      - _rec.scope_sha256 == tr_scope_expect.target.scope_sha256
+      - _rec.policy_sha256 == tr_scope_expect.target.policy_sha256
+      - _rec.scopes_sha256 == tr_scope_expect.scopes_sha256
+    fail_msg: >-
+      TRANSFER-RECEIPT-BINDING: the target recorded {{ _rec | to_json }}, which is not op {{ tr_edition.op }} of commit
+      {{ tr_edition.commit }} under the target's own controller-resolved scope {{ tr_scope_expect.target | to_json }}
+      (scopes {{ tr_scope_expect.scopes_sha256 }}) by this controller; no receipt is written.
+    quiet: true
+
+- name: Write the transfer receipt
+  ansible.builtin.copy:
+    dest: "{{ tr_out.transfer_receipt }}"
+    mode: '0600'
+    content: >-
+      {{ {'schema': tr.receipt_schema,
+          'op': tr_edition.op,
+          'edition': {'kind': tr_edition.kind, 'history': tr_edition.history, 'commit': tr_edition.commit,
+                      'member_count': tr_edition.member_count, 'archive_sha256': tr_edition.archive_sha256,
+                      'manifest_sha256': tr_edition.sha256_text | hash('sha256')},
+          'target': {'alias': tr_contract.alias, 'address': tr_contract.address, 'identity': hostvars[lme_transfer_target].tr_placed.identity,
+                     'remote_dir': lme_transfer_remote_dir, 'adopted': hostvars[lme_transfer_target].tr_placed.adopted,
+                     'pruned': hostvars[lme_transfer_target].tr_placed.pruned, 'abandoned': hostvars[lme_transfer_target].tr_placed.abandoned,
+                     'reaped': hostvars[lme_transfer_target].tr_placed.reaped, 'edition_record': hostvars[lme_transfer_target].tr_placed.edition},
+          'policy': {'policy_sha256': rh_config_revision, 'engine_revision': rh_engine_revision,
+                     'target_policy_sha256': hostvars[lme_transfer_target].rh_config_revision,
+                     'target_engine_revision': hostvars[lme_transfer_target].rh_engine_revision,
+                     'scope_binding': tr.policy_scope,
+                     'scope': {'controller': tr_scope_expect.controller, 'target': tr_scope_expect.target,
+                               'scopes_sha256': tr_scope_expect.scopes_sha256, 'binding': tr_scope_expect.binding},
+                     'route_interface': tr.route_interface},
+          'transport': {'auth_mode': tr_contract.auth_mode, 'user': tr_contract.user, 'key_source': tr_contract.key_source,
+                        'proxy': tr_contract.proxy, 'profile': tr_contract.profile},
+          'writer_token': tr_ctl_token,
+          'completed_utc': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')} | to_nice_json }}

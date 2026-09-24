@@ -1,0 +1,362 @@
+---
+# testing/remote_harness/tasks/package_bundle.yml -- ONE bundle publication destination of package.yml, included once
+# PER ARTIFACT CLASS (r3g: step 1 moved package.yml's per-destination body here unchanged; step 2 parameterized it by
+# class). Included by package.yml after the builder, executable identity, source edition, render-input digests and
+# the class set (tasks/scope_classes.yml) are bound. Two views, never mixed:
+#   EXECUTION (this controller): rh (the controller's own policy: path admission, os_tools, staging/lease policy,
+#     bundle layout names), rh_builder, rh_staging_lease, rh_profile_sha256, _rh_src_git, _rh_src_inputs,
+#     rh_artifact_source (host var of localhost)
+#   CONTENT (the class, include params from package.yml's class loop; all registry-reserved):
+#     rh_pub_dir     the class destination (controller class: rh_bundle_dir; others: the declared sibling rule)
+#     rh_pub_key     the class key (C1's published per_class.key_field value; recorded as bundle.json class_key)
+#     rh_pub_policy  the class scope's own resolved policy (what the seed renders from; artifacts, versions, lock path)
+#     rh_pub_lock    that policy's lock
+# Every class destination is a FULL publication destination: its own ancestry/custody admission, its own reap scope
+# (`.<class basename>.<infix>.*`), lease record, lock `.<class basename>.<lock_suffix>`, publish fence and E26/E32
+# semantics. Semantics are package.yml's header (SEED2-PACKAGE-RESERVATION, M1-STAGING-RECOVERY, PUBLISH FENCE,
+# PUBLICATION AUTHORITY).
+
+- name: Admit the package inputs (the ONE path-admission rule; no default)
+  ansible.builtin.assert:
+    that:
+      - rh_artifact_source is defined and rh_artifact_source is string
+      - rh_artifact_source is match(rh.controller.bootstrap.path_admission.regex)
+      - rh_artifact_source is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+      - rh_pub_dir is defined and rh_pub_dir is string
+      - rh_pub_dir is match(rh.controller.bootstrap.path_admission.regex)
+      - rh_pub_dir is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+      - rh_pub_dir.split('/') | length > 2
+    fail_msg: >-
+      REFUSED RH-BUILDER-UNSUPPORTED rh_artifact_source and the class destination {{ rh_pub_dir | default('absent') }}
+      (rh_bundle_dir or its declared class sibling) must be normalized absolute paths (host vars of localhost; no
+      default; the bundle is not a top-level dir).
+    quiet: true
+
+- name: Stat every ancestor of the destination and the destination itself (no links followed)
+  ansible.builtin.stat:
+    path: "{{ '/' ~ (rh_pub_dir.split('/')[1:item] | join('/')) }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ range(1, (rh_pub_dir.split('/') | length) + 1) | list }}"
+  register: _rh_pkg_anc
+
+- name: Stat the declared publish, reap, lock, mkdir and free-space tools (identity admitted before use)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: false
+  loop:
+    - "{{ rh.controller.bootstrap.os_tools.mv.path }}"
+    - "{{ rh.controller.bootstrap.os_tools.df.path }}"
+    - "{{ rh.controller.bootstrap.os_tools.rm.path }}"
+    - "{{ rh.controller.bootstrap.os_tools.flock.path }}"
+    - "{{ rh.controller.bootstrap.os_tools.mkdir.path }}"
+  register: _rh_pkg_mv
+
+- name: Refuse unsafe destination custody before any write (SEED2-PACKAGE-RESERVATION)
+  vars:
+    _anc: "{{ _rh_pkg_anc.results[:-1] | map(attribute='stat') | list }}"
+    _dst: "{{ _rh_pkg_anc.results[-1].stat }}"
+  ansible.builtin.assert:
+    that:
+      - _anc | selectattr('exists') | list | length == _anc | length
+      - _anc | selectattr('islnk') | list | length == 0
+      - _anc | rejectattr('isdir') | list | length == 0
+      - _anc | map(attribute='uid') | reject('in', [0, rh_builder.uid | int]) | list | length == 0
+      - _anc | selectattr('wgrp') | list | length == 0
+      - _anc | selectattr('woth') | list | length == 0
+      - _anc[-1].uid == rh_builder.uid | int
+      - not _dst.exists or (_dst.isdir and not _dst.islnk and _dst.uid == rh_builder.uid | int)
+      - _rh_pkg_mv.results | map(attribute='stat') | selectattr('exists') | selectattr('isreg') | selectattr('executable') | list | length == 5
+      - _rh_pkg_mv.results | map(attribute='stat') | rejectattr('uid', 'equalto', rh.controller.bootstrap.os_tool_identity.owner_uid) | list | length == 0
+      - _rh_pkg_mv.results | map(attribute='stat') | selectattr('wgrp') | list | length == 0
+      - _rh_pkg_mv.results | map(attribute='stat') | selectattr('woth') | list | length == 0
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: every ancestor of {{ rh_pub_dir }} must be a
+      real directory owned by 0 or uid {{ rh_builder.uid }} and not group/other-writable (sticky not excepted), the
+      parent owned by uid {{ rh_builder.uid }}; an existing destination must be an owned real directory; the
+      declared mv, df, rm, flock and mkdir ({{ _rh_pkg_mv.results | map(attribute='item') | list }})
+      must be root-owned, non-writable regular files.
+      Nothing was written.
+    quiet: true
+
+- name: Stat every declared artifact in the source (links followed; content is what gets admitted)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ (rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
+       | map(attribute='file') | map('regex_replace', '^', rh_artifact_source ~ '/') | list }}
+  register: _rh_pkg_src
+
+- name: Refuse missing or mismatched artifacts (offline admission; before any write)
+  ansible.builtin.assert:
+    that:
+      - _rh_pkg_src.results | rejectattr('stat.exists') | list | length == 0
+      - >-
+        _rh_pkg_src.results | map(attribute='stat') | selectattr('exists') | map(attribute='checksum') | list
+        == (rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections) | map(attribute='sha256') | list
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.bundle.refusals.artifacts }}:
+      missing: {{ _rh_pkg_src.results | rejectattr('stat.exists') | map(attribute='item') | list }};
+      digest differs: {{ _rh_pkg_src.results | selectattr('stat.exists')
+      | rejectattr('stat.checksum', 'in', (rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections) | map(attribute='sha256') | list)
+      | map(attribute='item') | list }}.
+      Nothing is downloaded here: acquire.yml (MAIN) fetches declared sources into {{ rh_artifact_source }}.
+    quiet: true
+
+- name: Reap this destination's quiescent owned staging, preserve live, busy and unknown entries, check free space (M1-STAGING-RECOVERY)
+  ansible.builtin.include_tasks: reap_staging.yml
+  vars:
+    rh_reap_dest: "{{ rh_pub_dir }}"
+    rh_reap_uid: "{{ rh_builder.uid | int }}"
+    rh_reap_mv: "{{ rh.controller.bootstrap.os_tools.mv.path }}"
+    rh_reap_df: "{{ rh.controller.bootstrap.os_tools.df.path }}"
+    rh_reap_rm: "{{ rh.controller.bootstrap.os_tools.rm.path }}"
+    rh_reap_flock: "{{ rh.controller.bootstrap.os_tools.flock.path }}"
+    rh_reap_remote: false
+    rh_reap_reserve: true
+    rh_reap_need: >-
+      {{ (_rh_pkg_src.results | map(attribute='stat.size') | sum)
+         * rh.controller.bootstrap.bundle.staging_retention.budget.free_bytes_factor_package }}
+    rh_reap_members: >-
+      {{ [rh.controller.bootstrap.bundle.seed_file, rh.controller.bootstrap.bundle.manifest_file,
+          rh.controller.bootstrap.bundle.checksum_file, rh.controller.bootstrap.bundle.artifacts_dir]
+         + ((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections) | map(attribute='file')
+            | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/') | list) }}
+
+- name: Reserve a private staging dir next to the destination (mkdtemp; this run's holder lease in its name; first write)
+  ansible.builtin.tempfile:
+    state: directory
+    path: "{{ rh_pub_dir | dirname }}"
+    prefix: ".{{ rh_pub_dir | basename }}.{{ rh.controller.bootstrap.bundle.staging_infix }}.{{ rh_staging_lease }}."
+  register: _rh_pkg_stage
+
+- name: Create the staged artifact directory (declared mkdir, no -p; the staging dir is mkdtemp 0700)
+  ansible.builtin.command:
+    argv: ["{{ rh.controller.bootstrap.os_tools.mkdir.path }}", -m, '0700', --, "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.artifacts_dir }}"]
+
+- name: Copy each admitted artifact into the staging dir
+  ansible.builtin.copy:
+    src: "{{ rh_artifact_source }}/{{ item.file }}"
+    dest: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.artifacts_dir }}/{{ item.file }}"
+    remote_src: true
+    mode: '0400'
+  loop: "{{ rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections }}"
+  loop_control:
+    label: "{{ item.file }}"
+
+- name: Render the seed from the declarations (the ONLY way a seed comes to exist)
+  ansible.builtin.template:
+    src: "{{ rh_repo_root }}/{{ rh.controller.bootstrap.template_rel }}"
+    dest: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.seed_file }}"
+    mode: '0500'
+  vars:
+    lme_seed_bs: "{{ rh_pub_policy.controller.bootstrap }}"
+    lme_seed_ctl: "{{ rh_pub_policy.controller }}"
+    lme_seed_lock: "{{ rh_pub_lock }}"
+
+- name: Digest the staged copies and the rendered seed
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+    follow: false
+  loop: >-
+    {{ (rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
+       | map(attribute='file')
+       | map('regex_replace', '^', _rh_pkg_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.artifacts_dir ~ '/') | list
+       + [_rh_pkg_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.seed_file] }}
+  register: _rh_pkg_dst
+
+- name: Refuse a staged bundle whose copies differ from the declarations or whose seed differs from a fresh render
+  ansible.builtin.assert:
+    that:
+      - >-
+        _rh_pkg_dst.results[:-1] | map(attribute='stat.checksum') | list
+        == (rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections) | map(attribute='sha256') | list
+      - >-
+        _rh_pkg_dst.results[-1].stat.checksum
+        == lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ rh.controller.bootstrap.template_rel,
+                  template_vars={'lme_seed_bs': rh_pub_policy.controller.bootstrap, 'lme_seed_ctl': rh_pub_policy.controller,
+                                 'lme_seed_lock': rh_pub_lock}) | hash('sha256')
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.bundle.refusals.staged }}: the staged copies or the rendered seed do not
+      match the declarations; nothing was published (staging {{ _rh_pkg_stage.path }} is left for inspection;
+      the next run reaps it under bundle.staging_retention).
+    quiet: true
+
+- name: Write the Ansible-free consumer check (sha256sum --check format; seed + every artifact)
+  ansible.builtin.copy:
+    dest: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
+    mode: '0400'
+    content: >-
+      {{ ([_rh_pkg_dst.results[-1].stat.checksum ~ '  ' ~ rh.controller.bootstrap.bundle.seed_file]
+          + ((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
+             | map(attribute='sha256')
+             | zip((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
+                   | map(attribute='file') | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/'))
+             | map('join', '  ') | list)) | join('\n') ~ '\n' }}
+
+- name: Digest the consumer check file
+  ansible.builtin.stat:
+    path: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _rh_pkg_sum
+
+- name: Write the bundle manifest (last inside the staging dir; a bundle without it is incomplete)
+  ansible.builtin.copy:
+    dest: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.manifest_file }}"
+    mode: '0400'
+    content: >-
+      {{ {'schema': rh.controller.bootstrap.bundle.schema,
+          'seed_file': rh.controller.bootstrap.bundle.seed_file,
+          'seed_sha256': _rh_pkg_dst.results[-1].stat.checksum,
+          'expected_generation': 'core' ~ rh_pub_policy.controller.expect_core ~ '-py' ~ rh_pub_policy.controller.bootstrap.python.version
+                                 ~ '-uv' ~ rh_pub_policy.controller.bootstrap.uv.version ~ '-' ~ _rh_pkg_dst.results[-1].stat.checksum[:12],
+          'profile_sha256': rh_profile_sha256,
+          'lock_sha256': lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ rh_pub_policy.controller.lock_file_rel) | hash('sha256'),
+          'class_key': rh_pub_key,
+          'artifacts': (rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
+                       | map(attribute='file') | zip((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections) | map(attribute='sha256'))
+                       | map('join', '  ') | list,
+          'checksum_file': rh.controller.bootstrap.bundle.checksum_file,
+          'checksum_file_sha256': _rh_pkg_sum.stat.checksum,
+          'builder': rh_builder,
+          'source': {'repo_head': _rh_src_git.results[0].stdout,
+                     'worktree_status_sha256': _rh_src_git.results[1].stdout | hash('sha256'),
+                     'worktree_dirty': _rh_src_git.results[1].stdout | length > 0,
+                     'inputs': _rh_src_inputs.results | map(attribute='stat.path') | map('regex_replace', '^' ~ (rh_repo_root | regex_escape) ~ '/', '')
+                               | zip(_rh_src_inputs.results | map(attribute='stat.checksum')) | map('join', '  ') | list},
+          'genesis': {'status': rh.controller.bootstrap.genesis.status, 'decision': rh.controller.bootstrap.genesis.decision}} | to_nice_json }}
+
+- name: Digest the staged manifest (UNCHANGED requires BOTH the check file and the manifest to be identical)
+  ansible.builtin.stat:
+    path: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.manifest_file }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _rh_pkg_man
+
+- name: Re-stat the destination immediately before publication
+  ansible.builtin.stat:
+    path: "{{ rh_pub_dir }}"
+    follow: false
+    get_checksum: false
+  register: _rh_pkg_final
+
+- name: Publish by ONE rename onto the absent destination under the destination lock (publish fence; declared flock + mv)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ rh.controller.bootstrap.os_tools.flock.path }}"
+      - -x
+      - -w
+      - "{{ _lz.publish_wait_seconds | string }}"
+      - -E
+      - "{{ _lz.busy_rc | string }}"
+      - "{{ (rh_pub_dir | dirname) ~ '/.' ~ (rh_pub_dir | basename) ~ '.' ~ _lz.lock_suffix }}"
+      - "{{ rh.controller.bootstrap.os_tools.mv.path }}"
+      - -T
+      - "{{ _lz.authority.noreplace_arg }}"
+      - --
+      - "{{ _rh_pkg_stage.path }}"
+      - "{{ rh_pub_dir }}"
+  register: _rh_pkg_publish
+  changed_when: _rh_pkg_publish.rc == 0
+  failed_when: false
+  when: not _rh_pkg_final.stat.exists
+
+- name: Observe whether the publish rename consumed this run's staging (landed iff rc 0 AND the source is gone)
+  ansible.builtin.stat:
+    path: "{{ _rh_pkg_stage.path }}"
+    follow: false
+    get_checksum: false
+  register: _rh_pkg_left
+
+- name: Digest the destination's check file and manifest (published now, or published earlier / concurrently)
+  ansible.builtin.stat:
+    path: "{{ rh_pub_dir }}/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop:
+    - "{{ rh.controller.bootstrap.bundle.checksum_file }}"
+    - "{{ rh.controller.bootstrap.bundle.manifest_file }}"
+  register: _rh_pkg_finalsum
+
+- name: Release this run's staging dir if it was not the one published (it is ours alone; a revoked path is already gone)
+  ansible.builtin.file:
+    path: "{{ _rh_pkg_stage.path }}"
+    state: absent
+  when: _rh_pkg_left.stat.exists
+
+- name: Release this run's lease record (its staging is published or released)
+  ansible.builtin.file:
+    path: "{{ (rh_pub_dir | dirname) ~ '/.' ~ (rh_pub_dir | basename) ~ '.' ~ rh.controller.bootstrap.bundle.staging_retention.lease.lease_infix ~ '.' ~ rh_staging_lease }}"
+    state: absent
+
+- name: Refuse a publish that could not take the destination lock (publish fence busy; own staging and record released)
+  ansible.builtin.assert:
+    that:
+      - _rh_pkg_publish is skipped or _rh_pkg_publish.rc != rh.controller.bootstrap.bundle.staging_retention.lease.busy_rc | int
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.bundle.staging_retention.lease.busy_refusal }}: the destination lock of
+      {{ rh_pub_dir }} stayed held for {{ rh.controller.bootstrap.bundle.staging_retention.lease.publish_wait_seconds }}s
+      (a reaper or another publisher); nothing was published, this run's staging and lease record are released. Rerun.
+    quiet: true
+
+- name: Refuse a publish whose authority was revoked (its staging was moved away under the destination lock)
+  ansible.builtin.assert:
+    that:
+      - _rh_pkg_publish is skipped or _rh_pkg_publish.rc == 0 or _rh_pkg_left.stat.exists
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.bundle.staging_retention.lease.authority.revoked_refusal }}: the publish rename
+      of {{ _rh_pkg_stage.path }} failed (rc {{ _rh_pkg_publish.rc | default('?') }}) and its source is gone: this run's
+      publication authority was revoked (recovery, teardown or retirement renamed its staging away under the lock).
+      Nothing was published by this run and the revoker's staging is not touched.
+    quiet: true
+
+- name: Read back a present destination's recorded revision when it differs (E26 next-run readback; read-only)
+  ansible.builtin.slurp:
+    src: "{{ rh_pub_dir }}/{{ rh.controller.bootstrap.bundle.manifest_file }}"
+  register: _rh_pkg_present
+  failed_when: false
+  when:
+    - _rh_pkg_finalsum.results[1].stat.exists | default(false)
+    - _rh_pkg_finalsum.results[1].stat.checksum | default('') != _rh_pkg_man.stat.checksum
+
+- name: Refuse a destination that holds a different bundle (preserved, never overwritten)
+  ansible.builtin.assert:
+    that:
+      - _rh_pkg_finalsum.results | map(attribute='stat') | selectattr('exists') | selectattr('isreg') | rejectattr('islnk') | list | length == 2
+      - _rh_pkg_finalsum.results[0].stat.checksum == _rh_pkg_sum.stat.checksum
+      - _rh_pkg_finalsum.results[1].stat.checksum == _rh_pkg_man.stat.checksum
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: {{ rh_pub_dir }} exists and is not this exact
+      bundle: check file {{ _rh_pkg_finalsum.results[0].stat.checksum | default('absent') }} vs {{ _rh_pkg_sum.stat.checksum }},
+      manifest (provenance: profile, lock, class key, builder, source) {{ _rh_pkg_finalsum.results[1].stat.checksum | default('absent') }}
+      vs {{ _rh_pkg_man.stat.checksum }}{% if _rh_pkg_present is not skipped %} (present class_key
+      {{ ((_rh_pkg_present.content | default('') | b64decode | from_json) if (_rh_pkg_present.content | default('') | length) > 0 else {}).class_key | default('unreadable') }}
+      vs this run's {{ rh_pub_key }}){% endif %}; it is preserved. Choose another rh_bundle_dir, or MAIN removes the old one.
+    quiet: true
+
+- name: Admit the published bundle exactly (members, modes, digests, fresh-render seed, manifest, class key)
+  ansible.builtin.include_tasks: admit_bundle.yml
+  vars:
+    rh_admit_dir: "{{ rh_pub_dir }}"
+    rh_admit_key: "{{ rh_pub_key }}"
+    rh_admit_policy: "{{ rh_pub_policy }}"
+    rh_admit_lock: "{{ rh_pub_lock }}"
+
+- name: Report the package result
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'PUBLISHED' if (_rh_pkg_publish is not skipped and _rh_pkg_publish.rc == 0 and not _rh_pkg_left.stat.exists) else 'UNCHANGED' }}
+      {{ rh_bundle.expected_generation }} {{ rh_pub_dir }} class {{ rh_pub_key }}; stale staging reaped before reservation:
+      {{ _rh_reap_rm.results | default([]) | map(attribute='item') | list }}

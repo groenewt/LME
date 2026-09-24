@@ -1,0 +1,51 @@
+---
+# testing/e2e/transfer/tasks/controller_recover.yml -- B2-TEMP-LIFECYCLE interruption recovery (localhost, effect).
+# An operation whose ledger has `start` and no terminal line was interrupted (kill, lost controller, Ctrl-C). The
+# NEXT operation removes exactly that op's two recorded paths (<pending>/<op>.tar.gz and <pending>/<op>.d) and
+# records `abandon`. Nothing is found by globbing; a ledger line outside the declared grammar refuses.
+# Inputs: tr, tr_state. Outputs: none (effects: exact removals + ledger lines).
+
+- name: Stat the controller ledger
+  ansible.builtin.stat:
+    path: "{{ tr_state.ledger }}"
+    follow: false
+  register: _tr_cl
+
+- name: Read the controller ledger
+  ansible.builtin.slurp:
+    src: "{{ tr_state.ledger }}"
+  register: _tr_clb
+  when: _tr_cl.stat.exists
+
+- name: Parse the ledger (declared grammar only)
+  ansible.builtin.set_fact:
+    _tr_cll: "{{ (_tr_clb.content | b64decode).splitlines() if _tr_cl.stat.exists else [] }}"
+    _tr_clre: "{{ '^(' ~ (tr.controller_state.verbs.values() | join('|')) ~ ') ' ~ tr.controller_state.op_regex[1:] }}"
+
+- name: Refuse a linked ledger or a line outside the grammar
+  ansible.builtin.assert:
+    that:
+      - not _tr_cl.stat.exists or (_tr_cl.stat.isreg and not _tr_cl.stat.islnk and _tr_cl.stat.uid == tr_state.uid)
+      - _tr_cll | reject('match', _tr_clre) | list | length == 0
+    fail_msg: "TRANSFER-STATE-LEDGER: {{ tr_state.ledger }} is not a regular file of uid {{ tr_state.uid }} or has lines outside {{ _tr_clre }}"
+    quiet: true
+
+- name: Interrupted operations (start without complete/fail/abandon)
+  ansible.builtin.set_fact:
+    _tr_interrupted: >-
+      {{ _tr_cll | select('match', '^' ~ tr.controller_state.verbs.start ~ ' ') | map('regex_replace', '^\S+ ', '') | list
+         | reject('in', _tr_cll | reject('match', '^' ~ tr.controller_state.verbs.start ~ ' ') | map('regex_replace', '^\S+ ', '') | list)
+         | list }}
+
+- name: Remove exactly the recorded artifacts of each interrupted operation
+  ansible.builtin.file:
+    path: "{{ tr_state.pending }}/{{ item.0 }}{{ item.1 }}"
+    state: absent
+  loop: "{{ _tr_interrupted | product(['.tar.gz', '.d']) | list }}"
+
+- name: Record the abandonment
+  ansible.builtin.lineinfile:
+    path: "{{ tr_state.ledger }}"
+    line: "{{ tr.controller_state.verbs.abandon }} {{ item }}"
+    insertafter: EOF
+  loop: "{{ _tr_interrupted }}"

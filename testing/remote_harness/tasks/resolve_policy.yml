@@ -1,0 +1,76 @@
+---
+# testing/remote_harness/tasks/resolve_policy.yml -- resolve the harness policy through the shared engine.
+# Requires tasks/refuse_pinned_outputs.yml to have run first in the play (it derives rh_repo_root).
+#
+# SEED-06 (JOINT with C1; consumer interface revision 4): the policy is the engine's typed section
+# lme_resolved.remote_harness = {schema_version: 3, policy, policy_sha256, adapter: {name, tools: {'target.tools': {<tool>:
+# {used_by, path, identity}}}}} -- adapter tool path/identity DERIVED by C1 from the effective os_tools (tick144). resolve.yml composes lme_global exactly ONCE
+# (global | profile | lme_global_override LAST, recursive), validates it deny-by-default against C1's registry
+# (manifests/global.yml lme_config_registry.remote_harness_schema: tunable paths, declared leaf types, executable
+# identity, bounds, adapter, package mapping, inventory variable names, retired paths) and binds the section into
+# lme_resolved_revision. An admitted override is therefore part of the policy and of both revisions; its dotted
+# leaves are audited in lme_remote_harness_overridden_paths (not revision-bound; a same-value override is listed).
+# This file reads NOTHING from the raw profile: no _lme_profile_file read, no interim override refusal.
+
+#
+# r3f DECLARED-INPUTS-VS-DERIVED-OUTPUTS (codex-tick144): clone_directory, lme_manifests_dir and lme_profile are the
+# engine's DECLARED INPUTS, not harness outputs (never reserved). This helper binds them to the harness checkout and
+# the remote-harness profile; an inventory value cannot reach the resolve (include vars outrank inventory), and an
+# extra-var that does reach it is refused AFTER the resolve by comparing the EFFECTIVE bindings the engine used
+# (its set_facts of lme_profile / lme_manifests_dir, and the loaded profile bytes) with the admitted ones. Profile
+# composition (global | remote-harness | lme_global_override) is unchanged; lme_global_override stays a declared input.
+
+- name: Resolve through the shared engine entrypoint (profile remote-harness)
+  ansible.builtin.include_role:
+    name: "{{ rh_repo_root }}/ansible/roles/podman"
+    tasks_from: resolve
+  vars:
+    clone_directory: "{{ rh_repo_root }}"
+    lme_manifests_dir: "{{ rh_repo_root }}/manifests"
+    lme_profile: remote-harness
+
+- name: Refuse an engine resolve whose effective checkout or profile is not this helper's admitted binding
+  ansible.builtin.assert:
+    that:
+      - lme_profile == 'remote-harness'
+      - lme_manifests_dir == rh_repo_root ~ '/manifests'
+      # clone_directory only feeds the engine's lme_manifests_dir default, which this helper binds explicitly, so an
+      # inventory/extra-var clone_directory (e.g. a shared LME inventory) is harmless here and is not refused
+      - _lme_profile_file == (lookup('ansible.builtin.file', rh_repo_root ~ '/manifests/profiles/remote-harness.yml') | from_yaml)
+    fail_msg: >-
+      REFUSED RH-POLICY-INPUT-CONFLICT: the engine resolved with profile '{{ lme_profile | default('?') }}' from
+      '{{ lme_manifests_dir | default('?') }}', but this harness admits only profile remote-harness from its own
+      checkout {{ rh_repo_root }}/manifests; an extra-var override of lme_profile / lme_manifests_dir conflicts with
+      the admitted inputs.
+    quiet: true
+
+- name: Refuse a resolution without the typed harness policy section (C1 projection; no fallback)
+  ansible.builtin.assert:
+    that:
+      - lme_resolved.remote_harness is defined
+      - lme_resolved.remote_harness is mapping
+      - lme_resolved.remote_harness.schema_version | default(none) == 3
+      - lme_resolved.remote_harness.policy | default(none) is mapping
+      - lme_resolved.remote_harness.policy_sha256 | default('') is match('^[0-9a-f]{64}$')
+      - lme_resolved.remote_harness.adapter.tools['target.tools'] | default(none) is mapping
+      - lme_resolved_revision | default('') is match('^[0-9a-f]{64}$')
+      - lme_remote_harness_overridden_paths is defined
+    fail_msg: >-
+      REFUSED RH-POLICY-UNRESOLVED: the engine resolve produced no lme_resolved.remote_harness section of schema 3
+      ({policy, policy_sha256, adapter.tools['target.tools']}) bound into lme_resolved_revision; the harness never reads the raw profile instead.
+    quiet: true
+
+- name: Publish the resolved harness policy, its revisions and the lock (derived outputs; pre-supply refused at entry)
+  ansible.builtin.set_fact:
+    rh: "{{ lme_resolved.remote_harness.policy }}"
+    rh_config_revision: "{{ lme_resolved.remote_harness.policy_sha256 }}"
+    rh_engine_revision: "{{ lme_resolved_revision }}"
+    rh_profile_sha256: "{{ lookup('ansible.builtin.file', rh_repo_root ~ '/manifests/profiles/remote-harness.yml') | hash('sha256') }}"
+    rh_seed_lock: >-
+      {{ lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ lme_resolved.remote_harness.policy.controller.lock_file_rel) | from_yaml }}
+
+- name: Report the resolved harness policy (audit of admitted overrides; not revision-bound)
+  ansible.builtin.debug:
+    msg: >-
+      RH-POLICY policy_sha256={{ rh_config_revision }} lme_resolved_revision={{ rh_engine_revision }}
+      overridden_paths={{ lme_remote_harness_overridden_paths }}

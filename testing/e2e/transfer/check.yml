@@ -1,0 +1,97 @@
+---
+# testing/e2e/transfer/check.yml -- STRUCTURAL guard of the two entry playbooks against transfer.decl.yml
+# (B2-CONTROL-REACH). Static, local, read-only:
+#   /usr/bin/ansible-playbook -i localhost, testing/e2e/transfer/check.yml
+# macro `violations` (templates/macros/transfer.j2), for each entry (decl `entries`): exact play names in order;
+# host placement (localhost = hosts localhost + connection local; target = hosts exactly the declared expression);
+# any_errors_fatal true; gather_facts false. Every task is walked THROUGH blocks/rescue/always and B includes:
+#   observe plays -> only observe modules, every command changed_when false, no delegation;
+#   effect plays  -> only declared observe/effect modules, delegation only to localhost.
+# B includes must resolve under tasks/; route includes must be declared and match their sha256; any other include
+# (or include_role) refuses. deploy_gate.sh must name every declared output suffix and build no root@HOST target.
+- name: transfer -- structural check
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    tr_dir: "{{ playbook_dir }}"
+    tr: "{{ (lookup('ansible.builtin.file', playbook_dir ~ '/transfer.decl.yml') | from_yaml).transfer }}"
+  tasks:
+    - name: Walk the entry playbooks and compute the violations
+      ansible.builtin.set_fact:
+        _ck: >-
+          {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                    template_vars={'lme_macro': 'violations', 'lme_args': [tr, tr_dir, tr_dir | dirname | dirname | dirname]}) | from_json }}
+
+    - name: Refuse any violation
+      ansible.builtin.assert:
+        that:
+          - _ck.violations | length == 0
+        fail_msg: "TRANSFER CHECK FAILED ({{ _ck.rows }} tasks walked): {{ _ck.violations | to_nice_json }}"
+        quiet: true
+
+    # ---- LOAD-BASE (SOURCE-REF check C): every lookup / include base in B's own files is a declared base, so a
+    # phase row can only load project bytes from the candidate tree (the bases are asserted at runtime by
+    # controls/load_paths.yml). Policy: tr.controls_source.load_binding (lookup_bases, identity_lookups, static).
+    - name: LOAD-BASE -- B's own task, playbook and template files
+      ansible.builtin.find:
+        paths: "{{ tr_dir }}"
+        recurse: true
+        patterns: ['*.yml', '*.j2']
+      register: _lbf
+
+    - name: LOAD-BASE -- read them
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: >-
+        {{ _lbf.files | map(attribute='path') | sort
+           | reject('in', tr.controls_source.load_binding.static.scan_exclude | map('regex_replace', '^', tr_dir ~ '/') | list) | list }}
+      register: _lbs
+
+    - name: LOAD-BASE -- compute the undeclared bases
+      vars:
+        _lb: "{{ tr.controls_source.load_binding }}"
+        _ids: "{{ _lb.identity_lookups | select('match', '^/') | list }}"
+      ansible.builtin.set_fact:
+        _lb_viol: >-
+          {%- set v = [] -%}
+          {%- set n = [] -%}
+          {%- for r in _lbs.results -%}
+            {%- set t = r.content | b64decode | regex_replace(_lb.static.strip_regexes[0], '') | regex_replace(_lb.static.strip_regexes[1], '') -%}
+            {%- for a0 in t | regex_findall(_lb.static.lookup_regex) -%}
+              {%- set a = a0 | trim -%}
+              {{- n.append('l') or '' -}}
+              {%- if not ((a.split(' ') | first) in _lb.lookup_bases
+                          or (a | replace("'", '') | replace('"', '')) in _ids) -%}
+                {{- v.append((r.source | replace(tr_dir ~ '/', '')) ~ ': lookup base ' ~ a) or '' -}}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- for i0 in t | regex_findall(_lb.static.include_regex) -%}
+              {%- set i = i0 | trim | replace('"', '') | replace("'", '') -%}
+              {{- n.append('i') or '' -}}
+              {%- if not ((i is match(_lb.static.relative_include_regex))
+                          or (i.startswith('{' ~ '{ ') and ((i[3:].split(' ') | first) in _lb.lookup_bases))) -%}
+                {{- v.append((r.source | replace(tr_dir ~ '/', '')) ~ ': include base ' ~ i) or '' -}}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ {'violations': v, 'lookups': n | select('equalto', 'l') | list | length, 'includes': n | select('equalto', 'i') | list | length} | to_json }}
+
+    - name: LOAD-BASE -- parse
+      ansible.builtin.set_fact:
+        _lb_viol: "{{ _lb_viol if (_lb_viol is mapping) else (_lb_viol | from_json) }}"
+
+    - name: LOAD-BASE -- refuse an undeclared base (TRANSFER-CHECK-LOAD-BASE)
+      ansible.builtin.assert:
+        that:
+          - _lbs.results | length > 0
+          - _lb_viol.lookups > 0 and _lb_viol.includes > 0
+          - _lb_viol.violations | length == 0
+        fail_msg: "TRANSFER-CHECK-LOAD-BASE: {{ _lb_viol | to_nice_json }}"
+        quiet: true
+
+    - name: OK
+      ansible.builtin.debug:
+        msg: >-
+          TRANSFER CHECK OK ({{ _ck.rows }} tasks walked; load-base: {{ _lbs.results | length }} files,
+          {{ _lb_viol.lookups }} lookups, {{ _lb_viol.includes }} includes)

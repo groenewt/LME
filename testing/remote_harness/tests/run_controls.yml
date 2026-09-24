@@ -1,0 +1,71 @@
+---
+# testing/remote_harness/tests/run_controls.yml -- the GENERIC runner of the lifecycle controls declared in
+# tests/controls/controls.yml (owner: G_acceptance_coordinator). It knows no control by name: it validates the
+# declarations, binds them to the owners' case rows, plans every control/variant and (execute mode only) drives
+# the real entrypoints and judges them with the pure macros in tests/controls/templates/macros/controls.j2.
+#
+# Modes (rhc_mode):
+#   plan     (default) no entrypoint is run and nothing is written. Validates the declarations (known case ids,
+#            declared dependencies/declarations/tokens, vocabulary), reports uncovered case rows and the planned
+#            status of every control/variant: READY | QUEUED | UNIMPLEMENTED | RESIDUAL | OPEN-REGRESSION | NOT-APPLICABLE.
+#            Also runs the gate self-tests (controls/selftests.yml) and the independent static checks with their
+#            negative controls (read-only: template renders, parsed declarations, `git ls-files`), and reports them.
+#            Fails only on a declaration error or a failing gate self-test (a runner defect).
+#   execute  runs the selected controls serially. Requires ALL of:
+#              rhc_release          the codex message id that released candidate execution (no release, no run)
+#              rhc_work_root        an owned, non-group/other-writable directory under $HOME (never /tmp), admitted
+#                                   by the profile's path_admission regex; every root/bundle/evidence lives under it
+#              rhc_artifact_source  the acquired artifact directory (read-only input of package.yml)
+#              rhc_select           a list of control ids, or [all]
+#            optional: rhc_variants {<declaration id>: <read-only repo copy>}, rhc_baseline_repo,
+#                      rhc_main_fixtures {foreign_entry, foreign_parent, root_canary} (staged by MAIN).
+#            Acceptance: the play fails unless every selected control/variant is PASS.
+#
+# Invocation (the declared builder, like every harness entrypoint; stdio redirected):
+#   /usr/bin/ansible-playbook -i localhost, -c local testing/remote_harness/tests/run_controls.yml [-e rhc_mode=execute -e @vars.yml]
+- name: Lifecycle controls of the managed controller seed (G)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    rhc_mode: plan
+    rhc_controls_dir: "{{ playbook_dir }}/controls"
+    rhc_call_j2: "{{ playbook_dir }}/controls/templates/call.j2"
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: ../tasks/refuse_pinned_outputs.yml
+
+    - name: Resolve the harness policy through the engine (the runner reads the same declarations the entrypoints do)
+      ansible.builtin.include_tasks: ../tasks/resolve_policy.yml
+
+    - name: Refuse an unknown mode
+      ansible.builtin.assert:
+        that: rhc_mode in ['plan', 'execute']
+        fail_msg: "rhc_mode must be plan or execute, not {{ rhc_mode }}"
+        quiet: true
+
+    - name: Name this execute run's directory (created by execute.yml after its admission checks)
+      ansible.builtin.set_fact:
+        rhc_run_dir: "{{ rhc_work_root }}/run-{{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}"
+      when: rhc_mode == 'execute' and rhc_work_root is defined
+
+    - name: Self-test the macro and regex gates (declared accepting and rejecting cases; a failure is a runner defect)
+      ansible.builtin.include_tasks: controls/tasks/selftest.yml
+
+    - name: Load, validate and plan the declared controls
+      ansible.builtin.include_tasks: controls/tasks/prepare.yml
+
+    - name: Run the independent static checks and their negative controls (plan mode; nothing is run or written)
+      ansible.builtin.include_tasks: controls/tasks/static_plan.yml
+      loop: "{{ rhc_decl.controls | selectattr('static_checks', 'defined') | list }}"
+      loop_control:
+        loop_var: rhc_c
+        label: "{{ rhc_c.id }}"
+      when: rhc_mode == 'plan'
+
+    - name: Execute the selected controls (released candidates only)
+      ansible.builtin.include_tasks: controls/tasks/execute.yml
+      when: rhc_mode == 'execute'
+
+    - name: Report
+      ansible.builtin.include_tasks: controls/tasks/summary.yml

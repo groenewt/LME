@@ -1,0 +1,136 @@
+---
+# one control variant (rhc_c, rhc_v): status gate, tokens, declaration admission, ops, steps, undo, cleanup, record (G)
+
+- name: "Gate {{ rhc_c.id }}/{{ rhc_v.id }}"
+  vars:
+    _ctl_deps: >-
+      {{ ((rhc_c.requires | default([])) + (rhc_v.requires | default([])))
+         | select('in', rhc_deps | dict2items | selectattr('value.kind', 'equalto', 'control') | map(attribute='key') | list) | list }}
+  ansible.builtin.set_fact:
+    _rhc_status: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_status', 'args': [rhc_c, rhc_v, rhc_deps, _rhc_c_unimpl[rhc_v.id] | default([])]}}) | from_json }}"
+    _rhc_blockers: >-
+      {{ (_ctl_deps | reject('in', rhc_deps | dict2items | selectattr('value.met') | map(attribute='key') | list)
+          | map('regex_replace', '^(.*)$', 'prerequisite \1 not PASS (' ~ 'ran or not selected' ~ ')') | list)
+         + (['shared root tainted by an earlier control'] if ((rhc_c.root | default('')) == 'shared' and (rhc_shared_tainted | default(false))) else []) }}
+    _rhc_fail: []
+    _rhc_log: []
+    _rhc_results_v: {}
+    _rhc_jobs: {}
+    _rhc_snaps: {}
+    _rhc_compiled: {}
+    _rhc_modes: {}
+    _rhc_sc_out: []
+    _rhc_static_only: "{{ rhc_c.static_checks is defined and rhc_c.steps is not defined }}"
+
+- name: "Static checks of {{ rhc_c.id }}/{{ rhc_v.id }} (independent: no entrypoint, no release input, nothing written)"
+  ansible.builtin.include_tasks: static_check.yml
+  loop: "{{ rhc_c.static_checks | default([]) }}"
+  loop_control:
+    loop_var: rhc_sc
+    label: "{{ (rhc_sc | list)[0] }}"
+  when: rhc_c.static_checks is defined and _rhc_status.status in ['READY', 'OPEN-REGRESSION'] and _rhc_blockers | length == 0
+
+- name: "Record a {{ rhc_c.id }}/{{ rhc_v.id }} that does not run (a failed static check of an OPEN-REGRESSION control is a FAIL)"
+  ansible.builtin.set_fact:
+    rhc_results: >-
+      {{ rhc_results + [{'control': rhc_c.id, 'variant': rhc_v.id,
+          'status': ('FAIL' if _rhc_fail | length > 0 else (_rhc_status.status if _rhc_status.status != 'READY' else 'BLOCKED')),
+          'why': _rhc_fail + (_rhc_status.why if _rhc_status.status != 'READY' else _rhc_blockers), 'cases': rhc_c.cases | default([]),
+          'static': _rhc_sc_out}] }}
+  when: _rhc_status.status != 'READY' or _rhc_blockers | length > 0
+
+- name: "Record the static-only {{ rhc_c.id }}/{{ rhc_v.id }}"
+  ansible.builtin.set_fact:
+    rhc_results: >-
+      {{ rhc_results + [{'control': rhc_c.id, 'variant': rhc_v.id, 'status': 'PASS' if _rhc_fail | length == 0 else 'FAIL',
+          'why': _rhc_fail, 'cases': rhc_c.cases | default([]), 'findings': rhc_c.findings | default([]), 'static': _rhc_sc_out}] }}
+  when: _rhc_status.status == 'READY' and _rhc_blockers | length == 0 and _rhc_static_only | bool
+
+- name: "Run {{ rhc_c.id }}/{{ rhc_v.id }}"
+  when: _rhc_status.status == 'READY' and _rhc_blockers | length == 0 and not (_rhc_static_only | bool)
+  block:
+    - name: Derive this variant's tokens (declared tokens first, then the variant's own, expanded against them)
+      vars:
+        _ctl: "{{ rhc_base_tokens.run }}/controls/{{ rhc_c.id }}/{{ rhc_v.id }}"
+        _t0: >-
+          {{ rhc_base_tokens | combine({'ctl': _ctl, 'parent': _ctl ~ '/p', 'root': _ctl ~ '/p/root', 'rootname': 'root', 'fifo': _ctl ~ '/fifo',
+               'gen': _ctl ~ '/p/root/generations/' ~ rhc_base_tokens.gen_id,
+               'sgen': rhc_base_tokens.shared ~ '/generations/' ~ rhc_base_tokens.gen_id, 'vowner': rhc_base_tokens.user}) }}
+      ansible.builtin.set_fact:
+        _rhc_t: "{{ _t0 | combine(lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [rhc_v.tokens | default({}), _t0]}}) | from_json) }}"
+
+    - name: Create the variant's private dirs (0700; the fresh root's parent stays empty)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      loop: ["{{ _rhc_t.ctl }}", "{{ _rhc_t.parent }}", "{{ _rhc_t.ctl }}/cwd", "{{ _rhc_t.ctl }}/stash", "{{ _rhc_t.ctl }}/playbooks"]
+
+    - name: Render the control playbooks
+      ansible.builtin.template:
+        src: "{{ rhc_controls_dir }}/templates/playbooks/{{ item }}.yml.j2"
+        dest: "{{ _rhc_t.ctl }}/playbooks/{{ item }}.yml"
+        mode: '0600'
+      loop: "{{ rhc_decl.rendered_playbooks }}"
+
+    - name: Build the variant context
+      ansible.builtin.set_fact:
+        _rhc_ctx: "{{ rhc_ctx_static | combine({'t': _rhc_t}) }}"
+
+    - name: Admit the declaration variant (SEED-06 override, or a MAIN-staged repository copy)
+      ansible.builtin.include_tasks: variant_admit.yml
+      when: (rhc_v.declaration | default(rhc_c.declaration | default(''))) | length > 0
+
+    - name: Compile the steps of this variant (sweeps and repeats become ordinary steps)
+      ansible.builtin.set_fact:
+        _rhc_compiled: >-
+          {{ (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'compile', 'args': [rhc_c, _rhc_ctx]}}) | from_json)
+             | selectattr('variant', 'equalto', rhc_v.id) | first }}
+
+    - name: Setup and variant ops
+      ansible.builtin.include_tasks: op.yml
+      loop: "{{ _rhc_compiled.ops }}"
+      loop_control:
+        loop_var: rhc_o
+      when: _rhc_fail | length == 0
+
+    - name: Steps (stop at the first failed step; undo and cleanup still run)
+      ansible.builtin.include_tasks: step.yml
+      loop: "{{ _rhc_compiled.steps }}"
+      loop_control:
+        loop_var: rhc_s
+        label: "{{ rhc_s.id }}"
+      when: _rhc_fail | length == 0
+
+  rescue:
+    - name: A runner error is a FAIL of this variant, never a PASS
+      ansible.builtin.set_fact:
+        _rhc_fail: "{{ _rhc_fail + ['runner error at task ' ~ (ansible_failed_task.name | default('?')) ~ ': ' ~ (ansible_failed_result.msg | default('') | string)[:400]] }}"
+
+  always:
+    - name: Undo (restores the shared root; failures are cleanup findings and taint it)
+      ansible.builtin.include_tasks: op.yml
+      loop: "{{ _rhc_compiled.undo | default([]) }}"
+      loop_control:
+        loop_var: rhc_o
+      vars:
+        rhc_op_is_undo: true
+
+    - name: Cleanup (purge a fresh root; re-verify the shared root)
+      ansible.builtin.include_tasks: finish_variant.yml
+
+    - name: "Record {{ rhc_c.id }}/{{ rhc_v.id }}"
+      ansible.builtin.set_fact:
+        rhc_results: >-
+          {{ rhc_results + [{'control': rhc_c.id, 'variant': rhc_v.id, 'status': 'PASS' if _rhc_fail | length == 0 else 'FAIL',
+              'why': _rhc_fail, 'cases': rhc_c.cases | default([]), 'findings': rhc_c.findings | default([]),
+              'evidence': _rhc_t.ctl ~ '/evidence.json'}] }}
+
+    - name: Write the variant evidence (every step's argv, exit status, output files and judgement)
+      ansible.builtin.copy:
+        dest: "{{ _rhc_t.ctl }}/evidence.json"
+        mode: '0600'
+        content: >-
+          {{ {'control': rhc_c.id, 'variant': rhc_v.id, 'release': rhc_release, 'bound': rhc_evidence_bound,
+              'status': 'PASS' if _rhc_fail | length == 0 else 'FAIL', 'failures': _rhc_fail, 'steps': _rhc_log} | to_nice_json }}
+  # (the always section runs only when the block ran)

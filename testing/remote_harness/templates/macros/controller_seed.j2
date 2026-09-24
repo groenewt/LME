@@ -1,0 +1,820 @@
+{#- testing/remote_harness/templates/macros/controller_seed.j2 -- GENUINE, PARAMETERIZED Jinja macros that emit the
+    managed-controller seed (POSIX sh) from the declarations:
+      bs   = profile remote_harness.controller.bootstrap   (pins, artifacts, os_tools, budget, layout, refusals)
+      ctl  = profile remote_harness.controller             (expect_core)
+      lock = the file named by remote_harness.controller.lock_file_rel (wheels + collections)
+    The seed is a BUILD OUTPUT rendered by package.yml into a local bundle; it is never committed.
+    Every system executable is emitted through x(bs, name) = bs.os_tools[name].path (SEED-07b): an undeclared
+    tool is a render error, a changed path changes the invocation. Every declared value reaches the shell
+    through shq() (single-quote serialization); runtime values (root, generation path, op id) are the ONLY
+    double-quoted expansions. Pure Jinja (no Ansible-only filters); block tags stay at column 0 so the
+    ansible.builtin.template render (trim_blocks) and the lookup('template') render agree.
+-#}
+{%- macro shq(v) -%}
+'{{ v | string | replace("'", "'\\''") }}'
+{%- endmacro -%}
+
+{%- macro cmt(v) -%}
+{{ v | string | replace('\r', ' ') | replace('\n', ' ') }}
+{%- endmacro -%}
+
+{#- the declared executable for a tool name (quoted) -#}
+{%- macro x(bs, n) -%}
+{{ shq(bs.os_tools[n].path) }}
+{%- endmacro -%}
+
+{#- ---- declared pins as one table (recorded in receipts/pins.txt; the generation id binds the whole seed) ---- -#}
+{%- macro pins_table(bs, ctl, lock) -%}
+schema lme-controller-seed/v2
+core {{ ctl.expect_core }}
+python {{ bs.python.version }} pbs {{ bs.python.pbs_release }} mode {{ bs.python.install_mode }}
+uv {{ bs.uv.version }} method {{ bs.uv.install_method }}
+{% for a in bs.artifacts %}
+artifact {{ a.key }} {{ a.file }} {{ a.sha256 }}
+{% endfor %}
+{% for p in lock.packages %}
+wheel {{ p.name }} {{ p.version }} {{ p.file }} {{ p.sha256 }}
+{% endfor %}
+{% for c in lock.collections %}
+collection {{ c.name }} {{ c.version }} {{ c.file }} {{ c.sha256 }}
+{% endfor %}
+{%- endmacro -%}
+
+{#- ---- refusal vocabulary -> one shell function ---- -#}
+{%- macro refusal_fn(refusals) -%}
+lme_refuse() {
+  _code=$1; shift
+  case "$_code" in
+{% for code, status in refusals | dictsort %}
+    {{ code }}) _st={{ status | int }} ;;
+{% endfor %}
+    *) _st=1 ;;
+  esac
+  printf 'REFUSED %s %s\n' "$_code" "$*" >&2
+  exit "$_st"
+}
+{%- endmacro -%}
+
+{#- ---- env -i prefix: declared base env + literal extras + runtime words ---- -#}
+{%- macro env_i(bs, extra_literal={}, runtime=[]) -%}
+{{ x(bs, 'env') }} -i HOME="$HOME"{% for k, v in bs.base_env | dictsort %} {{ k }}={{ shq(v) }}{% endfor %}{% for k, v in extra_literal | dictsort %} {{ k }}={{ shq(v) }}{% endfor %}{% for w in runtime %} {{ w }}{% endfor %}
+{%- endmacro -%}
+
+{#- managed ansible environment: declared managed_env + the SEALED generation ansible.cfg (SEED-01) -#}
+{%- macro managed_env(bs, home_dir, tmp_dir) -%}
+{{ env_i(bs, bs.managed_env, ['ANSIBLE_HOME="' ~ home_dir ~ '"', 'ANSIBLE_LOCAL_TEMP="' ~ tmp_dir ~ '/ansible-local"', 'ANSIBLE_GALAXY_CACHE_DIR="' ~ tmp_dir ~ '/galaxy-cache"', 'ANSIBLE_COLLECTIONS_PATH="$G/' ~ bs.layout.gen_dirs.collections ~ '"', 'ANSIBLE_CONFIG="$G/' ~ bs.layout.config_file ~ '"', 'TMPDIR="' ~ tmp_dir ~ '"']) }}
+{%- endmacro -%}
+
+{#- ---- preconditions that need no root and no artifact ---- -#}
+{%- macro combination_check(bs, ctl) -%}
+{% if bs.python.major_minor not in bs.core_supported_python %}
+lme_refuse RH-SEED-UNSUPPORTED-COMBINATION {{ shq('core ' ~ ctl.expect_core ~ ' does not support Python ' ~ bs.python.major_minor) }}
+{% else %}
+: # combination core {{ cmt(ctl.expect_core) }} on Python {{ cmt(bs.python.major_minor) }} is inside {{ cmt(bs.core_supported_python | join(',')) }}
+{% endif %}
+{%- endmacro -%}
+
+{#- every declared tool present; every uv_installer tool is exactly what base_env.PATH resolves -#}
+{%- macro os_tool_checks(bs) -%}
+_missing=''
+{% for n, t in bs.os_tools | dictsort %}
+{% if 'seed' in t.required_by or 'uv_installer' in t.required_by %}
+[ -x {{ shq(t.path) }} ] || _missing="$_missing {{ n }}={{ t.path }}({{ t.required_by | join('+') }})"
+{% endif %}
+{% endfor %}
+[ -z "$_missing" ] || lme_refuse RH-SEED-OS-TOOL-MISSING "absent:$_missing"
+_wrong=''
+{% for n, t in bs.os_tools | dictsort %}
+{% if 'uv_installer' in t.required_by %}
+[ "$({{ x(bs, 'env') }} -i PATH={{ shq(bs.base_env.PATH) }} {{ x(bs, 'sh') }} -c 'command -v "$1"' _ {{ shq(n) }})" = {{ shq(t.path) }} ] || _wrong="$_wrong {{ n }}"
+{% endif %}
+{% endfor %}
+[ -z "$_wrong" ] || lme_refuse RH-SEED-OS-TOOL-MISSING "base PATH resolves a different file than declared for:$_wrong"
+{% set ti = bs.os_tool_identity %}
+# SEED-06 os_tools_integrity: identity of every selected executable, independent of the tool verifying itself
+_badid=''
+{% for n, t in bs.os_tools | dictsort %}
+{% if 'seed' in t.required_by or 'uv_installer' in t.required_by %}
+_st=$({{ x(bs, 'stat') }} -L -c '%u %a %F' -- {{ shq(t.path) }} 2>/dev/null) || _st='unreadable'
+case "$_st" in {{ ti.owner_uid | int }}' '*' regular file') : ;; *) _badid="$_badid {{ n }}($_st)" ;; esac
+_m=${_st#* }; _m=${_m%% *}; _m=${_m#"${_m%??}"}
+case "$_m" in [2367]?|?[2367]) _badid="$_badid {{ n }}(group/other-writable)" ;; esac
+{% endif %}
+{% endfor %}
+[ -z "$_badid" ] || {{ 'lme_refuse ' ~ ti.refusal }} "executables must be regular files owned by uid {{ ti.owner_uid }} and not group/other-writable:$_badid"
+{% for k in ti.known_answers %}
+[ "$(printf '%s' {{ shq(k.stdin) }} | {{ x(bs, k.tool) }})" = "$(printf '%s' {{ shq(k.stdout) }})" ] || {{ 'lme_refuse ' ~ ti.refusal }} {{ shq(k.tool ~ ' at ' ~ bs.os_tools[k.tool].path ~ ' fails its known-answer identity check') }}
+{% endfor %}
+{%- endmacro -%}
+
+{%- macro platform_check(bs) -%}
+[ "$({{ x(bs, 'uname') }} -s)" = {{ shq(bs.platform.os) }} ] || lme_refuse RH-SEED-UNSUPPORTED-PLATFORM "os $({{ x(bs, 'uname') }} -s) != {{ bs.platform.os }}"
+[ "$({{ x(bs, 'uname') }} -m)" = {{ shq(bs.platform.arch) }} ] || lme_refuse RH-SEED-UNSUPPORTED-PLATFORM "arch $({{ x(bs, 'uname') }} -m) != {{ bs.platform.arch }}"
+_ldd=$({{ x(bs, 'ldd') }} --version 2>&1 | {{ x(bs, 'sed') }} -n '1p')
+case "$_ldd" in
+  *GLIBC*|*'GNU libc'*) : ;;
+  *) lme_refuse RH-SEED-UNSUPPORTED-PLATFORM "libc is not {{ bs.platform.libc }}: $_ldd" ;;
+esac
+_glibc=${_ldd##* }
+_gmaj=${_glibc%%.*}; _gmin=${_glibc#*.}; _gmin=${_gmin%%[!0-9]*}
+case "$_gmaj$_gmin" in ''|*[!0-9]*) lme_refuse RH-SEED-UNSUPPORTED-PLATFORM "unparsed glibc version: $_ldd" ;; esac
+if [ "$_gmaj" -lt {{ bs.platform.glibc_min.major | int }} ] || { [ "$_gmaj" -eq {{ bs.platform.glibc_min.major | int }} ] && [ "$_gmin" -lt {{ bs.platform.glibc_min.minor | int }} ]; }; then
+  lme_refuse RH-SEED-UNSUPPORTED-PLATFORM "glibc $_glibc < {{ bs.platform.glibc_min.major }}.{{ bs.platform.glibc_min.minor }}"
+fi
+{{ x(bs, 'curl') }} --version 2>/dev/null | {{ x(bs, 'grep') }} -E -q '^Protocols:.* file( |$)' || lme_refuse RH-SEED-OS-TOOL-MISSING 'curl lacks the file protocol (uv installer artifact base)'
+{%- endmacro -%}
+
+{#- ---- path admission: the ONE declared rule (bs.path_admission), shared with verify_toolchain_receipt.yml ---- -#}
+{%- macro path_arg_check(bs, var, label) -%}
+case "${{ var }}" in
+  /*) : ;;
+  *) lme_refuse RH-SEED-USAGE "{{ label }} must be an absolute path: ${{ var }}" ;;
+esac
+case "${{ var }}" in
+  *[!{{ bs.path_admission.charset }}]*{% for f in bs.path_admission.forbidden %}|{{ f }}{% endfor %}) lme_refuse RH-SEED-USAGE "{{ label }} must be a normalized path of [{{ bs.path_admission.charset }}]: ${{ var }}" ;;
+esac
+{%- endmacro -%}
+
+{#- ---- ancestry: every existing ancestor is a real dir owned by 0/us and not group/other-writable ---- -#}
+{%- macro ancestry_check(bs, var) -%}
+_a=${{ var }}
+while [ "$_a" != / ]; do
+  _a=${_a%/*}; [ -n "$_a" ] || _a=/
+  [ -e "$_a" ] || [ -L "$_a" ] || continue
+  [ ! -L "$_a" ] && [ -d "$_a" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "ancestor is not a real directory: $_a"
+  _st=$({{ x(bs, 'stat') }} -c '%u %a' -- "$_a") || lme_refuse RH-SEED-ROOT-NOT-OWNED "cannot stat ancestor $_a"
+  _o=${_st%% *}; _m=${_st#* }
+  [ "$_o" = 0 ] || [ "$_o" = "$_uid" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "ancestor $_a owned by uid $_o (allowed: 0, $_uid)"
+  _go=${_m#"${_m%??}"}
+  case "$_go" in
+    [2367]?|?[2367]) lme_refuse RH-SEED-ROOT-NOT-OWNED "ancestor $_a is group/other-writable (mode $_m; sticky directories are not excepted)" ;;
+  esac
+done
+{%- endmacro -%}
+
+{#- ---- an EXISTING root is admitted only as this seed's: real dir, resolves to itself, uid + 0700, our marker ---- -#}
+{%- macro root_existing(bs) -%}
+[ ! -L "$R" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "root is a symlink: $R"
+[ -d "$R" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "root is not a directory: $R"
+[ "$({{ x(bs, 'realpath') }} -e -- "$R")" = "$R" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "root does not resolve to itself: $R"
+[ "$({{ x(bs, 'stat') }} -c '%u %a' -- "$R")" = "$_uid 700" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "root is not uid $_uid mode 700: $R"
+[ -f "$R/{{ bs.layout.root_marker }}" ] && [ ! -L "$R/{{ bs.layout.root_marker }}" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "existing root lacks {{ bs.layout.root_marker }} (never adopted): $R"
+[ "$({{ x(bs, 'cat') }} -- "$R/{{ bs.layout.root_marker }}")" = "$_marker" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "root marker is not '$_marker': $R"
+{%- endmacro -%}
+
+{#- ---- root ownership: absent (owned, admitted parent) or carries this seed's marker, our uid, mode 0700 ---- -#}
+{%- macro root_check(bs) -%}
+_uid=$({{ x(bs, 'id') }} -u)
+_marker="lme-controller-root v1 uid=$_uid"
+{{ ancestry_check(bs, 'R') }}
+if [ -e "$R" ] || [ -L "$R" ]; then
+  {{ root_existing(bs) | indent(2) }}
+  ROOT_STATE=present
+else
+  _parent=${R%/*}; [ -n "$_parent" ] || _parent=/
+  [ "$({{ x(bs, 'realpath') }} -e -- "$_parent")" = "$_parent" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "parent does not resolve to itself: $_parent"
+  [ "$({{ x(bs, 'stat') }} -c %u -- "$_parent")" = "$_uid" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "parent not owned by uid $_uid: $_parent"
+  ROOT_STATE=absent
+fi
+{%- endmacro -%}
+
+{#- ---- budget: one transient user scope; limits read back from our own cgroup ---- -#}
+{%- macro budget_props(bs) -%}
+-p MemoryMax={{ bs.budget.memory_max_bytes | int }} -p CPUQuota={{ bs.budget.cpu_quota_percent | int }}% -p TasksMax={{ bs.budget.tasks_max | int }}
+{%- endmacro -%}
+
+{%- macro budget_enter(bs) -%}
+if [ "${LME_SEED_SCOPED:-}" != 1 ]; then
+  {{ x(bs, 'systemd-run') }} --user --scope --quiet --collect {{ budget_props(bs) }} -- {{ x(bs, 'true') }} >/dev/null 2>&1 \
+    || lme_refuse RH-SEED-BUDGET-UNAVAILABLE 'systemd-run --user --scope with the declared limits failed (no user manager or controller delegation); never run unbudgeted'
+  exec {{ x(bs, 'systemd-run') }} --user --scope --quiet --collect {{ budget_props(bs) }} -- {{ env_i(bs, {}, ['LME_SEED_SCOPED=1']) }} ${LME_CARRY_SOCK:+SSH_AUTH_SOCK="$LME_CARRY_SOCK"} {{ x(bs, 'sh') }} "$SELF" "$@"
+fi
+_cg=$({{ x(bs, 'sed') }} -n 's/^0:://p' {{ shq(bs.budget.cgroup_self) }})
+_cgd={{ shq(bs.budget.cgroup_mount) }}"$_cg"
+_mem=$({{ x(bs, 'cat') }} -- "$_cgd/memory.max" 2>/dev/null || :)
+_cpu=$({{ x(bs, 'cat') }} -- "$_cgd/cpu.max" 2>/dev/null || :)
+_pids=$({{ x(bs, 'cat') }} -- "$_cgd/pids.max" 2>/dev/null || :)
+case "$_mem" in ''|*[!0-9]*) lme_refuse RH-SEED-BUDGET-UNAVAILABLE "memory.max unreadable or unlimited in $_cgd: '$_mem'" ;; esac
+[ "$_mem" -le {{ bs.budget.memory_max_bytes | int }} ] && [ "$_mem" -gt {{ (bs.budget.memory_max_bytes | int) - 65536 }} ] || lme_refuse RH-SEED-BUDGET-UNAVAILABLE "memory.max $_mem != {{ bs.budget.memory_max_bytes | int }} (page-rounded)"
+[ "$_cpu" = {{ shq(((bs.budget.cpu_quota_percent | int) * 1000) ~ ' 100000') }} ] || lme_refuse RH-SEED-BUDGET-UNAVAILABLE "cpu.max '$_cpu' != '{{ (bs.budget.cpu_quota_percent | int) * 1000 }} 100000'"
+[ "$_pids" = {{ shq(bs.budget.tasks_max | int) }} ] || lme_refuse RH-SEED-BUDGET-UNAVAILABLE "pids.max '$_pids' != {{ bs.budget.tasks_max | int }}"
+{%- endmacro -%}
+
+{%- macro storage_check(bs, var, need=none) -%}
+{% set need = (bs.budget.free_required_bytes if need is none else need) | int %}
+_avail=$({{ x(bs, 'df') }} -B1 --output=avail -- "${{ var }}" | {{ x(bs, 'sed') }} -n '2p' | {{ x(bs, 'sed') }} 's/ //g')
+case "$_avail" in ''|*[!0-9]*) lme_refuse RH-SEED-STORAGE "free space unreadable for ${{ var }}" ;; esac
+[ "$_avail" -ge {{ need }} ] || lme_refuse RH-SEED-STORAGE "free $_avail < required {{ need }} bytes at ${{ var }}"
+{%- endmacro -%}
+
+{#- ---- S4 retention: keep the newest keep-1 seed scratch dirs (names of the declared mktemp shape) before a new one
+     is created. A matching name that is not an owned real directory refuses; other names (verify.log, receipts)
+     are neither counted nor touched. Removal is logged. Runs only under the exclusive root lock. ---- -#}
+{%- macro prune_dir(bs, dexpr, rel, keep) -%}
+_pd={{ dexpr }}; _n=0
+for _e in "$_pd"/* "$_pd"/.[!.]* "$_pd"/..?*; do
+  [ -e "$_e" ] || [ -L "$_e" ] || continue
+  _b=${_e##*/}
+  case "$_b" in {{ bs.run_retention.name_case }}) : ;; *) continue ;; esac
+  [ ! -L "$_e" ] && [ -d "$_e" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$_e")" = "$_uid" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "entry is not an owned real directory (preserved): $_e"
+  _n=$((_n + 1))
+done
+_drop=$((_n - {{ (keep | int) - 1 }}))
+for _e in "$_pd"/*; do
+  [ "$_drop" -gt 0 ] || break
+  case "${_e##*/}" in {{ bs.run_retention.name_case }}) : ;; *) continue ;; esac
+  _s=$({{ x(bs, 'du') }} -sb -- "$_e"); _s=${_s%%[!0-9]*}
+  [ "${_s:-0}" -le {{ bs.run_retention.max_bytes_each | int }} ] || printf 'lme-controller-seed: oversize %s bytes: %s\n' "$_s" "$_e" >&2
+  {{ x(bs, 'chmod') }} -R u+w -- "$_e" && {{ x(bs, 'rm') }} -rf --one-file-system -- "$_e" || lme_refuse RH-SEED-STORAGE "cannot prune $_e"
+  lme_log pruned "{{ rel }}/${_e##*/}"
+  _drop=$((_drop - 1))
+done
+{%- endmacro -%}
+
+{#- ---- artifacts: presence of EVERY file first, then EVERY digest; each refusal names all offenders ---- -#}
+{%- macro artifact_rows(bs, lock) -%}
+{% for a in (bs.artifacts + lock.packages + lock.collections) %}
+{{ a.sha256 }}  {{ a.file }}
+{% endfor %}
+{%- endmacro -%}
+
+{%- macro artifact_checks(bs, lock) -%}
+{% set rows = bs.artifacts + lock.packages + lock.collections %}
+_missing=''
+{% for a in rows %}
+[ -f "$A/"{{ shq(a.file) }} ] && [ ! -L "$A/"{{ shq(a.file) }} ] || _missing="$_missing {{ a.file }}"
+{% endfor %}
+[ -z "$_missing" ] || lme_refuse RH-SEED-ARTIFACT-MISSING "in $A:$_missing"
+_bad=''
+{% for a in rows %}
+_d=$({{ x(bs, 'sha256sum') }} -- "$A/"{{ shq(a.file) }}); [ "${_d%% *}" = {{ shq(a.sha256) }} ] || _bad="$_bad {{ a.file }}"
+{% endfor %}
+[ -z "$_bad" ] || lme_refuse RH-SEED-DIGEST-MISMATCH "declared sha256 differs:$_bad"
+[ "$({{ x(bs, 'grep') }} -c -F {{ shq('_checksum_value="' ~ bs.uv.installer_embedded_archive_sha256 ~ '"') }} -- "$A/"{{ shq((bs.artifacts | selectattr('key', 'equalto', bs.uv.installer_artifact) | first).file) }})" = 1 ] \
+  || lme_refuse RH-SEED-DIGEST-MISMATCH 'uv installer does not embed the declared archive digest exactly once'
+{%- endmacro -%}
+
+{%- macro startup_snapshot(bs, out) -%}
+{{ out }}=''
+{% for p in bs.startup_files_unchanged %}
+{{ out }}="${{ out }}|$({{ x(bs, 'stat') }} -c '%n %i %s %Y' -- "$HOME/"{{ shq(p) }} 2>/dev/null || printf 'absent %s' {{ shq(p) }})"
+{% endfor %}
+{%- endmacro -%}
+
+{#- one sorted, space-joined line from stdin -#}
+{%- macro joinsorted(bs) -%}
+LC_ALL=C {{ x(bs, 'sort') }} | {{ x(bs, 'sed') }} -n 'H;${x;s/\n/ /g;s/^ //;p;}'
+{%- endmacro -%}
+
+{#- ---- install phases (fresh generation only) ---- -#}
+{%- macro install_uv(bs) -%}
+{% set inst = (bs.artifacts | selectattr('key', 'equalto', bs.uv.installer_artifact) | first) %}
+{% set arch = (bs.artifacts | selectattr('key', 'equalto', bs.uv.archive_artifact) | first) %}
+lme_phase uv-install
+{{ env_i(bs, {'UV_NO_MODIFY_PATH': '1', 'UV_DISABLE_UPDATE': '1'}, ['TMPDIR="$G/' ~ bs.layout.gen_dirs.tmp ~ '"', 'UV_UNMANAGED_INSTALL="$G/' ~ bs.layout.gen_dirs.uv ~ '"', 'UV_DOWNLOAD_URL="file://$A"']) }} {{ x(bs, 'sh') }} "$A/"{{ shq(inst.file) }} \
+  || lme_refuse RH-SEED-INSTALL-FAILED 'official uv installer returned non-zero'
+[ "$({{ x(bs, 'find') }} "$G/{{ bs.layout.gen_dirs.uv }}" -mindepth 1 -printf '%P\n' | {{ joinsorted(bs) }})" = {{ shq(bs.uv.members | map(attribute='installed') | sort(case_sensitive=true) | join(' ')) }} ] \
+  || lme_refuse RH-SEED-IDENTITY-MISMATCH 'uv install dir holds entries other than the declared members'
+lme_phase uv-verify
+{{ x(bs, 'tar') }} -xzf "$A/"{{ shq(arch.file) }} -C "$G/{{ bs.layout.gen_dirs.verify }}/uv" --no-same-owner || lme_refuse RH-SEED-INSTALL-FAILED 'independent uv archive unpack failed'
+{% for m in bs.uv.members %}
+{{ x(bs, 'cmp') }} -s -- "$G/{{ bs.layout.gen_dirs.verify }}/uv/"{{ shq(m.archive) }} "$G/{{ bs.layout.gen_dirs.uv }}/"{{ shq(m.installed) }} || lme_refuse RH-SEED-IDENTITY-MISMATCH {{ shq('installed ' ~ m.installed ~ ' != pinned archive member ' ~ m.archive) }}
+{% endfor %}
+_v=$({{ env_i(bs, {'UV_NO_CONFIG': '1'}) }} "$G/{{ bs.layout.gen_dirs.uv }}/uv" --version 2>&1) || lme_refuse RH-SEED-IDENTITY-MISMATCH "uv --version failed: $_v"
+case "$_v" in {{ shq(bs.uv.version_prefix) }}|{{ shq(bs.uv.version_prefix) }}' '*) : ;; *) lme_refuse RH-SEED-IDENTITY-MISMATCH "uv reports '$_v'" ;; esac
+{%- endmacro -%}
+
+{%- macro install_python(bs) -%}
+{% set pa = (bs.artifacts | selectattr('key', 'equalto', bs.python.artifact) | first) %}
+{% set py = bs.python %}
+{% set tmp = '$G/' ~ bs.layout.gen_dirs.tmp %}
+lme_phase python-downloads-json
+# the ONLY download uv may resolve: one entry, file:// into the bundle artifacts, the admitted sha256
+_url="file://$A/{{ pa.file | urlencode | replace('/', '%2F') }}"
+printf '{"%s":{"arch":{"family":"%s","variant":null},"build":"%s","libc":"%s","major":%s,"minor":%s,"name":"%s","os":"%s","patch":%s,"prerelease":"","sha256":"%s","url":"%s","variant":null}}\n' \
+  {{ shq(py.download_key) }} {{ shq(py.download_entry.arch.family) }} {{ shq(py.download_entry.build) }} {{ shq(py.download_entry.libc) }} {{ shq(py.download_entry.major) }} {{ shq(py.download_entry.minor) }} {{ shq(py.download_entry.name) }} {{ shq(py.download_entry.os) }} {{ shq(py.download_entry.patch) }} {{ shq(pa.sha256) }} "$_url" \
+  > "{{ tmp }}/python-downloads.json" || lme_refuse RH-SEED-INSTALL-FAILED 'cannot write the python downloads JSON'
+lme_phase python-install
+[ ! -e "$G/{{ py.install_dir }}" ] || lme_refuse RH-SEED-INSTALL-FAILED 'interpreter install dir already exists in a fresh generation'
+{{ env_i(bs, {'UV_NO_CONFIG': '1', 'UV_PYTHON_PREFERENCE': 'only-managed', 'UV_PYTHON_DOWNLOADS': 'manual', 'UV_NO_PROGRESS': '1'}, ['TMPDIR="' ~ tmp ~ '"', 'UV_CACHE_DIR="' ~ tmp ~ '/uv-cache"', 'UV_PYTHON_CACHE_DIR="' ~ tmp ~ '/uv-python-cache"', 'UV_PYTHON_INSTALL_DIR="$G/' ~ py.install_dir ~ '"', 'UV_PYTHON_BIN_DIR="' ~ tmp ~ '/uv-python-bin"', 'UV_TOOL_DIR="' ~ tmp ~ '/uv-tool"', 'XDG_DATA_HOME="' ~ tmp ~ '/xdg-data"', 'XDG_CACHE_HOME="' ~ tmp ~ '/xdg-cache"', 'XDG_CONFIG_HOME="' ~ tmp ~ '/xdg-config"']) }} "$G/{{ bs.layout.gen_dirs.uv }}/uv" python install \
+  --no-config --no-bin --install-dir "$G/{{ py.install_dir }}" --python-downloads-json-url "{{ tmp }}/python-downloads.json" \
+  {{ shq(py.download_key) }} || lme_refuse RH-SEED-INSTALL-FAILED 'uv python install from the admitted local downloads JSON failed (no other build, no network fallback)'
+lme_phase python-verify
+# 1. the install dir holds exactly the declared key dir plus declared bookkeeping names
+for _e in "$G/{{ py.install_dir }}"/* "$G/{{ py.install_dir }}"/.[!.]* "$G/{{ py.install_dir }}"/..?*; do
+  [ -e "$_e" ] || [ -L "$_e" ] || continue
+  case "${_e##*/}" in
+    {{ py.download_key }}{% for n in py.install_dir_bookkeeping %}|{{ shq(n) }}{% endfor %}) : ;;
+    {{ shq(py.minor_link) }}) [ -L "$_e" ] && [ "$({{ x(bs, 'realpath') }} -e -- "$_e")" = "$G/{{ py.installed_rel }}" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "minor-version entry is not a link to the installed key: ${_e##*/}" ;;
+    *) lme_refuse RH-SEED-IDENTITY-MISMATCH "undeclared entry in the interpreter install dir: ${_e##*/}" ;;
+  esac
+done
+[ -d "$G/{{ py.installed_rel }}" ] && [ ! -L "$G/{{ py.installed_rel }}" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH 'uv did not install the declared key {{ py.download_key }}'
+# 2. independent unpack of the admitted archive; the ELF must be byte-equal, the trees may differ ONLY in declared uv-patched files
+{{ x(bs, 'tar') }} -xzf "$A/"{{ shq(pa.file) }} -C "$G/{{ bs.layout.gen_dirs.verify }}/pbs" --no-same-owner || lme_refuse RH-SEED-INSTALL-FAILED 'independent PBS unpack failed'
+{{ x(bs, 'cmp') }} -s -- "$G/{{ bs.layout.gen_dirs.verify }}/pbs/{{ py.archive_interpreter_rel }}" "$G/{{ py.interpreter_rel }}" || lme_refuse RH-SEED-IDENTITY-MISMATCH 'installed interpreter ELF differs from the admitted archive member'
+_dv=$({{ x(bs, 'diff') }} -r --no-dereference -q -- "$G/{{ bs.layout.gen_dirs.verify }}/pbs/{{ py.archive_top }}" "$G/{{ py.installed_rel }}" 2>&1)
+_dx=$(printf '%s\n' "$_dv" | {{ x(bs, 'grep') }} -v -x -F -e '' \
+{% for f in py.uv_patched_rel %}
+  -e "Files $G/{{ bs.layout.gen_dirs.verify }}/pbs/{{ py.archive_top }}/{{ f }} and $G/{{ py.installed_rel }}/{{ f }} differ" \
+{% endfor %}
+  || :)
+[ -z "$_dx" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "installed interpreter tree differs from the admitted archive beyond the declared uv-patched files: $_dx"
+# 3. runtime identity
+_v=$({{ env_i(bs) }} "$G/{{ py.interpreter_rel }}" -I -B -c 'import sys, platform; print(platform.python_implementation(), platform.python_version(), sys.base_prefix)' 2>&1) || lme_refuse RH-SEED-IDENTITY-MISMATCH "python identity probe failed: $_v"
+[ "$_v" = "CPython {{ py.version }} $G/{{ py.installed_rel }}" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "interpreter reports '$_v'"
+{%- endmacro -%}
+
+{%- macro install_venv(bs, lock) -%}
+lme_phase venv
+{{ env_i(bs) }} "$G/{{ bs.python.interpreter_rel }}" -I -B -m venv --without-pip "$G/{{ bs.layout.gen_dirs.venv }}" || lme_refuse RH-SEED-INSTALL-FAILED 'venv creation failed'
+{{ x(bs, 'grep') }} -q -x -F "home = $G/{{ bs.python.interpreter_dir_rel }}" -- "$G/{{ bs.layout.gen_dirs.venv }}/pyvenv.cfg" || lme_refuse RH-SEED-IDENTITY-MISMATCH 'venv home is not the pinned interpreter'
+lme_phase wheels
+{{ env_i(bs, {'UV_NO_CONFIG': '1', 'UV_OFFLINE': '1', 'UV_PYTHON_DOWNLOADS': 'never', 'PYTHONDONTWRITEBYTECODE': '1'}, ['TMPDIR="$G/' ~ bs.layout.gen_dirs.tmp ~ '"', 'UV_CACHE_DIR="$G/' ~ bs.layout.gen_dirs.tmp ~ '/uv-cache"']) }} "$G/{{ bs.layout.gen_dirs.uv }}/uv" pip install --python "$G/{{ bs.layout.gen_dirs.venv }}/bin/python" --offline --no-index --no-deps --no-build --no-cache --link-mode copy --strict \
+{% for p in lock.packages %}
+  "$A/"{{ shq(p.file) }} \
+{% endfor %}
+  || lme_refuse RH-SEED-INSTALL-FAILED 'wheel install failed'
+_inv=$({{ env_i(bs, {'UV_NO_CONFIG': '1', 'UV_OFFLINE': '1', 'UV_PYTHON_DOWNLOADS': 'never'}, ['TMPDIR="$G/' ~ bs.layout.gen_dirs.tmp ~ '"']) }} "$G/{{ bs.layout.gen_dirs.uv }}/uv" pip list --python "$G/{{ bs.layout.gen_dirs.venv }}/bin/python" --format freeze --no-cache) || lme_refuse RH-SEED-IDENTITY-MISMATCH 'uv pip list failed'
+printf '%s\n' "$_inv" > "$G/{{ bs.layout.receipts_dir }}/installed-inventory.txt"
+_norm=$(printf '%s\n' "$_inv" | {{ x(bs, 'sed') }} 'y/ABCDEFGHIJKLMNOPQRSTUVWXYZ_./abcdefghijklmnopqrstuvwxyz--/' | {{ joinsorted(bs) }})
+{% set ns = namespace(pins=[]) %}
+{% for p in lock.packages %}
+{% set ns.pins = ns.pins + [(p.name | lower | replace('_', '-') | replace('.', '-')) ~ '==' ~ p.version] %}
+{% endfor %}
+[ "$_norm" = {{ shq(ns.pins | sort(case_sensitive=true) | join(' ')) }} ] \
+  || lme_refuse RH-SEED-IDENTITY-MISMATCH "installed set != lock: $_norm"
+{%- endmacro -%}
+
+{%- macro install_collections(bs, lock) -%}
+lme_phase ansible-config
+printf '%s' {{ shq(bs.ansible_config_content) }} > "$G/{{ bs.layout.config_file }}" || lme_refuse RH-SEED-INSTALL-FAILED 'cannot write the generation ansible.cfg'
+lme_phase collections
+{{ managed_env(bs, '$G/' ~ bs.layout.gen_dirs.tmp ~ '/ansible-home', '$G/' ~ bs.layout.gen_dirs.tmp) }} "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-galaxy" collection install --offline --no-deps -p "$G/{{ bs.layout.gen_dirs.collections }}" \
+{% for c in lock.collections %}
+  "$A/"{{ shq(c.file) }} \
+{% endfor %}
+  || lme_refuse RH-SEED-INSTALL-FAILED 'collection install failed'
+[ "$({{ x(bs, 'find') }} "$G/{{ bs.layout.gen_dirs.collections }}/ansible_collections" -mindepth 2 -maxdepth 2 -type d -printf '%P\n' | {{ joinsorted(bs) }})" = {{ shq(lock.collections | map(attribute='name') | map('replace', '.', '/') | sort(case_sensitive=true) | join(' ')) }} ] \
+  || lme_refuse RH-SEED-IDENTITY-MISMATCH 'installed collections != lock'
+{% for c in lock.collections %}
+{{ x(bs, 'grep') }} -E -q {{ shq('"version": *"' ~ (c.version | replace('.', '\\.')) ~ '"') }} -- "$G/{{ bs.layout.gen_dirs.collections }}/ansible_collections/"{{ shq(c.name | replace('.', '/')) }}/MANIFEST.json || lme_refuse RH-SEED-IDENTITY-MISMATCH {{ shq(c.name ~ ' is not ' ~ c.version) }}
+{% endfor %}
+{%- endmacro -%}
+
+{#- ---- smoke (install and verify): core, interpreter, executable path AND the sealed config file ---- -#}
+{%- macro smoke(bs, ctl, home_dir, tmp_dir, out) -%}
+_s=$({{ managed_env(bs, home_dir, tmp_dir) }} "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" --version 2>&1) || lme_refuse RH-SEED-IDENTITY-MISMATCH "ansible-playbook --version failed: $_s"
+printf '%s\n' "$_s" > "{{ out }}"
+[ "$(printf '%s\n' "$_s" | {{ x(bs, 'sed') }} -n '1p')" = {{ shq('ansible-playbook [core ' ~ ctl.expect_core ~ ']') }} ] || lme_refuse RH-SEED-IDENTITY-MISMATCH 'ansible-playbook is not the declared core'
+printf '%s\n' "$_s" | {{ x(bs, 'grep') }} -q -F {{ shq('python version = ' ~ bs.python.version ~ ' ') }} || lme_refuse RH-SEED-IDENTITY-MISMATCH 'ansible-playbook does not run on the pinned interpreter'
+printf '%s\n' "$_s" | {{ x(bs, 'grep') }} -q -x -F "  executable location = $G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" || lme_refuse RH-SEED-IDENTITY-MISMATCH 'ansible-playbook executable location is not the generation venv'
+printf '%s\n' "$_s" | {{ x(bs, 'grep') }} -q -x -F "  config file = $G/{{ bs.layout.config_file }}" || lme_refuse RH-SEED-IDENTITY-MISMATCH 'ansible-playbook did not start on the sealed generation ansible.cfg'
+{%- endmacro -%}
+
+{%- macro tree_list(bs) -%}
+(cd "$G" && {{ x(bs, 'find') }} -P {{ bs.layout.sealed | join(' ') }} -printf '%y %m %s %p -> %l\n' | LC_ALL=C {{ x(bs, 'sort') }})
+{%- endmacro -%}
+
+{#- tree.sha256 members confined to the sealed names before any checksum read (SEED-04) -#}
+{%- macro tree_confine(bs) -%}
+{{ x(bs, 'grep') }} -v -E {{ shq('^[0-9a-f]{64}  (' ~ (bs.layout.sealed | map('replace', '.', '\\.') | join('|')) ~ ')(/[^/]+)*$') }} -- "$G/{{ bs.layout.receipts_dir }}/tree.sha256" >/dev/null \
+  && lme_refuse RH-SEED-GENERATION-DRIFT 'receipts/tree.sha256 names a member outside the sealed trees'
+{{ x(bs, 'grep') }} -E {{ shq('  (.*/)?\\.\\.?(/|$)') }} -- "$G/{{ bs.layout.receipts_dir }}/tree.sha256" >/dev/null \
+  && lme_refuse RH-SEED-GENERATION-DRIFT 'receipts/tree.sha256 names a . or .. segment'
+:
+{%- endmacro -%}
+
+{#- ---- verification: content (no pointer) and publication (pointer + receipt, unconditional) ---- -#}
+{%- macro verify_fns(bs, ctl) -%}
+lme_verify_content() {
+  [ -f "$G/{{ bs.layout.complete_marker }}" ] && [ ! -L "$G/{{ bs.layout.complete_marker }}" ] || lme_refuse RH-SEED-GENERATION-DRIFT "no complete generation $GEN_ID under $R"
+  [ "$({{ x(bs, 'cat') }} -- "$G/{{ bs.layout.complete_marker }}")" = "$GEN_ID" ] || lme_refuse RH-SEED-GENERATION-DRIFT "completion marker does not name $GEN_ID"
+  {{ tree_confine(bs) | indent(2) }}
+  (cd "$G" && {{ x(bs, 'sha256sum') }} --check --strict --quiet -- {{ bs.layout.receipts_dir }}/tree.sha256) >/dev/null 2>&1 || lme_refuse RH-SEED-GENERATION-DRIFT 'installed content differs from receipts/tree.sha256'
+  [ ! -L "$R/{{ bs.layout.check_dir }}" ] && [ -d "$R/{{ bs.layout.check_dir }}" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "$R/{{ bs.layout.check_dir }} is not a real directory"
+  {{ prune_dir(bs, '"$R/' ~ bs.layout.check_dir ~ '"', bs.layout.check_dir, bs.layout.check_retention.keep) | indent(2) }}
+  _chk=$({{ x(bs, 'mktemp') }} -d "$R/{{ bs.layout.check_dir }}/$UTC.XXXXXXXX") || lme_refuse RH-SEED-STORAGE "cannot create a check directory under $R"
+  {{ x(bs, 'mkdir') }} -- "$_chk/tmp" "$_chk/ansible-home" || lme_refuse RH-SEED-STORAGE "cannot create $_chk"
+  {{ tree_list(bs) }} > "$_chk/tree.list" || lme_refuse RH-SEED-GENERATION-DRIFT 'tree listing failed'
+  {{ x(bs, 'cmp') }} -s -- "$G/{{ bs.layout.receipts_dir }}/tree.list" "$_chk/tree.list" || lme_refuse RH-SEED-GENERATION-DRIFT 'installed paths, modes or links differ from receipts/tree.list'
+  {{ smoke(bs, ctl, '$_chk/ansible-home', '$_chk/tmp', '$_chk/ansible-playbook-version.txt') | indent(2) }}
+}
+lme_verify_published() {
+  [ -f "$R/{{ bs.layout.active_file }}" ] && [ ! -L "$R/{{ bs.layout.active_file }}" ] || lme_refuse RH-SEED-GENERATION-DRIFT "no active pointer $R/{{ bs.layout.active_file }}"
+  [ "$({{ x(bs, 'cat') }} -- "$R/{{ bs.layout.active_file }}")" = "$GEN_ID" ] || lme_refuse RH-SEED-GENERATION-DRIFT "active pointer does not name $GEN_ID"
+  [ -f "$R/{{ bs.toolchain_receipt }}" ] && [ ! -L "$R/{{ bs.toolchain_receipt }}" ] || lme_refuse RH-SEED-GENERATION-DRIFT "no published receipt $R/{{ bs.toolchain_receipt }}"
+  {{ x(bs, 'cmp') }} -s -- "$R/{{ bs.toolchain_receipt }}" "$G/{{ bs.layout.receipts_dir }}/toolchain.json" || lme_refuse RH-SEED-GENERATION-DRIFT 'published toolchain receipt differs from the sealed generation receipt'
+}
+lme_publish_active() {
+  _t=$({{ x(bs, 'mktemp') }} "$R/{{ bs.layout.publish_tmp_prefix }}XXXXXXXX") || lme_refuse RH-SEED-STORAGE 'cannot create a publication temp file'
+  {{ x(bs, 'cat') }} -- "$G/{{ bs.layout.receipts_dir }}/toolchain.json" > "$_t" && {{ x(bs, 'mv') }} -f -- "$_t" "$R/{{ bs.toolchain_receipt }}" || lme_refuse RH-SEED-STORAGE 'cannot publish the toolchain receipt'
+  _t=$({{ x(bs, 'mktemp') }} "$R/{{ bs.layout.publish_tmp_prefix }}XXXXXXXX") || lme_refuse RH-SEED-STORAGE 'cannot create a publication temp file'
+  printf '%s\n' "$GEN_ID" > "$_t" && {{ x(bs, 'mv') }} -f -- "$_t" "$R/{{ bs.layout.active_file }}" || lme_refuse RH-SEED-STORAGE 'cannot publish the active generation'
+}
+lme_log() { printf '%s %s %s\n' "$1" "$OP_ID" "$2" >> "$R/{{ bs.layout.operations_log }}" || lme_refuse RH-SEED-STORAGE 'cannot append the operations log'; }
+{%- endmacro -%}
+
+{#- ---- jq-readable toolchain receipt (schema bs.toolchain_receipt_schema). Paths are admitted to the declared
+     charset and owner names are POSIX account names, so no JSON escaping is needed. ---- -#}
+{%- macro toolchain_json(bs, ctl) -%}
+{% set v = '$G/' ~ bs.layout.gen_dirs.venv ~ '/bin/' %}
+printf '{"schema":"%s","generation":"%s","root":"%s","owner_uid":%s,"owner_name":"%s","generation_dir":"%s","sealed_receipt":"%s","seed_path":"%s","seed_sha256":"%s","expect_core":"%s","python_version":"%s","python_install_mode":"%s","uv_version":"%s","ansible_playbook":"%s","ansible_galaxy":"%s","ansible_inventory":"%s","ansible":"%s","python":"%s","interpreter":"%s","uv":"%s","collections_path":"%s","ansible_config":"%s","artifacts_manifest_sha256":"%s","tree_manifest_sha256":"%s","tree_list_sha256":"%s","interpreter_sha256":"%s","ansible_playbook_sha256":"%s","uv_sha256":"%s","ansible_config_sha256":"%s","operation":"%s","completed_utc":"%s"}\n' \
+  {{ shq(bs.toolchain_receipt_schema) }} "$GEN_ID" "$R" "$_uid" "$_owner" "$G" "$G/{{ bs.layout.receipts_dir }}/toolchain.json" "$SELF" "$SEED_SHA" \
+  {{ shq(ctl.expect_core) }} {{ shq(bs.python.version) }} {{ shq(bs.python.install_mode) }} {{ shq(bs.uv.version) }} \
+  "{{ v }}ansible-playbook" "{{ v }}ansible-galaxy" "{{ v }}ansible-inventory" "{{ v }}ansible" "{{ v }}python" \
+  "$G/{{ bs.python.interpreter_rel }}" "$G/{{ bs.layout.gen_dirs.uv }}/uv" "$G/{{ bs.layout.gen_dirs.collections }}" "$G/{{ bs.layout.config_file }}" \
+  "$_d_art" "$_d_tree" "$_d_list" "$_d_py" "$_d_ap" "$_d_uv" "$_d_cfg" "$OP_ID" "$UTC"
+{%- endmacro -%}
+
+{#- ---- S3: the ssh auth mode (run only; no default). agent mode carries SSH_AUTH_SOCK deliberately after
+     validating it (admitted path, a socket, owned by us); every other mode carries nothing. ---- -#}
+{%- macro ssh_auth_check(bs, sa) -%}
+LME_CARRY_SOCK=''; _ssh_args=''
+if [ "$MODE" = run ]; then
+  case "$SSH_AUTH" in
+{% for m, d in sa.modes | dictsort %}
+    {{ m }}) _ssh_args={{ shq(d.ssh_common_args) }} ;;
+{% endfor %}
+    '') lme_refuse RH-SEED-USAGE 'run needs --ssh-auth <mode> (no default): {{ sa.modes | list | sort | join(", ") }}' ;;
+    *) lme_refuse RH-SEED-AUTH "unsupported ssh auth mode: $SSH_AUTH" ;;
+  esac
+  if [ "$SSH_AUTH" = agent ]; then
+    _sock=${SSH_AUTH_SOCK:-}
+    [ -n "$_sock" ] || lme_refuse RH-SEED-AUTH 'agent mode needs SSH_AUTH_SOCK'
+    {{ path_arg_check(bs, '_sock', 'SSH_AUTH_SOCK') | indent(4) }}
+    [ -S "$_sock" ] && [ ! -L "$_sock" ] || lme_refuse RH-SEED-AUTH "SSH_AUTH_SOCK is not a socket: $_sock"
+    [ "$({{ x(bs, 'stat') }} -c %u -- "$_sock")" = "$({{ x(bs, 'id') }} -u)" ] || lme_refuse RH-SEED-AUTH "SSH_AUTH_SOCK is not owned by this account: $_sock"
+    LME_CARRY_SOCK=$_sock
+  fi
+else
+  [ -z "$SSH_AUTH" ] || lme_refuse RH-SEED-USAGE "--ssh-auth applies to run only"
+fi
+{%- endmacro -%}
+
+{#- ---- SEED2-BUNDLE-COMPLETION: apply refuses before ANY mutation unless its own directory is a complete, bound
+     package.yml bundle (exact members with modes, exact check-file names, seed line = running seed digest,
+     sha256sum --check, bundle.json binds the seed and check-file digests). ---- -#}
+{%- macro bundle_check(bs, lock) -%}
+{% set b = bs.bundle %}
+{% set rows = bs.artifacts + lock.packages + lock.collections %}
+{% set ns = namespace(members=['d 700 ' ~ b.artifacts_dir, 'f 500 ' ~ b.seed_file, 'f 400 ' ~ b.manifest_file, 'f 400 ' ~ b.checksum_file], names=[b.seed_file]) %}
+{% for a in rows %}
+{% set ns.members = ns.members + ['f 400 ' ~ b.artifacts_dir ~ '/' ~ a.file] %}
+{% set ns.names = ns.names + [b.artifacts_dir ~ '/' ~ a.file] %}
+{% endfor %}
+lme_bundle_check() {
+  _B=${SELF%/*}
+  for _f in {{ shq(b.checksum_file) }} {{ shq(b.manifest_file) }}; do
+    [ -f "$_B/$_f" ] && [ ! -L "$_B/$_f" ] || lme_refuse RH-SEED-ARTIFACT-MISSING "incomplete bundle (no $_f; package.yml publishes it last): $_B"
+  done
+  [ "$({{ x(bs, 'find') }} -P "$_B" -mindepth 1 -printf '%y %m %P\n' | {{ joinsorted(bs) }})" = {{ shq(ns.members | sort(case_sensitive=true) | join(' ')) }} ] \
+    || lme_refuse RH-SEED-ARTIFACT-MISSING "bundle members/modes are not exactly the declared set: $_B"
+  ! {{ x(bs, 'grep') }} -v -q -x -E '[0-9a-f]{64}  [A-Za-z0-9._/+-]+' -- "$_B/"{{ shq(b.checksum_file) }} \
+    || lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq(b.checksum_file ~ ' has a malformed line') }}
+  [ "$({{ x(bs, 'sed') }} -n 's/^[0-9a-f]\{64\}  //p' -- "$_B/"{{ shq(b.checksum_file) }} | {{ joinsorted(bs) }})" = {{ shq(ns.names | sort(case_sensitive=true) | join(' ')) }} ] \
+    || lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq(b.checksum_file ~ ' does not list exactly the declared members') }}
+  {{ x(bs, 'grep') }} -q -x -F "$SEED_SHA  {{ b.seed_file }}" -- "$_B/"{{ shq(b.checksum_file) }} \
+    || lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq(b.checksum_file ~ ' does not bind the running seed digest') }}
+  (cd "$_B" && {{ x(bs, 'sha256sum') }} --check --strict --quiet -- {{ shq(b.checksum_file) }}) >/dev/null 2>&1 \
+    || lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq('bundle content differs from ' ~ b.checksum_file) }}
+  _cs=$({{ x(bs, 'sha256sum') }} -- "$_B/"{{ shq(b.checksum_file) }}) || lme_refuse RH-SEED-DIGEST-MISMATCH 'cannot digest the check file'
+  _cs=${_cs%% *}
+  {{ x(bs, 'grep') }} -q -F "\"seed_sha256\": \"$SEED_SHA\"" -- "$_B/"{{ shq(b.manifest_file) }} \
+    && {{ x(bs, 'grep') }} -q -F "\"checksum_file_sha256\": \"$_cs\"" -- "$_B/"{{ shq(b.manifest_file) }} \
+    && {{ x(bs, 'grep') }} -q -F {{ shq('"schema": "' ~ b.schema ~ '"') }} -- "$_B/"{{ shq(b.manifest_file) }} \
+    || lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq(b.manifest_file ~ ' does not bind this seed, its check file and schema') }}
+}
+{%- endmacro -%}
+
+{#- ---- SEED2-PURGE-OWNERSHIP: admit an exact owned-removal inventory before ANY destruction ---- -#}
+{%- macro purge_inventory(bs) -%}
+{% set L = bs.layout %}
+{% set ci = '.' ~ L.creating_infix ~ '.' %}
+_log="$R/{{ L.operations_log }}"
+lme_recorded() {
+  [ -f "$_log" ] && [ ! -L "$_log" ] || return 1
+  {{ x(bs, 'awk') }} -v v="$1" -v o="$2" -v n="$3" '$1 == v && (o == "" || $2 == o) && (n == "" || $3 == n) { m = 1 } END { exit !m }' "$_log"
+}
+_unk=''
+for _e in "$R"/* "$R"/.[!.]* "$R"/..?*; do
+  [ -e "$_e" ] || [ -L "$_e" ] || continue
+  _b=${_e##*/}
+  if [ -L "$_e" ]; then _unk="$_unk $_b(link)"; continue; fi
+  case "$_b" in
+    {{ shq(L.root_marker) }}|{{ shq(L.operations_log) }}|{{ shq(L.active_file) }}|{{ shq(bs.toolchain_receipt) }}|{{ shq(L.publish_tmp_prefix) }}*) [ -f "$_e" ] || _unk="$_unk $_b(not-a-file)" ;;
+    {{ shq(L.generations_dir) }}|{{ shq(L.abandoned_dir) }}|{{ shq(L.check_dir) }}|{{ shq(L.run_dir) }}) [ -d "$_e" ] || _unk="$_unk $_b(not-a-dir)" ;;
+    *) _unk="$_unk $_b" ;;
+  esac
+done
+for _e in "$R/{{ L.generations_dir }}"/* "$R/{{ L.generations_dir }}"/.[!.]* "$R/{{ L.generations_dir }}"/..?*; do
+  [ -e "$_e" ] || [ -L "$_e" ] || continue
+  _b=${_e##*/}
+  [ ! -L "$_e" ] && [ -d "$_e" ] || { _unk="$_unk {{ L.generations_dir }}/$_b(not-a-dir)"; continue; }
+  case "$_b" in
+    {{ shq(ci) }}*) lme_recorded start "${_b#{{ ci }}}" '' || _unk="$_unk {{ L.generations_dir }}/$_b(unrecorded-staging)" ;;
+    *) lme_recorded start '' "$_b" || _unk="$_unk {{ L.generations_dir }}/$_b(unrecorded)" ;;
+  esac
+done
+for _e in "$R/{{ L.abandoned_dir }}"/* "$R/{{ L.abandoned_dir }}"/.[!.]* "$R/{{ L.abandoned_dir }}"/..?*; do
+  [ -e "$_e" ] || [ -L "$_e" ] || continue
+  _b=${_e##*/}
+  [ ! -L "$_e" ] && [ -d "$_e" ] && lme_recorded abandon '' "$_b" || _unk="$_unk {{ L.abandoned_dir }}/$_b(unrecorded)"
+done
+for _e in "$R/{{ L.check_dir }}"/* "$R/{{ L.check_dir }}"/.[!.]* "$R/{{ L.check_dir }}"/..?*; do
+  [ -e "$_e" ] || [ -L "$_e" ] || continue
+  _b=${_e##*/}
+  if [ -L "$_e" ]; then _unk="$_unk {{ L.check_dir }}/$_b(link)"; continue; fi
+  case "$_b" in
+    {% for f in bs.purge.check_files %}{{ shq(f) }}|{% endfor %}{{ bs.purge.check_file_case }}) [ -f "$_e" ] || _unk="$_unk {{ L.check_dir }}/$_b(not-a-file)" ;;
+    {{ bs.run_retention.name_case }}) [ -d "$_e" ] || _unk="$_unk {{ L.check_dir }}/$_b(not-a-dir)" ;;
+    *) _unk="$_unk {{ L.check_dir }}/$_b" ;;
+  esac
+done
+for _e in "$R/{{ L.run_dir }}"/* "$R/{{ L.run_dir }}"/.[!.]* "$R/{{ L.run_dir }}"/..?*; do
+  [ -e "$_e" ] || [ -L "$_e" ] || continue
+  _b=${_e##*/}
+  case "$_b" in {{ bs.run_retention.name_case }}) [ ! -L "$_e" ] && [ -d "$_e" ] && continue ;; esac
+  _unk="$_unk {{ L.run_dir }}/$_b"
+done
+[ -z "$_unk" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "purge refused before any removal; unaccounted entries (all preserved):$_unk"
+_foreign=$({{ x(bs, 'find') }} -P "$R" ! -user "$_uid" -print -quit 2>&1) || lme_refuse RH-SEED-ROOT-NOT-OWNED "cannot inventory $R: $_foreign"
+[ -z "$_foreign" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "purge refused before any removal; entry not owned by uid $_uid (all preserved): $_foreign"
+{%- endmacro -%}
+
+{#- ---- the complete seed ---- -#}
+{%- macro seed(bs, ctl, lock) -%}
+{% set ssh_auth = bs.ssh_auth %}
+#!/bin/sh
+# GENERATED by testing/remote_harness/package.yml from testing/remote_harness/templates/lme-controller-seed.sh.j2,
+# manifests/profiles/remote-harness.yml (remote_harness.controller) and {{ cmt(ctl.lock_file_rel) }}.
+# A BUILD OUTPUT in a local bundle; never committed, never hand-edited. The generation id binds this file's
+# sha256, and controller.yml refuses a receipt whose seed_sha256 is not a fresh render of the declarations.
+#
+# lme-controller-seed -- the ONE non-circular bootstrap of the managed LME toolchain: uv {{ cmt(bs.uv.version) }}
+#   (official installer, unmanaged, offline file:// base), CPython {{ cmt(bs.python.version) }} ({{ cmt(bs.python.install_mode) }},
+#   PBS {{ cmt(bs.python.pbs_release) }}), ansible-core {{ cmt(ctl.expect_core) }} and the lock's wheels/collections into
+#   <root>/{{ cmt(bs.layout.generations_dir) }}/<generation-id>. No ambient uv/python/pip/ansible, no network, never root,
+#   no shell startup edits. Artifacts come ONLY from <this file's directory>/{{ cmt(bs.bundle.artifacts_dir) }}.
+#
+# usage:
+#   lme-controller-seed.sh apply  --root <owned-root>
+#   lme-controller-seed.sh verify --root <owned-root>
+#   lme-controller-seed.sh purge  --root <owned-root> --confirm <owned-root>
+#   lme-controller-seed.sh run    --root <owned-root> --ssh-auth <mode> -- <ansible-playbook arguments>
+#   (mode: one of remote_harness.ssh_auth.modes; no default; agent mode carries a validated SSH_AUTH_SOCK)
+# Every mode runs inside the declared budget scope and holds an exclusive lock on the root (busy -> RH-SEED-BUSY).
+# apply: complete generation for THIS seed -> verify + republish (UNCHANGED); incomplete generation recorded by this
+#        seed in {{ cmt(bs.layout.operations_log) }} -> moved to {{ cmt(bs.layout.abandoned_dir) }}/ and removed, then install; unrecorded
+#        incomplete generation -> refused and preserved. Other generations (other revisions) are retained.
+# run:   verify, prune run/ and check/ to the declared retention, then exec the generation's ansible-playbook with
+#        the declared environment and the selected ssh auth mode, lock held for the whole playbook (serial per root;
+#        a nested seed call on the same root refuses BUSY at once, never waits).
+# apply refuses before any mutation unless its own directory is a complete, bound bundle (bundle.sha256 +
+#        bundle.json). purge destroys nothing unless every entry is in the owned-removal inventory.
+# exit: 0 ok; refusals print 'REFUSED <code> <detail>' on stderr with the declared status.
+set -u
+umask 077
+{{ refusal_fn(bs.refusals) }}
+lme_phase() {
+  [ -z "${PHASE_LOG:-}" ] || printf '%s\t%s\n' "$({{ x(bs, 'date') }} -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$PHASE_LOG"
+  printf 'lme-controller-seed: %s\n' "$1" >&2
+}
+LME_PINS={{ shq(pins_table(bs, ctl, lock) | trim) }}
+
+[ "$({{ x(bs, 'id') }} -u)" != 0 ] || lme_refuse RH-SEED-PRIVILEGED 'the seed never runs as root'
+case "${HOME:-}" in /*) : ;; *) lme_refuse RH-SEED-USAGE 'HOME must be an absolute path' ;; esac
+MODE=${1:-}; [ $# -gt 0 ] && shift
+R=''; CONFIRM=''; SSH_AUTH=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--root needs a value'; R=$2; shift 2 ;;
+    --confirm) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--confirm needs a value'; CONFIRM=$2; shift 2 ;;
+    --ssh-auth) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--ssh-auth needs a value'; SSH_AUTH=$2; shift 2 ;;
+    --) shift; break ;;
+    *) lme_refuse RH-SEED-USAGE "unknown argument: $1" ;;
+  esac
+done
+case "$MODE" in apply|verify|purge) [ $# -eq 0 ] || lme_refuse RH-SEED-USAGE "$MODE takes no arguments after --" ;; run) : ;; *) lme_refuse RH-SEED-USAGE 'mode must be apply, verify, purge or run' ;; esac
+[ -n "$R" ] || lme_refuse RH-SEED-USAGE '--root is required (no default)'
+{{ path_arg_check(bs, 'R', '--root') }}
+[ "$MODE" != purge ] || [ "$CONFIRM" = "$R" ] || lme_refuse RH-SEED-USAGE 'purge needs --confirm equal to --root'
+{{ ssh_auth_check(bs, ssh_auth) }}
+{{ combination_check(bs, ctl) }}
+{{ os_tool_checks(bs) }}
+{{ platform_check(bs) }}
+{{ root_check(bs) }}
+
+SELF=$({{ x(bs, 'realpath') }} -e -- "$0") || lme_refuse RH-SEED-USAGE 'cannot resolve the seed path'
+{{ path_arg_check(bs, 'SELF', 'the seed path') }}
+A="${SELF%/*}/{{ bs.bundle.artifacts_dir }}"
+case "$MODE" in
+  purge) set -- "$MODE" --root "$R" --confirm "$CONFIRM" ;;
+  run) set -- "$MODE" --root "$R" --ssh-auth "$SSH_AUTH" -- "$@" ;;
+  *) set -- "$MODE" --root "$R" -- ;;
+esac
+{{ budget_enter(bs) }}
+case "$MODE" in
+  purge) set -- ;;
+  run) shift 5; [ "${1:-}" != -- ] || shift ;;
+  *) shift 3; [ "${1:-}" != -- ] || shift ;;
+esac
+
+UTC=$({{ x(bs, 'date') }} -u +%Y%m%dT%H%M%SZ)
+OP_ID="$UTC-$$"
+SEED_SHA=$({{ x(bs, 'sha256sum') }} -- "$SELF") || lme_refuse RH-SEED-USAGE 'cannot digest the seed'
+SEED_SHA=${SEED_SHA%% *}
+GEN_ID="core{{ ctl.expect_core }}-py{{ bs.python.version }}-uv{{ bs.uv.version }}-$(printf '%.12s' "$SEED_SHA")"
+G="$R/{{ bs.layout.generations_dir }}/$GEN_ID"
+{{ verify_fns(bs, ctl) }}
+{{ bundle_check(bs, lock) }}
+
+# ---- root creation (apply only) and the operation lock (every mode) ----
+if [ "$ROOT_STATE" = absent ]; then
+  case "$MODE" in
+    purge) printf 'ABSENT %s\n' "$R"; exit 0 ;;
+    verify|run) lme_refuse RH-SEED-GENERATION-DRIFT "no root $R" ;;
+  esac
+  lme_bundle_check
+  # SEED2-EARLY-INTERRUPTION: the root becomes visible only WITH its marker (staging dir + one rename).
+  # G-SEED-ROOT-STAGING-RACE: first-root creation is serialised by a lock on the PARENT directory (fd 8; no file is
+  # created there). Every seed takes it before looking at `.<name>.creating.*`, so while it is held no live creator
+  # exists and a staging dir that is ours by shape (a real dir owned by this uid, EMPTY or holding only the marker
+  # file: a kill between mkdir and the marker write, or between the marker write and the rename) is stale and
+  # removed (G-E12-EMPTY-ROOT-STAGING: bounded); anything else is PRESERVED-UNKNOWN. The creator holds the parent
+  # lock until it holds the root lock. A second concurrent first apply therefore refuses BUSY (15) at either lock,
+  # or -- when the creator has finished -- admits the new root and applies normally (UNCHANGED for the same bundle).
+  # Only a NON-seed actor creating <root> at the same instant can still make the rename fail (8, not adopted).
+  exec 8<"$_parent" || lme_refuse RH-SEED-ROOT-NOT-OWNED "cannot open $_parent for locking"
+  {{ x(bs, 'flock') }} -n 8 || lme_refuse RH-SEED-BUSY "another seed is creating a root under $_parent"
+  _pl=1
+fi
+if [ "$ROOT_STATE" = absent ] && { [ -e "$R" ] || [ -L "$R" ]; }; then
+  # E20 (codex-001716): the root appeared while this apply waited for its turn. It is admitted exactly like an
+  # existing root (never adopted otherwise); this apply then takes the root lock like any other: BUSY while the
+  # creator still works, else a normal apply (UNCHANGED for the same bundle).
+  {{ root_existing(bs) | indent(2) }}
+  printf 'SERIALIZED-EXISTING-ROOT %s\n' "$R" >&2
+  ROOT_STATE=present
+fi
+if [ "$ROOT_STATE" = absent ]; then
+  _rb=${R##*/}
+  for _e in "$_parent/.$_rb.{{ bs.layout.creating_infix }}."*; do
+    [ -e "$_e" ] || [ -L "$_e" ] || continue
+    _m=
+    [ -L "$_e" ] || [ ! -d "$_e" ] || _m=$({{ x(bs, 'find') }} -P "$_e" -mindepth 1 -printf '%y %P\n') || _m=unreadable
+    if [ ! -L "$_e" ] && [ -d "$_e" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$_e")" = "$_uid" ] \
+       && { [ -z "$_m" ] || [ "$_m" = {{ shq('f ' ~ bs.layout.root_marker) }} ]; }; then
+      {{ x(bs, 'rm') }} -rf --one-file-system -- "$_e" || lme_refuse RH-SEED-ROOT-NOT-OWNED "cannot remove stale root staging $_e"
+      printf 'REMOVED-STALE-ROOT-STAGING %s\n' "$_e" >&2
+    else
+      printf 'PRESERVED-UNKNOWN %s\n' "$_e" >&2
+    fi
+  done
+  _rs="$_parent/.$_rb.{{ bs.layout.creating_infix }}.$OP_ID"
+  {{ x(bs, 'mkdir') }} -m 0700 -- "$_rs" || lme_refuse RH-SEED-ROOT-NOT-OWNED "cannot create $_rs"
+  printf '%s\n' "$_marker" > "$_rs/{{ bs.layout.root_marker }}" || lme_refuse RH-SEED-ROOT-NOT-OWNED "cannot write the root marker"
+  {{ x(bs, 'mv') }} -T -- "$_rs" "$R" || { {{ x(bs, 'rm') }} -rf --one-file-system -- "$_rs"; lme_refuse RH-SEED-ROOT-NOT-OWNED "$R appeared concurrently; not adopted"; }
+  [ "$({{ x(bs, 'cat') }} -- "$R/{{ bs.layout.root_marker }}")" = "$_marker" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "root marker mismatch after creation: $R"
+elif [ "$MODE" = apply ]; then
+  lme_bundle_check
+fi
+exec 9<"$R" || lme_refuse RH-SEED-ROOT-NOT-OWNED "cannot open $R for locking"
+{{ x(bs, 'flock') }} -n 9 || lme_refuse RH-SEED-BUSY "another seed operation holds the lock on $R"
+# the creator keeps the parent lock until it holds the root lock, so a serialized second apply meets BUSY, never a
+# half-initialised root
+[ -z "${_pl:-}" ] || exec 8<&-
+
+if [ "$MODE" = purge ]; then
+  {{ purge_inventory(bs) | indent(2) }}
+  {{ x(bs, 'chmod') }} -R u+w -- "$R" || lme_refuse RH-SEED-INSTALL-FAILED "cannot make $R writable"
+  {{ x(bs, 'rm') }} -rf --one-file-system -- "$R" || lme_refuse RH-SEED-INSTALL-FAILED "purge of $R failed"
+  [ ! -e "$R" ] || lme_refuse RH-SEED-INSTALL-FAILED "$R still exists after purge"
+  printf 'PURGED %s\n' "$R"
+  exit 0
+fi
+
+if [ "$MODE" = verify ] || [ "$MODE" = run ]; then
+  lme_verify_content
+  lme_verify_published
+  if [ "$MODE" = verify ]; then
+    printf '%s verify %s ok\n' "$UTC" "$GEN_ID" >> "$R/{{ bs.layout.check_dir }}/verify.log"
+    printf 'VERIFIED %s %s\n' "$GEN_ID" "$G"
+    exit 0
+  fi
+  _rd="$R/{{ bs.layout.run_dir }}"
+  [ ! -L "$_rd" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "$_rd is a link"
+  [ -d "$_rd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_rd" || lme_refuse RH-SEED-STORAGE "cannot create $_rd"
+  {{ prune_dir(bs, '"$_rd"', bs.layout.run_dir, bs.run_retention.keep) | indent(2) }}
+  {{ storage_check(bs, 'R', bs.run_retention.free_required_bytes) | indent(2) }}
+  _run=$({{ x(bs, 'mktemp') }} -d "$_rd/$UTC.XXXXXXXX") || lme_refuse RH-SEED-STORAGE "cannot create a run directory under $_rd"
+  {{ x(bs, 'mkdir') }} -- "$_run/ansible-home" "$_run/tmp" || lme_refuse RH-SEED-STORAGE "cannot create $_run"
+  # the lock (fd 9) stays held BY THIS PROCESS for the whole playbook run (no concurrent apply/purge can swap the
+  # generation); the playbook gets fd 9 CLOSED, so ssh ControlPersist masters it spawns never retain the lock
+  # Q-D12 (codex-001716): the playbook inherits THIS run's budget scope (LME_SEED_SCOPED=1); a seed it invokes
+  # re-verifies the declared limits from its own cgroup (budget enforcement kept) and then meets the root lock held
+  # by this process: a nested same-root call refuses BUSY (15) at once, never waits, never runs unbudgeted.
+  {{ managed_env(bs, '$_run/ansible-home', '$_run/tmp') }} LME_SEED_SCOPED=1 {{ ssh_auth.env_mode }}="$SSH_AUTH" ANSIBLE_SSH_COMMON_ARGS="$_ssh_args" ${LME_CARRY_SOCK:+{{ ssh_auth.modes.agent.socket_env }}="$LME_CARRY_SOCK"} "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" "$@" 9<&-
+  exit $?
+fi
+
+# ---- apply ----
+for _d in "$R/{{ bs.layout.generations_dir }}" "$R/{{ bs.layout.abandoned_dir }}" "$R/{{ bs.layout.check_dir }}"; do
+  [ -L "$_d" ] && lme_refuse RH-SEED-ROOT-NOT-OWNED "$_d is a link"
+  [ -d "$_d" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_d" || lme_refuse RH-SEED-STORAGE "cannot create $_d"
+done
+
+# SEED2-EARLY-INTERRUPTION recovery: a generation staging dir whose op recorded `start` is ours (removed); others preserved
+for _e in "$R/{{ bs.layout.generations_dir }}/.{{ bs.layout.creating_infix }}."*; do
+  [ -e "$_e" ] || [ -L "$_e" ] || continue
+  _op=${_e##*/.{{ bs.layout.creating_infix }}.}
+  case "$_op" in ''|*[!0-9TZ-]*) printf 'PRESERVED-UNKNOWN %s\n' "$_e" >&2; continue ;; esac
+  if [ ! -L "$_e" ] && [ -d "$_e" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$_e")" = "$_uid" ] \
+     && {{ x(bs, 'awk') }} -v o="$_op" '$1 == "start" && $2 == o { m = 1 } END { exit !m }' "$R/{{ bs.layout.operations_log }}" 2>/dev/null; then
+    {{ x(bs, 'chmod') }} -R u+w -- "$_e" && {{ x(bs, 'rm') }} -rf --one-file-system -- "$_e" || lme_refuse RH-SEED-INSTALL-FAILED "cannot remove stale generation staging $_e"
+    lme_log removed-staging "$_op"
+  else
+    printf 'PRESERVED-UNKNOWN %s\n' "$_e" >&2
+  fi
+done
+
+if [ -f "$G/{{ bs.layout.complete_marker }}" ]; then
+  lme_verify_content
+  lme_publish_active
+  lme_verify_published
+  lme_log unchanged "$GEN_ID"
+  printf 'UNCHANGED %s %s\n' "$GEN_ID" "$G"
+  exit 0
+fi
+
+if [ -e "$G" ] || [ -L "$G" ]; then
+  # interrupted install: replaced ONLY when this seed recorded the operation that created it
+  [ ! -L "$G" ] && [ -d "$G" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$G")" = "$_uid" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "incomplete generation is not an owned directory: $G"
+  [ -f "$G/{{ bs.layout.operation_file }}" ] && [ ! -L "$G/{{ bs.layout.operation_file }}" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "incomplete generation without {{ bs.layout.operation_file }} is preserved, not removed: $G"
+  _prev=$({{ x(bs, 'cat') }} -- "$G/{{ bs.layout.operation_file }}")
+  case "$_prev" in ''|*[!0-9TZ-]*) lme_refuse RH-SEED-ROOT-NOT-OWNED "unrecognised operation id in $G/{{ bs.layout.operation_file }}" ;; esac
+  {{ x(bs, 'grep') }} -q -x -F "start $_prev $GEN_ID" -- "$R/{{ bs.layout.operations_log }}" 2>/dev/null || lme_refuse RH-SEED-ROOT-NOT-OWNED "incomplete generation's operation $_prev is not recorded in {{ bs.layout.operations_log }}; preserved: $G"
+  _ab="$R/{{ bs.layout.abandoned_dir }}/$GEN_ID.$_prev"
+  [ ! -e "$_ab" ] && [ ! -L "$_ab" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "abandon target already exists: $_ab"
+  {{ x(bs, 'mv') }} -- "$G" "$_ab" || lme_refuse RH-SEED-INSTALL-FAILED 'cannot move the incomplete generation aside'
+  lme_log abandon "$GEN_ID.$_prev"
+  printf 'REPLACING-INCOMPLETE %s %s\n' "$GEN_ID" "$_prev" >&2
+  {{ x(bs, 'chmod') }} -R u+w -- "$_ab" && {{ x(bs, 'rm') }} -rf --one-file-system -- "$_ab" || lme_refuse RH-SEED-INSTALL-FAILED "cannot remove $_ab"
+  lme_log removed "$GEN_ID.$_prev"
+fi
+
+[ -d "$A" ] && [ ! -L "$A" ] || lme_refuse RH-SEED-ARTIFACT-MISSING "bundle artifact directory missing: $A"
+{{ artifact_checks(bs, lock) }}
+{{ storage_check(bs, 'R') }}
+
+lme_log start "$GEN_ID"
+# SEED2-EARLY-INTERRUPTION: the generation becomes visible only WITH its .operation (staging dir + one rename)
+_gs="$R/{{ bs.layout.generations_dir }}/.{{ bs.layout.creating_infix }}.$OP_ID"
+{{ x(bs, 'mkdir') }} -m 0700 -- "$_gs" || lme_refuse RH-SEED-INSTALL-FAILED "cannot create $_gs"
+printf '%s\n' "$OP_ID" > "$_gs/{{ bs.layout.operation_file }}" || lme_refuse RH-SEED-INSTALL-FAILED 'cannot record the operation'
+{{ x(bs, 'mv') }} -T -- "$_gs" "$G" || lme_refuse RH-SEED-INSTALL-FAILED "cannot publish $G"
+{{ x(bs, 'mkdir') }} -m 0700 -- "$G/{{ bs.layout.receipts_dir }}" "$G/{{ bs.layout.gen_dirs.tmp }}" "$G/{{ bs.layout.gen_dirs.verify }}" "$G/{{ bs.layout.gen_dirs.verify }}/uv" "$G/{{ bs.layout.gen_dirs.verify }}/pbs" "$G/{{ bs.layout.gen_dirs.collections }}" \
+  || lme_refuse RH-SEED-INSTALL-FAILED 'cannot create the generation layout'
+PHASE_LOG="$G/{{ bs.layout.receipts_dir }}/phases.tsv"
+lme_phase artifacts-verified
+printf '%s\n' {{ shq(artifact_rows(bs, lock) | trim) }} > "$G/{{ bs.layout.receipts_dir }}/artifacts.sha256"
+{{ startup_snapshot(bs, '_pre') }}
+{{ install_uv(bs) }}
+{{ install_python(bs) }}
+{{ install_venv(bs, lock) }}
+{{ install_collections(bs, lock) }}
+lme_phase smoke
+{{ smoke(bs, ctl, '$G/' ~ bs.layout.gen_dirs.tmp ~ '/ansible-home', '$G/' ~ bs.layout.gen_dirs.tmp, '$G/' ~ bs.layout.receipts_dir ~ '/ansible-playbook-version.txt') }}
+{{ startup_snapshot(bs, '_post') }}
+[ "$_pre" = "$_post" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH 'a shell startup or uv/ansible home file changed during install'
+
+lme_phase seal
+{{ x(bs, 'chmod') }} -R u+w -- "$G/{{ bs.layout.gen_dirs.verify }}" "$G/{{ bs.layout.gen_dirs.tmp }}" && {{ x(bs, 'rm') }} -rf --one-file-system -- "$G/{{ bs.layout.gen_dirs.verify }}" "$G/{{ bs.layout.gen_dirs.tmp }}" \
+  || lme_refuse RH-SEED-INSTALL-FAILED 'cannot remove the verification and temp trees'
+{{ x(bs, 'chmod') }} -R a-w -- {% for d in bs.layout.sealed %}"$G/{{ d }}" {% endfor %}|| lme_refuse RH-SEED-INSTALL-FAILED 'cannot seal the installed trees'
+(cd "$G" && {{ x(bs, 'find') }} -P {{ bs.layout.sealed | join(' ') }} -type f -exec {{ x(bs, 'sha256sum') }} -- '{}' '+') > "$G/{{ bs.layout.receipts_dir }}/tree.sha256" || lme_refuse RH-SEED-INSTALL-FAILED 'content manifest failed'
+{{ tree_list(bs) }} > "$G/{{ bs.layout.receipts_dir }}/tree.list" || lme_refuse RH-SEED-INSTALL-FAILED 'tree listing failed'
+{{ tree_confine(bs) }}
+(cd "$G" && {{ x(bs, 'sha256sum') }} --check --strict --quiet -- {{ bs.layout.receipts_dir }}/tree.sha256) >/dev/null || lme_refuse RH-SEED-IDENTITY-MISMATCH 'content manifest does not re-verify'
+_du=$({{ x(bs, 'du') }} -sb -- "$G"); _du=${_du%%[!0-9]*}
+[ "$_du" -le {{ bs.budget.generation_max_bytes | int }} ] || lme_refuse RH-SEED-STORAGE "generation uses $_du > {{ bs.budget.generation_max_bytes | int }} bytes"
+printf '%s\n' "$LME_PINS" > "$G/{{ bs.layout.receipts_dir }}/pins.txt"
+_owner=$({{ x(bs, 'id') }} -un) || lme_refuse RH-SEED-INSTALL-FAILED 'cannot name the owner account'
+lme_sha() { _x=$({{ x(bs, 'sha256sum') }} -- "$1") || lme_refuse RH-SEED-INSTALL-FAILED "cannot digest $1"; printf '%s' "${_x%% *}"; }
+_d_art=$(lme_sha "$G/{{ bs.layout.receipts_dir }}/artifacts.sha256") || exit $?
+_d_tree=$(lme_sha "$G/{{ bs.layout.receipts_dir }}/tree.sha256") || exit $?
+_d_list=$(lme_sha "$G/{{ bs.layout.receipts_dir }}/tree.list") || exit $?
+_d_py=$(lme_sha "$G/{{ bs.python.interpreter_rel }}") || exit $?
+_d_ap=$(lme_sha "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook") || exit $?
+_d_uv=$(lme_sha "$G/{{ bs.layout.gen_dirs.uv }}/uv") || exit $?
+_d_cfg=$(lme_sha "$G/{{ bs.layout.config_file }}") || exit $?
+( {{ toolchain_json(bs, ctl) }} ) > "$G/{{ bs.layout.receipts_dir }}/toolchain.json" || lme_refuse RH-SEED-INSTALL-FAILED 'cannot write the toolchain receipt'
+lme_phase complete
+PHASE_LOG=''
+{{ x(bs, 'chmod') }} -R a-w -- "$G/{{ bs.layout.receipts_dir }}" || lme_refuse RH-SEED-INSTALL-FAILED 'cannot seal the receipts'
+printf '%s\n' "$GEN_ID" > "$G/{{ bs.layout.complete_marker }}" || lme_refuse RH-SEED-INSTALL-FAILED 'cannot write the completion marker'
+lme_log complete "$GEN_ID"
+lme_publish_active
+lme_verify_published
+printf 'INSTALLED %s %s\n' "$GEN_ID" "$G"
+{%- endmacro -%}

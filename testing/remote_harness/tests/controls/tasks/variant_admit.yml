@@ -1,0 +1,75 @@
+---
+# admit the declaration variant of this control (rhc_c / rhc_v): the SAME candidate declarations with ONE declared
+# patch under controller.bootstrap. Route 1 (SEED-06 projection landed; not for a bytes-only variant): the patch rides
+# the override channel as an inventory var of the playbook acts. Route 2: a MAIN-staged read-only repository copy
+# rhc_variants.<id>, admitted only when its profile == the candidate profile recursively combined with the patch
+# (`profile_bytes_differ`: parsed equal, bytes different) AND every other render input recorded in bundle A's
+# manifest (source.inputs) is byte-identical. Anything else is a FAIL of this variant, never a silent fallback.
+
+- name: The declaration and its expanded patch
+  vars:
+    _id: "{{ rhc_v.declaration | default(rhc_c.declaration) }}"
+  ansible.builtin.set_fact:
+    _rhc_decl_id: "{{ _id }}"
+    _rhc_decl: "{{ rhc_decl.declarations[_id] }}"
+    _rhc_patch: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [rhc_decl.declarations[_id].patch, _rhc_t]}}) | from_json }}"
+    _rhc_route: >-
+      {{ 'override' if (rhc_deps.seed06_projection.met and not (rhc_decl.declarations[_id].profile_bytes_differ | default(false)))
+         else ('copy' if _id in (rhc_variants | default({})) else 'none') }}
+
+- name: Route 1 -- the patch through the override channel
+  ansible.builtin.set_fact:
+    _rhc_ctx: "{{ _rhc_ctx | combine({'override_inventory': {'lme_global_override': {'remote_harness': {'controller': {'bootstrap': _rhc_patch}}}}}) }}"
+  when: _rhc_route == 'override'
+
+- name: Route 2 -- admit the MAIN-staged repository copy
+  when: _rhc_route == 'copy'
+  block:
+    - name: Read both profiles and bundle A's recorded render inputs
+      vars:
+        _vrepo: "{{ rhc_variants[_rhc_decl_id] }}"
+      ansible.builtin.set_fact:
+        _rhc_vrepo: "{{ _vrepo }}"
+        _rhc_vprof_text: "{{ lookup('ansible.builtin.file', _vrepo ~ '/manifests/profiles/remote-harness.yml', rstrip=false) }}"
+        _rhc_cprof_text: "{{ lookup('ansible.builtin.file', rh_repo_root ~ '/manifests/profiles/remote-harness.yml', rstrip=false) }}"
+        _rhc_inputs: >-
+          {{ (lookup('ansible.builtin.file', rhc_base_tokens.bundle_a ~ '/' ~ rh.controller.bootstrap.bundle.manifest_file) | from_json).source.inputs
+             | map('split', '  ') | rejectattr('0', 'equalto', 'manifests/profiles/remote-harness.yml') | list }}
+
+    - name: Digest every other render input in the copy
+      ansible.builtin.stat:
+        path: "{{ _rhc_vrepo }}/{{ item.0 }}"
+        follow: false
+        checksum_algorithm: sha256
+      loop: "{{ _rhc_inputs }}"
+      loop_control:
+        label: "{{ item.0 }}"
+      register: _rhc_vin
+
+    - name: Admit the copy (profile == candidate + patch; every other input byte-identical)
+      vars:
+        _cprof: "{{ _rhc_cprof_text | from_yaml }}"
+        _want: >-
+          {{ _cprof | combine({'profile_overlay': {'lme_global': {'remote_harness': {'controller': {'bootstrap': _rhc_patch}}}}}, recursive=true) }}
+      ansible.builtin.assert:
+        that:
+          - (_rhc_vprof_text | from_yaml) == _want
+          - (_rhc_vprof_text != _rhc_cprof_text) if (_rhc_decl.profile_bytes_differ | default(false)) else true
+          - _rhc_vin.results | rejectattr('stat.exists') | list | length == 0
+          - _rhc_vin.results | selectattr('stat.islnk') | list | length == 0
+          - _rhc_vin.results | map(attribute='stat.checksum') | list == _rhc_inputs | map(attribute='1') | list
+        fail_msg: >-
+          variant {{ _rhc_decl_id }} at {{ _rhc_vrepo }} is not the candidate plus exactly the declared patch
+          (profile equal to candidate+patch: {{ (_rhc_vprof_text | from_yaml) == _want }}; inputs differing:
+          {{ _rhc_inputs | map(attribute='0') | zip(_rhc_inputs | map(attribute='1'), _rhc_vin.results | map(attribute='stat.checksum', default='ABSENT'))
+             | map('join', ' ') | reject('regex', '^\\S+ (\\S+) \\1$') | list }})
+        quiet: true
+
+    - name: Route 2 admitted -- playbook acts of repo `variant` use the copy
+      ansible.builtin.set_fact:
+        _rhc_ctx: "{{ _rhc_ctx | combine({'variant_repo': _rhc_vrepo}) }}"
+
+- name: No route -- a FAIL of this variant (plan_status should have QUEUED it)
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + ['declaration variant ' ~ _rhc_decl_id ~ ': no admitted route (SEED-06 projection or rhc_variants.' ~ _rhc_decl_id ~ ')'] }}"
+  when: _rhc_route == 'none'

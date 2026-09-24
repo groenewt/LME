@@ -1,0 +1,78 @@
+---
+# one step (rhc_s): expand tokens NOW (bound tokens such as {staging} exist only after the predicate that binds them),
+# refuse a residual token, dispatch by kind, judge (G)
+
+- name: "Expand step {{ rhc_s.id }} (twice: a variant token may itself name a token bound later, e.g. {hold_path} -> {staging})"
+  vars:
+    _once: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [rhc_s | dict2items | rejectattr('key', 'in', ['state', 'post_state']) | items2dict, _rhc_t]}}) | from_json }}"
+  ansible.builtin.set_fact:
+    _rhc_step_json: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [_once, _rhc_t]}}) }}"
+
+- name: "Parse step {{ rhc_s.id }} (state / post_state stay raw: each predicate is expanded when its turn comes)"
+  ansible.builtin.set_fact:
+    _rhc_step: "{{ (_rhc_step_json | from_json) | combine(rhc_s | dict2items | selectattr('key', 'in', ['state', 'post_state']) | items2dict) }}"
+    _rhc_step_residual: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'residual', 'args': [_rhc_step_json]}}) | from_json }}"
+    _rhc_ctx: "{{ _rhc_ctx | combine({'t': _rhc_t}) }}"
+
+- name: "A residual token in {{ rhc_s.id }} is a declaration error (never passed to an entrypoint)"
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [rhc_s.id ~ ': unresolved tokens ' ~ (_rhc_step_residual | join(' '))] }}"
+  when: _rhc_step_residual | length > 0
+
+- name: "Act {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: act.yml
+  when: _rhc_step_residual | length == 0 and _rhc_step.act is defined
+
+- name: "Wait {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: wait.yml
+  when: _rhc_step_residual | length == 0 and _rhc_step.wait is defined
+
+- name: "Kill {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: kill.yml
+  when: _rhc_step_residual | length == 0 and _rhc_step.kill is defined
+
+- name: "Freeze or thaw {{ rhc_s.id }} (the act's own transient scope; cgroup v2 freezer)"
+  ansible.builtin.include_tasks: freeze.yml
+  when: _rhc_step_residual | length == 0 and (_rhc_step.freeze is defined or _rhc_step.thaw is defined)
+
+- name: "Join {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: join.yml
+  when: _rhc_step_residual | length == 0 and _rhc_step.join is defined
+
+- name: "Ops {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: op.yml
+  loop: "{{ _rhc_step.ops | default([]) }}"
+  loop_control:
+    loop_var: rhc_o
+  when: _rhc_step_residual | length == 0 and _rhc_step.ops is defined
+
+- name: "Snapshot {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: snapshot.yml
+  vars:
+    rhc_snap: "{{ _rhc_step.snapshot }}"
+  when: _rhc_step_residual | length == 0 and _rhc_step.snapshot is defined
+
+- name: "State {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: state.yml
+  vars:
+    rhc_preds: "{{ _rhc_step.state }}"
+    rhc_preds_label: "{{ rhc_s.id }}"
+  when: _rhc_step_residual | length == 0 and _rhc_step.state is defined
+
+- name: "Budget scope {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: scope.yml
+  when: _rhc_step_residual | length == 0 and _rhc_step.sample_scope is defined
+
+- name: "Judge the pair {{ rhc_s.id }}"
+  ansible.builtin.set_fact:
+    _rhc_fail: >-
+      {{ _rhc_fail + (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_pair', 'args': [_rhc_step.judge_pair, _rhc_results_v, _rhc_ctx]}})
+         | from_json | map('regex_replace', '^', rhc_s.id ~ ': ') | list) }}
+  when: _rhc_step_residual | length == 0 and _rhc_step.judge_pair is defined
+
+- name: "Post-state {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: state.yml
+  vars:
+    rhc_preds: "{{ _rhc_step.post_state }}"
+    rhc_preds_label: "{{ rhc_s.id }} post_state"
+  when: _rhc_step_residual | length == 0 and _rhc_step.post_state is defined and _rhc_fail | length == 0

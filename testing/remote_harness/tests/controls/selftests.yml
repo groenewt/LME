@@ -1,0 +1,208 @@
+---
+# testing/remote_harness/tests/controls/selftests.yml -- self-tests of the runner's macro and regex GATES (owner: G).
+# Every judgement the runner makes goes through a pure macro in templates/macros/controls.j2; these declared inputs pin
+# what each gate must accept (negative: false) and, above all, what it must REJECT (negative: true). tasks/selftest.yml
+# evaluates them before any planning in BOTH modes; a failing self-test is a runner defect and fails the play. Each
+# gate named in `gates` needs at least one accepting and one rejecting case. The ctx below is a FIXTURE (not the
+# profile): the gates are tested for their logic, independent of the candidate's declared values.
+#
+# expect: equals <value> (parsed result) | search <regex over the JSON text> | not_search <regex>; several may combine.
+schema_version: 1
+kind: lme-remote-harness-control-selftests
+gates: [judge, judge_pair, failed_task, outcome, refusal, residual, xjson, network_lines, plan_status, coverage, diff_paths, neutrality, dig, plan_act, judge_state, unimplemented]
+ctx:
+  rh: {controller: {bootstrap: {lock: {busy: RH-SEED-BUSY}, bundle: {staging_retention: {lease: {busy_refusal: RH-STAGING-BUSY}}}}}}
+  refusals: {RH-SEED-USAGE: 2, RH-SEED-BUDGET-UNAVAILABLE: 7, RH-SEED-BUSY: 15}
+  t: {gen_id: G1, ctl: /h/c, staging_repeat: 3}
+fixtures:
+  busy: &busy {rc: 15, stdout: '', stderr: "lme-controller-seed: lock\nREFUSED RH-SEED-BUSY root held\n"}
+  busy_wrong_exit: &busy_wrong_exit {rc: 1, stdout: '', stderr: "REFUSED RH-SEED-BUSY root held\n"}
+  budget: &budget {rc: 7, stdout: '', stderr: "REFUSED RH-SEED-BUDGET-UNAVAILABLE no memory.max\n"}
+  installed: &installed {rc: 0, stdout: "lme-controller-seed: x\nINSTALLED core219-py313 /r/generations/g\n", stderr: ''}
+  pb_named: &pb_named {rc: 2, stderr: '', stdout: "TASK [Refuse missing or mismatched artifacts (offline admission; before any write)] ***\nfatal: [localhost]: FAILED! => {\"msg\": \"REFUSED RH-PACKAGE-ARTIFACT x\"}\n"}
+  pb_generic: &pb_generic {rc: 2, stderr: '', stdout: "TASK [Refuse missing or mismatched artifacts (offline admission; before any write)] ***\nfatal: [localhost]: FAILED! => {\"msg\": \"boom\"}\n"}
+  pb_reached_fetch: &pb_reached_fetch {rc: 2, stderr: '', stdout: "TASK [Fetch each absent row from its declared source] ***\nfatal: [localhost]: FAILED! => {\"msg\": \"REFUSED RH-ACQUIRE x\"}\n"}
+  killed: &killed {rc: 137, stdout: '', stderr: ''}
+  pb_staging_busy: &pb_staging_busy {rc: 2, stderr: '', stdout: "TASK [Refuse a publish that could not take the destination lock (publish fence busy; own staging and record released)] ***\nfatal: [localhost]: FAILED! => {\"msg\": \"REFUSED RH-STAGING-BUSY x\"}\n"}
+  pkg_reaped: &pkg_reaped {rc: 0, stderr: '', stdout: "REAPED-STAGING localhost ['/h/c/.bundle.staging.Labc.x1'] records []\nPUBLISHED /h/c/bundle\n"}
+  pkg_preserved: &pkg_preserved {rc: 0, stderr: '', stdout: "PRESERVED-UNKNOWN-STAGING localhost /h/c/.bundle.staging.Labc.x1\nREAPED-STAGING localhost [] records []\nPUBLISHED /h/c/bundle\n"}
+  # minimal vocabulary for the `unimplemented` gate (the TEST-NET-1 target guard; G never reaches a real host)
+  vocab_min: &vocab_min
+    control_keys: [id, steps, variants]
+    variant_keys: [id]
+    step_common: [id, expect]
+    steps: [act]
+    acts: [playbook]
+    act_keys: [kind, playbook, inventory_targets, extra_vars, limit]
+    expect: [rc]
+    predicates: []
+    ops: []
+    op_options: []
+    waits: []
+    kill_options: []
+    target_address_regex: '^192\.0\.2\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$'
+  act_ctx: &act_ctx
+    rh: {controller: {bootstrap: {base_env: {PATH: /usr/bin:/bin}}}}
+    env: {HOME: /h, XDG_RUNTIME_DIR: /run/user/1, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1/bus'}
+    tools: {env: /usr/bin/env, timeout: /usr/bin/timeout, strace: /usr/bin/strace, systemd_run: /usr/bin/systemd-run}
+    t: {ctl: /h/c}
+    timeouts: {command: 120, playbook: 900}
+    wraps: {none: []}
+    act_scope: {default: own, unit_prefix: rhc-act-}
+  deps: &deps
+    d04_cold_start_ruling: {met: true, kind: ruling, value: a, why: w}
+    r3e_acquisition_receipt: {met: false, kind: source, why: r3e}
+    bundle_a: {met: false, kind: control, control: P01, why: c}
+    main_only: {met: false, kind: main_only, why: MAIN}
+    retired_dep: {met: true, kind: source, why: landed}
+    bound_bytes_current: {met: true, kind: binding, why: current}   # G-CURRENT-BINDING: absent means QUEUED (no fallback)
+cases:
+  # ---- judge: named refusals, BUSY, kills, any_of ----
+  - {id: judge-busy-expected, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{refusal: RH-SEED-BUSY, busy_expected: true}, *busy], expect: {equals: []}}
+  - {id: judge-busy-unexpected-is-not-coverage, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc: 0, outcome: UNCHANGED}, *busy], expect: {search: 'BUSY-not-coverage'}}
+  - {id: judge-budget-unavailable-never-busy, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{refusal: RH-SEED-BUSY, busy_expected: true}, *budget], expect: {search: 'refusal RH-SEED-BUDGET-UNAVAILABLE != RH-SEED-BUSY'}}
+  - {id: judge-named-refusal-needs-declared-exit, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{refusal: RH-SEED-BUSY, busy_expected: true}, *busy_wrong_exit], expect: {search: 'exit 1 != declared RH-SEED-BUSY'}}
+  - {id: judge-named-playbook-refusal, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{rc_nonzero: true, playbook_refusal: RH-PACKAGE-ARTIFACT, refused_at: Refuse missing or mismatched artifacts}, *pb_named], expect: {equals: []}}
+  - {id: judge-generic-fatal-is-not-a-named-refusal, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc_nonzero: true, playbook_refusal: RH-PACKAGE-ARTIFACT, refused_at: Refuse missing or mismatched artifacts}, *pb_generic],
+     expect: {search: 'no \\"REFUSED RH-PACKAGE-ARTIFACT\\"'}}
+  - {id: judge-failed-before-task-reached, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc_nonzero: true, playbook_refusal: RH-ACQUIRE, failed_before_task: Fetch each absent row from its declared source}, *pb_reached_fetch],
+     expect: {search: 'reached \\"Fetch each absent row'}}
+  - {id: judge-kill-unexpected, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc_nonzero: true}, *killed], expect: {search: 'timed out or killed'}}
+  - {id: judge-outcome-and-new-generation, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{rc: 0, outcome: INSTALLED, gen: new}, *installed], expect: {equals: []}}
+  - {id: judge-generation-must-change, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc: 0, outcome: INSTALLED, gen: expected_a}, *installed], expect: {search: 'generation core219-py313 != bundle A G1'}}
+  - {id: judge-any-of-met, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{any_of: [{rc: 0}, {refusal: RH-SEED-BUSY, busy_expected: true}]}, *busy], expect: {equals: []}}
+  - {id: judge-any-of-none-met, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{any_of: [{rc: 0}, {playbook_refusal: RH-STAGING-BUDGET}]}, *pb_named], expect: {search: 'none of 2 alternatives met'}}
+  - {id: judge-stdout-regex-miss, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{stdout_regex: '^PUBLISHED '}, *installed], expect: {search: 'stdout does not match'}}
+  - {id: judge-staging-busy-unexpected-is-not-coverage, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc_nonzero: true, playbook_refusal: RH-STAGING-BUSY}, *pb_staging_busy], expect: {search: 'BUSY-not-coverage: the playbook refused RH-STAGING-BUSY'}}
+  - {id: judge-staging-busy-expected, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{rc_nonzero: true, playbook_refusal: RH-STAGING-BUSY, busy_expected: true}, *pb_staging_busy], expect: {equals: []}}
+  - {id: judge-stdout-not-regex-reaped-named-entry, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc: 0, stdout_not_regex: ['^REAPED-STAGING .*/h/c/\.bundle\.staging\.Labc\.x1']}, *pkg_reaped], expect: {search: 'stdout matches forbidden'}}
+  - {id: judge-stdout-not-regex-preserved-ok, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{rc: 0, stdout_regex: '^PRESERVED-UNKNOWN-STAGING .*/h/c/\.bundle\.staging\.Labc\.x1', stdout_not_regex: ['^REAPED-STAGING .*/h/c/\.bundle\.staging\.Labc\.x1']}, *pkg_preserved],
+     expect: {equals: []}}
+  # ---- judge_pair ----
+  - {id: pair-one-published-other-unchanged, gate: judge_pair, fn: judge_pair, with_ctx: true, negative: false,
+     args: [{steps: [a, b], one_of: {rc: 0, outcome: INSTALLED}, other_any: [{refusal: RH-SEED-BUSY}]}, {a: *installed, b: *busy}], expect: {equals: []}}
+  - {id: pair-both-met-is-not-serialized, gate: judge_pair, fn: judge_pair, with_ctx: true, negative: true,
+     args: [{steps: [a, b], one_of: {rc: 0, outcome: INSTALLED}, other_any: [{refusal: RH-SEED-BUSY}]}, {a: *installed, b: *installed}], expect: {search: 'both did'}}
+  # ---- parsers ----
+  - {id: failed-task-last-header-before-fatal, gate: failed_task, fn: failed_task, negative: false,
+     args: ["TASK [A] ***\nok: [localhost]\nTASK [Refuse B (x)] ****\nfatal: [localhost]: FAILED!\n"], expect: {equals: 'Refuse B (x)'}}
+  - {id: failed-task-none-without-fatal, gate: failed_task, fn: failed_task, negative: true,
+     args: ["TASK [A] ***\nok: [localhost]\nTASK [B] ***\nok: [localhost]\n"], expect: {equals: ''}}
+  - {id: outcome-line, gate: outcome, fn: outcome, negative: false,
+     args: ["x\nUNCHANGED core219-py313 /r/g\n"], expect: {equals: {word: UNCHANGED, arg: core219-py313}}}
+  - {id: outcome-embedded-word-is-not-an-outcome, gate: outcome, fn: outcome, negative: true,
+     args: ["seed: INSTALLED core219-py313 /r/g\nnot VERIFIED here\n"], expect: {equals: null}}
+  - {id: refusal-first-line, gate: refusal, fn: refusal, negative: false,
+     args: ["x\nREFUSED RH-SEED-USAGE a\nREFUSED RH-SEED-BUSY b\n"], expect: {equals: RH-SEED-USAGE}}
+  - {id: refusal-not-at-line-start, gate: refusal, fn: refusal, negative: true,
+     args: ["x NOT REFUSED RH-SEED-BUSY\n  REFUSED RH-SEED-BUSY\n"], expect: {equals: null}}
+  # ---- tokens ----
+  - {id: residual-token-detected, gate: residual, fn: residual, negative: true, args: ['{"a": "/h/{nope}/x"}'], expect: {equals: ['{nope}']}}
+  - {id: residual-clean, gate: residual, fn: residual, negative: false, args: ['{"a": "/h/c/x", "b": "{ not a token }"}'], expect: {equals: []}}
+  - {id: xjson-whole-int-token, gate: xjson, fn: xjson, negative: false,
+     args: [{a: '{ctl}/p', n: '{staging_repeat}'}, {ctl: /h/c, staging_repeat: 3}], expect: {equals: {a: /h/c/p, n: 3}}}
+  - {id: xjson-unknown-token-left-for-residual, gate: xjson, fn: xjson, negative: true,
+     args: [{a: '{nope}/p'}, {ctl: /h/c}], expect: {equals: {a: '{nope}/p'}}}
+  # ---- network ----
+  - {id: network-external-connect, gate: network_lines, fn: network_lines, negative: true,
+     args: ["1 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"151.101.0.1\")}, 16) = 0\n"], expect: {search: '151\.101\.0\.1'}}
+  - {id: network-loopback-only, gate: network_lines, fn: network_lines, negative: false,
+     args: ["1 connect(3, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = 0\n"], expect: {equals: []}}
+  # ---- plan_status ----
+  - {id: plan-ready-after-control, gate: plan_status, fn: plan_status, negative: false,
+     args: [{id: A, requires: [bundle_a], applies_when: {ruling: d04_cold_start_ruling, options: [a]}}, {id: base}, *deps, []], expect: {equals: {status: READY, why: [after P01]}}}
+  - {id: plan-other-option-not-applicable, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: B, requires: [bundle_a], applies_when: {ruling: d04_cold_start_ruling, options: [b]}}, {id: base}, *deps, []], expect: {search: '"status": "NOT-APPLICABLE"'}}
+  - {id: plan-unmet-source-queued, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: Q, requires: [bundle_a, r3e_acquisition_receipt]}, {id: base}, *deps, []], expect: {search: '"status": "QUEUED"'}}
+  - {id: plan-main-only-variant-queued, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: M}, {id: v, requires: [main_only]}, *deps, []], expect: {search: '"status": "QUEUED"'}}
+  - {id: plan-unimplemented, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: U}, {id: base}, *deps, [op retarget]], expect: {search: '"status": "UNIMPLEMENTED"'}}
+  - {id: plan-undeclared-dependency-queued, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: X, requires: [no_such_dependency]}, {id: base}, *deps, []], expect: {search: 'undeclared dependency'}}
+  - {id: plan-residual-never-ready, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: R, result_class: RESIDUAL, declared_only: x}, {id: base}, *deps, []], expect: {search: '"status": "RESIDUAL"'}}
+  - {id: plan-retired-not-applicable, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: Y, retire_when: retired_dep}, {id: base}, *deps, []], expect: {search: '"status": "NOT-APPLICABLE", "why": \["retired: retired_dep'}}
+  - {id: plan-retire-unmet-stays-queued, gate: plan_status, fn: plan_status, negative: false,
+     args: [{id: Y, retire_when: r3e_acquisition_receipt, requires: [bundle_a]}, {id: base}, *deps, []], expect: {equals: {status: READY, why: [after P01]}}}
+  - {id: plan-stale-binding-queues-all, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: S, retire_when: retired_dep}, {id: base}, {retired_dep: {met: true, kind: source, why: landed},
+            bound_bytes_current: {met: false, kind: binding, why: 'bound bytes changed since authoring: p 9b9987ac!=be011fae'}}, []],
+     expect: {equals: {status: QUEUED, why: ['stale-binding: bound bytes changed since authoring: p 9b9987ac!=be011fae']}}}
+  # ---- unimplemented: TEST-NET-1 target guard ----
+  - {id: unimpl-testnet-target-admitted, gate: unimplemented, fn: unimplemented, negative: false,
+     args: [{id: A, steps: [{id: s, act: {kind: playbook, playbook: target_bootstrap, limit: localhost, inventory_targets: {t1: {ansible_host: 192.0.2.10}, t2: {ansible_host: 192.0.2.11}}}}]}, *vocab_min],
+     expect: {equals: {base: []}}}
+  - {id: unimpl-real-address-refused, gate: unimplemented, fn: unimplemented, negative: true,
+     args: [{id: A, steps: [{id: s, act: {kind: playbook, playbook: target_bootstrap, inventory_targets: {t1: {ansible_host: 10.1.2.3}, t2: {}}}}]}, *vocab_min],
+     expect: {search: 't1 ansible_host is not a TEST-NET-1 address.*t2 ansible_host is not a TEST-NET-1 address'}}
+  - {id: unimpl-extra-var-repoint-refused, gate: unimplemented, fn: unimplemented, negative: true,
+     args: [{id: A, steps: [{id: s, act: {kind: playbook, playbook: target_bootstrap, extra_vars: {ansible_host: 100.64.0.1}, inventory_targets: {t1: {ansible_host: 192.0.2.10}}}}]}, *vocab_min],
+     expect: {search: 'extra var ansible_host is not a TEST-NET-1 address'}}
+  - {id: plan-binding-absent-queues, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: S}, {id: base}, {retired_dep: {met: true, kind: source, why: landed}}, []],
+     expect: {equals: {status: QUEUED, why: ['stale-binding: binding not evaluated (no bound_bytes_current dependency; no older-harness fallback)']}}}
+  - {id: plan-current-binding-ready, gate: plan_status, fn: plan_status, negative: false,
+     args: [{id: S}, {id: base}, {bound_bytes_current: {met: true, kind: binding, why: current}}, []],
+     expect: {equals: {status: READY, why: []}}}
+  # ---- coverage ----
+  - {id: coverage-known-and-uncovered, gate: coverage, fn: coverage, negative: false,
+     args: [[{id: C, cases: [A1, 'transfer:K1']}], [{prefix: '', ids: [A1, A2]}, {prefix: 'transfer:', ids: [K1]}]],
+     expect: {equals: {unknown: [], uncovered: [A2], known_count: 3}}}
+  - {id: coverage-unknown-id-detected, gate: coverage, fn: coverage, negative: true,
+     args: [[{id: C, cases: [A9, K1]}], [{prefix: '', ids: [A1]}, {prefix: 'transfer:', ids: [K1]}]], expect: {search: 'C -> A9.*C -> K1'}}
+  # ---- neutrality (Y03 helper; C1 Q-C1-NEUTRALITY predicate) ----
+  - {id: diff-paths-nested, gate: diff_paths, fn: diff_paths, negative: false,
+     args: [{a: {b: 1, c: [1, 2]}, d: x}, {a: {b: 2, c: [1, 3]}, d: x, e: 1}, ''], expect: {equals: [a.b, 'a.c[1]', e]}}
+  - {id: diff-paths-equal, gate: diff_paths, fn: diff_paths, negative: true, args: [{a: [1, {b: 2}]}, {a: [1, {b: 2}]}, ''], expect: {equals: []}}
+  - {id: neutral-except-revision, gate: neutrality, fn: neutrality, negative: false,
+     args: [{refused: null, facts: {lme_resolved_revision: r1, lme_services: {a: 1}}}, {refused: null, facts: {lme_resolved_revision: r2, lme_services: {a: 1}}}, [lme_resolved_revision]],
+     expect: {search: '"class": "NEUTRAL-EXCEPT-INTENDED"'}}
+  - {id: neutral-outside-intended-is-different, gate: neutrality, fn: neutrality, negative: true,
+     args: [{refused: null, facts: {lme_resolved_revision: r1, lme_services: {a: 1}}}, {refused: null, facts: {lme_resolved_revision: r2, lme_services: {a: 2}}}, [lme_resolved_revision]],
+     expect: {search: '"outside": \["lme_services.a"\]'}}
+  - {id: neutral-prefix-is-not-a-sibling, gate: neutrality, fn: neutrality, negative: true,
+     args: [{refused: null, facts: {lme_resolved_revision: r1}}, {refused: null, facts: {lme_resolved_revision: r2}}, [lme_resolved]],
+     expect: {search: '"class": "DIFFERENT"'}}
+  - {id: neutral-both-refused-same, gate: neutrality, fn: neutrality, negative: false,
+     args: [{refused: 'inventory required', facts: {}}, {refused: 'inventory required', facts: {}}, []], expect: {search: '"class": "NOT-REACHED-PARITY"'}}
+  - {id: neutral-one-side-refused, gate: neutrality, fn: neutrality, negative: true,
+     args: [{refused: null, facts: {a: 1}}, {refused: 'boom', facts: {}}, [a]], expect: {search: '"class": "DIFFERENT"'}}
+  # ---- dig ----
+  - {id: dig-found, gate: dig, fn: dig, negative: false, args: [{a: {b: {c: 1}}}, a.b.c], expect: {equals: {found: true, value: 1}}}
+  - {id: dig-missing, gate: dig, fn: dig, negative: true, args: [{a: {b: 1}}, a.b.c], expect: {equals: {found: false, value: null}}}
+  # ---- plan_act: every act in its own transient user scope (r3e E30), unless scope: shared ----
+  - {id: plan-act-own-scope, gate: plan_act, fn: plan_act, negative: false,
+     args: [{id: p1, act: {kind: command, argv: [/usr/bin/true]}}, *act_ctx],
+     expect: {search: '"argv": \["/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit=rhc-act-[0-9a-f]{20}\.scope", "/usr/bin/timeout", "--kill-after=10", "120s", "/usr/bin/env", "-i"'}}
+  - {id: plan-act-shared-scope-has-no-unit, gate: plan_act, fn: plan_act, negative: true,
+     args: [{id: p1, act: {kind: command, argv: [/usr/bin/true], scope: shared}}, *act_ctx],
+     expect: {search: '"argv": \["/usr/bin/timeout"', not_search: 'systemd-run'}}
+  # ---- judge_state json_all (D04 receipt rows) ----
+  - {id: state-json-all-fetched, gate: judge_state, fn: judge_state, negative: false,
+     args: [[{file: /r/acq.json, json_all: {path: rows, key: disposition, value: fetched}}],
+            [{text: '{"rows": [{"file": "a", "disposition": "fetched"}, {"file": "b", "disposition": "fetched"}]}'}], {}], expect: {equals: []}}
+  - {id: state-json-all-one-reused, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{file: /r/acq.json, json_all: {path: rows, key: disposition, value: fetched}}],
+            [{text: '{"rows": [{"file": "a", "disposition": "fetched"}, {"file": "b", "disposition": "reused"}]}'}], {}], expect: {search: '1 of 2 rows entries'}}
+  - {id: state-json-all-empty-list, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{file: /r/acq.json, json_all: {path: rows, key: disposition, value: fetched}}], [{text: '{"rows": []}'}], {}], expect: {search: 'not a non-empty list'}}

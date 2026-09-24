@@ -1,0 +1,238 @@
+---
+# testing/e2e/transfer/controls/run_controls.yml -- the GENERIC runner for the declared transfer controls
+# (controls/CASES.yml).
+#
+#   /usr/bin/ansible-playbook -i localhost, testing/e2e/transfer/controls/run_controls.yml \
+#       -e work_root=$HOME/.cache/lme-b-transfer-controls [-e '{"only": ["P01-...", ...]}']
+#
+# Each run gets a unique immutable directory <work_root>/runs/<run_id>/ (EVIDENCE-RETENTION: no earlier run's
+# verdicts, cases or receipt are ever removed or overwritten; a pre-existing run directory refuses). Each case goes
+# through run_one_case.yml and leaves <run_dir>/verdicts/<id>.json. The aggregate
+# <run_dir>/receipt.json is GREEN only if every RUNNABLE case (every kind except integration) has an ok verdict,
+# and every named neighbour is ok. Integration cases are listed in the receipt as declared_unrun.
+# Local and unprivileged: no remote host, no network, no root, no ssh (gate cases use a fake), no package manager.
+# The repository is only read. Phase cases need a clone of the declared SOURCE into <run_dir>/src (nothing is
+# committed), so they run only with -e allow_git_fixture=true (a lane that may not run git leaves it false and the
+# runner REFUSES a selection containing phase or source cases instead of skipping them).
+# SOURCE-REF (phase cases only): -e '{"source_ref": {"path": "/abs/candidate", "commit": "<40-hex>"}}' (path defaults
+# to this repository, commit to HEAD). controls/source_ref.yml admits it BEFORE any clone: CONTROLS-SOURCE-INPUT,
+# CONTROLS-SOURCE-DIRTY (tracked edits or untracked files), CONTROLS-SOURCE-MISMATCH (commit is not the source's
+# HEAD), CONTROLS-RUNNER-SOURCE-MISMATCH (these controls must run from inside the source, so B's tasks, the phase
+# driver and the route tasks are the same commit as the shipped source). Every clone (controls/source_clone.yml) is
+# `--no-checkout` + `checkout --detach <commit>` and is re-checked for commit and tree. The receipt records
+# source_ref {used, path, requested, commit, tree, clean, runner_root, git, clones, load_binding}; a phase selection
+# with used=false is refused (CONTROLS-SOURCE-VACUOUS). A dirty working tree (e.g. an uncommitted candidate)
+# therefore refuses instead of silently testing HEAD. LOAD BINDING (policy: transfer.decl.yml controls_source):
+# (A) before any clone, `ansible-config dump` with chdir = the source refuses CONTROLS-SOURCE-LOAD-PATH for a config
+# file outside the source or a non-empty project plugin/role/module path outside it (collections and the ansible
+# install are recorded); (B) every phase run asserts its loaded roots at runtime (controls/load_paths.yml, same
+# code) and its verdict carries load_paths; (C) check.yml refuses an undeclared lookup/include base
+# (TRANSFER-CHECK-LOAD-BASE). Phase driver runs use chdir = the source, the directory (A) checked.
+# Receipt schema lme.transfer.controls/v4.
+# Phase cases also need C1's registry reserved_outputs and the engine's lme_resolved.remote_harness projection.
+# OPEN cases (status: OPEN, e.g. K06/I4 per TR01) are listed separately and are never counted as covered: a
+# refusal does not cover them.
+- name: transfer controls
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    ctl_dir: "{{ playbook_dir }}"
+    transfer_dir: "{{ playbook_dir | dirname }}"
+    repo_root: "{{ playbook_dir | dirname | dirname | dirname | dirname }}"
+    only: []
+    allow_git_fixture: false
+  tasks:
+    - name: HYGIENE -- work_root absolute, outside the repository, not under /tmp
+      ansible.builtin.assert:
+        that:
+          - work_root is defined
+          - (work_root | string).startswith('/')
+          - not ((work_root | realpath) ~ '/').startswith((repo_root | realpath) ~ '/')
+          - not (work_root | realpath).startswith('/tmp/')
+        fail_msg: "work_root must be an absolute path OUTSIDE the repository and not under /tmp ({{ C.harness.work_root_rule | default('') }})"
+        quiet: true
+
+    - name: Load the declarations
+      ansible.builtin.set_fact:
+        C: "{{ lookup('ansible.builtin.file', ctl_dir ~ '/CASES.yml') | from_yaml }}"
+        T: "{{ (lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer }}"
+        me_uid: "{{ lookup('ansible.builtin.pipe', 'id -u') | int }}"
+
+    - name: Cases are well-formed (unique ids, known kinds, expectations, known neighbours)
+      ansible.builtin.assert:
+        that:
+          - C.cases | map(attribute='id') | unique | list | length == C.cases | length
+          - C.cases | map(attribute='kind') | reject('in', ['check', 'regex', 'phase', 'gate', 'scope', 'source', 'integration']) | list | length == 0
+          - C.cases | rejectattr('expect', 'defined') | list | length == 0
+          - C.cases | selectattr('neighbour', 'defined') | map(attribute='neighbour') | reject('in', C.cases | map(attribute='id') | list) | list | length == 0
+          - only | reject('in', C.cases | map(attribute='id') | list) | list | length == 0
+          - C.cases | selectattr('status', 'defined') | map(attribute='status') | reject('equalto', 'OPEN') | list | length == 0
+        fail_msg: "CASES.yml is malformed (duplicate id, unknown kind, missing expect, unknown neighbour or status), or `only` names an unknown id"
+        quiet: true
+
+    - name: Name the selected cases
+      ansible.builtin.set_fact:
+        _sel: "{{ C.cases | selectattr('id', 'in', only if (only | length > 0) else (C.cases | map(attribute='id') | list)) | list }}"
+
+    - name: Refuse phase and source cases without the git fixture (never skipped silently)
+      ansible.builtin.assert:
+        that:
+          - allow_git_fixture | bool or (_sel | selectattr('kind', 'in', ['phase', 'source']) | list | length == 0)
+        fail_msg: >-
+          phase/source cases {{ _sel | selectattr('kind', 'in', ['phase', 'source']) | map(attribute='id') | list }} need
+          the git clone fixture: pass -e allow_git_fixture=true where git is permitted, or select check/regex/gate/scope
+          cases with `only`.
+        quiet: true
+
+    - name: Whether this selection needs the declared source (phase cases)
+      ansible.builtin.set_fact:
+        _needs_src: "{{ _sel | selectattr('kind', 'equalto', 'phase') | list | length > 0 }}"
+
+    - name: Name this run (EVIDENCE-RETENTION -- every run gets its own immutable directory; nothing earlier is removed)
+      ansible.builtin.set_fact:
+        run_id: "{{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') ~ '-' ~ lookup('ansible.builtin.password', '/dev/null', chars=['0123456789abcdef'], length=8) }}"
+
+    - name: Name the run directory
+      ansible.builtin.set_fact:
+        wr: "{{ work_root }}/runs/{{ run_id }}"
+
+    - name: Stat the run directory
+      ansible.builtin.stat:
+        path: "{{ wr }}"
+        follow: false
+      register: _wrst
+
+    - name: Refuse to reuse a run directory (receipts are never overwritten)
+      ansible.builtin.assert:
+        that: [not _wrst.stat.exists]
+        fail_msg: "run directory {{ wr }} already exists; an earlier run's evidence is never overwritten"
+        quiet: true
+
+    - name: SOURCE-REF -- admit the declared source before any clone (phase selections only)
+      ansible.builtin.include_tasks: source_ref.yml
+      vars:
+        sr_decl: "{{ T }}"
+        sr_runner_root: "{{ repo_root }}"
+        sr_work_root: "{{ work_root }}"
+        sr_ansible_config: "{{ C.harness.ansible_config }}"
+      when: _needs_src | bool
+
+    - name: SOURCE-REF -- not used (no phase case selected)
+      ansible.builtin.set_fact:
+        sr: {used: false, path: null, requested: null, commit: null, tree: null, clean: null, runner_root: null, git: null,
+             clones: [], load_binding: null}
+      when: not (_needs_src | bool)
+
+    - name: SOURCE-REF -- a phase selection with an unused source is impossible (CONTROLS-SOURCE-VACUOUS)
+      ansible.builtin.assert:
+        that:
+          - (sr.used | bool) == (_needs_src | bool)
+        fail_msg: "CONTROLS-SOURCE-VACUOUS: phase cases selected={{ _needs_src }} but source_ref.used={{ sr.used }}"
+        quiet: true
+
+    - name: Work root, run root, case root and verdicts (explicit 0755 modes -- no umask-dependent ancestry)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop: ["{{ work_root }}", "{{ work_root }}/runs", "{{ wr }}", "{{ wr }}/cases", "{{ wr }}/verdicts"]
+
+    - name: The shared source clone at the admitted commit (nothing is committed; only for selected phase cases)
+      ansible.builtin.include_tasks: source_clone.yml
+      vars:
+        sr_dest: "{{ wr }}/src"
+        sr_decl: "{{ T }}"
+      when: _needs_src | bool
+
+    - name: Run the declared cases
+      ansible.builtin.include_tasks: run_one_case.yml
+      loop: "{{ _sel }}"
+      loop_control:
+        loop_var: case
+        label: "{{ case.id }}"
+
+    - name: Aggregate -- find verdicts
+      ansible.builtin.find:
+        paths: "{{ wr }}/verdicts"
+        patterns: ['*.json']
+      register: _vf
+
+    - name: Aggregate -- read verdicts
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ _vf.files | sort(attribute='path') }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: _vs
+
+    - name: Aggregate -- compute
+      ansible.builtin.set_fact:
+        _verdicts: "{{ _vs.results | map(attribute='content') | map('b64decode') | map('from_json') | list }}"
+        _ran: "{{ _sel }}"
+
+    - name: Aggregate -- every phase verdict ran on the admitted source (non-vacuity)
+      ansible.builtin.set_fact:
+        _source_vacuous: >-
+          {{ ([] if ((sr.used | bool) == (_needs_src | bool)) else ['source_ref.used != phase selected'])
+             + ([] if (not (_needs_src | bool)) or ((sr.clones | map(attribute='dir') | list) is contains(wr ~ '/src'))
+                else ['no shared clone at ' ~ wr ~ '/src'])
+             + (_verdicts | selectattr('kind', 'equalto', 'phase')
+                | rejectattr('source_commit', 'equalto', sr.commit) | map(attribute='id') | map('regex_replace', '^', 'source_commit differs: ') | list)
+             + (_verdicts | selectattr('kind', 'equalto', 'phase')
+                | rejectattr('source_tree', 'equalto', sr.tree) | map(attribute='id') | map('regex_replace', '^', 'source_tree differs: ') | list)
+             + (_verdicts | selectattr('kind', 'equalto', 'phase') | selectattr('rc', 'equalto', 0)
+                | selectattr('load_paths', 'none') | map(attribute='id') | map('regex_replace', '^', 'rc 0 without asserted load_paths: ') | list) }}
+
+    - name: Aggregate -- green only when every runnable case and its neighbour is ok
+      ansible.builtin.set_fact:
+        _receipt:
+          schema: lme.transfer.controls/v4
+          narrower_than_integration: >-
+            phase cases use the local stand-in target and the resolved `rh` (resolve_policy) without a managed
+            generation, and decl_overrides for privilege uid and owner uids; their source = source_ref.commit (a
+            local-only candidate, not the integration branch). Gate cases use a fake seed and a fake ssh; scope
+            cases feed synthetic schema-3 projections (no resolver, no transport) through the real scope task
+            files; source cases run source_ref.yml against local fixture clones. Load binding: the route files and
+            lme_manifests.py are covered by the realpath and role-path asserts only (not content-scanned); python
+            sys.path / site-packages and the ansible collections are recorded as the managed toolchain, not
+            refused. The integration cases are
+            declared and not run.
+          source_ref: "{{ sr }}"
+          source_vacuous: "{{ _source_vacuous }}"
+          open: "{{ _ran | selectattr('status', 'defined') | selectattr('status', 'equalto', 'OPEN') | map(attribute='id') | list }}"
+          covered: >-
+            {{ _verdicts | selectattr('ok') | map(attribute='id')
+               | reject('in', _ran | selectattr('status', 'defined') | selectattr('status', 'equalto', 'OPEN') | map(attribute='id') | list) | list }}
+          work_root: "{{ work_root }}"
+          run_id: "{{ run_id }}"
+          run_dir: "{{ wr }}"
+          cases: "{{ _verdicts }}"
+          declared_unrun: "{{ _ran | selectattr('kind', 'equalto', 'integration') | map(attribute='id') | list }}"
+          failed: "{{ _verdicts | rejectattr('ok') | map(attribute='id') | list }}"
+          neighbour_missing: >-
+            {{ _ran | rejectattr('kind', 'equalto', 'integration') | selectattr('neighbour', 'defined')
+               | map(attribute='neighbour') | reject('in', _verdicts | selectattr('ok') | map(attribute='id') | list) | unique | list }}
+          green: >-
+            {{ (_source_vacuous | length == 0)
+               and (_verdicts | rejectattr('ok') | list | length == 0)
+               and (_verdicts | length == (_ran | rejectattr('kind', 'equalto', 'integration') | list | length))
+               and (_ran | rejectattr('kind', 'equalto', 'integration') | selectattr('neighbour', 'defined')
+                    | map(attribute='neighbour') | reject('in', _verdicts | selectattr('ok') | map(attribute='id') | list) | list | length == 0) }}
+
+    - name: Aggregate -- write the receipt
+      ansible.builtin.copy:
+        content: "{{ _receipt | to_nice_json }}\n"
+        dest: "{{ wr }}/receipt.json"
+        mode: '0644'
+
+    - name: Aggregate -- verdict
+      ansible.builtin.assert:
+        that: [_receipt.green | bool]
+        fail_msg: >-
+          CONTROLS NOT GREEN: failed={{ _receipt.failed }} neighbour_missing={{ _receipt.neighbour_missing }}
+          {{ ('CONTROLS-SOURCE-VACUOUS: ' ~ (_receipt.source_vacuous | string)) if (_receipt.source_vacuous | length > 0) else '' }}
+        success_msg: >-
+          CONTROLS GREEN: {{ _verdicts | length }} run, {{ _receipt.covered | length }} covered,
+          {{ _receipt.open | length }} OPEN (not covered: {{ _receipt.open }}), {{ _receipt.declared_unrun | length }} integration declared-unrun

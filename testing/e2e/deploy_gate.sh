@@ -83,7 +83,7 @@
 _SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SRC:-$(cd "$_SELF_DIR/../.." && pwd)}"
 REMOTE_DIR="${REMOTE_DIR:-/root/LME-gate}"     # tree lands here on the target
-HOST=""; IP=""; GRAPHROOT=""; FLAGS=""; LABEL=""; STAGE="all"; STRICT=0
+HOST=""; IP=""; GRAPHROOT=""; FLAGS=""; LABEL=""; STAGE="all"; STRICT=0; SSH_KEY=""
 # Raw ansible extra-vars (JSON/k=v) forwarded verbatim to the target's install.sh
 # --extra-vars. In the SINGLE-NODE install path install.sh appends it as a
 # last-winning -e (install.sh:832/834). In --cluster mode it is currently DROPPED:
@@ -120,7 +120,7 @@ parse_args() {
           --extra-vars) EXTRA_VARS="$2";;
           --label) LABEL="$2";;
           --stage) STAGE="$2";;
-          --ssh-key) SSH_OPTS+=(-i "$2");;
+          --ssh-key) SSH_KEY="$2"; SSH_OPTS+=(-i "$2");;   # target: translated by the contract; SSH_OPTS: probe host only
           --src) SRC="$2";;
           --remote-dir) REMOTE_DIR="$2";;
         esac
@@ -145,7 +145,10 @@ init_gate_run() {
   mkdir -p "$LOGDIR"
   LOG="${LOG:-$LOGDIR/${LABEL}.log}"
   RESULTS="${RESULTS:-$LOGDIR/${LABEL}.gate-results.jsonl}"
-  SSH=(ssh "${SSH_OPTS[@]}" "root@${HOST}")
+  case "$STAGE" in
+    telemetry|vip-probe) ;;
+    *) resolve_target_contract || return $?;;
+  esac
 }
 
 say() {
@@ -175,37 +178,62 @@ emit_gate_result() {
 
 run_remote() { "${SSH[@]}" "$@" 2>&1 | tee -a "$LOG"; return "${PIPESTATUS[0]}"; }
 
-# ---- stage: rsync ----------------------------------------------------------
+# ---- target contract + stage rsync (declared: testing/e2e/transfer/transfer.decl.yml) -------------------
+# Residual debt: this is hand-written bash. It only STARTS the declared entry playbooks through the route's ONE
+# executor entrypoint (the bundle seed's `run`, which binds the managed generation; resolve_harness.yml refuses
+# any other) and reads their declared outputs. Required inputs, no default:
+#   LME_CONTROLLER_SEED     the bundle's lme-controller-seed.sh     LME_CONTROLLER_ROOT   its owned toolchain root
+#   LME_TRANSFER_INVENTORY  inventory (the target alias + root/owner host vars)
+#   LME_TRANSFER_STATE_DIR  owned 0700 controller state dir; outputs gate.<label>.{contract.json,ssh-argv,machine-id,transfer.json}
+#   LME_SSH_AUTH_MODE       the ONE ssh auth mode of this run (route ssh_auth.modes; `seed run --ssh-auth`); the
+#                           inventory's lme_ssh_auth_mode must equal it (a conflict refuses before any effect).
+gate_seed_run() {
+  local pb="$1" v; shift
+  for v in LME_CONTROLLER_SEED LME_CONTROLLER_ROOT LME_TRANSFER_INVENTORY LME_TRANSFER_STATE_DIR LME_SSH_AUTH_MODE; do
+    if [ -z "${!v:-}" ]; then
+      say "FATAL: $v is required (no default)"
+      emit_gate_result transfer-input true true false FAIL none "TRANSFER_INPUT_MISSING: $v"
+      return 2
+    fi
+  done
+  "$LME_CONTROLLER_SEED" run --root "$LME_CONTROLLER_ROOT" --ssh-auth "$LME_SSH_AUTH_MODE" -- -i "$LME_TRANSFER_INVENTORY" "$_SELF_DIR/transfer/$pb" \
+    -e "lme_transfer_target=$HOST" -e "lme_transfer_ssh_key=$SSH_KEY" -e "lme_transfer_state_dir=$LME_TRANSFER_STATE_DIR" \
+    -e "lme_transfer_label=$LABEL" -e "lme_transfer_remote_dir=$REMOTE_DIR" "$@" 2>&1 | tee -a "$LOG"
+  return "${PIPESTATUS[0]}"
+}
+
+# Every target stage uses ONLY this ssh argv (rendered from the one contract) and the recorded endpoint identity.
+resolve_target_contract() {
+  local out="$LME_TRANSFER_STATE_DIR/gate.$LABEL" rc
+  gate_seed_run resolve_target.yml; rc=$?
+  if [ "$rc" -ne 0 ] || ! mapfile -t SSH < "$out.ssh-argv" || ! IFS= read -r TARGET_IDENTITY < "$out.machine-id"; then
+    emit_gate_result target-contract true true true FAIL "$LOG" "TARGET_CONTRACT_REFUSED: rc=$rc (see $out.contract.json and the log)"
+    return 1
+  fi
+  emit_gate_result target-contract true true true PASS "$out.contract.json" ""
+}
+
+assert_target_identity() {
+  local id
+  id=$("${SSH[@]}" cat /etc/machine-id 2>>"$LOG") || id=""
+  if [ -z "${TARGET_IDENTITY:-}" ] || [ "$id" != "$TARGET_IDENTITY" ]; then
+    emit_gate_result target-identity true true true FAIL "$LOG" "TARGET_IDENTITY_MISMATCH: read '$id', contract '${TARGET_IDENTITY:-}'"
+    return 1
+  fi
+}
+
 do_rsync() {
-  say "RSYNC $SRC/ -> root@${HOST}:${REMOTE_DIR}/"
-  "${SSH[@]}" "mkdir -p '$REMOTE_DIR'" 2>&1 | tee -a "$LOG"
-  # rsync must exist on BOTH ends -- it spawns a remote rsync over ssh. Stock
-  # Debian-13 cloud images ship WITHOUT rsync (noble preinstalls it), so ensure
-  # it on the target before the transfer. Idempotent: no-op where present. On an
-  # AIRGAPPED target apt-get cannot reach a mirror -> nonzero rc -> this stage
-  # FAILS loudly (airgapped images must pre-bake rsync); we never mask it.
-  "${SSH[@]}" "command -v rsync >/dev/null 2>&1 || { apt-get update && apt-get install -y rsync; }" 2>&1 | tee -a "$LOG"
-  local ensure_rc="${PIPESTATUS[0]}"
-  if [ "$ensure_rc" -ne 0 ]; then say "RSYNC ensure-rsync-on-target FAILED rc=$ensure_rc"; return "$ensure_rc"; fi
-  # Keep manifests/, ansible/inventory/, filter_plugins/ (ESSENTIAL to render).
-  # Drop dev-only tooling + VM images + the env file (install.sh auto-creates it).
-  # offline_resources/ holds the airgapped bundle (~21G, built ON the target by
-  # scripts/prepare_offline.sh -- it needs network, so it CANNOT be rebuilt on an
-  # airgapped box). The controller's source tree does NOT carry it, so without this
-  # exclude `--delete` would wipe the on-target bundle and brick every subsequent
-  # offline install. An --exclude also protects the target path from --delete, so
-  # the bundle survives. Inert for networked targets (they have no such dir).
-  rsync -e "ssh ${SSH_OPTS[*]}" -a --delete \
-    --exclude='.git/' --exclude='scratchpad/' --exclude='_ocr_wt/' \
-    --exclude='.ocr/' --exclude='.cursor/' --exclude='.opencode/' \
-    --exclude='.quarantine/' --exclude='.superpowers/' \
-    --exclude='node_modules/' --exclude='__pycache__/' --exclude='*.pyc' \
-    --exclude='*.qcow2' --exclude='*.iso' --exclude='*.img' \
-    --exclude='offline_resources/' \
-    --exclude='config/lme-environment.env' \
-    "$SRC/" "root@${HOST}:${REMOTE_DIR}/" 2>&1 | tee -a "$LOG"
-  local rc="${PIPESTATUS[0]}"
-  say "RSYNC rc=$rc"; return "$rc"
+  local receipt="$LME_TRANSFER_STATE_DIR/gate.$LABEL.transfer.json" rc
+  say "TRANSFER (managed_archive, committed edition) $SRC -> contract ${SSH[*]: -1}:$REMOTE_DIR"
+  rm -f -- "$receipt"
+  gate_seed_run transfer.yml -e "lme_transfer_src=$SRC"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    emit_gate_result transfer true true true FAIL "$LOG" "TRANSFER_REFUSED: rc=$rc"; return 1
+  fi
+  if [ ! -s "$receipt" ]; then
+    emit_gate_result transfer true true true FAIL "$LOG" "TRANSFER_NO_RECEIPT: rc=0 without $receipt"; return 1
+  fi
+  emit_gate_result transfer true true true PASS "$receipt" ""
 }
 
 # ---- stage: wipe (pre teardown + self-verify; cheapest smoke) ---------------
@@ -219,6 +247,7 @@ refuse_physical_silmaril_wipe() {
 
 do_wipe() {
   refuse_physical_silmaril_wipe || return $?
+  assert_target_identity || return $?
   say "WIPE (teardown + self-verify clean) via tree's own scripts/wipe_lme.sh"
   run_remote "cd '$REMOTE_DIR' && bash scripts/wipe_lme.sh"
   local rc=$?
@@ -233,6 +262,7 @@ do_install() {
   # the outer quotes and install.sh's --extra-vars receives the JSON as one arg.
   # (JSON must be single-quote-free -- it is, being all double-quoted.)
   local ev=""; [ -n "$EXTRA_VARS" ] && ev="--extra-vars '$EXTRA_VARS'"
+  assert_target_identity || return $?
   say "INSTALL via tree's own install.sh  flags=[$FLAGS] ip=[$IP] graphroot=[$GRAPHROOT] extra_vars=[$EXTRA_VARS]"
   # Capture THIS invocation's output to its own file (LOGDIR persists across
   # runs, so grepping the shared $LOG would match a prior leg's `rescued=`).
@@ -1088,6 +1118,7 @@ REMOTE_EOF
 
 # ---- stage: health probe ---------------------------------------------------
 do_health() {
+  assert_target_identity || return $?
   say "HEALTH probe (deep gate)"
 
   # ---- controller-side: derive the expected sets from the install flags ------
@@ -1517,6 +1548,7 @@ do_telemetry() {
 # ---- stage: teardown (final) ----------------------------------------------
 do_teardown() {
   refuse_physical_silmaril_wipe || return $?
+  assert_target_identity || return $?
   say "TEARDOWN (final) via tree's own scripts/wipe_lme.sh"
   run_remote "cd '$REMOTE_DIR' && bash scripts/wipe_lme.sh"
   local rc=$?

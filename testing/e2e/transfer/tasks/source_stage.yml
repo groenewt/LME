@@ -1,0 +1,140 @@
+---
+# testing/e2e/transfer/tasks/source_stage.yml -- build and BIND the edition archive (localhost, effect).
+# One operation id; the archive lives ONLY at <pending>/<op>.tar.gz (never TMPDIR: the seed's run dir is unpruned).
+# Binding: the archive is extracted once into <pending>/<op>.d, its member set must equal the admitted committed
+# members, each extracted file's git blob id must equal the index blob (git hash-object --no-filters), and HEAD
+# must be unchanged; only then is the sha256 manifest the target verifies derived FROM THOSE BYTES.
+# Failure removes this op's exact archive + extraction and records `fail`; success keeps only the archive (removed
+# after the target readback by the place play) and records nothing yet.
+# Inputs: tr, tr_bs, tr_adapter, tr_state, tr_source, lme_transfer_src. Outputs: tr_edition.
+
+- name: Allocate the operation id
+  ansible.builtin.set_fact:
+    tr_op: >-
+      {{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') ~ '-'
+         ~ lookup('ansible.builtin.password', '/dev/null', chars=['0123456789abcdef'], length=12) }}
+
+- name: Refuse an operation id outside the declared grammar
+  ansible.builtin.assert:
+    that: [tr_op is match(tr.controller_state.op_regex)]
+    fail_msg: "TRANSFER-OP-ID: {{ tr_op }}"
+    quiet: true
+
+- name: Record the start (before the first artifact exists, so an interruption is always recoverable)
+  ansible.builtin.lineinfile:
+    path: "{{ tr_state.ledger }}"
+    line: "{{ tr.controller_state.verbs.start }} {{ tr_op }}"
+    insertafter: EOF
+    create: true
+    mode: '0600'
+
+- name: Build and bind the edition
+  block:
+    - name: Pending directory (owned, 0700)
+      ansible.builtin.file:
+        path: "{{ tr_state.pending }}"
+        state: directory
+        mode: '0700'
+
+    - name: Archive exactly the committed members (adapter managed_archive, controller module)
+      community.general.archive:
+        path: "{{ tr_source.members | map(attribute='path') | map('regex_replace', '^', lme_transfer_src ~ '/') | list }}"
+        dest: "{{ tr_state.pending }}/{{ tr_op }}.tar.gz"
+        format: "{{ tr_adapter.controller.format }}"
+        mode: '0600'
+
+    - name: Stat the archive (budget)
+      ansible.builtin.stat:
+        path: "{{ tr_state.pending }}/{{ tr_op }}.tar.gz"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: _tr_arc
+
+    - name: Refuse an archive over the declared budget
+      ansible.builtin.assert:
+        that: [_tr_arc.stat.size <= tr.controller_state.archive_max_bytes]
+        fail_msg: "TRANSFER-ARCHIVE-BUDGET: {{ _tr_arc.stat.size }} > {{ tr.controller_state.archive_max_bytes }} bytes"
+        quiet: true
+
+    - name: Extraction directory for the binding
+      ansible.builtin.file:
+        path: "{{ tr_state.pending }}/{{ tr_op }}.d"
+        state: directory
+        mode: '0700'
+
+    - name: Extract the archive as the target will
+      ansible.builtin.unarchive:
+        src: "{{ tr_state.pending }}/{{ tr_op }}.tar.gz"
+        dest: "{{ tr_state.pending }}/{{ tr_op }}.d"
+        remote_src: true
+
+    - name: Read back the archive's actual members, their blob ids and sha256, and HEAD again
+      ansible.builtin.command:
+        argv: "{{ item.argv }}"
+        chdir: "{{ tr_state.pending }}/{{ tr_op }}.d"
+        stdin: "{{ item.stdin | default(omit) }}"
+      environment:
+        LC_ALL: C
+        GIT_OPTIONAL_LOCKS: '0'
+      loop:
+        - {argv: ["{{ tr_bs.os_tools.find.path }}", ., -mindepth, '1', '!', -type, d, -printf, "%P\\n"]}
+        - {argv: ["{{ tr.source.git }}", -C, "{{ lme_transfer_src }}", hash-object, --no-filters, --stdin-paths],
+           stdin: "{{ tr_source.members | map(attribute='path') | map('regex_replace', '^', tr_state.pending ~ '/' ~ tr_op ~ '.d/') | join('\n') }}"}
+        - {argv: "{{ [tr_bs.os_tools.sha256sum.path, '--'] + (tr_source.members | map(attribute='path') | list) }}"}
+        - {argv: ["{{ tr.source.git }}", -C, "{{ lme_transfer_src }}", rev-parse, --verify, 'HEAD^{commit}']}
+      loop_control:
+        label: "{{ item.argv[:4] }}"
+      register: _tr_bind
+      changed_when: false
+
+    - name: Refuse an archive that is not exactly the committed edition (member set, blob ids, HEAD)
+      ansible.builtin.assert:
+        that:
+          - (_tr_bind.results[0].stdout_lines | sort) == (tr_source.members | map(attribute='path') | sort)
+          - _tr_bind.results[1].stdout_lines == (tr_source.members | map(attribute='blob') | list)
+          - _tr_bind.results[3].stdout == tr_source.commit
+        fail_msg: >-
+          TRANSFER-SOURCE-BINDING: the archive members/bytes are not the committed members of {{ tr_source.commit }}
+          (unexpected: {{ (_tr_bind.results[0].stdout_lines | reject('in', tr_source.members | map(attribute='path') | list) | list)[:10] }},
+          missing: {{ (tr_source.members | map(attribute='path') | reject('in', _tr_bind.results[0].stdout_lines) | list)[:10] }}),
+          or HEAD moved during the operation.
+        quiet: true
+
+    - name: Publish the bound edition (manifests derived from the archive bytes)
+      ansible.builtin.set_fact:
+        tr_edition:
+          op: "{{ tr_op }}"
+          commit: "{{ tr_source.commit }}"
+          kind: "{{ tr.source.edition_kind }}"
+          history: "{{ tr.source.history }}"
+          archive: "{{ tr_state.pending }}/{{ tr_op }}.tar.gz"
+          archive_sha256: "{{ _tr_arc.stat.checksum }}"
+          member_count: "{{ tr_source.members | length }}"
+          sha256_text: "{{ _tr_bind.results[2].stdout ~ '\n' }}"
+          modes_text: >-
+            {{ (tr_source.members | map(attribute='mode') | map('extract', tr.source.admitted_modes) | list
+                | zip(tr_source.members | map(attribute='path') | list) | map('join', ' ') | join('\n')) ~ '\n' }}
+          members_text: "{{ (tr_source.members | map(attribute='path') | join('\n')) ~ '\n' }}"
+
+    - name: Remove the binding extraction (exact path)
+      ansible.builtin.file:
+        path: "{{ tr_state.pending }}/{{ tr_op }}.d"
+        state: absent
+
+  rescue:
+    - name: Failure -- remove exactly this op's artifacts
+      ansible.builtin.file:
+        path: "{{ tr_state.pending }}/{{ tr_op }}{{ item }}"
+        state: absent
+      loop: ['.tar.gz', '.d']
+
+    - name: Failure -- record it
+      ansible.builtin.lineinfile:
+        path: "{{ tr_state.ledger }}"
+        line: "{{ tr.controller_state.verbs.fail }} {{ tr_op }}"
+        insertafter: EOF
+
+    - name: Failure -- stop (the rescue never turns a failure into success)
+      ansible.builtin.fail:
+        msg: "TRANSFER-STAGE-FAILED: {{ ansible_failed_result.msg | default('') }}"

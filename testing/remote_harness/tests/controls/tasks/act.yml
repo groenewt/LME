@@ -1,0 +1,81 @@
+---
+# run one action through its real entrypoint (_rhc_step.act). The argv is planned by the pure macro plan_act; it is
+# executed by `exec` so the entrypoint (or its scope/timeout/strace wrapper) replaces the shell and its streams go to files.
+# Every act runs in its own transient user scope (plan.unit; controls.yml act_scope) unless it declares scope: shared.
+
+- name: "Plan the action of {{ _rhc_step.id }}"
+  ansible.builtin.set_fact:
+    _rhc_plan: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_act', 'args': [_rhc_step, _rhc_ctx]}}) | from_json }}"
+
+- name: Refuse a working directory outside this run (a decoy cwd is created by the control itself)
+  ansible.builtin.assert:
+    that: _rhc_plan.cwd.startswith(rhc_run_dir ~ '/')
+    fail_msg: "cwd {{ _rhc_plan.cwd }} is outside {{ rhc_run_dir }}"
+    quiet: true
+
+- name: Ensure the default working directory exists
+  ansible.builtin.file:
+    path: "{{ _rhc_plan.cwd }}"
+    state: directory
+    mode: '0700'
+  when: _rhc_plan.cwd == _rhc_t.ctl ~ '/cwd'
+
+- name: Refuse declared targets outside RFC 5737 TEST-NET-1 at run time too (G never reaches a real host; plan-time guard in _steps_unimpl)
+  ansible.builtin.assert:
+    that:
+      - _rhc_plan.inventory_targets | dict2items | map(attribute='value') | map(attribute='ansible_host', default='') | map('string')
+        | reject('match', rhc_decl.vocabulary.target_address_regex) | list | length == 0
+      - (_rhc_plan.inventory_targets | length == 0) or (_rhc_plan.target_group | length > 0)
+    fail_msg: "inventory_targets of {{ _rhc_step.id }} name a non-TEST-NET-1 address or no target group: {{ _rhc_plan.inventory_targets }}"
+    quiet: true
+  when: _rhc_plan.inventory and (_rhc_plan.inventory_targets | default({}) | length > 0)
+
+- name: Write the inventory of a playbook-shaped action (localhost + the declared TEST-NET-1 target group; declared inputs + the step's pins)
+  ansible.builtin.copy:
+    dest: "{{ _rhc_plan.inventory }}"
+    mode: '0600'
+    content: >-
+      {{ {'all': {'hosts': {'localhost': _rhc_plan.inventory_vars}}
+                  | combine({'children': {_rhc_plan.target_group: {'hosts': _rhc_plan.inventory_targets}}}
+                            if (_rhc_plan.inventory_targets | default({}) | length > 0) else {})} | to_nice_yaml }}
+  when: _rhc_plan.inventory
+
+- name: "Run {{ _rhc_step.id }} (synchronous)"
+  ansible.builtin.shell:
+    cmd: "exec {{ _rhc_plan.argv | map('quote') | join(' ') }} </dev/null >{{ _rhc_plan.out | quote }} 2>{{ _rhc_plan.err | quote }}"
+    chdir: "{{ _rhc_plan.cwd }}"
+  environment:   # systemd-run --user reaches the owner's user manager; the entrypoint itself still runs under env -i
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
+  register: _rhc_sync
+  changed_when: true
+  failed_when: false
+  timeout: "{{ _rhc_plan.timeout_s + 60 }}"
+  when: not _rhc_plan.async
+
+- name: "Run {{ _rhc_step.id }} (in the background; joined, killed or awaited by later steps)"
+  ansible.builtin.shell:
+    cmd: "exec {{ _rhc_plan.argv | map('quote') | join(' ') }} </dev/null >{{ _rhc_plan.out | quote }} 2>{{ _rhc_plan.err | quote }}"
+    chdir: "{{ _rhc_plan.cwd }}"
+  environment:   # systemd-run --user reaches the owner's user manager; the entrypoint itself still runs under env -i
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
+  register: _rhc_async
+  changed_when: true
+  async: "{{ _rhc_plan.timeout_s + 120 }}"
+  poll: 0
+  when: _rhc_plan.async
+
+- name: Remember the background job
+  ansible.builtin.set_fact:
+    _rhc_jobs: "{{ _rhc_jobs | combine({_rhc_step.id: {'jid': _rhc_async.ansible_job_id, 'plan': _rhc_plan}}) }}"
+  when: _rhc_plan.async
+
+- name: Collect and judge the synchronous result
+  ansible.builtin.include_tasks: collect.yml
+  vars:
+    rhc_cid: "{{ _rhc_step.id }}"
+    rhc_cplan: "{{ _rhc_plan }}"
+    rhc_crc: "{{ _rhc_sync.rc | default(-1) }}"
+    rhc_cexp: "{{ _rhc_step.expect | default({}) }}"
+  when: not _rhc_plan.async

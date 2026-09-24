@@ -1,0 +1,255 @@
+---
+# testing/remote_harness/tests/controls/tasks/prepare.yml -- load, validate and plan the declared controls (G).
+# Reads only: controls.yml, the owners' case files, the resolved harness policy (rh). Writes nothing.
+
+- name: Load the control declarations and the owners' case rows
+  ansible.builtin.set_fact:
+    rhc_decl: "{{ lookup('ansible.builtin.file', rhc_controls_dir ~ '/controls.yml') | from_yaml }}"
+
+- name: Bind the case sources (ids only; rows are never copied)
+  ansible.builtin.set_fact:
+    rhc_sources: >-
+      {{ rhc_sources | default([]) + [{'prefix': item.prefix, 'file': item.file,
+          'ids': (lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ item.file) | from_yaml)[item.key] | map(attribute='id') | list}] }}
+  loop: "{{ rhc_decl.cases_refs }}"
+
+- name: Derive the run-independent tokens and the planning context
+  vars:
+    _bs: "{{ rh.controller.bootstrap }}"
+    _work: "{{ rhc_work_root | default('/PLAN/work') }}"
+    _run: "{{ rhc_run_dir | default(_work ~ '/run-PLAN') }}"
+  ansible.builtin.set_fact:
+    rhc_base_tokens:
+      work: "{{ _work }}"
+      run: "{{ _run }}"
+      shared: "{{ _run }}/shared/p/root"
+      sparent: "{{ _run }}/shared/p"
+      bundle_a: "{{ _run }}/bundles/a"
+      src: "{{ rhc_artifact_source | default('/PLAN/artifacts') }}"
+      head: "{{ rhc_head | default('PLAN-HEAD') }}"
+      uid: "{{ rhc_uid | default('PLAN-UID') }}"
+      user: "{{ lookup('ansible.builtin.env', 'USER') | default('PLAN-USER', true) }}"
+      home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
+      xdg_runtime_dir: "{{ lookup('ansible.builtin.env', 'XDG_RUNTIME_DIR') }}"
+      tmpprobe: "/tmp/lme-rhc-absent-{{ _run | basename }}"
+      fixtures: "{{ _work }}/fixtures"
+      canary: "{{ rhc_main_fixtures.root_canary | default('/PLAN/main-input-absent/canary') }}"
+      foreign: "{{ rhc_main_fixtures.foreign_parent | default('/PLAN/main-input-absent/foreign') }}"
+      builder: "{{ _bs.genesis.builder.executable }}"
+      sha256sum: "{{ _bs.os_tools.sha256sum.path }}"
+      gen_id: "{{ rhc_gen_a | default('PLAN-GENERATION-OF-BUNDLE-A') }}"
+      first_source_file: "{{ (_bs.artifacts | first).file }}"
+      envelope_memory_plus_1: "{{ (rh.controller.local_envelope.memory_bytes | int) + 1 }}"
+      run_keep: "{{ _bs.run_retention.keep | int }}"
+      run_keep_plus_3: "{{ (_bs.run_retention.keep | int) + 3 }}"
+      check_keep: "{{ _bs.layout.check_retention.keep | int }}"
+      check_keep_plus_2: "{{ (_bs.layout.check_retention.keep | int) + 2 }}"
+      staging_max: "{{ _bs.bundle.staging_retention.max_reserved_per_run | int }}"
+      staging_repeat: "{{ (_bs.bundle.staging_retention.max_reserved_per_run | int) + (_bs.bundle.staging_retention.keep | int) + 2 }}"
+      artifact_count: "{{ _bs.artifacts | length }}"
+    rhc_ctx_static:
+      rh: "{{ rh }}"
+      refusals: "{{ _bs.refusals }}"
+      vocab: "{{ rhc_decl.vocabulary }}"
+      env:
+        HOME: "{{ lookup('ansible.builtin.env', 'HOME') }}"
+        XDG_RUNTIME_DIR: "{{ lookup('ansible.builtin.env', 'XDG_RUNTIME_DIR') }}"
+        DBUS_SESSION_BUS_ADDRESS: "{{ lookup('ansible.builtin.env', 'DBUS_SESSION_BUS_ADDRESS') }}"
+      tools: "{{ rhc_decl.runner_tools }}"
+      repo: "{{ rh_repo_root }}"
+      variant_repo: ''
+      receipt: {}
+      bundles: {a: "{{ _run }}/bundles/a"}
+      entry: "{{ rhc_decl.entrypoints }}"
+      rendered_playbooks: "{{ rhc_decl.rendered_playbooks }}"
+      seed_run_auth_mode: "{{ rhc_decl.seed_run_auth_mode }}"
+      timeouts: "{{ rhc_decl.state.timeouts_s }}"
+      phases: "{{ rhc_decl.interruption.phases }}"
+      points: "{{ rhc_decl.interruption.points }}"
+      hold: "{{ rhc_decl.interruption.hold }}"
+      wraps: "{{ rhc_decl.wraps }}"
+      act_scope: "{{ rhc_decl.act_scope }}"
+      override_inventory: {}
+      pin_names: []
+
+- name: The reserved output names N01 pins -- the union of every declared source that is present (never a crash on a moved list)
+  ansible.builtin.set_fact:
+    _rhc_pin_found: >-
+      {{ (_rhc_pin_found | default([])) + [lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'dig',
+           'args': [(rh if item.kind == 'profile' else (lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ item.file, errors='ignore') | default('{}', true) | from_yaml)),
+                    item.path]}}) | from_json | combine({'source': item})] }}
+  loop: "{{ rhc_decl.pin_name_sources }}"
+  loop_control:
+    label: "{{ item.kind }} {{ item.file | default('') }} {{ item.path }}"
+
+- name: Bind the pinned names (empty when no source is present -> N01 stays QUEUED on pin_names_declared)
+  vars:
+    _names: "{{ _rhc_pin_found | selectattr('found') | map(attribute='value') | select('iterable') | reject('string') | flatten | unique | list }}"
+  ansible.builtin.set_fact:
+    rhc_ctx_static: >-
+      {{ rhc_ctx_static | combine({'pin_names': ((_names + ['rh_repo_root']
+           + (rhc_decl.controls | selectattr('sweep', 'defined') | selectattr('sweep.kind', 'equalto', 'pins') | map(attribute='per_point_expect.must_include') | flatten))
+           | unique | list) if _names else []}) }}
+    rhc_pin_sources_found: "{{ _rhc_pin_found | selectattr('found') | map(attribute='source') | list }}"
+
+- name: Refuse a non-integer count token (a whole-token value such as {run_keep} must reach the macros as a number)
+  ansible.builtin.assert:
+    that: "['envelope_memory_plus_1', 'run_keep', 'run_keep_plus_3', 'check_keep', 'check_keep_plus_2', 'staging_max', 'staging_repeat', 'artifact_count'] | map('extract', rhc_base_tokens) | reject('integer') | list | length == 0"
+    fail_msg: "count tokens are not integers: {{ rhc_base_tokens }}"
+    quiet: true
+
+- name: Evaluate every declared dependency that is not a control (source probes, MAIN inputs, MAIN-only legs)
+  vars:
+    _d: "{{ item.value }}"
+    _probe_text: >-
+      {{ lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ _d.probe.file, errors='ignore') | default('', true)
+         if (_d.kind == 'source' and _d.probe.file is defined) else '' }}
+    _path: "{{ _d.input.split('.') if _d.kind == 'input' else [] }}"
+    _top: "{{ lookup('ansible.builtin.vars', _path[0], default='') if _path else '' }}"
+    _input_value: "{{ (_top[_path[1]] | default('')) if (_path | length == 2 and _top is mapping) else (_top if _path | length == 1 else '') }}"
+    _met: >-
+      {{ (_d.kind == 'source' and not (_d.probe.never | default(false))
+          and (_d.probe.contains is not defined or _d.probe.contains in _probe_text)
+          and (_d.probe.lacks is not defined or (_probe_text | length > 0 and _d.probe.lacks not in _probe_text)))
+         or (_d.kind == 'input' and (_input_value | string | length > 0))
+         or (_d.kind == 'ruling' and (rhc_decl.rulings[_d.ruling] | default(none)) is not none) }}
+  ansible.builtin.set_fact:
+    rhc_deps: >-
+      {{ rhc_deps | default({}) | combine({item.key: {'kind': _d.kind, 'control': _d.control | default(''),
+          'met': (_met | bool) if _d.kind != 'control' else false,
+          'value': (rhc_decl.rulings[_d.ruling] | default(none)) if _d.kind == 'ruling' else none,
+          'why': _d.note | default(_d.kind ~ ' ' ~ (_d.input | default(_d.control | default(''))))}}) }}
+  loop: "{{ rhc_decl.dependencies | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Digest every bound_bytes_at_authoring path (P04/P06 -- evidence binds to the bytes the controls were authored against)
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root }}/{{ item.key }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _rhc_bb
+  loop: "{{ (rhc_decl.bound_bytes_at_authoring | default({}, true)) | dict2items | selectattr('key', 'search', '/') | list }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# codex 023332 G-CURRENT-BINDING: absent or EMPTY required binding metadata is refused like a stale digest (never READY):
+# an absent/empty/non-mapping bound_bytes_at_authoring, a path value that is not a 64-hex digest, a binding_required path
+# with no bound digest, or a consumer_interface without {revision (int), interface_sha256 (64-hex)}.
+- name: Refuse absent, empty or incomplete binding metadata (added to the stale list, which queues every control)
+  vars:
+    _bb: "{{ rhc_decl.bound_bytes_at_authoring | default(none) }}"
+    _paths: "{{ (_bb | dict2items | selectattr('key', 'search', '/') | list) if _bb is mapping else [] }}"
+    _ci: "{{ (_bb.consumer_interface | default(none)) if _bb is mapping else none }}"
+  ansible.builtin.set_fact:
+    _rhc_bb_stale: >-
+      {{ (['bound_bytes_at_authoring absent or not a mapping'] if _bb is not mapping else [])
+         + (['bound_bytes_at_authoring binds no source path'] if (_paths | length) == 0 else [])
+         + (_paths | rejectattr('value', 'match', '^[0-9a-f]{64}$') | map(attribute='key') | map('regex_replace', '$', ' authored value is not a 64-hex digest') | list)
+         + ((rhc_decl.binding_required | default([])) | reject('in', _paths | map(attribute='key') | list) | map('regex_replace', '$', ' has no bound digest (binding_required)') | list)
+         + ([] if (_ci is mapping and (_ci.revision | default('')) is integer and (_ci.interface_sha256 | default('') | string) is match('^[0-9a-f]{64}$'))
+            else ['consumer_interface binding absent or incomplete (revision int + interface_sha256 64-hex)']) }}
+
+- name: Collect every bound path whose digest is absent or differs from the authored one
+  ansible.builtin.set_fact:
+    _rhc_bb_stale: >-
+      {{ (_rhc_bb_stale | default([]))
+         + ([item.item.key ~ ' ' ~ (item.stat.checksum | default('MISSING'))[:8] ~ '!=' ~ (item.item.value | string)[:8]]
+            if (item.stat.checksum | default('MISSING')) != (item.item.value | string) else []) }}
+  loop: "{{ _rhc_bb.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: bound_bytes_current is met only when every bound path carries its authored digest (else every control is QUEUED stale-binding)
+  ansible.builtin.set_fact:
+    rhc_deps: >-
+      {{ rhc_deps | combine({'bound_bytes_current': {'kind': 'binding', 'control': '', 'value': none,
+          'met': (_rhc_bb_stale | default([])) | length == 0,
+          'why': 'bound bytes changed since authoring or binding incomplete: ' ~ ((_rhc_bb_stale | default([])) | join(', '))}}) }}
+
+- name: pin_names_declared is met when a declared pin-name source is present
+  ansible.builtin.set_fact:
+    rhc_deps: >-
+      {{ rhc_deps | combine({'pin_names_declared': rhc_deps.pin_names_declared | combine({'met': rhc_ctx_static.pin_names | length > 0,
+          'why': 'no declared pin-name source is present: ' ~ (rhc_decl.pin_name_sources | map(attribute='path') | join(' | '))}) }) }}
+
+- name: A declaration variant is available through the SEED-06 projection or an admitted MAIN-staged repository copy
+  ansible.builtin.set_fact:
+    rhc_deps: >-
+      {{ rhc_deps | combine({'variant:' ~ item.key: {'kind': 'variant',
+          'met': rhc_deps.seed06_projection.met or (item.key in (rhc_variants | default({}))),
+          'why': 'declaration variant ' ~ item.key ~ ' needs the SEED-06 projection or rhc_variants.' ~ item.key}}) }}
+  loop: "{{ rhc_decl.declarations | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Case binding -- every named case id exists in its owner's file
+  ansible.builtin.set_fact:
+    rhc_coverage: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'coverage', 'args': [rhc_decl.controls, rhc_sources]}}) | from_json }}"
+
+- name: Plan every control and variant (compile, expand tokens, check vocabulary and residual tokens)
+  vars:
+    _ctx: "{{ rhc_ctx_static | combine({'t': rhc_base_tokens}) }}"
+    _unimpl: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'unimplemented', 'args': [item, rhc_decl.vocabulary]}}) | from_json }}"
+    _compiled: >-
+      {{ (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'compile', 'args': [item, _ctx]}}) | from_json)
+         if (item.declared_only is not defined and item.static_checks is not defined) else [] }}
+  ansible.builtin.set_fact:
+    rhc_plan: >-
+      {{ rhc_plan | default([]) + [{'control': item.id, 'cases': item.cases | default([]), 'findings': item.findings | default([]),
+          'variants': (item.variants | default([{'id': 'base'}])) | map(attribute='id') | list,
+          'unimplemented': _unimpl,
+          'compiled': _compiled}] }}
+  loop: "{{ rhc_decl.controls }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Planned status per control/variant, residual tokens after expansion (bound tokens excepted)
+  vars:
+    _c: "{{ rhc_decl.controls | selectattr('id', 'equalto', item.0.control) | first }}"
+    _v: "{{ (_c.variants | default([{'id': 'base'}])) | selectattr('id', 'equalto', item.1) | first }}"
+    _cv: "{{ item.0.compiled | selectattr('variant', 'equalto', item.1) | list }}"
+    _vt: >-
+      {{ rhc_base_tokens | combine({'ctl': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1,
+                                    'parent': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/p',
+                                    'root': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/p/root',
+                                    'rootname': 'root', 'fifo': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/fifo',
+                                    'gen': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/p/root/generations/' ~ rhc_base_tokens.gen_id,
+                                    'sgen': rhc_base_tokens.run ~ '/shared/p/root/generations/' ~ rhc_base_tokens.gen_id,
+                                    'staging': 'BOUND-AT-RUN', 'reaping': 'BOUND-AT-RUN', 'sibling': 'BOUND-AT-RUN', 'vowner': rhc_base_tokens.user}) }}
+    _vt2: "{{ _vt | combine(lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [_v.tokens | default({}), _vt]}}) | from_json) }}"
+    _expanded: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [_cv, _vt2]}}) }}"
+    _status: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_status', 'args': [_c, _v, rhc_deps, item.0.unimplemented[item.1] | default([])]}}) | from_json }}"
+  ansible.builtin.set_fact:
+    rhc_planned: >-
+      {{ rhc_planned | default([]) + [{'control': item.0.control, 'variant': item.1, 'status': _status.status, 'why': _status.why,
+          'residual': lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'residual', 'args': [_expanded]}}) | from_json}] }}
+  loop: "{{ rhc_plan | subelements('variants') }}"
+  loop_control:
+    label: "{{ item.0.control }}/{{ item.1 }}"
+
+- name: Refuse declaration errors (unknown case ids, duplicate ids, undeclared dependencies or declarations, residual tokens)
+  vars:
+    _ids: "{{ rhc_decl.controls | map(attribute='id') | list }}"
+    _reqs: >-
+      {{ (rhc_decl.controls | map(attribute='requires', default=[]) | flatten)
+         + (rhc_decl.controls | map(attribute='variants', default=[]) | flatten | map(attribute='requires', default=[]) | flatten) }}
+    _decls: >-
+      {{ ((rhc_decl.controls | map(attribute='declaration', default='') | list)
+          + (rhc_decl.controls | map(attribute='variants', default=[]) | flatten | map(attribute='declaration', default='') | list)) | select | list }}
+  ansible.builtin.assert:
+    that:
+      - rhc_coverage.unknown | length == 0
+      - _ids | length == _ids | unique | length
+      - _reqs | reject('in', rhc_decl.dependencies) | list | length == 0
+      - rhc_decl.controls | selectattr('applies_when', 'defined') | map(attribute='applies_when.ruling') | reject('in', rhc_decl.dependencies) | list | length == 0
+      - rhc_decl.dependencies | dict2items | selectattr('value.kind', 'equalto', 'ruling') | map(attribute='value.ruling') | reject('in', rhc_decl.rulings) | list | length == 0
+      - _decls | reject('in', rhc_decl.declarations) | list | length == 0
+      - rhc_planned | selectattr('residual') | list | length == 0
+    fail_msg: >-
+      DECLARATION ERROR: unknown case ids {{ rhc_coverage.unknown }}; duplicate control ids
+      {{ _ids | difference(_ids | unique) }}; undeclared dependencies {{ _reqs | reject('in', rhc_decl.dependencies) | unique | list }};
+      undeclared declarations {{ _decls | reject('in', rhc_decl.declarations) | unique | list }};
+      residual tokens {{ rhc_planned | selectattr('residual') | map(attribute='control') | zip(rhc_planned | selectattr('residual') | map(attribute='residual')) | list }}
+    quiet: true

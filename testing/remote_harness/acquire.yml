@@ -1,0 +1,207 @@
+---
+# testing/remote_harness/acquire.yml -- declared ACQUISITION route (codex-tick127 genesis: acquisition/admission
+# route + missing-dependency handling). MAIN runs it; it is the ONLY network-permitted stage of the bootstrap.
+#
+#   ansible-playbook -i <operator inventory> testing/remote_harness/acquire.yml
+# localhost host vars (inputs, no defaults): rh_artifact_source = an EXISTING directory owned by the invoking account;
+# rh_acquisition_receipt (genesis.acquisition.receipt_var) = the receipt file path, OUTSIDE the store, in an existing
+# owned directory.
+#
+# Runs on the declared builder only (tasks/admit_builder.yml). For every declared artifact row
+# (controller.bootstrap.artifacts + the lock's packages and collections):
+#   EVERY row must declare `url` (present or not): a row without a declared source refuses before any fetch, so the
+#   declared mechanism alone can always carry a COLD acquisition (codex-000010: no manual placement by MAIN);
+#   a lock row's url must end in its exact `file` name (the lock records the tick112 URLs verbatim)
+#   present with the declared sha256            -> REUSED, not fetched (content-addressed: the digest is the lock's /
+#                                                  profile's declared sha256, never the file's own claim)
+#   present with another digest                 -> refused (never overwritten)
+#   absent                                      -> FETCHED by ansible.builtin.get_url from that exact URL, checksum-
+#                                                  pinned (2.19.11: download into the module tmpdir, sha256 checked
+#                                                  BEFORE atomic_move into the store, temp removed on mismatch)
+# A non-empty store is admitted (warm reapply is idempotent). Q-D04-COLD-START (codex-tick138, option (a)): the
+# store's entries are listed BEFORE any fetch; after the fetch every row is re-verified and ONE JSON receipt is written
+# OUTSIDE the store (so the store snapshot is untouched) recording store_empty_before, store_entries_before,
+# store_foreign_entries and, per row, file / declared url / declared sha256 / observed disposition (fetched | reused).
+# Cold qualification is store_empty_before AND every row fetched -- a warm or manually prefilled store cannot produce
+# it. Stdout marker: ACQUIRED ...; refusal: RH-ACQUIRE.
+# Nothing else is downloaded and nothing is executed. package.yml then admits the directory offline.
+- name: Acquire the declared bootstrap artifacts (sha256-pinned, declared sources only)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
+
+    - name: Bind the effective controller connection before any effect (local, localhost, no become; r3g)
+      ansible.builtin.include_tasks: tasks/admit_controller.yml
+
+    - name: Resolve the harness policy through the engine
+      ansible.builtin.include_tasks: tasks/resolve_policy.yml
+
+    - name: Admit exactly the declared builder (GENESIS)
+      ansible.builtin.include_tasks: tasks/admit_builder.yml
+
+    - name: Admit the artifact source path (the ONE path-admission rule; no default)
+      ansible.builtin.assert:
+        that:
+          - rh_artifact_source is defined and rh_artifact_source is string
+          - rh_artifact_source is match(rh.controller.bootstrap.path_admission.regex)
+          - rh_artifact_source is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+          - rh_acquisition_receipt is defined and rh_acquisition_receipt is string
+          - rh_acquisition_receipt is match(rh.controller.bootstrap.path_admission.regex)
+          - rh_acquisition_receipt is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+          - not (rh_acquisition_receipt ~ '/').startswith(rh_artifact_source ~ '/')
+        fail_msg: >-
+          REFUSED RH-ACQUIRE rh_artifact_source and rh_acquisition_receipt must be normalized absolute paths (host vars
+          of localhost; no defaults), and the receipt must lie OUTSIDE the store.
+        quiet: true
+
+    - name: Stat the receipt path and its directory (read-only; the receipt never lands in the store)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: ["{{ rh_acquisition_receipt | dirname }}", "{{ rh_acquisition_receipt }}"]
+      register: _rh_acq_rcpt
+
+    - name: Refuse an unowned receipt directory or a receipt path that is not an owned regular file
+      vars:
+        _d: "{{ _rh_acq_rcpt.results[0].stat }}"
+        _f: "{{ _rh_acq_rcpt.results[1].stat }}"
+      ansible.builtin.assert:
+        that:
+          - _d.exists and _d.isdir and not _d.islnk and _d.uid == rh_builder.uid | int and not (_d.wgrp or _d.woth)
+          - not _f.exists or (_f.isreg and not _f.islnk and _f.uid == rh_builder.uid | int)
+        fail_msg: >-
+          REFUSED RH-ACQUIRE: {{ rh_acquisition_receipt | dirname }} must be an existing real directory owned by uid
+          {{ rh_builder.uid }} and not group/other-writable, and {{ rh_acquisition_receipt }} absent or an owned regular file.
+        quiet: true
+
+    - name: List every entry of the artifact store BEFORE any fetch (the cold-qualification observation; read-only)
+      ansible.builtin.find:
+        paths: "{{ rh_artifact_source }}"
+        file_type: any
+        hidden: true
+        recurse: false
+        follow: false
+      register: _rh_acq_before
+
+    - name: Stat the artifact source directory and every declared row in it
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: >-
+        {{ [rh_artifact_source] + ((rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections)
+           | map(attribute='file') | map('regex_replace', '^', rh_artifact_source ~ '/') | list) }}
+      register: _rh_acq_have
+
+    - name: Refuse before any fetch -- unowned source dir, wrong digests, or absent rows without a declared source
+      vars:
+        _rows: "{{ rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections }}"
+        _st: "{{ _rh_acq_have.results[1:] | map(attribute='stat') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_acq_have.results[0].stat.exists and _rh_acq_have.results[0].stat.isdir and not _rh_acq_have.results[0].stat.islnk
+          - _rh_acq_have.results[0].stat.uid == rh_builder.uid | int
+          - not (_rh_acq_have.results[0].stat.wgrp or _rh_acq_have.results[0].stat.woth)
+          - >-
+            _rows | zip(_st) | selectattr('1.exists') | selectattr('1.islnk') | list | length == 0
+          - >-
+            _rows | zip(_st) | selectattr('1.exists') | map('last') | map(attribute='checksum') | list
+            == _rows | zip(_st) | selectattr('1.exists') | map('first') | map(attribute='sha256') | list
+          - _rows | rejectattr('url', 'defined') | list | length == 0
+          - _rows | selectattr('url', 'defined') | rejectattr('url', 'string') | list | length == 0
+          - >-
+            (rh_seed_lock.packages + rh_seed_lock.collections) | selectattr('url', 'defined')
+            | map(attribute='url') | map('regex_replace', '^.*/', '') | list
+            == (rh_seed_lock.packages + rh_seed_lock.collections) | selectattr('url', 'defined') | map(attribute='file') | list
+        fail_msg: >-
+          REFUSED RH-ACQUIRE: source dir must be an existing real directory owned by uid {{ rh_builder.uid }} and not
+          group/other-writable; present-but-wrong or linked: {{ _rows | zip(_st) | selectattr('1.exists')
+          | rejectattr('1.checksum', 'in', _rows | map(attribute='sha256') | list) | map('first') | map(attribute='file') | list }};
+          rows with NO declared source (every row declares `url`; placing a file by hand is not a source):
+          {{ _rows | rejectattr('url', 'defined') | map(attribute='file') | list }}; lock rows whose url does not end in
+          their file name: {% for r in rh_seed_lock.packages + rh_seed_lock.collections if r.url is defined and (r.url | regex_replace('^.*/', '')) != r.file %}{{ r.file }} {% endfor %}.
+        quiet: true
+
+    - name: Fetch each absent row from its declared source, checksum-pinned (the only network effect)
+      vars:
+        _rows: "{{ rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections }}"
+      ansible.builtin.get_url:
+        url: "{{ item.0.url }}"
+        dest: "{{ rh_artifact_source }}/{{ item.0.file }}"
+        checksum: "sha256:{{ item.0.sha256 }}"
+        mode: '0400'
+        force: false
+        use_proxy: true
+      loop: "{{ _rows | zip(_rh_acq_have.results[1:] | map(attribute='stat') | list) | rejectattr('1.exists') | list }}"
+      loop_control:
+        label: "{{ item.0.file }}"
+
+    - name: Re-verify every declared row in the store after the fetch (links not followed)
+      ansible.builtin.stat:
+        path: "{{ rh_artifact_source }}/{{ item.file }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: "{{ rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections }}"
+      loop_control:
+        label: "{{ item.file }}"
+      register: _rh_acq_after
+
+    - name: Refuse unless every declared row is now present with its declared digest
+      vars:
+        _rows: "{{ rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_acq_after.results | map(attribute='stat') | selectattr('exists') | selectattr('isreg') | rejectattr('islnk') | list | length == _rows | length
+          - _rh_acq_after.results | map(attribute='stat') | map(attribute='checksum', default='') | list == _rows | map(attribute='sha256') | list
+          - _rh_acq_before.files is defined
+        fail_msg: >-
+          REFUSED RH-ACQUIRE: after acquisition not every declared row is a regular file with its declared sha256
+          (absent: {{ _rh_acq_after.results | rejectattr('stat.exists') | map(attribute='item.file') | list }});
+          no receipt was written.
+        quiet: true
+
+    - name: Write this run's acquisition receipt (observed dispositions; overwrites any earlier receipt)
+      vars:
+        _acq: "{{ rh.controller.bootstrap.genesis.acquisition }}"
+        _rows: "{{ rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections }}"
+        _pre: "{{ _rh_acq_have.results[1:] | map(attribute='stat') | list }}"
+        _empty: "{{ _rh_acq_before.files | length == 0 }}"
+        _disp: "{{ _pre | map(attribute='exists') | map('ternary', _acq.dispositions[1], _acq.dispositions[0]) | list }}"
+        _out: >-
+          {%- set ns = namespace(r=[]) -%}{%- for x in _rows -%}
+          {%- set ns.r = ns.r + [{'file': x.file, 'url': x.url, 'sha256': x.sha256, 'disposition': _disp[loop.index0]}] -%}
+          {%- endfor -%}{{ ns.r }}
+        _decl: "{{ _rows | map(attribute='file') | list }}"
+      ansible.builtin.copy:
+        dest: "{{ rh_acquisition_receipt }}"
+        mode: '0400'
+        content: >-
+          {{ {'schema': _acq.receipt_schema,
+              'observed_at_utc': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'store': rh_artifact_source,
+              'store_empty_before': _empty,
+              'store_entries_before': _rh_acq_before.files | map(attribute='path') | map('basename') | sort,
+              'store_foreign_entries': _rh_acq_before.files | map(attribute='path') | map('basename') | reject('in', _decl) | sort,
+              'profile_sha256': rh_profile_sha256,
+              'lock_sha256': lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ rh.controller.lock_file_rel) | hash('sha256'),
+              'builder_uid': rh_builder.uid,
+              'rows': _out,
+              'cold_qualified': _empty and (_disp | unique | list == [_acq.dispositions[0]])} | to_nice_json }}
+
+    - name: Report the acquisition result
+      vars:
+        _acq: "{{ rh.controller.bootstrap.genesis.acquisition }}"
+        _pre: "{{ _rh_acq_have.results[1:] | map(attribute='stat') | list }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ _acq.report }} store_empty_before={{ _rh_acq_before.files | length == 0 }}
+          fetched={{ _pre | rejectattr('exists') | list | length }} reused={{ _pre | selectattr('exists') | list | length }}
+          cold_qualified={{ (_rh_acq_before.files | length == 0) and (_pre | selectattr('exists') | list | length == 0) }}
+          receipt={{ rh_acquisition_receipt }}

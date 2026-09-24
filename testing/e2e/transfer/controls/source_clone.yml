@@ -1,0 +1,52 @@
+---
+# testing/e2e/transfer/controls/source_clone.yml -- clone the ADMITTED source (sr, from source_ref.yml) at its
+# declared commit and re-check the clone. Nothing is committed; the source is only read.
+# Inputs: sr (its `git` is the decl's referenced executable), sr_decl (controls_source.status_args), sr_dest (a
+# directory that must not exist). Output: sr.clones gains {dir, commit, tree}; sr_clone.
+# Refusal: CONTROLS-SOURCE-MISMATCH when the clone's HEAD commit or tree is not the admitted one, or the clone is
+# not clean (tracked or untracked).
+
+- name: SOURCE-CLONE -- only an admitted source is cloned
+  ansible.builtin.assert:
+    that:
+      - sr is defined and sr is mapping and sr.used | default(false) | bool
+      - sr.git is string and sr.git.startswith('/')
+      - sr.commit is match(sr_decl.controls_source.commit_regex) and sr.tree is match(sr_decl.controls_source.commit_regex)
+    fail_msg: "CONTROLS-SOURCE-INPUT: no admitted source_ref (source_ref.yml) before cloning into {{ sr_dest }}"
+    quiet: true
+
+- name: SOURCE-CLONE -- clone without checkout, then detach at the admitted commit
+  ansible.builtin.command:
+    argv: "{{ item }}"
+  loop:
+    - ["{{ sr.git }}", clone, --no-hardlinks, --no-checkout, --quiet, "{{ sr.path }}", "{{ sr_dest }}"]
+    - ["{{ sr.git }}", -C, "{{ sr_dest }}", checkout, --quiet, --detach, "{{ sr.commit }}"]
+  changed_when: true
+
+- name: SOURCE-CLONE -- the clone's HEAD commit, tree and state
+  ansible.builtin.command:
+    argv: "{{ [sr.git, '-C', sr_dest] + item }}"
+  loop:
+    - [rev-parse, --verify, --quiet, 'HEAD^{commit}']
+    - [rev-parse, --verify, --quiet, 'HEAD^{tree}']
+    - "{{ sr_decl.controls_source.status_args }}"
+  register: _sc_rp
+  changed_when: false
+  failed_when: false
+
+- name: SOURCE-CLONE -- the clone is the admitted commit and tree (CONTROLS-SOURCE-MISMATCH)
+  ansible.builtin.assert:
+    that:
+      - _sc_rp.results | map(attribute='rc') | reject('equalto', 0) | list | length == 0
+      - (_sc_rp.results[0].stdout | trim) == sr.commit
+      - (_sc_rp.results[1].stdout | trim) == sr.tree
+      - _sc_rp.results[2].stdout | trim | length == 0
+    fail_msg: >-
+      CONTROLS-SOURCE-MISMATCH: clone {{ sr_dest }} is commit '{{ _sc_rp.results[0].stdout | default('') | trim }}'
+      tree '{{ _sc_rp.results[1].stdout | default('') | trim }}', admitted {{ sr.commit }} / {{ sr.tree }}
+    quiet: true
+
+- name: SOURCE-CLONE -- record the clone
+  ansible.builtin.set_fact:
+    sr_clone: {dir: "{{ sr_dest }}", commit: "{{ sr.commit }}", tree: "{{ sr.tree }}"}
+    sr: "{{ sr | combine({'clones': sr.clones + [{'dir': sr_dest, 'commit': sr.commit, 'tree': sr.tree}]}) }}"

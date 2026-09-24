@@ -1,0 +1,62 @@
+---
+# testing/e2e/transfer/tasks/endpoint_bind.yml -- B-PER-HOST-POLICY-BINDING, endpoint (localhost, observe-only).
+# The endpoint B's contract actually reaches (resolve_contract.yml: address, port, ProxyJump) plus the target's owner
+# must be the endpoint C1 bound into this target's scope: binding.deployment.endpoints[<target>] in the route's
+# declared key order ssh_auth.composition.endpoint_key = [address, port, proxy_jump, owner] (C1 delta, tick158).
+# Every normalisation rule is READ from the resolved policy (tr_bs = rh.controller.bootstrap), never copied here:
+#   address    composition.address (B's contract reads the same var; absent -> the inventory name) | normalize
+#   port       the explicit value as a canonical decimal string, else composition.port.absent_key
+#   proxy_jump B's contract proxy (the form_regex capture, B's proxy_regex == the route's, asserted by bind_controller)
+#              or '' for the three no-jump inventory forms
+#   owner      the declared rule inventory.owner = {var, absent} (route r3h, profile fabb0712): the target's
+#              inventory.owner.var value, else inventory.owner.absent; owner.var must equal inventory.owner_var
+# An old endpoint, or another target's endpoint, refuses here -- before any target effect and before the contract is
+# recorded. Inputs: tr, tr_bs, tr_contract, tr_scope_expect, lme_transfer_target. Outputs: tr_endpoint.
+
+- name: Refuse an endpoint rule B's contract does not read the same way (seam)
+  vars:
+    _cp: "{{ tr_bs.ssh_auth.composition | default({}) }}"
+  ansible.builtin.assert:
+    that:
+      - _cp.endpoint_key | default([]) == ['address', 'port', 'proxy_jump', 'owner']
+      - _cp.address.var | default('') == tr.contract.address_var
+      - _cp.address.absent | default('') == 'inventory_hostname'
+      - _cp.address.normalize | default('') in ['lower']
+      - _cp.port.var | default('') == tr.contract.port_var
+      - _cp.port.absent_key | default('') is string and _cp.port.absent_key | default('') | length > 0
+      - tr_bs.inventory.owner_var | default('') is string and tr_bs.inventory.owner_var | default('') | length > 0
+      - tr_bs.inventory.owner | default(none) is mapping
+      - tr_bs.inventory.owner.var | default(none) == tr_bs.inventory.owner_var
+      - tr_bs.inventory.owner.absent | default(none) is string
+    fail_msg: >-
+      TRANSFER-ENDPOINT-BINDING: the resolved endpoint rule (ssh_auth.composition endpoint_key/address/port,
+      inventory.owner_var, inventory.owner {var == owner_var, absent: a string}) is not the one B's contract reads
+      ({{ tr.contract.address_var }}, {{ tr.contract.port_var }}, owner {{ tr_bs.inventory.owner | default('undeclared') | to_json }}).
+    quiet: true
+
+- name: Compose the endpoint B's contract reaches, in the scope's endpoint key form
+  vars:
+    _cp: "{{ tr_bs.ssh_auth.composition }}"
+  ansible.builtin.set_fact:
+    tr_endpoint:
+      - "{{ tr_contract.address | lower }}"
+      - "{{ _cp.port.absent_key if tr_contract.port is none else ((tr_contract.port | int) | string) }}"
+      - "{{ '' if tr_contract.proxy is none else tr_contract.proxy }}"
+      - >-
+        {{ hostvars[lme_transfer_target][tr_bs.inventory.owner.var]
+           if (tr_bs.inventory.owner.var in hostvars[lme_transfer_target]) else tr_bs.inventory.owner.absent }}
+
+- name: Refuse a contract endpoint that is not the endpoint bound into this target's scope
+  vars:
+    _eps: "{{ tr_scope_expect.binding.deployment.endpoints | default(none) }}"
+  ansible.builtin.assert:
+    that:
+      - _eps is mapping
+      - lme_transfer_target in _eps
+      - _eps[lme_transfer_target] is sequence and _eps[lme_transfer_target] is not string
+      - _eps[lme_transfer_target] | list == tr_endpoint
+    fail_msg: >-
+      TRANSFER-ENDPOINT-BINDING: the contract for {{ lme_transfer_target }} reaches {{ tr_endpoint | to_json }}, but
+      its scope binds {{ (_eps[lme_transfer_target] if (_eps is mapping and lme_transfer_target in _eps) else 'no endpoint') | to_json }}
+      (binding.deployment.endpoints). An old endpoint or another target's endpoint is refused; nothing was changed.
+    quiet: true

@@ -1,0 +1,554 @@
+---
+# testing/remote_harness/tasks/reap_staging.yml -- M1-STAGING-RECOVERY (codex-000256, codex-001716 E20-CONCURRENCY,
+# codex-tick138 Q-LEASE-AS-LIVENESS): OWNED retention/recovery of the staging dirs of ONE destination that reaps ONLY
+# entries whose writers are PROVABLY QUIESCENT, plus the free-space backpressure, run BEFORE a new staging dir is
+# reserved. Used by package.yml (controller) and target_bootstrap.yml (each target). Requires resolve_policy.yml (rh).
+# Policy: controller.bootstrap.bundle.staging_retention (lease, target_quiescence, recovery). Inputs (required):
+#   rh_reap_dest     the destination path (its parent was admitted by the caller: real dirs, owned by 0 or the
+#                    acting uid, not group/other-writable)
+#   rh_reap_uid      the acting uid on this host (int)
+#   rh_reap_members  the OWNED MANIFEST: every relative path a staging dir of this destination may hold
+#   rh_reap_mv       the declared, identity-admitted mv path   (on this host)
+#   rh_reap_rm       the declared, identity-admitted rm path   (on this host)
+#   rh_reap_flock    the declared, identity-admitted flock path (on this host; known-answer checked below)
+#   rh_reap_df       the declared, identity-admitted df path   (on this host)
+#   rh_reap_need     bytes that must be available on the destination filesystem before the reservation
+#   rh_reap_remote   true for target staging (target writer quiescence is required too), false on the controller
+#   rh_reap_reserve  true when the caller reserves a staging dir next (the lease record is written last)
+# Outputs: rh_staging_lease (token; carried in the reserved name), the lease record next to the destination.
+# Scope: ONLY `.<dest>.<staging_infix>.*`, `.<dest>.<reaping_infix>.*` and `.<dest>.<lease_infix>.*` in the parent;
+# the destination lock `.<dest>.<lock_suffix>` is persistent and never reaped. r3g PER-CLASS (bundle.per_class):
+# package.yml reaps once per class destination; a class sibling `<dest><separator><infix><separator><key>` is its OWN
+# destination with its own `.<sibling>.<infix>.*` scope, and because no sibling basename begins with `<dest>.` the
+# scopes of two classes are disjoint (concurrent publication of two classes never cross-reaps). Published class dirs
+# are never in any reap scope: a sibling that matches the rule but is not a class of the current deployment is
+# owned by the declared rule, reported PRESERVED (tasks/scope_classes.yml) and never mutated, never judged by age. An entry is reaped only when (1) the
+# controller writers named by its lease record are quiescent in an ADMITTED view and (2) for target staging, no other
+# session of the owner has processes; anything live, busy, unknown or unprovable is PRESERVED, reported and charged.
+# Every reap mutation runs as ONE declared command under `flock -x -n` on the destination lock; the callers' publish
+# rename runs under the SAME lock (`flock -x -w`, the publish fence), so reapers and publishers serialize and a staging
+# path the reaper moved away can never be published. r3f: the flock known answers run on a PRIVATE temp lock (a held
+# destination lock is contention, never a tool failure); liveness is cgroup.events `populated` (subtree), and target
+# containment/session separation is declared in staging_retention (target_quiescence comment) and admitted by stat.
+# No age rule. Stdout markers (staging_retention): REAPED-STAGING,
+# PRESERVED-LIVE-STAGING, PRESERVED-BUSY-STAGING, PRESERVED-UNKNOWN-STAGING; refusals RH-STAGING-LEASE (unprovable
+# lease or flock known answers), RH-STAGING-BUDGET (no convergence / no space).
+
+- name: Derive this run's staging holder lease (controller ansible-playbook main process; read-only /proc)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+  ansible.builtin.set_fact:
+    _rh_lease_self: >-
+      {%- set pr = _lz.proc_root -%}
+      {%- set st = lookup('ansible.builtin.file', pr ~ '/self/stat') -%}
+      {%- set pp = (st.split(')') | last).split()[1] -%}
+      {%- set cm = lookup('ansible.builtin.file', pr ~ '/self/cmdline') -%}
+      {%- set h = pp if (query('ansible.builtin.file', pr ~ '/' ~ pp ~ '/cmdline', errors='ignore') | join) == cm else st.split(' ')[0] -%}
+      {%- set hf = ((query('ansible.builtin.file', pr ~ '/' ~ h ~ '/stat', errors='ignore') | join).split(')') | last).split() -%}
+      {%- set top = (hf | length > 19) and (query('ansible.builtin.file', pr ~ '/' ~ hf[1] ~ '/cmdline', errors='ignore') | join) != cm -%}
+      {%- set ul = lookup('ansible.builtin.file', pr ~ '/self/status').splitlines() | select('match', 'Uid:') | list -%}
+      {%- set cg = (query('ansible.builtin.file', pr ~ '/' ~ h ~ '/cgroup', errors='ignore') | join).splitlines() -%}
+      {{ {'machine': lookup('ansible.builtin.file', _lz.machine_id_path) | trim,
+          'boot': lookup('ansible.builtin.file', _lz.boot_id_path) | trim | replace('-', ''),
+          'uid': (ul | first).split()[1] if ul | length == 1 else '',
+          'pid': h, 'start': hf[19] if hf | length > 19 else '',
+          'cgroup': cg[0][3:] if (cg | length == 1 and cg[0] is match('^0::/')) else '',
+          'argv_ok': cm is search(_lz.holder_argv_regex), 'top': top} }}
+
+- name: Read the holder's and this reaper's namespace identities and the cgroup v2 marker on the controller (read-only)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop:
+    - "{{ _lz.proc_root }}/{{ _rh_lease_self.pid }}/ns/pid"
+    - "{{ _lz.proc_root }}/{{ _rh_lease_self.pid }}/ns/cgroup"
+    - "{{ _lz.proc_root }}/self/ns/pid"
+    - "{{ _lz.proc_root }}/self/ns/cgroup"
+    - "{{ _lz.cgroup_v2_marker }}"
+  register: _rh_lease_ns
+  delegate_to: localhost
+  failed_when: false
+
+- name: Refuse a run whose holder lease cannot be derived (nothing reaped, nothing reserved)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+    _ns: "{{ _rh_lease_ns.results | map(attribute='stat') | map('default', {}) | list }}"
+    _tok: "{{ 'L' ~ _rh_lease_self.machine ~ '-' ~ _rh_lease_self.boot ~ '-' ~ _rh_lease_self.uid ~ '-' ~ _rh_lease_self.pid ~ '-' ~ _rh_lease_self.start }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_lease_self.argv_ok
+      - _rh_lease_self.top
+      - _rh_lease_self.uid is match('^[0-9]+$')
+      - _rh_lease_self.cgroup is match('^/')
+      - _tok is match(_lz.token_regex)
+      - _rh_lease_ns.results | selectattr('failed', 'defined') | selectattr('failed') | list | length == 0
+      - _ns[:4] | map(attribute='lnk_target') | map('default', '') | select('match', _lz.ns_regex) | list | length == 4
+      - _ns[0].lnk_target == _ns[2].lnk_target
+      - _ns[1].lnk_target == _ns[3].lnk_target
+      - _ns[4].exists | default(false)
+    fail_msg: >-
+      REFUSED {{ _lz.refusal }} on {{ inventory_hostname }}: this run's staging holder (the controller ansible-playbook
+      main process, its pid/cgroup namespaces and cgroup v2 path) could not be proven, or this reaper does not observe
+      the holder's namespaces ({{ _rh_lease_self }}; {{ _ns | map(attribute='lnk_target') | map('default', '?') | list }});
+      no staging was reaped or reserved.
+    quiet: true
+
+- name: Publish this run's lease token and record (derived outputs)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+    _ns: "{{ _rh_lease_ns.results | map(attribute='stat') | list }}"
+  ansible.builtin.set_fact:
+    rh_staging_lease: "{{ 'L' ~ _rh_lease_self.machine ~ '-' ~ _rh_lease_self.boot ~ '-' ~ _rh_lease_self.uid ~ '-' ~ _rh_lease_self.pid ~ '-' ~ _rh_lease_self.start }}"
+    _rh_lease_rec:
+      schema: "{{ _lz.record_schema }}"
+      token: "{{ 'L' ~ _rh_lease_self.machine ~ '-' ~ _rh_lease_self.boot ~ '-' ~ _rh_lease_self.uid ~ '-' ~ _rh_lease_self.pid ~ '-' ~ _rh_lease_self.start }}"
+      machine: "{{ _rh_lease_self.machine }}"
+      boot: "{{ _rh_lease_self.boot }}"
+      uid: "{{ _rh_lease_self.uid }}"
+      pid: "{{ _rh_lease_self.pid }}"
+      start: "{{ _rh_lease_self.start }}"
+      pidns: "{{ _ns[0].lnk_target }}"
+      cgroupns: "{{ _ns[1].lnk_target }}"
+      cgroup_b64: "{{ _rh_lease_self.cgroup | b64encode }}"
+
+# r3f R3E-CONTENDED-KAT (codex-014047): the known answers run on a PRIVATE scratch lock of this run, never on the
+# destination lock, so a destination lock held by another run (E26 ii, E27) cannot fail tool admission; contention on
+# the real lock is met only by the reap mutations (-n: preserved, reported BUSY) and the publish fence (-w: bounded
+# wait, RH-STAGING-BUSY).
+- name: Reserve a private scratch lock for the flock known answers (this run's own temp file; not the destination lock)
+  ansible.builtin.tempfile:
+    state: file
+    suffix: "{{ '.' ~ rh.controller.bootstrap.bundle.staging_retention.lease.kat_lock_suffix }}"
+  register: _rh_reap_katlock
+
+- name: Known-answer check of the declared flock on the private scratch lock (conflict detected, command executed)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+  ansible.builtin.command:
+    argv: "{{ item }}"
+  loop:
+    - ["{{ rh_reap_flock }}", -x, -n, "{{ _rh_reap_katlock.path }}", "{{ rh_reap_flock }}", --version]
+    - ["{{ rh_reap_flock }}", -x, -n, "{{ _rh_reap_katlock.path }}", "{{ rh_reap_flock }}", -x, -n, -E, "{{ _lz.busy_rc | string }}", "{{ _rh_reap_katlock.path }}", "{{ rh_reap_flock }}", --version]
+  register: _rh_reap_kat
+  changed_when: false
+  failed_when: false
+
+- name: Release the private scratch lock
+  ansible.builtin.file:
+    path: "{{ _rh_reap_katlock.path }}"
+    state: absent
+
+- name: Refuse a flock that does not serialize (a substituted flock would silently remove every exclusion)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_reap_kat.results[0].rc == 0
+      - _rh_reap_kat.results[0].stdout is search('util-linux')
+      - _rh_reap_kat.results[1].rc == _lz.busy_rc | int
+    fail_msg: >-
+      REFUSED {{ _lz.refusal }} on {{ inventory_hostname }}: {{ rh_reap_flock }} failed the lock known answers on this
+      run's private scratch lock (rc {{ _rh_reap_kat.results | map(attribute='rc') | list }}; destination-lock contention
+      is never a cause here); nothing was reaped or reserved.
+    quiet: true
+
+- name: List this destination's staging, reaping and lease entries (any type; no links followed)
+  vars:
+    _bn: "{{ rh.controller.bootstrap.bundle }}"
+  ansible.builtin.find:
+    paths: "{{ rh_reap_dest | dirname }}"
+    patterns:
+      - ".{{ rh_reap_dest | basename }}.{{ _bn.staging_infix }}.*"
+      - ".{{ rh_reap_dest | basename }}.{{ _bn.reaping_infix }}.*"
+      - ".{{ rh_reap_dest | basename }}.{{ _bn.staging_retention.lease.lease_infix }}.*"
+    file_type: any
+    hidden: true
+    recurse: false
+    follow: false
+  register: _rh_reap_top
+
+- name: List every descendant of each candidate directory (no links followed)
+  ansible.builtin.find:
+    paths: "{{ _rh_reap_top.files | selectattr('isdir') | rejectattr('islnk') | map(attribute='path') | list }}"
+    file_type: any
+    hidden: true
+    recurse: true
+    follow: false
+  register: _rh_reap_desc
+  when: _rh_reap_top.files | selectattr('isdir') | rejectattr('islnk') | list | length > 0
+
+- name: Read every owned lease record in scope (regular, this uid, not group/other-writable; read-only)
+  vars:
+    _lp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.staging_retention.lease.lease_infix }}."
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: >-
+    {{ _rh_reap_top.files | selectattr('isreg') | rejectattr('islnk') | selectattr('uid', 'equalto', rh_reap_uid | int)
+       | rejectattr('wgrp') | rejectattr('woth') | map(attribute='path') | select('search', '/' ~ (_lp | regex_escape) ~ '[^/]+$') | sort }}
+  register: _rh_reap_recs
+  failed_when: false
+
+- name: Parse the lease records (strict shape before JSON; a malformed record is no record)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+    _lp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.staging_retention.lease.lease_infix }}."
+    _shape: '^[{]"[a-z_0-9]+": "[]A-Za-z0-9+/=:._[-]*"(, "[a-z_0-9]+": "[]A-Za-z0-9+/=:._[-]*")*[}]$'
+    _keys: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.record_fields | list | sort }}"
+  ansible.builtin.set_fact:
+    _rh_reap_recmap: >-
+      {%- set ns = namespace(m={}) -%}
+      {%- for r in _rh_reap_recs.results | default([]) -%}
+        {%- set t = (r.item | basename)[(_lp | length):] -%}
+        {%- set c = (r.content | b64decode) if (r.content is defined and not (r.failed | default(false))) else '' -%}
+        {%- if c is match(_shape) -%}{%- set d = c | from_json -%}
+          {%- if (d.keys() | sort | list) == _keys and d.token == t and d.schema == _lz.record_schema and t is match(_lz.token_regex)
+                 and d.pid is match('^[1-9][0-9]*$') and d.start is match('^[0-9]+$') and d.uid is match('^[0-9]+$')
+                 and d.machine is match('^[0-9a-f]{32}$') and d.boot is match('^[0-9a-f]{32}$')
+                 and d.pidns is match(_lz.ns_regex) and d.pidns is match('^pid:') and d.cgroupns is match(_lz.ns_regex) and d.cgroupns is match('^cgroup:')
+                 and t == 'L' ~ d.machine ~ '-' ~ d.boot ~ '-' ~ d.uid ~ '-' ~ d.pid ~ '-' ~ d.start
+                 and d.cgroup_b64 is match('^(?:[A-Za-z0-9+/]{4})+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$|^[A-Za-z0-9+/]{2}==$|^[A-Za-z0-9+/]{3}=$')
+                 and (d.cgroup_b64 | b64decode) is match('^/') -%}
+            {%- set ns.m = ns.m | combine({t: d}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}{{ ns.m }}
+
+- name: Select the records whose controller writers can be observed from here (same machine, uid and boot)
+  ansible.builtin.set_fact:
+    _rh_reap_probe: >-
+      {{ _rh_reap_recmap.values() | selectattr('machine', 'equalto', _rh_lease_rec.machine)
+         | selectattr('uid', 'equalto', _rh_lease_rec.uid) | selectattr('boot', 'equalto', _rh_lease_rec.boot)
+         | selectattr('pidns', 'equalto', _rh_lease_rec.pidns) | selectattr('cgroupns', 'equalto', _rh_lease_rec.cgroupns)
+         | sort(attribute='token') | list }}
+
+- name: Observe each recorded holder process on the controller (stat; exists=false is positive absence in this view)
+  ansible.builtin.stat:
+    path: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.proc_root }}/{{ item.pid }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ _rh_reap_probe }}"
+  loop_control:
+    label: "{{ item.token }}"
+  register: _rh_reap_pid
+  delegate_to: localhost
+  failed_when: false
+
+- name: Read each present holder's /proc stat on the controller (a failed read is UNKNOWN, never dead)
+  ansible.builtin.slurp:
+    src: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.proc_root }}/{{ item.pid }}/stat"
+  loop: "{{ _rh_reap_probe }}"
+  loop_control:
+    label: "{{ item.token }}"
+  register: _rh_reap_pstat
+  delegate_to: localhost
+  failed_when: false
+
+- name: Observe each recorded cgroup and its parent on the controller (every process of that run stays in it)
+  vars:
+    _cr: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.cgroup_root }}"
+  ansible.builtin.stat:
+    path: "{{ _cr ~ (item.0.cgroup_b64 | b64decode) if item.1 == 'self' else (_cr ~ (item.0.cgroup_b64 | b64decode)) | dirname }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ _rh_reap_probe | product(['self', 'parent']) | list }}"
+  loop_control:
+    label: "{{ item.0.token }} {{ item.1 }}"
+  register: _rh_reap_cg
+  delegate_to: localhost
+  failed_when: false
+
+# r3f R3E-WRITER-CONTAINMENT (codex-014047): the subtree proof is cgroup.events `populated` (cgroup v2: covers the
+# cgroup AND every descendant), never an empty direct cgroup.procs.
+- name: Read each present recorded cgroup's populated state on the controller (subtree; a failed read is UNKNOWN)
+  ansible.builtin.slurp:
+    src: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.cgroup_root ~ (item.cgroup_b64 | b64decode) }}/{{ rh.controller.bootstrap.bundle.staging_retention.lease.events_file }}"
+  loop: "{{ _rh_reap_probe }}"
+  loop_control:
+    label: "{{ item.token }}"
+  register: _rh_reap_cgev
+  delegate_to: localhost
+  failed_when: false
+
+- name: Decide each token's controller writer state (dead only on positive, admitted observations)
+  vars:
+    _rec: "{{ rh.controller.bootstrap.bundle.staging_retention.recovery }}"
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+  ansible.builtin.set_fact:
+    _rh_reap_tok: >-
+      {%- set me = _rh_lease_rec -%}{%- set ns = namespace(m={}) -%}
+      {%- for t, d in _rh_reap_recmap.items() -%}
+        {%- if d.machine in _rec.retired_controller_machine_ids -%}{%- set v = 'dead' -%}
+        {%- elif d.machine != me.machine or d.uid != me.uid -%}{%- set v = 'unknown' -%}
+        {%- elif d.boot != me.boot -%}{%- set v = 'dead' -%}
+        {%- elif d.pidns != me.pidns or d.cgroupns != me.cgroupns -%}{%- set v = 'unknown' -%}
+        {%- else -%}
+          {%- set i = (_rh_reap_probe | map(attribute='token') | list).index(t) -%}
+          {%- set ps = _rh_reap_pid.results[i] -%}{%- set pr = _rh_reap_pstat.results[i] -%}
+          {%- set cs = _rh_reap_cg.results[2 * i] -%}{%- set cp = _rh_reap_cg.results[2 * i + 1] -%}{%- set cq = _rh_reap_cgev.results[i] -%}
+          {%- set pop = ((cq.content | b64decode).splitlines() | select('match', _lz.populated_regex) | list)
+                        if (cq.content is defined and not (cq.failed | default(false))) else [] -%}
+          {%- set pf = ((pr.content | b64decode).split(')') | last).split() if (pr.content is defined and not (pr.failed | default(false))) else [] -%}
+          {%- set pid = 'unknown' -%}
+          {%- if not (ps.failed | default(false)) and ps.stat is defined and not ps.stat.exists -%}{%- set pid = 'gone' -%}
+          {%- elif pf | length > 19 -%}{%- set pid = 'gone' if pf[19] != d.start else 'live' -%}{%- endif -%}
+          {%- set cg = 'unknown' -%}
+          {%- if not (cs.failed | default(false)) and cs.stat is defined and not cs.stat.exists
+                 and not (cp.failed | default(false)) and cp.stat is defined and cp.stat.exists and cp.stat.isdir -%}{%- set cg = 'gone' -%}
+          {%- elif pop | length == 1 -%}{%- set cg = 'gone' if pop[0] | trim == 'populated 0' else 'live' -%}{%- endif -%}
+          {%- set v = 'live' if (pid == 'live' or cg == 'live') else ('dead' if (pid == 'gone' and cg == 'gone') else 'unknown') -%}
+        {%- endif -%}
+        {%- set ns.m = ns.m | combine({t: v}) -%}
+      {%- endfor -%}{{ ns.m }}
+
+- name: Read this reaper's own session cgroup on the target (target writer quiescence; read-only)
+  ansible.builtin.slurp:
+    src: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.proc_root }}/self/cgroup"
+  register: _rh_reap_own
+  failed_when: false
+  when: rh_reap_remote | bool
+
+# TARGET CONTAINMENT (r3f R3E-WRITER-CONTAINMENT; declared in target_quiescence): every target staging writer is a
+# module/command of some run, executed over that run's SSH connection, so pam_systemd places it in a logind session
+# scope `user-<uid>.slice/session-*.scope`. That scope is a ROOT-owned, non-delegated cgroup: a cgroup-v2 migration
+# needs write access to the common ancestor's cgroup.procs (user-<uid>.slice, admitted here as root-owned and not
+# owner-writable), so no owner process can leave it or enter another; the only other owner cgroup is the user manager
+# `user@<uid>.service`, where no staging-writing operation spawns anything (the seed's own systemd-run scope never
+# writes staging). ANY other child of the user slice, an unreadable events file, or an unproven own session is
+# UNKNOWN -> not quiescent (preserve). Session separation for THIS reaper: its own scope was opened by this run's own
+# ControlMaster connection (control path under the seed's fresh per-run ANSIBLE_HOME; ssh args pinned by
+# admit_transport), so every process in it descends from this run -- a stale writer of another run cannot be in it.
+- name: Admit the owner's user slice on the target (root-owned, not owner/group/other-writable; the containment premise)
+  ansible.builtin.stat:
+    path: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.cgroup_root }}/{{ rh.controller.bootstrap.bundle.staging_retention.target_quiescence.user_slice | replace('{uid}', rh_reap_uid | string) }}"
+    follow: false
+    get_checksum: false
+  register: _rh_reap_uslice
+  failed_when: false
+  when: rh_reap_remote | bool
+
+- name: List EVERY child cgroup of the owner's user slice on the target (session scopes and the user manager; any other is unknown)
+  ansible.builtin.find:
+    paths: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.cgroup_root }}/{{ rh.controller.bootstrap.bundle.staging_retention.target_quiescence.user_slice | replace('{uid}', rh_reap_uid | string) }}"
+    file_type: directory
+    recurse: false
+    follow: false
+    hidden: true
+  register: _rh_reap_sessions
+  failed_when: false
+  when: rh_reap_remote | bool
+
+- name: Read every owner session scope's populated state on the target (cgroup.events covers descendants; a failed read is not quiescent)
+  vars:
+    _tq: "{{ rh.controller.bootstrap.bundle.staging_retention.target_quiescence }}"
+  ansible.builtin.slurp:
+    src: "{{ item }}/{{ rh.controller.bootstrap.bundle.staging_retention.lease.events_file }}"
+  loop: "{{ _rh_reap_sessions.files | default([]) | map(attribute='path') | select('search', _tq.session_path_regex) | sort }}"
+  register: _rh_reap_sev
+  failed_when: false
+  when: rh_reap_remote | bool
+
+- name: Decide target writer quiescence (every session scope but this run's own unpopulated; nothing else in the slice)
+  vars:
+    _tq: "{{ rh.controller.bootstrap.bundle.staging_retention.target_quiescence }}"
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+    _cr: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.cgroup_root }}"
+    _ownl: "{{ ((_rh_reap_own.content | default('')) | b64decode).splitlines() if (rh_reap_remote | bool) else [] }}"
+  ansible.builtin.set_fact:
+    _rh_reap_quiet: >-
+      {%- if not (rh_reap_remote | bool) -%}{{ true }}{%- else -%}
+      {%- set own = _cr ~ (_ownl[0][3:] if _ownl | length == 1 else '') -%}
+      {%- set sl = _cr ~ '/' ~ (_tq.user_slice | replace('{uid}', rh_reap_uid | string)) -%}
+      {%- set kids = _rh_reap_sessions.files | default([]) | map(attribute='path') | list -%}
+      {%- set sess = _rh_reap_sev.results | default([]) | map(attribute='item') | list -%}
+      {%- set others = _rh_reap_sev.results | default([]) | rejectattr('item', 'equalto', own) | list -%}
+      {%- set evs = others | selectattr('content', 'defined') | map(attribute='content') | map('b64decode') | list -%}
+      {{ _ownl | length == 1 and _ownl[0] is match(_tq.own_cgroup_regex | replace('{uid}', rh_reap_uid | string))
+         and _rh_reap_uslice.stat is defined and _rh_reap_uslice.stat.exists | default(false) and _rh_reap_uslice.stat.isdir
+         and _rh_reap_uslice.stat.uid == 0 and not _rh_reap_uslice.stat.wgrp and not _rh_reap_uslice.stat.woth
+         and not (_rh_reap_sessions.failed | default(false))
+         and own in sess
+         and kids | reject('in', sess) | reject('equalto', sl ~ '/' ~ (_tq.manager_unit | replace('{uid}', rh_reap_uid | string))) | list | length == 0
+         and others | selectattr('failed', 'defined') | selectattr('failed') | list | length == 0
+         and others | rejectattr('content', 'defined') | list | length == 0
+         and evs | reject('search', _lz.unpopulated_regex) | list | length == 0 }}
+      {%- endif -%}
+
+- name: Classify each candidate (owned manifest, lease record, controller and target quiescence)
+  vars:
+    _ret: "{{ rh.controller.bootstrap.bundle.staging_retention }}"
+    _desc: "{{ _rh_reap_desc.files | default([]) }}"
+    _skip: "{{ _rh_reap_desc.skipped_paths | default({}) }}"
+    _sp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.staging_infix }}."
+    _rp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.reaping_infix }}."
+    _lp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.staging_retention.lease.lease_infix }}."
+  ansible.builtin.set_fact:
+    _rh_reap_sel: >-
+      {%- set ns = namespace(o=[], l=[], b=[], u=[], rec=[], blk=[]) -%}
+      {%- for c in _rh_reap_top.files | sort(attribute='path') -%}
+        {%- set bn = c.path | basename -%}
+        {%- if bn.startswith(_lp) -%}
+          {%- set t = bn[(_lp | length):] -%}
+          {%- if t in _rh_reap_recmap and c.isreg and not c.islnk and c.uid == rh_reap_uid | int and not c.wgrp and not c.woth -%}
+            {%- if _rh_reap_tok[t] == 'dead' and _rh_reap_quiet -%}{%- set ns.rec = ns.rec + [c.path] -%}{%- endif -%}
+          {%- else -%}{%- set ns.u = ns.u + [c.path] -%}{%- endif -%}
+        {%- else -%}
+          {%- set k = namespace(ok=(c.isdir and not c.islnk and c.uid == rh_reap_uid | int and not c.wgrp and not c.woth)) -%}
+          {%- for d in _desc -%}{%- if d.path.startswith(c.path ~ '/') -%}{%- set rel = d.path[(c.path | length) + 1:] -%}
+            {%- if d.uid != rh_reap_uid | int or d.islnk or not (d.isdir or d.isreg)
+                  or not (rel in rh_reap_members or rel is search(_ret.transient_member_regex)) -%}{%- set k.ok = false -%}{%- endif -%}
+          {%- endif -%}{%- endfor -%}
+          {%- for p in _skip -%}{%- if (p ~ '/').startswith(c.path ~ '/') -%}{%- set k.ok = false -%}{%- endif -%}{%- endfor -%}
+          {%- set rest = bn[(_sp | length):] if bn.startswith(_sp) else (bn[(_rp | length):] if bn.startswith(_rp) else '') -%}
+          {%- set t = rest.split('.')[0] if rest.split('.') | length == 2 else '' -%}
+          {%- set v = _rh_reap_tok[t] if t in _rh_reap_tok else 'unknown' -%}
+          {%- if not k.ok or v == 'unknown' -%}{%- set ns.u = ns.u + [c.path] -%}{%- set ns.blk = ns.blk + [t] -%}
+          {%- elif v == 'live' -%}{%- set ns.l = ns.l + [c.path] -%}{%- set ns.blk = ns.blk + [t] -%}
+          {%- elif not _rh_reap_quiet -%}{%- set ns.b = ns.b + [c.path] -%}{%- set ns.blk = ns.blk + [t] -%}
+          {%- else -%}{%- set ns.o = ns.o + [c.path] -%}{%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ {'owned': ns.o, 'live': ns.l, 'busy': ns.b, 'unknown': ns.u, 'records': ns.rec, 'blocked_tokens': ns.blk | unique | list} }}
+
+- name: Report every live, busy or unknown entry (preserved untouched, bytes charged)
+  vars:
+    _ret: "{{ rh.controller.bootstrap.bundle.staging_retention }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ _ret.live_report }} {{ inventory_hostname }} {{ _rh_reap_sel.live }};
+      {{ _ret.busy_report }} {{ inventory_hostname }} {{ _rh_reap_sel.busy }} (target writers not provably quiescent);
+      {{ _ret.unknown_report }} {{ inventory_hostname }} {{ _rh_reap_sel.unknown }};
+      recorded owners (machine, uid): {{ _rh_reap_recmap.values() | map(attribute='machine') | zip(_rh_reap_recmap.values() | map(attribute='uid')) | unique | list }}
+  when: (_rh_reap_sel.live + _rh_reap_sel.busy + _rh_reap_sel.unknown) | length > 0
+
+- name: Take each reapable staging dir out of the publish path (flock -x -n on the destination lock; mv -T)
+  vars:
+    _bn: "{{ rh.controller.bootstrap.bundle }}"
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+    _sp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.staging_infix }}."
+    _lock: "{{ (rh_reap_dest | dirname) ~ '/.' ~ (rh_reap_dest | basename) ~ '.' ~ _lz.lock_suffix }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ rh_reap_flock }}"
+      - -x
+      - -n
+      - -E
+      - "{{ _lz.busy_rc | string }}"
+      - "{{ _lock }}"
+      - "{{ rh_reap_mv }}"
+      - -T
+      - --
+      - "{{ item }}"
+      - "{{ (item | dirname) ~ '/.' ~ (rh_reap_dest | basename) ~ '.' ~ _bn.reaping_infix ~ '.' ~ (item | basename)[(_sp | length):] }}"
+  loop: "{{ _rh_reap_sel.owned | select('search', '/' ~ (_sp | regex_escape) ~ '[^/]+$') | list }}"
+  register: _rh_reap_mv
+  changed_when: _rh_reap_mv.rc == 0
+  failed_when: false
+
+- name: Remove every reapable reaping dir (flock -x -n on the destination lock; rm -rf)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+    _rp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.reaping_infix }}."
+    _lock: "{{ (rh_reap_dest | dirname) ~ '/.' ~ (rh_reap_dest | basename) ~ '.' ~ _lz.lock_suffix }}"
+  ansible.builtin.command:
+    argv: ["{{ rh_reap_flock }}", -x, -n, -E, "{{ _lz.busy_rc | string }}", "{{ _lock }}", "{{ rh_reap_rm }}", -rf, --, "{{ item }}"]
+  loop: >-
+    {{ (_rh_reap_sel.owned | select('search', '/' ~ (_rp | regex_escape) ~ '[^/]+$') | list
+        + (_rh_reap_mv.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0)
+           | map(attribute='cmd') | map('last') | list)) | unique | list }}
+  register: _rh_reap_rm
+  changed_when: _rh_reap_rm.rc == 0
+  failed_when: false
+
+- name: Remove each reapable lease record no longer named by any remaining entry (flock -x -n; rm -f)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+    _lp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.staging_retention.lease.lease_infix }}."
+    _sp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.staging_infix }}."
+    _rp: ".{{ rh_reap_dest | basename }}.{{ rh.controller.bootstrap.bundle.reaping_infix }}."
+    _lock: "{{ (rh_reap_dest | dirname) ~ '/.' ~ (rh_reap_dest | basename) ~ '.' ~ _lz.lock_suffix }}"
+    # tokens still named by an owned entry that was NOT removed (a busy lock or a failed command)
+    _left: >-
+      {{ (_rh_reap_mv.results | default([]) | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list
+          + (_rh_reap_rm.results | default([]) | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list))
+         | map('basename') | map('regex_replace', '^(' ~ (_sp | regex_escape) ~ '|' ~ (_rp | regex_escape) ~ ')', '')
+         | map('regex_replace', '[.][^.]*$', '') | list }}
+  ansible.builtin.command:
+    argv: ["{{ rh_reap_flock }}", -x, -n, -E, "{{ _lz.busy_rc | string }}", "{{ _lock }}", "{{ rh_reap_rm }}", -f, --, "{{ item }}"]
+  loop: >-
+    {{ _rh_reap_sel.records | reject('in', (_rh_reap_sel.blocked_tokens + _left) | map('regex_replace', '^', (rh_reap_dest | dirname) ~ '/' ~ _lp) | list) | list }}
+  register: _rh_reap_rmrec
+  changed_when: _rh_reap_rmrec.rc == 0
+  failed_when: false
+
+- name: Report the reap result (reaped entries; entries left by a busy lock stay preserved)
+  vars:
+    _ret: "{{ rh.controller.bootstrap.bundle.staging_retention }}"
+    _busy: >-
+      {{ (_rh_reap_mv.results | default([]) + _rh_reap_rm.results | default([]) + _rh_reap_rmrec.results | default([]))
+         | selectattr('rc', 'defined') | selectattr('rc', 'equalto', _ret.lease.busy_rc | int) | map(attribute='item') | list }}
+  ansible.builtin.debug:
+    msg: >-
+      {{ _ret.reaped_report }} {{ inventory_hostname }}
+      {{ _rh_reap_rm.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | map(attribute='item') | list }}
+      records {{ _rh_reap_rmrec.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | map(attribute='item') | list }}{{
+      ('; ' ~ _ret.busy_report ~ ' ' ~ inventory_hostname ~ ' ' ~ (_busy | string) ~ ' (destination lock busy)') if _busy | length > 0 else '' }}
+
+- name: Re-list the scope after the reap
+  vars:
+    _bn: "{{ rh.controller.bootstrap.bundle }}"
+  ansible.builtin.find:
+    paths: "{{ rh_reap_dest | dirname }}"
+    patterns:
+      - ".{{ rh_reap_dest | basename }}.{{ _bn.staging_infix }}.*"
+      - ".{{ rh_reap_dest | basename }}.{{ _bn.reaping_infix }}.*"
+      - ".{{ rh_reap_dest | basename }}.{{ _bn.staging_retention.lease.lease_infix }}.*"
+    file_type: any
+    hidden: true
+    recurse: false
+    follow: false
+  register: _rh_reap_after
+
+- name: Read the free space of the destination filesystem with the declared df (read-only)
+  ansible.builtin.command:
+    argv: ["{{ rh_reap_df }}", --output=avail, -B1, --, "{{ rh_reap_dest | dirname }}"]
+  register: _rh_reap_df
+  changed_when: false
+
+- name: Refuse if the reap did not converge or the reservation does not fit (backpressure; nothing reserved)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+    _gone: >-
+      {{ (_rh_reap_mv.results | default([]) | selectattr('rc', 'equalto', 0) | map(attribute='item') | list)
+         + (_rh_reap_rm.results | default([]) | selectattr('rc', 'equalto', 0) | map(attribute='item') | list)
+         + (_rh_reap_rmrec.results | default([]) | selectattr('rc', 'equalto', 0) | map(attribute='item') | list) }}
+    # a failed command whose entry is STILL present (a competing reaper that already took the entry under the lock
+    # makes this run's mv fail with the entry gone: converged, not a failure)
+    _cmdfail: >-
+      {{ (_rh_reap_mv.results | default([]) + _rh_reap_rm.results | default([]) + _rh_reap_rmrec.results | default([]))
+         | selectattr('rc', 'defined') | rejectattr('rc', 'in', [0, _lz.busy_rc | int]) | map(attribute='item')
+         | intersect(_rh_reap_after.files | map(attribute='path') | list) | list }}
+  ansible.builtin.assert:
+    that:
+      - _rh_reap_after.files | map(attribute='path') | intersect(_gone) | list | length == 0
+      - _cmdfail | length == 0
+      - _rh_reap_df.stdout_lines | length == 2
+      - _rh_reap_df.stdout_lines[-1] | trim is match('^[0-9]+$')
+      - _rh_reap_df.stdout_lines[-1] | trim | int >= rh_reap_need | int
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.bundle.staging_retention.budget.refusal }} on {{ inventory_hostname }}: a
+      reaped entry is still present or a reap command failed ({{ _cmdfail }}), or {{ rh_reap_dest | dirname }} has
+      {{ _rh_reap_df.stdout_lines[-1] | default('?') | trim }} bytes free, below the required {{ rh_reap_need }}.
+      Retained and charged: live {{ _rh_reap_sel.live }}, busy {{ _rh_reap_sel.busy }}, unknown {{ _rh_reap_sel.unknown }};
+      recorded owners (machine, uid) {{ _rh_reap_recmap.values() | map(attribute='machine') | zip(_rh_reap_recmap.values() | map(attribute='uid')) | unique | list }}.
+      No staging dir was reserved.
+    quiet: true
+
+- name: Record this run's lease next to the destination (before the reservation)
+  ansible.builtin.copy:
+    dest: "{{ (rh_reap_dest | dirname) ~ '/.' ~ (rh_reap_dest | basename) ~ '.' ~ rh.controller.bootstrap.bundle.staging_retention.lease.lease_infix ~ '.' ~ rh_staging_lease }}"
+    content: "{{ _rh_lease_rec | to_json }}"
+    mode: '0400'
+  when: rh_reap_reserve | bool

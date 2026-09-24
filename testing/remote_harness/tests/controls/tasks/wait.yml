@@ -1,0 +1,73 @@
+---
+# wait for an observable (_rhc_step.wait): a seed phase line, a file regex, a path, or a glob match
+
+- name: Wait bounds
+  ansible.builtin.set_fact:
+    _rhc_w_retries: "{{ ((_rhc_step.timeout_s | default(300) | int) // 2) + 1 }}"
+    _rhc_w_file: >-
+      {{ (_rhc_t.ctl ~ '/' ~ _rhc_step.wait.step ~ '.stderr') if _rhc_step.wait.phase is defined
+         else (_rhc_step.wait.file_regex.file if _rhc_step.wait.file_regex is defined else '') }}
+    _rhc_w_regex: >-
+      {{ ('(^|\n)lme-controller-seed: ' ~ (_rhc_step.wait.phase | regex_escape) ~ '(\s|$)') if _rhc_step.wait.phase is defined
+         else (_rhc_step.wait.file_regex.regex if _rhc_step.wait.file_regex is defined else '') }}
+
+- name: "Wait for {{ _rhc_w_regex }} in {{ _rhc_w_file }}"
+  ansible.builtin.slurp:
+    src: "{{ _rhc_w_file }}"
+  register: _rhc_w
+  until: (_rhc_w.content | default('') | b64decode) is search(_rhc_w_regex, multiline=true)
+  retries: "{{ _rhc_w_retries }}"
+  delay: 2
+  failed_when: false
+  when: _rhc_w_file | length > 0
+
+- name: Wait for the path
+  ansible.builtin.stat:
+    path: "{{ _rhc_step.wait.path_exists }}"
+    follow: false
+    get_checksum: false
+  register: _rhc_wp
+  until: _rhc_wp.stat.exists | default(false)
+  retries: "{{ _rhc_w_retries }}"
+  delay: 2
+  failed_when: false
+  when: _rhc_step.wait.path_exists is defined
+
+- name: Wait for a glob match
+  ansible.builtin.find:
+    paths: "{{ _rhc_step.wait.glob.dir }}"
+    patterns: ["{{ _rhc_step.wait.glob.pattern }}"]
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _rhc_wg
+  until: (_rhc_wg.matched | default(0)) > 0
+  retries: "{{ _rhc_w_retries }}"
+  delay: 2
+  failed_when: false
+  when: _rhc_step.wait.glob is defined
+
+- name: A wait that never saw its observable fails the step
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [_rhc_step.id ~ ': the awaited observable never appeared ' ~ (_rhc_step.wait | to_json)] }}"
+  when: >-
+    (_rhc_step.wait.phase is defined or _rhc_step.wait.file_regex is defined)
+      and not ((_rhc_w.content | default('') | b64decode) is search(_rhc_w_regex, multiline=true))
+    or (_rhc_step.wait.path_exists is defined and not (_rhc_wp.stat.exists | default(false)))
+    or (_rhc_step.wait.glob is defined and (_rhc_wg.matched | default(0)) == 0)
+
+- name: Wait until no process of the named operation remains (gone)
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.pgrep }}", -f, --, "{{ _rhc_jobs[_rhc_step.wait.gone].plan.kill_token | regex_escape }}"]
+  register: _rhc_wgone
+  until: _rhc_wgone.rc == 1
+  retries: "{{ _rhc_w_retries }}"
+  delay: 2
+  changed_when: false
+  failed_when: false
+  when: _rhc_step.wait.gone is defined
+
+- name: A process that never went away fails the step
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [_rhc_step.id ~ ': operation ' ~ _rhc_step.wait.gone ~ ' still has processes ' ~ (_rhc_wgone.stdout_lines | join(' '))] }}"
+  when: _rhc_step.wait.gone is defined and _rhc_wgone.rc != 1

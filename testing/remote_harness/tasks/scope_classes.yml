@@ -1,0 +1,108 @@
+---
+# testing/remote_harness/tasks/scope_classes.yml -- CONTROLLER-side scope binding and the deployment's artifact
+# classes (r3g; PER-HOST-SCOPE-CONTRACT codex 023332; C1 field contract 033500; policy
+# controller.bootstrap.bundle.per_class). Included by package.yml and by target_bootstrap.yml's controller play, after
+# the policy is resolved (rh, rh_config_revision, rh_profile_sha256, rh_repo_root). Read-only; its outputs are derived
+# (registry-reserved): rh_classes.
+#
+# 1. The controller resolve must be the controller scope of a scoped deployment whose targets are exactly the declared
+#    group members, bound to this checkout's edition and the declared operation (RH-SCOPE-BINDING). Every read is
+#    guarded, so a malformed resolve refuses instead of failing to template.
+# 2. Every scope (controller + each target) carries C1's published class key (per_class.key_field, per_class.key_regex).
+#    The route NEVER derives, merges or re-hashes it.
+# 3. rh_classes = one entry per distinct key, controller's key first, the rest in key order:
+#      {key, controller (bool), targets (sorted ids of that class), dir, policy}
+#    dir: the controller's class -> rh_bundle_dir; any other -> the declared sibling rule. policy: the class scope's own
+#    resolved policy (the controller's scope for its class; else the lowest target id of the class). With C1's key
+#    covering every declared seed-template input, every member renders the same artifacts, so the choice of member
+#    changes no byte; bundle identity is the key (bundle.json class_key), never that member's policy digest.
+# 4. Siblings matching the rule that are not classes of this deployment are PRESERVED and reported, never mutated.
+
+- name: Admit the bundle destination input and refuse a basename that already matches the class-sibling rule
+  vars:
+    _pc: "{{ rh.controller.bootstrap.bundle.per_class | default({}) }}"
+  ansible.builtin.assert:
+    that:
+      - _pc.key_field | default('') is string and _pc.key_field | default('') | length > 0
+      - rh_bundle_dir is defined and rh_bundle_dir is string
+      - rh_bundle_dir is match(rh.controller.bootstrap.path_admission.regex)
+      - rh_bundle_dir is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+      - rh_bundle_dir.split('/') | length > 2
+      - >-
+        (rh_bundle_dir | basename) is not search((_pc.separator ~ _pc.infix ~ _pc.separator) | regex_escape
+        ~ (_pc.key_regex | regex_replace('^\^', '') | regex_replace('\$$', '')) ~ '$')
+    fail_msg: >-
+      REFUSED {{ _pc.refusal | default('RH-SCOPE-BINDING') }}: rh_bundle_dir {{ rh_bundle_dir | default('absent') }} must be
+      a normalized absolute path (host var of localhost; no default) whose basename is not itself a class sibling
+      (`<name>{{ _pc.separator | default('?') }}{{ _pc.infix | default('?') }}{{ _pc.separator | default('?') }}<key>`),
+      and the policy must declare bundle.per_class.
+    quiet: true
+
+- name: Refuse a controller resolve that is not the controller scope of a scoped deployment (RH-SCOPE-BINDING)
+  vars:
+    _r: "{{ lme_resolved.remote_harness | default({}) }}"
+    _pc: "{{ rh.controller.bootstrap.bundle.per_class }}"
+  ansible.builtin.assert:
+    that:
+      - _r.scope | default({}) == dict(kind='controller', id='localhost')
+      - _r.scopes_sha256 | default('') is match('^[0-9a-f]{64}$')
+      - _r.scopes | default(none) is mapping
+      - _r.scopes.controller | default(none) is mapping
+      - _r.scopes.controller.policy_sha256 | default('') == rh_config_revision
+      - _r.scopes.controller.policy | default(none) is mapping
+      - _r.scopes.targets | default(none) is mapping
+      - _r.scopes.targets | list | sort == (groups[rh.controller.bootstrap.inventory.target_group] | default([]) | unique | sort)
+      - _r.scopes.targets | dict2items | map(attribute='value') | reject('mapping') | list | length == 0
+      - _r.scopes.targets | dict2items | map(attribute='value') | map('list') | reject('contains', 'policy') | list | length == 0
+      - _r.scopes.targets | dict2items | map(attribute='value') | map(attribute='policy') | reject('mapping') | list | length == 0
+      - _r.binding | default(none) is mapping
+      - _r.binding.source_edition | default(none) is mapping
+      - _r.binding.source_edition.profile_sha256 | default('') == rh_profile_sha256
+      - _r.binding.source_edition.global_sha256 | default('') == (lookup('ansible.builtin.file', rh_repo_root ~ '/manifests/global.yml') | hash('sha256'))
+      - _r.binding.operation | default('') == rh.transfer.operation
+      # C1's published class key on every scope (never derived here)
+      - _r.scopes.controller[_pc.key_field] | default('') is match(_pc.key_regex)
+      - >-
+        _r.scopes.targets | dict2items | map(attribute='value') | map(attribute=_pc.key_field, default='')
+        | reject('match', _pc.key_regex) | list | length == 0
+    fail_msg: >-
+      REFUSED RH-SCOPE-BINDING on {{ inventory_hostname }}: the controller resolve is not the controller scope
+      {{ _r.scope | default('absent') }} of a deployment whose targets are the declared group members (every scope a
+      mapping with its policy and a well-formed {{ _pc.key_field }}), bound to this checkout's edition and the declared
+      operation.
+    quiet: true
+
+- name: Derive the deployment's artifact classes from C1's published class keys (derived output; no key is computed here)
+  vars:
+    _s: "{{ lme_resolved.remote_harness.scopes }}"
+    _pc: "{{ rh.controller.bootstrap.bundle.per_class }}"
+  ansible.builtin.set_fact:
+    rh_classes: >-
+      {%- set ck = _s.controller[_pc.key_field] -%}
+      {%- set tk = _s.targets | dict2items | map(attribute='value') | map(attribute=_pc.key_field) | unique | sort | reject('equalto', ck) | list -%}
+      {%- set ns = namespace(l=[]) -%}
+      {%- for k in [ck] + tk -%}
+      {%- set mem = _s.targets | dict2items | selectattr('value.' ~ _pc.key_field, 'equalto', k) | map(attribute='key') | sort | list -%}
+      {%- set ns.l = ns.l + [{'key': k, 'controller': k == ck, 'targets': mem,
+            'dir': rh_bundle_dir if k == ck else rh_bundle_dir ~ _pc.separator ~ _pc.infix ~ _pc.separator ~ k,
+            'policy': _s.controller.policy if k == ck else _s.targets[mem | first].policy}] -%}
+      {%- endfor -%}
+      {{ ns.l }}
+
+- name: List siblings that match the class rule (read-only; never mutated here or by any reap)
+  ansible.builtin.find:
+    paths: "{{ rh_bundle_dir | dirname }}"
+    patterns:
+      - "{{ (rh_bundle_dir | basename) ~ rh.controller.bootstrap.bundle.per_class.separator ~ rh.controller.bootstrap.bundle.per_class.infix ~ rh.controller.bootstrap.bundle.per_class.separator ~ '*' }}"
+    file_type: any
+    hidden: false
+    recurse: false
+    follow: false
+  register: _rh_cls_sib
+
+- name: Report undeclared class siblings (PRESERVED; ownership is the declared rule and this deployment's class set, never age)
+  ansible.builtin.debug:
+    msg: >-
+      {{ rh.controller.bootstrap.bundle.per_class.undeclared_marker }}
+      {{ _rh_cls_sib.files | map(attribute='path') | reject('in', rh_classes | map(attribute='dir') | list) | sort | list }}
+  when: _rh_cls_sib.files | map(attribute='path') | reject('in', rh_classes | map(attribute='dir') | list) | list | length > 0
