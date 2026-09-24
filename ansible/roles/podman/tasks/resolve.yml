@@ -52,31 +52,68 @@
     file: "{{ lme_manifests_dir }}/global.yml"
     name: _lme_global_file
 
-- name: Load active profile overlay
-  ansible.builtin.include_vars:
-    file: "{{ lme_manifests_dir }}/profiles/{{ lme_profile }}.yml"
-    name: _lme_profile_file
-
 # P2 -- BIND the loaded config facts to the declared SOURCE BYTES (codex-0915/0930). The
 # loader trusts _lme_global_file (the config registry + the material_catalog security
 # boundary) and _lme_profile_file, but both are include_vars FACTS and an extra-var OUTRANKS
 # include_vars: `-e _lme_global_file=<forged registry>` would replace the whole admitted
 # catalog/registry with an operator value, while every downstream check (the catalog-override
 # gate, the split-brain invariant below) reused that SAME overridable fact and agreed.
-# Independently re-read the two manifests from disk with an INLINE lookup (an expression, so
-# an extra-var cannot pin it) and assert the loaded facts EQUAL the declared file bytes. The
-# manifests are Jinja-free, so a whole-fact equality is exact. Fail-closed, pre-mutation.
+#
+# global.yml is Jinja-free: its fact is bound by whole-fact equality to an INLINE re-read of the
+# declared bytes (an expression; an extra-var cannot pin it). A PROFILE may carry Jinja that
+# include_vars renders lazily at each use (manifests/profiles/multinode.yml publish_ports read
+# fleet_*_bind_address / tailscale_serve_services), so a raw-bytes equality can never hold for it
+# (C1-MULTINODE-REAL-PATH, codex 021809) -- and a RENDERED comparison would admit a frozen forged
+# snapshot that matches at check time but not at the later composition. The profile fact is
+# therefore bound by PROVING THE LOAD TOOK EFFECT: an include_vars into _lme_profile_file is hidden
+# only by a higher-precedence binding of that name (extra-var, role/include param, set_fact).
+# (1) load the Jinja-free global.yml into the name as a SENTINEL and require the exact declared
+# bytes -- a pinned name still shows the pin; (2) load the declared profile into the same name;
+# (3) require the sentinel is gone -- a pin equal to the sentinel cannot move. The fact the loader
+# then reads IS the include_vars load of the declared profile path, still lazily rendered, so the
+# multinode/Tailscale route resolves exactly as authored. Re-entry safe (an include_vars overwrites
+# its own earlier load). Fail-closed, pre-mutation. Residual (unchanged from the raw-equality bind):
+# an -e LAZY template that observes play state could answer each check differently.
 - name: Bind the loaded config facts to the declared manifest bytes (fail-closed, pre-mutation)
   ansible.builtin.assert:
     that:
       - _lme_global_file == (lookup('ansible.builtin.file', lme_manifests_dir ~ '/global.yml') | from_yaml)
-      - _lme_profile_file == (lookup('ansible.builtin.file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | from_yaml)
     fail_msg: >-
-      the loaded global.yml / profile overlay fact does not match the declared manifest bytes
-      on disk -- an -e _lme_global_file / _lme_profile_file (or a tampered load) replaced the
-      admitted registry / material_catalog / profile with external state. The declared manifest
-      file is the sole authority for the config registry and the material security boundary
-      (C1-CATALOG-BOUND-TO-DECLARED-BYTES).
+      the loaded global.yml fact does not match the declared manifest bytes on disk -- an -e
+      _lme_global_file (or a tampered load) replaced the admitted registry / material_catalog with
+      external state. The declared manifest file is the sole authority for the config registry and
+      the material security boundary (C1-CATALOG-BOUND-TO-DECLARED-BYTES).
+    quiet: true
+
+- name: Prove the profile fact name is writable -- load the Jinja-free global manifest into it as a sentinel
+  ansible.builtin.include_vars:
+    file: "{{ lme_manifests_dir }}/global.yml"
+    name: _lme_profile_file
+
+- name: Refuse a profile fact the loader cannot write (sentinel must be the declared global bytes)
+  ansible.builtin.assert:
+    that:
+      - _lme_profile_file == (lookup('ansible.builtin.file', lme_manifests_dir ~ '/global.yml') | from_yaml)
+    fail_msg: >-
+      _lme_profile_file is bound outside the loader (an -e _lme_profile_file, a role/include param or a
+      set_fact outranks include_vars); the declared profile could not be loaded into it
+      (C1-CATALOG-BOUND-TO-DECLARED-BYTES, C1-MULTINODE-REAL-PATH).
+    quiet: true
+
+- name: Load active profile overlay
+  ansible.builtin.include_vars:
+    file: "{{ lme_manifests_dir }}/profiles/{{ lme_profile }}.yml"
+    name: _lme_profile_file
+
+- name: Refuse a profile fact the declared profile load did not replace (fail-closed, pre-mutation)
+  ansible.builtin.assert:
+    that:
+      - _lme_profile_file != (lookup('ansible.builtin.file', lme_manifests_dir ~ '/global.yml') | from_yaml)
+      - _lme_profile_file.profile_overlay is defined
+    fail_msg: >-
+      the profile fact still holds the sentinel (or no profile_overlay) after loading
+      {{ lme_manifests_dir }}/profiles/{{ lme_profile }}.yml -- the fact is pinned outside the loader
+      (C1-CATALOG-BOUND-TO-DECLARED-BYTES, C1-MULTINODE-REAL-PATH).
     quiet: true
 
 # --- C1 caller-input contract: capture pristine operator selections, compose, resolve ---
