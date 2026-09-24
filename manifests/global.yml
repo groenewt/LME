@@ -881,6 +881,124 @@ lme_config_registry:
     package_mapping: {families: packages.by_os_family, required: packages.required}
     inventory_var_path: controller.bootstrap.inventory
     inventory_vars: {root_var: lme_toolchain_root, owner_var: lme_toolchain_owner}
+    # C1-BOOTSTRAP-CONTRACT-VALUE-ADMISSION (codex-C1-four-contract-admission-audit-20260924-191117, MEDIUM; route
+    # codex-tick213-215-route-C1-caller-decisions-20260924-191017 (2)). The controller.bootstrap contracts the seed
+    # (controller_seed.j2), the route (reap_staging / package_bundle / admit_builder / target_bootstrap) and B consume are
+    # admitted HERE by shape, enum and reference -- at resolve, on the COMPOSED policy, before any mutation -- instead of
+    # failing at render (seed_launch.derive.home.tool: missing_tool used to resolve and only break at controller_seed.j2
+    # x(bs, dh.tool)). It widens nothing: every leaf below stays declaration-pinned (tunable_paths unchanged; a malformed
+    # profile declaration is REFUSED, never admitted by a wider allowlist), and references follow the composed policy,
+    # so an admitted os_tools.<t>.path/identity override keeps satisfying them. The enums are the consumers' closed
+    # vocabularies (the only branches the templates/tasks implement), never deployment values.
+    # Closed check vocabulary (lme_manifests.py _rh_admit_contracts; exactly one kind per check):
+    #   keys [..] exact key set | has_keys [..] required subset | enum [..] (type-exact) | positive_int
+    #   pattern <patterns name> (full match) | key_pattern <name> (every mapping key) | strings {nonempty, distinct}
+    #   within [policy paths]: every member of the value (a string; list elements; mapping keys) is a member of the
+    #     union of the referenced nodes (mapping keys, list elements, a scalar; '*' expands); having {field, contains}:
+    #     only mapping entries whose <field> list contains <contains> count (e.g. a tool the seed hash-admits)
+    #   ere fragment|anchored: a portable ERE (compiles; no backslash, newline, '|', '[:', '(?', lazy quantifier;
+    #     fragment: no '^'/'$' (it is composed inside ^...$); anchored: exactly the leading '^' and trailing '$');
+    #     sed_delimited: additionally no '/' (the fragment sits inside a sed s/.../.../ expression)
+    #   ere_compose [paths relative to the value]: '^' + the fragments concatenated + '$' compiles (the ONE grammar)
+    #   umask_yields <path relative to the contract root>: 0666 & ~value == that octal mode
+    #   not_in [names of lists of THIS schema]: the value is none of their members
+    # Modifier each: the check applies to every list element / mapping value. `path` is relative to the contract root
+    # ('' = the root); `at` is an absolute policy path. when_present: the contract applies only when that policy path
+    # is declared (genesis is declared on the m1-1g lineage only); otherwise its root is REQUIRED.
+    # derive.runtime / derive.names are pinned (enum) to the pointers controller_seed.j2 actually reads
+    # (bs.target_bootstrap.user_manager, bs.work_roots.run_local.user_manager_env): a resolvable but different pointer
+    # would be silently ignored by the template, so it refuses here; the pointed-to nodes are admitted by `at`.
+    contract_admission:
+      patterns:
+        env_name: '^[A-Z_][A-Z0-9_]*$'
+        var_name: '^[a-z_][a-z0-9_]*$'
+        refusal_code: '^RH-[A-Z0-9]+(-[A-Z0-9]+)*$'
+        mode_word: '^[a-z]+(-[a-z]+)*$'
+        rel_segment: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+        file_mode: '^0[0-7]{3}$'
+        lock_mode: '^0[0-7][0145][0145]$'          # never group/other-writable (lock_file.existing refuses those)
+        dir_mode: '^[0-7]{3,4}$'                    # stat %a form
+        uid_rule: '^/[^{}]*\{uid\}[^{}]*$'          # absolute, exactly one {uid} placeholder
+        literal_separator: '^[^\n\\/.\[\]()*+?{}|^$]+$'   # composed literally into ERE and sed: no metacharacter
+      contracts:
+        seed_launch:
+          root: controller.bootstrap.seed_launch
+          checks:
+            - {path: '', keys: [argv, mode_args, env, base_check, derive, scope_env, refusal, budget_refusal]}
+            - {path: argv, strings: {nonempty: true}}
+            - {path: mode_args, key_pattern: mode_word}
+            - {path: mode_args, each: true, strings: {}}
+            - {path: env, keys: [clear, order, base, inherited, carried]}
+            - {path: env.clear, enum: [true]}
+            - {path: env.order, strings: {nonempty: true, distinct: true}}
+            - {path: env.order, each: true, pattern: env_name}
+            - {at: controller.bootstrap.base_env, key_pattern: env_name}
+            - {path: env.base, enum: [base_env]}
+            - {path: env.inherited, key_pattern: env_name}
+            - {path: env.inherited, each: true, enum: [invoker_passwd_home]}
+            - {path: env.order, within: [controller.bootstrap.base_env, controller.bootstrap.seed_launch.env.inherited]}
+            - {path: env.inherited, within: [controller.bootstrap.seed_launch.env.order]}
+            - {path: env.carried, keys: [when, name_from]}
+            - {path: env.carried.when, keys: [mode, ssh_auth_agent]}
+            - {path: env.carried.when.mode, within: [controller.bootstrap.seed_launch.mode_args]}
+            - {path: env.carried.when.ssh_auth_agent, within: [controller.bootstrap.ssh_auth.modes.*.agent]}
+            - {path: env.carried.name_from, enum: ['ssh_auth.modes.<mode>.socket_env']}
+            - {path: base_check, enum: [exact]}
+            - {path: derive, keys: [home, runtime, names, caller_values]}
+            - {path: derive.home, keys: [tool, database, field]}
+            - {path: derive.home.tool, within: [controller.bootstrap.os_tools], having: {field: required_by, contains: seed}}
+            - {path: derive.home.database, enum: [passwd]}
+            - {path: derive.home.field, positive_int: true}
+            - {path: derive.runtime, enum: [target_bootstrap.user_manager]}
+            - {at: controller.bootstrap.target_bootstrap.user_manager, has_keys: [runtime_dir, runtime_dir_mode, bus]}
+            - {at: controller.bootstrap.target_bootstrap.user_manager.runtime_dir, pattern: uid_rule}
+            - {at: controller.bootstrap.target_bootstrap.user_manager.runtime_dir_mode, pattern: dir_mode}
+            - {at: controller.bootstrap.target_bootstrap.user_manager.bus, pattern: rel_segment}
+            - {path: derive.names, enum: [work_roots.run_local.user_manager_env]}
+            - {at: controller.bootstrap.work_roots.run_local.user_manager_env, keys: [runtime_dir_env, bus_env, user_env]}
+            - {at: controller.bootstrap.work_roots.run_local.user_manager_env, each: true, pattern: env_name}
+            - {path: derive.caller_values, enum: [refuse_if_different]}
+            - {path: scope_env, strings: {nonempty: true, distinct: true}}
+            - {path: scope_env, each: true, enum: [HOME, base_env, runtime_dir_env, bus_env]}
+            - {path: refusal, pattern: refusal_code}
+            - {path: budget_refusal, pattern: refusal_code}
+        lock_file:
+          root: controller.bootstrap.bundle.staging_retention.lease.lock_file
+          checks:
+            - {path: '', keys: [owner, mode, create_umask, create, existing, refusal]}
+            - {path: owner, enum: [acting_uid]}
+            - {path: mode, pattern: lock_mode}
+            - {path: create_umask, pattern: file_mode}
+            - {path: create_umask, umask_yields: mode}
+            - {path: create, enum: [append_open_if_absent]}
+            - {path: existing, keys: [regular_file, refuse_links, owner, refuse_group_other_writable]}
+            - {path: existing.regular_file, enum: [true]}
+            - {path: existing.refuse_links, enum: [true]}
+            - {path: existing.owner, enum: [acting_uid]}
+            - {path: existing.refuse_group_other_writable, enum: [true]}
+            - {path: refusal, pattern: refusal_code}
+        checksum_format:
+          root: controller.bootstrap.bundle.checksum_format
+          checks:
+            - {path: '', keys: [digest, separator, name, terminator]}
+            - {path: digest, ere: fragment, sed_delimited: true}
+            - {path: separator, pattern: literal_separator}
+            - {path: name, ere: fragment}
+            - {path: '', ere_compose: [digest, separator, name]}
+            - {path: terminator, enum: [newline]}
+        genesis_act:
+          root: controller.bootstrap.genesis.launch.stage_root
+          when_present: controller.bootstrap.genesis.launch
+          checks:
+            - {path: '', keys: [sub, rel, act]}
+            - {path: sub, within: [controller.bootstrap.work_roots.sub_roots]}
+            - {path: rel, pattern: rel_segment}
+            - {path: act, keys: [var, regex, match, created]}
+            - {path: act.var, pattern: var_name}
+            - {path: act.var, not_in: [reserved_outputs, resolver_outputs]}
+            - {path: act.regex, ere: anchored}
+            - {path: act.match, enum: [fullmatch]}
+            - {path: act.created, enum: [exclusive]}
     # Registry-owned now; a profile copy would be a parallel field (codex-232517): refused if still present.
     retired_policy_paths: [controller.immutable_fields, controller.bootstrap.derived_outputs]
     # Variable names the remote-harness route DERIVES (facts, registers, task/include vars). The route deletes its
@@ -892,7 +1010,13 @@ lme_config_registry:
     # +_ep (admit_transport endpoint list), -_addr (no longer derived) = 169; route r3g per-class publication
     # (coordinator relay, MAIN byte-verified; profile 977e6b2b, target_bootstrap 662db2f2, admit_transport c4dc19d7):
     # +17 (_rh_bnd_dir, _rh_cls_sib, rh_classes, rh_tb_xfer, _cls, _pc, _r, _s, rh_admit_{dir,key,lock,policy},
-    # rh_pub_{dir,key,lock,policy}, _rh_class = the package.yml / target_bootstrap.yml loop_var), -0 = 186.
+    # rh_pub_{dir,key,lock,policy}, _rh_class = the package.yml / target_bootstrap.yml loop_var), -0 = 186;
+    # codex-tick213-215 191017 (1) (route derived names of the codex 183510 wave: target_bootstrap _rh_tb_pw,
+    # reap_staging lock custody _rh_reap_lock / _rh_reap_lock_rb / rh_reap_sh / _lf, package_bundle _cf, admit_builder
+    # _act): +7 = 193. Task vars, register/set_fact and include parameters are NOT protection from extra-vars.
+    # rh_gen_act is NOT reserved: it is the genesis launch's EXTERNAL input (genesis.launch.stage_root.act.var); its
+    # declaration is admitted by contract_admission (var grammar, not a reserved/resolver output) and its VALUE by the
+    # route's admit_builder.yml (act.regex, fullmatch).
     # rh_tc_root / rh_tc_owner STAY reserved: both route call sites (resolve_harness.yml, target_bootstrap.yml)
     # DERIVE them as include vars from the declared inputs lme_toolchain_root / lme_toolchain_owner
     # (inventory.root_var / owner_var); an -e pin outranks include vars and would steer the receipt verifier to
@@ -923,7 +1047,8 @@ lme_config_registry:
       _ad, _ep, _rh_pkg_left, _rh_pkg_present, _rh_reap_cgev, _rh_reap_katlock, _rh_reap_sev, _rh_reap_uslice,
       _rh_tb_left, _rh_tb_present, _tg,
       _rh_bnd_dir, _rh_cls_sib, rh_classes, rh_tb_xfer, _cls, _pc, _r, _s, rh_admit_dir, rh_admit_key,
-      rh_admit_lock, rh_admit_policy, rh_pub_dir, rh_pub_key, rh_pub_lock, rh_pub_policy, _rh_class]
+      rh_admit_lock, rh_admit_policy, rh_pub_dir, rh_pub_key, rh_pub_lock, rh_pub_policy, _rh_class,
+      _rh_tb_pw, _rh_reap_lock, _rh_reap_lock_rb, rh_reap_sh, _lf, _cf, _act]
     # C1-TYPED-OUTPUT-REVISION (codex 022716) defence in depth: the names the C1 LOADER publishes (resolve.yml /
     # load_manifests.yml set_fact / include_vars / register). reserved_outputs omits them, so a route entry guard
     # did not refuse e.g. -e lme_resolved; the loader's type-aware read-back guards + lme_verify_resolved refuse
@@ -931,7 +1056,7 @@ lme_config_registry:
     # before any loader include in the run: set_facts persist per host across plays (site.yml / elasticsearch.yml
     # include the loader repeatedly), so a later play legitimately sees them -- there the loader read-backs are
     # the defence, not a `select('in', vars)` refusal. Kept SEPARATE from reserved_outputs (route-owned, exactly
-    # 186). Every name is an OUTPUT: the loader asserts none is a declared config field; declared caller inputs
+    # 193). Every name is an OUTPUT: the loader asserts none is a declared config field; declared caller inputs
     # (lme_profile, lme_manifests_dir, lme_inputs, lme_global_override, lme_service_overrides,
     # lme_runtime_inventory, the bare registry field names) are deliberately NOT listed and stay usable.
     resolver_outputs: [lme_resolved, lme_resolved_origins, lme_enable_flags, lme_resolved_revision,

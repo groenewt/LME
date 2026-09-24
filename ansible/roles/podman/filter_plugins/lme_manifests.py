@@ -2496,6 +2496,192 @@ def _rh_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+# C1-BOOTSTRAP-CONTRACT-VALUE-ADMISSION (codex 191117 / 191017): the closed check vocabulary of registry
+# remote_harness_schema.contract_admission. Generic: every contract, path, enum, pattern and reference is registry
+# DATA; this code names no contract, tool, env name or deployment value.
+_RH_CA_KINDS = frozenset(('keys', 'has_keys', 'enum', 'pattern', 'key_pattern', 'positive_int', 'strings', 'within',
+                          'ere', 'ere_compose', 'umask_yields', 'not_in'))
+_RH_CA_MODS = {'each': frozenset(('enum', 'pattern', 'strings', 'positive_int')),
+               'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',))}
+_RH_CA_ERE_BANNED = ('\\', '\n', '|', '[:', '(?', '*?', '+?', '??', '}?')
+
+
+def _rh_ca_same(a, b):
+    """Type-exact equality (True != 1; tagged strings compare as str)."""
+    return _rh_kind(a) == _rh_kind(b) and a == b
+
+
+def _rh_ca_members(x):
+    if isinstance(x, (dict, list)):
+        return list(x)
+    return [x]
+
+
+def _rh_ca_ere(v, form, sed):
+    """None when v is an admitted portable ERE of the declared form, else the reason."""
+    if not isinstance(v, str) or not v:
+        return 'must be a non-empty string'
+    bad = [t for t in _RH_CA_ERE_BANNED + (('/',) if sed else ()) if t in v]
+    if bad:
+        return 'contains %r (portable ERE: no backslash, newline, alternation, class name, extension or lazy quantifier%s)' % (
+            bad, '; sed-delimited: no /' if sed else '')
+    body = v
+    if form == 'anchored':
+        if len(v) < 2 or not v.startswith('^') or not v.endswith('$'):
+            return "must be anchored: exactly a leading '^' and a trailing '$'"
+        body = v[1:-1]
+    if '^' in body or '$' in body:
+        return "must carry no other '^' or '$' (%s)" % ('an anchored ERE is anchored once' if form == 'anchored' else 'a fragment is composed inside ^...$')
+    try:
+        re.compile(v)
+    except re.error as e:
+        return 'does not compile: %s' % (e,)
+    return None
+
+
+def _rh_ca_registry(ca, schema):
+    """The registry declaration contract_admission, shape-checked (fail-closed: admission can never be disabled or
+    weakened by a malformed or missing registry entry). Returns ({pattern name: compiled}, contracts)."""
+    if not isinstance(ca, dict) or set(ca) != {'patterns', 'contracts'} or not isinstance(ca['patterns'], dict) \
+            or not isinstance(ca['contracts'], dict) or not ca['contracts']:
+        raise ValueError('lme: registry remote_harness_schema.contract_admission must declare {patterns, contracts} (bootstrap contract admission is fail-closed); got %r' % (ca,))
+    pats = {}
+    for n in sorted(ca['patterns']):
+        p = ca['patterns'][n]
+        try:
+            pats[n] = re.compile(p) if isinstance(p, str) and p else None
+        except re.error:
+            pats[n] = None
+        if pats[n] is None:
+            raise ValueError('lme: registry contract_admission.patterns.%s must be a compilable regex; got %r' % (n, p))
+    strs = lambda a: isinstance(a, list) and bool(a) and all(isinstance(x, str) and x for x in a)
+    for cname in sorted(ca['contracts']):
+        c = ca['contracts'][cname]
+        if not isinstance(c, dict) or not {'root', 'checks'} <= set(c) or set(c) - {'root', 'checks', 'when_present'} \
+                or not isinstance(c['root'], str) or not c['root'] or not isinstance(c['checks'], list) or not c['checks'] \
+                or ('when_present' in c and (not isinstance(c['when_present'], str) or not c['when_present'])):
+            raise ValueError('lme: registry contract_admission.contracts.%s must be {root, checks[, when_present]}; got %r' % (cname, c))
+        for i, chk in enumerate(c['checks']):
+            locs = [k for k in ('path', 'at') if isinstance(chk, dict) and k in chk]
+            kinds = [k for k in chk if k in _RH_CA_KINDS] if isinstance(chk, dict) else []
+            mods = [k for k in chk if k in _RH_CA_MODS] if isinstance(chk, dict) else []
+            if not isinstance(chk, dict) or len(locs) != 1 or not isinstance(chk[locs[0]], str) \
+                    or (locs[0] == 'at' and not chk['at']) or len(kinds) != 1 or set(chk) - set(locs) - set(kinds) - set(mods):
+                raise ValueError('lme: registry contract_admission.contracts.%s.checks[%d] must carry exactly one of path/at, exactly one check kind of %s and only the modifiers %s; got %r' % (
+                    cname, i, sorted(_RH_CA_KINDS), sorted(_RH_CA_MODS), chk))
+            kind, arg = kinds[0], chk[kinds[0]]
+            ok = {'keys': strs(arg), 'has_keys': strs(arg), 'within': strs(arg), 'ere_compose': strs(arg),
+                  'enum': isinstance(arg, list) and bool(arg),
+                  'pattern': isinstance(arg, str) and arg in pats, 'key_pattern': isinstance(arg, str) and arg in pats,
+                  'positive_int': arg is True,
+                  'strings': isinstance(arg, dict) and not set(arg) - {'nonempty', 'distinct'} and all(isinstance(x, bool) for x in arg.values()),
+                  'ere': arg in ('fragment', 'anchored'),
+                  'umask_yields': isinstance(arg, str) and bool(arg),
+                  'not_in': strs(arg) and all(isinstance(schema.get(n), list) for n in arg)}[kind]
+            for m in mods:
+                ok = ok and kind in _RH_CA_MODS[m] and (
+                    isinstance(chk[m], dict) and set(chk[m]) == {'field', 'contains'} and all(isinstance(x, str) and x for x in chk[m].values())
+                    if m == 'having' else isinstance(chk[m], bool))
+            if not ok:
+                raise ValueError('lme: registry contract_admission.contracts.%s.checks[%d] %s argument/modifiers are malformed; got %r' % (cname, i, kind, chk))
+    return pats, ca['contracts']
+
+
+def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
+    """One admission check of subject s; None when admitted, else the reason."""
+    if kind in ('keys', 'has_keys'):
+        if not isinstance(s, dict):
+            return 'must be a mapping'
+        miss, extra = sorted(set(arg) - set(s)), sorted(set(s) - set(arg))
+        if miss or (kind == 'keys' and extra):
+            return 'key set must be %s %s (missing %s%s)' % ('exactly' if kind == 'keys' else 'at least', sorted(arg), miss,
+                                                             ', undeclared %s' % (extra,) if kind == 'keys' else '')
+        return None
+    if kind == 'enum':
+        return None if any(_rh_ca_same(s, e) for e in arg) else 'must be one of %r' % (arg,)
+    if kind == 'pattern':
+        return None if isinstance(s, str) and pats[arg].fullmatch(s) else 'must fully match patterns.%s %r' % (arg, pats[arg].pattern)
+    if kind == 'key_pattern':
+        if not isinstance(s, dict):
+            return 'must be a mapping'
+        bad = sorted(str(k) for k in s if not isinstance(k, str) or not pats[arg].fullmatch(k))
+        return 'keys %s must fully match patterns.%s %r' % (bad, arg, pats[arg].pattern) if bad else None
+    if kind == 'positive_int':
+        return None if _rh_int(s) and s >= 1 else 'must be an integer >= 1'
+    if kind == 'strings':
+        if not isinstance(s, list) or any(not isinstance(x, str) for x in s):
+            return 'must be a list of strings'
+        if arg.get('nonempty') and not s:
+            return 'must be non-empty'
+        if arg.get('distinct') and len(set(s)) != len(s):
+            return 'must hold distinct entries'
+        return None
+    if kind == 'within':
+        allowed, hv = [], chk.get('having')
+        for ref in arg:
+            nodes = _rh_expand(pol, ref)
+            if not nodes:
+                return 'references %s, which the policy does not declare (missing dependency)' % (ref,)
+            for _p, node in nodes:
+                if isinstance(node, dict):
+                    allowed.extend(k for k in node if hv is None or (
+                        isinstance(node[k], dict) and isinstance(node[k].get(hv['field']), list) and hv['contains'] in node[k][hv['field']]))
+                elif isinstance(node, list):
+                    allowed.extend(node)
+                else:
+                    allowed.append(node)
+        miss = [m for m in _rh_ca_members(s) if isinstance(m, (dict, list)) or not any(_rh_ca_same(m, a) for a in allowed)]
+        return 'names %r outside %s%s (missing dependency)' % (miss, arg, ' with %s containing %r' % (hv['field'], hv['contains']) if hv else '') if miss else None
+    if kind == 'ere':
+        return _rh_ca_ere(s, arg, chk.get('sed_delimited', False))
+    if kind == 'ere_compose':
+        parts = [_rh_get(s, p) if isinstance(s, dict) else (False, None) for p in arg]
+        if any(not f or not isinstance(v, str) for f, v in parts):
+            return 'must declare %s as strings' % (arg,)
+        try:
+            re.compile('^' + ''.join(v for _f, v in parts) + '$')
+        except re.error as e:
+            return 'the composed ^%s$ does not compile: %s' % ('+'.join(arg), e)
+        return None
+    if kind == 'umask_yields':
+        fm, mode = _rh_get(pol, root + '.' + arg)
+        octal = re.compile('^0?[0-7]{3}$')
+        if not (isinstance(s, str) and octal.match(s) and fm and isinstance(mode, str) and octal.match(mode)):
+            return 'and %s must both be octal modes' % (arg,)
+        return None if (0o666 & ~int(s, 8)) == int(mode, 8) else '0666 & ~%s = %04o, not the declared %s %s' % (s, 0o666 & ~int(s, 8), arg, mode)
+    if kind == 'not_in':
+        hit = [n for n in arg if s in schema[n]]
+        return 'is a registry %s name (a route/loader OUTPUT, never an external input)' % (hit,) if hit else None
+    return 'unknown check kind'
+
+
+def _rh_admit_contracts(pol, schema, key):
+    """C1-BOOTSTRAP-CONTRACT-VALUE-ADMISSION: shape, enum and reference admission of every registry-declared
+    controller.bootstrap contract on the COMPOSED policy, at resolve, before any mutation. Raises on the first
+    refusal (named by the policy path, the contract and the check kind)."""
+    pats, contracts = _rh_ca_registry(schema.get('contract_admission'), schema)
+    for cname in sorted(contracts):
+        c = contracts[cname]
+        if 'when_present' in c and not _rh_get(pol, c['when_present'])[0]:
+            continue
+        fr, rv = _rh_get(pol, c['root'])
+        if not fr or not isinstance(rv, dict):
+            raise ValueError('lme: %s.%s must be a declared mapping (contract_admission.%s); got %r' % (key, c['root'], cname, rv if fr else '<absent>'))
+        for chk in c['checks']:
+            kind = [k for k in chk if k in _RH_CA_KINDS][0]
+            dotted = chk['at'] if 'at' in chk else '.'.join(p for p in (c['root'], chk['path']) if p)
+            found, v = _rh_get(pol, dotted)
+            why = 'is not declared' if not found else None
+            if why is None:
+                subjects = (list(v.values()) if isinstance(v, dict) else v if isinstance(v, list) else None) if chk.get('each') else [v]
+                if subjects is None:
+                    why = 'must be a list or mapping (each)'
+                for sub in subjects or []:
+                    why = why or _rh_ca_check(kind, chk[kind], sub, chk, pol, pats, schema, c['root'])
+            if why:
+                raise ValueError('lme: %s.%s fails contract_admission.%s (%s): %s; got %r' % (key, dotted, cname, kind, why, v))
+
+
 def _rh_validate(composed, declared, override, schema):
     key = schema['policy_key']
     ov = (override or {}).get(key) if isinstance(override, dict) else None
@@ -2568,6 +2754,9 @@ def _rh_validate(composed, declared, override, schema):
         if spec is None or not isinstance(val, str) or not re.match(spec['value_pattern'], val) \
                 or set(ident) != {'kind', spec['value_field']}:
             raise ValueError('lme: %s.%s.%s.%s must be {kind: <one of %s>, <value>} (executable identity); got %r' % (key, ei['entries'], tool, ei['field'], sorted(ei['kinds']), ident))
+    # C1-BOOTSTRAP-CONTRACT-VALUE-ADMISSION (codex 191117): the registry-declared bootstrap contracts and their
+    # references (executables, env names, sub_roots keys, ERE/format fields) on the composed policy, before any mutation.
+    _rh_admit_contracts(pol, schema, key)
     for dotted in schema['positive_int_paths']:
         f, v = _rh_get(pol, dotted)
         if not f or not _rh_int(v) or v < 1:
