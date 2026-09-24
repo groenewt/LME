@@ -231,13 +231,16 @@ case "$_iavail" in ''|*[!0-9]*) lme_refuse {{ a.refusal }} "free inodes unreadab
 {% set ns = namespace(d=[]) %}
 {% for s in w.run_env | map(attribute='sub') | unique %}{% set ns.d = ns.d + [w.sub_roots[s]] %}{% endfor %}
 {% for e in w.run_env | selectattr('kind', 'equalto', 'dir') %}{% set ns.d = ns.d + [w.sub_roots[e.sub] ~ '/' ~ e.rel] %}{% endfor %}
-{% for r in [w.engine_storage_conf.graphroot_rel, w.engine_storage_conf.runroot_rel] %}{% set ns.d = ns.d + [w.sub_roots.engine_storage ~ '/' ~ r] %}{% endfor %}
+{% for r in [w.engine_storage_conf.graphroot_rel, w.engine_storage_conf.runroot_rel, w.engine_containers_conf.image_copy_tmp_rel] %}{% set ns.d = ns.d + [w.sub_roots.engine_storage ~ '/' ~ r] %}{% endfor %}
 for _wd in {% for d in ns.d %}"${{ var }}/"{{ shq(d) }}{% if not loop.last %} {% endif %}{% endfor %}; do
   [ ! -L "$_wd" ] || lme_refuse {{ w.admission.refusal }} "$_wd is a link"
   [ -d "$_wd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_wd" || lme_refuse {{ w.admission.refusal }} "cannot create $_wd"
 done
 {% for e in w.run_env | selectattr('kind', 'equalto', 'engine_storage_conf') %}
 printf '[storage]\nrunroot = "%s"\ngraphroot = "%s"\n' "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_storage_conf.runroot_rel) }} "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_storage_conf.graphroot_rel) }} > "${{ var }}/"{{ shq(w.sub_roots[e.sub] ~ '/' ~ e.rel) }} || lme_refuse {{ w.admission.refusal }} "cannot write the engine storage.conf under ${{ var }}"
+{% endfor %}
+{% for e in w.run_env | selectattr('kind', 'equalto', 'engine_containers_conf') %}
+printf '[engine]\nimage_copy_tmp_dir = "%s"\n' "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_containers_conf.image_copy_tmp_rel) }} > "${{ var }}/"{{ shq(w.sub_roots[e.sub] ~ '/' ~ e.rel) }} || lme_refuse {{ w.admission.refusal }} "cannot write the engine containers.conf under ${{ var }}"
 {% endfor %}
 {%- endmacro -%}
 
@@ -581,9 +584,67 @@ _foreign=$({{ x(bs, 'find') }} -P "$R" ! -user "$_uid" -print -quit 2>&1) || lme
 [ -z "$_foreign" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "purge refused before any removal; entry not owned by uid $_uid (all preserved): $_foreign"
 {%- endmacro -%}
 
+{#- ---- RUN-LOCAL (work_roots.run_local): the runner is selected ONLY by declared key; after -- only the declared
+     arg_flags <value> pairs are admitted (no playbook, inventory or connection can be passed) ---- -#}
+{%- macro run_local_args(bs) -%}
+{% set rl = bs.work_roots.run_local %}
+_rl_pb=''; _rl_dir=''; _rl_var=''
+if [ "$MODE" = {{ shq(rl.mode) }} ]; then
+  case "$RUNNER" in
+{% for k, d in rl.runners | dictsort %}
+    {{ shq(k) }}) _rl_pb={{ shq(d.playbook) }}; _rl_dir={{ shq(bs.work_roots.runners[k]) }}; _rl_var={{ shq(d.work_root_var) }} ;;
+{% endfor %}
+    '') lme_refuse RH-SEED-USAGE {{ shq(rl.mode ~ ' needs --runner <key> (no default): ' ~ (rl.runners | list | sort | join(', '))) }} ;;
+    *) lme_refuse RH-SEED-USAGE "unknown runner key: $RUNNER" ;;
+  esac
+  _pair=''
+  for _a in "$@"; do
+    if [ -n "$_pair" ]; then _pair=''; continue; fi
+    case "$_a" in
+      {% for f in rl.arg_flags %}{{ shq(f) }}{% if not loop.last %}|{% endif %}{% endfor %}) _pair=1 ;;
+      *) lme_refuse RH-SEED-USAGE "{{ rl.mode }} accepts only {{ rl.arg_flags | join('/') }} <value> pairs after --, not: $_a" ;;
+    esac
+  done
+  [ -z "$_pair" ] || lme_refuse RH-SEED-USAGE "{{ rl.mode }}: {{ rl.arg_flags | join('/') }} without a value"
+else
+  [ -z "$RUNNER" ] || lme_refuse RH-SEED-USAGE "--runner applies to {{ rl.mode }} only"
+fi
+{%- endmacro -%}
+
+{#- RUN-LOCAL exec (inside the verify/run block, after the W admission and the run dir): the checkout is the work
+    root's parent (the work root must be named root_rel); the runner's evidence dir <W>/<run>/<runners.key> is created
+    and passed LAST as its work_root_var; connection local is forced; the owner's user manager env is derived here
+    (never carried from the caller); LME_SEED_SCOPED is NOT passed (a seed the runner calls enters its own scope). -#}
+{%- macro run_local_exec(bs) -%}
+{% set wr = bs.work_roots %}
+{% set rl = wr.run_local %}
+{% set um = bs.target_bootstrap.user_manager %}
+{% set rt = um.runtime_dir.split('{uid}') %}
+case "${W##*/}" in {{ shq(wr.root_rel) }}) : ;; *) lme_refuse RH-SEED-USAGE "{{ rl.mode }} needs --root <checkout>/{{ wr.root_rel }}/{{ wr.sub_roots.toolchain }}; the work root $W is not named {{ wr.root_rel }}" ;; esac
+_co=${W%/*}
+[ -n "$_co" ] || lme_refuse RH-SEED-USAGE "the work root $W has no checkout parent"
+_pb="$_co/$_rl_pb"
+[ -f "$_pb" ] && [ ! -L "$_pb" ] || lme_refuse RH-SEED-USAGE "runner $RUNNER: $_pb is not a regular file"
+_ev="$W/"{{ shq(wr.sub_roots.run) }}"/$_rl_dir"
+for _wd in "$W/"{{ shq(wr.sub_roots.run) }} "$_ev"; do
+  [ ! -L "$_wd" ] || lme_refuse {{ wr.admission.refusal }} "$_wd is a link"
+  [ -d "$_wd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_wd" || lme_refuse {{ wr.admission.refusal }} "cannot create $_wd"
+done
+_xrd={{ shq(rt[0]) }}"$_uid"{{ shq(rt[1] if rt | length > 1 else '') }}
+[ -d "$_xrd" ] && [ ! -L "$_xrd" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$_xrd")" = "$_uid" ] || lme_refuse RH-SEED-USAGE "the user manager runtime dir $_xrd is not an owned directory (no user manager for uid $_uid)"
+[ -S "$_xrd/"{{ shq(um.bus) }} ] || lme_refuse RH-SEED-USAGE "no user manager bus socket at $_xrd/{{ um.bus }}"
+_user=$({{ x(bs, 'id') }} -un) || lme_refuse RH-SEED-USAGE 'cannot read the account name'
+case "$_user" in ''|*[!A-Za-z0-9._-]*) lme_refuse RH-SEED-USAGE "unadmitted account name: $_user" ;; esac
+[ -z "$_rl_var" ] || set -- "$@" {{ shq(rl.arg_flags | first) }} "$_rl_var=$_ev"
+set -- "$@" {{ shq(rl.arg_flags | first) }} {{ shq('ansible_connection=' ~ rl.connection) }}
+{{ managed_env(bs, '$_run/ansible-home', '$_run/tmp') }} {{ work_env(bs, 'W') }} {{ rl.user_manager_env.runtime_dir_env }}="$_xrd" {{ rl.user_manager_env.bus_env }}="unix:path=$_xrd/"{{ shq(um.bus) }} {{ rl.user_manager_env.user_env }}="$_user" "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" -i {{ shq(rl.inventory) }} -c {{ shq(rl.connection) }} "$_pb" "$@" 9<&-
+exit $?
+{%- endmacro -%}
+
 {#- ---- the complete seed ---- -#}
 {%- macro seed(bs, ctl, lock) -%}
 {% set ssh_auth = bs.ssh_auth %}
+{% set rlm = bs.work_roots.run_local.mode %}
 #!/bin/sh
 # GENERATED by testing/remote_harness/package.yml from testing/remote_harness/templates/lme-controller-seed.sh.j2,
 # manifests/profiles/remote-harness.yml (remote_harness.controller) and {{ cmt(ctl.lock_file_rel) }}.
@@ -602,6 +663,9 @@ _foreign=$({{ x(bs, 'find') }} -P "$R" ! -user "$_uid" -print -quit 2>&1) || lme
 #   lme-controller-seed.sh purge  --root <owned-root> --confirm <owned-root>
 #   lme-controller-seed.sh run    --root <owned-root> --ssh-auth <mode> -- <ansible-playbook arguments>
 #   (mode: one of remote_harness.ssh_auth.modes; no default; agent mode carries a validated SSH_AUTH_SOCK)
+#   lme-controller-seed.sh {{ bs.work_roots.run_local.mode }} --root <work root>/{{ bs.work_roots.sub_roots.toolchain }} --runner <key> [-- {{ bs.work_roots.run_local.arg_flags | first }} <value> ...]
+#   (key: one of {{ bs.work_roots.run_local.runners | list | sort | join(', ') }}; inventory {{ bs.work_roots.run_local.inventory }}
+#   connection {{ bs.work_roots.run_local.connection }}; no --ssh-auth; only {{ bs.work_roots.run_local.arg_flags | join('/') }} <value> pairs after --)
 # Every mode runs inside the declared budget scope and holds an exclusive lock on the root (busy -> RH-SEED-BUSY).
 # apply: complete generation for THIS seed -> verify + republish (UNCHANGED); incomplete generation recorded by this
 #        seed in {{ cmt(bs.layout.operations_log) }} -> moved to {{ cmt(bs.layout.abandoned_dir) }}/ and removed, then install; unrecorded
@@ -624,21 +688,23 @@ LME_PINS={{ shq(pins_table(bs, ctl, lock) | trim) }}
 [ "$({{ x(bs, 'id') }} -u)" != 0 ] || lme_refuse RH-SEED-PRIVILEGED 'the seed never runs as root'
 case "${HOME:-}" in /*) : ;; *) lme_refuse RH-SEED-USAGE 'HOME must be an absolute path' ;; esac
 MODE=${1:-}; [ $# -gt 0 ] && shift
-R=''; CONFIRM=''; SSH_AUTH=''
+R=''; CONFIRM=''; SSH_AUTH=''; RUNNER=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --root) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--root needs a value'; R=$2; shift 2 ;;
+    --runner) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--runner needs a value'; RUNNER=$2; shift 2 ;;
     --confirm) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--confirm needs a value'; CONFIRM=$2; shift 2 ;;
     --ssh-auth) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--ssh-auth needs a value'; SSH_AUTH=$2; shift 2 ;;
     --) shift; break ;;
     *) lme_refuse RH-SEED-USAGE "unknown argument: $1" ;;
   esac
 done
-case "$MODE" in apply|verify|purge) [ $# -eq 0 ] || lme_refuse RH-SEED-USAGE "$MODE takes no arguments after --" ;; run) : ;; *) lme_refuse RH-SEED-USAGE 'mode must be apply, verify, purge or run' ;; esac
+case "$MODE" in apply|verify|purge) [ $# -eq 0 ] || lme_refuse RH-SEED-USAGE "$MODE takes no arguments after --" ;; run|{{ rlm }}) : ;; *) lme_refuse RH-SEED-USAGE 'mode must be apply, verify, purge, run or {{ rlm }}' ;; esac
 [ -n "$R" ] || lme_refuse RH-SEED-USAGE '--root is required (no default)'
 {{ path_arg_check(bs, 'R', '--root') }}
 [ "$MODE" != purge ] || [ "$CONFIRM" = "$R" ] || lme_refuse RH-SEED-USAGE 'purge needs --confirm equal to --root'
 {{ ssh_auth_check(bs, ssh_auth) }}
+{{ run_local_args(bs) }}
 {{ combination_check(bs, ctl) }}
 {{ os_tool_checks(bs) }}
 {{ platform_check(bs) }}
@@ -650,12 +716,13 @@ A="${SELF%/*}/{{ bs.bundle.artifacts_dir }}"
 case "$MODE" in
   purge) set -- "$MODE" --root "$R" --confirm "$CONFIRM" ;;
   run) set -- "$MODE" --root "$R" --ssh-auth "$SSH_AUTH" -- "$@" ;;
+  {{ rlm }}) set -- "$MODE" --root "$R" --runner "$RUNNER" -- "$@" ;;
   *) set -- "$MODE" --root "$R" -- ;;
 esac
 {{ budget_enter(bs) }}
 case "$MODE" in
   purge) set -- ;;
-  run) shift 5; [ "${1:-}" != -- ] || shift ;;
+  run|{{ rlm }}) shift 5; [ "${1:-}" != -- ] || shift ;;
   *) shift 3; [ "${1:-}" != -- ] || shift ;;
 esac
 
@@ -672,7 +739,7 @@ G="$R/{{ bs.layout.generations_dir }}/$GEN_ID"
 if [ "$ROOT_STATE" = absent ]; then
   case "$MODE" in
     purge) printf 'ABSENT %s\n' "$R"; exit 0 ;;
-    verify|run) lme_refuse RH-SEED-GENERATION-DRIFT "no root $R" ;;
+    verify|run|{{ rlm }}) lme_refuse RH-SEED-GENERATION-DRIFT "no root $R" ;;
   esac
   lme_bundle_check
   # SEED2-EARLY-INTERRUPTION: the root becomes visible only WITH its marker (staging dir + one rename).
@@ -733,7 +800,7 @@ if [ "$MODE" = purge ]; then
   exit 0
 fi
 
-if [ "$MODE" = verify ] || [ "$MODE" = run ]; then
+if [ "$MODE" = verify ] || [ "$MODE" = run ] || [ "$MODE" = {{ rlm }} ]; then
   lme_verify_content
   lme_verify_published
   if [ "$MODE" = verify ]; then
@@ -755,6 +822,9 @@ if [ "$MODE" = verify ] || [ "$MODE" = run ]; then
   {{ work_root_prepare(bs, 'W') | indent(2) }}
   _run=$({{ x(bs, 'mktemp') }} -d "$_rd/$UTC.XXXXXXXX") || lme_refuse RH-SEED-STORAGE "cannot create a run directory under $_rd"
   {{ x(bs, 'mkdir') }} -- "$_run/ansible-home" "$_run/tmp" || lme_refuse RH-SEED-STORAGE "cannot create $_run"
+  if [ "$MODE" = {{ rlm }} ]; then
+    {{ run_local_exec(bs) | indent(4) }}
+  fi
   # the lock (fd 9) stays held BY THIS PROCESS for the whole playbook run (no concurrent apply/purge can swap the
   # generation); the playbook gets fd 9 CLOSED, so ssh ControlPersist masters it spawns never retain the lock
   # Q-D12 (codex-001716): the playbook inherits THIS run's budget scope (LME_SEED_SCOPED=1); a seed it invokes

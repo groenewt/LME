@@ -534,6 +534,42 @@ profile_overlay:
               transfer_controls: transfer-controls
               loader_integration: loader-integration
               acceptance: acceptance
+              transfer_check: transfer-check
+            # RUN-LOCAL (MAIN-approved launcher for the local runners; codex 135500 / 135903): the SAME generated seed
+            #   lme-controller-seed.sh run-local --root <work root>/<sub_roots.toolchain> --runner <runners key> [-- -e <v> ...]
+            # runs ONE declared runner playbook with the generation's ansible-playbook, inventory `localhost,` and
+            # connection local (forced: -c local AND a final -e ansible_connection=local, after the caller's -e). It
+            # takes no --ssh-auth. It performs the same verify, run-dir retention, work-root admission (prefix, fs type,
+            # bytes, inodes) and sub-root preparation as `run`, execs under the same managed_env + run_env, creates
+            # <work root>/<sub_roots.run>/<runners.<key>> and passes it as the runner's work_root_var (last -e, so it
+            # wins), and propagates the playbook's exit status (exit $?). The playbook is selected ONLY by runner key
+            # (<checkout>/<playbook>, where <checkout> is the work root's parent and the work root's basename must be
+            # root_rel); after `--` only `-e`/`--extra-vars <value>` pairs (arg_flags) are accepted, so no arbitrary
+            # playbook, inventory or connection can be passed.
+            # The playbook env carries NO LME_SEED_SCOPED: a seed a runner invokes enters its OWN declared budget scope.
+            # The runner itself runs inside this seed's budget scope (controller.bootstrap.budget).
+            # user_manager: the runner env carries the owner's systemd user manager -- XDG_RUNTIME_DIR =
+            # target_bootstrap.user_manager.runtime_dir with {uid} = `id -u` (an owned, non-link directory) and
+            # DBUS_SESSION_BUS_ADDRESS = unix:path=<that>/<user_manager.bus> (a socket) -- derived by the seed, never
+            # carried from the caller; plus USER = `id -un`. XDG_RUNTIME_DIR is the user-manager runtime dir (tmpfs
+            # by design, runtime state only), NOT a work location: moving it to the work root would sever
+            # systemd-run --user and rootless podman's systemd/cgroup and lock state.
+            # BOOTSTRAP EXCEPTION (the ONE disclosed one): the FIRST testing/remote_harness/package.yml build runs
+            # under the declared genesis builder (/usr/bin/ansible-playbook, genesis.builder) WITHOUT this launcher,
+            # because the seed is that build's product; its temp is the invoker's environment. Every later runner in
+            # `runners` goes through run-local.
+            run_local:
+              mode: run-local
+              inventory: 'localhost,'
+              connection: local
+              arg_flags: ['-e', '--extra-vars']
+              user_manager_env: {runtime_dir_env: XDG_RUNTIME_DIR, bus_env: DBUS_SESSION_BUS_ADDRESS, user_env: USER}
+              runners:
+                remote_harness_controls: {playbook: testing/remote_harness/tests/run_controls.yml, work_root_var: rhc_work_root}
+                transfer_controls: {playbook: testing/e2e/transfer/controls/run_controls.yml, work_root_var: work_root}
+                transfer_check: {playbook: testing/e2e/transfer/check.yml, work_root_var: ''}
+                loader_integration: {playbook: testing/tests/loader_integration/run_integration.yml, work_root_var: work_root}
+                acceptance: {playbook: testing/acceptance/run_acceptance.yml, work_root_var: work_root}
             # names the seed `run` binds from the work root (sub_root + relative dir); the per-run temp names
             # (TMPDIR, ANSIBLE_LOCAL_TEMP, ANSIBLE_HOME, ANSIBLE_GALAXY_CACHE_DIR) stay in the run dir (managed_env).
             run_env:
@@ -542,9 +578,17 @@ profile_overlay:
               - {name: PIP_CACHE_DIR, sub: cache, rel: pip, kind: dir}
               - {name: XDG_DATA_HOME, sub: engine_storage, rel: xdg-data, kind: dir}
               - {name: CONTAINERS_STORAGE_CONF, sub: engine_storage, rel: storage.conf, kind: engine_storage_conf}
+              - {name: CONTAINERS_CONF, sub: engine_storage, rel: containers.conf, kind: engine_containers_conf}
             # rootless engine storage: the seed writes <engine_storage>/storage.conf (only these keys) so graphroot and
             # runroot are on the work root, not $XDG_RUNTIME_DIR or /tmp/storage-run-<uid> (the env -i default)
             engine_storage_conf: {graphroot_rel: graph, runroot_rel: runroot}
+            # rootless engine config: the seed writes <engine_storage>/containers.conf with ONLY [engine]
+            # image_copy_tmp_dir = <engine_storage>/<image_copy_tmp_rel> (the /var/tmp default of image pulls/copies moves
+            # to the work root; TMPDIR = the run tmp covers the same path). CONTAINERS_CONF makes this the only
+            # containers.conf read (built-in defaults otherwise). [engine] tmp_dir is NOT moved: it is libpod runtime
+            # state under XDG_RUNTIME_DIR (tmpfs by design, reboot detection). UNVERIFIED against the installed podman
+            # (nothing was run): an engine that ignores the key keeps /var/tmp -> listed unresolved until observed.
+            engine_containers_conf: {image_copy_tmp_rel: image-copy}
             admission:
               refused_prefixes: [/tmp/, /var/tmp/, /dev/shm/, /run/]
               refused_fs_types: [tmpfs, ramfs]
