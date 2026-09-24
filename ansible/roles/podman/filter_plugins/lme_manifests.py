@@ -2530,12 +2530,31 @@ def _rh_validate(composed, declared, override, schema):
         f, pk = _rh_get(adecl, pl)
         if f:
             _pkg_check(pk, '%s.%s.%s' % (ad['members'], sel, pl))
+    # CANONICAL-TOOL-OVERRIDES (codex-tick144): an adapter's executables are NAMED here (keys of
+    # executable_identity.entries) and never re-declared; their location and identity DERIVE from the same
+    # effective entries, so one admitted override reaches every consumer. A declared copy is refused.
+    derived = {}
+    for tm in ad['tool_maps']:
+        f, tmap = _rh_get(adecl, tm)
+        if not f:
+            continue
+        if not isinstance(tmap, dict) or any(not isinstance(v, dict) for v in tmap.values()):
+            raise ValueError('lme: %s adapter %s.%s must map executable names to mappings' % (key, sel, tm))
+        outside = sorted(t for t in tmap if t not in entries)
+        if outside:
+            raise ValueError('lme: %s adapter %s.%s names executables outside %s.%s: %s (missing dependency)' % (key, sel, tm, key, ei['entries'], outside))
+        for t in sorted(tmap):
+            dup = sorted(k for k in tmap[t] if k in ad['derived_tool_fields'])
+            if dup:
+                raise ValueError('lme: %s adapter %s.%s.%s declares %s; these DERIVE from %s.%s.%s (one source; a copy would diverge from an admitted override)' % (key, sel, tm, t, dup, key, ei['entries'], t))
+        derived[tm] = {t: dict(tmap[t], **{k: entries[t][k] for k in ad['derived_tool_fields']}) for t in sorted(tmap)}
     fi, inv = _rh_get(pol, schema['inventory_var_path'])
     for name, want in sorted(schema['inventory_vars'].items()):
         got = inv.get(name) if fi and isinstance(inv, dict) else None
         if got != want:
             raise ValueError('lme: %s.%s.%s is %r; the registry declares %r' % (key, schema['inventory_var_path'], name, got, want))
-    section = {'schema_version': schema['projection_schema_version'], 'policy': pol, 'policy_sha256': _digest(pol)}
+    section = {'schema_version': schema['projection_schema_version'], 'policy': pol, 'policy_sha256': _digest(pol),
+               'adapter': {'name': sel, 'tools': derived}}
     return section, sorted(overridden)
 
 
@@ -2550,7 +2569,10 @@ def lme_project_remote_harness(composed, declared, override, schema):
     its identity; absolute normalized executable paths; a well-formed identity of a declared kind for every
     executable; positive integers and resource bounds inside the declared envelope; package mappings for every
     required and adapter package in every os family; an admitted adapter whose executables are declared;
-    registry inventory variable names; retired profile paths absent. The section is revision-bound; override
+    registry inventory variable names; retired profile paths absent; adapter tool maps name declared
+    executables only and carry no derived field (path/identity): section.adapter.tools.<map>.<tool> is
+    DERIVED from the effective executable entry (codex-tick144 CANONICAL-TOOL-OVERRIDES). The section is
+    revision-bound; override
     provenance is NOT in it (lme_remote_harness_overridden_paths is the unhashed audit view)."""
     return _rh_validate(composed, declared, override, schema)[0]
 
