@@ -21,19 +21,78 @@
   loop_control:
     label: "{{ item.item.key }}"
 
-- name: Purge the fresh root through bundle A (and the root of a variant token, when one names another path)
-  vars:
-    _plan: >-
+# The cleanup seed launches are the declared seed_launch vector (controls.j2 plan_act -> seed_launch) and their records
+# are created by the writer itself (writer_cmd; G-PRIVATE-PREPARE-CUSTODY; ported from m1-1g, codex 200213 point 7). m1-1
+# has no private_create.yml: the writer's own precheck is the freshness check. An unresolved launch is never run; it is
+# a cleanup finding (and taints the shared root for verify).
+# G-RECORD-OPEN-BEFORE-TIMEOUT (codex 195110 / 200213): the cleanup writer is the SAME writer_cmd, so its precheck, create,
+# open and verification run inside the cleanup launch's own scope + timeout (plan.bound); each cleanup task also carries
+# an INDEPENDENT task-level `timeout:` (timeout_s + 60) -- that bounds the controller's wait for the task, it does not kill
+# the process tree (the plan's own timeout does). A cleanup writer that refused or never admitted its records is a
+# cleanup finding (purge) / taints the shared root (verify); its records are never read unless a variant declares
+# cleanup_purge.expect (then collect.yml reads them through the admitted identity only, exactly as for an act).
+# cleanup_purge (variant key; the cleanup race control runner.record.cleanup-barrier): {record_barrier, timeout_s} are
+# declared deviations of the purge act (the writer plants the barrier after its precheck, before its create), expect
+# judges the purge like a step (collect.yml; failures fail the variant), post_state is checked after it.
+- name: Plan the purge of the fresh root through bundle A (the declared seed launch)
+  ansible.builtin.set_fact:
+    _rhc_purge_plan: >-
       {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_act',
-           'args': [{'id': 'cleanup-purge', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'purge', 'root': _rhc_t.root}}, _rhc_ctx]}}) | from_json }}
+           'args': [{'id': 'cleanup-purge', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'purge', 'root': _rhc_t.root}
+                     | combine((rhc_v.cleanup_purge | default({})) | dict2items | selectattr('key', 'in', ['record_barrier', 'timeout_s']) | items2dict)}, _rhc_ctx]}}) | from_json }}
+  when: (rhc_c.root | default('')) == 'fresh' and rhc_deps.bundle_a.met
+
+- name: An unresolved cleanup purge launch is a cleanup finding (never run)
+  ansible.builtin.set_fact:
+    rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': cleanup purge seed_launch unresolved ' ~ (_rhc_purge_plan.seed_launch.unresolved | join(' '))] }}"
+  when: (rhc_c.root | default('')) == 'fresh' and rhc_deps.bundle_a.met and (_rhc_purge_plan.seed_launch.unresolved | length > 0)
+
+- name: Purge the fresh root through bundle A (and the root of a variant token, when one names another path)
   ansible.builtin.shell:
-    cmd: "exec {{ _plan.argv | map('quote') | join(' ') }} </dev/null >{{ _plan.out | quote }} 2>{{ _plan.err | quote }}"
+    cmd: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'writer_cmd', 'args': [_rhc_purge_plan, _rhc_ctx]}}) }}"
     chdir: "{{ _rhc_t.ctl }}/cwd"
+  environment:   # systemd-run --user reaches the owner's user manager (the act's own scope); the seed still runs under env -i
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
   register: _rhc_purge
   changed_when: true
   failed_when: false
-  # the declared seed launch (controls.j2 seed_launch); an unresolved one is never run (the purge then counts as not run)
-  when: (rhc_c.root | default('')) == 'fresh' and rhc_deps.bundle_a.met and (_plan.seed_launch.unresolved | length == 0)
+  timeout: "{{ _rhc_purge_plan.timeout_s + 60 }}"
+  when: (rhc_c.root | default('')) == 'fresh' and rhc_deps.bundle_a.met and (_rhc_purge_plan.seed_launch.unresolved | length == 0)
+
+- name: What the purge writer admitted or refused (its own stderr; nothing read)
+  vars:
+    _rr: "{{ _rhc_ctx.record_refusal }}"
+  ansible.builtin.set_fact:
+    _rhc_purge_adm: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'writer_admitted', 'args': [_rhc_purge.stderr | default(''), _rhc_purge_plan, _rhc_ctx]}}) | from_json }}"
+    _rhc_purge_refused: "{{ (_rhc_purge.rc | default(-1) | int) == (_rr.rc | int) and ('REFUSED ' ~ _rr.code ~ ': stage=') in (_rhc_purge.stderr | default('')) }}"
+  when: _rhc_purge.rc is defined
+
+- name: Judge the purge as a step (the cleanup race control declares cleanup_purge.expect; records read through the admitted identity only)
+  ansible.builtin.include_tasks: collect.yml
+  vars:
+    rhc_cid: cleanup-purge
+    rhc_cplan: "{{ _rhc_purge_plan }}"
+    rhc_crc: "{{ _rhc_purge.rc | default(-1) }}"
+    rhc_cwstderr: "{{ _rhc_purge.stderr | default('') }}"
+    rhc_cexp: "{{ rhc_v.cleanup_purge.expect }}"
+  when: _rhc_purge.rc is defined and (rhc_v.cleanup_purge | default({})).expect is defined
+
+- name: A purge the variant did not declare to be refused or unadmitted is a cleanup finding
+  ansible.builtin.set_fact:
+    rhc_cleanup_findings: >-
+      {{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': cleanup purge writer ' ~ ('refused stage ' ~ _rhc_purge_adm.stage
+         if (_rhc_purge_refused | bool) else 'never admitted ' ~ (_rhc_purge_adm.missing | join(' '))) ~ ' (rc ' ~ _rhc_purge.rc ~ ')'] }}
+  when: >-
+    _rhc_purge.rc is defined and (rhc_v.cleanup_purge | default({})).expect is not defined
+    and ((_rhc_purge_refused | bool) or (_rhc_purge_adm.missing | length > 0))
+
+- name: The cleanup race control's post-state (after the purge)
+  ansible.builtin.include_tasks: state.yml
+  vars:
+    rhc_preds: "{{ rhc_v.cleanup_purge.post_state }}"
+    rhc_preds_label: cleanup-purge post_state
+  when: (rhc_v.cleanup_purge | default({})).post_state is defined and _rhc_fail | length == 0
 
 - name: Is anything left in the fresh root's parent?
   ansible.builtin.find:
@@ -89,27 +148,45 @@
       loop_control:
         label: "{{ item.path }}"
 
-- name: Re-verify the shared root after a control that used it
-  vars:
-    _plan: >-
+- name: Plan the re-verify of the shared root (the declared seed launch)
+  ansible.builtin.set_fact:
+    _rhc_sv_plan: >-
       {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_act',
            'args': [{'id': 'cleanup-verify', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'verify', 'root': rhc_base_tokens.shared}}, _rhc_ctx]}}) | from_json }}
+  when: (rhc_c.root | default('')) == 'shared' and rhc_deps.shared_root.met
+
+- name: An unresolved cleanup verify launch taints the shared root (never run)
+  ansible.builtin.set_fact:
+    rhc_shared_tainted: true
+    rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': cleanup verify seed_launch unresolved ' ~ (_rhc_sv_plan.seed_launch.unresolved | join(' ')) ~ ' (tainted)'] }}"
+  when: (rhc_c.root | default('')) == 'shared' and rhc_deps.shared_root.met and (_rhc_sv_plan.seed_launch.unresolved | length > 0)
+
+- name: Re-verify the shared root after a control that used it
   ansible.builtin.shell:
-    # the declared seed launch (controls.j2 seed_launch); an unresolved one is never run and taints the shared root (rc 1)
-    cmd: >-
-      {{ ('exec ' ~ (_plan.argv | map('quote') | join(' ')) ~ ' </dev/null >' ~ (_plan.out | quote) ~ ' 2>' ~ (_plan.err | quote))
-         if (_plan.seed_launch.unresolved | length == 0) else 'exit 1' }}
+    cmd: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'writer_cmd', 'args': [_rhc_sv_plan, _rhc_ctx]}}) }}"
     chdir: "{{ _rhc_t.ctl }}/cwd"
+  environment:   # systemd-run --user reaches the owner's user manager (the act's own scope); the seed still runs under env -i
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
   register: _rhc_sv
   changed_when: false
   failed_when: false
-  when: (rhc_c.root | default('')) == 'shared' and rhc_deps.shared_root.met
+  timeout: "{{ _rhc_sv_plan.timeout_s + 60 }}"
+  when: (rhc_c.root | default('')) == 'shared' and rhc_deps.shared_root.met and (_rhc_sv_plan.seed_launch.unresolved | length == 0)
 
-- name: A shared root that no longer verifies taints every later shared-root control
+- name: What the verify writer admitted (its own stderr; nothing read)
+  ansible.builtin.set_fact:
+    _rhc_sv_adm: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'writer_admitted', 'args': [_rhc_sv.stderr | default(''), _rhc_sv_plan, _rhc_ctx]}}) | from_json }}"
+  when: _rhc_sv.rc is defined
+
+- name: A shared root that no longer verifies (or whose verify writer refused or never admitted its records) taints every later shared-root control
   ansible.builtin.set_fact:
     rhc_shared_tainted: true
-    rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': shared root verify rc ' ~ _rhc_sv.rc ~ ' (tainted)'] }}"
-  when: _rhc_sv.rc is defined and _rhc_sv.rc != 0
+    rhc_cleanup_findings: >-
+      {{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': shared root verify rc ' ~ _rhc_sv.rc
+         ~ ((' writer never admitted ' ~ (_rhc_sv_adm.missing | join(' ')) ~ (' refused stage ' ~ _rhc_sv_adm.stage if _rhc_sv_adm.stage else '')) if (_rhc_sv_adm.missing | length > 0) else '')
+         ~ ' (tainted)'] }}
+  when: _rhc_sv.rc is defined and (_rhc_sv.rc != 0 or _rhc_sv_adm.missing | length > 0)
 
 # Route 3 (variant_checkout: clone): the clone's own root {vroot} is purged through bundle A (the seed's own purge; purge
 # is exempt from the checkout binding) BEFORE {vclone} leaves with the variant scratch, so a mid-control failure still
@@ -125,18 +202,32 @@
   register: _rhc_vr
   when: (rhc_c.variant_checkout | default('')) == 'clone' and (_rhc_t.vroot | default('')) | length > 0
 
-- name: Purge the variant clone root through bundle A
-  vars:
-    _plan: >-
+- name: Plan the purge of the variant clone root through bundle A (the declared seed launch)
+  ansible.builtin.set_fact:
+    _rhc_vpurge_plan: >-
       {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_act',
            'args': [{'id': 'cleanup-purge-vroot', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'purge', 'root': _rhc_t.vroot}}, _rhc_ctx]}}) | from_json }}
+  when: ((_rhc_vr.stat | default({})).exists | default(false)) and rhc_deps.bundle_a.met
+
+# the same bounded writer as every other launch (writer_cmd); a writer that refused or never admitted its records makes
+# the purge count as failed below (rc != 0 or unadmitted -> retained), never as a clean purge
+- name: Purge the variant clone root through bundle A
   ansible.builtin.shell:
-    cmd: "exec {{ _plan.argv | map('quote') | join(' ') }} </dev/null >{{ _plan.out | quote }} 2>{{ _plan.err | quote }}"
+    cmd: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'writer_cmd', 'args': [_rhc_vpurge_plan, _rhc_ctx]}}) }}"
     chdir: "{{ _rhc_t.ctl }}/cwd"
+  environment:   # systemd-run --user reaches the owner's user manager (the act's own scope); the seed still runs under env -i
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
   register: _rhc_vpurge
   changed_when: true
   failed_when: false
-  when: ((_rhc_vr.stat | default({})).exists | default(false)) and rhc_deps.bundle_a.met and (_plan.seed_launch.unresolved | length == 0)
+  timeout: "{{ _rhc_vpurge_plan.timeout_s + 60 }}"
+  when: ((_rhc_vr.stat | default({})).exists | default(false)) and rhc_deps.bundle_a.met and (_rhc_vpurge_plan.seed_launch.unresolved | length == 0)
+
+- name: What the variant clone purge writer admitted (its own stderr; nothing read)
+  ansible.builtin.set_fact:
+    _rhc_vpurge_adm: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'writer_admitted', 'args': [_rhc_vpurge.stderr | default(''), _rhc_vpurge_plan, _rhc_ctx]}}) | from_json }}"
+  when: _rhc_vpurge.rc is defined
 
 - name: Read the variant clone root back after the purge (never trust the exit status alone)
   ansible.builtin.stat:
@@ -151,8 +242,9 @@
     _was: "{{ (_rhc_vr.stat | default({})).exists | default(false) }}"
     _left: "{{ (_rhc_vr_after.stat | default({})).exists | default(false) }}"
     _rc: "{{ _rhc_vpurge.rc | default('not run') }}"
+    _unadm: "{{ (_rhc_vpurge_adm | default({'missing': []})).missing | default([]) | length > 0 }}"
   ansible.builtin.set_fact:
-    _rhc_retain: "{{ (_was | bool) and ((_left | bool) or (_rc | string) != '0') }}"
+    _rhc_retain: "{{ (_was | bool) and ((_left | bool) or (_rc | string) != '0' or (_unadm | bool)) }}"
     _rhc_retain_why: >-
       {{ rhc_c.id ~ '/' ~ rhc_v.id ~ ': variant clone root ' ~ _rhc_t.vroot ~ ' purge rc ' ~ (_rc | string)
          ~ ', present after purge: ' ~ (_left | string) ~ '; clone and variant scratch RETAINED for recovery (' ~ _rhc_t.ctl ~ ')' }}

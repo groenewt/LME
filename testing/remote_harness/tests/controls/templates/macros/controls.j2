@@ -58,7 +58,7 @@
 {%- set ni = vocab.not_implemented | default({}) -%}
 {%- set ns = namespace(u = []) -%}
 {%- for p in preds -%}
-{%- set k = p | list | reject('in', ['exists', 'equal', 'contains', 'lacks', 'regex', 'json_equal', 'json_all']) | first -%}
+{%- set k = p | list | reject('in', ['exists', 'equal', 'contains', 'lacks', 'regex', 'json_equal', 'json_all', 'kind', 'size']) | first -%}
 {%- if k not in vocab.predicates or k in (ni.predicates | default([])) -%}{%- set ns.u = ns.u + ['predicate ' ~ k] -%}{%- endif -%}
 {%- endfor -%}
 {{ ns.u | to_json }}
@@ -113,6 +113,18 @@
 {%- for k in v if k not in vocab.variant_keys -%}{%- set ns.v = ns.v + ['variant key ' ~ k] -%}{%- endfor -%}
 {%- set ns.v = ns.v + (_ops_unimpl((v.ops | default([])) + (v.undo | default([])), vocab) | from_json) -%}
 {%- for sid in (v.expect | default({})) -%}{%- for k in v.expect[sid] if k not in vocab.expect -%}{%- set ns.v = ns.v + ['expect ' ~ k] -%}{%- endfor -%}{%- endfor -%}
+{#- cleanup_purge (the cleanup race control): only the declared keys, a barrier of a declared kind at out / err, known
+    expectations and predicates; a root: fresh control (the purge runs only there) -#}
+{%- if v.cleanup_purge is defined -%}
+{%- set cp = v.cleanup_purge -%}
+{%- for k in cp if k not in (vocab.cleanup_purge_keys | default([])) -%}{%- set ns.v = ns.v + ['cleanup_purge key ' ~ k] -%}{%- endfor -%}
+{%- for b in cp.record_barrier | default([]) -%}
+{%- if not (b is mapping and b | length == 1 and (b | list | first) in ['fifo', 'regular'] and b[b | list | first] in ['out', 'err']) -%}{%- set ns.v = ns.v + ['cleanup_purge record_barrier ' ~ (b | to_json)] -%}{%- endif -%}
+{%- endfor -%}
+{%- for k in (cp.expect | default({})) if k not in vocab.expect -%}{%- set ns.v = ns.v + ['cleanup_purge expect ' ~ k] -%}{%- endfor -%}
+{%- set ns.v = ns.v + (_preds_unimpl(cp.post_state | default([]), vocab) | from_json) -%}
+{%- if (c.root | default('')) != 'fresh' -%}{%- set ns.v = ns.v + ['cleanup_purge on a control whose root is not fresh (the purge never runs)'] -%}{%- endif -%}
+{%- endif -%}
 {%- set ns.out = ns.out | combine({v.id: (ns.common + ns.v) | unique | list}) -%}
 {%- endfor -%}
 {{ ns.out | to_json }}
@@ -173,7 +185,43 @@
 {%- endmacro -%}
 
 {#- ------------------------------------------------------------ case binding ------------------------------ -#}
-{#- sources: [{prefix, ids}] ; returns unknown ids per control and source ids no control names -#}
+{#- sources: [{prefix, ids, variants}] ; returns unknown ids per control and source ids no control names -#}
+{#- COMPONENT COVERAGE (G-E77-PARTIAL-COVERAGE, codex review 190358; ported from m1-1g, codex 200213 point 7): a control
+    naming a case row covers the WHOLE row unless it declares case_components {<case id>: [<row variant ids>]} -- then it
+    covers only those variants, which must be keys of that row's own `variants` mapping (sources[].variants, read by
+    prepare.yml; an unknown key, a component of a case the control does not name, or components of a row without variants
+    are declaration errors -> unknown). A row is covered only when some control names it whole, or the union of its
+    components over the counted controls equals the row's declared variant set; otherwise it is PARTIAL {covered, missing}.
+    Rows without variants stay whole-row. -#}
+{%- macro row_variants(sources, id) -%}
+{%- set ns = namespace(v = none) -%}
+{%- for s in sources -%}
+{%- set bare = id | replace(s.prefix, '', 1) if (s.prefix and id.startswith(s.prefix)) else (id if not s.prefix else '') -%}
+{%- if ns.v is none and bare and bare in (s.variants | default({})) -%}{%- set ns.v = s.variants[bare] -%}{%- endif -%}
+{%- endfor -%}
+{{ ns.v | to_json }}
+{%- endmacro -%}
+
+{#- entries: [{control, cases, case_components}] counted as covering; returns {whole, partial {case: {covered, missing}}} -#}
+{%- macro coverage_of(entries, sources) -%}
+{%- set ns = namespace(whole = [], comp = {}) -%}
+{%- for e in entries -%}
+{%- for id in e.cases | default([]) -%}
+{%- if id in (e.case_components | default({})) -%}
+{%- set ns.comp = ns.comp | combine({id: ((ns.comp[id] | default([])) + e.case_components[id]) | unique | list}) -%}
+{%- else -%}{%- set ns.whole = ns.whole + [id] -%}{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- set pv = namespace(partial = {}, whole = ns.whole) -%}
+{%- for id in ns.comp | sort if id not in ns.whole -%}
+{%- set rv = row_variants(sources, id) | from_json -%}
+{%- set miss = (rv or []) | reject('in', ns.comp[id]) | list -%}
+{%- if rv and not miss -%}{%- set pv.whole = pv.whole + [id] -%}
+{%- else -%}{%- set pv.partial = pv.partial | combine({id: {'covered': ns.comp[id] | sort, 'missing': miss}}) -%}{%- endif -%}
+{%- endfor -%}
+{{ {'whole': pv.whole | unique | sort, 'partial': pv.partial} | to_json }}
+{%- endmacro -%}
+
 {%- macro coverage(controls, sources) -%}
 {%- set ns = namespace(known = [], unknown = [], named = []) -%}
 {%- for s in sources -%}{%- set ns.known = ns.known + (s.ids | map('regex_replace', '^', s.prefix) | list) -%}{%- endfor -%}
@@ -182,8 +230,29 @@
 {%- set ns.named = ns.named + [id] -%}
 {%- if id not in ns.known -%}{%- set ns.unknown = ns.unknown + [c.id ~ ' -> ' ~ id] -%}{%- endif -%}
 {%- endfor -%}
+{#- case_components may be declared on the control and/or on a variant (a variant's replaces the control's for that
+    variant's result) -- each declaration is validated alike -#}
+{%- set vcc = namespace(l = [{'at': c.id, 'm': c.case_components | default({})}]) -%}
+{%- for v in c.variants | default([]) if v.case_components is defined -%}{%- set vcc.l = vcc.l + [{'at': c.id ~ '/' ~ v.id, 'm': v.case_components}] -%}{%- endfor -%}
+{%- for cc in vcc.l -%}
+{%- for id, comps in cc.m.items() -%}
+{%- set rv = row_variants(sources, id) | from_json -%}
+{%- if id not in (c.cases | default([])) -%}{%- set ns.unknown = ns.unknown + [cc.at ~ ' -> case_components ' ~ id ~ ' (not a case the control names)'] -%}
+{%- elif not rv -%}{%- set ns.unknown = ns.unknown + [cc.at ~ ' -> case_components ' ~ id ~ ' (the row declares no variants)'] -%}
+{%- else -%}{%- for k in comps if k not in rv -%}{%- set ns.unknown = ns.unknown + [cc.at ~ ' -> case_components ' ~ id ~ '/' ~ k ~ ' (not a variant of the row)'] -%}{%- endfor -%}{%- endif -%}
 {%- endfor -%}
-{{ {'unknown': ns.unknown, 'uncovered': ns.known | reject('in', ns.named) | list, 'known_count': ns.known | length} | to_json }}
+{%- endfor -%}
+{%- endfor -%}
+{#- declared coverage (plan): what the controls name, components folded in per variant (never evidence) -#}
+{%- set ent = namespace(e = []) -%}
+{%- for c in controls if c.declared_only is not defined -%}
+{%- for v in c.variants | default([{'id': 'base'}]) -%}
+{%- set ent.e = ent.e + [{'cases': c.cases | default([]), 'case_components': v.case_components | default(c.case_components | default({}))}] -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- set cov = coverage_of(ent.e, sources) | from_json -%}
+{{ {'unknown': ns.unknown, 'uncovered': ns.known | reject('in', ns.named) | list, 'partial': cov.partial,
+    'declared_whole': cov.whole, 'known_count': ns.known | length} | to_json }}
 {%- endmacro -%}
 
 {#- ------------------------------------------------------------ argv ------------------------------------- -#}
@@ -199,18 +268,20 @@
 {{ ns.a | to_json }}
 {%- endmacro -%}
 
-{#- strace prefix: record (network / exec) or inject a delay at a syscall set, optionally restricted to a path -#}
+{#- strace prefix: record (network / exec) or inject a delay at a syscall set, optionally restricted to a path. The trace
+    record <base>.strace is created and verified by the writer (writer_cmd) and handed over as descriptor 5: strace -o
+    /proc/self/fd/5 reopens that SAME inode, never the record path -#}
 {%- macro stracep(ctx, act, base) -%}
 {%- set ns = namespace(a = []) -%}
 {%- if act.strace is defined -%}
 {%- set i = act.strace.inject -%}
 {%- set sc = i.syscalls if i.syscalls is string else (i.syscalls | join(',')) -%}
 {%- set ns.a = [ctx.tools.strace, '-f'] + ([] if act.strace.detach_on_tracer_kill | default(false) else ['--kill-on-exit'])
-               + ['-qq', '-ttt', '-o', base ~ '.strace', '-e', 'trace=' ~ sc, '-e', 'inject=' ~ sc ~ ':delay_' ~ i.when ~ '=' ~ i.hold] -%}
+               + ['-qq', '-ttt', '-o', '/proc/self/fd/5', '-e', 'trace=' ~ sc, '-e', 'inject=' ~ sc ~ ':delay_' ~ i.when ~ '=' ~ i.hold] -%}
 {%- for p in ([act.strace.trace_path] if act.strace.trace_path is defined else []) -%}{%- set ns.a = ns.a + ['-P', p] -%}{%- endfor -%}
 {%- elif act.trace_network | default(false) or act.trace_exec | default(false) -%}
 {%- set sc = (['connect'] if act.trace_network | default(false) else []) + (['execve'] if act.trace_exec | default(false) else []) -%}
-{%- set ns.a = [ctx.tools.strace, '-f', '-qq', '-s', '256', '-o', base ~ '.strace', '-e', 'trace=' ~ (sc | join(','))] -%}
+{%- set ns.a = [ctx.tools.strace, '-f', '-qq', '-s', '256', '-o', '/proc/self/fd/5', '-e', 'trace=' ~ (sc | join(','))] -%}
 {%- endif -%}
 {{ ns.a | to_json }}
 {%- endmacro -%}
@@ -285,6 +356,121 @@
 {{ {'runner': runner, 'words': rest[1:] if (rest[:1] == ['--']) else rest} | to_json }}
 {%- endmacro -%}
 
+{#- RECORD WRITER CONTRACT (G-PRIVATE-PREPARE-CUSTODY 190358; G-RECORD-OPEN-BEFORE-TIMEOUT 195110/200213; ported from
+    m1-1g, codex 200213 point 7): the ONE writer of an action's records. Returns the shell line of the act (and of a
+    cleanup launch -- finish_variant.yml uses the same macro).
+    BOUND FIRST: the line is `exec <plan.bound> <os_tools.sh> -c <writer body> rhc-writer <plan.inner...>`. plan.bound is the
+    act's own transient scope + `timeout --kill-after=10 <timeout_s>s` (plan_act); the writer body runs as the declared sh
+    CHILD of that timeout, so every record precheck, barrier, create, open and verification below happens inside the act's
+    own scope and bound -- nothing touches a record path before the bound is active. The entrypoint argv is the sh's
+    positional parameters (`exec "$@"`), never re-quoted into the body; plan.argv (bound + inner) is unchanged for the log.
+    The body, in order:
+      1. PRECHECK -- an absence test of every record (any object, a dangling link included): present -> REFUSED
+         RHC-ACT-RECORD stage=precheck; the object is preserved and not opened by the writer.
+      2. BARRIER (a control's declared deviation only; act.record_barrier / cleanup_purge.record_barrier): after the precheck
+         and before the create, the writer itself plants the declared object at a record path -- {fifo: <role>} via
+         runner_tools.mkfifo -m 0600, {regular: <role>} via runner_tools.dd if=/dev/null conv=excl (an EMPTY regular file).
+         A barrier that cannot be planted exits record_refusal.barrier_rc (never the refusal status) with BARRIER-FAILED.
+      3. CREATE -- ONE redirection of a brace group under `set -C` and umask 0177. Noclobber (dash and bash, source-level
+         reading, NOT verified here): the shell stat()s the name; ABSENT -> open(O_WRONLY|O_CREAT|O_EXCL) -- the descriptor
+         IS the object that open created (a name appearing after the stat fails EEXIST: refused); an existing REGULAR file
+         -> EEXIST, never opened (refused stage=open); an existing NON-REGULAR object (a FIFO, a device, a link to either)
+         -> the shell DOES open it O_WRONLY without O_EXCL: a FIFO without a reader BLOCKS inside open(2) until the act's
+         bound ends the writer (rc 124 / 137, no ADMITTED line), a device or a FIFO with a reader IS opened -- and then
+         refused at step 4, never written. That opening is stated, never denied.
+      4. IDENTITY -- before any byte is written, every descriptor must be the SAME object its path names now: path not a
+         link, `stat` of the path == `stat -L` of /proc/$$/fd/<n> (device, inode, owner, links, size, type) and that is an
+         owned (ctx uid), single-link, EMPTY regular file -- else REFUSED stage=identity (nothing written).
+      5. ADMISSION -- only after every record passed step 4: one line per record on the writer's OWN stderr (the ansible
+         task's, never a record), `ADMITTED RHC-ACT-RECORD <role> <dev>:<ino>:<uid>:<links>:<size>:<type>`, then the umask
+         and noclobber are restored and the entrypoint is exec'd with stdout >&3, stderr >&4. collect.yml reads a record
+         ONLY through that admitted identity (writer_admitted / record_readback below).
+    Stated limits (not closed): another process of THIS uid can rename the admitted inode away and back, open it and write
+    it, or forge later ADMITTED lines on the task's stderr via /proc (collect takes the FIRST line per role; lines printed
+    before the exec come first); a traced act's strace reopens /proc/self/fd/5 (the admitted trace inode) -- fd 5 itself
+    STAYS OPEN, writable, at offset 0 in the traced entrypoint, so the trace is DIAGNOSTIC only and never independent
+    custody evidence; that fd 5 survives systemd-run, timeout and strace is verified only when the declared runner runs.
+    The refusal is exit record_refusal.rc AND the stderr marker `REFUSED RHC-ACT-RECORD: stage=<precheck|open|identity>`
+    -- collect.yml needs both. -#}
+{%- macro writer_cmd(plan, ctx) -%}
+{%- set bs = ctx.rh.controller.bootstrap -%}
+{%- set rr = ctx.record_refusal -%}
+{%- set st = bs.os_tools.stat.path -%}
+{%- set nlf = '%s\\n' | quote -%}
+{%- set recs = [['3', 'out', plan.out], ['4', 'err', plan.err]] + ([['5', 'strace', plan.strace]] if plan.strace else []) -%}
+{%- set rpath = {'out': plan.out, 'err': plan.err, 'strace': plan.strace} -%}
+{%- set ns = namespace(pre = [], bar = [], chk = [], adm = [], redir = []) -%}
+{%- for r in recs -%}
+{%- set q = r[2] | quote -%}
+{%- set ns.pre = ns.pre + ['if [ -e ' ~ q ~ ' ] || [ -h ' ~ q ~ ' ]; then printf ' ~ nlf ~ ' ' ~ (('REFUSED ' ~ rr.code ~ ': stage=precheck ' ~ r[1] ~ ' ' ~ r[2] ~ ' exists before its writer created it (preserved, not opened by the writer)') | quote) ~ ' >&2; exit ' ~ rr.rc ~ '; fi'] -%}
+{%- set ns.redir = ns.redir + [r[0] ~ '>' ~ q] -%}
+{%- set ns.chk = ns.chk + ['_a=$(' ~ st ~ ' -c %d:%i:%u:%h:%s:%F -- ' ~ q ~ ') && _b=$(' ~ st ~ ' -L -c %d:%i:%u:%h:%s:%F /proc/$$/fd/' ~ r[0] ~ ')'
+                           ~ ' && [ ! -h ' ~ q ~ ' ] && [ "$_a" = "$_b" ] && case "$_b" in *:*:' ~ ctx.t.uid ~ ":1:0:'regular empty file') true ;; *) false ;; esac"
+                           ~ ' || { printf ' ~ nlf ~ ' ' ~ (('REFUSED ' ~ rr.code ~ ': stage=identity ' ~ r[1] ~ ' ' ~ r[2] ~ ' is not the fresh owned empty regular file its writer created (opened, never written)') | quote) ~ ' >&2; exit ' ~ rr.rc ~ '; }; _r' ~ r[0] ~ '=$_b'] -%}
+{%- set ns.adm = ns.adm + ['printf ' ~ (('ADMITTED ' ~ rr.code ~ ' ' ~ r[1] ~ ' %s\\n') | quote) ~ ' "$_r' ~ r[0] ~ '" >&2'] -%}
+{%- endfor -%}
+{%- for b in plan.record_barrier | default([]) -%}
+{%- set k = b | list | first -%}
+{%- set q = rpath[b[k]] | quote -%}
+{%- set w = ([ctx.tools.mkfifo, '-m', '0600', '--', rpath[b[k]]] if k == 'fifo' else [ctx.tools.dd, 'if=/dev/null', 'of=' ~ rpath[b[k]], 'conv=excl', 'status=none']) | map('quote') | join(' ') -%}
+{%- set ns.bar = ns.bar + [w ~ ' || { printf ' ~ nlf ~ ' ' ~ (('BARRIER-FAILED ' ~ rr.code ~ ': ' ~ k ~ ' at ' ~ b[k] ~ ' ' ~ rpath[b[k]]) | quote) ~ ' >&2; exit ' ~ rr.barrier_rc ~ '; }'] -%}
+{%- endfor -%}
+{%- set body = (ns.pre + ns.bar) | join('; ') ~ '; _m=$(umask); umask 0177; set -C; { ' ~ (ns.chk | join('; ')) ~ '; ' ~ (ns.adm | join('; '))
+               ~ '; umask "$_m"; set +C; exec "$@" </dev/null >&3 2>&4 3>&- 4>&-; } ' ~ (ns.redir | join(' '))
+               ~ ' || { printf ' ~ nlf ~ ' ' ~ (('REFUSED ' ~ rr.code ~ ': stage=open a record of ' ~ plan.out ~ ' could not be created exclusively (an object appeared after the precheck; an existing regular file is never opened)') | quote) ~ ' >&2; exit ' ~ rr.rc ~ '; }' -%}
+{{- 'exec ' ~ ((plan.bound + [bs.os_tools.sh.path, '-c', body, 'rhc-writer'] + plan.inner) | map('quote') | join(' ')) -}}
+{%- endmacro -%}
+
+{#- the identities the writer ADMITTED (its own stderr: writer_cmd step 5) and the stage of its refusal. Only the FIRST
+    admitted line per role counts. Returns {records: [{role, path, dev, ino, uid}], missing: [roles never admitted],
+    stage: <precheck|open|identity|''>}. -#}
+{%- macro writer_admitted(stderr, plan, ctx) -%}
+{%- set code = ctx.record_refusal.code | regex_escape -%}
+{%- set roles = ['out', 'err'] + (['strace'] if plan.strace else []) -%}
+{%- set rpath = {'out': plan.out, 'err': plan.err, 'strace': plan.strace} -%}
+{%- set ns = namespace(adm = {}, stage = '') -%}
+{%- for l in (stderr | default('')).splitlines() -%}
+{%- set m = l | regex_search('^ADMITTED ' ~ code ~ ' (out|err|strace) ([0-9]+):([0-9]+):([0-9]+):', '\\1', '\\2', '\\3', '\\4') -%}
+{%- if m and m[0] in roles and m[0] not in ns.adm -%}
+{%- set ns.adm = ns.adm | combine({m[0]: {'role': m[0], 'path': rpath[m[0]], 'dev': m[1] | int, 'ino': m[2] | int, 'uid': m[3] | int}}) -%}
+{%- endif -%}
+{%- set s = l | regex_search('^REFUSED ' ~ code ~ ': stage=([a-z]+) ', '\\1') -%}
+{%- if s and not ns.stage -%}{%- set ns.stage = s[0] -%}{%- endif -%}
+{%- endfor -%}
+{{ {'records': roles | select('in', ns.adm) | map('extract', ns.adm) | list, 'missing': roles | reject('in', ns.adm) | list, 'stage': ns.stage} | to_json }}
+{%- endmacro -%}
+
+{#- READBACK ADMISSION (collect.yml): a record is read only when its path still names the ADMITTED object. pre: the
+    ansible.builtin.stat results (follow false; mime / attributes / checksum off -- nothing opened) aligned with
+    adm.records. reads: none -> returns the roles whose pre-stat admits a read; otherwise the bounded read results (declared
+    timeout + dd iflag=nofollow,nonblock: a link refuses, a FIFO never blocks) and post: the stat results after the read.
+    A role is accepted when its pre-stat is a regular non-link single-link file with the admitted dev / inode / uid, the
+    read exited 0, and the post-stat is the SAME object unchanged (dev, inode, links, size, mtime, ctime). Returns
+    {text: {role: content}, rejected: [role: reason]}. Stated limit: a same-uid swap and swap-back between the two stats. -#}
+{%- macro readback_ok(r, p) -%}
+{{ (p.exists | default(false)) and (p.isreg | default(false)) and not (p.islnk | default(true)) and (p.nlink | default(0)) == 1
+   and (p.dev | default(-1)) == r.dev and (p.inode | default(-1)) == r.ino and (p.uid | default(-1)) == r.uid }}
+{%- endmacro -%}
+{%- macro record_readback(adm, pre, reads, post) -%}
+{%- set ns = namespace(ok = [], text = {}, rej = []) -%}
+{%- for r in adm.records -%}
+{%- set p = (pre[loop.index0] | default({})).stat | default({}) -%}
+{%- set pok = (readback_ok(r, p) | trim) == 'True' -%}
+{%- if reads is none -%}{%- if pok -%}{%- set ns.ok = ns.ok + [r.role] -%}{%- endif -%}
+{%- else -%}
+{%- set d = reads[loop.index0] | default({}) -%}
+{%- set q = (post[loop.index0] | default({})).stat | default({}) -%}
+{%- set same = pok and (q.exists | default(false)) and (q.isreg | default(false)) and not (q.islnk | default(true))
+               and ['dev', 'inode', 'nlink', 'size', 'mtime', 'ctime'] | map('extract', q) | list == ['dev', 'inode', 'nlink', 'size', 'mtime', 'ctime'] | map('extract', p) | list -%}
+{%- if not pok -%}{%- set ns.rej = ns.rej + [r.role ~ ': path no longer names the admitted object (not read)'] -%}
+{%- elif (d.rc | default(-1)) != 0 -%}{%- set ns.rej = ns.rej + [r.role ~ ': bounded read rc ' ~ (d.rc | default('not run'))] -%}
+{%- elif not same -%}{%- set ns.rej = ns.rej + [r.role ~ ': changed or replaced during the read (discarded)'] -%}
+{%- else -%}{%- set ns.text = ns.text | combine({r.role: d.stdout | default('')}) -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ (ns.ok if reads is none else {'text': ns.text, 'rejected': ns.rej}) | to_json }}
+{%- endmacro -%}
+
 {#- G-PASSWD-RESULT-KEY (codex; ported from m1-1g): ansible.builtin.getent keys getent_passwd by the RETURNED row's field 0
     (the account NAME), never by the query key. rows: that mapping; uid: the queried uid. Admitted only when exactly ONE
     row is returned, its uid field (value[1]) equals uid, and its home (value[4]) is absolute. Returns {account, home,
@@ -300,7 +486,8 @@
 {{ {'account': (hit | first).key if hit else '', 'home': home, 'failures': ns.f} | to_json }}
 {%- endmacro -%}
 
-{#- one action -> {argv, unit, cwd, out, err, strace, inventory, kill_token, timeout_s, async, seed_launch} -#}
+{#- one action -> {argv, bound, inner, record_barrier, unit, cwd, out, err, strace, inventory, kill_token, timeout_s, async,
+    seed_launch, records} -#}
 {%- macro plan_act(step, ctx) -%}
 {%- set act = step.act -%}
 {%- set bs = ctx.rh.controller.bootstrap -%}
@@ -361,12 +548,17 @@
     empty; an act sharing the runner's session scope would stay LIVE forever). act.scope: shared opts out (E30 control). -#}
 {%- set unit = (ctx.act_scope.unit_prefix ~ (base | hash('sha1'))[:20] ~ '.scope') if (act.scope | default(ctx.act_scope.default)) == 'own' else '' -%}
 {%- set scope = [ctx.tools.systemd_run, '--user', '--scope', '--quiet', '--collect', '--unit=' ~ unit] if unit else [] -%}
-{{ {'argv': scope + [ctx.tools.timeout, '--kill-after=10', (to | string) ~ 's'] + pre + wrap + ns.argv, 'unit': unit,
+{#- bound: the act's own scope + timeout, which writer_cmd puts AROUND the record writer itself; inner: what the writer
+    exec's; argv = bound + inner (unchanged, for the log and the plan_act self-tests) -#}
+{%- set bound = scope + [ctx.tools.timeout, '--kill-after=10', (to | string) ~ 's'] -%}
+{{ {'argv': bound + pre + wrap + ns.argv, 'bound': bound, 'inner': pre + wrap + ns.argv, 'unit': unit,
+    'record_barrier': act.record_barrier | default([]),
     'cwd': act.cwd | default(ctx.t.ctl ~ '/cwd'), 'out': base ~ '.stdout', 'err': base ~ '.stderr',
     'strace': (base ~ '.strace') if pre else '', 'inventory': ns.inv, 'inventory_vars': ns.invvars,
     'inventory_targets': act.inventory_targets | default({}), 'target_group': (bs.inventory | default({})).target_group | default(''),
     'kill_token': ns.kill, 'timeout_s': to | int, 'async': act.async | default(false),
-    'kind': act.kind, 'op': act.op | default(''), 'seed_launch': ns.sl} | to_json }}
+    'kind': act.kind, 'op': act.op | default(''), 'seed_launch': ns.sl,
+    'records': [base ~ '.stdout', base ~ '.stderr'] + ([base ~ '.strace'] if pre else [])} | to_json }}
 {%- endmacro -%}
 
 {#- ------------------------------------------------------------ parsing ---------------------------------- -#}
@@ -412,7 +604,29 @@
 {%- set ft = failed_task(res.stdout | default('')) | from_json -%}
 {%- set rc = res.rc | default(-1) | int -%}
 {%- set busy = ctx.rh.controller.bootstrap.lock.busy -%}
-{%- if exp.record_only | default(false) -%}{{ [] | to_json }}
+{#- G-PRIVATE-PREPARE-CUSTODY (ported from m1-1g): a record the writer refused (res.record_refused, collect.yml: the refusal
+    status AND the stderr marker) is judged FIRST -- before record_only and inside every any_of alternative: only a step
+    declaring record_refused is met by it; nothing else (no rc / refusal / output expectation) ever is -#}
+{#- exp.record_refused: true (any stage) | <stage> (precheck | open | identity: the refusal must come from THAT stage, so a
+    barrier planted at the open cannot pass vacuously on the precheck). G-RECORD-OPEN-BEFORE-TIMEOUT: a record the writer
+    never ADMITTED (res.record_unadmitted, collect.yml) was never read and is never evidence -- judged right after, also
+    before record_only / any_of: only exp.record_unadmitted meets it, and only when the act's own bound ended the writer
+    (rc in record_readback.bound_rcs), e.g. a FIFO barrier blocking the noclobber open. -#}
+{%- set rrc = (ctx.record_refusal | default({})).code | default('RHC-ACT-RECORD') -%}
+{%- set unadm = res.record_unadmitted | default([]) -%}
+{%- if res.record_refused | default(false) or exp.record_refused | default(false) -%}
+{%- if (res.record_refused | default(false)) and (exp.record_refused | default(false)) -%}
+{%- if exp.record_refused is string and exp.record_refused != (res.record_refused_stage | default('')) -%}{{ ['the writer refused at stage ' ~ (res.record_refused_stage | default('?')) ~ ', expected stage ' ~ exp.record_refused] | to_json }}
+{%- else -%}{{ [] | to_json }}{%- endif -%}
+{%- elif exp.record_refused | default(false) -%}{{ ['expected the writer to refuse an appeared record (' ~ rrc ~ '), rc ' ~ rc ~ ((', unadmitted ' ~ (unadm | join(' '))) if unadm else '')] | to_json }}
+{%- else -%}{{ ['the writer refused an appeared record (' ~ rrc ~ ' stage ' ~ (res.record_refused_stage | default('?')) ~ '): the entrypoint never ran'] | to_json }}{%- endif -%}
+{%- elif unadm | length > 0 or exp.record_unadmitted | default(false) -%}
+{%- set brc = (ctx.record_readback | default({})).bound_rcs | default([124, 137]) | map('int') | list -%}
+{%- if unadm | length > 0 and (exp.record_unadmitted | default(false)) -%}
+{%- if rc in brc -%}{{ [] | to_json }}{%- else -%}{{ ['records never admitted (' ~ (unadm | join('; ')) ~ ') but rc ' ~ rc ~ ' is not the bound (' ~ (brc | join('|')) ~ ')'] | to_json }}{%- endif -%}
+{%- elif exp.record_unadmitted | default(false) -%}{{ ['expected the writer never to admit its records (bounded), but every record was admitted and read, rc ' ~ rc] | to_json }}
+{%- else -%}{{ ['records not admitted by the writer (' ~ (unadm | join('; ')) ~ '), rc ' ~ rc ~ ': never read, never evidence'] | to_json }}{%- endif -%}
+{%- elif exp.record_only | default(false) -%}{{ [] | to_json }}
 {%- elif exp.any_of is defined -%}
 {#- met when ANY alternative is met (each judged alone, BUSY rule included); otherwise every alternative's reasons -#}
 {%- set ns.alts = [] -%}
@@ -494,6 +708,9 @@
 {%- for p in preds -%}
 {%- set o = obs[loop.index0] | default({}) -%}
 {%- if p.path is defined and p.exists is defined and (o.exists | default(false)) != p.exists -%}{%- set ns.r = ns.r + [p.path ~ (' missing' if p.exists else ' exists')] -%}{%- endif -%}
+{#- path kind (fifo | regular | link | dir | other; observed by stat, follow false, nothing opened) and size (bytes) -#}
+{%- if p.path is defined and p.kind is defined and (o.kind | default('absent')) != p.kind -%}{%- set ns.r = ns.r + [p.path ~ ' is ' ~ (o.kind | default('absent')) ~ ', expected ' ~ p.kind] -%}{%- endif -%}
+{%- if p.path is defined and p.size is defined and (o.size | default(-1) | int) != p.size | int -%}{%- set ns.r = ns.r + [p.path ~ ' size ' ~ (o.size | default('?')) ~ ' != ' ~ p.size] -%}{%- endif -%}
 {%- if p.glob is defined and (o.count | default(-1)) != p.glob.count | int -%}{%- set ns.r = ns.r + [p.glob.dir ~ '/' ~ p.glob.pattern ~ ': ' ~ (o.count | default('?')) ~ ' entries, expected ' ~ p.glob.count] -%}{%- endif -%}
 {%- if p.file is defined -%}
 {%- set text = o.text | default(none) -%}

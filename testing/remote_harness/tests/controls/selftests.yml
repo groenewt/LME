@@ -9,9 +9,12 @@
 # expect: equals <value> (parsed result) | search <regex over the JSON text> | not_search <regex>; several may combine.
 schema_version: 1
 kind: lme-remote-harness-control-selftests
-gates: [judge, judge_pair, failed_task, outcome, refusal, residual, xjson, network_lines, plan_status, coverage, diff_paths, neutrality, dig, plan_act, judge_state, unimplemented, variant_dep]
+gates: [judge, judge_pair, failed_task, outcome, refusal, residual, xjson, network_lines, plan_status, coverage, diff_paths, neutrality, dig, plan_act, judge_state, unimplemented, variant_dep,
+        writer_cmd, writer_admitted, record_readback]
 ctx:
   rh: {controller: {bootstrap: {lock: {busy: RH-SEED-BUSY}, bundle: {staging_retention: {lease: {busy_refusal: RH-STAGING-BUSY}}}}}}
+  record_refusal: {code: RHC-ACT-RECORD, rc: 86, barrier_rc: 87}
+  record_readback: {timeout_s: 60, bound_rcs: [124, 137]}
   refusals: {RH-SEED-USAGE: 2, RH-SEED-BUDGET-UNAVAILABLE: 7, RH-SEED-BUSY: 15}
   t: {gen_id: G1, ctl: /h/c, staging_repeat: 3}
 fixtures:
@@ -62,6 +65,17 @@ fixtures:
     timeouts: {command: 120, playbook: 900}
     wraps: {none: []}
     act_scope: {default: own, unit_prefix: rhc-act-}
+  # record writer fixture (G-RECORD-OPEN-BEFORE-TIMEOUT; ported from m1-1g): fixture tool paths and records only
+  writer_ctx: &writer_ctx
+    rh: {controller: {bootstrap: {os_tools: {stat: {path: /usr/bin/stat}, sh: {path: /bin/sh}}}}}
+    record_refusal: {code: RHC-ACT-RECORD, rc: 86, barrier_rc: 87}
+    tools: {mkfifo: /usr/bin/mkfifo, dd: /usr/bin/dd}
+    t: {uid: '1000'}
+  writer_plan: &writer_plan {bound: [/usr/bin/timeout, --kill-after=10, 120s], inner: [/usr/bin/true], out: /h/c/p.stdout, err: /h/c/p.stderr, strace: '', record_barrier: []}
+  writer_plan_fifo: &writer_plan_fifo {bound: [/usr/bin/timeout, --kill-after=10, 120s], inner: [/usr/bin/true], out: /h/c/p.stdout, err: /h/c/p.stderr, strace: '', record_barrier: [{fifo: out}]}
+  adm_out: &adm_out {records: [{role: out, path: /h/c/p.stdout, dev: 1, ino: 2, uid: 1000}], missing: [err], stage: ''}
+  st_out: &st_out {stat: {exists: true, isreg: true, islnk: false, nlink: 1, dev: 1, inode: 2, uid: 1000, size: 3, mtime: 5, ctime: 5}}
+  st_out_swapped: &st_out_swapped {stat: {exists: true, isreg: true, islnk: false, nlink: 1, dev: 1, inode: 9, uid: 1000, size: 3, mtime: 5, ctime: 5}}
   deps: &deps
     d04_cold_start_ruling: {met: true, kind: ruling, value: a, why: w}
     r3e_acquisition_receipt: {met: false, kind: source, why: r3e}
@@ -72,6 +86,45 @@ fixtures:
     variant_clone_fixture: {met: false, kind: derived, why: no-clone}
     'variant:cfg': {met: true, kind: variant, why: override}
 cases:
+  # G-PRIVATE-PREPARE-CUSTODY (ported from m1-1g): a writer refusal meets ONLY a declared record_refused (never an rc / refusal expectation)
+  - {id: judge-record-refused-expected, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{record_refused: true}, {rc: 86, record_refused: true, stdout: '', stderr: ''}], expect: {equals: []}}
+  - {id: judge-record-refused-is-not-a-refusal, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc: 86}, {rc: 86, record_refused: true, stdout: '', stderr: ''}], expect: {search: 'the entrypoint never ran'}}
+  - {id: judge-record-refused-not-observed, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{record_refused: true}, {rc: 86, record_refused: false, stdout: '', stderr: ''}], expect: {search: 'expected the writer to refuse'}}
+  # G-RECORD-OPEN-BEFORE-TIMEOUT: a refusal stage is judged; an unadmitted record meets ONLY record_unadmitted with the bound's rc
+  - {id: judge-record-refused-wrong-stage, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{record_refused: open}, {rc: 86, record_refused: true, record_refused_stage: precheck, stdout: '', stderr: ''}], expect: {search: 'expected stage open'}}
+  - {id: judge-record-refused-right-stage, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{record_refused: open}, {rc: 86, record_refused: true, record_refused_stage: open, stdout: '', stderr: ''}], expect: {equals: []}}
+  - {id: judge-unadmitted-bounded, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{record_unadmitted: true}, {rc: 124, record_unadmitted: ['out: never admitted'], stdout: '', stderr: ''}], expect: {equals: []}}
+  - {id: judge-unadmitted-is-not-killed, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{killed: true}, {rc: 137, record_unadmitted: ['out: never admitted'], stdout: '', stderr: ''}], expect: {search: 'never read, never evidence'}}
+  - {id: judge-unadmitted-needs-the-bound, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{record_unadmitted: true}, {rc: 1, record_unadmitted: ['out: never admitted'], stdout: '', stderr: ''}], expect: {search: 'is not the bound'}}
+  # ---- writer_cmd: the bound wraps the writer; a barrier only when declared, after the precheck, before the create ----
+  - {id: writer-cmd-bound-wraps-writer, gate: writer_cmd, fn: writer_cmd, negative: false,
+     args: [*writer_plan, *writer_ctx],
+     expect: {search: '^exec /usr/bin/timeout --kill-after=10 120s /bin/sh -c .*set -C.*ADMITTED RHC-ACT-RECORD out .* rhc-writer /usr/bin/true$', not_search: 'mkfifo|BARRIER-FAILED'}}
+  - {id: writer-cmd-barrier-after-precheck, gate: writer_cmd, fn: writer_cmd, negative: true,
+     args: [*writer_plan_fifo, *writer_ctx],
+     expect: {search: 'stage=precheck err .*/usr/bin/mkfifo -m 0600 -- /h/c/p\.stdout .*BARRIER-FAILED.*_m=\$\(umask\); umask 0177; set -C'}}
+  # ---- writer_admitted: the FIRST admitted line per role; a later forged line and a missing role never admit ----
+  - {id: writer-admitted-both, gate: writer_admitted, fn: writer_admitted, with_ctx: true, negative: false,
+     args: ["ADMITTED RHC-ACT-RECORD out 1:2:1000:1:0:regular empty file\nADMITTED RHC-ACT-RECORD err 1:3:1000:1:0:regular empty file\n", *writer_plan],
+     expect: {equals: {records: [{role: out, path: /h/c/p.stdout, dev: 1, ino: 2, uid: 1000}, {role: err, path: /h/c/p.stderr, dev: 1, ino: 3, uid: 1000}], missing: [], stage: ''}}}
+  - {id: writer-admitted-forged-second-line, gate: writer_admitted, fn: writer_admitted, with_ctx: true, negative: true,
+     args: ["ADMITTED RHC-ACT-RECORD out 1:2:1000:1:0:regular empty file\nADMITTED RHC-ACT-RECORD out 9:9:0:1:0:regular empty file\nREFUSED RHC-ACT-RECORD: stage=open a record\n", *writer_plan],
+     expect: {equals: {records: [{role: out, path: /h/c/p.stdout, dev: 1, ino: 2, uid: 1000}], missing: [err], stage: open}}}
+  # ---- record_readback: read only the admitted object, unchanged across the read ----
+  - {id: readback-admitted-unchanged, gate: record_readback, fn: record_readback, negative: false,
+     args: [*adm_out, [*st_out], [{rc: 0, stdout: abc}], [*st_out]], expect: {equals: {text: {out: abc}, rejected: []}}}
+  - {id: readback-replaced-during-read, gate: record_readback, fn: record_readback, negative: true,
+     args: [*adm_out, [*st_out], [{rc: 0, stdout: abc}], [*st_out_swapped]], expect: {search: 'changed or replaced during the read', not_search: 'abc'}}
+  - {id: readback-pre-stat-not-admitted, gate: record_readback, fn: record_readback, negative: true,
+     args: [*adm_out, [*st_out_swapped], null, null], expect: {equals: []}}
   # ---- judge: named refusals, BUSY, kills, any_of ----
   - {id: judge-busy-expected, gate: judge, fn: judge, with_ctx: true, negative: false,
      args: [{refusal: RH-SEED-BUSY, busy_expected: true}, *busy], expect: {equals: []}}
@@ -204,9 +257,23 @@ cases:
   # ---- coverage ----
   - {id: coverage-known-and-uncovered, gate: coverage, fn: coverage, negative: false,
      args: [[{id: C, cases: [A1, 'transfer:K1']}], [{prefix: '', ids: [A1, A2]}, {prefix: 'transfer:', ids: [K1]}]],
-     expect: {equals: {unknown: [], uncovered: [A2], known_count: 3}}}
+     expect: {equals: {unknown: [], uncovered: [A2], partial: {}, declared_whole: [A1, 'transfer:K1'], known_count: 3}}}
   - {id: coverage-unknown-id-detected, gate: coverage, fn: coverage, negative: true,
      args: [[{id: C, cases: [A9, K1]}], [{prefix: '', ids: [A1]}, {prefix: 'transfer:', ids: [K1]}]], expect: {search: 'C -> A9.*C -> K1'}}
+  # G-E77-PARTIAL-COVERAGE (ported from m1-1g): components through the row model -- some of a row's declared variants = PARTIAL, never whole
+  - {id: coverage-components-partial, gate: coverage, fn: coverage, negative: true,
+     args: [[{id: C, cases: [E77], case_components: {E77: [positive]}}], [{prefix: '', ids: [E77], variants: {E77: [positive, negative-malformed]}}]],
+     expect: {equals: {unknown: [], uncovered: [], partial: {E77: {covered: [positive], missing: [negative-malformed]}}, declared_whole: [], known_count: 1}}}
+  - {id: coverage-components-span-the-row, gate: coverage, fn: coverage, negative: false,
+     args: [[{id: C, cases: [E77], variants: [{id: a, case_components: {E77: [positive]}}, {id: b, case_components: {E77: [negative-malformed]}}]}],
+            [{prefix: '', ids: [E77], variants: {E77: [positive, negative-malformed]}}]],
+     expect: {equals: {unknown: [], uncovered: [], partial: {}, declared_whole: [E77], known_count: 1}}}
+  - {id: coverage-component-not-a-row-variant, gate: coverage, fn: coverage, negative: true,
+     args: [[{id: C, cases: [E77], case_components: {E77: [positiv]}}], [{prefix: '', ids: [E77], variants: {E77: [positive]}}]],
+     expect: {search: 'C -> case_components E77/positiv \(not a variant of the row\)'}}
+  - {id: coverage-of-pass-results-partial, gate: coverage, fn: coverage_of, negative: true,
+     args: [[{cases: [E79], case_components: {E79: [absent, link]}}], [{prefix: '', ids: [E79], variants: {E79: [absent, present-0600, link]}}]],
+     expect: {equals: {whole: [], partial: {E79: {covered: [absent, link], missing: [present-0600]}}}}}
   # ---- neutrality (Y03 helper; C1 Q-C1-NEUTRALITY predicate) ----
   - {id: diff-paths-nested, gate: diff_paths, fn: diff_paths, negative: false,
      args: [{a: {b: 1, c: [1, 2]}, d: x}, {a: {b: 2, c: [1, 3]}, d: x, e: 1}, ''], expect: {equals: [a.b, 'a.c[1]', e]}}

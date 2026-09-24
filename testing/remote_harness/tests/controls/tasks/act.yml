@@ -1,6 +1,9 @@
 ---
-# run one action through its real entrypoint (_rhc_step.act). The argv is planned by the pure macro plan_act; it is
-# executed by `exec` so the entrypoint (or its scope/timeout/strace wrapper) replaces the shell and its streams go to files.
+# run one action through its real entrypoint (_rhc_step.act). The argv is planned by the pure macro plan_act and run by the
+# ONE record writer (controls.j2 writer_cmd; ported from m1-1g, codex 200213 point 7): the task shell exec's the act's own
+# scope + timeout (plan.bound), whose child is the declared sh running the writer body (precheck, create, identity,
+# admission -- all inside the bound), which exec's the entrypoint (plan.inner) with its streams on the admitted records.
+# m1-1 has no private_create.yml: the record freshness check is the writer's own precheck (stage=precheck) only.
 # Every act runs in its own transient user scope (plan.unit; controls.yml act_scope) unless it declares scope: shared.
 
 - name: "Plan the action of {{ _rhc_step.id }}"
@@ -31,6 +34,28 @@
     mode: '0700'
   when: _rhc_plan.cwd == _rhc_t.ctl ~ '/cwd'
 
+# G-RECORD-OPEN-BEFORE-TIMEOUT race control (codex 195110 point 2): act.record_barrier [{fifo|regular: out|err|strace}] is
+# planted by the WRITER ITSELF after its precheck and before its noclobber create (controls.j2 writer_cmd step 2) -- the
+# deterministic precheck-to-open barrier. Only a record role of this very plan; a declaration error otherwise.
+- name: Refuse a record barrier that is not a declared kind at a record of this act (declaration error; before any process)
+  vars:
+    _roles: "{{ ['out', 'err'] + (['strace'] if _rhc_plan.strace else []) }}"
+    _bad: >-
+      {{ _rhc_plan.record_barrier | reject('mapping') | list
+         + (_rhc_plan.record_barrier | select('mapping') | rejectattr('fifo', 'defined') | rejectattr('regular', 'defined') | list)
+         + (_rhc_plan.record_barrier | select('mapping') | selectattr('fifo', 'defined') | rejectattr('fifo', 'in', _roles) | list)
+         + (_rhc_plan.record_barrier | select('mapping') | selectattr('regular', 'defined') | rejectattr('regular', 'in', _roles) | list)
+         + (_rhc_plan.record_barrier | select('mapping') | map('list') | map('length') | reject('equalto', 1) | list) }}
+  ansible.builtin.assert:
+    that: _bad | length == 0
+    fail_msg: "REFUSED RHC-ACT-RECORD-BARRIER: {{ _rhc_step.id }} record_barrier {{ _rhc_plan.record_barrier | to_json }} (bad: {{ _bad | to_json }}); one {fifo|regular: <role>} per entry, role in {{ _roles }}"
+    quiet: true
+  when: _rhc_plan.record_barrier | length > 0
+
+- name: The writer line of this act (records created exclusively by the writer itself; controls.j2 writer_cmd)
+  ansible.builtin.set_fact:
+    _rhc_wcmd: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'writer_cmd', 'args': [_rhc_plan, _rhc_ctx]}}) }}"
+
 - name: Refuse declared targets outside RFC 5737 TEST-NET-1 at run time too (G never reaches a real host; plan-time guard in _steps_unimpl)
   ansible.builtin.assert:
     that:
@@ -53,7 +78,7 @@
 
 - name: "Run {{ _rhc_step.id }} (synchronous)"
   ansible.builtin.shell:
-    cmd: "exec {{ _rhc_plan.argv | map('quote') | join(' ') }} </dev/null >{{ _rhc_plan.out | quote }} 2>{{ _rhc_plan.err | quote }}"
+    cmd: "{{ _rhc_wcmd }}"
     chdir: "{{ _rhc_plan.cwd }}"
   environment:   # systemd-run --user reaches the owner's user manager; the entrypoint itself still runs under env -i
     XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
@@ -66,7 +91,7 @@
 
 - name: "Run {{ _rhc_step.id }} (in the background; joined, killed or awaited by later steps)"
   ansible.builtin.shell:
-    cmd: "exec {{ _rhc_plan.argv | map('quote') | join(' ') }} </dev/null >{{ _rhc_plan.out | quote }} 2>{{ _rhc_plan.err | quote }}"
+    cmd: "{{ _rhc_wcmd }}"
     chdir: "{{ _rhc_plan.cwd }}"
   environment:   # systemd-run --user reaches the owner's user manager; the entrypoint itself still runs under env -i
     XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
@@ -89,4 +114,5 @@
     rhc_cplan: "{{ _rhc_plan }}"
     rhc_crc: "{{ _rhc_sync.rc | default(-1) }}"
     rhc_cexp: "{{ _rhc_step.expect | default({}) }}"
+    rhc_cwstderr: "{{ _rhc_sync.stderr | default('') }}"   # the writer's own stderr (its RHC-ACT-RECORD refusal / admission), not the record
   when: not _rhc_plan.async

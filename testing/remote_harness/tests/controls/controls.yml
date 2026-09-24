@@ -307,7 +307,16 @@ wraps:
 # as a root that must be refused before any write.
 state:
   run_marker: .lme-rhc-run          # first file of every run dir; cleanup removes only dirs carrying it
-  keep_runs: 3                      # older marked run dirs are removed at the start of an execute run (oldest first)
+  # G-PRIVATE-PREPARE-CUSTODY (ported from m1-1g, codex 200213 point 7): the record writer's refusal (controls.j2
+  # writer_cmd) -- exit 86 (outside the seed's refusal statuses 2..16, timeout's 124/125/137) AND stderr
+  # `REFUSED RHC-ACT-RECORD: stage=`; judged only by expect record_refused
+  # barrier_rc: a declared record barrier (act.record_barrier) that could not be planted (stderr BARRIER-FAILED) -- never 86
+  record_refusal: {code: RHC-ACT-RECORD, rc: 86, barrier_rc: 87}
+  # G-RECORD-OPEN-BEFORE-TIMEOUT (collect.yml): each admitted record is read by runner_tools.timeout <timeout_s>s +
+  # runner_tools.dd iflag=nofollow,nonblock; bound_rcs = the act timeout's own statuses (TERM 124, KILL after
+  # --kill-after 137) -- the only exit an unadmitted record meets (expect record_unadmitted)
+  record_readback: {timeout_s: 60, bound_rcs: [124, 137]}
+  keep_runs: 3                     # older marked run dirs are removed at the start of an execute run (oldest first)
   max_live_roots: 2                 # the shared root + one fresh root; a fresh root is purged when its control ends
   variant_scratch: [bundle, bundle-b, src, stash, receipt, vclone, '.bundle.staging.*', '.bundle.reaping.*', '.bundle.lease.*', .bundle.lock]   # removed after each variant (evidence stays; vclone after its root is purged)
   storage:                          # free bytes required on the work root before execute (resolved values, not literals)
@@ -332,20 +341,29 @@ state:
 vocabulary:
   control_keys: [id, cases, findings, purpose, requires, root, fixture_for, declaration, variants, setup, steps, undo,
                  sweep, per_point_expect, note, static_checks, declared_only, acceptance_rule, retire_when, evidence, result_class,
-                 applies_when, interface, refute, hostile, rows, variant_checkout]
+                 applies_when, interface, refute, hostile, rows, variant_checkout, case_components]
+  # case_components {<case id>: [<row variant key>]} (control or variant; G-E77-PARTIAL-COVERAGE, ported from m1-1g): the
+  # control covers only those variants of the row's declared `variants` mapping -- the summary reports the row PARTIAL
+  # until they span it.
   # variant_checkout: clone -- the control's declaration variant runs from its OWN declared clone (top-level variant_clone;
   # tasks/variant_clone.yml), never the override channel or a MAIN-staged copy; tokens {vclone} {vwork} {vparent} {vroot}
   # legibility (operator gold standard; documentation keys, never executed): `refute` names the mutated input on which the
   # control must FAIL (non-vacuity); `hostile` names its hostile negative; `rows` maps each variant to its lifecycle row(s).
   # New controls are named <operation>.<phase>.<relation>; the older ids stay (other messages cite them).
-  variant_keys: [id, declaration, requires, ops, undo, tokens, expect, note]
+  variant_keys: [id, declaration, requires, ops, undo, tokens, expect, note, case_components, cleanup_purge]
+  # cleanup_purge (runner.record.cleanup-barrier; a root: fresh control): declared deviations of the fresh-root cleanup
+  # purge -- record_barrier / timeout_s go into its act, expect judges it like a step, post_state is checked after it
+  cleanup_purge_keys: [record_barrier, timeout_s, expect, post_state]
   step_common: [id, timeout_s, note, post_state, only_variants, skip_variants, expect]
   steps: [act, wait, kill, freeze, thaw, join, ops, snapshot, state, sample_scope, judge_pair, repeat]
   acts: [seed, package, playbook, command]
   # extra_vars_json: ONE structured -e (JSON) after the k=v extra_vars (the lme_resolved_run mapping of the run-local contract)
   act_keys: [kind, op, bundle, root, args, raw_args, argv, async, cwd, dest, env, unset_env, executor, extra_vars, extra_vars_json, inventory_extra,
              inventory_omit_root, inventory_owner, inventory_root, inventory_targets, invoke, limit, no_ssh_auth, playbook, repo, scope,
-             source, ssh_auth, strace, timeout_s, trace_exec, trace_network, via, wrap]
+             source, ssh_auth, strace, timeout_s, trace_exec, trace_network, via, wrap, record_barrier]
+  # record_barrier: [{fifo|regular: out|err|strace}] planted by the WRITER ITSELF after its precheck and before its
+  # noclobber create (G-RECORD-OPEN-BEFORE-TIMEOUT: the deterministic precheck-to-open barrier; controls.j2 writer_cmd
+  # step 2). m1-1 has no plant_record (no private_create.yml): a prior object is planted by an ordinary op before the act.
   # inventory_targets {name: {host vars}} writes the declared target group (controller.bootstrap.inventory.target_group);
   # every ansible_host / ansible_ssh_host there (and an extra-var ansible_host) must match this RFC 5737 TEST-NET-1 regex,
   # checked at plan time (_steps_unimpl -> UNIMPLEMENTED) and again before the inventory is written (act.yml).
@@ -353,7 +371,14 @@ vocabulary:
   kill_options: [step, root, token, holder_only, tracer_only, processes_only]
   expect: [rc, rc_nonzero, refusal, refusal_any, outcome, outcome_any, gen, refused_at, refused_at_any, failed_before_task,
            playbook_refusal, stdout_has, stderr_has, stdout_or_stderr_has, stderr_regex, stdout_regex, stdout_not_regex, busy_expected,
-           killed, record_only, no_network, exec_seen, no_exec_regex, any_of]
+           killed, record_only, no_network, exec_seen, no_exec_regex, any_of, record_refused, record_unadmitted]
+  # record_refused: true | precheck | open | identity (the writer's refusal stage); record_unadmitted: true (no record
+  # admitted, never read, and the act's own bound ended the writer: rc in state.record_readback.bound_rcs).
+  # TRACE IS DIAGNOSTIC (codex 200213 point 6): no_network / exec_seen / no_exec_regex judge the strace record, which the
+  # traced entrypoint can still write (fd 5 stays open, writable, at offset 0; controls.j2 writer_cmd) -- they never
+  # support a claim of independent trace custody; fd 5 surviving systemd-run / timeout / strace is verified only when
+  # the declared runner runs.
+  # path predicate options: exists, kind (absent | fifo | regular | link | dir | other; stat, nothing opened), size
   predicates: [path, glob, file, same_bytes, snapshot, implies]
   ops: [mkdir, write, symlink, chmod, remove, remove_glob, stash, stash_copy, unstash, copy, copy_tree, mkfifo, append,
         unseal, reseal, json_rewrite, drop_line, retarget, move, overwrite_first_byte, rehash_into_json, run_shaped_dirs]
@@ -3474,3 +3499,91 @@ controls:
       .clear in transfer.j2 is refused TRANSFER-CHECK-METHOD-ATTR). G does not duplicate either. G''s acceptance matrix uses B''s
       ACTUAL recorded results; this runner never executes them, so they plan UNIMPLEMENTED here (never PASS or coverage from G).
       Both rows are UNRUN at 49e9a637.'
+
+  # ---- G-RECORD-OPEN-BEFORE-TIMEOUT record-writer race controls (ported from m1-1g, codex 200213 points 5 / 7) ----
+  - id: runner.record.appearance-refused
+    findings: [G-PRIVATE-PREPARE-CUSTODY, G-RECORD-OPEN-BEFORE-TIMEOUT]
+    purpose: 'the record writer never truncates, follows or writes an object that appears before it created the record --
+      at its precheck (prior-record, link) AND at the precheck-to-open boundary (fifo-open, regular-open) -- a legitimate
+      prior record survives, a raced FIFO cannot block the runner beyond the act''s own bound, and no unadmitted record is
+      ever read back'
+    refute: 'a writer that opens with `>` (O_TRUNC, following links) empties prior.stdout / writes through the link into
+      plant-target: the file predicates FAIL; a writer that skips silently runs the entrypoint: record_refused FAILS; a
+      writer whose create is not O_EXCL opens the planted regular-race.stderr: record_refused open FAILS (stage); a writer
+      opened OUTSIDE the act''s bound hangs the FIFO step (the task-level timeout fires: runner error, FAIL); a collector
+      that reopens the record by pathname (lookup file) hangs on the FIFO the same way'
+    variants:
+      - {id: none}
+      # m1-1 has no plant_record / private_create.yml: the prior object is planted by the variant's own ops (setup, before
+      # every step), so it reaches only the writer's PRECHECK -- the same boundary as m1-1g's plant_record
+      - {id: prior-record, ops: [{write: '{ctl}/prior.stdout', content: 'LEGITIMATE PRIOR RECORD', mode: '0600'}]}
+      - {id: link, ops: [{write: '{ctl}/plant-target', content: 'TARGET', mode: '0600'}, {symlink: '{ctl}/linked.stderr', target: '{ctl}/plant-target'}]}
+      - {id: fifo-open}
+      - {id: regular-open}
+    steps:
+      # non-vacuity: nothing planted -- the writer admits both records and collect.yml reads them back through the admitted
+      # identity (stdout_has is judged on that readback; an unadmitted record would fail the judge first)
+      - {id: plain, act: {kind: command, argv: ['{sha256sum}', --version]}, only_variants: [none], expect: {rc: 0, stdout_has: [sha256sum]},
+         post_state: [{file: '{ctl}/plain.stdout', contains: sha256sum}]}
+      - {id: prior, act: {kind: command, argv: ['{sha256sum}', --version]},
+         only_variants: [prior-record], expect: {record_refused: precheck},
+         post_state: [{file: '{ctl}/prior.stdout', regex: '\ALEGITIMATE PRIOR RECORD\Z'}, {path: '{ctl}/prior.stderr', exists: false}]}
+      - {id: linked, act: {kind: command, argv: ['{sha256sum}', --version]},
+         only_variants: [link], expect: {record_refused: precheck},
+         post_state: [{file: '{ctl}/plant-target', regex: '\ATARGET\Z'}, {path: '{ctl}/linked.stdout', exists: false}]}
+      # precheck-to-open barrier (the writer plants it AFTER its precheck passed): a reader-less FIFO at the stdout record.
+      # The noclobber open of a non-regular object is a plain O_WRONLY open -> it blocks INSIDE the act's own timeout (10 s),
+      # which ends the writer (rc 124 / 137); nothing is admitted, so nothing is read; the stderr record is never created
+      # (its redirection comes after the blocked one); the FIFO stays a FIFO. Completing this step at all shows neither the
+      # writer nor the readback blocked the runner past the bound.
+      - {id: fifo-race, act: {kind: command, argv: ['{sha256sum}', --version], timeout_s: 10, record_barrier: [{fifo: out}]},
+         only_variants: [fifo-open], expect: {record_unadmitted: true},
+         post_state: [{path: '{ctl}/fifo-race.stdout', kind: fifo}, {path: '{ctl}/fifo-race.stderr', exists: false}]}
+      # precheck-to-open barrier: an EMPTY regular file at the stderr record. The stdout record is created by O_EXCL (empty,
+      # the writer's own); the stderr create meets the existing regular file -> EEXIST, never opened -> refused at stage
+      # open (not precheck: the barrier came after it). Both stay empty regular files; nothing ran.
+      - {id: regular-race, act: {kind: command, argv: ['{sha256sum}', --version], record_barrier: [{regular: err}]},
+         only_variants: [regular-open], expect: {record_refused: open},
+         post_state: [{path: '{ctl}/regular-race.stderr', kind: regular, size: 0}, {path: '{ctl}/regular-race.stdout', kind: regular, size: 0}]}
+    note: 'runner self-control, no case credit; ALL VARIANTS UNRUN. m1-1: the prior object is planted by variant ops (no
+      private_create.yml, no plant_record), so it reaches only the writer''s PRECHECK (prior-record, link: refused stage
+      precheck, exit 86; collect.yml reads NO record). record_barrier is planted by the writer itself between its precheck
+      and its noclobber create (controls.j2 writer_cmd step 2) -- the deterministic precheck-to-open race (fifo-open,
+      regular-open). What this establishes, and what it does NOT (stated): (1) a raced FIFO IS opened by the noclobber open
+      (O_WRONLY, no O_EXCL: dash / bash noclobber semantics for an existing non-regular name, read from the shell sources,
+      NOT verified here) -- it blocks inside the act''s own scope + timeout, never before it; a raced device or a FIFO with
+      a reader would be opened and then refused at stage identity, never written; (2) a raced regular file is never opened
+      (EEXIST) -- the refused-at-open expectation depends on the shell continuing to the `||` refusal after a redirection
+      error on the brace group (dash behaviour, NOT verified here; if it exits instead, regular-race FAILS); (3) the stdout
+      record is admitted only when its descriptor came from the O_EXCL branch, but another process of this uid can still
+      rename / reopen / write the admitted inode afterwards (same-uid limit, stated in writer_cmd).'
+
+  # G-RECORD-OPEN-BEFORE-TIMEOUT cleanup race control (codex 195110 / 200213 point 5): the fresh-root CLEANUP purge
+  # (tasks/finish_variant.yml) runs through the same writer inside its own scope + timeout; each variant plants the
+  # declared barrier at the purge's records after the writer's precheck. The root is never installed (the purge of an
+  # absent root is `ABSENT`), so an expected refusal leaves nothing behind.
+  - id: runner.record.cleanup-barrier
+    findings: [G-RECORD-OPEN-BEFORE-TIMEOUT]
+    requires: [bundle_a]
+    root: fresh
+    purpose: 'the cleanup writer has the act writer''s contract: bounded by its own scope + timeout and an independent
+      task-level timeout, refuses a raced regular record at its create, never admits (never reads) a raced FIFO, and an
+      unperturbed cleanup purge is admitted and read back'
+    refute: 'a cleanup writer outside its bound hangs on the FIFO (the task-level timeout fires: runner error, FAIL); a
+      cleanup writer without O_EXCL opens the planted stderr: record_refused open FAILS; a collector reading the cleanup
+      records by pathname hangs on the FIFO'
+    variants:
+      - {id: none, cleanup_purge: {expect: {rc: 0, outcome: ABSENT}}}
+      - {id: fifo-open, cleanup_purge: {record_barrier: [{fifo: out}], timeout_s: 15, expect: {record_unadmitted: true},
+                                        post_state: [{path: '{ctl}/cleanup-purge.stdout', kind: fifo}, {path: '{ctl}/cleanup-purge.stderr', exists: false}]}}
+      - {id: regular-open, cleanup_purge: {record_barrier: [{regular: err}], expect: {record_refused: open},
+                                           post_state: [{path: '{ctl}/cleanup-purge.stderr', kind: regular, size: 0},
+                                                        {path: '{ctl}/cleanup-purge.stdout', kind: regular, size: 0}]}}
+    steps:
+      - {id: untouched, state: [{path: '{root}', exists: false}]}
+    note: 'runner self-control, no case credit; UNRUN. The only step asserts the fresh root was never created; the judged
+      action is the variant''s cleanup purge (finish_variant.yml: cleanup_purge.expect through collect.yml, post_state after
+      it). The none variant is the non-vacuity leg (the purge''s ABSENT outcome is read back through the admitted identity).
+      Same stated limits as runner.record.appearance-refused (noclobber semantics and the dash redirection-error path read
+      from source, not verified; same-uid limit). The task-level timeout bounds the controller''s wait only; the plan''s own
+      timeout is what ends the writer.'
