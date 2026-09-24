@@ -83,12 +83,6 @@
         state: directory
         mode: "0755"
 
-    - name: "Prepare the per-case temp dir (TMPDIR of the scrubbed-env probe; never the /tmp fallback of env -i) :: {{ case.name }}"
-      ansible.builtin.file:
-        path: "{{ work }}/{{ case.name }}/tmp"
-        state: directory
-        mode: "0700"
-
     - name: "Render probe playbook from macros/probe.j2 :: {{ case.name }}"
       ansible.builtin.template:
         src: probe_wrapper.yml.j2
@@ -99,9 +93,21 @@
       ansible.builtin.set_fact:
         _assert_count: "{{ (lookup('ansible.builtin.file', work ~ '/' ~ case.name ~ '/probe.yml')).splitlines() | select('search', 'ansible.builtin.assert') | list | length }}"
 
+    # the ONE nested-probe argv builder (RH-NESTED-PROBE-EXECUTOR): lme_resolved_run.ansible_playbook under exactly
+    # lme_resolved_run.env (bound by run_integration.yml) plus this case's own HOME/TMPDIR/TMP/TEMP/ANSIBLE_LOCAL_TEMP/
+    # ANSIBLE_REMOTE_TMP and a fixed PATH <resolved bin dir>:/usr/bin:/bin (created
+    # by the builder under the work root; never /usr/bin/ansible-playbook, never the /tmp fallback of env -i)
+    - name: "Compose the nested probe argv :: {{ case.name }}"
+      ansible.builtin.include_tasks: "{{ repo_root }}/testing/remote_harness/tests/tasks/probe_argv.yml"
+      vars:
+        bpe_case_dir: "{{ work }}/{{ case.name }}"
+        bpe_args: [probe.yml]
+        bpe_extra_env: {ANSIBLE_ROLES_PATH: "{{ repo_root }}/ansible/roles"}
+      when: (_assert_count | int) > 0
+
     - name: "Run probe under scrubbed env :: {{ case.name }}"
       ansible.builtin.command:
-        cmd: /usr/bin/env -i HOME={{ work }}/{{ case.name }} PATH=/usr/bin:/bin TMPDIR={{ work }}/{{ case.name }}/tmp ANSIBLE_ROLES_PATH={{ repo_root }}/ansible/roles /usr/bin/ansible-playbook probe.yml
+        argv: "{{ bpe_argv }}"
         chdir: "{{ work }}/{{ case.name }}"
       register: probe_run
       changed_when: false
@@ -139,12 +145,6 @@
         state: directory
         mode: "0755"
 
-    - name: "Prepare the per-case temp dir (TMPDIR of the scrubbed-env probe; never the /tmp fallback of env -i) :: {{ case.name }}"
-      ansible.builtin.file:
-        path: "{{ work }}/{{ case.name }}/tmp"
-        state: directory
-        mode: "0700"
-
     - name: "Render engine probe from engine_probe.yml.j2 :: {{ case.name }}"
       ansible.builtin.template:
         src: engine_probe.yml.j2
@@ -165,9 +165,20 @@
         _eng_bad_expect_keys: "{{ ((case.expect | default({})).keys() | list) | difference(case_schema.engine_expect_allowlist) }}"
         _eng_raises_unreasoned: "{{ (case.expect.raises | default(false)) and (case.expect.raises_match is not defined) }}"
 
+    - name: "Compose the nested engine probe argv (RH-NESTED-PROBE-EXECUTOR) :: {{ case.name }}"
+      ansible.builtin.include_tasks: "{{ repo_root }}/testing/remote_harness/tests/tasks/probe_argv.yml"
+      vars:
+        bpe_case_dir: "{{ work }}/{{ case.name }}"
+        bpe_args: [probe.yml]
+        bpe_extra_env: {ANSIBLE_FILTER_PLUGINS: "{{ engine_filter_dir }}"}
+      when:
+        - (_eng_assert_count | int) > 0
+        - (_eng_bad_expect_keys | length) == 0
+        - not _eng_raises_unreasoned
+
     - name: "Run engine probe under scrubbed env against the immutable resolver copy :: {{ case.name }}"
       ansible.builtin.command:
-        cmd: /usr/bin/env -i HOME={{ work }}/{{ case.name }} PATH=/usr/bin:/bin TMPDIR={{ work }}/{{ case.name }}/tmp ANSIBLE_FILTER_PLUGINS={{ engine_filter_dir }} /usr/bin/ansible-playbook probe.yml
+        argv: "{{ bpe_argv }}"
         chdir: "{{ work }}/{{ case.name }}"
       register: eng_run
       changed_when: false

@@ -90,6 +90,14 @@ bound_bytes_at_authoring:
   # still == the route's form_regex, K01/K06/K07/I4 still present. The rest of B's changes were NOT reviewed by G.
   testing/e2e/transfer/controls/CASES.yml: aca149100773b9c6ab9a6882135149fe45d5e9f5b243644a9bd9f2d2cd5cca02
   testing/e2e/transfer/transfer.decl.yml: f410d0debb9bc941df53d789720b38a7a3aa7fc46af516370078d1a9ea9c3acc
+  # G's nested-probe executor binding + the two local runners that include it (RH-NESTED-PROBE-EXECUTOR /
+  # RH-RUNNER-RESOLVED-WORKROOT, codex 143844 / 144541; control executor.nested.resolved-run), digested by G with sha256sum
+  testing/remote_harness/tests/tasks/bind_probe_executor.yml: ec2a88627b275ac0d4082b5a25bb47aab3990b52ab5b3016070872924409ff5d
+  testing/remote_harness/tests/tasks/probe_argv.yml: 55c81a9b696213473c0f0a47655831ebdc659b612700b2ebf445e32ef115f1c5
+  testing/acceptance/run_acceptance.yml: 32d83f72fa7ac568f6906e2c0155ab21c64baa91b485c0c1ff98cb00a0543f32
+  testing/acceptance/one_case_acceptance.yml: bc6b3304a53c038e50d0ee972a9b6035583f99c96e567c0383457c639ffd3a66
+  testing/tests/loader_integration/run_integration.yml: 156219df20288e2783f8c3f89e6c8b42609833844d78fd7bc92c2da59b78493b
+  testing/tests/loader_integration/one_case.yml: 700c2636af12ca452e9eeab281ef591e8393a876a0a6a9be15e9b2d5f4918450
   decisions: [codex-tick134-r3b-contract-decisions-20260924-000256, codex-G-control-contract-answers-20260924-001716, claude-tick137-r3c-byte-verified-E09-defect,
               claude-route-author-seed-candidate-r3d-supersedes-r3c-20260924, claude-tick138-r3d-byte-verified-lease-questions,
               codex-tick138-lease-and-cold-acquisition-decisions-20260924-004749, codex-tick139-writer-quiescence-clarification-20260924-010127,
@@ -121,6 +129,12 @@ binding_required:
   - testing/remote_harness/templates/lme-controller-seed.sh.j2
   - manifests/global.yml
   - ansible/roles/podman/filter_plugins/lme_manifests.py
+  - testing/remote_harness/tests/tasks/bind_probe_executor.yml
+  - testing/remote_harness/tests/tasks/probe_argv.yml
+  - testing/acceptance/run_acceptance.yml
+  - testing/acceptance/one_case_acceptance.yml
+  - testing/tests/loader_integration/run_integration.yml
+  - testing/tests/loader_integration/one_case.yml
 # rows G asked owners for that are not (yet) in their files (channel: claude-G-controls-case-requests-and-seams-20260924-0012)
 requested_cases:
   - {id: 'transfer:U01-edition-unchanged-rerun', owner: B, control: W01-deploy-edition-lifecycle}
@@ -134,7 +148,11 @@ entrypoints:
   target_bootstrap: testing/remote_harness/target_bootstrap.yml   # G runs it only under `seed run` (play 1 asserts the seed run TMPDIR),
                                                                   # with --limit localhost (play 1 only) or against TEST-NET-1 targets
                                                                   # for pre-contact refusals (Q-G-PRECONTACT-TARGET-PLAY = main_only: MAIN runs those)
-rendered_playbooks: [probe_config, hold_lock]     # rendered per control from templates/playbooks/<name>.yml.j2
+  # G's local runners: controls run them ONLY on refusal paths that stop at their first task (a full run writes the
+  # committed acceptance receipt into the checkout); the positive nested-executor path runs through probe_nested
+  acceptance: testing/acceptance/run_acceptance.yml
+  loader_integration: testing/tests/loader_integration/run_integration.yml
+rendered_playbooks: [probe_config, hold_lock, probe_nested]     # rendered per control from templates/playbooks/<name>.yml.j2
 seed_run_auth_mode: tailnet_identity              # a localhost-only play still names a mode (controller.bootstrap.ssh_auth)
 # absolute tools the RUNNER uses to observe and interrupt (never PATH; the entrypoints bring their own)
 runner_tools: {env: /usr/bin/env, timeout: /usr/bin/timeout, strace: /usr/bin/strace, pgrep: /usr/bin/pgrep, pkill: /usr/bin/pkill,
@@ -188,7 +206,8 @@ vocabulary:
   step_common: [id, timeout_s, note, post_state, only_variants, skip_variants, expect]
   steps: [act, wait, kill, freeze, thaw, join, ops, snapshot, state, sample_scope, judge_pair, repeat]
   acts: [seed, package, playbook, command]
-  act_keys: [kind, op, bundle, root, args, raw_args, argv, async, cwd, dest, env, unset_env, executor, extra_vars, inventory_extra,
+  # extra_vars_json: ONE structured -e (JSON) after the k=v extra_vars (the lme_resolved_run mapping of the run-local contract)
+  act_keys: [kind, op, bundle, root, args, raw_args, argv, async, cwd, dest, env, unset_env, executor, extra_vars, extra_vars_json, inventory_extra,
              inventory_omit_root, inventory_owner, inventory_root, inventory_targets, invoke, limit, no_ssh_auth, playbook, repo, scope,
              source, ssh_auth, strace, timeout_s, trace_exec, trace_network, via, wrap]
   # inventory_targets {name: {host vars}} writes the declared target group (controller.bootstrap.inventory.target_group);
@@ -2321,3 +2340,100 @@ controls:
     requires: [main_only]
     declared_only: 'offline profiles never run acquire.yml: they consume a packaged bundle transferred as a unit; package.yml stays offline
       (T26 / B01 / M01 trace no connect). The offline-profile transfer leg is MAIN on a real target (TR02)'
+
+  # ---- nested-probe executor + resolved run (RH-NESTED-PROBE-EXECUTOR codex 143844; RH-RUNNER-RESOLVED-WORKROOT codex 144541) ----
+  # The shared binding testing/remote_harness/tests/tasks/bind_probe_executor.yml (+ probe_argv.yml) is what G's local
+  # runners (acceptance, loader_integration) run FIRST. The positive path runs it through the rendered probe_nested
+  # playbook under the shared root's generation (via: generation -- receipt consistency; no seed verify ran here) with a
+  # control-built lme_resolved_run shaped as the producer's (exact key set; env = absolute path values only, no PATH)
+  # whose work_root is a non-default control dir, while the act's own (ambient) PATH puts a decoy ansible-playbook
+  # FIRST; the real runners are exercised only on their first-task refusals.
+  - id: executor.nested.resolved-run
+    cases: []
+    findings: [RH-NESTED-PROBE-EXECUTOR, RH-RUNNER-RESOLVED-WORKROOT]
+    requires: [shared_root, bundle_a]
+    root: shared
+    evidence: {bind_source_sha256: [testing/remote_harness/tests/tasks/bind_probe_executor.yml, testing/remote_harness/tests/tasks/probe_argv.yml,
+                                    testing/acceptance/run_acceptance.yml, testing/acceptance/one_case_acceptance.yml,
+                                    testing/tests/loader_integration/run_integration.yml, testing/tests/loader_integration/one_case.yml]}
+    rows:
+      resolved-decoy-on-path: 'ambient PATH ansible-playbook (a decoy FIRST on the act PATH) + resolved override consumed: work_root {ctl}/wr (not the profile default) receives the identity act (tmp, tmp/ansible-local, tmp/ansible-remote); the nested probe executes {sgen}/venv/bin/ansible-playbook with the receipt config/collections/python and the decoy never runs'
+      resolved-malformed: 'lme_resolved_run with one field beyond the declared key set -> refused at the first binding task (exact key set)'
+      ambient-executor: 'conflicting ambient executor: /usr/bin/ansible-playbook runs the binding -> refused'
+      ambient-tmpdir-conflict: 'conflicting ambient TMPDIR ({ctl}/foreign-tmp, not lme_resolved_run.env.TMPDIR) -> refused'
+      resolved-absent: 'lme_resolved_run absent at the binding -> refused (RH-RUNNER-RESOLVED-WORKROOT)'
+      runner-acceptance-direct: 'run_acceptance.yml invoked directly (no extra vars at all) -> refused at its first task'
+      runner-acceptance-absent: 'run_acceptance.yml with -e work_root and NO lme_resolved_run -> refused at its first task; the raw-profile fallback does not exist'
+      runner-loader-absent: 'run_integration.yml with -e work_root and NO lme_resolved_run -> refused at its first task'
+      runner-work-root-differs: 'run_acceptance.yml with lme_resolved_run and a DIFFERENT -e work_root -> refused at its first task'
+    refute: 'resolved-decoy-on-path would FAIL if the nested probe resolved ansible-playbook through PATH (decoy marker / decoy-ran) or ignored lme_resolved_run.work_root (identity dirs absent); each hostile variant differs from it in exactly one input'
+    hostile: 'ambient executor, ambient PATH with a decoy ansible-playbook, ambient TMPDIR, malformed or absent lme_resolved_run, direct runner invocation, differing -e work_root'
+    setup:
+      - {mkdir: '{ctl}/wr', mode: '0700'}
+      - {mkdir: '{ctl}/tmp', mode: '0700'}
+      - {mkdir: '{ctl}/tmp/ansible-local', mode: '0700'}
+      - {mkdir: '{ctl}/foreign-tmp', mode: '0700'}
+      - {mkdir: '{ctl}/decoy', mode: '0700'}
+      - {write: '{ctl}/decoy/ansible-playbook', mode: '0700', content: "#!/bin/sh\necho RHC-DECOY-EXECUTED\n: > '{ctl}/decoy-ran'\nexit 0\n"}
+    variants:
+      - {id: resolved-decoy-on-path}
+      - {id: resolved-malformed}
+      - {id: ambient-executor}
+      - {id: ambient-tmpdir-conflict}
+      - {id: resolved-absent}
+      - {id: runner-acceptance-direct}
+      - {id: runner-acceptance-absent}
+      - {id: runner-loader-absent}
+      - {id: runner-work-root-differs}
+    steps:
+      - {id: nested-resolved, only_variants: [resolved-decoy-on-path],
+         # rhc_resolved_env = the record's env: absolute path values only (profile resolved_run.env_value), no PATH.
+         # rhc_act_env = that env as the act's process env, plus the ambient PATH with the decoy FIRST.
+         act: {kind: playbook, playbook: probe_nested, via: generation,
+               env: &rhc_act_env {<<: &rhc_resolved_env {ANSIBLE_CONFIG: '{sgen}/ansible.cfg', ANSIBLE_COLLECTIONS_PATH: '{sgen}/collections',
+                                                        TMPDIR: '{ctl}/tmp', ANSIBLE_LOCAL_TEMP: '{ctl}/tmp/ansible-local', XDG_CACHE_HOME: '{ctl}/wr/cache'},
+                                  PATH: '{ctl}/decoy:/usr/bin:/bin'},
+               extra_vars_json: &rhc_resolved_run {lme_resolved_run: {runner: acceptance, work_root: '{ctl}/wr', ansible_playbook: '{sgen}/venv/bin/ansible-playbook',
+                                                                      python: '{sgen}/venv/bin/python', env: *rhc_resolved_env,
+                                                                      receipt: {path: '{sreceipt}', sha256: '{sreceipt_sha256}'}}}},
+         expect: {rc: 0, stdout_regex: 'RHC-NESTED-EXEC={sgen}/venv/bin/ansible-playbook RHC-NESTED-CONFIG={sgen}/ansible\.cfg RHC-NESTED-PYTHON={sgen}/venv/bin/python RHC-NESTED-WORK-ROOT={ctl}/wr',
+                  stdout_not_regex: ['RHC-DECOY-EXECUTED']},
+         post_state: [{path: '{ctl}/decoy-ran', exists: false}, {path: '{ctl}/wr/_executor-identity/tmp/ansible-local', exists: true},
+                      {path: '{ctl}/wr/_executor-identity/tmp/ansible-remote', exists: true}]}
+      - {id: nested-resolved-malformed, only_variants: [resolved-malformed],
+         act: {kind: playbook, playbook: probe_nested, via: generation, env: *rhc_act_env,
+               extra_vars_json: {lme_resolved_run: {runner: acceptance, work_root: '{ctl}/wr', ansible_playbook: '{sgen}/venv/bin/ansible-playbook',
+                                                    python: '{sgen}/venv/bin/python', env: *rhc_resolved_env,
+                                                    receipt: {path: '{sreceipt}', sha256: '{sreceipt_sha256}'}, executor_path: '{ctl}/decoy'}}},
+         expect: {rc_nonzero: true, playbook_refusal: RH-RUNNER-RESOLVED-WORKROOT, refused_at: 'Refuse an absent or malformed resolved run, or pre-supplied binding outputs (RH-RUNNER-RESOLVED-WORKROOT)'},
+         post_state: [{path: '{ctl}/decoy-ran', exists: false}, {path: '{ctl}/wr/_executor-identity', exists: false}]}
+      - {id: nested-ambient-executor, only_variants: [ambient-executor],
+         act: {kind: playbook, playbook: probe_nested, via: builder_ambient, env: *rhc_act_env, extra_vars_json: *rhc_resolved_run},
+         expect: {rc_nonzero: true, playbook_refusal: RH-NESTED-PROBE-EXECUTOR, refused_at: Bind this play and the nested probe executor to the resolved run (RH-NESTED-PROBE-EXECUTOR)},
+         post_state: [{path: '{ctl}/decoy-ran', exists: false}, {path: '{ctl}/wr/_executor-identity', exists: false}]}
+      - {id: nested-ambient-tmpdir, only_variants: [ambient-tmpdir-conflict],
+         act: {kind: playbook, playbook: probe_nested, via: generation, env: {<<: *rhc_act_env, TMPDIR: '{ctl}/foreign-tmp'},
+               extra_vars_json: *rhc_resolved_run},
+         expect: {rc_nonzero: true, playbook_refusal: RH-NESTED-PROBE-EXECUTOR, refused_at: Bind this play and the nested probe executor to the resolved run (RH-NESTED-PROBE-EXECUTOR)},
+         post_state: [{path: '{ctl}/wr/_executor-identity', exists: false}]}
+      - {id: nested-resolved-absent, only_variants: [resolved-absent],
+         act: {kind: playbook, playbook: probe_nested, via: generation, env: *rhc_act_env},
+         expect: {rc_nonzero: true, playbook_refusal: RH-RUNNER-RESOLVED-WORKROOT, refused_at: 'Refuse an absent or malformed resolved run, or pre-supplied binding outputs (RH-RUNNER-RESOLVED-WORKROOT)'},
+         post_state: [{path: '{ctl}/wr/_executor-identity', exists: false}]}
+      - {id: acceptance-direct, only_variants: [runner-acceptance-direct],
+         act: {kind: playbook, playbook: acceptance, via: generation, env: *rhc_act_env},
+         expect: {rc_nonzero: true, playbook_refusal: RH-RUNNER-RESOLVED-WORKROOT, refused_at: 'Require the resolved run and bind work_root to it (RH-RUNNER-RESOLVED-WORKROOT; no raw-profile fallback)'},
+         post_state: [{path: '{ctl}/decoy-ran', exists: false}, {path: '{ctl}/wr/_executor-identity', exists: false}]}
+      - {id: acceptance-resolved-absent, only_variants: [runner-acceptance-absent],
+         act: {kind: playbook, playbook: acceptance, via: generation, env: *rhc_act_env, extra_vars: {work_root: '{ctl}/raw'}},
+         expect: {rc_nonzero: true, playbook_refusal: RH-RUNNER-RESOLVED-WORKROOT, refused_at: 'Require the resolved run and bind work_root to it (RH-RUNNER-RESOLVED-WORKROOT; no raw-profile fallback)'},
+         post_state: [{path: '{ctl}/raw', exists: false}]}
+      - {id: loader-resolved-absent, only_variants: [runner-loader-absent],
+         act: {kind: playbook, playbook: loader_integration, via: generation, env: *rhc_act_env, extra_vars: {work_root: '{ctl}/raw'}},
+         expect: {rc_nonzero: true, playbook_refusal: RH-RUNNER-RESOLVED-WORKROOT, refused_at: 'Require the resolved run and bind work_root to it (RH-RUNNER-RESOLVED-WORKROOT; no raw-profile fallback)'},
+         post_state: [{path: '{ctl}/raw', exists: false}]}
+      - {id: acceptance-work-root-differs, only_variants: [runner-work-root-differs],
+         act: {kind: playbook, playbook: acceptance, via: generation, env: *rhc_act_env, extra_vars: {work_root: '{ctl}/raw'}, extra_vars_json: *rhc_resolved_run},
+         expect: {rc_nonzero: true, playbook_refusal: RH-RUNNER-RESOLVED-WORKROOT, refused_at: 'Require the resolved run and bind work_root to it (RH-RUNNER-RESOLVED-WORKROOT; no raw-profile fallback)'},
+         post_state: [{path: '{ctl}/raw', exists: false}, {path: '{ctl}/wr/_executor-identity', exists: false}]}
+    note: 'Not a full-runner positive run: a real acceptance/loader run writes the committed receipt and runs every case; that leg is MAIN''s `seed run-local` execution against the route author''s lme_resolved_run producer. The positive binding path here is receipt consistency under via: generation (no seed verify ran). The scrub tool is /usr/bin/env (the contract carries no env-tool field).'

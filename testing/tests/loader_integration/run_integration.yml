@@ -9,15 +9,18 @@
 # entrypoint context. No hand-authored Python. Mirrors C1's runner shape but at the
 # INTEGRATION scope (all four entrypoints, cross-consumer agreement, evidence matrix).
 #
-# Invoke (design/self-proof, RUNNABLE NOW at any HEAD):
-#   /usr/bin/ansible-playbook run_integration.yml
-# Invoke (acceptance, AFTER contract_binding.status == bound):
-#   /usr/bin/ansible-playbook run_integration.yml -e mode=acceptance
-# Declared launcher (work roots; manifests/profiles/remote-harness.yml controller.bootstrap.work_roots.run_local):
+# Declared launcher -- the ONLY supported start (work roots; manifests/profiles/remote-harness.yml
+# controller.bootstrap.work_roots.run_local); design mode by default, acceptance AFTER contract_binding.status == bound:
 #   <checkout>/.work/toolchain/<bundle>/lme-controller-seed.sh run-local --root <checkout>/.work/toolchain \
 #       --runner loader_integration [-- -e mode=acceptance]
-# work_root defaults to the declared work root <checkout>/<root_rel>/<sub_roots.run>/<runners.loader_integration>
-# (run-local passes the same path last); an explicit -e work_root still overrides a direct invocation.
+# The launcher passes lme_resolved_run {runner, work_root, ansible_playbook, python, env, receipt {path, sha256}} as its
+# final JSON -e (and work_root=<same>). RH-RUNNER-RESOLVED-WORKROOT (codex 144541): work_root IS
+# lme_resolved_run.work_root; there is NO raw-profile fallback (absent or differing -> REFUSED before any read or write).
+# RH-NESTED-PROBE-EXECUTOR (codex 143844): the play binds itself and every nested probe to lme_resolved_run
+# (testing/remote_harness/tests/tasks/bind_probe_executor.yml): nested probes run lme_resolved_run.ansible_playbook
+# under every lme_resolved_run.env item (+ per-case HOME/TMPDIR/TMP/TEMP/ANSIBLE_LOCAL_TEMP/ANSIBLE_REMOTE_TMP under
+# the work root and a fixed PATH <resolved bin dir>:/usr/bin:/bin -- tests/tasks/probe_argv.yml); a direct
+# /usr/bin/ansible-playbook start or an ambient env value that differs is REFUSED.
 #
 # mode=design (default): QUEUED cases are EXPECTED and reported; the gate fails only
 #                        on hard FAIL/ERROR/OFF-EXPECTATION.
@@ -31,8 +34,7 @@
   vars:
     repo_root: "{{ playbook_dir | dirname | dirname | dirname }}"
     cases_glob: "{{ playbook_dir }}/cases/*.yml"
-    lme_work_roots: "{{ (lookup('ansible.builtin.file', repo_root ~ '/manifests/profiles/remote-harness.yml') | from_yaml).profile_overlay.lme_global.remote_harness.controller.bootstrap.work_roots }}"
-    work_root: "{{ repo_root ~ '/' ~ lme_work_roots.root_rel ~ '/' ~ lme_work_roots.sub_roots.run ~ '/' ~ lme_work_roots.runners.loader_integration }}"
+    work_root: "{{ lme_resolved_run.work_root }}"   # the resolved run's; no raw-profile fallback (asserted first)
     resolver_rel: ansible/roles/podman/filter_plugins/lme_manifests.py
     mode: design
     expected_bound_verdicts: [PASS, XFAIL-as-expected, REJECTED-as-expected]
@@ -40,6 +42,29 @@
     results: []
     scan_findings: []
   tasks:
+    # --- Resolved run + nested-probe executor binding (FIRST; before any read or write) ---
+    - name: Require the resolved run and bind work_root to it (RH-RUNNER-RESOLVED-WORKROOT; no raw-profile fallback)
+      ansible.builtin.assert:
+        that:
+          - lme_resolved_run is defined
+          - lme_resolved_run is mapping
+          - lme_resolved_run.work_root is defined
+          - work_root is string and work_root == lme_resolved_run.work_root
+          - query('ansible.builtin.varnames', '^bpe_runner$') | length == 0
+        fail_msg: >-
+          REFUSED RH-RUNNER-RESOLVED-WORKROOT: lme_resolved_run is absent or not a mapping
+          (defined={{ lme_resolved_run is defined }}), or the work_root extra var differs from lme_resolved_run.work_root,
+          or bpe_runner was pre-supplied. (The message deliberately templates no work_root: its play default IS
+          lme_resolved_run.work_root, so it has no value to print when the record is absent.)
+          This runner never derives a work root from the profile; start it with
+          `lme-controller-seed.sh run-local --root <checkout>/.work/toolchain --runner loader_integration`.
+        quiet: true
+
+    - name: Bind this play and every nested probe to the resolved run (RH-NESTED-PROBE-EXECUTOR)
+      ansible.builtin.include_tasks: "{{ repo_root }}/testing/remote_harness/tests/tasks/bind_probe_executor.yml"
+      vars:
+        bpe_runner: loader_integration
+
     - name: Load pinned case schema
       ansible.builtin.include_vars:
         file: CASE-SCHEMA.yml
@@ -107,14 +132,6 @@
         run_id: "{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
         work: "{{ work_root }}/{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
 
-    - name: Record toolchain versions
-      ansible.builtin.command: >-
-        /usr/bin/python3 -c "import sys,jinja2,yaml,subprocess;
-        print(sys.version.split()[0]); print(jinja2.__version__); print(yaml.__version__);
-        print(subprocess.run(['/usr/bin/ansible','--version'],capture_output=True,text=True).stdout.splitlines()[0])"
-      register: tool_raw
-      changed_when: false
-
     - name: sha256 of the four real entrypoints (evidence identity)
       ansible.builtin.stat:
         path: "{{ repo_root }}/{{ item.value }}"
@@ -137,7 +154,9 @@
              playbook_dir ~ '/engine_probe.yml.j2',
              playbook_dir ~ '/one_case.yml',
              playbook_dir ~ '/scan_target.yml',
-             playbook_dir ~ '/run_integration.yml'
+             playbook_dir ~ '/run_integration.yml',
+             repo_root ~ '/testing/remote_harness/tests/tasks/bind_probe_executor.yml',
+             repo_root ~ '/testing/remote_harness/tests/tasks/probe_argv.yml'
            ] }}
       loop_control: {label: "{{ item | basename }}"}
 
@@ -175,10 +194,16 @@
     - name: Publish evidence facts
       ansible.builtin.set_fact:
         toolchain:
-          python: "{{ tool_raw.stdout_lines[0] }}"
-          jinja2: "{{ tool_raw.stdout_lines[1] }}"
-          pyyaml: "{{ tool_raw.stdout_lines[2] }}"
-          ansible: "{{ tool_raw.stdout_lines[3] }}"
+          # the nested-probe executor proven by the binding's identity act (no python3 -c, no ambient /usr/bin/ansible)
+          python: "{{ bpe_identity.python_version }}"
+          python_executable: "{{ bpe_identity.python }}"
+          jinja2: "{{ bpe_identity.jinja }}"
+          pyyaml: "{{ bpe_identity.pyyaml }}"
+          ansible: "{{ bpe_identity.version_line }}"
+          executable: "{{ bpe_identity.executable }}"
+          config_file: "{{ bpe_identity.config_file }}"
+          receipt: "{{ {'path': lme_resolved_run.receipt.path, 'sha256': lme_resolved_run.receipt.sha256, 'generation': bpe_receipt.generation | default(''), 'ansible_playbook_sha256': bpe_receipt.ansible_playbook_sha256} }}"
+          resolved_run: "{{ {'runner': lme_resolved_run.runner, 'work_root': lme_resolved_run.work_root, 'ansible_playbook': lme_resolved_run.ansible_playbook, 'python': lme_resolved_run.python, 'env_names': lme_resolved_run.env | list | sort} }}"
         entrypoints_sha256: "{{ dict(entrypoint_stat.results | map(attribute='item.key') | list | zip(entrypoint_stat.results | map(attribute='stat.checksum') | list)) }}"
         authored_sha256: "{{ dict(authored_stat.results | map(attribute='item') | map('basename') | list | zip(authored_stat.results | map(attribute='stat.checksum') | list)) }}"
 

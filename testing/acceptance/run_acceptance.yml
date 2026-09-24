@@ -15,13 +15,18 @@
 #
 # Probes run mutation-free (become:false / gather_facts:false / connection:local);
 # an ACCEPT run proves stats.changed == 0. Per-run probe artifacts + full logs live
-# under work_root (default: the declared work root <checkout>/<root_rel>/<sub_roots.run>/<runners.acceptance>
-# from manifests/profiles/remote-harness.yml controller.bootstrap.work_roots; -e work_root=<dir> overrides).
+# under work_root = lme_resolved_run.work_root (RH-RUNNER-RESOLVED-WORKROOT, codex 144541: there is NO raw-profile
+# fallback; an absent lme_resolved_run, or a -e work_root that differs from it, is REFUSED before any read or write).
 #
-# Declared launcher (work_roots.run_local; passes the same work_root last):
+# Declared launcher -- the ONLY supported start; it passes lme_resolved_run {runner, work_root, ansible_playbook,
+# python, env, receipt {path, sha256}} as its final JSON -e (and work_root=<same>):
 #   <checkout>/.work/toolchain/<bundle>/lme-controller-seed.sh run-local --root <checkout>/.work/toolchain --runner acceptance
-# Direct invoke (from testing/acceptance/; ambient temp, not the declared launcher):
-#   /usr/bin/ansible-playbook run_acceptance.yml [-e work_root=<dir>]
+# RH-NESTED-PROBE-EXECUTOR (codex 143844): before any write the play binds itself and every nested probe to
+# lme_resolved_run (testing/remote_harness/tests/tasks/bind_probe_executor.yml): nested probes run
+# lme_resolved_run.ansible_playbook under every lme_resolved_run.env item (+ per-case HOME/TMPDIR/TMP/TEMP/
+# ANSIBLE_LOCAL_TEMP/ANSIBLE_REMOTE_TMP under the work root and a fixed PATH <resolved bin dir>:/usr/bin:/bin --
+# testing/remote_harness/tests/tasks/probe_argv.yml); an ambient /usr/bin/ansible-playbook start or an ambient value of
+# a resolved env name that differs is REFUSED.
 - name: LME real-caller acceptance tier
   hosts: localhost
   connection: local
@@ -30,8 +35,7 @@
   vars:
     repo_root: "{{ playbook_dir | dirname | dirname }}"
     cases_glob: "{{ playbook_dir }}/cases/*.yml"
-    lme_work_roots: "{{ (lookup('ansible.builtin.file', repo_root ~ '/manifests/profiles/remote-harness.yml') | from_yaml).profile_overlay.lme_global.remote_harness.controller.bootstrap.work_roots }}"
-    work_root: "{{ repo_root ~ '/' ~ lme_work_roots.root_rel ~ '/' ~ lme_work_roots.sub_roots.run ~ '/' ~ lme_work_roots.runners.acceptance }}"
+    work_root: "{{ lme_resolved_run.work_root }}"   # the resolved run's; no raw-profile fallback (asserted first)
     # the four real-caller sources snapshotted from HEAD (rel to repo_root):
     caller_rels:
       - ansible/roles/podman/tasks/resolve.yml
@@ -47,6 +51,29 @@
       - manifests/global.yml
     results: []
   tasks:
+    # --- Resolved run + nested-probe executor binding (FIRST; before any read or write) ---
+    - name: Require the resolved run and bind work_root to it (RH-RUNNER-RESOLVED-WORKROOT; no raw-profile fallback)
+      ansible.builtin.assert:
+        that:
+          - lme_resolved_run is defined
+          - lme_resolved_run is mapping
+          - lme_resolved_run.work_root is defined
+          - work_root is string and work_root == lme_resolved_run.work_root
+          - query('ansible.builtin.varnames', '^bpe_runner$') | length == 0
+        fail_msg: >-
+          REFUSED RH-RUNNER-RESOLVED-WORKROOT: lme_resolved_run is absent or not a mapping
+          (defined={{ lme_resolved_run is defined }}), or the work_root extra var differs from lme_resolved_run.work_root,
+          or bpe_runner was pre-supplied. (The message deliberately templates no work_root: its play default IS
+          lme_resolved_run.work_root, so it has no value to print when the record is absent.)
+          This runner never derives a work root from the profile; start it with
+          `lme-controller-seed.sh run-local --root <checkout>/.work/toolchain --runner acceptance`.
+        quiet: true
+
+    - name: Bind this play and every nested probe to the resolved run (RH-NESTED-PROBE-EXECUTOR)
+      ansible.builtin.include_tasks: "{{ repo_root }}/testing/remote_harness/tests/tasks/bind_probe_executor.yml"
+      vars:
+        bpe_runner: acceptance
+
     - name: Load the pinned case schema
       ansible.builtin.include_vars: {file: CASE-SCHEMA.yml, name: case_schema}
 
@@ -120,25 +147,15 @@
       register: run_ts
       changed_when: false
 
-    # Toolchain, HONESTLY: the RUNNER's own ansible (magic var) AND the scrubbed-env
-    # ansible the PROBES actually execute under (/usr/bin/ansible-playbook). No
-    # python3 -c program-in-a-scalar (banned representation).
-    # This probe runs before the per-run dir exists: its TMPDIR is the work root's own temp dir (created here),
-    # never the /tmp fallback of env -i.
-    - name: Prepare the toolchain probe's temp dir under the work root
-      ansible.builtin.file: {path: "{{ work_root }}/tmp", state: directory, mode: "0700"}
-
-    - name: Record the probe toolchain (the scrubbed-env ansible the real caller runs under)
-      ansible.builtin.command: /usr/bin/env -i PATH=/usr/bin:/bin TMPDIR={{ work_root }}/tmp /usr/bin/ansible-playbook --version
-      register: _probe_ver
-      changed_when: false
-
+    # Toolchain, HONESTLY: the RUNNER's own ansible (magic var) AND the nested-probe executor proven by the
+    # binding's identity act (the receipt-bound generation the PROBES actually execute; RH-NESTED-PROBE-EXECUTOR).
+    # No python3 -c program-in-a-scalar (banned representation).
     - name: Publish run identity + toolchain facts
       ansible.builtin.set_fact:
         run_id: "{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
         work: "{{ work_root }}/{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
-        runner_toolchain: "ansible {{ ansible_version.full }}"
-        probe_toolchain: "{{ _probe_ver.stdout_lines[0] }}"
+        runner_toolchain: "ansible {{ ansible_version.full }} ({{ ansible_playbook_python }})"
+        probe_toolchain: "{{ bpe_identity.version_line }} ({{ bpe_identity.executable }})"
 
     - name: Create the per-run work dir
       ansible.builtin.file: {path: "{{ work }}", state: directory, mode: "0755"}
@@ -282,12 +299,12 @@
     - name: sha256 each mechanism file
       ansible.builtin.stat: {path: "{{ item }}", checksum_algorithm: sha256}
       register: _mech_stat
-      loop: "{{ _mech_files.files | map(attribute='path') | sort }}"
+      loop: "{{ ((_mech_files.files | map(attribute='path') | list) + [repo_root ~ '/testing/remote_harness/tests/tasks/bind_probe_executor.yml', repo_root ~ '/testing/remote_harness/tests/tasks/probe_argv.yml']) | sort }}"
       loop_control: {label: "{{ item | relpath(repo_root) }}"}
 
     - name: Does the on-disk mechanism equal HEAD? (receipts excluded)
       ansible.builtin.command:
-        argv: [git, diff, --quiet, HEAD, --, testing/acceptance, ":!testing/acceptance/receipts"]
+        argv: [git, diff, --quiet, HEAD, --, testing/acceptance, ":!testing/acceptance/receipts", testing/remote_harness/tests/tasks/bind_probe_executor.yml, testing/remote_harness/tests/tasks/probe_argv.yml]
         chdir: "{{ repo_root }}"
       register: _mech_diff
       changed_when: false
@@ -320,7 +337,10 @@
           harness_matches_head: "{{ harness_matches_head }}"
           runner_toolchain: "{{ runner_toolchain }}"
           probe_toolchain: "{{ probe_toolchain }}"
-          toolchain_note: "probes execute under the scrubbed-env probe_toolchain (/usr/bin/ansible-playbook); the worktree default anaconda ansible-core 2.17.14 was not separately exercised (findings are engine-logic-level)"
+          toolchain_note: "probes execute under the scrubbed-env probe_toolchain: lme_resolved_run.ansible_playbook under lme_resolved_run.env, bound by bind_probe_executor.yml (identity act: executable, config file, collections, python equal the resolved run and its receipt); an ambient ansible-playbook or env conflict is refused (RH-NESTED-PROBE-EXECUTOR)"
+          probe_executor: "{{ bpe_identity | dict2items | rejectattr('key', 'equalto', 'stdout') | items2dict }}"
+          probe_receipt: "{{ {'path': lme_resolved_run.receipt.path, 'sha256': lme_resolved_run.receipt.sha256, 'generation': bpe_receipt.generation | default(''), 'ansible_playbook_sha256': bpe_receipt.ansible_playbook_sha256} }}"
+          resolved_run: "{{ {'runner': lme_resolved_run.runner, 'work_root': lme_resolved_run.work_root, 'ansible_playbook': lme_resolved_run.ansible_playbook, 'python': lme_resolved_run.python, 'env_names': lme_resolved_run.env | list | sort} }}"
           mechanism_sha256: "{{ mechanism_sha256 }}"
           snapshot_head_blobs: "{{ snapshot_head_blobs }}"
           snapshot_sha256: "{{ snapshot_sha256 }}"
