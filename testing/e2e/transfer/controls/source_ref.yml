@@ -8,6 +8,8 @@
 #                             default_commit
 #          sr_runner_root     the repository the controls run FROM (run_controls: repo_root)
 #          sr_work_root       the controls' work root (the source must lie outside it)
+#          sr_work_rel        the resolved work_roots.root_rel (e.g. .work): <source>/<sr_work_rel>/ is git-ignored run
+#                             scratch, NEVER candidate bytes, so a path under it counts as OUTSIDE the source below
 #          sr_ansible_config  the ansible-config executable (CASES harness.ansible_config)
 #          sr_env             optional environment for the config dump (controls only; a real run inherits its own)
 # Output:  sr {used: true, path, requested, commit, tree, clean: true, runner_root, clones: [], load_binding}
@@ -22,7 +24,8 @@
 #   CONTROLS-RUNNER-SOURCE-MISMATCH  the controls do not run from inside the source (runner_rule realpath_equal)
 #   CONTROLS-SOURCE-LOAD-PATH        (load_binding, check A) with chdir = the source, the ansible config in effect is a
 #                                    file outside the source, or a project_path_keys path exists outside the source
-#                                    and is non-empty (a scratch filter/module/role/... would be loaded). The
+#                                    and is non-empty (a scratch filter/module/role/... would be loaded). "Inside"
+#                                    means under <source>/ and NOT under <source>/<sr_work_rel>/. The
 #                                    recorded_keys (collections) and the ansible install are recorded, never refused.
 
 - name: SOURCE-REF -- the declared policy
@@ -56,12 +59,20 @@
       - _sri.path is string and _sri.path.startswith('/')
       - _sri.path == (_sri.path | normpath)
       - not ((_sri.path | realpath) ~ '/').startswith((sr_work_root | realpath) ~ '/')
+      - sr_work_rel is defined and sr_work_rel is string and sr_work_rel | length > 0
+      - not sr_work_rel.startswith('/') and sr_work_rel == (sr_work_rel | normpath) and not sr_work_rel.startswith('..')
       - _sri.commit is string
       - _sri.commit == _srp.default_commit or _sri.commit is match(_srp.commit_regex)
     fail_msg: >-
       CONTROLS-SOURCE-INPUT: source_ref {{ source_ref | default({}) | to_json }} must be {path: an absolute normalized
       path outside the work root {{ sr_work_root }}, commit: a 40-hex sha or {{ _srp.default_commit }}}
+      (work_rel {{ sr_work_rel | default('UNSET') }}: a relative normalized path)
     quiet: true
+
+- name: SOURCE-REF -- the source's excluded run-scratch prefix (<source>/<work_rel>/ is never candidate bytes)
+  ansible.builtin.set_fact:
+    _sr_in: "{{ (_sri.path | realpath) ~ '/' }}"
+    _sr_ex: "{{ (_sri.path | realpath) ~ '/' ~ sr_work_rel ~ '/' }}"
 
 - name: SOURCE-REF -- the path is a git work-tree root
   ansible.builtin.command:
@@ -199,14 +210,16 @@
         {{- o.append({'key': r.item.key, 'path': r.item.path, 'recorded': r.item.recorded,
                       'realpath': r.item.path | realpath, 'exists': r.item.path is exists,
                       'entries': (r.files | default([]) | length),
-                      'inside': (((r.item.path | realpath) ~ '/').startswith((_sri.path | realpath) ~ '/'))}) or '' -}}
+                      'inside': (((r.item.path | realpath) ~ '/').startswith(_sr_in)
+                                 and not ((r.item.path | realpath) ~ '/').startswith(_sr_ex))}) or '' -}}
       {%- endfor -%}
       {{ o | to_json }}
     _sr_lb:
       config_file: "{{ _sr_cfgd.CONFIG_FILE | default(none) }}"
       config_file_inside: >-
         {{ (_sr_cfgd.CONFIG_FILE | default(none)) is none
-           or (((_sr_cfgd.CONFIG_FILE | realpath) ~ '/').startswith((_sri.path | realpath) ~ '/')) }}
+           or (((_sr_cfgd.CONFIG_FILE | realpath) ~ '/').startswith(_sr_in)
+               and not ((_sr_cfgd.CONFIG_FILE | realpath) ~ '/').startswith(_sr_ex)) }}
       ansible: "{{ _sr_ver.stdout_lines | default([]) }}"
 
 - name: LOAD-BINDING -- parse rows
@@ -242,6 +255,7 @@
       load_binding:
         config_file: "{{ _sr_lb.config_file }}"
         config_file_inside: "{{ _sr_lb.config_file_inside | bool }}"
+        excluded_prefix: "{{ _sr_ex }}"
         project_paths: "{{ _sr_rows | rejectattr('recorded') | list }}"
         collections: "{{ _sr_rows | selectattr('recorded') | list }}"
         ansible: "{{ _sr_lb.ansible }}"

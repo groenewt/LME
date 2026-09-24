@@ -2,8 +2,18 @@
 # testing/e2e/transfer/controls/run_controls.yml -- the GENERIC runner for the declared transfer controls
 # (controls/CASES.yml).
 #
-#   /usr/bin/ansible-playbook -i localhost, testing/e2e/transfer/controls/run_controls.yml \
-#       -e work_root=$HOME/.cache/lme-b-transfer-controls [-e '{"only": ["P01-...", ...]}']
+#   <ansible-playbook> -i localhost, testing/e2e/transfer/controls/run_controls.yml [-e '{"only": ["P01-...", ...]}']
+#
+# WORK ROOT (codex 135012/135500): DEFAULT = the declared <checkout>/<work_roots.root_rel>/<sub_roots.run>/
+# <runners.transfer_controls> (e.g. <checkout>/.work/run/transfer-controls), read from the RESOLVED policy
+# (resolve_work_root.yml: refuse_pinned_outputs + resolve_policy, never the raw profile); -e work_root overrides it.
+# Either is admitted against path_admission (regex, forbidden segments, ancestry: every existing ancestor a real,
+# non-group/other-writable directory owned by uid 0 or the runner) and work_roots.admission.refused_prefixes
+# (CONTROLS-WORK-ROOT); missing levels are created 0755 explicitly. Free bytes, inodes and fs type are the run-local
+# seed's admission (work_roots.admission), not re-checked here. A work root inside the
+# checkout must be git-ignored (`git check-ignore`), so SOURCE-REF's clean-tree check (status_args, ignored files
+# excluded) never sees run evidence as untracked; and SOURCE-REF's "inside the source" (load binding A and B)
+# EXCLUDES <source>/<root_rel>, so a scratch dir under the work root never counts as candidate bytes.
 #
 # Each run gets a unique immutable directory <work_root>/runs/<run_id>/ (EVIDENCE-RETENTION: no earlier run's
 # verdicts, cases or receipt are ever removed or overwritten; a pre-existing run directory refuses). Each case goes
@@ -44,21 +54,112 @@
     only: []
     allow_git_fixture: false
   tasks:
-    - name: HYGIENE -- work_root absolute, outside the repository, not under /tmp
-      ansible.builtin.assert:
-        that:
-          - work_root is defined
-          - (work_root | string).startswith('/')
-          - not ((work_root | realpath) ~ '/').startswith((repo_root | realpath) ~ '/')
-          - not (work_root | realpath).startswith('/tmp/')
-        fail_msg: "work_root must be an absolute path OUTSIDE the repository and not under /tmp ({{ C.harness.work_root_rule | default('') }})"
-        quiet: true
-
     - name: Load the declarations
       ansible.builtin.set_fact:
         C: "{{ lookup('ansible.builtin.file', ctl_dir ~ '/CASES.yml') | from_yaml }}"
         T: "{{ (lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer }}"
         me_uid: "{{ lookup('ansible.builtin.pipe', 'id -u') | int }}"
+
+    - name: WORK-ROOT -- resolve the declared work-root rules (resolved policy; see resolve_work_root.yml)
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, 'umask 022 && exec "$0" -i localhost, "$1" 2>&1', "{{ C.harness.ansible_playbook }}",
+               "{{ transfer_dir }}/resolve_work_root.yml"]
+        chdir: "{{ repo_root }}"
+      environment: {ANSIBLE_NOCOLOR: '1', ANSIBLE_RETRY_FILES_ENABLED: '0'}
+      register: _wrr
+      changed_when: false
+      failed_when: false
+
+    - name: WORK-ROOT -- the resolver answered (CONTROLS-WORK-ROOT)
+      ansible.builtin.assert:
+        that:
+          - _wrr.rc == 0
+          - _wrr.stdout is search('TR-WORK-ROOTS [A-Za-z0-9+/=]+ TR-WORK-ROOTS-END')
+        fail_msg: "CONTROLS-WORK-ROOT: the declared work-root rules did not resolve (rc {{ _wrr.rc }}): {{ (_wrr.stdout | default(''))[-800:] }}"
+        quiet: true
+
+    - name: WORK-ROOT -- the declared rules and the effective work root (-e work_root overrides the declared default)
+      vars:
+        _p: >-
+          {{ _wrr.stdout | regex_search('TR-WORK-ROOTS [A-Za-z0-9+/=]+ TR-WORK-ROOTS-END')
+             | regex_replace('^TR-WORK-ROOTS ', '') | regex_replace(' TR-WORK-ROOTS-END$', '') | b64decode | from_json }}
+      ansible.builtin.set_fact:
+        _wrp: "{{ _p }}"
+        _wroot: >-
+          {{ work_root | default(_p.repo_root ~ '/' ~ _p.work_roots.root_rel ~ '/' ~ _p.work_roots.sub_roots.run
+                                 ~ '/' ~ _p.work_roots.runners.transfer_controls) }}
+
+    - name: WORK-ROOT -- admitted (path_admission, declared refused prefixes; the resolver's checkout is this runner's)
+      ansible.builtin.assert:
+        that:
+          - (_wrp.repo_root | realpath) == (repo_root | realpath)
+          - _wroot is string and _wroot is match(_wrp.path_admission.regex)
+          - _wrp.path_admission.forbidden_segment_regex is string
+          - _wroot is not search(_wrp.path_admission.forbidden_segment_regex)
+          - ((_wroot | realpath) ~ '/') is not match('(' ~ (_wrp.work_roots.admission.refused_prefixes | map('regex_escape') | join('|')) ~ ')')
+          - (_wroot ~ '/') is not match('(' ~ (_wrp.work_roots.admission.refused_prefixes | map('regex_escape') | join('|')) ~ ')')
+        fail_msg: >-
+          CONTROLS-WORK-ROOT: work root {{ _wroot }} is not admitted (path_admission {{ _wrp.path_admission.regex }};
+          refused prefixes {{ _wrp.work_roots.admission.refused_prefixes }}; resolver checkout {{ _wrp.repo_root }})
+        quiet: true
+
+    - name: WORK-ROOT -- inside the checkout, the work root must be git-ignored
+      ansible.builtin.command:
+        argv: ["{{ T.source.git }}", -C, "{{ repo_root }}", check-ignore, --quiet, --no-index, "{{ _wroot }}/"]
+      register: _wri
+      changed_when: false
+      failed_when: false
+      when: ((_wroot | realpath) ~ '/').startswith((repo_root | realpath) ~ '/')
+
+    - name: WORK-ROOT -- ignored, so SOURCE-REF's clean-tree check never sees run evidence (CONTROLS-WORK-ROOT)
+      ansible.builtin.assert:
+        that:
+          - _wri is skipped or _wri.rc == 0
+        fail_msg: "CONTROLS-WORK-ROOT: {{ _wroot }} is inside the checkout {{ repo_root }} but not git-ignored"
+        quiet: true
+
+    - name: WORK-ROOT -- stat the work root and every ancestor (no link following)
+      ansible.builtin.stat:
+        path: "{{ '/' ~ (_wroot.split('/')[1:item] | join('/')) }}"
+        follow: false
+        get_checksum: false
+      loop: "{{ range(1, (_wroot.split('/') | length) + 1) | list }}"
+      register: _wranc
+
+    - name: WORK-ROOT -- declared ancestry (path_admission.ancestry; the same rule as admit_state_dir.yml) (CONTROLS-WORK-ROOT)
+      vars:
+        _anc: "{{ _wranc.results | map(attribute='stat') | selectattr('exists') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _wrp.path_admission.ancestry.refuse_links | bool
+          - _wrp.path_admission.ancestry.refuse_group_other_writable | bool
+          - not (_wrp.path_admission.ancestry.sticky_exception | bool)
+          - _anc | selectattr('islnk') | list | length == 0
+          - _anc | selectattr('isdir') | list | length == _anc | length
+          - _anc | selectattr('wgrp') | list | length == 0
+          - _anc | selectattr('woth') | list | length == 0
+          - (_anc | map(attribute='uid') | unique | reject('in', [0, me_uid | int]) | list) == []
+        fail_msg: >-
+          CONTROLS-WORK-ROOT: an existing ancestor of {{ _wroot }} is a link, not a directory, group/other-writable
+          (sticky /tmp included) or owned by another account than uid 0 or {{ me_uid }}:
+          {{ _wranc.results | map(attribute='stat') | selectattr('exists')
+             | selectattr('wgrp') | map(attribute='path') | list
+             + (_wranc.results | map(attribute='stat') | selectattr('exists') | selectattr('woth') | map(attribute='path') | list)
+             + (_wranc.results | map(attribute='stat') | selectattr('exists') | selectattr('islnk') | map(attribute='path') | list) }}
+        quiet: true
+
+    - name: WORK-ROOT -- the missing levels, created in order below (explicit 0755, never umask-dependent)
+      ansible.builtin.set_fact:
+        _wr_missing: >-
+          {%- set o = [] -%}
+          {%- for r in _wranc.results if not r.stat.exists -%}
+            {{- o.append('/' ~ (_wroot.split('/')[1:r.item] | join('/'))) or '' -}}
+          {%- endfor -%}
+          {{ o | to_json }}
+
+    - name: WORK-ROOT -- parse
+      ansible.builtin.set_fact:
+        _wr_missing: "{{ _wr_missing if (_wr_missing is not string) else (_wr_missing | from_json) }}"
 
     - name: Cases are well-formed (unique ids, known kinds, expectations, known neighbours)
       ansible.builtin.assert:
@@ -96,7 +197,7 @@
 
     - name: Name the run directory
       ansible.builtin.set_fact:
-        wr: "{{ work_root }}/runs/{{ run_id }}"
+        wr: "{{ _wroot }}/runs/{{ run_id }}"
 
     - name: Stat the run directory
       ansible.builtin.stat:
@@ -115,7 +216,8 @@
       vars:
         sr_decl: "{{ T }}"
         sr_runner_root: "{{ repo_root }}"
-        sr_work_root: "{{ work_root }}"
+        sr_work_root: "{{ _wroot }}"
+        sr_work_rel: "{{ _wrp.work_roots.root_rel }}"
         sr_ansible_config: "{{ C.harness.ansible_config }}"
       when: _needs_src | bool
 
@@ -137,7 +239,7 @@
         path: "{{ item }}"
         state: directory
         mode: '0755'
-      loop: ["{{ work_root }}", "{{ work_root }}/runs", "{{ wr }}", "{{ wr }}/cases", "{{ wr }}/verdicts"]
+      loop: "{{ _wr_missing + [_wroot, _wroot ~ '/runs', wr, wr ~ '/cases', wr ~ '/verdicts'] }}"
 
     - name: The shared source clone at the admitted commit (nothing is committed; only for selected phase cases)
       ansible.builtin.include_tasks: source_clone.yml
@@ -205,7 +307,7 @@
           covered: >-
             {{ _verdicts | selectattr('ok') | map(attribute='id')
                | reject('in', _ran | selectattr('status', 'defined') | selectattr('status', 'equalto', 'OPEN') | map(attribute='id') | list) | list }}
-          work_root: "{{ work_root }}"
+          work_root: "{{ _wroot }}"
           run_id: "{{ run_id }}"
           run_dir: "{{ wr }}"
           cases: "{{ _verdicts }}"
