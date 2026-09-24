@@ -21,7 +21,8 @@
 #               exception); the module temp is never inside the owner's work root or bundle dir; storage by
 #               work_roots.admission of the ACTUAL staging filesystem (the existing module temp itself, else its
 #               root-only parent where it is created; an existing module temp on another device than its parent -- a
-#               nested mount -- refuses). ONLY THEN is the admitted interpreter executed, once (-I -V; PRIVILEGED
+#               nested mount of another filesystem, e.g. a tmpfs -- refuses; device equality does NOT detect a bind
+#               mount from the same filesystem, whose storage is then the measured one). ONLY THEN is the admitted interpreter executed, once (-I -V; PRIVILEGED
 #               INITIAL CONTACT 4), and its version admitted (codex rev8 RH-PRIVILEGED-PYTHON-BEFORE-CUSTODY,
 #               RH-PRIVILEGED-TOOL-ANCESTRY, RH-PRIVILEGED-TEMP-FILESYSTEM). Then, BEFORE any
 #               module, it SETS ansible_python_interpreter = the admitted system interpreter and ansible_remote_tmp =
@@ -102,14 +103,14 @@
       - _pv.system_python in _pv.executed_after_custody
       - _observes | difference(_pv.observation_tools) | length == 0
       - _pv.tool_custody.max_paths | int >= 1
-      - _pv.temp_storage.measure_at == 'existing_leaf_else_parent' and _pv.temp_storage.nested_mount == 'refuse'
+      - _pv.temp_storage.measure_at == 'existing_leaf_else_parent' and _pv.temp_storage.nested_mount == 'refuse_other_device'
       - rh.controller.bootstrap.path_admission.ancestry.root_only.allow_owner_uids == [0]
     fail_msg: >-
       REFUSED {{ _pv.refusal }} on {{ inventory_hostname }} (before privileged contact): observation_tools
       {{ _pv.observation_tools | default('?') }} and executed_after_custody {{ _pv.executed_after_custody | default('?') }}
       must partition tools {{ _pv.tools }}, the system interpreter {{ _pv.system_python }} is executed only after custody,
       every tool the raw observation executes ({{ _observes }}) must be an observation tool, tool_custody.max_paths >= 1,
-      temp_storage {existing_leaf_else_parent, refuse} and path_admission.ancestry.root_only.allow_owner_uids [0].
+      temp_storage {existing_leaf_else_parent, refuse_other_device} and path_admission.ancestry.root_only.allow_owner_uids [0].
     quiet: true
   when: rh_ic_variant == 'privileged'
 
@@ -259,7 +260,7 @@
       refused {{ _wr.admission.refused_fs_types }}) with >= {{ _wr.admission.free_bytes_min }} free bytes (got
       {{ _rh_tb_ic_avail }}) and >= {{ _wr.admission.free_inodes_min }} free inodes (got {{ _rh_tb_ic_iavail }}); the
       module temp chain {{ _mt }} must be absent or owned, not group/other-writable and on the work root's device
-      (no nested mount). Components: {{ _rh_tb_ic_anc }}.
+      (no mount of another filesystem). Components: {{ _rh_tb_ic_anc }}.
     quiet: true
   when: _rh_ic_plan.variant == 'owner'
 
@@ -303,7 +304,8 @@
       - _obd == '' or not ((_mt ~ '/').startswith(_obd ~ '/'))
       # storage (work_roots.admission) of the ACTUAL staging filesystem (rev8 RH-PRIVILEGED-TEMP-FILESYSTEM): measured at
       # the existing module temp (else its root_only parent, where the connection creates it); an existing module temp
-      # on another device than its parent (a nested mount of any mode) refuses
+      # on another device than its parent (a nested mount of another filesystem, any mode) refuses; a same-filesystem
+      # bind mount is not detected by device equality (its storage is the measured one)
       - _rh_tb_ic_fsat == _fsat_want
       - _mt not in _rh_tb_ic_anc or _rh_tb_ic_anc[_mt].dev == _rh_tb_ic_anc[_wt].dev
       - _rh_tb_ic_fst | length > 0 and _rh_tb_ic_fst not in _wr.admission.refused_fs_types
@@ -317,7 +319,7 @@
       system interpreter NOT executed): the connected principal must be uid {{ _pv.uid }} / {{ _prof.user }} (got
       {{ _rh_tb_ic_uid }} / {{ _rh_tb_ic_uname }}); every existing component of {{ _mt }} and {{ rh_ic_paths }} must be a
       real directory owned by uid {{ _ro.allow_owner_uids }} and not group/other-writable (nothing the toolchain owner
-      controls); the module temp {{ _mt }} must be absent or uid 0 mode 0700 on its parent's device (no nested mount),
+      controls); the module temp {{ _mt }} must be absent or uid 0 mode 0700 on its parent's device (no mount of another filesystem),
       with an existing parent, never inside the owner work root '{{ _owr }}' or bundle dir '{{ _obd }}'; the staging
       filesystem measured at {{ _rh_tb_ic_fsat }} (expected {{ _fsat_want }}: {{ _rh_tb_ic_fst }}, {{ _rh_tb_ic_avail }}
       bytes, {{ _rh_tb_ic_iavail }} inodes; admission {{ _wr.admission.refused_fs_types }} / {{ _wr.admission.free_bytes_min }}
@@ -331,8 +333,18 @@
 - name: PRIVILEGED INITIAL CONTACT 4 (raw) -- execute the ADMITTED system interpreter once (-I -V), only after principal, custody and complete ancestry passed
   vars:
     _ot: "{{ rh.controller.bootstrap.os_tools }}"
+    # RH-PRIVILEGED-PYTHON-PROBE-EXIT: the interpreter's OWN exit status is captured immediately (the status of the
+    # assignment is the command substitution's), recorded FIRST as `pyrc|`, then whether its merged output spans more
+    # than one line (`pyml|` 1/0 -- so no output line can pose as a record), then that output as `pyv|`, and the raw
+    # task exits WITH that status -- never printf's.
     _cmd: >-
-      printf 'pyv|%s\n' "$({{ _rh_ic_plan.python | quote }} -I -V 2>&1)"
+      _o=$({{ _rh_ic_plan.python | quote }} -I -V 2>&1); _s=$?;
+      _nl=$(printf '\n_'); _nl=${_nl%_};
+      case "$_o" in *"$_nl"*) _ml=1;; *) _ml=0;; esac;
+      printf 'pyrc|%s\n' "$_s";
+      printf 'pyml|%s\n' "$_ml";
+      printf 'pyv|%s\n' "$_o";
+      exit "$_s"
   ansible.builtin.raw: "{{ _ot.sh.path | quote }} -c {{ _cmd | quote }}"
   register: _rh_tb_ic4
   changed_when: false
@@ -342,15 +354,23 @@
 - name: Refuse a system interpreter whose reported version is not the declared one (PRIVILEGED; nothing staged)
   vars:
     _pv: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.privileged }}"
-    _v: "{{ ((_rh_tb_ic4.stdout | default('') | replace('\r', '') | split('\n') | map('trim') | select('match', '^pyv[|]') | first | default('pyv|')).split('|', 1)[1]) }}"
+    # the records in order: pyrc|<status>, pyml|0, pyv|<one-line version>; a multi-line interpreter output refuses
+    _l4: "{{ _rh_tb_ic4.stdout | default('') | replace('\r', '') | split('\n') | map('trim') | select('match', '^py(rc|ml|v)[|]') | list }}"
+    _rc: "{{ (_l4[0] | default('pyrc|')).split('|', 1)[1] if (_l4[0] | default('')) is match('^pyrc[|]') else '' }}"
+    _ml: "{{ (_l4[1] | default('pyml|')).split('|', 1)[1] if (_l4[1] | default('')) is match('^pyml[|]') else '' }}"
+    _v: "{{ (_l4[2] | default('pyv|')).split('|', 1)[1] if (_l4[2] | default('')) is match('^pyv[|]') else '' }}"
   ansible.builtin.assert:
     that:
+      - _l4 | length == 3
+      - _rc == '0'
+      - _ml == '0'
       - _rh_tb_ic4.rc | default(1) == 0
       - _v is match(_pv.python_version_regex)
     fail_msg: >-
       REFUSED {{ _rh_ic_plan.refusal }} on {{ inventory_hostname }} (privileged initial contact, nothing staged): the
-      admitted system interpreter {{ _rh_ic_plan.python }} -> {{ _rh_tb_ic_py.resolved }} reported '{{ _v }}' (rc
-      {{ _rh_tb_ic4.rc | default('none') }}), not {{ _pv.python_version_regex }}.
+      admitted system interpreter {{ _rh_ic_plan.python }} -> {{ _rh_tb_ic_py.resolved }} must exit 0 (interpreter
+      status '{{ _rc }}', raw rc {{ _rh_tb_ic4.rc | default('none') }}) and report exactly one line matching
+      {{ _pv.python_version_regex }} (got '{{ _v }}'; multi-line {{ _ml }}; records {{ _l4 }}). Matching version text with a nonzero exit refuses.
     quiet: true
   when: _rh_ic_plan.variant == 'privileged'
 
