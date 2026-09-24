@@ -2372,6 +2372,12 @@ def lme_service_coverage_gap(declared_universe, services):
     return sorted(str(x) for x in (universe ^ composed))
 
 
+# Prerequisite hunk (byte-identical to the helper introduced by stack commit ea67f95 REV-ACCEL-MODEL): its
+# SEED-06 consumer is _rh_validate (policy_sha256). The later accelerator join keeps ONE definition.
+def _digest(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(',', ':'), default=str).encode('utf-8')).hexdigest()
+
+
 def _rh_kind(v):
     if isinstance(v, bool):
         return 'bool'
