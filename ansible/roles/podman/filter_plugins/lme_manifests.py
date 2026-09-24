@@ -2570,25 +2570,128 @@ def _rh_validate(composed, declared, override, schema):
         if got != want:
             raise ValueError('lme: %s.%s.%s is %r; the registry declares %r' % (key, schema['inventory_var_path'], name, got, want))
     # PER-HOST-SCOPE-CONTRACT (codex 023332): the registry rule host_scope names the leaves that may differ between
-    # scopes of one deployment (every scoped field of every executable), and the leaves shared artifacts consume
-    # (the path of each executable a shared consumer requires). Both are derived from the declaration, never listed.
+    # scopes of one deployment (every scoped field of every executable), derived from the declaration, never listed.
+    # C1-ARTIFACT-REUSE-INPUT-COVERAGE (codex 035141): the reuse key digests EVERY input the declared shared
+    # artifacts' templates consume (_rh_shared_inputs), not selected executable paths.
     hs = schema['host_scope']
     if hs['tool_map'] != ei['entries']:
         raise ValueError('lme: registry host_scope.tool_map %r must be executable_identity.entries %r' % (hs['tool_map'], ei['entries']))
-    scoped, shared_inputs = [], {}
+    scoped = []
     for t in sorted(entries):
         req = entries[t].get(hs['consumer_field'])
         if '.' in t or not isinstance(req, list) or not req or any(not isinstance(r, str) for r in req):
             raise ValueError('lme: %s.%s.%s.%s must be a non-empty list of consumer names (host scope derives from it); got %r' % (key, ei['entries'], t, hs['consumer_field'], req))
         scoped.extend('%s.%s.%s' % (ei['entries'], t, fld) for fld in hs['scoped_fields'] if fld in entries[t])
-        if any(r in hs['shared_consumers'] for r in req):
-            shared_inputs.update(('%s.%s.%s' % (ei['entries'], t, fld), entries[t][fld]) for fld in hs['shared_fields'] if fld in entries[t])
+    shared_inputs = _rh_shared_inputs(pol, hs, scoped, key)
     section = {'schema_version': schema['projection_schema_version'], 'policy': pol, 'policy_sha256': _digest(pol),
                'adapter': {'name': sel, 'tools': derived},
                'host_scoped_paths': scoped,
                'scope_invariant_sha256': _digest({'policy': _rh_without(pol, scoped), 'host_scoped_paths': scoped}),
                'shared_artifact_inputs_sha256': _digest(shared_inputs)}
     return section, sorted(overridden)
+
+
+_RH_ARTIFACT_KEYS = frozenset(('templates', 'inputs', 'checkout_inputs', 'consumers', 'not_embedded_fields'))
+
+
+def _rh_artifact_decl(hs):
+    """The registry declaration host_scope.shared_artifacts, shape-checked (fail-closed)."""
+    arts = hs.get('shared_artifacts')
+    if not isinstance(arts, dict) or not arts:
+        raise ValueError('lme: registry host_scope.shared_artifacts must declare every shared rendered artifact; got %r' % (arts,))
+    for a in sorted(arts):
+        d = arts[a]
+        if not isinstance(d, dict) or set(d) != _RH_ARTIFACT_KEYS:
+            raise ValueError('lme: registry host_scope.shared_artifacts.%s must carry exactly %s' % (a, sorted(_RH_ARTIFACT_KEYS)))
+        tpl, ins, cins, cons, ne = (d[k] for k in ('templates', 'inputs', 'checkout_inputs', 'consumers', 'not_embedded_fields'))
+        if not isinstance(tpl, list) or not tpl or len(set(tpl)) != len(tpl) or any(
+                not isinstance(p, str) or not p or p.startswith('/') or '..' in p.split('/') for p in tpl):
+            raise ValueError('lme: shared_artifacts.%s.templates must be distinct repository-relative paths, entry first; got %r' % (a, tpl))
+        for n, m in (('inputs', ins), ('checkout_inputs', cins)):
+            if not isinstance(m, dict) or any(not isinstance(k, str) or not isinstance(v, str) or not v for k, v in m.items()):
+                raise ValueError('lme: shared_artifacts.%s.%s must map template variables to policy paths; got %r' % (a, n, m))
+        if not ins or set(ins) & set(cins):
+            raise ValueError('lme: shared_artifacts.%s.inputs must be non-empty and disjoint from checkout_inputs' % (a,))
+        if not isinstance(cons, list) or not cons or any(not isinstance(c, str) for c in cons):
+            raise ValueError('lme: shared_artifacts.%s.consumers must be a non-empty list of consumer names; got %r' % (a, cons))
+        if not isinstance(ne, list) or any(f not in hs['scoped_fields'] for f in ne):
+            raise ValueError('lme: shared_artifacts.%s.not_embedded_fields must name scoped_fields %r only; got %r' % (a, hs['scoped_fields'], ne))
+    return arts
+
+
+def _rh_shared_inputs(pol, hs, scoped, key):
+    """C1-ARTIFACT-REUSE-INPUT-COVERAGE (codex 035141). {artifact: {template variable: the policy subtree it
+    receives}} for every declared shared artifact, minus the host-scoped leaves whose field the templates never read
+    (not_embedded_fields; proved against the templates by _rh_prove_artifact_templates). Every declared input path
+    must exist, and every executable a declared consumer runs must reach the templates through an input (a
+    consumed input missing from the declaration refuses). Value-pure; derived from the declaration only."""
+    tm = hs['tool_map']
+    _, entries = _rh_get(pol, tm)
+    out = {}
+    for a, d in sorted(_rh_artifact_decl(hs).items()):
+        stripped = _rh_without(pol, [p for p in scoped if p.rsplit('.', 1)[1] in d['not_embedded_fields']])
+        vals = {}
+        for var, path in sorted(d['inputs'].items()):
+            f, v = _rh_get(stripped, path)
+            if not f:
+                raise ValueError('lme: shared artifact %s input %s names %s.%s, which the policy does not declare' % (a, var, key, path))
+            vals[var] = v
+        for var, path in sorted(d['checkout_inputs'].items()):
+            if not _rh_get(pol, path)[0]:
+                raise ValueError('lme: shared artifact %s checkout input %s names %s.%s, which the policy does not declare' % (a, var, key, path))
+        for t in sorted(entries if isinstance(entries, dict) else {}):
+            if not set(entries[t].get(hs['consumer_field']) or []) & set(d['consumers']):
+                continue
+            for fld in hs['scoped_fields']:
+                leaf = '%s.%s.%s' % (tm, t, fld)
+                if fld in entries[t] and fld not in d['not_embedded_fields'] and not any(
+                        leaf == p or leaf.startswith(p + '.') for p in d['inputs'].values()):
+                    raise ValueError('lme: shared artifact %s runs %s but no declared input covers %s.%s (a consumed input missing from the declaration)' % (a, t, key, leaf))
+        out[a] = vals
+    return out
+
+
+def _rh_prove_artifact_templates(hs, sources):
+    """C1-ARTIFACT-REUSE-INPUT-COVERAGE: prove the shared_artifacts declaration against the ACTUAL template sources
+    (the loader reads them; artifact_sources = {repository-relative path: content}). The entry template's free
+    variables must EQUAL inputs + checkout_inputs (anything else it consumes is missing from the declaration); it
+    and every other template import only declared templates, never with context, and never include/extend (a
+    context-carrying load could read undeclared variables); non-entry templates have no free variables; a
+    not_embedded field name is never an attribute, item or string constant of any template. Raises otherwise."""
+    import jinja2
+    from jinja2 import meta, nodes
+    arts = _rh_artifact_decl(hs)
+    want = sorted(set(p for d in arts.values() for p in d['templates']))
+    if not isinstance(sources, dict) or sorted(sources) != want or any(not isinstance(v, str) for v in sources.values()):
+        raise ValueError('lme: remote-harness scope artifact_sources must carry exactly the declared templates %r; got %r' % (
+            want, sorted(sources) if isinstance(sources, dict) else sources))
+    env = jinja2.Environment(extensions=['jinja2.ext.do', 'jinja2.ext.loopcontrols'])
+    for a, d in sorted(arts.items()):
+        base = d['templates'][0].rsplit('/', 1)[0] if '/' in d['templates'][0] else ''
+        for i, path in enumerate(d['templates']):
+            try:
+                ast = env.parse(sources[path])
+            except jinja2.TemplateSyntaxError as e:
+                raise ValueError('lme: shared artifact %s template %s does not parse: %s' % (a, path, e))
+            free = set(meta.find_undeclared_variables(ast))
+            declared = set(d['inputs']) | set(d['checkout_inputs'])
+            if i == 0 and free != declared:
+                raise ValueError('lme: shared artifact %s entry template %s consumes %s; the declaration names %s (undeclared: %s; unconsumed: %s)' % (
+                    a, path, sorted(free), sorted(declared), sorted(free - declared), sorted(declared - free)))
+            if i > 0 and free:
+                raise ValueError('lme: shared artifact %s template %s reads variables %s outside its macro parameters' % (a, path, sorted(free)))
+            if list(ast.find_all((nodes.Include, nodes.Extends))):
+                raise ValueError('lme: shared artifact %s template %s includes/extends (context-carrying; undeclared inputs)' % (a, path))
+            for imp in ast.find_all((nodes.Import, nodes.FromImport)):
+                tgt = imp.template.value if isinstance(imp.template, nodes.Const) else None
+                if imp.with_context or not isinstance(tgt, str) or ((base + '/' if base else '') + tgt) not in d['templates']:
+                    raise ValueError('lme: shared artifact %s template %s imports %r (only declared templates, without context)' % (a, path, tgt))
+            names = set(n.attr for n in ast.find_all(nodes.Getattr)) | set(
+                n.value for n in ast.find_all(nodes.Const) if isinstance(n.value, str))
+            hit = sorted(set(d['not_embedded_fields']) & names)
+            if hit:
+                raise ValueError('lme: shared artifact %s template %s reads %s, declared not_embedded (the reuse key would omit an embedded input)' % (a, path, hit))
+    return True
 
 
 def _rh_without(tree, dotted_paths):
@@ -2616,9 +2719,10 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
     bytes) and the operation. scope_invariant_sha256 is an ADDITIONAL compatibility digest only; exact identity
     is scope_sha256 / policy_sha256 of the scope a consumer serves."""
     hs, key = schema['host_scope'], schema['policy_key']
-    need = ('self', 'groups', 'composed', 'overrides', 'edition')
+    need = ('self', 'groups', 'composed', 'overrides', 'edition', 'artifact_sources')
     if not isinstance(scope, dict) or any(k not in scope for k in need):
         raise ValueError('lme: remote-harness scope context must carry %s; got %r' % (list(need), sorted(scope) if isinstance(scope, dict) else scope))
+    _rh_prove_artifact_templates(hs, scope['artifact_sources'])
     ed = scope['edition']
     if not isinstance(ed, dict) or set(ed) != {'profile', 'global_sha256', 'profile_sha256'} or not isinstance(ed['profile'], str) \
             or any(not isinstance(ed[k], str) or not re.match('^[0-9a-f]{64}$', ed[k]) for k in ('global_sha256', 'profile_sha256')):
@@ -2693,7 +2797,7 @@ _RH_BASE_KEYS = frozenset(('schema_version', 'policy', 'policy_sha256', 'adapter
 _RH_SCOPED_KEYS = frozenset(('scope', 'binding', 'scope_sha256', 'scopes', 'scopes_sha256'))
 
 
-def _rh_verify_entry(where, sec, keys):
+def _rh_verify_entry(where, sec, keys, schema):
     if not isinstance(sec, dict) or set(sec) != set(keys):
         raise ValueError('lme: published %s must carry exactly %s; got %r' % (where, sorted(keys), sorted(sec) if isinstance(sec, dict) else sec))
     if sec['policy_sha256'] != _digest(sec['policy']):
@@ -2703,6 +2807,9 @@ def _rh_verify_entry(where, sec, keys):
         raise ValueError('lme: published %s.host_scoped_paths must be a list of dotted paths' % (where,))
     if sec['scope_invariant_sha256'] != _digest({'policy': _rh_without(sec['policy'], hsp), 'host_scoped_paths': hsp}):
         raise ValueError('lme: published %s.scope_invariant_sha256 is not the digest of its actual content' % (where,))
+    # C1-ARTIFACT-REUSE-INPUT-COVERAGE: the reuse key re-derives from the entry's own policy + the registry declaration.
+    if sec['shared_artifact_inputs_sha256'] != _digest(_rh_shared_inputs(sec['policy'], schema['host_scope'], hsp, schema['policy_key'])):
+        raise ValueError('lme: published %s.shared_artifact_inputs_sha256 is not the digest of its declared artifact inputs' % (where,))
 
 
 def lme_verify_resolved(resolved, registry):
@@ -2730,7 +2837,7 @@ def lme_verify_resolved(resolved, registry):
         return True
     sec = resolved[key]
     scoped = isinstance(sec, dict) and 'scope' in sec
-    _rh_verify_entry(key, sec, _RH_BASE_KEYS | (_RH_SCOPED_KEYS if scoped else frozenset()))
+    _rh_verify_entry(key, sec, _RH_BASE_KEYS | (_RH_SCOPED_KEYS if scoped else frozenset()), schema)
     want = schema['projection_schema_version']
     if not _leaf_equal(sec['schema_version'], want):
         raise ValueError('lme: published %s.schema_version is %r (%s); the registry declares %r (%s)' % (
@@ -2742,7 +2849,7 @@ def lme_verify_resolved(resolved, registry):
         raise ValueError('lme: published %s.scopes must be {controller, targets}' % (key,))
     entries = [('controller', scopes['controller'])] + [('targets.' + t, scopes['targets'][t]) for t in sorted(scopes['targets'])]
     for where, ent in entries:
-        _rh_verify_entry('%s.scopes.%s' % (key, where), ent, set(_RH_SCOPE_ENTRY) | {'kind', 'id', 'scope_sha256'})
+        _rh_verify_entry('%s.scopes.%s' % (key, where), ent, set(_RH_SCOPE_ENTRY) | {'kind', 'id', 'scope_sha256'}, schema)
         ident = {'kind': ent['kind'], 'id': ent['id']}
         if ent['scope_sha256'] != _digest({'scope': ident, 'binding': binding, 'policy_sha256': ent['policy_sha256']}):
             raise ValueError('lme: published %s.scopes.%s.scope_sha256 is not bound to its scope/binding/policy' % (key, where))
