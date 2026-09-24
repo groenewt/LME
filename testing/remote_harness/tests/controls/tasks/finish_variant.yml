@@ -107,6 +107,35 @@
     rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': shared root verify rc ' ~ _rhc_sv.rc ~ ' (tainted)'] }}"
   when: _rhc_sv.rc is defined and _rhc_sv.rc != 0
 
+# Route 3 (variant_checkout: clone): the clone's own root {vroot} is purged through bundle A (the seed's own purge; purge
+# is exempt from the checkout binding) BEFORE {vclone} leaves with the variant scratch, so a mid-control failure still
+# gets the seed's purge; a purge that fails or leaves the root is a cleanup finding (the scratch removal then takes it).
+- name: Is there a variant clone root to purge?
+  ansible.builtin.stat:
+    path: "{{ _rhc_t.vroot | default('') }}"
+    follow: false
+    get_checksum: false
+  register: _rhc_vr
+  when: (rhc_c.variant_checkout | default('')) == 'clone' and (_rhc_t.vroot | default('')) | length > 0
+
+- name: Purge the variant clone root through bundle A
+  vars:
+    _plan: >-
+      {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_act',
+           'args': [{'id': 'cleanup-purge-vroot', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'purge', 'root': _rhc_t.vroot}}, _rhc_ctx]}}) | from_json }}
+  ansible.builtin.shell:
+    cmd: "exec {{ _plan.argv | map('quote') | join(' ') }} </dev/null >{{ _plan.out | quote }} 2>{{ _plan.err | quote }}"
+    chdir: "{{ _rhc_t.ctl }}/cwd"
+  register: _rhc_vpurge
+  changed_when: true
+  failed_when: false
+  when: ((_rhc_vr.stat | default({})).exists | default(false)) and rhc_deps.bundle_a.met
+
+- name: A variant clone root the seed's purge did not remove is a cleanup finding
+  ansible.builtin.set_fact:
+    rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': variant clone root purge rc ' ~ (_rhc_vpurge.rc | default('not run')) ~ ' (' ~ _rhc_t.vroot ~ '); removed with the scratch'] }}"
+  when: ((_rhc_vr.stat | default({})).exists | default(false)) and (_rhc_vpurge.rc | default(1)) != 0
+
 - name: Drop the variant's bulky scratch (declared names only; evidence files stay)
   ansible.builtin.find:
     paths: "{{ _rhc_t.ctl }}"

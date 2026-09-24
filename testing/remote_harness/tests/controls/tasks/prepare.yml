@@ -185,15 +185,39 @@
       {{ rhc_deps | combine({'pin_names_declared': rhc_deps.pin_names_declared | combine({'met': rhc_ctx_static.pin_names | length > 0,
           'why': 'no declared pin-name source is present: ' ~ (rhc_decl.pin_name_sources | map(attribute='path') | join(' | '))}) }) }}
 
-- name: A declaration variant is available through the SEED-06 projection or an admitted MAIN-staged repository copy
+# variant:<id> is met only when a route that declaration may ACTUALLY take is available (tasks/variant_admit.yml): the
+# override (SEED-06 projection) never carries a profile_bytes_differ declaration, so those need the MAIN-staged copy
+# rhc_variants.<id> (a variant_checkout: clone control requires variant_clone_fixture instead of variant:<id>; controls.j2
+# plan_status). A met variant:<id> whose route variant_admit.yml then cannot take would be a READY control that FAILs.
+- name: A declaration variant is available through a route it may take (override unless profile_bytes_differ; MAIN-staged copy)
+  vars:
+    _bytes: "{{ item.value.profile_bytes_differ | default(false) | bool }}"
   ansible.builtin.set_fact:
     rhc_deps: >-
       {{ rhc_deps | combine({'variant:' ~ item.key: {'kind': 'variant',
-          'met': rhc_deps.seed06_projection.met or (item.key in (rhc_variants | default({}))),
-          'why': 'declaration variant ' ~ item.key ~ ' needs the SEED-06 projection or rhc_variants.' ~ item.key}}) }}
+          'met': (rhc_deps.seed06_projection.met and not _bytes) or (item.key in (rhc_variants | default({}))),
+          'why': 'declaration variant ' ~ item.key ~ ' needs '
+                 ~ ('rhc_variants.' ~ item.key ~ ' (profile_bytes_differ: the override cannot carry it) or a variant_checkout: clone control'
+                    if _bytes else 'the SEED-06 projection or rhc_variants.' ~ item.key)}}) }}
   loop: "{{ rhc_decl.declarations | dict2items }}"
   loop_control:
     label: "{{ item.key }}"
+
+- name: Is the run checkout a git repository the declared variant clone can be cloned from? (read only)
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root }}/.git"
+    follow: false
+    get_checksum: false
+  register: _rhc_src_git
+
+- name: variant_clone_fixture is met when the clone is declared, git is a declared runner tool and the run checkout has .git
+  ansible.builtin.set_fact:
+    rhc_deps: >-
+      {{ rhc_deps | combine({'variant_clone_fixture': rhc_deps.variant_clone_fixture | combine({
+           'met': (rhc_decl.variant_clone is defined) and ((rhc_decl.runner_tools.git | default('')) | length > 0) and (_rhc_src_git.stat.exists | default(false)),
+           'why': 'declared variant clone unavailable: variant_clone ' ~ ('declared' if rhc_decl.variant_clone is defined else 'ABSENT')
+                  ~ ', runner_tools.git ' ~ (rhc_decl.runner_tools.git | default('ABSENT')) ~ ', ' ~ rh_repo_root ~ '/.git '
+                  ~ ('present' if (_rhc_src_git.stat.exists | default(false)) else 'ABSENT')}) }) }}
 
 - name: Case binding -- every named case id exists in its owner's file
   ansible.builtin.set_fact:
@@ -228,7 +252,11 @@
                                     'rootname': 'root', 'fifo': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/fifo',
                                     'gen': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/p/root/generations/' ~ rhc_base_tokens.gen_id,
                                     'sgen': rhc_base_tokens.run ~ '/shared/p/root/generations/' ~ rhc_base_tokens.gen_id,
-                                    'staging': 'BOUND-AT-RUN', 'reaping': 'BOUND-AT-RUN', 'sibling': 'BOUND-AT-RUN', 'vowner': rhc_base_tokens.user}) }}
+                                    'staging': 'BOUND-AT-RUN', 'reaping': 'BOUND-AT-RUN', 'sibling': 'BOUND-AT-RUN', 'vowner': rhc_base_tokens.user,
+                                    'vclone': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/vclone',
+                                    'vwork': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel,
+                                    'vparent': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p',
+                                    'vroot': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p/root'}) }}
     _vt2: "{{ _vt | combine(lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [_v.tokens | default({}), _vt]}}) | from_json) }}"
     _expanded: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [_cv, _vt2]}}) }}"
     _status: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_status', 'args': [_c, _v, rhc_deps, item.0.unimplemented[item.1] | default([])]}}) | from_json }}"
