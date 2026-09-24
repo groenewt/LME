@@ -1,11 +1,13 @@
 ---
 # testing/e2e/transfer/tasks/source_admit.yml -- B2-OWNED-SOURCE-EDITION source admission (localhost, observe-only).
 # The shipped edition is the COMMITTED tree of the repository the harness itself runs from: src must be that
-# repository (no substitution), no tracked path may be staged or modified (dirty refuses), members are the index
-# (== HEAD when clean) minus the declared transfer manifest, with admitted names and modes only.
+# repository (no substitution), no tracked path may be staged or modified (dirty refuses), members are the tree of
+# the commit HEAD resolved to ONCE (read by commit id, never the index) minus the declared transfer manifest, with
+# admitted names and modes only. This is a history-independent source ARCHIVE (tr.source.edition_kind, history
+# not_transferred); a Git-dependent job bundle is a different artifact and is never produced here.
 # Inputs: tr, tr_bs, tr_repo_root (the harness repository root), lme_transfer_src.
 # R-B3: the PATH tar/gzip the binding extraction (unarchive) uses is proven to be the admitted os_tools file.
-# Outputs: tr_source {commit, members: [{path, mode, blob}]}.
+# Outputs: tr_source {commit, tree, membership, members: [{path, mode, type, blob}]}.
 
 - name: Admit the source input (no default)
   ansible.builtin.assert:
@@ -35,38 +37,60 @@
       ({{ tr_repo_root }}), or {{ tr.source.git }} is absent (controller dependency; {{ tr.remedy }}).
     quiet: true
 
-- name: Read the tracked-path status, the HEAD commit and the index (read-only git plumbing)
+# B-COMMIT-INDEX-RACE (codex tick165/166): HEAD is resolved ONCE to a commit id; membership, modes and blob ids are
+# then read from THAT commit's immutable tree (`ls-tree -r --full-tree <commit>`), never from the index. A concurrent
+# `git add` can move the index or the working files at any point; it can no longer change what is labelled as the
+# commit, and source_stage.yml refuses any archived byte whose blob id is not the tree's (TRANSFER-SOURCE-BINDING).
+# The status read stays as an ADDITIONAL refusal (a staged or unstaged tracked change refuses), not as a source.
+- name: Resolve HEAD once to the commit that is shipped (read-only git plumbing)
+  ansible.builtin.command:
+    argv: "{{ [tr.source.git, '-C', lme_transfer_src, 'rev-parse', '--verify', 'HEAD^{commit}'] }}"
+  environment:
+    LC_ALL: C
+    GIT_OPTIONAL_LOCKS: '0'
+  register: _tr_head
+  changed_when: false
+
+- name: Refuse a HEAD that is not a commit id
+  ansible.builtin.assert:
+    that: [_tr_head.stdout is match('^[0-9a-f]{40,64}$')]
+    fail_msg: "TRANSFER-SOURCE-MEMBERS: HEAD of {{ lme_transfer_src }} did not resolve to a commit id ({{ _tr_head.stdout }})"
+    quiet: true
+
+- name: Read that commit's tree id and its tree (by commit id; immutable), and the tracked-path status
   ansible.builtin.command:
     argv: "{{ [tr.source.git, '-C', lme_transfer_src] + item }}"
   environment:
     LC_ALL: C
     GIT_OPTIONAL_LOCKS: '0'
   loop:
+    - [rev-parse, --verify, "{{ _tr_head.stdout }}^{tree}"]
+    - "{{ tr.source.tree_list_args + [_tr_head.stdout] }}"
     - [status, --porcelain=v1, --untracked-files=no, --ignore-submodules=none]
-    - [rev-parse, --verify, 'HEAD^{commit}']
-    - [ls-files, --stage]
   register: _tr_git
   changed_when: false
 
 - name: Refuse dirty source (any staged or unstaged change to a tracked path)
   ansible.builtin.assert:
     that:
-      - _tr_git.results[0].stdout == ''
+      - _tr_git.results[2].stdout == ''
     fail_msg: >-
       TRANSFER-SOURCE-DIRTY: {{ lme_transfer_src }} has tracked changes; only a committed edition is shipped:
-      {{ _tr_git.results[0].stdout_lines[:20] }}
+      {{ _tr_git.results[2].stdout_lines[:20] }}
     quiet: true
 
-- name: Derive the committed members (index minus the declared transfer manifest)
+- name: Derive the committed members (the commit's tree minus the declared transfer manifest)
   ansible.builtin.set_fact:
     tr_source:
-      commit: "{{ _tr_git.results[1].stdout }}"
+      commit: "{{ _tr_head.stdout }}"
+      tree: "{{ _tr_git.results[0].stdout }}"
+      membership: "{{ tr.source.members }}"
       excluded_regex: >-
         {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
                   template_vars={'lme_macro': 'exclusion_regex', 'lme_args': [tr.excludes]}) | trim }}
     _tr_index: >-
-      {{ _tr_git.results[2].stdout_lines
-         | map('regex_replace', '^([0-7]{6}) ([0-9a-f]{40,64}) ([0-3])\t(.*)$', '{"mode": "\1", "blob": "\2", "stage": "\3", "path": "\4"}')
+      {{ _tr_git.results[1].stdout_lines
+         | map('regex_replace', '^([0-7]{6}) (blob|commit|tree) ([0-9a-f]{40,64})\t(.*)$', '{"mode": "\1", "type": "\2", "blob": "\3", "stage": "0", "path": "\4"}')
          | map('from_json') | list }}
 
 - name: Publish the member list

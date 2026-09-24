@@ -126,6 +126,17 @@ transfer:
     refused_vars: [ansible_ssh_extra_args, ansible_ssh_args, ansible_password, ansible_ssh_pass, ansible_ssh_executable,
                    ansible_become, ansible_become_user, ansible_become_method, ansible_become_password,
                    ansible_ssh_host, ansible_ssh_user, ansible_ssh_port, ansible_private_key_file]
+    # B-INHERITED-OWNER-KEY (codex tick165/166): every target play binds EXACTLY these connection vars from the ONE
+    # contract (macro ansible_conn; play vars outrank inventory host vars; check.yml refuses a target play that omits
+    # one or binds it to anything but hostvars['localhost'].tr_conn.<var>). conn_vars are the transport; the
+    # credential selectors are the ssh connection plugin's credential inputs: bind_key ones carry the contract key
+    # (or '' when the mode takes none), clear ones are always ''. So an inherited owner-profile
+    # ansible_ssh_private_key_file (or a password / PKCS#11 provider) can never be offered on a privileged leg.
+    conn_vars: [ansible_connection, ansible_host, ansible_user, ansible_ssh_executable, ansible_ssh_common_args,
+                ansible_ssh_extra_args]
+    credential_selectors:
+      bind_key: [ansible_ssh_private_key_file, ansible_private_key_file]
+      clear: [ansible_password, ansible_ssh_pass, ansible_ssh_pkcs11_provider]
     # deploy_gate flag -> contract field. Rule: profile key unset -> the flag supplies it; both set and equal -> it;
     # both set and different -> TRANSFER-CONTRACT-CONFLICT before any effect.
     overrides:
@@ -147,7 +158,10 @@ transfer:
     git: /usr/bin/git                              # controller tool (seam S6: not in controller.bootstrap.os_tools)
     must_equal_repo_root: true                     # src == the repository the harness itself resolved (no substitution)
     clean: tracked                                 # no staged or unstaged change to any tracked path
-    members: committed                             # git ls-files of HEAD minus `excludes`; untracked never shipped
+    # B-COMMIT-INDEX-RACE: membership, modes and blob ids come from the IMMUTABLE tree of the commit HEAD resolved to
+    # once (ls-tree by commit id), minus `excludes`; the index is never a source (untracked never shipped either).
+    members: committed_tree
+    tree_list_args: [ls-tree, -r, --full-tree]     # + <commit id>; output "<mode> <type> <blob>\t<path>"
     refused_modes: ['120000', '160000']            # symlink, gitlink: refused (none exist today)
     admitted_modes: {'100644': '644', '100755': '755'}   # git mode -> the mode every placed member gets
     history: not_transferred
@@ -228,7 +242,11 @@ transfer:
 
   # ---- controller state (B2-TEMP-LIFECYCLE). Admitted with rh path_admission (+ ancestry); owned by the gate user.
   controller_state:
-    ledger: operations.log                         # lines: <verb> <op> ; verbs below
+    ledger: operations.log                         # lines: `start <op> <writer token>`, else `<verb> <op>`; verbs below
+    # B-CROSS-ROOT-RECOVERY: the state dir may be shared by several controller roots. An unfinished op is abandoned
+    # (its two recorded paths removed) ONLY when its start token is THIS controller's (tr_ctl_token = sha256 of
+    # machine-id ':' controller root); any other token, or a legacy untokened start, is an UNCERTAIN writer: its
+    # artifacts are preserved, never abandoned here, and reported as TRANSFER-STATE-UNCERTAIN-PRESERVED <ops>.
     pending_dir: pending                           # <op>.tar.gz and <op>.d (extraction for binding) ONLY
     verbs: {start: start, complete: complete, fail: fail, abandon: abandon}
     op_regex: '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$'     # op id = UTC stamp + 12 random hex; ledger lines are parsed with it
@@ -249,7 +267,7 @@ transfer:
   # out_of_edition declared_by_B, unarchive_path_equality required); bind_controller.yml asserts that binding.
   edition:
     model: in_place_reconcile
-    membership: 'source.members: the committed index of HEAD minus `excludes` (nothing untracked, nothing excluded)'
+    membership: 'source.members: the tree of the commit HEAD resolved to, read by commit id, minus `excludes` (never the index; nothing untracked, nothing excluded)'
     removal_inventory: 'target.owned_manifest of the ACTIVE edition + the manifests of promoted-unfinished ops; ONLY
       regular files listed there are ever removed; a file no edition recorded is never removed'
     # persistent in-tree state that survives every reconcile: never a member, never in a removal inventory (an owned
@@ -300,6 +318,11 @@ transfer:
     #    (another controller or root) is UNKNOWN: kept, charged to the budget, and it REFUSES a new in-place reconcile
     #    (TRANSFER-TARGET-FOREIGN-UNFINISHED) -- never age-based deletion;
     #  * budget: at most staging_max_unknown unknown unfinished ops are tolerated in the observation; any unknown refuses.
+    #  * internal custody (B-TARGET-INTERNAL-CUSTODY): tasks/target_custody.yml admits every EXISTING path of
+    #    state_dir, staging_dir, incoming_dir, ops_dir (directories), lock, ledger, owned_manifest, modes_manifest and
+    #    the edition record (regular files) -- never a link, the declared kind, not group/other-writable, uid in
+    #    owner_uids -- in target_observe and again first in target_place, before any mutation; ops entries must be
+    #    regular non-link files (TRANSFER-TARGET-INTERNAL-CUSTODY). The lock is created 0600 explicitly, never by umask.
     lock: .lock
     busy_rc: 75
     publish_wait_s: 30                             # promote/prune: flock -x -w 30 (route E26); claim/reap: flock -x -n

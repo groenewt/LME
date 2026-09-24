@@ -63,6 +63,27 @@
   loop: "{{ tr.target.tools_used }}"
   register: _tr_tools
 
+# B-TOOL-PREADMISSION-EXEC (codex tick165/166): the identities are admitted HERE, from stat alone, before ANY
+# command runs on the target -- the PATH resolution below and the id/cat reads come only after this refusal point,
+# so a substituted id/cat is refused with zero executions. (Residual, disclosed: stat-then-exec is not atomic; the
+# tool files' custody is the target's root-owned system paths, which the declared privilege already trusts.)
+- name: Refuse a missing or substituted tool (before any target command and any target mutation)
+  ansible.builtin.assert:
+    that:
+      - _tr_tools.results | rejectattr('stat.exists') | list | length == 0
+      - _tr_tools.results | selectattr('stat.exists') | rejectattr('stat.executable') | list | length == 0
+      - >-
+        _tr_tools.results | selectattr('stat.exists')
+        | map(attribute='stat.checksum') | list
+        == _tr_tid
+    fail_msg: >-
+      TRANSFER-TARGET-TOOL-IDENTITY: missing {{ _tr_tools.results | rejectattr('stat.exists') | map(attribute='item') | list }};
+      or a tool is not executable, or its sha256 differs from this host's derived adapter identity
+      ({{ _tr_tools.results | selectattr('stat.exists') | map(attribute='item') | zip(_tr_tools.results | selectattr('stat.exists') | map(attribute='stat.checksum')) | list }}).
+      Route it through the ONE target bootstrap (packages.required; {{ tr.remedy }}); an identity differing by package
+      version is an lme_global_override identity override.
+    quiet: true
+
 - name: Resolve the tools a module finds through PATH (unarchive -> tar, tar -z -> gzip), under the module's PATH
   ansible.builtin.command:
     argv: [/bin/sh, -c, 'command -v -- "$1"', sh, "{{ item }}"]
@@ -81,33 +102,6 @@
     label: "{{ item.item }}"
   register: _tr_pathst
 
-- name: Read the connected uid and the endpoint identity
-  ansible.builtin.command:
-    argv: "{{ item }}"
-  loop:
-    - ["{{ tr_tl.id }}", -u]
-    - ["{{ tr_tl.cat }}", "{{ tr.contract.identity_file }}"]
-  register: _tr_who
-  changed_when: false
-  failed_when: false
-
-- name: Refuse a missing or substituted tool (before any target mutation)
-  ansible.builtin.assert:
-    that:
-      - _tr_tools.results | rejectattr('stat.exists') | list | length == 0
-      - _tr_tools.results | selectattr('stat.exists') | rejectattr('stat.executable') | list | length == 0
-      - >-
-        _tr_tools.results | selectattr('stat.exists')
-        | map(attribute='stat.checksum') | list
-        == _tr_tid
-    fail_msg: >-
-      TRANSFER-TARGET-TOOL-IDENTITY: missing {{ _tr_tools.results | rejectattr('stat.exists') | map(attribute='item') | list }};
-      or a tool is not executable, or its sha256 differs from this host's derived adapter identity
-      ({{ _tr_tools.results | selectattr('stat.exists') | map(attribute='item') | zip(_tr_tools.results | selectattr('stat.exists') | map(attribute='stat.checksum')) | list }}).
-      Route it through the ONE target bootstrap (packages.required; {{ tr.remedy }}); an identity differing by package
-      version is an lme_global_override identity override.
-    quiet: true
-
 - name: Refuse a PATH-resolved tool that is not the admitted one (R-B3 unarchive_path_equality)
   ansible.builtin.assert:
     that:
@@ -123,6 +117,16 @@
       {{ _tr_pathres.results | map(attribute='item') | zip(_tr_pathres.results | map(attribute='stdout')) | list }},
       which is not the declared admitted {{ tr.target.path_resolved }} tool file (same device + inode required).
     quiet: true
+
+- name: Read the connected uid and the endpoint identity (only admitted tool identities run)
+  ansible.builtin.command:
+    argv: "{{ item }}"
+  loop:
+    - ["{{ tr_tl.id }}", -u]
+    - ["{{ tr_tl.cat }}", "{{ tr.contract.identity_file }}"]
+  register: _tr_who
+  changed_when: false
+  failed_when: false
 
 - name: Refuse a non-declared privilege or an unreadable identity (before any target mutation)
   ansible.builtin.assert:
@@ -167,6 +171,9 @@
       TRANSFER-REMOTE-DIR-ANCESTRY: {{ lme_transfer_remote_dir }} or an ancestor is a link, not a directory,
       group/other-writable, owned outside {{ tr.target.owner_uids }}, or its parent is missing. Nothing was changed.
     quiet: true
+
+- name: Admit the owned state's internal ancestry and custody (B-TARGET-INTERNAL-CUSTODY)
+  ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/target_custody.yml"
 
 - name: Stat the owned state (manifest, modes, ledger)
   ansible.builtin.stat:
@@ -259,6 +266,25 @@
     recurse: false
     follow: false
   register: _tr_stg
+
+- name: Refuse a foreign or group/other-writable staging entry, or an ops entry that is not a regular file (custody)
+  ansible.builtin.assert:
+    that:
+      - _tr_stg.files | map(attribute='uid') | reject('in', tr.target.owner_uids) | list | length == 0
+      - _tr_stg.files | selectattr('wgrp') | list | length == 0
+      - _tr_stg.files | selectattr('woth') | list | length == 0
+      - >-
+        _tr_stg.files | selectattr('path', 'search', '/' ~ (tr.target.ops_dir | regex_escape) ~ '/[^/]+$')
+        | rejectattr('isreg') | list | length == 0
+      - >-
+        _tr_stg.files | selectattr('path', 'search', '/' ~ (tr.target.ops_dir | regex_escape) ~ '/[^/]+$')
+        | selectattr('islnk') | list | length == 0
+    fail_msg: >-
+      TRANSFER-TARGET-INTERNAL-CUSTODY: staging/incoming/ops entries
+      {{ _tr_stg.files | rejectattr('uid', 'in', tr.target.owner_uids) | map(attribute='path') | list }} are owned outside
+      {{ tr.target.owner_uids }}, or an entry is group/other-writable, or an ops entry is linked or not a regular file
+      (ops files are read and pruned from). Nothing was changed.
+    quiet: true
 
 - name: Classify every staging entry by the ledger op it belongs to (an entry no ledger line names is UNKNOWN)
   ansible.builtin.set_fact:

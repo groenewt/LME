@@ -1,9 +1,24 @@
 ---
 # testing/e2e/transfer/tasks/controller_recover.yml -- B2-TEMP-LIFECYCLE interruption recovery (localhost, effect).
-# An operation whose ledger has `start` and no terminal line was interrupted (kill, lost controller, Ctrl-C). The
-# NEXT operation removes exactly that op's two recorded paths (<pending>/<op>.tar.gz and <pending>/<op>.d) and
-# records `abandon`. Nothing is found by globbing; a ledger line outside the declared grammar refuses.
-# Inputs: tr, tr_state. Outputs: none (effects: exact removals + ledger lines).
+# An operation whose ledger has `start` and no terminal line is unfinished. B-CROSS-ROOT-RECOVERY (codex
+# tick165/166): two controller roots can share one state directory while each seed holds only its OWN root lock, so
+# an unfinished op is DEAD only when its `start` line carries THIS controller's writer token (tr_ctl_token =
+# sha256(machine-id ':' owned controller root); this run's seed holds that root's lock, so no live writer with this
+# token exists). Only a dead op's two recorded paths (<pending>/<op>.tar.gz and <pending>/<op>.d) are removed and it
+# is recorded `abandon`. An unfinished op with ANOTHER token, or a legacy `start <op>` line without a token, is an
+# UNCERTAIN writer: its artifacts are preserved and it is never abandoned by this controller (it may be live under
+# another root). Nothing is found by globbing; a ledger line outside the declared grammar refuses.
+# Ledger appends use lineinfile (read-modify-write, no lock): a lost line under a concurrent writer can only hide a
+# `start` (its artifacts are then never removed) or re-surface THIS controller's own finished op as dead (its
+# recorded paths are already gone) -- never delete another writer's artifacts.
+# Inputs: tr, tr_state, tr_ctl_token. Outputs: tr_recovered {abandoned, uncertain} (effects: exact removals + ledger lines).
+
+- name: Admit this controller's writer token (the start-line grammar)
+  ansible.builtin.assert:
+    that:
+      - tr_ctl_token is defined and tr_ctl_token is string and tr_ctl_token is match(tr.target.token_regex)
+    fail_msg: "TRANSFER-STATE-LEDGER: no admitted controller writer token (tr_ctl_token) for the controller ledger"
+    quiet: true
 
 - name: Stat the controller ledger
   ansible.builtin.stat:
@@ -17,10 +32,13 @@
   register: _tr_clb
   when: _tr_cl.stat.exists
 
-- name: Parse the ledger (declared grammar only)
+- name: Parse the ledger (declared grammar only; `start <op> <token>`, legacy `start <op>`, `<verb> <op>`)
   ansible.builtin.set_fact:
     _tr_cll: "{{ (_tr_clb.content | b64decode).splitlines() if _tr_cl.stat.exists else [] }}"
-    _tr_clre: "{{ '^(' ~ (tr.controller_state.verbs.values() | join('|')) ~ ') ' ~ tr.controller_state.op_regex[1:] }}"
+    _tr_clre: >-
+      {{ '^((' ~ tr.controller_state.verbs.start ~ ' ' ~ tr.controller_state.op_regex[1:-1]
+         ~ '( ' ~ tr.target.token_regex[1:-1] ~ ')?)|((' ~ (tr.controller_state.verbs.values() | reject('equalto', tr.controller_state.verbs.start) | join('|'))
+         ~ ') ' ~ tr.controller_state.op_regex[1:-1] ~ '))$' }}
 
 - name: Refuse a linked ledger or a line outside the grammar
   ansible.builtin.assert:
@@ -30,22 +48,38 @@
     fail_msg: "TRANSFER-STATE-LEDGER: {{ tr_state.ledger }} is not a regular file of uid {{ tr_state.uid }} or has lines outside {{ _tr_clre }}"
     quiet: true
 
-- name: Interrupted operations (start without complete/fail/abandon)
+- name: Unfinished operations and their writers (start without complete/fail/abandon)
+  vars:
+    _starts: "{{ _tr_cll | select('match', '^' ~ tr.controller_state.verbs.start ~ ' ') | list }}"
+    _terminal: >-
+      {{ _tr_cll | reject('match', '^' ~ tr.controller_state.verbs.start ~ ' ') | map('regex_replace', '^\S+ ', '') | list }}
   ansible.builtin.set_fact:
-    _tr_interrupted: >-
-      {{ _tr_cll | select('match', '^' ~ tr.controller_state.verbs.start ~ ' ') | map('regex_replace', '^\S+ ', '') | list
-         | reject('in', _tr_cll | reject('match', '^' ~ tr.controller_state.verbs.start ~ ' ') | map('regex_replace', '^\S+ ', '') | list)
-         | list }}
+    _tr_unf: "{{ _starts | map('regex_replace', '^\\S+ (\\S+)( \\S+)?$', '\\1') | reject('in', _terminal) | unique | list }}"
+    _tr_own: >-
+      {{ _starts | select('match', '^\S+ \S+ ' ~ (tr_ctl_token | regex_escape) ~ '$')
+         | map('regex_replace', '^\S+ (\S+) \S+$', '\1') | reject('in', _terminal) | unique | list }}
 
-- name: Remove exactly the recorded artifacts of each interrupted operation
+- name: Classify (DEAD = this controller's token; every other unfinished op is an uncertain writer and is preserved)
+  ansible.builtin.set_fact:
+    _tr_interrupted: "{{ _tr_own }}"
+    tr_recovered:
+      abandoned: "{{ _tr_own }}"
+      uncertain: "{{ _tr_unf | reject('in', _tr_own) | list }}"
+
+- name: Remove exactly the recorded artifacts of each dead operation of THIS controller
   ansible.builtin.file:
     path: "{{ tr_state.pending }}/{{ item.0 }}{{ item.1 }}"
     state: absent
   loop: "{{ _tr_interrupted | product(['.tar.gz', '.d']) | list }}"
 
-- name: Record the abandonment
+- name: Record the abandonment (this controller's dead ops only)
   ansible.builtin.lineinfile:
     path: "{{ tr_state.ledger }}"
     line: "{{ tr.controller_state.verbs.abandon }} {{ item }}"
     insertafter: EOF
   loop: "{{ _tr_interrupted }}"
+
+- name: Report the preserved uncertain writers (never removed here)
+  ansible.builtin.debug:
+    msg: "TRANSFER-STATE-UNCERTAIN-PRESERVED {{ tr_recovered.uncertain | join(',') }}"
+  when: tr_recovered.uncertain | length > 0

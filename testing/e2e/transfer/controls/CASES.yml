@@ -270,6 +270,17 @@ cases:
         replace: 'include_tasks: "{{ lme_scratch_root }}/testing/remote_harness/tasks/resolve_policy.yml"'
     expect: {rc: fail, out: ['TRANSFER-CHECK-LOAD-BASE: ', 'phase_driver.yml: include base']}
 
+  # B-INHERITED-OWNER-KEY (codex tick165/166): a target play that leaves a credential selector unbound would let the
+  # inventory's owner ansible_ssh_private_key_file reach the privileged leg.
+  - id: C13-target-play-leaves-owner-key-selector-unbound
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/transfer/transfer.yml
+        regexp: '^(- name: place-target\n(?:  [^\n]*\n)*?)    ansible_ssh_private_key_file: [^\n]*\n'
+        replace: '\1'
+    expect: {rc: fail, out: ['transfer.yml:place-target: connection var ansible_ssh_private_key_file not bound to the contract']}
+
   # ---------------- exclusions (the one macro) ----------------
   - id: X01-nested-exclusions
     kind: regex
@@ -319,6 +330,30 @@ cases:
       absent: ['@cd@/tgt/srv/lme/ansible/extra/untracked.yml']
       present: ['@cd@/tgt/srv/lme/install.sh']
 
+  # B-COMMIT-INDEX-RACE (codex tick165/166): the index moves between source_admit's observation and source_stage's
+  # binding (a concurrent `git add`; phase_driver tamper). Membership/blob ids are the admitted commit's tree, so a
+  # staged edit refuses (the archived bytes are not the tree blob) and a staged new path is never shipped.
+  - id: S05-index-edit-staged-between-observations-refused
+    kind: phase
+    neighbour: S01-real-archive-members
+    phase: {src: clone, runs: [{tamper: index_stage_edit}]}
+    expect:
+      rc: fail
+      out: ['TRANSFER-SOURCE-BINDING', 'TRANSFER-STAGE-FAILED']
+      absent: ['@cd@/tgt/srv/lme/install.sh']
+      file_has: [{path: '@cd@/state/operations.log', text: 'fail '}]
+      dir_empty: ['@cd@/state/pending']
+
+  - id: S06-index-new-path-staged-between-observations-not-shipped
+    kind: phase
+    neighbour: S01-real-archive-members
+    phase: {src: clone, runs: [{tamper: index_add_new}]}
+    expect:
+      rc: 0
+      absent: ['@cd@/tgt/srv/lme/lme-index-only.txt']
+      present: ['@cd@/tgt/srv/lme/install.sh']
+      file_lacks: [{path: '@cd@/tgt/srv/lme/.lme-transfer/owned.sha256', text: 'lme-index-only.txt'}]
+
   # ---------------- REMOTE_DIR admission + target dependencies ----------------
   - id: T01-dotdot-remote-dir
     kind: phase
@@ -358,6 +393,24 @@ cases:
         rh_toolchain: {root: '@cd@/tc', python: '@cd@/tc/gen/venv/bin/python'}
         ansible_python_interpreter: '@cd@/tc/gen/venv/bin/python'
     expect: {rc: fail, out: [TRANSFER-TARGET-INTERPRETER], absent: ['@cd@/tgt/srv/lme']}
+
+  # B-TOOL-PREADMISSION-EXEC (codex tick165/166): id and cat at their derived paths are SUBSTITUTED files (the
+  # engine's identity sha256 unchanged; phase_driver drv_tool_subst). Each substitute records any execution in a
+  # marker file; the refusal must come from stat alone, with ZERO executions (no marker, no privilege read).
+  - id: T06-substituted-id-cat-refused-before-execution
+    kind: phase
+    neighbour: P01-first-place-preserves-unrelated
+    setup:
+      - {dir: '@cd@/subst', mode: '0755'}
+      - {file: '@cd@/subst/id', mode: '0755', content: "#!/bin/sh\necho executed >> '@cd@/subst/id.ran'\necho 0"}
+      - {file: '@cd@/subst/cat', mode: '0755', content: "#!/bin/sh\necho executed >> '@cd@/subst/cat.ran'\necho 0123456789abcdef0123456789abcdef"}
+    phase:
+      tool_subst: {id: '@cd@/subst/id', cat: '@cd@/subst/cat'}
+    expect:
+      rc: fail
+      out: [TRANSFER-TARGET-TOOL-IDENTITY]
+      out_absent: [TRANSFER-TARGET-PRIVILEGE, TRANSFER-TARGET-PATH-TOOL]
+      absent: ['@cd@/subst/id.ran', '@cd@/subst/cat.ran', '@cd@/tgt/srv/lme']
 
   # ---------------- owned placement ----------------
   - id: P01-first-place-preserves-unrelated
@@ -439,7 +492,7 @@ cases:
     neighbour: P01-first-place-preserves-unrelated
     setup:
       - {dir: '@cd@/state/pending', mode: '0700'}
-      - {file: '@cd@/state/operations.log', content: 'start 20260101T000000Z-aaaaaaaaaaaa', mode: '0600'}
+      - {file: '@cd@/state/operations.log', content: 'start 20260101T000000Z-aaaaaaaaaaaa @token@', mode: '0600'}
       - {file: '@cd@/state/pending/20260101T000000Z-aaaaaaaaaaaa.tar.gz', content: 'partial', mode: '0600'}
       - {dir: '@cd@/state/pending/20260101T000000Z-aaaaaaaaaaaa.d', mode: '0700'}
       - {file: '@cd@/state/pending/20260101T000000Z-aaaaaaaaaaaa.d/x', content: 'x', mode: '0600'}
@@ -449,6 +502,33 @@ cases:
       absent: ['@cd@/state/pending/20260101T000000Z-aaaaaaaaaaaa.tar.gz', '@cd@/state/pending/20260101T000000Z-aaaaaaaaaaaa.d']
       present: ['@cd@/state/pending/decoy.keep']
       file_has: [{path: '@cd@/state/operations.log', text: 'abandon 20260101T000000Z-aaaaaaaaaaaa'}]
+
+  # B-CROSS-ROOT-RECOVERY (codex tick165/166): a second controller root (another writer token) shares this state
+  # directory and has an unfinished op in flight; a legacy untokened `start` is equally uncertain. Only THIS
+  # controller's dead op (@token@) is abandoned and removed; the other writers' artifacts are preserved, never
+  # abandoned by this controller, and the run still completes.
+  - id: L04-two-roots-sharing-state-uncertain-writers-preserved
+    kind: phase
+    neighbour: L02-controller-interruption
+    setup:
+      - {dir: '@cd@/state/pending', mode: '0700'}
+      - {dir: '@cd@/state/pending/20260101T000000Z-eeeeeeeeeeee.d', mode: '0700'}
+      - file: '@cd@/state/operations.log'
+        mode: '0600'
+        content: "start 20260101T000000Z-aaaaaaaaaaaa @token@\nstart 20260101T000000Z-eeeeeeeeeeee eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nstart 20260101T000000Z-cccccccccccc"
+      - {file: '@cd@/state/pending/20260101T000000Z-aaaaaaaaaaaa.tar.gz', content: 'own dead', mode: '0600'}
+      - {file: '@cd@/state/pending/20260101T000000Z-eeeeeeeeeeee.tar.gz', content: 'other root in flight', mode: '0600'}
+      - {file: '@cd@/state/pending/20260101T000000Z-eeeeeeeeeeee.d/x', content: 'other root in flight', mode: '0600'}
+      - {file: '@cd@/state/pending/20260101T000000Z-cccccccccccc.tar.gz', content: 'legacy writer', mode: '0600'}
+    expect:
+      rc: 0
+      out: ['TRANSFER-STATE-UNCERTAIN-PRESERVED 20260101T000000Z-eeeeeeeeeeee,20260101T000000Z-cccccccccccc']
+      absent: ['@cd@/state/pending/20260101T000000Z-aaaaaaaaaaaa.tar.gz']
+      present: ['@cd@/state/pending/20260101T000000Z-eeeeeeeeeeee.tar.gz', '@cd@/state/pending/20260101T000000Z-eeeeeeeeeeee.d/x',
+                '@cd@/state/pending/20260101T000000Z-cccccccccccc.tar.gz', '@cd@/tgt/srv/lme/install.sh']
+      file_has: [{path: '@cd@/state/operations.log', text: 'abandon 20260101T000000Z-aaaaaaaaaaaa'}]
+      file_lacks: [{path: '@cd@/state/operations.log', text: 'abandon 20260101T000000Z-eeeeeeeeeeee'},
+                   {path: '@cd@/state/operations.log', text: 'abandon 20260101T000000Z-cccccccccccc'}]
 
   - id: L03-target-interruption-after-promote
     kind: phase
@@ -545,6 +625,8 @@ cases:
       - {dir: '@cd@/tgt/srv/lme/.lme-transfer', mode: '0750'}
       - {dir: '@cd@/tgt/srv/lme/.lme-transfer/staging/20260101T000000Z-dddddddddddd', mode: '0700'}
       - {file: '@cd@/tgt/srv/lme/.lme-transfer/operations.log', mode: '0600', content: "start 20260101T000000Z-dddddddddddd @token@"}
+      # the lock exists 0600 BEFORE the runner's flock opens it (custody: never a umask-dependent create)
+      - {file: '@cd@/tgt/srv/lme/.lme-transfer/.lock', content: '', mode: '0600'}
     phase: {hold_lock: '@cd@/tgt/srv/lme/.lme-transfer/.lock', runs: [{hold_lock: true}]}
     expect:
       rc: fail
@@ -552,6 +634,70 @@ cases:
       present: ['@cd@/tgt/srv/lme/.lme-transfer/staging/20260101T000000Z-dddddddddddd']
       absent: ['@cd@/tgt/srv/lme/install.sh']
       line_count: [{path: '@cd@/tgt/srv/lme/.lme-transfer/operations.log', regex: '.', n: 1}]
+
+  # B-TARGET-INTERNAL-CUSTODY (codex tick165/166): the whole .lme-transfer/{state,staging,incoming,ops,.lock} ancestry
+  # (and the ledger/manifests/edition record) is admitted -- not a link, the declared kind, not group/other-writable,
+  # owner uid admitted -- in target_observe and again at the start of target_place, BEFORE any mutation. A decoy the
+  # link points at is never touched. (A foreign-uid internal dir needs root to build; not constructible here.)
+  - id: D09d-linked-internal-staging-dir-refused
+    kind: phase
+    neighbour: P01-first-place-preserves-unrelated
+    setup:
+      - {dir: '@cd@/tgt/srv/lme/.lme-transfer', mode: '0750'}
+      - {dir: '@cd@/tgt/elsewhere', mode: '0750'}
+      - {file: '@cd@/tgt/elsewhere/decoy.keep', content: 'not ours to touch', mode: '0600'}
+      - {link: '@cd@/tgt/srv/lme/.lme-transfer/staging', to: '@cd@/tgt/elsewhere'}
+    expect:
+      rc: fail
+      out: [TRANSFER-TARGET-INTERNAL-CUSTODY]
+      absent: ['@cd@/tgt/srv/lme/install.sh']
+      file_has: [{path: '@cd@/tgt/elsewhere/decoy.keep', text: 'not ours to touch'}]
+      dir_empty: ['@cd@/state/pending']
+
+  - id: D09e-linked-state-lock-refused
+    kind: phase
+    neighbour: D09d-linked-internal-staging-dir-refused
+    setup:
+      - {dir: '@cd@/tgt/srv/lme/.lme-transfer', mode: '0750'}
+      - {dir: '@cd@/tgt/elsewhere', mode: '0750'}
+      - {file: '@cd@/tgt/elsewhere/decoy.keep', content: 'not ours to touch', mode: '0600'}
+      - {link: '@cd@/tgt/srv/lme/.lme-transfer/.lock', to: '@cd@/tgt/elsewhere/decoy.keep'}
+    expect:
+      rc: fail
+      out: [TRANSFER-TARGET-INTERNAL-CUSTODY]
+      absent: ['@cd@/tgt/srv/lme/install.sh']
+      file_has: [{path: '@cd@/tgt/elsewhere/decoy.keep', text: 'not ours to touch'}]
+      dir_empty: ['@cd@/state/pending']
+
+  - id: D09f-group-writable-internal-ops-dir-refused
+    kind: phase
+    neighbour: D09d-linked-internal-staging-dir-refused
+    setup:
+      - {dir: '@cd@/tgt/srv/lme/.lme-transfer', mode: '0750'}
+      - {dir: '@cd@/tgt/srv/lme/.lme-transfer/ops', mode: '0770'}
+    expect:
+      rc: fail
+      out: [TRANSFER-TARGET-INTERNAL-CUSTODY]
+      absent: ['@cd@/tgt/srv/lme/install.sh']
+      dir_empty: ['@cd@/state/pending', '@cd@/tgt/srv/lme/.lme-transfer/ops']
+
+  - id: D09g-linked-ops-entry-refused
+    kind: phase
+    neighbour: L03-target-interruption-after-promote
+    setup:
+      - {dir: '@cd@/tgt/srv/lme/.lme-transfer/ops', mode: '0750'}
+      - {dir: '@cd@/tgt/elsewhere', mode: '0750'}
+      - {file: '@cd@/tgt/elsewhere/decoy.keep', content: 'not ours to touch', mode: '0600'}
+      - {file: '@cd@/tgt/srv/lme/.lme-transfer/operations.log', mode: '0600',
+         content: "start 20260101T000000Z-bbbbbbbbbbbb @token@\npromote 20260101T000000Z-bbbbbbbbbbbb"}
+      - {link: '@cd@/tgt/srv/lme/.lme-transfer/ops/20260101T000000Z-bbbbbbbbbbbb.sha256', to: '@cd@/tgt/elsewhere/decoy.keep'}
+    expect:
+      rc: fail
+      out: [TRANSFER-TARGET-INTERNAL-CUSTODY]
+      absent: ['@cd@/tgt/srv/lme/install.sh']
+      present: ['@cd@/tgt/srv/lme/.lme-transfer/ops/20260101T000000Z-bbbbbbbbbbbb.sha256']
+      file_has: [{path: '@cd@/tgt/elsewhere/decoy.keep', text: 'not ours to touch'}]
+      file_lacks: [{path: '@cd@/tgt/srv/lme/.lme-transfer/operations.log', text: 'abandon '}]
 
   - id: D09c-out-of-edition-owned-refused
     kind: phase
@@ -669,6 +815,32 @@ cases:
       steps: {observe_controller_steps: [resolve_contract], observe_target_steps: [], stage_controller_steps: [], place_target_steps: []}
       k_vars: {lme_ssh_auth_mode: explicit_key, lme_privileged_key: '@cd@/id_priv', ansible_ssh_common_args: '-o IdentityAgent=none -o IdentitiesOnly=yes'}
     expect: {rc: 0, out: ['-o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=@cd@/id_priv root@k KCOMMON'], out_absent: [TRANSFER-CONTRACT, ProxyJump]}
+
+  # B-INHERITED-OWNER-KEY (codex tick165/166): the host inherits the OWNER profile's ansible_ssh_private_key_file.
+  # Every connection-plugin credential selector is bound explicitly from tr_conn (bind_key -> the contract key, or ''
+  # when the mode takes none; clear -> ''), and the target plays bind them as play vars (which outrank inventory), so
+  # the inherited owner key can never be the plugin's key on the privileged leg. KKEY/KCLR print the bound values.
+  - id: K17-inherited-owner-key-bound-to-privileged-key
+    kind: phase
+    neighbour: K16-mode-args-common-args-admitted
+    setup:
+      - {file: '@cd@/id_priv', content: 'not a real key', mode: '0600'}
+      - {file: '@cd@/id_owner', content: 'not a real key (owner profile)', mode: '0600'}
+    phase:
+      steps: {observe_controller_steps: [resolve_contract], observe_target_steps: [], stage_controller_steps: [], place_target_steps: []}
+      k_vars: {lme_ssh_auth_mode: explicit_key, lme_privileged_key: '@cd@/id_priv', ansible_ssh_private_key_file: '@cd@/id_owner'}
+    expect: {rc: 0, out: ['KKEY=@cd@/id_priv|@cd@/id_priv KCLR=|| KEND'], out_absent: [id_owner, TRANSFER-CONTRACT]}
+
+  - id: K18-inherited-owner-key-cleared-when-mode-takes-none
+    kind: phase
+    neighbour: K10-tailnet-identity-no-key
+    setup:
+      - {file: '@cd@/id_owner', content: 'not a real key (owner profile)', mode: '0600'}
+    phase:
+      steps: {observe_controller_steps: [resolve_contract], observe_target_steps: [], stage_controller_steps: [], place_target_steps: []}
+      k_vars: {lme_ssh_auth_mode: tailnet_identity, ansible_ssh_private_key_file: '@cd@/id_owner'}
+      auth_mode: tailnet_identity
+    expect: {rc: 0, out: ['KKEY=| KCLR=|| KEND'], out_absent: [id_owner, IdentityFile, TRANSFER-CONTRACT]}
 
   - id: K08-agent-mode-refused
     kind: phase

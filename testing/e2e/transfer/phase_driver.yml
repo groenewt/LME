@@ -66,7 +66,10 @@
 
     - name: Report the rendered contract argv (K cases compare it exactly)
       ansible.builtin.debug:
-        msg: "KARGV {{ tr_ssh_argv | join(' ') }} KCOMMON {{ tr_conn.ansible_ssh_common_args }} KHOST {{ tr_conn.ansible_host }}"
+        msg: >-
+          KARGV {{ tr_ssh_argv | join(' ') }} KCOMMON {{ tr_conn.ansible_ssh_common_args }} KHOST {{ tr_conn.ansible_host }}
+          KKEY={{ tr.contract.credential_selectors.bind_key | map('extract', tr_conn) | join('|') }}
+          KCLR={{ tr.contract.credential_selectors.clear | map('extract', tr_conn) | join('|') }} KEND
       when: tr_ssh_argv is defined
 
 - name: driver observe-target
@@ -92,6 +95,18 @@
     - name: Admit only the controller-resolved policy of THIS target's scope (B-PER-HOST-POLICY-BINDING)
       ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/scope_admit.yml"
 
+    # B-TOOL-PREADMISSION-EXEC control (drv_tool_subst {tool: path}): the derived path of a used tool names a
+    # SUBSTITUTED file while the derived identity sha256 stays the engine's -- a non-root stand-in for a replaced
+    # /usr/bin/id or /usr/bin/cat. target_observe.yml must refuse it before running it.
+    - name: Tamper -- substitute used tools' derived paths (identity unchanged)
+      ansible.builtin.set_fact:
+        lme_resolved: >-
+          {{ lme_resolved | combine({'remote_harness': {'adapter': {'tools': {'target.tools':
+               dict(drv_tool_subst | dict2items | map(attribute='key')
+                    | zip(drv_tool_subst | dict2items | map(attribute='value') | map('community.general.dict_kv', 'path')))}}}},
+               recursive=true) }}
+      when: drv_tool_subst | default({}) | length > 0
+
     - name: Run the steps
       ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/{{ _step }}.yml"
       loop: "{{ observe_target_steps }}"
@@ -105,6 +120,23 @@
   any_errors_fatal: true
   vars: *drv
   tasks:
+    # B-COMMIT-INDEX-RACE controls (cases use src: clone, so only the case's own clone moves): the index moves AFTER
+    # source_admit observed the source and BEFORE source_stage binds the archive -- a concurrent `git add`.
+    #   index_stage_edit: a tracked file's working bytes change and are staged (index blob != the commit's tree blob)
+    #   index_add_new:    a new file is staged (index membership != the commit's tree)
+    - name: Tamper -- move the index between observations (working bytes / new path staged)
+      ansible.builtin.copy:
+        content: "index moved between observations\n"
+        dest: "{{ lme_transfer_src }}/{{ 'README.md' if tamper == 'index_stage_edit' else 'lme-index-only.txt' }}"
+        mode: '0644'
+      when: (tamper | default('')) in ['index_stage_edit', 'index_add_new']
+
+    - name: Tamper -- stage it (git add; the index now differs from the admitted commit's tree)
+      ansible.builtin.command:
+        argv: ["{{ tr.source.git }}", -C, "{{ lme_transfer_src }}", add, --, "{{ 'README.md' if tamper == 'index_stage_edit' else 'lme-index-only.txt' }}"]
+      changed_when: true
+      when: (tamper | default('')) in ['index_stage_edit', 'index_add_new']
+
     - name: Run the steps
       ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/{{ _step }}.yml"
       loop: "{{ stage_controller_steps }}"

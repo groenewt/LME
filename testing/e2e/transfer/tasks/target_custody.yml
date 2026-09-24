@@ -1,0 +1,52 @@
+---
+# testing/e2e/transfer/tasks/target_custody.yml -- B-TARGET-INTERNAL-CUSTODY (codex tick165/166): the owned state's
+# INTERNAL ancestry and custody, admitted before any directory operation (target host, observe-only).
+# Included by target_observe.yml (after the REMOTE_DIR ancestry) and again by target_place.yml as its first task,
+# before the directory task, the flock lock open and any write, reap or promotion.
+# Every EXISTING path of <REMOTE_DIR>/<state_dir>, its staging/incoming/ops directories, its lock file and its
+# state files must be: not a link; a directory (the four dirs) or a regular file (lock + state files); not
+# group/other-writable; owned by tr.target.owner_uids (the REMOTE_DIR rule). A linked or foreign internal directory
+# could otherwise redirect writes (the file module follows a linked directory), the lock (flock creates through a
+# link) or reaping (rm -rf below a linked staging dir). With REMOTE_DIR's ancestry and these paths all owned by the
+# declared uids and not group/other-writable, no other account can swap them between this check and the effect.
+# Inputs: tr, lme_transfer_remote_dir. Output: none (refusal TRANSFER-TARGET-INTERNAL-CUSTODY).
+
+- name: CUSTODY -- stat the owned state's internal directories, lock and state files (no link following)
+  ansible.builtin.stat:
+    path: "{{ lme_transfer_remote_dir }}/{{ item.rel }}"
+    follow: false
+    get_checksum: false
+  loop:
+    - {rel: "{{ tr.target.state_dir }}", kind: dir}
+    - {rel: "{{ tr.target.state_dir }}/{{ tr.target.staging_dir }}", kind: dir}
+    - {rel: "{{ tr.target.state_dir }}/{{ tr.target.incoming_dir }}", kind: dir}
+    - {rel: "{{ tr.target.state_dir }}/{{ tr.target.ops_dir }}", kind: dir}
+    - {rel: "{{ tr.target.state_dir }}/{{ tr.target.lock }}", kind: file}
+    - {rel: "{{ tr.target.state_dir }}/{{ tr.target.ledger }}", kind: file}
+    - {rel: "{{ tr.target.state_dir }}/{{ tr.target.owned_manifest }}", kind: file}
+    - {rel: "{{ tr.target.state_dir }}/{{ tr.target.modes_manifest }}", kind: file}
+    - {rel: "{{ tr.target.state_dir }}/{{ tr.edition.record }}", kind: file}
+  loop_control:
+    label: "{{ item.rel }}"
+  register: _tr_cus
+
+- name: CUSTODY -- refuse a linked, mistyped, group/other-writable or foreign internal path (before any mutation)
+  vars:
+    _ex: "{{ _tr_cus.results | selectattr('stat.exists') | list }}"
+  ansible.builtin.assert:
+    that:
+      - _ex | selectattr('stat.islnk') | list | length == 0
+      - _ex | selectattr('item.kind', 'equalto', 'dir') | rejectattr('stat.isdir') | list | length == 0
+      - _ex | selectattr('item.kind', 'equalto', 'file') | rejectattr('stat.isreg') | list | length == 0
+      - _ex | selectattr('stat.wgrp') | list | length == 0
+      - _ex | selectattr('stat.woth') | list | length == 0
+      - _ex | map(attribute='stat.uid') | reject('in', tr.target.owner_uids) | list | length == 0
+    fail_msg: >-
+      TRANSFER-TARGET-INTERNAL-CUSTODY: under {{ lme_transfer_remote_dir }}:
+      linked {{ _ex | selectattr('stat.islnk') | map(attribute='item.rel') | list }},
+      not a directory {{ _ex | selectattr('item.kind', 'equalto', 'dir') | rejectattr('stat.isdir') | map(attribute='item.rel') | list }},
+      not a regular file {{ _ex | selectattr('item.kind', 'equalto', 'file') | rejectattr('stat.isreg') | map(attribute='item.rel') | list }},
+      group/other-writable {{ (_ex | selectattr('stat.wgrp') | map(attribute='item.rel') | list) + (_ex | selectattr('stat.woth') | map(attribute='item.rel') | list) }},
+      owned outside {{ tr.target.owner_uids }} {{ _ex | rejectattr('stat.uid', 'in', tr.target.owner_uids) | map(attribute='item.rel') | list }}.
+      Nothing was changed.
+    quiet: true
