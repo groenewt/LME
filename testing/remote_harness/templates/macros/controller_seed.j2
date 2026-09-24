@@ -72,6 +72,68 @@ ANSIBLE_CONFIG=$G/{{ bs.layout.config_file }}
 TMPDIR={{ tmp_dir }}
 {%- endmacro -%}
 
+{#- ---- SEED LAUNCH CONTRACT (bs.seed_launch; codex 183510) ---- -#}
+{#- (1) base_check: every base_env name equals its declared value -- emitted BEFORE any case pattern (the pre-scope
+    checks use bracket ranges whose meaning depends on the locale) -#}
+{%- macro launch_base_check(bs) -%}
+{% set sl = bs.seed_launch %}
+{% if sl.base_check == 'exact' %}
+{% for k, v in bs.base_env | dictsort %}
+[ "${{ '{' ~ k ~ '-}' }}" = {{ shq(v) }} ] || lme_refuse {{ sl.refusal }} {{ shq('seed launch: ' ~ k ~ ' must be exactly ' ~ v ~ ' (seed_launch.base_check; start the seed through seed_launch)') }}
+{% endfor %}
+{% else %}
+lme_refuse {{ sl.refusal }} {{ shq('undeclared seed_launch.base_check mode: ' ~ sl.base_check) }}
+{% endif %}
+{%- endmacro -%}
+
+{#- (2) the ONE invoker derivation (after the os-tool identity checks): uid, passwd home == HOME, the user manager
+    runtime dir (declared {uid} rule, owned, declared mode) and bus socket, caller-supplied names unset or equal,
+    the account name. Sets _uid _home _xrd _bus _user; run-local and the budget scope consume these. -#}
+{%- macro launch_derive(bs) -%}
+{% set sl = bs.seed_launch %}
+{% set dh = sl.derive.home %}
+{% set um = bs.target_bootstrap.user_manager %}
+{% set un = bs.work_roots.run_local.user_manager_env %}
+{% set rt = um.runtime_dir.split('{uid}') %}
+{% set hp = '*:' * ((dh.field | int) - 1) %}
+_uid=$({{ x(bs, 'id') }} -u) || lme_refuse {{ sl.refusal }} 'seed launch: cannot read the invoking uid'
+case "$_uid" in ''|*[!0-9]*) lme_refuse {{ sl.refusal }} "seed launch: unadmitted uid: $_uid" ;; esac
+_pw=$({{ x(bs, dh.tool) }} {{ shq(dh.database) }} "$_uid") || lme_refuse {{ sl.refusal }} "seed launch: no {{ dh.database }} entry for uid $_uid"
+_home=${_pw#{{ hp ~ '}' }}
+_home=${_home%%:*}
+case "$_home" in /*) : ;; *) lme_refuse {{ sl.refusal }} "seed launch: the {{ dh.database }} home of uid $_uid is not absolute: $_home" ;; esac
+[ -d "$_home" ] && [ ! -L "$_home" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$_home")" = "$_uid" ] || lme_refuse {{ sl.refusal }} "seed launch: the {{ dh.database }} home $_home of uid $_uid is not an owned real directory"
+[ "${HOME-}" = "$_home" ] || lme_refuse {{ sl.refusal }} "seed launch: HOME=${HOME-} is not the {{ dh.database }} home $_home of uid $_uid"
+_xrd={{ shq(rt[0]) }}"$_uid"{{ shq(rt[1] if rt | length > 1 else '') }}
+[ -d "$_xrd" ] && [ ! -L "$_xrd" ] && [ "$({{ x(bs, 'stat') }} -c '%u %a' -- "$_xrd")" = "$_uid "{{ shq(um.runtime_dir_mode) }} ] || lme_refuse {{ sl.budget_refusal }} "seed launch: the user manager runtime dir $_xrd is not a real directory owned by uid $_uid mode {{ um.runtime_dir_mode }} (no user manager)"
+[ -S "$_xrd/"{{ shq(um.bus) }} ] && [ ! -L "$_xrd/"{{ shq(um.bus) }} ] || lme_refuse {{ sl.budget_refusal }} "seed launch: no user manager bus socket at $_xrd/{{ um.bus }}"
+_bus="unix:path=$_xrd/"{{ shq(um.bus) }}
+_user=$({{ x(bs, 'id') }} -un) || lme_refuse {{ sl.refusal }} 'seed launch: cannot read the account name'
+case "$_user" in ''|*[!A-Za-z0-9._-]*) lme_refuse {{ sl.refusal }} "seed launch: unadmitted account name: $_user" ;; esac
+{% if sl.derive.caller_values == 'refuse_if_different' %}
+{% for n, v in [(un.runtime_dir_env, '$_xrd'), (un.bus_env, '$_bus'), (un.user_env, '$_user')] %}
+[ -z "${{ '{' ~ n ~ '+x}' }}" ] || [ "${{ '{' ~ n ~ '}' }}" = "{{ v }}" ] || lme_refuse {{ sl.refusal }} "seed launch: caller {{ n }}=${{ '{' ~ n ~ '}' }} is not the derived {{ v }}"
+{% endfor %}
+{% else %}
+lme_refuse {{ sl.refusal }} {{ shq('undeclared seed_launch.derive.caller_values mode: ' ~ sl.derive.caller_values) }}
+{% endif %}
+{%- endmacro -%}
+
+{#- (3) the ONLY environment of `systemd-run --user` (probe and scope exec): env -i with exactly seed_launch.scope_env -#}
+{%- macro launch_scope_env(bs) -%}
+{%- set sl = bs.seed_launch -%}
+{%- set un = bs.work_roots.run_local.user_manager_env -%}
+{%- set ns = namespace(w=[]) -%}
+{%- for e in sl.scope_env -%}
+{%- if e == 'HOME' -%}{%- set ns.w = ns.w + ['HOME="$HOME"'] -%}
+{%- elif e == 'base_env' -%}{%- for k, v in bs.base_env | dictsort -%}{%- set ns.w = ns.w + [k ~ '=' ~ shq(v)] -%}{%- endfor -%}
+{%- elif e == 'runtime_dir_env' -%}{%- set ns.w = ns.w + [un.runtime_dir_env ~ '="$_xrd"'] -%}
+{%- elif e == 'bus_env' -%}{%- set ns.w = ns.w + [un.bus_env ~ '="$_bus"'] -%}
+{%- else -%}{{ sl['undeclared scope_env entry ' ~ e].render_error }}{%- endif -%}
+{%- endfor -%}
+{{ x(bs, 'env') }} -i {{ ns.w | join(' ') }}
+{%- endmacro -%}
+
 {%- macro managed_env(bs, home_dir, tmp_dir, extra=[]) -%}
 {%- set ns = namespace(w=[]) -%}
 {%- for l in (managed_pairs(bs, home_dir, tmp_dir) | string).split('\n') + extra -%}{%- set kv = l.split('=', 1) -%}{%- set ns.w = ns.w + [kv[0] ~ '="' ~ kv[1] ~ '"'] -%}{%- endfor -%}
@@ -339,9 +401,9 @@ fi
 
 {%- macro budget_enter(bs) -%}
 if [ "${LME_SEED_SCOPED:-}" != 1 ]; then
-  {{ x(bs, 'systemd-run') }} --user --scope --quiet --collect {{ budget_props(bs) }} -- {{ x(bs, 'true') }} >/dev/null 2>&1 \
-    || lme_refuse RH-SEED-BUDGET-UNAVAILABLE 'systemd-run --user --scope with the declared limits failed (no user manager or controller delegation); never run unbudgeted'
-  exec {{ x(bs, 'systemd-run') }} --user --scope --quiet --collect {{ budget_props(bs) }} -- {{ env_i(bs, {}, ['LME_SEED_SCOPED=1']) }} ${LME_CARRY_SOCK:+SSH_AUTH_SOCK="$LME_CARRY_SOCK"} {{ x(bs, 'sh') }} "$SELF" "$@"
+  {{ launch_scope_env(bs) }} {{ x(bs, 'systemd-run') }} --user --scope --quiet --collect {{ budget_props(bs) }} -- {{ x(bs, 'true') }} >/dev/null 2>&1 \
+    || lme_refuse {{ bs.seed_launch.budget_refusal }} 'systemd-run --user --scope with the declared limits failed (no user manager or controller delegation); never run unbudgeted'
+  exec {{ launch_scope_env(bs) }} {{ x(bs, 'systemd-run') }} --user --scope --quiet --collect {{ budget_props(bs) }} -- {{ env_i(bs, {}, ['LME_SEED_SCOPED=1']) }} ${LME_CARRY_SOCK:+SSH_AUTH_SOCK="$LME_CARRY_SOCK"} {{ x(bs, 'sh') }} "$SELF" "$@"
 fi
 _cg=$({{ x(bs, 'sed') }} -n 's/^0:://p' {{ shq(bs.budget.cgroup_self) }})
 _cgd={{ shq(bs.budget.cgroup_mount) }}"$_cg"
@@ -720,6 +782,7 @@ fi
      sha256sum --check, bundle.json binds the seed and check-file digests). ---- -#}
 {%- macro bundle_check(bs, lock) -%}
 {% set b = bs.bundle %}
+{% set cf = b.checksum_format %}
 {% set rows = bs.artifacts + lock.packages + lock.collections %}
 {% set ns = namespace(members=['d 700 ' ~ b.artifacts_dir, 'f 500 ' ~ b.seed_file, 'f 400 ' ~ b.manifest_file, 'f 400 ' ~ b.checksum_file], names=[b.seed_file]) %}
 {% for a in rows %}
@@ -733,11 +796,19 @@ lme_bundle_check() {
   done
   [ "$({{ x(bs, 'find') }} -P "$_B" -mindepth 1 -printf '%y %m %P\n' | {{ joinsorted(bs) }})" = {{ shq(ns.members | sort(case_sensitive=true) | join(' ')) }} ] \
     || lme_refuse RH-SEED-ARTIFACT-MISSING "bundle members/modes are not exactly the declared set: $_B"
-  ! {{ x(bs, 'grep') }} -v -q -x -E '[0-9a-f]{64}  [A-Za-z0-9._/+-]+' -- "$_B/"{{ shq(b.checksum_file) }} \
+  # the ONE declared checksum_file grammar (bundle.checksum_format), shared with package_bundle.yml
+  ! {{ x(bs, 'grep') }} -v -q -x -E {{ shq(cf.digest ~ cf.separator ~ cf.name) }} -- "$_B/"{{ shq(b.checksum_file) }} \
     || lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq(b.checksum_file ~ ' has a malformed line') }}
-  [ "$({{ x(bs, 'sed') }} -n 's/^[0-9a-f]\{64\}  //p' -- "$_B/"{{ shq(b.checksum_file) }} | {{ joinsorted(bs) }})" = {{ shq(ns.names | sort(case_sensitive=true) | join(' ')) }} ] \
+{% if cf.terminator == 'newline' %}
+  _t=$({{ x(bs, 'cat') }} -- "$_B/"{{ shq(b.checksum_file) }} && printf .) || lme_refuse RH-SEED-DIGEST-MISMATCH 'cannot read the check file'
+  case "${_t%.}" in *'
+') : ;; *) lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq(b.checksum_file ~ ' is not newline-terminated') }} ;; esac
+{% else %}
+  lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq('undeclared bundle.checksum_format.terminator: ' ~ cf.terminator) }}
+{% endif %}
+  [ "$({{ x(bs, 'sed') }} -E -n {{ shq('s/^' ~ cf.digest ~ cf.separator ~ '//p') }} -- "$_B/"{{ shq(b.checksum_file) }} | {{ joinsorted(bs) }})" = {{ shq(ns.names | sort(case_sensitive=true) | join(' ')) }} ] \
     || lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq(b.checksum_file ~ ' does not list exactly the declared members') }}
-  {{ x(bs, 'grep') }} -q -x -F "$SEED_SHA  {{ b.seed_file }}" -- "$_B/"{{ shq(b.checksum_file) }} \
+  {{ x(bs, 'grep') }} -q -x -F "$SEED_SHA"{{ shq(cf.separator ~ b.seed_file) }} -- "$_B/"{{ shq(b.checksum_file) }} \
     || lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq(b.checksum_file ~ ' does not bind the running seed digest') }}
   (cd "$_B" && {{ x(bs, 'sha256sum') }} --check --strict --quiet -- {{ shq(b.checksum_file) }}) >/dev/null 2>&1 \
     || lme_refuse RH-SEED-DIGEST-MISMATCH {{ shq('bundle content differs from ' ~ b.checksum_file) }}
@@ -893,8 +964,6 @@ fi
 {%- macro run_local_exec(bs) -%}
 {% set wr = bs.work_roots %}
 {% set rl = wr.run_local %}
-{% set um = bs.target_bootstrap.user_manager %}
-{% set rt = um.runtime_dir.split('{uid}') %}
 {% set rs = rl.resolved_run %}
 {% set ap = '$G/' ~ bs.layout.gen_dirs.venv ~ '/bin/ansible-playbook' %}
 {% set rcpt = '$G/' ~ bs.layout.receipts_dir ~ '/toolchain.json' %}
@@ -913,11 +982,8 @@ for _wd in "$W/"{{ shq(wr.sub_roots.run) }} "$_ev"; do
   [ -d "$_wd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_wd" || lme_refuse {{ wr.admission.refusal }} "cannot create $_wd"
   lme_dest "$_wd" d
 done
-_xrd={{ shq(rt[0]) }}"$_uid"{{ shq(rt[1] if rt | length > 1 else '') }}
-[ -d "$_xrd" ] && [ ! -L "$_xrd" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$_xrd")" = "$_uid" ] || lme_refuse RH-SEED-USAGE "the user manager runtime dir $_xrd is not an owned directory (no user manager for uid $_uid)"
-[ -S "$_xrd/"{{ shq(um.bus) }} ] || lme_refuse RH-SEED-USAGE "no user manager bus socket at $_xrd/{{ um.bus }}"
-_user=$({{ x(bs, 'id') }} -un) || lme_refuse RH-SEED-USAGE 'cannot read the account name'
-case "$_user" in ''|*[!A-Za-z0-9._-]*) lme_refuse RH-SEED-USAGE "unadmitted account name: $_user" ;; esac
+# _xrd _bus _user: the ONE seed launch derivation (seed_launch, before the budget scope), never re-derived here
+[ -n "${_xrd:-}" ] && [ -n "${_bus:-}" ] && [ -n "${_user:-}" ] || lme_refuse RH-SEED-USAGE '{{ rl.mode }} without the seed launch derivation'
 # the interpreter = the receipt's `python` (the generation venv python, never link-resolved), which must be what the
 # generation's ansible-playbook runs: its shebang line is exactly #!<that path>, or (a shebang too long for the kernel)
 # its launcher execs exactly '<that path>'. The runner then sees it as ansible_playbook_python (sys.executable).
@@ -944,7 +1010,7 @@ _rr=$(printf {{ shq('{"' ~ rs.var ~ '":{"runner":"%s","work_root":"%s","ansible_
 set -- "$@" {{ shq(rl.arg_flags | first) }} "$_rr"
 lme_ancestry "$_ev/."
 lme_ancestry "$_pb"
-{{ managed_env(bs, '$_run/ansible-home', '$_run/tmp', ns.extra) }} {{ rl.user_manager_env.bus_env }}="unix:path=$_xrd/"{{ shq(um.bus) }} {{ rl.user_manager_env.user_env }}="$_user" "{{ ap }}" -i {{ shq(rl.inventory) }} -c {{ shq(rl.connection) }} "$_pb" "$@" 9<&-
+{{ managed_env(bs, '$_run/ansible-home', '$_run/tmp', ns.extra) }} {{ rl.user_manager_env.bus_env }}="$_bus" {{ rl.user_manager_env.user_env }}="$_user" "{{ ap }}" -i {{ shq(rl.inventory) }} -c {{ shq(rl.connection) }} "$_pb" "$@" 9<&-
 exit $?
 {%- endmacro -%}
 
@@ -996,6 +1062,7 @@ lme_phase() {
   printf 'lme-controller-seed: %s\n' "$1" >&2
 }
 LME_PINS={{ shq(pins_table(bs, ctl, lock) | trim) }}
+{{ launch_base_check(bs) }}
 
 [ "$({{ x(bs, 'id') }} -u)" != 0 ] || lme_refuse RH-SEED-PRIVILEGED 'the seed never runs as root'
 case "${HOME:-}" in /*) : ;; *) lme_refuse RH-SEED-USAGE 'HOME must be an absolute path' ;; esac
@@ -1018,6 +1085,7 @@ case "$MODE" in apply|verify|purge) [ $# -eq 0 ] || lme_refuse RH-SEED-USAGE "$M
 {{ ssh_auth_check(bs, ssh_auth) }}
 {{ combination_check(bs, ctl) }}
 {{ os_tool_checks(bs) }}
+{{ launch_derive(bs) }}
 {{ run_local_args(bs) }}
 {{ platform_check(bs) }}
 {{ ancestry_fn(bs) }}

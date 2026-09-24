@@ -51,6 +51,7 @@
     - "{{ rh.controller.bootstrap.os_tools.rm.path }}"
     - "{{ rh.controller.bootstrap.os_tools.flock.path }}"
     - "{{ rh.controller.bootstrap.os_tools.mkdir.path }}"
+    - "{{ rh.controller.bootstrap.os_tools.sh.path }}"
   register: _rh_pkg_mv
 
 - name: Admit the destination's ancestry by the ONE resolved rule (path_admission.ancestry incl. owner_private_group)
@@ -75,7 +76,7 @@
       - _anc | selectattr('woth') | list | length == 0
       - _anc[-1].uid == rh_builder.uid | int
       - not _dst.exists or (_dst.isdir and not _dst.islnk and _dst.uid == rh_builder.uid | int)
-      - _rh_pkg_mv.results | map(attribute='stat') | selectattr('exists') | selectattr('isreg') | selectattr('executable') | list | length == 5
+      - _rh_pkg_mv.results | map(attribute='stat') | selectattr('exists') | selectattr('isreg') | selectattr('executable') | list | length == _rh_pkg_mv.results | length
       - _rh_pkg_mv.results | map(attribute='stat') | rejectattr('uid', 'equalto', rh.controller.bootstrap.os_tool_identity.owner_uid) | list | length == 0
       - _rh_pkg_mv.results | map(attribute='stat') | selectattr('wgrp') | list | length == 0
       - _rh_pkg_mv.results | map(attribute='stat') | selectattr('woth') | list | length == 0
@@ -83,7 +84,7 @@
       REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: every ancestor of {{ rh_pub_dir }} must be a
       real directory owned by 0 or uid {{ rh_builder.uid }} and not group/other-writable (sticky not excepted), the
       parent owned by uid {{ rh_builder.uid }}; an existing destination must be an owned real directory; the
-      declared mv, df, rm, flock and mkdir ({{ _rh_pkg_mv.results | map(attribute='item') | list }})
+      declared mv, df, rm, flock, mkdir and sh ({{ _rh_pkg_mv.results | map(attribute='item') | list }})
       must be root-owned, non-writable regular files.
       Nothing was written.
     quiet: true
@@ -124,6 +125,7 @@
     rh_reap_df: "{{ rh.controller.bootstrap.os_tools.df.path }}"
     rh_reap_rm: "{{ rh.controller.bootstrap.os_tools.rm.path }}"
     rh_reap_flock: "{{ rh.controller.bootstrap.os_tools.flock.path }}"
+    rh_reap_sh: "{{ rh.controller.bootstrap.os_tools.sh.path }}"
     rh_reap_remote: false
     rh_reap_reserve: true
     rh_reap_need: >-
@@ -208,32 +210,34 @@
     dest: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
     mode: '0400'
     content: >-
-      {% set nl = '\n' -%}
-      {{ ([_rh_pkg_dst.results[-1].stat.checksum ~ '  ' ~ rh.controller.bootstrap.bundle.seed_file]
+      {% set cf = rh.controller.bootstrap.bundle.checksum_format -%}
+      {% set nl = {'newline': '\n'}[cf.terminator] -%}
+      {{ ([_rh_pkg_dst.results[-1].stat.checksum ~ cf.separator ~ rh.controller.bootstrap.bundle.seed_file]
           + ((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
              | map(attribute='sha256')
              | zip((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
                    | map(attribute='file') | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/'))
-             | map('join', '  ') | list)) | join(nl) ~ nl }}
+             | map('join', cf.separator) | list)) | join(nl) ~ nl }}
 
-- name: Refuse a consumer check the seed would reject (exact declared lines, seed grammar, newline-terminated; before publish)
+- name: Refuse a consumer check the seed would reject (exact declared lines, the shared checksum_format grammar, terminated; before publish)
   vars:
+    _cf: "{{ rh.controller.bootstrap.bundle.checksum_format }}"
     _rows: "{{ rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections }}"
     _want: >-
-      {{ [_rh_pkg_dst.results[-1].stat.checksum ~ '  ' ~ rh.controller.bootstrap.bundle.seed_file]
+      {{ [_rh_pkg_dst.results[-1].stat.checksum ~ _cf.separator ~ rh.controller.bootstrap.bundle.seed_file]
          + (_rows | map(attribute='sha256')
             | zip(_rows | map(attribute='file') | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/'))
-            | map('join', '  ') | list) }}
+            | map('join', _cf.separator) | list) }}
   ansible.builtin.assert:
     # conditionals are evaluated with escape_backslashes=False (_engine.py evaluate_conditional), so '\n' below IS a
     # newline; the file is read unstripped (rstrip=false) on the controller (genesis is localhost, connection local)
     that:
       - _want | length == 1 + (_rows | length)
-      # the seed's grammar (controller_seed.j2 bundle_check: grep -v -x -E '[0-9a-f]{64}  [A-Za-z0-9._/+-]+')
-      - _want | reject('match', '^[0-9a-f]{64}  [A-Za-z0-9._/+-]+$') | list | length == 0
+      # the ONE grammar (bundle.checksum_format), the same the seed's lme_bundle_check applies with grep -x -E
+      - _want | reject('match', '^' ~ _cf.digest ~ _cf.separator ~ _cf.name ~ '$') | list | length == 0
       - >-
         lookup('ansible.builtin.file', _rh_pkg_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.checksum_file, rstrip=false)
-        == (_want | join('\n')) ~ '\n'
+        == (_want | join({'newline': '\n'}[_cf.terminator])) ~ {'newline': '\n'}[_cf.terminator]
     fail_msg: >-
       REFUSED {{ rh.controller.bootstrap.bundle.refusals.staged }}: the staged {{ rh.controller.bootstrap.bundle.checksum_file }}
       is not exactly {{ _want | length }} newline-terminated lines '<64 hex>  <path>' in the declared order (seed, then

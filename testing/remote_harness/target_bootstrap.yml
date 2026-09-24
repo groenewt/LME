@@ -539,6 +539,7 @@
         rh_reap_df: "{{ rh.controller.bootstrap.os_tools.df.path }}"
         rh_reap_rm: "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].rm.path }}"
         rh_reap_flock: "{{ lme_resolved.remote_harness.adapter.tools['target.tools'].flock.path }}"
+        rh_reap_sh: "{{ rh.controller.bootstrap.os_tools.sh.path }}"   # os_tools like df: sh is required_by seed (preflighted)
         rh_reap_remote: true
         rh_reap_reserve: "{{ not _rh_tb_bdir.stat.exists }}"
         rh_reap_need: >-
@@ -761,15 +762,40 @@
           check file differs from the controller's; staging reaped before this run: {{ _rh_reap_rm.results | default([]) | map(attribute='item') | list }}.
         quiet: true
 
-    - name: Apply the SAME seed as the declared owner (one operation; unprivileged, offline, budgeted, locked)
+    # SEED LAUNCH CONTRACT (controller.bootstrap.seed_launch; codex 183510): the apply is launched through the declared
+    # seed_launch.argv -- env -i with exactly seed_launch.env.order (base_env values, HOME = the invoker's passwd home,
+    # field seed_launch.derive.home.field of `getent passwd <uid>`). No runtime dir / bus is passed: the seed derives
+    # them from target_bootstrap.user_manager for the actual uid and refuses a mismatch (no constant uid or path).
+    - name: Seed launch -- the invoker's passwd entry (read-only; HOME of the env -i launch, re-derived by the seed)
       ansible.builtin.command:
         argv:
-          - "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}/{{ rh.controller.bootstrap.bundle.seed_file }}"
-          - apply
-          - --root
-          - "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.root_var) }}"
-      environment:
-        XDG_RUNTIME_DIR: "{{ rh.controller.bootstrap.target_bootstrap.user_manager.runtime_dir | replace('{uid}', _rh_tb_uid.stdout) }}"
+          - "{{ rh.controller.bootstrap.os_tools[rh.controller.bootstrap.seed_launch.derive.home.tool].path }}"
+          - "{{ rh.controller.bootstrap.seed_launch.derive.home.database }}"
+          - "{{ _rh_tb_uid.stdout }}"
+      register: _rh_tb_pw
+      changed_when: false
+
+    - name: Apply the SAME seed as the declared owner (one operation; unprivileged, offline, budgeted, locked)
+      ansible.builtin.command:
+        # every name below is template-local ({% set %}): no task var an extra-var could outrank feeds the exec vector
+        argv: >-
+          {%- set bs = rh.controller.bootstrap -%}
+          {%- set sl = bs.seed_launch -%}
+          {%- set home = _rh_tb_pw.stdout.split(':')[(sl.derive.home.field | int) - 1] -%}
+          {%- set root = lookup('ansible.builtin.vars', bs.inventory.root_var) -%}
+          {%- set subst = {'{os_tools.env.path}': bs.os_tools.env.path,
+                           '{bundle_dir}': lookup('ansible.builtin.vars', bs.inventory.bundle_var),
+                           '{bundle.seed_file}': bs.bundle.seed_file, '{mode}': 'apply', '{root}': root} -%}
+          {%- set ns = namespace(a=[]) -%}
+          {%- for w in sl.argv -%}
+          {%- if w == '{env_pairs}' -%}
+          {%- for n in sl.env.order -%}{%- set ns.a = ns.a + [n ~ '=' ~ (home if n in sl.env.inherited else bs[sl.env.base][n])] -%}{%- endfor -%}
+          {%- elif w == '{mode_args}' -%}
+          {%- for m in sl.mode_args.apply -%}{%- set ns.a = ns.a + [m | replace('{root}', root)] -%}{%- endfor -%}
+          {%- else -%}
+          {%- set t = namespace(w=w) -%}{%- for k, v in subst.items() -%}{%- set t.w = t.w | replace(k, v) -%}{%- endfor -%}{%- set ns.a = ns.a + [t.w] -%}
+          {%- endif -%}
+          {%- endfor -%}{{ ns.a }}
       register: _rh_tb_apply
       changed_when: _rh_tb_apply.stdout is search('^INSTALLED ', multiline=true)
       failed_when: >-

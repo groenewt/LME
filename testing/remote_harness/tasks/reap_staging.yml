@@ -12,6 +12,7 @@
 #   rh_reap_rm       the declared, identity-admitted rm path   (on this host)
 #   rh_reap_flock    the declared, identity-admitted flock path (on this host; known-answer checked below)
 #   rh_reap_df       the declared, identity-admitted df path   (on this host)
+#   rh_reap_sh       the declared, identity-admitted sh path   (on this host; creates an absent destination lock)
 #   rh_reap_need     bytes that must be available on the destination filesystem before the reservation
 #   rh_reap_remote   true for target staging (target writer quiescence is required too), false on the controller
 #   rh_reap_reserve  true when the caller reserves a staging dir next (the lease record is written last)
@@ -180,6 +181,65 @@
       REFUSED {{ _lz.refusal }} on {{ inventory_hostname }}: {{ rh_reap_flock }} failed the lock known answers on this
       run's private scratch lock (rc {{ _rh_reap_kat.results | map(attribute='rc') | list }}; destination-lock contention
       is never a cause here); nothing was reaped or reserved.
+    quiet: true
+
+# DESTINATION LOCK CUSTODY (staging_retention.lease.lock_file; codex 183510): the persistent destination lock is
+# admitted HERE, unconditionally and before ANY flock on it (the reap mutations below and both callers' publish fences
+# run after this include). Absent -> created once, O_CREAT|O_APPEND under a umask bound to that one sh child (never
+# truncated, never an inode replaced, so a lock another run holds keeps its identity). Present -> never recreated or
+# chmod-ed; it must be the acting uid's regular, non-link, not group/other-writable file, else refused and preserved.
+- name: Stat the destination lock (no link followed; read-only)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+  ansible.builtin.stat:
+    path: "{{ (rh_reap_dest | dirname) ~ '/.' ~ (rh_reap_dest | basename) ~ '.' ~ _lz.lock_suffix }}"
+    follow: false
+    get_checksum: false
+  register: _rh_reap_lock
+
+- name: Create the absent destination lock with the declared mode (declared sh; umask bound to this one child; append-open)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ rh_reap_sh }}"
+      - -c
+      - 'umask "$1" && : >> "$2"'
+      - sh
+      - "{{ _lz.lock_file.create_umask }}"
+      - "{{ (rh_reap_dest | dirname) ~ '/.' ~ (rh_reap_dest | basename) ~ '.' ~ _lz.lock_suffix }}"
+  when:
+    - _lz.lock_file.create == 'append_open_if_absent'
+    - not _rh_reap_lock.stat.exists
+  changed_when: true
+
+- name: Read the destination lock back (no link followed; read-only)
+  vars:
+    _lz: "{{ rh.controller.bootstrap.bundle.staging_retention.lease }}"
+  ansible.builtin.stat:
+    path: "{{ (rh_reap_dest | dirname) ~ '/.' ~ (rh_reap_dest | basename) ~ '.' ~ _lz.lock_suffix }}"
+    follow: false
+    get_checksum: false
+  register: _rh_reap_lock_rb
+
+- name: Refuse a destination lock outside the declared custody (RH-STAGING-LOCK-CUSTODY; preserved, never chmod-ed)
+  vars:
+    _lf: "{{ rh.controller.bootstrap.bundle.staging_retention.lease.lock_file }}"
+    _s: "{{ _rh_reap_lock_rb.stat }}"
+  ansible.builtin.assert:
+    that:
+      - _lf.owner == 'acting_uid' and _lf.existing.owner == 'acting_uid'
+      - _s.exists
+      - _s.isreg and not _s.islnk
+      - _s.uid == rh_reap_uid | int
+      - not _s.wgrp and not _s.woth
+      - _rh_reap_lock.stat.exists or _s.mode == _lf.mode
+    fail_msg: >-
+      REFUSED {{ _lf.refusal }} (RH-STAGING-LOCK-CUSTODY) on {{ inventory_hostname }}: the destination lock {{ _s.path | default('') }}
+      must be a regular file (not a link) owned by uid {{ rh_reap_uid }}, not group/other-writable, and mode {{ _lf.mode }}
+      when created by this run (found exists={{ _s.exists }} isreg={{ _s.isreg | default('') }} islnk={{ _s.islnk | default('') }}
+      uid={{ _s.uid | default('') }} mode={{ _s.mode | default('') }}; pre-existing={{ _rh_reap_lock.stat.exists }}). It is
+      preserved (never recreated or chmod-ed); nothing was reaped or reserved.
     quiet: true
 
 - name: List this destination's staging, reaping and lease entries (any type; no links followed)

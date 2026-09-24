@@ -81,6 +81,19 @@ profile_overlay:
             artifacts_dir: artifacts          # the seed reads its artifacts ONLY from <its own dir>/artifacts
             manifest_file: bundle.json
             checksum_file: bundle.sha256      # sha256sum --check format: the Ansible-free consumer check
+            # CHECKSUM FORMAT CONTRACT (codex 183510; RH-BUNDLE-CHECKSUM-FORMAT): the ONE grammar of checksum_file,
+            # consumed by BOTH sides -- the producer (tasks/package_bundle.yml writes each line as
+            # <digest><separator><name><terminator> and refuses before publish any line not matching
+            # ^<digest><separator><name>$ or a file not exactly those lines each terminated) and the controller seed
+            # (controller_seed.j2 lme_bundle_check: grep -x -E <digest><separator><name> on every line, the name set
+            # stripped with sed -E 's/^<digest><separator>//', the running seed line "<sha><separator><seed_file>",
+            # the last byte a terminator). The regexes are POSIX ERE and Python-re compatible (no backslash, no class
+            # names); the separator is literal (two spaces: sha256sum text mode, never ' *' binary mode).
+            checksum_format:
+              digest: '[0-9a-f]{64}'
+              separator: '  '
+              name: '[A-Za-z0-9._/+-]+'
+              terminator: newline             # every line, the last included
             schema: lme-controller-bundle/v1
             # SEED2-PACKAGE-RESERVATION / SEED2-BUNDLE-COMPLETION: a bundle is built (package.yml) or extracted (target)
             # ONLY inside an exclusively reserved sibling staging dir `.<bundle basename>.<staging_infix>.<random>`
@@ -210,6 +223,24 @@ profile_overlay:
                   cgroup_b64: 'string, base64 of the holder cgroup v2 path (/proc/<pid>/cgroup without 0::)'
                 lease_infix: lease
                 lock_suffix: lock
+                # DESTINATION LOCK CUSTODY (codex 183510; RH-STAGING-LOCK-CUSTODY). `.<dest basename>.<lock_suffix>` in the
+                # destination parent (the controller's <work root>/.bundle.lock; each target's bundle-dir sibling) is
+                # persistent state of the SAME owner as the staging it serializes (the acting uid, rh_reap_uid). It is
+                # admitted by tasks/reap_staging.yml BEFORE any flock on it (the reap mutations and both callers'
+                # publish fences run after that include), never created implicitly by flock (O_CREAT 0666 & ~umask):
+                #   absent  -> created ONCE by the declared sh as `umask <create_umask> && : >> <lock>`: O_CREAT|O_APPEND,
+                #              so it never truncates or replaces an inode (a lock another process already holds keeps
+                #              its identity) and the umask binds only that one child process (no host or play change);
+                #   present -> never recreated, never chmod-ed: it must be a regular file (not a link) owned by `owner`
+                #              and not group/other-writable (existing), else refusal (preserved for the operator);
+                #   read back after creation: regular, owner, exactly `mode`.
+                lock_file:
+                  owner: acting_uid                  # rh_reap_uid on this host
+                  mode: '0600'
+                  create_umask: '0177'               # 0666 & ~0177 = 0600
+                  create: append_open_if_absent
+                  existing: {regular_file: true, refuse_links: true, owner: acting_uid, refuse_group_other_writable: true}
+                  refusal: RH-STAGING-LEASE
                 busy_rc: 75
                 publish_wait_seconds: 30     # bounded wait of the publish fence for the destination lock
                 kat_lock_suffix: lme-flock-kat   # r3f: flock known answers run on a PRIVATE temp lock, never the destination lock
@@ -510,6 +541,58 @@ profile_overlay:
           base_env:
             PATH: /usr/bin:/bin
             LC_ALL: C.UTF-8
+          # SEED LAUNCH CONTRACT (codex decision 183510; RH-SEED-LAUNCH). The COMPLETE initial launch of the generated
+          # seed (lme-controller-seed.sh, every mode: the genesis seed apply, target_bootstrap.yml's apply, G's seed
+          # acts, a `seed run` / `run-local` caller) -- built from base_env and target_bootstrap.user_manager, bound
+          # to the ACTUAL invoker, never to a constant uid or runtime path:
+          #   caller argv   argv below: env -i with EXACTLY env.order (base_env values; HOME = the invoker's passwd
+          #                 home) + env.carried when it applies, then the mode and its mode_args. The runtime dir and
+          #                 bus are NOT passed: the seed derives them (a caller that does pass XDG_RUNTIME_DIR /
+          #                 DBUS_SESSION_BUS_ADDRESS / USER / HOME must pass exactly the derived value).
+          #   ENFORCED by the seed (below): base_env values, HOME, the runtime/bus/user names. NOT inspected: any
+          #                 OTHER ambient name a caller leaks past this contract (e.g. LD_PRELOAD) reaches the pre-scope
+          #                 tool calls (id, getent, stat, the known answers); it is cleared at the scope's env -i
+          #                 (step 3). The exact name set is a CALLER obligation (argv), not a seed proof.
+          #   the seed      (templates/macros/controller_seed.j2, consumed there, not prose):
+          #                 (1) FIRST, before any pattern match (the pre-scope checks use locale-dependent bracket
+          #                     ranges): every base_env name must equal its declared value (base_check), else refusal;
+          #                 (2) after the os-tool identity checks (derive.home.tool is hash-admitted there): uid = `id -u`,
+          #                     home = field derive.home.field of `getent passwd <uid>` -- an absolute, real directory
+          #                     owned by uid; HOME must equal it; runtime dir = target_bootstrap.user_manager.runtime_dir
+          #                     with {uid} = uid -- a real directory owned by uid, mode user_manager.runtime_dir_mode;
+          #                     bus = <runtime dir>/<user_manager.bus> -- a socket; caller-supplied runtime/bus names
+          #                     (work_roots.run_local.user_manager_env) must be unset or equal (caller_values); USER =
+          #                     `id -un` (admitted name). This is the ONE derivation: run-local reuses it (no second one);
+          #                 (3) `systemd-run --user` (the budget probe AND the scope exec) runs as `env -i` with EXACTLY
+          #                     scope_env: HOME, base_env, the runtime dir and bus names -- no ambient variable reaches
+          #                     the user manager; inside the scope the seed re-runs under its own env -i (managed env).
+          seed_launch:
+            argv: ['{os_tools.env.path}', '-i', '{env_pairs}', '{bundle_dir}/{bundle.seed_file}', '{mode}', '--root', '{root}', '{mode_args}']
+            # {mode_args}: the mode's remaining words, in order (the seed's own usage; {args} = the caller's
+            # ansible-playbook words after --, screened by the seed)
+            mode_args:
+              apply: []
+              verify: []
+              purge: ['--confirm', '{root}']
+              run: ['--ssh-auth', '{ssh_auth_mode}', '--', '{args}']
+              run-local: ['--runner', '{runner}', '--', '{args}']
+            env:
+              clear: true
+              order: [PATH, LC_ALL, HOME]
+              base: base_env
+              inherited: {HOME: invoker_passwd_home}
+              # appended after `order` ONLY for mode run with a mode whose ssh_auth.modes.<mode>.agent is `carried`:
+              # its socket_env (SSH_AUTH_SOCK), the caller's agent socket, validated by the seed's ssh_auth_check
+              carried: {when: {mode: run, ssh_auth_agent: carried}, name_from: ssh_auth.modes.<mode>.socket_env}
+            base_check: exact                  # every base_env name == its declared value before any pattern match
+            derive:
+              home: {tool: getent, database: passwd, field: 6}   # passwd(5) field 6 = home directory
+              runtime: target_bootstrap.user_manager            # runtime_dir ({uid}) + runtime_dir_mode + bus
+              names: work_roots.run_local.user_manager_env      # runtime_dir_env / bus_env / user_env
+              caller_values: refuse_if_different
+            scope_env: [HOME, base_env, runtime_dir_env, bus_env]   # the ONLY environment of systemd-run --user
+            refusal: RH-SEED-USAGE             # base env, HOME / passwd home, caller-supplied runtime or bus mismatch
+            budget_refusal: RH-SEED-BUDGET-UNAVAILABLE   # no user manager: runtime dir or bus missing / not owned
           # WORK-ROOT DECLARATION (operator: no work in /tmp; codex 135500 / 135903). Every local work path of a run
           # (temp, Ansible local temp + AnsiballZ payloads, tool caches, rootless engine storage, runner evidence)
           # lives under ONE declared, admitted work root. Nothing here is an ambient or manually exported default.
@@ -1137,7 +1220,8 @@ profile_overlay:
             playbook_rel: testing/remote_harness/target_bootstrap.yml
             connect_as: owner                        # ansible_user must equal the owner var; become must be off
             user_manager:
-              runtime_dir: /run/user/{uid}           # must exist, owned by uid, mode 0700
+              runtime_dir: /run/user/{uid}           # must exist, owned by uid, mode runtime_dir_mode
+              runtime_dir_mode: '700'                # stat %a form; checked by the seed launch derivation
               bus: bus                               # <runtime_dir>/bus must be a socket
               linger: >-
                 NOT required for the bootstrap itself (the SSH session carries the user manager). A MAIN-only root
