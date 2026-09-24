@@ -357,12 +357,47 @@
       sha256: "{{ system_inventory_stat.stat.checksum | default(none) }}"
   when: case.no_inventory | default(false)
 
-- name: "[{{ case.name }}] compose the probe argv (declared binary; scrubbed env)"
+# RH-NESTED-PROBE-EXECUTOR-C1-JOIN (codex 144541; ATTRIBUTED CHANGE vs one_case.yml a23923a0): the probe keeps its
+# DECLARED executable (probe_ansible_playbook -- deliberately not the runner's) and its env -i scrub, but the scrubbed
+# environment is now ONE merged mapping (each name once in argv), in precedence order, last wins:
+#   1. case.ambient_env        OPTIONAL test-only injection modelling a conflicting ambient value (C1 temp controls)
+#   2. lme_resolved_run.env    the resolved run environment (TMPDIR, ANSIBLE_LOCAL_TEMP, XDG_*, *_CACHE_DIR, CONTAINERS_*, ...)
+#   3. the fixed probe scrub   HOME, PATH, LANG, PYTHONNOUSERSITE, ANSIBLE_CONFIG, ANSIBLE_NOCOLOR (unchanged values)
+#   4. per-case temp roots     TMPDIR/TMP/TEMP=<casedir>/tmp, ANSIBLE_LOCAL_TEMP=<casedir>/atmp (= ansible.cfg local_tmp),
+#                              ANSIBLE_REMOTE_TMP=<casedir>/rtmp -- all under the case dir, inside work_root
+# The merged mapping is recorded in the envelope (argv.json + argv_sha256) and as probe_env in the result.
+- name: "[{{ case.name }}] refuse an unsafe ambient_env / tempfile_probe declaration (optional C1 temp-control fields)"
+  ansible.builtin.assert:
+    that:
+      - case.ambient_env is not defined or case.ambient_env is mapping
+      - case.ambient_env is not defined or (case.ambient_env.keys() | map('string') | reject('match', '^[A-Z_][A-Z0-9_]*$') | list | length) == 0
+      - case.ambient_env is not defined or (case.ambient_env.values() | reject('string') | list | length) == 0
+      - case.tempfile_probe is not defined or case.tempfile_probe is boolean
+      - (casedir ~ '/') is match('^' ~ ((work_root ~ '/') | regex_escape))
+    fail_msg: "case {{ case.name }}: ambient_env must map NAME -> string, tempfile_probe must be boolean, and the case dir must lie inside work_root"
+
+- name: "[{{ case.name }}] per-case temp roots (under the case dir, inside work_root)"
+  ansible.builtin.file: {path: "{{ casedir }}/{{ item }}", state: directory, mode: '0700'}
+  loop: [tmp, atmp, rtmp]
+
+- name: "[{{ case.name }}] compose the probe environment (ambient_env < resolved env < fixed scrub < per-case temp roots)"
+  ansible.builtin.set_fact:
+    probe_env: >-
+      {{ (case.ambient_env | default({}))
+         | combine(lme_resolved_run.env)
+         | combine({'HOME': casedir, 'PATH': (probe_ansible_playbook | dirname) ~ ':/usr/bin:/bin',
+                    'LANG': 'C.UTF-8', 'PYTHONNOUSERSITE': '1', 'ANSIBLE_CONFIG': casedir ~ '/ansible.cfg', 'ANSIBLE_NOCOLOR': '1'})
+         | combine({'TMPDIR': casedir ~ '/tmp', 'TMP': casedir ~ '/tmp', 'TEMP': casedir ~ '/tmp',
+                    'ANSIBLE_LOCAL_TEMP': casedir ~ '/atmp', 'ANSIBLE_REMOTE_TMP': casedir ~ '/rtmp'}) }}
+
+- name: "[{{ case.name }}] compose the probe argv (declared binary; scrubbed env = probe_env only)"
   ansible.builtin.set_fact:
     probe_argv: >-
-      {{ ['env', '-i', 'HOME=' + casedir, 'PATH=' + (probe_ansible_playbook | dirname) + ':/usr/bin:/bin',
-          'LANG=C.UTF-8', 'PYTHONNOUSERSITE=1', 'ANSIBLE_CONFIG=' + casedir + '/ansible.cfg', 'ANSIBLE_NOCOLOR=1',
-          probe_ansible_playbook]
+      {{ ['env', '-i']
+         + (probe_env | dict2items | sort(attribute='key', case_sensitive=true) | map(attribute='key')
+            | zip(probe_env | dict2items | sort(attribute='key', case_sensitive=true) | map(attribute='value'))
+            | map('join', '=') | list)
+         + [probe_ansible_playbook]
          + ([] if (case.no_inventory | default(false)) else
             ['-i', (casedir + '/inventory.yml' if (case.inventory_vars is defined or case.inventory_hosts is defined) else 'localhost,')])
          + [casedir + '/probe.yml']
@@ -532,6 +567,7 @@
           'probe_rc': probe_run.rc, 'verdict': verdict, 'outcome': outcome, 'cause_source': cause_source, 'cause': cause[:600],
           'expected_failed_task': case.expected_failed_task | default(case.invariant_task | default(none)),
           'probe_sha256': probe_stat.stat.checksum, 'argv_sha256': (probe_argv | to_json | hash('sha256')),
+          'probe_env': probe_env,
           'stdout_sha256': (probe_run.stdout | hash('sha256')), 'stderr_sha256': (probe_run.stderr | hash('sha256')),
           'overlay_sha256': overlay_sha256, 'dump_sha256': dump_sha256,
           'copied_tree_sha256': copied_tree_digests,

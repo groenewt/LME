@@ -49,6 +49,8 @@
 #     -e expected_probe_python_executable=<abs> -e expected_probe_python_version=<x.y.z> \
 #     -e run_mode=reproduction|integration -e source_commit=<40-hex> [-e baseline_commit=<40-hex>] \
 #     -e managed_interpreter_root=<abs> [-e interpreter_policy=managed_only|unmanaged_diagnostic]
+#     -e work_root=<abs> -e '{"lme_resolved_run": {...}}'   (both from the declared seed run-local, passed LAST;
+#                                                            RH-RUNNER-RESOLVED-WORKROOT, see the play header)
 #
 #   codex-2017 (OPERATOR DIRECT: uv-managed interpreters; system Python is NOT a test-leg fallback):
 #       interpreter_policy defaults to NOTHING (required). managed_only: the RESOLVED (symlink-followed)
@@ -60,18 +62,65 @@
   connection: local
   gather_facts: false
   become: false
-  # C1_runner_location (codex 143342) ATTRIBUTED CHANGE vs the loader-tests-r4 instrument (sha256 3987d133...): the
-  # work root no longer defaults to "{{ playbook_dir }}/runs". It defaults to the DECLARED work root, read from THIS
-  # checkout's profile (the checkout that holds this runner, testing/loader-tests-r4 -> two levels up; NOT repo_root,
-  # which is the clone under test): <checkout>/<root_rel>/<sub_roots.run>/<runners.loader_cases>, from
-  # manifests/profiles/remote-harness.yml controller.bootstrap.work_roots (same shape as loader_integration and
-  # acceptance). work_root_var = work_root: the declared launcher passes -e work_root=<same path> last, and an
-  # explicit -e work_root still overrides a direct invocation. Nonzero exit: the Overall gate below fails the play.
-  vars:
-    lme_runner_checkout: "{{ playbook_dir | dirname | dirname }}"
-    lme_work_roots: "{{ (lookup('ansible.builtin.file', lme_runner_checkout ~ '/manifests/profiles/remote-harness.yml') | from_yaml).profile_overlay.lme_global.remote_harness.controller.bootstrap.work_roots }}"
-    work_root: "{{ lme_runner_checkout ~ '/' ~ lme_work_roots.root_rel ~ '/' ~ lme_work_roots.sub_roots.run ~ '/' ~ lme_work_roots.runners.loader_cases }}"
+  # ATTRIBUTED CHANGES vs the loader-tests-r4 instrument (sha256 3987d133...):
+  #   C1_runner_location (codex 143342): the work root no longer defaults to "{{ playbook_dir }}/runs".
+  #   RH-RUNNER-RESOLVED-WORKROOT (codex 144541): the interim raw-profile default (m1-1 0160b1b read
+  #     manifests/profiles/remote-harness.yml work_roots directly) is REMOVED. This runner has NO work-root default
+  #     and reads no profile/manifest for it. It REQUIRES the resolved run input the declared seed run-local passes
+  #     LAST (shared route/G/C1 contract; exact field names):
+  #       -e '{"lme_resolved_run": {"runner", "work_root", "ansible_playbook", "python",
+  #            "env": {TMPDIR, ANSIBLE_LOCAL_TEMP, XDG_*, *_CACHE_DIR, CONTAINERS_*, ...}, "receipt": {"path", "sha256"}}}'
+  #     and refuses its absence. work_root_var = work_root; work_root must EQUAL lme_resolved_run.work_root.
+  #   RH-NESTED-PROBE-EXECUTOR-C1-JOIN: one_case.yml carries lme_resolved_run.env across the probe's env -i with
+  #     per-case temp roots under the case dir (inside work_root).
+  # Nonzero exit: every refusal below and the Overall gate fail the play.
   tasks:
+    - name: "RH-RUNNER-RESOLVED-WORKROOT -- require the resolved run input (no raw-profile fallback, no default work root)"
+      ansible.builtin.assert:
+        that:
+          - lme_resolved_run is defined and lme_resolved_run is mapping
+          - (lme_resolved_run.keys() | map('string') | sort | list) == ['ansible_playbook', 'env', 'python', 'receipt', 'runner', 'work_root']
+          - lme_resolved_run.runner is string and lme_resolved_run.runner == 'loader_cases'
+          - lme_resolved_run.work_root is string and lme_resolved_run.work_root is match('^/.+[^/]$')
+          - lme_resolved_run.ansible_playbook is string and lme_resolved_run.ansible_playbook is match('^/')
+          - lme_resolved_run.python is string and lme_resolved_run.python is match('^/')
+          - lme_resolved_run.env is mapping and 'TMPDIR' in lme_resolved_run.env
+          - (lme_resolved_run.env.keys() | map('string') | reject('match', '^[A-Z_][A-Z0-9_]*$') | list | length) == 0
+          - (lme_resolved_run.env.values() | reject('string') | list | length) == 0
+          - (lme_resolved_run.env.values() | reject('match', '^/') | list | length) == 0
+          - lme_resolved_run.receipt is mapping and (lme_resolved_run.receipt.keys() | map('string') | sort | list) == ['path', 'sha256']
+          - lme_resolved_run.receipt.path is string and lme_resolved_run.receipt.path is match('^/')
+          - lme_resolved_run.receipt.sha256 is string and lme_resolved_run.receipt.sha256 is match('^[0-9a-f]{64}$')
+          - work_root is defined and work_root is string and work_root == lme_resolved_run.work_root
+        fail_msg: >-
+          run_loader_tests.yml requires -e lme_resolved_run={runner: loader_cases, work_root, ansible_playbook, python,
+          env: {TMPDIR, ...absolute paths}, receipt: {path, sha256}} from the declared seed run-local, and
+          work_root == lme_resolved_run.work_root; there is no raw-profile or default work root (RH-RUNNER-RESOLVED-WORKROOT)
+
+    - name: "RH-RUNNER-RESOLVED-WORKROOT -- measure the resolved-run receipt"
+      ansible.builtin.stat: {path: "{{ lme_resolved_run.receipt.path }}", checksum_algorithm: sha256, follow: false}
+      register: resolved_run_receipt_stat
+
+    - name: "RH-RUNNER-RESOLVED-WORKROOT -- the receipt and the runner interpreter are the resolved ones"
+      ansible.builtin.assert:
+        that:
+          - resolved_run_receipt_stat.stat.exists and resolved_run_receipt_stat.stat.isreg and not resolved_run_receipt_stat.stat.islnk
+          - resolved_run_receipt_stat.stat.checksum == lme_resolved_run.receipt.sha256
+          - ansible_playbook_python == lme_resolved_run.python
+        fail_msg: >-
+          resolved run mismatch: receipt {{ lme_resolved_run.receipt.path }} measured
+          {{ resolved_run_receipt_stat.stat.checksum | default('<absent>') }} (declared {{ lme_resolved_run.receipt.sha256 }});
+          runner python {{ ansible_playbook_python }} (declared {{ lme_resolved_run.python }})
+
+    - name: "RH-RUNNER-RESOLVED-WORKROOT -- the runner's OWN environment carries every resolved item (a conflicting ambient TMPDIR/temp/cache value refuses)"
+      ansible.builtin.assert:
+        that: lookup('ansible.builtin.env', item.key) == item.value
+        fail_msg: >-
+          runner environment {{ item.key }}={{ lookup('ansible.builtin.env', item.key) }} differs from the resolved
+          {{ item.value }}; the runner must be started by the declared seed run-local with lme_resolved_run.env
+      loop: "{{ lme_resolved_run.env | dict2items }}"
+      loop_control: {label: "{{ item.key }}"}
+
     - name: Refuse a run whose inputs are not all explicit (no private defaults)
       ansible.builtin.assert:
         that:
@@ -405,6 +454,9 @@
             {{ {'path': managed_bootstrap_receipt, 'sha256': managed_bootstrap_receipt_sha256}
                if interpreter_policy == 'managed_only' else none }}
           qualifies_leg: "{{ interpreter_policy == 'managed_only' }}"
+          # RH-RUNNER-RESOLVED-WORKROOT: the resolved run input this run consumed (receipt measured above)
+          resolved_run: "{{ lme_resolved_run }}"
+          resolved_run_receipt_measured_sha256: "{{ resolved_run_receipt_stat.stat.checksum }}"
 
     - name: "r3 -- write consumed-inputs.yml"
       ansible.builtin.copy:
@@ -439,6 +491,7 @@
               'executed_checkpoint': head_rev.stdout,
               'interpreter_policy': interpreter_policy, 'qualifies_leg': (interpreter_policy == 'managed_only'),
               'consumed_inputs_sha256': consumed_stat.stat.checksum,
+              'work_root': work_root, 'resolved_run': lme_resolved_run,
               'worktree_dirty': (git_porcelain.stdout_lines | length > 0),
               'git_status_porcelain': git_porcelain.stdout_lines, 'toolchain': toolchain,
               'cases_file': cases_file, 'instruments_sha256': instruments,
