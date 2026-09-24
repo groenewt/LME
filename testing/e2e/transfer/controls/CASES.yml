@@ -476,6 +476,18 @@ cases:
         replace: '"$LME_CONTROLLER_LAUNCHER" run "$LME_CONTROLLER_ROOT" "$LME_SSH_AUTH_MODE" -- -i '
     expect: {rc: fail, out: ['TRANSFER-GATE-LAUNCH', 'launcher calls 0 != 1', 'launcher statement: "$LME_CONTROLLER_LAUNCHER" run "$LME_CONTROLLER_ROOT" "$LME_SSH_AUTH_MODE" -- -i ']}
 
+  # B-R1-CONTROL-QUOTING (codex 202245): ONE interior argument of the call unquoted (word splitting / globbing on
+  # $REMOTE_DIR). The earlier launch_call_regex (an unrestricted `.*` between the fixed prefix and "$@") ACCEPTED this
+  # text; the quoted-token grammar refuses it: 0 declared calls and the call statement refused.
+  - id: C34-gate-launcher-unquoted-argument-refused
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/deploy_gate.sh
+        regexp: '-e "lme_transfer_remote_dir=\$REMOTE_DIR"'
+        replace: '-e lme_transfer_remote_dir=$REMOTE_DIR'
+    expect: {rc: fail, out: ['TRANSFER-GATE-LAUNCH', 'launcher calls 0 != 1', 'launcher statement: "$LME_CONTROLLER_LAUNCHER" run "$LME_CONTROLLER_ROOT" "$LME_SSH_AUTH_MODE" -i ']}
+
   # The launcher is invoked by an ABSOLUTE path only (caller_argv; a bare or relative value would be resolved by the
   # gate's ambient PATH / cwd, and bash would then hand the launcher an absolute $0, so its own check cannot see it).
   # The value here is relative and EXISTS (<case>/bundle/<launcher_file>, the gate case's cwd is <case>), so the
@@ -495,7 +507,8 @@ cases:
   # environment: shadow env/getent/id/realpath/sh lead PATH, LC_ALL/LANG are POSIX, HOME / XDG_RUNTIME_DIR /
   # DBUS_SESSION_BUS_ADDRESS / USER are foreign and SSH_AUTH_SOCK is set. The stand-in records its exact initial
   # environment (launch order) and its %q argv. Expected: exactly PATH LC_ALL HOME (seed_launch.env.order; base_env
-  # values; HOME from passwd, never the caller's) -- plus SSH_AUTH_SOCK with the caller's value ONLY in the
+  # values; HOME equal to the INDEPENDENT passwd-home oracle @passwd_home@ (run_controls.yml PASSWD-HOME, the getent
+  # module; never the launcher's own value), never the caller's) -- plus SSH_AUTH_SOCK with the caller's value ONLY in the
   # carried-agent mode (C27b), never otherwise (C27a); no shadow tool runs; argument boundaries (a word with a space,
   # an empty word, a trailing '=') reach the seed unchanged, and the seed receives the seed_launch argv
   # (run --root <root> --ssh-auth <mode> -- <args>) built by the launcher from the gate's positional call.
@@ -521,6 +534,7 @@ cases:
       absent: ['@cd@/shadow.calls']
       file_has:
         - {path: '@cd@/seed.env', text: 'ENVNAMES PATH LC_ALL HOME END'}
+        - {path: '@cd@/seed.env', text: "\nHOME=@passwd_home@\n"}      # the independent PASSWD-HOME oracle, whole line
         - {path: '@cd@/seed.env', text: 'PATH=/usr/bin:/bin'}
         - {path: '@cd@/seed.env', text: 'LC_ALL=C.UTF-8'}
         - {path: '@cd@/seed.calls', text: 'run --root @cd@/ctlroot --ssh-auth explicit_key -- -i @cd@/inventory.json @repo@/testing/e2e/transfer/resolve_target.yml'}
@@ -557,6 +571,7 @@ cases:
       absent: ['@cd@/shadow.calls']
       file_has:
         - {path: '@cd@/seed.env', text: 'ENVNAMES PATH LC_ALL HOME SSH_AUTH_SOCK END'}
+        - {path: '@cd@/seed.env', text: "\nHOME=@passwd_home@\n"}      # the independent PASSWD-HOME oracle, whole line
         - {path: '@cd@/seed.env', text: 'SSH_AUTH_SOCK=/nonexistent/carried-agent.sock'}
         - {path: '@cd@/seed.env', text: 'PATH=/usr/bin:/bin'}
         - {path: '@cd@/seed.env', text: 'LC_ALL=C.UTF-8'}
@@ -570,6 +585,39 @@ cases:
         - {path: '@cd@/seed.env', text: 'LANG='}
         - {path: '@cd@/seed.env', text: 'POSIX'}
         - {path: '@cd@/seed.env', text: 'shadow'}
+
+  # B-R1-CONTROL-PASSWD-HOME (codex 202245): a WRONG-HOME launcher. This case's launcher is rendered from the resolved
+  # policy with ONE deliberate mutation (seed_launch.derive.home.field 7: the passwd SHELL field instead of the home),
+  # so the seed receives a HOME that is neither the caller's hostile value nor the passwd home. The earlier C27
+  # control (HOME named in ENVNAMES + not the one foreign value) is satisfied by this wrong launcher (the first
+  # file_has / file_lacks pair below restates it); the independent PASSWD-HOME oracle is NOT (file_lacks the exact
+  # "\nHOME=<passwd home>\n" line): the case passes only when the recorded HOME differs from the oracle, i.e. when the
+  # C27a/b oracle line would refuse this launcher. Fixture mutation of a case-dir render only; never a bundle.
+  - id: C35-gate-launch-wrong-home-caught-by-passwd-oracle
+    kind: gate
+    neighbour: C27a-gate-launch-hostile-ambient-no-agent
+    gate:
+      host: tgt
+      label: g
+      remote_dir: /srv/lme
+      auth_mode: explicit_key
+      record_env: true
+      launcher_policy_mutation: {seed_launch: {derive: {home: {field: 7}}}}
+      hostile:
+        shadow_tools: [env, getent, id, realpath, sh]
+        env: {HOME: /nonexistent/foreign-home}
+      calls: [resolve_target_contract]
+      contract_identity: 0123456789abcdef0123456789abcdef
+      endpoint_identity: 0123456789abcdef0123456789abcdef
+    expect:
+      rc: 0
+      absent: ['@cd@/shadow.calls']
+      file_has:
+        - {path: '@cd@/seed.env', text: 'ENVNAMES PATH LC_ALL HOME END'}
+        - {path: '@cd@/seed.env', text: "\nHOME=/"}
+      file_lacks:
+        - {path: '@cd@/seed.env', text: '/nonexistent/foreign-home'}
+        - {path: '@cd@/seed.env', text: "\nHOME=@passwd_home@\n"}
 
   # ... and so is a root play that binds the module temp the contact owns (a play var would be a second authority).
   - id: C18-root-play-binds-remote-tmp
