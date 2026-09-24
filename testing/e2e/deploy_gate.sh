@@ -179,24 +179,37 @@ emit_gate_result() {
 run_remote() { "${SSH[@]}" "$@" 2>&1 | tee -a "$LOG"; return "${PIPESTATUS[0]}"; }
 
 # ---- target contract + stage rsync (declared: testing/e2e/transfer/transfer.decl.yml) -------------------
-# Residual debt: this is hand-written bash. It only STARTS the declared entry playbooks through the route's ONE
-# executor entrypoint (the bundle seed's `run`, which binds the managed generation; resolve_harness.yml refuses
-# any other) and reads their declared outputs. Required inputs, no default:
-#   LME_CONTROLLER_SEED     the bundle's lme-controller-seed.sh     LME_CONTROLLER_ROOT   its owned toolchain root
+# Residual debt: this is hand-written bash. It only STARTS the declared entry playbooks through the route's
+# GENERATED seed launcher (controller.bootstrap.seed_launcher: <bundle>/<bundle.launcher_file>, a bundle member with
+# the seed's custody), which execs the bundle seed's `run` (it binds the managed generation; resolve_harness.yml
+# refuses any other) with exactly the declared seed_launch environment. This gate builds no environment and never
+# names the seed; it reads the entry playbooks' declared outputs. Required inputs, no default, no derived fallback:
+#   LME_CONTROLLER_LAUNCHER the bundle's generated launcher, by its ABSOLUTE path (seed_launcher.caller_argv)
+#   LME_CONTROLLER_ROOT     the seed's owned toolchain root
 #   LME_TRANSFER_INVENTORY  inventory (the target alias + root/owner host vars)
 #   LME_TRANSFER_STATE_DIR  owned 0700 controller state dir; outputs gate.<label>.{contract.json,ssh-argv,machine-id,transfer.json}
-#   LME_SSH_AUTH_MODE       the ONE ssh auth mode of this run (route ssh_auth.modes; `seed run --ssh-auth`); the
-#                           inventory's lme_ssh_auth_mode must equal it (a conflict refuses before any effect).
+#   LME_SSH_AUTH_MODE       the ONE ssh auth mode of this run (route ssh_auth.modes; the launcher's run mode
+#                           parameter); the inventory's lme_ssh_auth_mode must equal it (a conflict refuses before any effect).
+# Launcher call (positional, caller_argv): <launcher> run <root> <ssh auth mode> <ansible-playbook words...>; every
+# word is one quoted argument ("$@" preserved), so spaces and empty words keep their boundaries.
 gate_seed_run() {
   local pb="$1" v; shift
-  for v in LME_CONTROLLER_SEED LME_CONTROLLER_ROOT LME_TRANSFER_INVENTORY LME_TRANSFER_STATE_DIR LME_SSH_AUTH_MODE; do
+  for v in LME_CONTROLLER_LAUNCHER LME_CONTROLLER_ROOT LME_TRANSFER_INVENTORY LME_TRANSFER_STATE_DIR LME_SSH_AUTH_MODE; do
     if [ -z "${!v:-}" ]; then
       say "FATAL: $v is required (no default)"
       emit_gate_result transfer-input true true false FAIL none "TRANSFER_INPUT_MISSING: $v"
       return 2
     fi
   done
-  "$LME_CONTROLLER_SEED" run --root "$LME_CONTROLLER_ROOT" --ssh-auth "$LME_SSH_AUTH_MODE" -- -i "$LME_TRANSFER_INVENTORY" "$_SELF_DIR/transfer/$pb" \
+  case "$LME_CONTROLLER_LAUNCHER" in
+    /*) : ;;
+    *)
+      say "FATAL: LME_CONTROLLER_LAUNCHER must be an absolute path (no command lookup)"
+      emit_gate_result transfer-input true true false FAIL none "TRANSFER_INPUT_NOT_ABSOLUTE: LME_CONTROLLER_LAUNCHER"
+      return 2
+      ;;
+  esac
+  "$LME_CONTROLLER_LAUNCHER" run "$LME_CONTROLLER_ROOT" "$LME_SSH_AUTH_MODE" -i "$LME_TRANSFER_INVENTORY" "$_SELF_DIR/transfer/$pb" \
     -e "lme_transfer_target=$HOST" -e "lme_transfer_ssh_key=$SSH_KEY" -e "lme_transfer_state_dir=$LME_TRANSFER_STATE_DIR" \
     -e "lme_transfer_label=$LABEL" -e "lme_transfer_remote_dir=$REMOTE_DIR" "$@" 2>&1 | tee -a "$LOG"
   return "${PIPESTATUS[0]}"

@@ -413,6 +413,164 @@ cases:
         replace: '\1.clear'
     expect: {rc: fail, out: ['TRANSFER-CHECK-METHOD-ATTR', 'templates/macros/transfer.j2: .clear']}
 
+  # GATE SEED LAUNCH (codex tick217 R1; transfer.decl.yml gate_launch, check.yml GATE-LAUNCH): deploy_gate.sh starts
+  # the seed only through the route's bundle launcher and constructs no environment. Each negative inserts ONE
+  # violation at the top of gate_seed_run (independent of the launcher call below it) and must be refused by FULL
+  # VALUE: the direct call (C26), an env -i literal (C28), a nameref alias of the seed variable (C29), and a direct
+  # call whose variable name is split by a backslash-newline continuation (C30; bash rejoins it, so must the check).
+  - id: C26-gate-direct-seed-call-refused
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/deploy_gate.sh
+        regexp: '^(gate_seed_run\(\) \{\n)'
+        replace: '\1  "$LME_CONTROLLER_SEED" run --root "$LME_CONTROLLER_ROOT" --ssh-auth "$LME_SSH_AUTH_MODE" -- "$@"\n'
+    expect: {rc: fail, out: ['TRANSFER-GATE-LAUNCH', 'expansion $LME_CONTROLLER_SEED']}
+
+  - id: C28-gate-env-vector-refused
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/deploy_gate.sh
+        regexp: '^(gate_seed_run\(\) \{\n)'
+        replace: '\1  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C.UTF-8 true\n'
+    expect: {rc: fail, out: ['TRANSFER-GATE-LAUNCH', 'env word /usr/bin/env']}
+
+  - id: C29-gate-seed-nameref-alias-refused
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/deploy_gate.sh
+        regexp: '^(gate_seed_run\(\) \{\n)'
+        replace: '\1  declare -n _s=LME_CONTROLLER_SEED; "$_s" run -- "$@"\n'
+    expect: {rc: fail, out: ['TRANSFER-GATE-LAUNCH', 'statement naming LME_CONTROLLER_SEED: declare -n _s=LME_CONTROLLER_SEED;']}
+
+  - id: C30-gate-split-seed-call-refused
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/deploy_gate.sh
+        regexp: '^(gate_seed_run\(\) \{\n)'
+        replace: '\1  "$LME_CONTROLLER_\\\nSEED" run -- "$@"\n'
+    expect: {rc: fail, out: ['TRANSFER-GATE-LAUNCH', 'expansion $LME_CONTROLLER_SEED']}
+
+  # The launcher input itself (route R1 relay): every expansion of LME_CONTROLLER_LAUNCHER outside the absolute-path
+  # test must be the ONE declared positional call (gate_launch.launch_call_regex, exactly launch_call_count). A second
+  # launcher call in another shape is refused by statement (C32); the old seed separator `--` in the call breaks the
+  # caller_argv shape: 0 declared calls and a refused statement (C33).
+  - id: C32-gate-extra-launcher-statement-refused
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/deploy_gate.sh
+        regexp: '^(gate_seed_run\(\) \{\n)'
+        replace: '\1  "$LME_CONTROLLER_LAUNCHER" run "$LME_CONTROLLER_ROOT" explicit_key "$@"\n'
+    expect: {rc: fail, out: ['TRANSFER-GATE-LAUNCH', 'launcher statement: "$LME_CONTROLLER_LAUNCHER" run "$LME_CONTROLLER_ROOT" explicit_key "$@"']}
+
+  - id: C33-gate-launcher-call-shape-refused
+    kind: check
+    neighbour: C00-check-neighbour
+    mutate:
+      - file: testing/e2e/deploy_gate.sh
+        regexp: '"\$LME_CONTROLLER_LAUNCHER" run "\$LME_CONTROLLER_ROOT" "\$LME_SSH_AUTH_MODE" -i '
+        replace: '"$LME_CONTROLLER_LAUNCHER" run "$LME_CONTROLLER_ROOT" "$LME_SSH_AUTH_MODE" -- -i '
+    expect: {rc: fail, out: ['TRANSFER-GATE-LAUNCH', 'launcher calls 0 != 1', 'launcher statement: "$LME_CONTROLLER_LAUNCHER" run "$LME_CONTROLLER_ROOT" "$LME_SSH_AUTH_MODE" -- -i ']}
+
+  # The launcher is invoked by an ABSOLUTE path only (caller_argv; a bare or relative value would be resolved by the
+  # gate's ambient PATH / cwd, and bash would then hand the launcher an absolute $0, so its own check cannot see it).
+  # The value here is relative and EXISTS (<case>/bundle/<launcher_file>, the gate case's cwd is <case>), so the
+  # refusal is the gate's input rule, not a missing file: nothing is executed.
+  - id: C31-gate-relative-launcher-refused
+    kind: gate
+    neighbour: G02-contract-loaded-exact-seed-argv
+    gate: {host: tgt, label: g, remote_dir: /srv/lme, launcher: bundle/lme-seed-launch.sh, calls: [resolve_target_contract],
+           contract_identity: 0123456789abcdef0123456789abcdef, endpoint_identity: 0123456789abcdef0123456789abcdef}
+    expect: {rc: 0, out: ['CALL resolve_target_contract rc=1'], absent: ['@cd@/seed.calls'],
+             file_has: [{path: '@cd@/gate.results.jsonl', text: 'TRANSFER_INPUT_NOT_ABSOLUTE: LME_CONTROLLER_LAUNCHER'}]}
+
+  # C27 -- ARGV/ENVIRONMENT-CONSTRUCTION PROOF ONLY (recording stand-in seed; the real seed apply on the final bundle
+  # proves compatibility separately). The gate launches through route's launcher -- rendered by run_one_case.yml from
+  # controller.bootstrap.seed_launcher.template_rel with the RESOLVED policy into <case>/bundle/<bundle.launcher_file>,
+  # the stand-in at <case>/bundle/<bundle.seed_file> beside it; not an admitted bundle -- under a hostile ambient
+  # environment: shadow env/getent/id/realpath/sh lead PATH, LC_ALL/LANG are POSIX, HOME / XDG_RUNTIME_DIR /
+  # DBUS_SESSION_BUS_ADDRESS / USER are foreign and SSH_AUTH_SOCK is set. The stand-in records its exact initial
+  # environment (launch order) and its %q argv. Expected: exactly PATH LC_ALL HOME (seed_launch.env.order; base_env
+  # values; HOME from passwd, never the caller's) -- plus SSH_AUTH_SOCK with the caller's value ONLY in the
+  # carried-agent mode (C27b), never otherwise (C27a); no shadow tool runs; argument boundaries (a word with a space,
+  # an empty word, a trailing '=') reach the seed unchanged, and the seed receives the seed_launch argv
+  # (run --root <root> --ssh-auth <mode> -- <args>) built by the launcher from the gate's positional call.
+  - id: C27a-gate-launch-hostile-ambient-no-agent
+    kind: gate
+    neighbour: G02-contract-loaded-exact-seed-argv
+    gate:
+      host: tgt
+      label: g
+      remote_dir: /srv/lme
+      auth_mode: explicit_key
+      record_env: true
+      hostile:
+        shadow_tools: [env, getent, id, realpath, sh]
+        env: {LC_ALL: POSIX, LANG: POSIX, HOME: /nonexistent/foreign-home, XDG_RUNTIME_DIR: /nonexistent/foreign-xdg,
+              DBUS_SESSION_BUS_ADDRESS: 'unix:path=/nonexistent/foreign-bus', USER: not-the-invoker,
+              SSH_AUTH_SOCK: /nonexistent/hostile-agent.sock}
+      calls: ["gate_seed_run resolve_target.yml -e 'lme_x=a b' '' -e 'lme_y='"]
+      contract_identity: 0123456789abcdef0123456789abcdef
+      endpoint_identity: 0123456789abcdef0123456789abcdef
+    expect:
+      rc: 0
+      absent: ['@cd@/shadow.calls']
+      file_has:
+        - {path: '@cd@/seed.env', text: 'ENVNAMES PATH LC_ALL HOME END'}
+        - {path: '@cd@/seed.env', text: 'PATH=/usr/bin:/bin'}
+        - {path: '@cd@/seed.env', text: 'LC_ALL=C.UTF-8'}
+        - {path: '@cd@/seed.calls', text: 'run --root @cd@/ctlroot --ssh-auth explicit_key -- -i @cd@/inventory.json @repo@/testing/e2e/transfer/resolve_target.yml'}
+        - {path: '@cd@/seed.calls', text: '-e lme_transfer_remote_dir=/srv/lme -e lme_x=a\ b '''' -e lme_y= '}
+      file_lacks:
+        - {path: '@cd@/seed.env', text: 'SSH_AUTH_SOCK'}
+        - {path: '@cd@/seed.env', text: '/nonexistent/foreign-home'}
+        - {path: '@cd@/seed.env', text: 'XDG_RUNTIME_DIR'}
+        - {path: '@cd@/seed.env', text: 'DBUS_SESSION_BUS_ADDRESS'}
+        - {path: '@cd@/seed.env', text: 'USER='}
+        - {path: '@cd@/seed.env', text: 'LANG='}
+        - {path: '@cd@/seed.env', text: 'POSIX'}
+        - {path: '@cd@/seed.env', text: 'shadow'}
+
+  - id: C27b-gate-launch-hostile-ambient-carried-agent
+    kind: gate
+    neighbour: C27a-gate-launch-hostile-ambient-no-agent
+    gate:
+      host: tgt
+      label: g
+      remote_dir: /srv/lme
+      auth_mode: agent
+      record_env: true
+      hostile:
+        shadow_tools: [env, getent, id, realpath, sh]
+        env: {LC_ALL: POSIX, LANG: POSIX, HOME: /nonexistent/foreign-home, XDG_RUNTIME_DIR: /nonexistent/foreign-xdg,
+              DBUS_SESSION_BUS_ADDRESS: 'unix:path=/nonexistent/foreign-bus', USER: not-the-invoker,
+              SSH_AUTH_SOCK: /nonexistent/carried-agent.sock}
+      calls: ["gate_seed_run resolve_target.yml -e 'lme_x=a b' '' -e 'lme_y='"]
+      contract_identity: 0123456789abcdef0123456789abcdef
+      endpoint_identity: 0123456789abcdef0123456789abcdef
+    expect:
+      rc: 0
+      absent: ['@cd@/shadow.calls']
+      file_has:
+        - {path: '@cd@/seed.env', text: 'ENVNAMES PATH LC_ALL HOME SSH_AUTH_SOCK END'}
+        - {path: '@cd@/seed.env', text: 'SSH_AUTH_SOCK=/nonexistent/carried-agent.sock'}
+        - {path: '@cd@/seed.env', text: 'PATH=/usr/bin:/bin'}
+        - {path: '@cd@/seed.env', text: 'LC_ALL=C.UTF-8'}
+        - {path: '@cd@/seed.calls', text: 'run --root @cd@/ctlroot --ssh-auth agent -- -i @cd@/inventory.json @repo@/testing/e2e/transfer/resolve_target.yml'}
+        - {path: '@cd@/seed.calls', text: '-e lme_transfer_remote_dir=/srv/lme -e lme_x=a\ b '''' -e lme_y= '}
+      file_lacks:
+        - {path: '@cd@/seed.env', text: '/nonexistent/foreign-home'}
+        - {path: '@cd@/seed.env', text: 'XDG_RUNTIME_DIR'}
+        - {path: '@cd@/seed.env', text: 'DBUS_SESSION_BUS_ADDRESS'}
+        - {path: '@cd@/seed.env', text: 'USER='}
+        - {path: '@cd@/seed.env', text: 'LANG='}
+        - {path: '@cd@/seed.env', text: 'POSIX'}
+        - {path: '@cd@/seed.env', text: 'shadow'}
+
   # ... and so is a root play that binds the module temp the contact owns (a play var would be a second authority).
   - id: C18-root-play-binds-remote-tmp
     kind: check
@@ -1160,10 +1318,10 @@ cases:
   # ---------------- deploy_gate wrapper (fake seed + fake ssh) ----------------
   - id: G01-missing-executor-input
     kind: gate
-    gate: {host: tgt, label: g, remote_dir: /srv/lme, unset: [LME_CONTROLLER_SEED], calls: [resolve_target_contract],
+    gate: {host: tgt, label: g, remote_dir: /srv/lme, unset: [LME_CONTROLLER_LAUNCHER], calls: [resolve_target_contract],
            contract_identity: 0123456789abcdef0123456789abcdef, endpoint_identity: 0123456789abcdef0123456789abcdef}
     expect: {rc: 0, out: ['CALL resolve_target_contract rc=1'], absent: ['@cd@/seed.calls'],
-             file_has: [{path: '@cd@/gate.results.jsonl', text: 'TRANSFER_INPUT_MISSING: LME_CONTROLLER_SEED'}]}
+             file_has: [{path: '@cd@/gate.results.jsonl', text: 'TRANSFER_INPUT_MISSING: LME_CONTROLLER_LAUNCHER'}]}
 
   - id: G09-missing-auth-mode-input
     kind: gate
@@ -1245,7 +1403,8 @@ cases:
     run: >-
       MAIN: package.yml bundle -> seed apply to a throwaway root under an owned $HOME subdirectory (controller) and
       target_bootstrap.yml for the target owner; inventory with ansible_user=root and lme_toolchain_root/owner;
-      deploy_gate.sh --stage rsync with LME_CONTROLLER_SEED/ROOT, LME_TRANSFER_INVENTORY, LME_TRANSFER_STATE_DIR and
+      deploy_gate.sh --stage rsync with LME_CONTROLLER_LAUNCHER (absolute <bundle>/<bundle.launcher_file>),
+      LME_CONTROLLER_ROOT, LME_TRANSFER_INVENTORY, LME_TRANSFER_STATE_DIR and
       LME_SSH_AUTH_MODE (= the inventory's lme_ssh_auth_mode) set
     expect: >-
       resolve_target + transfer rc 0; gate.<label>.transfer.json present; the target's owned.sha256 verifies;
