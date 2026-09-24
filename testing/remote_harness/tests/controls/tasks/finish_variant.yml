@@ -109,7 +109,10 @@
 
 # Route 3 (variant_checkout: clone): the clone's own root {vroot} is purged through bundle A (the seed's own purge; purge
 # is exempt from the checkout binding) BEFORE {vclone} leaves with the variant scratch, so a mid-control failure still
-# gets the seed's purge; a purge that fails or leaves the root is a cleanup finding (the scratch removal then takes it).
+# gets the seed's purge. G-VARIANT-PURGE-READBACK (codex-rev8-route-B-G-source-audits-20260924-163642): the root is
+# RE-STATTED after the purge; a zero exit alone never authorizes deleting recovery evidence. A root still present (any
+# exit), a failed purge, or a root that could not be purged (no bundle A) FAILS the variant, is recorded, and RETAINS the
+# clone and the whole variant scratch (nothing below is removed) for recovery.
 - name: Is there a variant clone root to purge?
   ansible.builtin.stat:
     path: "{{ _rhc_t.vroot | default('') }}"
@@ -131,12 +134,33 @@
   failed_when: false
   when: ((_rhc_vr.stat | default({})).exists | default(false)) and rhc_deps.bundle_a.met
 
-- name: A variant clone root the seed's purge did not remove is a cleanup finding
-  ansible.builtin.set_fact:
-    rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': variant clone root purge rc ' ~ (_rhc_vpurge.rc | default('not run')) ~ ' (' ~ _rhc_t.vroot ~ '); removed with the scratch'] }}"
-  when: ((_rhc_vr.stat | default({})).exists | default(false)) and (_rhc_vpurge.rc | default(1)) != 0
+- name: Read the variant clone root back after the purge (never trust the exit status alone)
+  ansible.builtin.stat:
+    path: "{{ _rhc_t.vroot }}"
+    follow: false
+    get_checksum: false
+  register: _rhc_vr_after
+  when: ((_rhc_vr.stat | default({})).exists | default(false))
 
-- name: Drop the variant's bulky scratch (declared names only; evidence files stay)
+- name: Decide whether the variant scratch must be RETAINED (root still present, purge failed or not run)
+  vars:
+    _was: "{{ (_rhc_vr.stat | default({})).exists | default(false) }}"
+    _left: "{{ (_rhc_vr_after.stat | default({})).exists | default(false) }}"
+    _rc: "{{ _rhc_vpurge.rc | default('not run') }}"
+  ansible.builtin.set_fact:
+    _rhc_retain: "{{ (_was | bool) and ((_left | bool) or (_rc | string) != '0') }}"
+    _rhc_retain_why: >-
+      {{ rhc_c.id ~ '/' ~ rhc_v.id ~ ': variant clone root ' ~ _rhc_t.vroot ~ ' purge rc ' ~ (_rc | string)
+         ~ ', present after purge: ' ~ (_left | string) ~ '; clone and variant scratch RETAINED for recovery (' ~ _rhc_t.ctl ~ ')' }}
+
+- name: A variant clone root the purge did not remove FAILS the variant and is recorded (scratch retained)
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + ['G-VARIANT-PURGE-READBACK ' ~ _rhc_retain_why] }}"
+    rhc_cleanup_findings: "{{ rhc_cleanup_findings + [_rhc_retain_why] }}"
+  when: _rhc_retain | bool
+
+- name: Drop the variant's bulky scratch (declared names only; evidence files stay; never when retained)
+  when: not (_rhc_retain | default(false) | bool)
   ansible.builtin.find:
     paths: "{{ _rhc_t.ctl }}"
     patterns: "{{ rhc_decl.state.variant_scratch }}"
@@ -148,7 +172,7 @@
 - name: Owner write on the scratch
   ansible.builtin.command:
     argv: ["{{ rhc_decl.runner_tools.chmod }}", -R, u+w, --, "{{ item.path }}"]
-  loop: "{{ _rhc_scratch.files | rejectattr('islnk') | selectattr('isdir') | list }}"
+  loop: "{{ [] if (_rhc_retain | default(false) | bool) else (_rhc_scratch.files | rejectattr('islnk') | selectattr('isdir') | list) }}"
   loop_control:
     label: "{{ item.path }}"
   changed_when: true
@@ -158,6 +182,6 @@
   ansible.builtin.file:
     path: "{{ item.path }}"
     state: absent
-  loop: "{{ _rhc_scratch.files }}"
+  loop: "{{ [] if (_rhc_retain | default(false) | bool) else _rhc_scratch.files }}"
   loop_control:
     label: "{{ item.path }}"
