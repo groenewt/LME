@@ -1,0 +1,67 @@
+---
+# testing/remote_harness/tests/run_probe_env.yml -- the run-local PLAYBOOK ENVIRONMENT probe (lifecycle case E84
+# other-modes-set; codex 220222). It records WHICH variable names the seed's run-local exec hands the playbook (the
+# launcher's env -i + seed_launch.env.order, then the seed's managed_env / run_env) and refuses if SSH_AUTH_SOCK is among
+# them: env.carried applies to mode env.carried.when.mode (run) only, never to run-local. NAMES ONLY: no variable VALUE
+# is written, logged or shown (the fact gathering is no_log; the evidence and every message carry names and booleans).
+# apply / verify / purge exec no playbook: their evidence is the static rendered launcher (socket_env appears only in the
+# env.carried.when.mode branch of controller_seed.j2 seed_launcher), not this runner.
+# Launched ONLY by the declared seed, started by the bundle's generated launcher:
+#   <bundle>/lme-seed-launch.sh run-local <checkout>/.work/toolchain probe_env
+#   (controller.bootstrap.seed_launcher.caller_argv; an ambient shell launch of the seed refuses RH-SEED-USAGE)
+# which supplies pe_work_root and, LAST, lme_resolved_run (work_roots.run_local.resolved_run); there is no default work
+# root and the raw profile is never read for one (RH-RUNNER-RESOLVED-WORKROOT). Evidence: <pe_work_root>/env.json (0600).
+# Acceptance: the play fails if SSH_AUTH_SOCK is present in the playbook environment.
+- name: Run-local playbook environment probe (names only; route-owned)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: ../tasks/refuse_pinned_outputs.yml
+
+    - name: Resolve the harness policy through the engine
+      ansible.builtin.include_tasks: ../tasks/resolve_policy.yml
+
+    - name: Admit the resolved run (launched by the declared seed run-local; no default work root)
+      vars:
+        _rs: "{{ rh.controller.bootstrap.work_roots.run_local.resolved_run }}"
+      ansible.builtin.assert:
+        that:
+          - lme_resolved_run is defined and lme_resolved_run is mapping
+          - (lme_resolved_run.keys() | map('string') | sort | list) == (_rs.fields | sort | list)
+          - lme_resolved_run.runner == 'probe_env'
+          - pe_work_root is defined and pe_work_root is string and pe_work_root == lme_resolved_run.work_root
+          - pe_work_root is match(rh.controller.bootstrap.path_admission.regex)
+          - "'TMPDIR' in lme_resolved_run.env"
+          - ansible_playbook_python == lme_resolved_run.python
+        fail_msg: >-
+          REFUSED RH-SEED-USAGE: run_probe_env.yml runs only under the declared seed run-local
+          (--runner probe_env), which passes pe_work_root and {{ _rs.var }} (fields {{ _rs.fields }}).
+        quiet: true
+
+    # the module runs under the environment the seed exec'd this playbook with (connection local); no_log keeps every
+    # variable VALUE out of the output and the callback
+    - name: Gather the playbook environment (env subset only)
+      ansible.builtin.setup:
+        gather_subset: ['!all', '!min', 'env']
+      no_log: true
+
+    - name: Write the evidence under the admitted runner work root (names only)
+      ansible.builtin.copy:
+        dest: "{{ pe_work_root }}/env.json"
+        mode: '0600'
+        content: >-
+          {{ {'schema': 'probe-env/1', 'runner': lme_resolved_run.runner, 'work_root': pe_work_root,
+              'profile_sha256': rh_profile_sha256,
+              'env_names': ansible_facts.env.keys() | map('string') | sort | list,
+              'ssh_auth_sock_present': 'SSH_AUTH_SOCK' in ansible_facts.env} | to_nice_json }}
+
+    - name: Accept only when SSH_AUTH_SOCK is absent from the playbook environment
+      ansible.builtin.assert:
+        that:
+          - "'SSH_AUTH_SOCK' not in ansible_facts.env"
+        fail_msg: "probe_env FAILED: SSH_AUTH_SOCK is present in the run-local playbook environment (names: {{ ansible_facts.env.keys() | map('string') | sort | list }})"
+        success_msg: "probe_env: SSH_AUTH_SOCK absent ({{ ansible_facts.env | length }} names recorded in {{ pe_work_root }}/env.json)"
+        quiet: true
