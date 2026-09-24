@@ -58,7 +58,7 @@
 {%- set ni = vocab.not_implemented | default({}) -%}
 {%- set ns = namespace(u = []) -%}
 {%- for p in preds -%}
-{%- set k = p | list | reject('in', ['exists', 'equal', 'contains', 'lacks', 'regex', 'json_equal', 'json_all', 'kind', 'size']) | first -%}
+{%- set k = p | list | reject('in', ['exists', 'equal', 'contains', 'lacks', 'regex', 'json_equal', 'json_all', 'kind', 'size', 'mode']) | first -%}
 {%- if k not in vocab.predicates or k in (ni.predicates | default([])) -%}{%- set ns.u = ns.u + ['predicate ' ~ k] -%}{%- endif -%}
 {%- endfor -%}
 {{ ns.u | to_json }}
@@ -186,22 +186,38 @@
 {#- G-EXPORT-CONSUMER-COVERAGE (codex 220515 / 220352; the same macros as m1-1g): every path of a control/variant that
     launches the seed through the bundle's generated launcher (plan_act -> seed_launch) and therefore consumes
     ctx.launch_params. Derived from the SAME shapes the runner executes, never from a list of control ids:
-      steps       c.steps + variant.steps, and every repeat.steps nested at any depth (flatten), each step whose act is
-                  kind seed (any op / invoke) OR a playbook-shaped act with via seed_run (plan_act: `seed run`)
+      steps       c.steps (compile executes c.steps only, and none when a sweep generates them), and every repeat.steps
+                  nested at any depth, each step whose act is kind seed (any op / invoke) OR a playbook-shaped act with via
+                  seed_run (plan_act: `seed run`) -- AFTER the SAME effective variant filtering execution applies
+                  (G-EXPORT-VARIANT-SELECTION, codex 223100: step_selected below is the ONE predicate compile uses; a
+                  repeat's only_variants / skip_variants override its sub-steps' as flatten combines them), so a variant
+                  whose selected steps launch nothing is not queued because a sibling-only step does
       generated   sweep phases / declared_points (sweep_phases / sweep_points generate seed apply / verify / purge steps);
                   sweep pins: each per_point_expect.entrypoints entry with via seed_run (sweep_pins)
       cleanup     finish_variant.yml: root fresh -> the cleanup purge of {root}; root shared -> the cleanup re-verify of
                   {shared}; variant cleanup_purge -> that purge (a declared deviation of the same launch). The {vroot} purge
                   (cleanup-purge-vroot) runs only for a clone root a step installed -- that step is itself a consumer
     Returns the consuming paths (strings, stable order); [] = the control consumes no launcher. -#}
-{%- macro _step_launches(steps, prefix) -%}
+{#- G-EXPORT-VARIANT-SELECTION (codex 223100): the ONE effective step-selection predicate, used by compile (execution) and
+    by launcher_consumers (planning). s: a (flattened) step; vid: the variant id. Returns JSON true / false. -#}
+{%- macro step_selected(s, vid) -%}
+{{ ((s.only_variants is not defined or vid in s.only_variants) and (vid not in (s.skip_variants | default([])))) | to_json }}
+{%- endmacro -%}
+
+{%- macro _step_launches(steps, prefix, vid, inherit) -%}
 {%- set ns = namespace(r = []) -%}
-{%- for s in steps | default([]) -%}
-{%- if s is mapping -%}
-{%- if s.repeat is defined -%}{%- set ns.r = ns.r + (_step_launches(s.repeat.steps | default([]), prefix ~ s.id ~ ' > ') | from_json) -%}{%- endif -%}
+{%- for s0 in steps | default([]) -%}
+{%- if s0 is mapping -%}
+{#- flatten: a repeat's own only_variants / skip_variants are combined OVER each sub-step's -#}
+{%- set s = s0 | combine(inherit) -%}
+{%- if s.repeat is defined -%}
+{%- set ns.r = ns.r + (_step_launches(s.repeat.steps | default([]), prefix ~ s.id ~ ' > ', vid,
+      s | dict2items | selectattr('key', 'in', ['only_variants', 'skip_variants']) | items2dict) | from_json) -%}
+{%- elif step_selected(s, vid) | from_json -%}
 {%- set a = s.act | default({}) -%}
 {%- if a is mapping and (a.kind | default('')) == 'seed' -%}{%- set ns.r = ns.r + ['step ' ~ prefix ~ s.id ~ ' (seed ' ~ (a.op | default('?')) ~ ')'] -%}
 {%- elif a is mapping and (a.via | default('')) == 'seed_run' -%}{%- set ns.r = ns.r + ['step ' ~ prefix ~ s.id ~ ' (' ~ (a.playbook | default(a.kind | default('?'))) ~ ' via seed_run)'] -%}
+{%- endif -%}
 {%- endif -%}
 {%- endif -%}
 {%- endfor -%}
@@ -210,8 +226,9 @@
 
 {%- macro launcher_consumers(c, variant) -%}
 {%- set v = variant if variant is mapping else {} -%}
-{%- set ns = namespace(r = _step_launches((c.steps | default([])) + (v.steps | default([])), '') | from_json) -%}
 {%- set sw = (c.sweep | default({})).kind | default('') -%}
+{%- set ns = namespace(r = [] if sw in ['phases', 'declared_points', 'pins']
+                            else (_step_launches(c.steps | default([]), '', v.id | default('base'), {}) | from_json)) -%}
 {%- if sw in ['phases', 'declared_points'] -%}{%- set ns.r = ns.r + ['sweep ' ~ sw ~ ' (generated seed apply / verify / purge steps)'] -%}{%- endif -%}
 {%- if sw == 'pins' -%}
 {%- for e in (c.per_point_expect | default({})).entrypoints | default([]) if (e.via | default('')) == 'seed_run' -%}
@@ -265,6 +282,122 @@
 {{ {'met': ns.bad | length == 0, 'why': ('shape-invalid: ' ~ (ns.bad | join('; '))) if ns.bad else 'shape as declared'} | to_json }}
 {%- endmacro -%}
 
+{#- ------------------------------------------------ Route 3 clone fixtures (codex 220953 / 223100) ---------- -#}
+{#- the controller.bootstrap-relative patch of a route catalog profile_cases entry (tests/bundle_fixtures.yml): either
+    patch_bootstrap (a mapping, recursively combined under controller.bootstrap) or patch {path, value} with a dotted
+    path that starts controller.bootstrap. (one field). Returns {patch, why}; why != '' is a declaration error. -#}
+{%- macro profile_case_patch(pc) -%}
+{%- set pre = 'controller.bootstrap.' -%}
+{%- if pc is not mapping -%}{{ {'patch': {}, 'why': 'profile case is not a mapping'} | to_json }}
+{%- elif pc.patch_bootstrap is defined and pc.patch is defined -%}{{ {'patch': {}, 'why': 'profile case ' ~ (pc.id | default('?')) ~ ' declares both patch_bootstrap and patch'} | to_json }}
+{%- elif pc.patch_bootstrap is defined -%}
+{%- if pc.patch_bootstrap is mapping and pc.patch_bootstrap | length > 0 -%}{{ {'patch': pc.patch_bootstrap, 'why': ''} | to_json }}
+{%- else -%}{{ {'patch': {}, 'why': 'profile case ' ~ (pc.id | default('?')) ~ ' patch_bootstrap is not a non-empty mapping'} | to_json }}{%- endif -%}
+{%- elif pc.patch is defined and pc.patch is mapping and (pc.patch.keys() | list | sort) == ['path', 'value'] and pc.patch.path is string
+      and pc.patch.path.startswith(pre) and (pc.patch.path[pre | length:].split('.') | reject('match', '^[A-Za-z0-9_]+$') | list | length == 0) -%}
+{%- set ns = namespace(d = pc.patch.value) -%}
+{%- for k in pc.patch.path[pre | length:].split('.') | reverse -%}{%- set ns.d = {k: ns.d} -%}{%- endfor -%}
+{{ {'patch': ns.d, 'why': ''} | to_json }}
+{%- else -%}{{ {'patch': {}, 'why': 'profile case ' ~ (pc.id | default('?')) ~ ' has neither patch_bootstrap nor patch {path: ' ~ pre ~ '<dotted>, value}'} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- the porcelain v1 (--untracked-files=all) lines a fixture-checkout-result/1 mutation list produces against its head,
+    sorted: modify ' M <path>', add '?? <path>', delete ' D <path>', rename ' D <from>' + '?? <path>' (a copy then a
+    removal, nothing staged: never an 'R' line). Returns {lines, failures}. -#}
+{%- macro fixture_status_lines(mutations) -%}
+{%- set ns = namespace(l = [], f = []) -%}
+{%- if mutations is string or mutations is mapping or mutations is not iterable -%}{%- set ns.f = ['mutations is not a list'] -%}
+{%- else -%}
+{%- for m in mutations -%}
+{%- set p = (m.path | default('')) if m is mapping else '' -%}
+{%- set op = (m.op | default('')) if m is mapping else '' -%}
+{%- set fr = (m.from | default('')) if m is mapping else '' -%}
+{%- if p is not string or p | length == 0 -%}{%- set ns.f = ns.f + ['mutation ' ~ loop.index0 ~ ' has no path'] -%}
+{%- elif op == 'modify' -%}{%- set ns.l = ns.l + [' M ' ~ p] -%}
+{%- elif op == 'add' -%}{%- set ns.l = ns.l + ['?? ' ~ p] -%}
+{%- elif op == 'delete' -%}{%- set ns.l = ns.l + [' D ' ~ p] -%}
+{%- elif op == 'rename' and fr is string and fr | length > 0 -%}{%- set ns.l = ns.l + [' D ' ~ fr, '?? ' ~ p] -%}
+{%- else -%}{%- set ns.f = ns.f + ['mutation ' ~ loop.index0 ~ ' op ' ~ (op or 'absent') ~ ' outside modify | add | delete | rename (with from)'] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{ {'lines': ns.l | sort, 'failures': ns.f} | to_json }}
+{%- endmacro -%}
+
+{#- REPAIR 5 (codex 223100): the clone admission's status is the DECLARED mutation set -- G's own profile line plus every
+    applied fixture's expected_status -- compared with the actual porcelain as a SORTED EXACT set. fx = the G-owned copies
+    of the producer results (fixture-checkout-result/1) applied to this clone; head = the clone's Route 3 head. A fixture
+    result is admitted only when it names that head, its expected_status agrees with its own mutations
+    (fixture_status_lines) and it does not touch the profile. Any 'R' entry, any duplicate and any difference fails.
+    Returns {ok, want, got, failures}. -#}
+{%- macro clone_status(actual, profile_rel, fx, head) -%}
+{%- set ns = namespace(w = [' M ' ~ profile_rel], f = []) -%}
+{%- for r in fx -%}
+{%- set ms = r.mutations if (r.mutations is defined and r.mutations is not string and r.mutations is not mapping and r.mutations is iterable) else [] -%}
+{%- set d = fixture_status_lines(r.mutations | default(none)) | from_json -%}
+{%- set es = r.expected_status | default(none) -%}
+{%- if (r.schema | default('')) != 'fixture-checkout-result/1' -%}{%- set ns.f = ns.f + ['fixture ' ~ loop.index0 ~ ': schema ' ~ (r.schema | default('absent'))] -%}{%- endif -%}
+{%- if (r.head | default('') | string) != (head | string) -%}{%- set ns.f = ns.f + ['fixture ' ~ (r.case | default(loop.index0)) ~ ': head ' ~ (r.head | default('absent')) ~ ' != clone head ' ~ head] -%}{%- endif -%}
+{%- set ns.f = ns.f + (d.failures | map('regex_replace', '^', 'fixture ' ~ (r.case | default(loop.index0)) ~ ': ') | list) -%}
+{%- if es is string or es is mapping or es is not iterable -%}{%- set ns.f = ns.f + ['fixture ' ~ (r.case | default(loop.index0)) ~ ': expected_status is not a list'] -%}
+{%- else -%}
+{%- if (es | sort) != d.lines -%}{%- set ns.f = ns.f + ['fixture ' ~ (r.case | default(loop.index0)) ~ ': expected_status ' ~ (es | sort | to_json) ~ ' != its mutations ' ~ (d.lines | to_json)] -%}{%- endif -%}
+{%- if profile_rel in (ms | select('mapping') | map(attribute='path', default='') | list)
+      or profile_rel in (ms | select('mapping') | map(attribute='from', default='') | list) -%}{%- set ns.f = ns.f + ['fixture ' ~ (r.case | default(loop.index0)) ~ ': touches the profile (the profile is G''s patch only)'] -%}{%- endif -%}
+{%- set ns.w = ns.w + es -%}
+{%- endif -%}
+{%- endfor -%}
+{%- set got = actual | sort -%}
+{%- set want = ns.w | sort -%}
+{%- if want | length != want | unique | list | length -%}{%- set ns.f = ns.f + ['declared mutation set has duplicate lines'] -%}{%- endif -%}
+{%- if got | select('match', '^(R.|.R) ') | list | length > 0 -%}{%- set ns.f = ns.f + ['rename entries in the status: ' ~ (got | select('match', '^(R.|.R) ') | list | to_json)] -%}{%- endif -%}
+{%- if got != want -%}{%- set ns.f = ns.f + ['status ' ~ (got | to_json) ~ ' != declared ' ~ (want | to_json)] -%}{%- endif -%}
+{{ {'ok': ns.f | length == 0, 'want': want, 'got': got, 'failures': ns.f} | to_json }}
+{%- endmacro -%}
+
+{#- REPAIR 5 input map (codex 223100): where each render input bundle A recorded (source.inputs, [path, sha256]) must be
+    found in the clone, and with which digest. The profile is excluded (G's patch; admitted by parsed equality). A rename
+    whose from is the input: the input lives at its new path with the recorded digest, which the producer's before /
+    after digests must both equal (mode preserved). A modify of the input: sha256_before must be the recorded digest and
+    the clone must hold sha256_after. A delete of an input, two mutations of one input, or a mutation landing on another
+    input's path fails. Every other input: byte-identical at its own path. Mutations of non-input paths are not mapped
+    (the clone status set still covers them). Returns {checks: [{input, at, want}], failures}. -#}
+{%- macro input_map(inputs, profile_rel, mutations) -%}
+{%- set ns = namespace(c = [], f = [], ms = []) -%}
+{%- set paths = inputs | map(attribute='0') | list -%}
+{%- for m0 in mutations -%}
+{%- set m = m0 if m0 is mapping else {} -%}
+{%- set ns.ms = ns.ms + [{'op': m.op | default(''), 'path': m.path | default(''), 'from': m.from | default(''),
+                          'sha256_before': m.sha256_before | default('ABSENT'), 'sha256_after': m.sha256_after | default('ABSENT'),
+                          'mode_before': m.mode_before | default('ABSENT'), 'mode_after': m.mode_after | default('ABSENT')}] -%}
+{%- endfor -%}
+{%- set mutations = ns.ms -%}
+{%- for m in mutations -%}
+{%- if m.op not in ['modify', 'add', 'delete', 'rename'] -%}{%- set ns.f = ns.f + ['mutation op ' ~ (m.op or 'absent') ~ ' outside the schema'] -%}{%- endif -%}
+{%- if m.op in ['add', 'rename'] and m.path in paths -%}{%- set ns.f = ns.f + [m.op ~ ' lands on the input path ' ~ m.path] -%}{%- endif -%}
+{%- endfor -%}
+{%- for i in inputs if i[0] != profile_rel -%}
+{%- set rn = mutations | selectattr('op', 'equalto', 'rename') | selectattr('from', 'equalto', i[0]) | list -%}
+{%- set mo = mutations | selectattr('op', 'equalto', 'modify') | selectattr('path', 'equalto', i[0]) | list -%}
+{%- set de = mutations | selectattr('op', 'equalto', 'delete') | selectattr('path', 'equalto', i[0]) | list -%}
+{%- if (rn | length) + (mo | length) + (de | length) > 1 -%}{%- set ns.f = ns.f + ['input ' ~ i[0] ~ ' has more than one mutation'] -%}
+{%- elif de -%}{%- set ns.f = ns.f + ['input ' ~ i[0] ~ ' deleted'] -%}
+{%- elif rn -%}
+{%- set m = rn | first -%}
+{%- if m.sha256_before != i[1] or m.sha256_after != i[1] -%}{%- set ns.f = ns.f + ['rename ' ~ i[0] ~ ' -> ' ~ m.path ~ ': digest ' ~ m.sha256_before ~ ' -> ' ~ m.sha256_after ~ ' != recorded ' ~ i[1]] -%}{%- endif -%}
+{%- if m.mode_before != m.mode_after -%}{%- set ns.f = ns.f + ['rename ' ~ i[0] ~ ' -> ' ~ m.path ~ ': mode ' ~ m.mode_before ~ ' -> ' ~ m.mode_after] -%}{%- endif -%}
+{%- set ns.c = ns.c + [{'input': i[0], 'at': m.path, 'want': i[1]}] -%}
+{%- elif mo -%}
+{%- set m = mo | first -%}
+{%- if m.sha256_before != i[1] -%}{%- set ns.f = ns.f + ['modify ' ~ i[0] ~ ': sha256_before ' ~ m.sha256_before ~ ' != recorded ' ~ i[1]] -%}{%- endif -%}
+{%- set ns.c = ns.c + [{'input': i[0], 'at': i[0], 'want': m.sha256_after}] -%}
+{%- else -%}{%- set ns.c = ns.c + [{'input': i[0], 'at': i[0], 'want': i[1]}] -%}
+{%- endif -%}
+{%- endfor -%}
+{{ {'checks': ns.c, 'failures': ns.f} | to_json }}
+{%- endmacro -%}
+
 {#- variant:<id> dependency (tasks/prepare.yml): met only when a route that declaration may ACTUALLY take is available
     (tasks/variant_admit.yml). The override (SEED-06 projection) never carries a profile_bytes_differ declaration; such a
     declaration is reachable ONLY by a variant_checkout: clone control (Route 3, which requires variant_clone_fixture, not
@@ -299,22 +432,47 @@
 {{ ns.v | to_json }}
 {%- endmacro -%}
 
-{#- entries: [{control, cases, case_components}] counted as covering; returns {whole, partial {case: {covered, missing}}} -#}
-{%- macro coverage_of(entries, sources) -%}
-{%- set ns = namespace(whole = [], comp = {}) -%}
+{#- entries: [{control, variant, cases, case_components}] counted as covering; returns
+    {whole, partial {case: {covered, missing[, pending_variants]}}}.
+    G-E84-PARTIAL-WHOLE-CREDIT (codex 231744): case_components {<case id>: []} is the EXPLICIT no-credit form -- the entry
+    names the row but credits no component (the row is reported PARTIAL, covered []). With `controls` (the declared controls;
+    summary.yml passes them for execute PASS evidence) a row an entry names WHOLE (no case_components entry) is credited
+    whole only when EVERY declared variant of that entry's control that names the row whole is among the entries (PASSED);
+    otherwise it is PARTIAL with pending_variants {<control>: [<variant not passed>]} -- one passing leg of a multi-leg
+    control never completes the row. Without `controls` (plan: every declared variant is an entry) a whole naming counts
+    whole as before. -#}
+{%- macro coverage_of(entries, sources, controls = none) -%}
+{%- set ns = namespace(whole = [], comp = {}, claim = {}) -%}
 {%- for e in entries -%}
 {%- for id in e.cases | default([]) -%}
 {%- if id in (e.case_components | default({})) -%}
 {%- set ns.comp = ns.comp | combine({id: ((ns.comp[id] | default([])) + e.case_components[id]) | unique | list}) -%}
+{%- elif controls is not none and e.control is defined -%}
+{%- set cur = ns.claim[id] | default({}) -%}
+{%- set ns.claim = ns.claim | combine({id: cur | combine({e.control: ((cur[e.control] | default([])) + [e.variant | default('base')]) | unique | list})}) -%}
+{%- else -%}{%- set ns.whole = ns.whole + [id] -%}{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- set pend = namespace(p = {}) -%}
+{%- for id, byc in ns.claim.items() -%}
+{%- for cid, passed in byc.items() -%}
+{%- set cs = controls | selectattr('id', 'equalto', cid) | list -%}
+{%- set need = namespace(l = ['<undeclared control>']) -%}
+{%- if cs -%}{%- set need.l = [] -%}
+{%- for v in cs[0].variants | default([{'id': 'base'}]) if id not in (v.case_components | default(cs[0].case_components | default({}))) -%}{%- set need.l = need.l + [v.id] -%}{%- endfor -%}
+{%- endif -%}
+{%- set miss = need.l | reject('in', passed) | list -%}
+{%- if miss -%}{%- set pend.p = pend.p | combine({id: (pend.p[id] | default({})) | combine({cid: miss})}) -%}
 {%- else -%}{%- set ns.whole = ns.whole + [id] -%}{%- endif -%}
 {%- endfor -%}
 {%- endfor -%}
 {%- set pv = namespace(partial = {}, whole = ns.whole) -%}
-{%- for id in ns.comp | sort if id not in ns.whole -%}
+{%- for id in ((ns.comp | list) + (pend.p | list)) | unique | sort if id not in ns.whole -%}
 {%- set rv = row_variants(sources, id) | from_json -%}
-{%- set miss = (rv or []) | reject('in', ns.comp[id]) | list -%}
-{%- if rv and not miss -%}{%- set pv.whole = pv.whole + [id] -%}
-{%- else -%}{%- set pv.partial = pv.partial | combine({id: {'covered': ns.comp[id] | sort, 'missing': miss}}) -%}{%- endif -%}
+{%- set got = ns.comp[id] | default([]) -%}
+{%- set miss = (rv or []) | reject('in', got) | list -%}
+{%- if id in ns.comp and rv and not miss -%}{%- set pv.whole = pv.whole + [id] -%}
+{%- else -%}{%- set pv.partial = pv.partial | combine({id: {'covered': got | sort, 'missing': miss} | combine({'pending_variants': pend.p[id]} if id in pend.p else {})}) -%}{%- endif -%}
 {%- endfor -%}
 {{ {'whole': pv.whole | unique | sort, 'partial': pv.partial} | to_json }}
 {%- endmacro -%}
@@ -338,6 +496,15 @@
 {%- elif not rv -%}{%- set ns.unknown = ns.unknown + [cc.at ~ ' -> case_components ' ~ id ~ ' (the row declares no variants)'] -%}
 {%- else -%}{%- for k in comps if k not in rv -%}{%- set ns.unknown = ns.unknown + [cc.at ~ ' -> case_components ' ~ id ~ '/' ~ k ~ ' (not a variant of the row)'] -%}{%- endfor -%}{%- endif -%}
 {%- endfor -%}
+{%- endfor -%}
+{#- G-E84-PARTIAL-WHOLE-CREDIT: MIXED CREDIT is a declaration error -- when some variants of a control credit a row by
+    component (explicitly, [] included) and others omit it, the omission would silently credit the whole row -#}
+{%- for id in c.cases | default([]) if (c.variants | default([])) and (row_variants(sources, id) | from_json) -%}
+{%- set mx = namespace(has = [], omit = []) -%}
+{%- for v in c.variants -%}
+{%- if id in (v.case_components | default(c.case_components | default({}))) -%}{%- set mx.has = mx.has + [v.id] -%}{%- else -%}{%- set mx.omit = mx.omit + [v.id] -%}{%- endif -%}
+{%- endfor -%}
+{%- if mx.has and mx.omit -%}{%- set ns.unknown = ns.unknown + [c.id ~ ' -> case_components ' ~ id ~ ' (mixed credit: variants ' ~ (mx.omit | join(', ')) ~ ' omit it while ' ~ (mx.has | join(', ')) ~ ' credit by component; declare [] for no credit)'] -%}{%- endif -%}
 {%- endfor -%}
 {%- endfor -%}
 {#- declared coverage (plan): what the controls name, components folded in per variant (never evidence) -#}
@@ -916,6 +1083,8 @@
 {#- path kind (fifo | regular | link | dir | other; observed by stat, follow false, nothing opened) and size (bytes) -#}
 {%- if p.path is defined and p.kind is defined and (o.kind | default('absent')) != p.kind -%}{%- set ns.r = ns.r + [p.path ~ ' is ' ~ (o.kind | default('absent')) ~ ', expected ' ~ p.kind] -%}{%- endif -%}
 {%- if p.path is defined and p.size is defined and (o.size | default(-1) | int) != p.size | int -%}{%- set ns.r = ns.r + [p.path ~ ' size ' ~ (o.size | default('?')) ~ ' != ' ~ p.size] -%}{%- endif -%}
+{#- path mode (octal permission string as stat reports it, e.g. '0600'; codex 225207: the probe_env evidence is 0600) -#}
+{%- if p.path is defined and p.mode is defined and (o.mode | default('absent') | string) != (p.mode | string) -%}{%- set ns.r = ns.r + [p.path ~ ' mode ' ~ (o.mode | default('absent')) ~ ' != ' ~ p.mode] -%}{%- endif -%}
 {%- if p.glob is defined and (o.count | default(-1)) != p.glob.count | int -%}{%- set ns.r = ns.r + [p.glob.dir ~ '/' ~ p.glob.pattern ~ ': ' ~ (o.count | default('?')) ~ ' entries, expected ' ~ p.glob.count] -%}{%- endif -%}
 {%- if p.file is defined -%}
 {%- set text = o.text | default(none) -%}
@@ -1003,7 +1172,8 @@
 {%- if c.sweep is defined and c.sweep.kind == 'pins' -%}{%- set steps = sweep_pins(c, ctx) | from_json -%}{%- endif -%}
 {%- set steps = flatten(steps, ctx.t) | from_json -%}
 {%- set ns.flat = [] -%}
-{%- for s in steps if (s.only_variants is not defined or v.id in s.only_variants) and (v.id not in (s.skip_variants | default([]))) -%}
+{#- G-EXPORT-VARIANT-SELECTION: the SAME predicate launcher_consumers uses -#}
+{%- for s in steps if step_selected(s, v.id) | from_json -%}
 {%- set ns.flat = ns.flat + [s | combine({'expect': (s.expect | default({})) | combine((v.expect | default({}))[s.id] | default({}))}) if (s.expect is defined or ((v.expect | default({}))[s.id] is defined)) else s] -%}
 {%- endfor -%}
 {%- set ns.out = ns.out + [{'variant': v.id, 'declaration': v.declaration | default(c.declaration | default('')),

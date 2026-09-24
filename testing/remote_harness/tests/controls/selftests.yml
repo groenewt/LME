@@ -10,7 +10,8 @@
 schema_version: 1
 kind: lme-remote-harness-control-selftests
 gates: [judge, judge_pair, failed_task, outcome, refusal, residual, xjson, network_lines, plan_status, coverage, diff_paths, neutrality, dig, plan_act, judge_state, unimplemented, variant_dep,
-        writer_cmd, writer_admitted, record_readback, launcher_consumers, export_availability, export_shape]
+        writer_cmd, writer_admitted, record_readback, launcher_consumers, export_availability, export_shape,
+        profile_case_patch, fixture_status_lines, clone_status, input_map]
 ctx:
   rh: {controller: {bootstrap: {lock: {busy: RH-SEED-BUSY}, bundle: {staging_retention: {lease: {busy_refusal: RH-STAGING-BUSY}}}}}}
   record_refusal: {code: RHC-ACT-RECORD, rc: 86, barrier_rc: 87}
@@ -291,9 +292,39 @@ cases:
   - {id: consumers-nested-repeat-seed, gate: launcher_consumers, fn: launcher_consumers, negative: true,
      args: [{id: R, steps: [{id: rp, repeat: {count_token: n, steps: [{id: inner, repeat: {count_token: m, steps: [{id: a, act: {kind: seed, op: apply}}]}}]}}]}, {id: base}],
      expect: {equals: ['step rp > inner > a (seed apply)']}}
+  # codex 223100 G-EXPORT-VARIANT-SELECTION: consumers are derived AFTER the effective variant filtering compile applies
+  # (controls.j2 step_selected, the one shared predicate); variant-own `steps` are not executed by compile and never count
   - {id: consumers-variant-step-via-seed-run, gate: launcher_consumers, fn: launcher_consumers, negative: true,
-     args: [{id: V}, {id: v, steps: [{id: g, act: {kind: playbook, playbook: target_bootstrap, via: seed_run}}]}],
+     args: [{id: V, steps: [{id: g, only_variants: [v], act: {kind: playbook, playbook: target_bootstrap, via: seed_run}}]}, {id: v}],
      expect: {equals: ['step g (target_bootstrap via seed_run)']}}
+  - {id: consumers-sibling-only-seed-step-not-counted, gate: launcher_consumers, fn: launcher_consumers, negative: false,
+     args: [{id: SIB, variants: [{id: cmdv}, {id: seedv}],
+             steps: [{id: cmd, act: {kind: command, argv: [/usr/bin/true]}}, {id: s, only_variants: [seedv], act: {kind: seed, op: apply}}]},
+            {id: cmdv}],
+     expect: {equals: []}}
+  - {id: consumers-skip-variants-honoured, gate: launcher_consumers, fn: launcher_consumers, negative: false,
+     args: [{id: SK, steps: [{id: s, skip_variants: [cmdv], act: {kind: seed, op: verify}}]}, {id: cmdv}],
+     expect: {equals: []}}
+  - {id: consumers-repeat-filter-overrides-sub-step, gate: launcher_consumers, fn: launcher_consumers, negative: true,
+     args: [{id: RF, steps: [{id: rp, only_variants: [a], repeat: {count_token: n, steps: [{id: x, only_variants: [b], act: {kind: seed, op: apply}}]}}]}, {id: a}],
+     expect: {equals: ['step rp > x (seed apply)']}}
+  - {id: consumers-variant-own-steps-not-executed, gate: launcher_consumers, fn: launcher_consumers, negative: false,
+     args: [{id: VO}, {id: v, steps: [{id: g, act: {kind: seed, op: apply}}]}],
+     expect: {equals: []}}
+  - {id: plan-sibling-command-variant-eligible-without-export, gate: plan_status, fn: plan_status, negative: false,
+     args: [{id: SIB, variants: [{id: cmdv}, {id: seedv}],
+             steps: [{id: cmd, act: {kind: command, argv: [/usr/bin/true]}}, {id: s, only_variants: [seedv], act: {kind: seed, op: apply}}]},
+            {id: cmdv},
+            {route_launch_params_export: {met: false, kind: derived, why: 'declared-missing: x'},
+             bound_bytes_current: {met: true, kind: binding, why: current}}, []],
+     expect: {equals: {status: READY, why: []}}}
+  - {id: plan-sibling-seed-variant-queued-on-export, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: SIB, variants: [{id: cmdv}, {id: seedv}],
+             steps: [{id: cmd, act: {kind: command, argv: [/usr/bin/true]}}, {id: s, only_variants: [seedv], act: {kind: seed, op: apply}}]},
+            {id: seedv},
+            {route_launch_params_export: {met: false, kind: derived, why: 'declared-missing: x'},
+             bound_bytes_current: {met: true, kind: binding, why: current}}, []],
+     expect: {equals: {status: QUEUED, why: ['route_launch_params_export: declared-missing: x [launcher consumers: step s (seed apply)]']}}}
   - {id: consumers-generated-sweeps, gate: launcher_consumers, fn: launcher_consumers, negative: true,
      args: [{id: S, sweep: {kind: pins}, per_point_expect: {entrypoints: [{playbook: package, via: builder}, {playbook: controller, via: seed_run}]}}, {id: base}],
      expect: {equals: ['sweep pins entrypoint controller via seed_run']}}
@@ -399,6 +430,41 @@ cases:
   - {id: coverage-of-pass-results-partial, gate: coverage, fn: coverage_of, negative: true,
      args: [[{cases: [E79], case_components: {E79: [absent, link]}}], [{prefix: '', ids: [E79], variants: {E79: [absent, present-0600, link]}}]],
      expect: {equals: {whole: [], partial: {E79: {covered: [absent, link], missing: [present-0600]}}}}}
+  # G-E84-PARTIAL-WHOLE-CREDIT (codex 231744) regression: the E84 shape -- every implemented leg PASSES (explicit-key-set,
+  # G's tailnet-identity-set and the run-local leg, both explicit []), agent-set (MAIN) and apply / verify never run: E84
+  # stays PARTIAL, never whole
+  - {id: coverage-of-e84-implemented-legs-not-whole, gate: coverage, fn: coverage_of, negative: true,
+     args: [[{control: S, variant: explicit-key-set, cases: [E84], case_components: {E84: [explicit-key-set]}},
+             {control: S, variant: tailnet-identity-set, cases: [E84], case_components: {E84: []}},
+             {control: S, variant: run-local-set, cases: [E84], case_components: {E84: []}}],
+            [{prefix: '', ids: [E84], variants: {E84: [agent-set, agent-unset, explicit-key-set, other-modes-set]}}],
+            [{id: S, cases: [E84], variants: [{id: explicit-key-set, case_components: {E84: [explicit-key-set]}},
+                                               {id: tailnet-identity-set, case_components: {E84: []}},
+                                               {id: agent-set, case_components: {E84: [agent-set]}},
+                                               {id: run-local-set, case_components: {E84: []}}]}]],
+     expect: {equals: {whole: [], partial: {E84: {covered: [explicit-key-set], missing: [agent-set, agent-unset, other-modes-set]}}}}}
+  # the pre-fix shape (a leg naming the row with NO entry): one passing leg of a multi-leg control never completes the row
+  - {id: coverage-of-whole-naming-needs-every-variant, gate: coverage, fn: coverage_of, negative: true,
+     args: [[{control: S, variant: run-local-set, cases: [E84], case_components: {}}],
+            [{prefix: '', ids: [E84], variants: {E84: [agent-set, agent-unset, explicit-key-set, other-modes-set]}}],
+            [{id: S, cases: [E84], variants: [{id: run-local-set}, {id: apply-set}, {id: verify-set}]}]],
+     expect: {equals: {whole: [], partial: {E84: {covered: [], missing: [agent-set, agent-unset, explicit-key-set, other-modes-set],
+                                                  pending_variants: {S: [apply-set, verify-set]}}}}}}
+  # legitimate whole credit is kept: every declared variant of the whole-naming control PASSED
+  - {id: coverage-of-whole-naming-every-variant-passed, gate: coverage, fn: coverage_of, negative: false,
+     args: [[{control: W, variant: g, cases: [E25]}, {control: W, variant: m, cases: [E25]}],
+            [{prefix: '', ids: [E25], variants: {E25: [a, b]}}],
+            [{id: W, cases: [E25], variants: [{id: g}, {id: m}]}]],
+     expect: {equals: {whole: [E25], partial: {}}}}
+  # declaration: an omitted entry beside component-crediting siblings is refused; the explicit [] form is admitted
+  - {id: coverage-mixed-credit-refused, gate: coverage, fn: coverage, negative: true,
+     args: [[{id: S, cases: [E84], variants: [{id: k, case_components: {E84: [explicit-key-set]}}, {id: r}]}],
+            [{prefix: '', ids: [E84], variants: {E84: [explicit-key-set, other-modes-set]}}]],
+     expect: {search: 'S -> case_components E84 \(mixed credit: variants r omit it while k credit by component'}}
+  - {id: coverage-explicit-no-credit-declared, gate: coverage, fn: coverage, negative: false,
+     args: [[{id: S, cases: [E84], variants: [{id: k, case_components: {E84: [explicit-key-set]}}, {id: r, case_components: {E84: []}}]}],
+            [{prefix: '', ids: [E84], variants: {E84: [explicit-key-set, other-modes-set]}}]],
+     expect: {equals: {unknown: [], uncovered: [], partial: {E84: {covered: [explicit-key-set], missing: [other-modes-set]}}, declared_whole: [], known_count: 1}}}
   # ---- neutrality (Y03 helper; C1 Q-C1-NEUTRALITY predicate) ----
   - {id: diff-paths-nested, gate: diff_paths, fn: diff_paths, negative: false,
      args: [{a: {b: 1, c: [1, 2]}, d: x}, {a: {b: 2, c: [1, 3]}, d: x, e: 1}, ''], expect: {equals: [a.b, 'a.c[1]', e]}}
@@ -492,3 +558,82 @@ cases:
             [{text: '{"rows": [{"file": "a", "disposition": "fetched"}, {"file": "b", "disposition": "reused"}]}'}], {}], expect: {search: '1 of 2 rows entries'}}
   - {id: state-json-all-empty-list, gate: judge_state, fn: judge_state, negative: true,
      args: [[{file: /r/acq.json, json_all: {path: rows, key: disposition, value: fetched}}], [{text: '{"rows": []}'}], {}], expect: {search: 'not a non-empty list'}}
+  # ---- judge_state path mode (codex 225207: the run-local probe_env evidence env.json is 0600) ----
+  - {id: state-path-mode-0600, gate: judge_state, fn: judge_state, negative: false,
+     args: [[{path: /r/run/probe-env/env.json, kind: regular, mode: '0600'}], [{exists: true, kind: regular, mode: '0600'}], {}], expect: {equals: []}}
+  - {id: state-path-mode-group-readable, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{path: /r/run/probe-env/env.json, kind: regular, mode: '0600'}], [{exists: true, kind: regular, mode: '0640'}], {}],
+     expect: {search: 'env\.json mode 0640 != 0600'}}
+  - {id: state-path-mode-absent, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{path: /r/run/probe-env/env.json, mode: '0600'}], [{exists: false, kind: absent, mode: absent}], {}],
+     expect: {search: 'mode absent != 0600'}}
+  # ---- REPAIR 5 (codex 223100): Route 3 clone fixtures -- the declared mutation set (clone_status: G's profile line + every
+  # applied fixture's expected_status, SORTED EXACT set against the porcelain) and the old-to-new input map (input_map) ----
+  - {id: fx-status-lines-rename-is-delete-plus-untracked, gate: fixture_status_lines, fn: fixture_status_lines, negative: false,
+     args: [[{op: rename, from: t/a.j2, path: n/a.j2, sha256_before: s1, sha256_after: s1, mode_before: '0644', mode_after: '0644'}]],
+     expect: {equals: {lines: [' D t/a.j2', '?? n/a.j2'], failures: []}}}
+  - {id: fx-status-lines-unknown-op-refused, gate: fixture_status_lines, fn: fixture_status_lines, negative: true,
+     args: [[{op: move, from: t/a.j2, path: n/a.j2}]], expect: {search: 'op move outside modify'}}
+  - {id: fx-status-lines-rename-without-from-refused, gate: fixture_status_lines, fn: fixture_status_lines, negative: true,
+     args: [[{op: rename, path: n/a.j2}]], expect: {search: 'op rename outside modify'}}
+  - {id: clone-status-profile-only, gate: clone_status, fn: clone_status, negative: false,
+     args: [[' M m/p.yml'], m/p.yml, [], h1], expect: {search: '"ok": true', not_search: '"failures": \[[^\]]'}}
+  - {id: clone-status-relocation-set-sorted, gate: clone_status, fn: clone_status, negative: false,
+     args: [[' M m/g.yml', ' M m/p.yml', ' D t/a.j2', '?? n/a.j2'], m/p.yml, [&fx_reloc {schema: fixture-checkout-result/1, case: reloc, head: h1,
+              mutations: [{op: rename, from: t/a.j2, path: n/a.j2, sha256_before: s1, sha256_after: s1, mode_before: '0644', mode_after: '0644'},
+                          {op: modify, path: m/g.yml, sha256_before: g0, sha256_after: g1, mode_before: '0644', mode_after: '0644'}],
+              expected_status: [' D t/a.j2', ' M m/g.yml', '?? n/a.j2']}], h1],
+     expect: {search: '"ok": true', not_search: '"failures": \[[^\]]'}}
+  - {id: clone-status-edit-set, gate: clone_status, fn: clone_status, negative: false,
+     args: [[' M m/p.yml', ' M t/m.j2'], m/p.yml, [{schema: fixture-checkout-result/1, case: edit, head: h1,
+              mutations: [{op: modify, path: t/m.j2, sha256_before: e0, sha256_after: e1, mode_before: '0644', mode_after: '0644'}], expected_status: [' M t/m.j2']}], h1],
+     expect: {search: '"ok": true'}}
+  - {id: clone-status-profile-only-but-fixture-applied, gate: clone_status, fn: clone_status, negative: true,
+     args: [[' M m/p.yml'], m/p.yml, [*fx_reloc], h1], expect: {search: '"ok": false', not_search: '"failures": \[\]'}}
+  - {id: clone-status-rename-entry-refused, gate: clone_status, fn: clone_status, negative: true,
+     args: [[' M m/g.yml', ' M m/p.yml', 'R  t/a.j2 -> n/a.j2'], m/p.yml, [*fx_reloc], h1], expect: {search: 'rename entries in the status'}}
+  - {id: clone-status-extra-untracked-refused, gate: clone_status, fn: clone_status, negative: true,
+     args: [[' M m/g.yml', ' M m/p.yml', ' D t/a.j2', '?? n/a.j2', '?? stray'], m/p.yml, [*fx_reloc], h1], expect: {search: 'status \[[^\]]*stray[^\]]*\] != declared'}}
+  - {id: clone-status-other-head-refused, gate: clone_status, fn: clone_status, negative: true,
+     args: [[' M m/g.yml', ' M m/p.yml', ' D t/a.j2', '?? n/a.j2'], m/p.yml, [*fx_reloc], h2], expect: {search: 'head h1 != clone head h2'}}
+  - {id: clone-status-expected-disagrees-with-mutations, gate: clone_status, fn: clone_status, negative: true,
+     args: [[' M m/g.yml', ' M m/p.yml', ' D t/a.j2'], m/p.yml, [{schema: fixture-checkout-result/1, case: short, head: h1,
+              mutations: [{op: rename, from: t/a.j2, path: n/a.j2, sha256_before: s1, sha256_after: s1, mode_before: '0644', mode_after: '0644'},
+                          {op: modify, path: m/g.yml, sha256_before: g0, sha256_after: g1, mode_before: '0644', mode_after: '0644'}],
+              expected_status: [' D t/a.j2', ' M m/g.yml']}], h1], expect: {search: 'expected_status .* != its mutations'}}
+  - {id: clone-status-fixture-touching-profile-refused, gate: clone_status, fn: clone_status, negative: true,
+     args: [[' M m/p.yml'], m/p.yml, [{schema: fixture-checkout-result/1, case: prof, head: h1,
+              mutations: [{op: modify, path: m/p.yml, sha256_before: p0, sha256_after: p1, mode_before: '0644', mode_after: '0644'}], expected_status: [' M m/p.yml']}], h1],
+     expect: {search: 'touches the profile'}}
+  - {id: input-map-rename-and-registry-modify, gate: input_map, fn: input_map, negative: false,
+     args: [[[t/a.j2, s1], [m/g.yml, g0], [m/p.yml, p0], [o/x, x0]], m/p.yml,
+            [{op: rename, from: t/a.j2, path: n/a.j2, sha256_before: s1, sha256_after: s1, mode_before: '0644', mode_after: '0644'},
+             {op: modify, path: m/g.yml, sha256_before: g0, sha256_after: g1, mode_before: '0644', mode_after: '0644'}]],
+     expect: {equals: {checks: [{input: t/a.j2, at: n/a.j2, want: s1}, {input: m/g.yml, at: m/g.yml, want: g1}, {input: o/x, at: o/x, want: x0}], failures: []}}}
+  - {id: input-map-no-mutation-byte-identical, gate: input_map, fn: input_map, negative: false,
+     args: [[[t/a.j2, s1], [m/p.yml, p0]], m/p.yml, []], expect: {equals: {checks: [{input: t/a.j2, at: t/a.j2, want: s1}], failures: []}}}
+  - {id: input-map-rename-digest-changed-refused, gate: input_map, fn: input_map, negative: true,
+     args: [[[t/a.j2, s1]], m/p.yml, [{op: rename, from: t/a.j2, path: n/a.j2, sha256_before: s1, sha256_after: s2, mode_before: '0644', mode_after: '0644'}]],
+     expect: {search: 'digest s1 -> s2 != recorded s1'}}
+  - {id: input-map-rename-mode-changed-refused, gate: input_map, fn: input_map, negative: true,
+     args: [[[t/a.j2, s1]], m/p.yml, [{op: rename, from: t/a.j2, path: n/a.j2, sha256_before: s1, sha256_after: s1, mode_before: '0644', mode_after: '0755'}]],
+     expect: {search: 'mode 0644 -> 0755'}}
+  - {id: input-map-modify-before-not-recorded-refused, gate: input_map, fn: input_map, negative: true,
+     args: [[[m/g.yml, g0]], m/p.yml, [{op: modify, path: m/g.yml, sha256_before: g9, sha256_after: g1, mode_before: '0644', mode_after: '0644'}]],
+     expect: {search: 'sha256_before g9 != recorded g0'}}
+  - {id: input-map-input-deleted-refused, gate: input_map, fn: input_map, negative: true,
+     args: [[[o/x, x0]], m/p.yml, [{op: delete, path: o/x, sha256_before: x0, sha256_after: '', mode_before: '0644', mode_after: ''}]],
+     expect: {search: 'input o/x deleted'}}
+  - {id: input-map-rename-onto-input-refused, gate: input_map, fn: input_map, negative: true,
+     args: [[[t/a.j2, s1], [o/x, x0]], m/p.yml, [{op: rename, from: t/a.j2, path: o/x, sha256_before: s1, sha256_after: s1, mode_before: '0644', mode_after: '0644'}]],
+     expect: {search: 'rename lands on the input path o/x'}}
+  - {id: profile-case-patch-bootstrap, gate: profile_case_patch, fn: profile_case_patch, negative: false,
+     args: [{id: pc, patch_bootstrap: {template_rel: n/s.j2, seed_launcher: {params_rel: n/p.j2}}}],
+     expect: {equals: {patch: {template_rel: n/s.j2, seed_launcher: {params_rel: n/p.j2}}, why: ''}}}
+  - {id: profile-case-patch-dotted-path, gate: profile_case_patch, fn: profile_case_patch, negative: false,
+     args: [{id: pc, patch: {path: controller.bootstrap.bundle.checksum_format.name, value: 'N+'}}],
+     expect: {equals: {patch: {bundle: {checksum_format: {name: 'N+'}}}, why: ''}}}
+  - {id: profile-case-patch-outside-bootstrap-refused, gate: profile_case_patch, fn: profile_case_patch, negative: true,
+     args: [{id: pc, patch: {path: controller.lock_file_rel, value: x}}], expect: {search: 'has neither patch_bootstrap nor patch'}}
+  - {id: profile-case-patch-both-forms-refused, gate: profile_case_patch, fn: profile_case_patch, negative: true,
+     args: [{id: pc, patch_bootstrap: {template_rel: x}, patch: {path: controller.bootstrap.template_rel, value: x}}], expect: {search: 'declares both'}}

@@ -3,8 +3,9 @@
 # controller-handoff-20260924-155203). Included by tasks/variant_admit.yml BEFORE any op or step of the variant, with
 # _rhc_want (candidate profile + the declared patch) set. Builds {vclone}: an exact-commit {head} --no-hardlinks clone of
 # the run checkout (rh_repo_root), inside this marked run dir under the run's work root (never /tmp, never the authoring
-# checkout), 0700, with its own work root {vwork} and root parent {vparent}; its profile is candidate + patch and nothing
-# else differs from {head}. Every git call reads no ambient configuration and runs no hook. Writes only below {vclone};
+# checkout), 0700, with its own work root {vwork} and root parent {vparent}; its profile is candidate + patch, plus (a
+# declaration with checkout_fixture) exactly the route fixture's declared mutations, and nothing else differs from {head}
+# (REPAIR 5, codex 223100). Every git call reads no ambient configuration and runs no hook. Writes only below {vclone};
 # the run checkout is only read (status without optional locks). Any refusal here fails the variant (variant.yml rescue).
 
 - name: Stat the clone destination
@@ -98,6 +99,43 @@
     mode: "{{ _rhc_vc_prof.stat.mode }}"
     follow: false
 
+# The declaration's route checkout fixture (codex 220953 / 211654 / 223100): the ONE producer tasks/fixture_checkout.yml
+# (route-owned, pinned) applies catalog case checkout_fixture to THIS clone AFTER the profile patch (a relocation reads
+# the patched profile) and BEFORE the status and the clone's own work root exist. G passes the Route 3 record exactly
+# {ctl, vclone, head}, copies the producer's rh_fx_result into its own fact at once (the producer's fact names are
+# shared with the bundle producer) and binds it to this case, clone and head. One fixture per declaration.
+- name: Start this clone's fixture record (G-owned)
+  ansible.builtin.set_fact:
+    _rhc_fx_results: []
+
+- name: Apply the declaration's route checkout fixture to the clone (route producer; never the canonical checkout)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/fixture_checkout.yml"
+  vars:
+    rh_fx_clone: "{{ _rhc_t.vclone }}"
+    rh_fx_route3: {ctl: "{{ _rhc_t.ctl }}", vclone: "{{ _rhc_t.vclone }}", head: "{{ _rhc_t.head }}"}
+    rh_fx_case: "{{ _rhc_decl.checkout_fixture }}"
+  when: _rhc_decl.checkout_fixture is defined
+
+- name: Keep the producer's result as G's own record of this clone
+  ansible.builtin.set_fact:
+    _rhc_fx_results: "{{ [rh_fx_result] }}"
+  when: _rhc_decl.checkout_fixture is defined
+
+- name: Refuse a fixture result that is not this case on this clone at this head (a stale result is never reused)
+  ansible.builtin.assert:
+    that:
+      - _rhc_fx_results[0].schema == 'fixture-checkout-result/1'
+      - _rhc_fx_results[0].case == _rhc_decl.checkout_fixture
+      - _rhc_fx_results[0].clone == _rhc_t.vclone
+      - (_rhc_fx_results[0].head | string) == (_rhc_t.head | string)
+      - (_rhc_fx_results[0].route3.ctl == _rhc_t.ctl) and (_rhc_fx_results[0].route3.vclone == _rhc_t.vclone)
+    fail_msg: >-
+      REFUSED RHC-VARIANT-CLONE: the checkout fixture result {{ _rhc_fx_results[0].case | default('absent') }} /
+      {{ _rhc_fx_results[0].clone | default('absent') }} / {{ _rhc_fx_results[0].head | default('absent') }} is not case
+      {{ _rhc_decl.checkout_fixture }} on {{ _rhc_t.vclone }} at {{ _rhc_t.head }}
+    quiet: true
+  when: _rhc_decl.checkout_fixture is defined
+
 - name: The clone's status against {head}
   ansible.builtin.command:
     argv: "{{ [rhc_decl.runner_tools.git, '-C', _rhc_t.vclone] + rhc_decl.variant_clone.config + rhc_decl.variant_clone.clone_status }}"
@@ -105,10 +143,20 @@
   register: _rhc_vc_st
   changed_when: false
 
-- name: Refuse a clone that differs from {head} anywhere but its profile (nothing untracked, nothing else modified)
+# REPAIR 5 (codex 223100): the status is the DECLARED mutation set -- G's own ' M <profile>' line plus every applied
+# fixture's expected_status (which must agree with its own mutations and name this head) -- as a SORTED EXACT set
+# (controls.j2 clone_status; git prints tracked entries before untracked ones). A rename is a copy then a removal, so it
+# shows ' D <from>' plus '?? <path>'; any 'R' entry, any extra or missing line refuses.
+- name: Judge the clone's status against the declared mutation set (pure macro)
+  ansible.builtin.set_fact:
+    _rhc_vc_judge: >-
+      {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'clone_status',
+         'args': [_rhc_vc_st.stdout_lines, rhc_profile_rel, _rhc_fx_results, _rhc_t.head]}}) | from_json }}
+
+- name: Refuse a clone that differs from {head} anywhere but its profile and its declared fixture mutations
   ansible.builtin.assert:
-    that: _rhc_vc_st.stdout_lines == [' M ' ~ rhc_profile_rel]
-    fail_msg: "REFUSED RHC-VARIANT-CLONE: {{ _rhc_t.vclone }} status {{ _rhc_vc_st.stdout_lines[:20] }} != only ' M {{ rhc_profile_rel }}'"
+    that: _rhc_vc_judge.ok
+    fail_msg: "REFUSED RHC-VARIANT-CLONE: {{ _rhc_t.vclone }}: {{ _rhc_vc_judge.failures }}"
     quiet: true
 
 - name: The clone's own work root and root parent (the seed creates {vroot} and its sub-roots there)
