@@ -215,7 +215,92 @@
 {{ ns.a | to_json }}
 {%- endmacro -%}
 
-{#- one action -> {argv, unit, cwd, out, err, strace, inventory, kill_token, timeout_s, async} -#}
+{#- SEED LAUNCH (controller.bootstrap.seed_launch; codex 183510, RH-SEED-LAUNCH; lifecycle E78; ported from m1-1g): EVERY G
+    launch of the generated seed (kind seed, via seed_run, finish_variant's cleanup purge / verify) is the declared vector:
+      argv   seed_launch.argv with {os_tools.env.path}, {bundle_dir}, {bundle.seed_file}, {mode}, {root} substituted,
+             {env_pairs} = env -i pairs and {mode_args} = seed_launch.mode_args[mode] ({root}, {ssh_auth_mode}, {runner}
+             substituted; {args} = the caller's words after `--`). A leftover placeholder is unresolved (no launch).
+      env    EXACTLY seed_launch.env.order: base_env values, HOME = the invoker's passwd home (ctx.passwd_home, the ONE
+             passwd row execute.yml admitted); then env.carried ONLY for mode env.carried.when.mode whose ssh_auth mode has
+             agent == when.ssh_auth_agent: its socket_env with the runner's own value. NO XDG_RUNTIME_DIR /
+             DBUS_SESSION_BUS_ADDRESS / USER / TMPDIR: the seed derives them and refuses a differing caller value.
+    DECLARED DEVIATIONS of a control, never defaults: act.env replaces a declared pair in place or appends NAME=value
+    (sorted), act.unset_env drops a pair, act.raw_args go before the mode words, act.no_ssh_auth drops `--ssh-auth <mode>`,
+    act.invoke declared_sh runs the seed file through os_tools.sh. Returns {argv, unresolved}. -#}
+{%- macro seed_launch(ctx, act, bdir, mode, root, words, runner) -%}
+{%- set bs = ctx.rh.controller.bootstrap -%}
+{%- set sl = bs.seed_launch | default(none) -%}
+{%- if sl is none -%}{{ {'argv': [], 'unresolved': ['controller.bootstrap.seed_launch undeclared']} | to_json }}
+{%- else -%}
+{%- set dev = act.env | default({}) -%}
+{%- set drop = act.unset_env | default([]) -%}
+{%- set am = act.ssh_auth | default(ctx.seed_run_auth_mode) -%}
+{%- set mdef = bs.ssh_auth.modes[am] if (bs.ssh_auth is defined and am in bs.ssh_auth.modes) else {} -%}
+{%- set ns = namespace(pairs = [], unresolved = [], argv = [], mw = [], sock = '') -%}
+{%- for k in sl.env.order -%}
+{%- set pv = namespace(v = none) -%}
+{%- if k in (sl.env.inherited | default({})) -%}{%- set pv.v = (ctx.passwd_home | default('')) if sl.env.inherited[k] == 'invoker_passwd_home' else none -%}
+{%- elif k in (bs[sl.env.base] | default({})) -%}{%- set pv.v = bs[sl.env.base][k] -%}{%- endif -%}
+{%- if k in dev -%}{%- set pv.v = dev[k] -%}{%- endif -%}
+{%- if k in drop -%}
+{%- elif pv.v is none or (pv.v | string | length) == 0 -%}{%- set ns.unresolved = ns.unresolved + [k] -%}
+{%- else -%}{%- set ns.pairs = ns.pairs + [k ~ '=' ~ pv.v] -%}{%- endif -%}
+{%- endfor -%}
+{%- set cw = sl.env.carried | default({}) -%}
+{%- if mode == (cw.when | default({})).mode | default('') and (mdef.agent | default('')) == (cw.when | default({})).ssh_auth_agent | default('-') and not (act.no_ssh_auth | default(false)) -%}
+{%- set ns.sock = mdef.socket_env | default('') -%}
+{%- set sv = dev[ns.sock] if ns.sock in dev else (ctx.env[ns.sock] | default('')) -%}
+{%- if ns.sock and sv and ns.sock not in drop -%}{%- set ns.pairs = ns.pairs + [ns.sock ~ '=' ~ sv] -%}{%- endif -%}
+{%- endif -%}
+{%- for k in dev | sort if k not in sl.env.order and k != ns.sock and k not in drop -%}{%- set ns.pairs = ns.pairs + [k ~ '=' ~ dev[k]] -%}{%- endfor -%}
+{%- if mode not in (sl.mode_args | default({})) -%}{%- set ns.unresolved = ns.unresolved + ['mode_args.' ~ mode] -%}{%- endif -%}
+{%- for w in (sl.mode_args | default({}))[mode] | default([]) -%}
+{%- if w == '{args}' -%}{%- set ns.mw = ns.mw + (words | default([])) -%}
+{%- elif act.no_ssh_auth | default(false) and w in ['--ssh-auth', '{ssh_auth_mode}'] -%}
+{%- else -%}
+{%- set t = namespace(w = w | replace('{root}', root) | replace('{ssh_auth_mode}', am) | replace('{runner}', runner | default(''))) -%}
+{%- if '{' in t.w or (w == '{runner}' and not runner) -%}{%- set ns.unresolved = ns.unresolved + ['mode_args ' ~ w] -%}{%- else -%}{%- set ns.mw = ns.mw + [t.w] -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- for w in sl.argv -%}
+{%- if w == '{env_pairs}' -%}{%- set ns.argv = ns.argv + ns.pairs -%}
+{%- elif w == '{mode_args}' -%}{%- set ns.argv = ns.argv + (act.raw_args | default([])) + ns.mw -%}
+{%- else -%}
+{%- set t = namespace(w = w | replace('{os_tools.env.path}', bs.os_tools.env.path) | replace('{bundle_dir}', bdir)
+                          | replace('{bundle.seed_file}', bs.bundle.seed_file) | replace('{mode}', mode) | replace('{root}', root)) -%}
+{%- if '{bundle_dir}' in w and (act.invoke | default('')) == 'declared_sh' -%}{%- set ns.argv = ns.argv + [bs.os_tools.sh.path] -%}{%- endif -%}
+{%- if '{' in t.w -%}{%- set ns.unresolved = ns.unresolved + ['argv ' ~ w] -%}{%- else -%}{%- set ns.argv = ns.argv + [t.w] -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ {'argv': ns.argv, 'unresolved': ns.unresolved} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- the {args} words of a seed act's declared `args`: a leading `--` is the declared separator of seed_launch.mode_args
+    (never repeated); run-local's `--runner <key>` pair is its {runner} (returned apart) -#}
+{%- macro seed_words(op, args) -%}
+{%- set a = args | default([]) -%}
+{%- set runner = a[1] if (op == 'run-local' and a | length > 1 and a[0] == '--runner') else '' -%}
+{%- set rest = a[2:] if runner else a -%}
+{{ {'runner': runner, 'words': rest[1:] if (rest[:1] == ['--']) else rest} | to_json }}
+{%- endmacro -%}
+
+{#- G-PASSWD-RESULT-KEY (codex; ported from m1-1g): ansible.builtin.getent keys getent_passwd by the RETURNED row's field 0
+    (the account NAME), never by the query key. rows: that mapping; uid: the queried uid. Admitted only when exactly ONE
+    row is returned, its uid field (value[1]) equals uid, and its home (value[4]) is absolute. Returns {account, home,
+    failures}. Used by tasks/execute.yml. -#}
+{%- macro passwd_row(rows, uid) -%}
+{%- set items = (rows | default({}, true)) | dict2items -%}
+{%- set hit = items | selectattr('value.1', 'defined') | selectattr('value.1', 'equalto', uid | string) | list -%}
+{%- set ns = namespace(f = []) -%}
+{%- if items | length != 1 -%}{%- set ns.f = ns.f + [(items | length | string) ~ ' passwd rows returned for uid ' ~ uid ~ ' (exactly one required)'] -%}{%- endif -%}
+{%- if hit | length != 1 -%}{%- set ns.f = ns.f + [(hit | length | string) ~ ' returned rows carry uid ' ~ uid ~ ' in the uid field (keys: ' ~ (items | map(attribute='key') | join(' ')) ~ ')'] -%}{%- endif -%}
+{%- set home = ((hit | first).value[4] | default('')) if hit else '' -%}
+{%- if hit and not (home is string and home.startswith('/')) -%}{%- set ns.f = ns.f + ['home of ' ~ (hit | first).key ~ ' is not absolute: ' ~ home] -%}{%- endif -%}
+{{ {'account': (hit | first).key if hit else '', 'home': home, 'failures': ns.f} | to_json }}
+{%- endmacro -%}
+
+{#- one action -> {argv, unit, cwd, out, err, strace, inventory, kill_token, timeout_s, async, seed_launch} -#}
 {%- macro plan_act(step, ctx) -%}
 {%- set act = step.act -%}
 {%- set bs = ctx.rh.controller.bootstrap -%}
@@ -223,15 +308,15 @@
 {%- set repo = ctx.variant_repo if ((act.repo | default('candidate')) == 'variant' and ctx.variant_repo) else ctx.repo -%}
 {%- set tkey = act.kind ~ ('_' ~ act.op if act.op is defined else '') -%}
 {%- set to = act.timeout_s | default(ctx.timeouts[tkey] | default(ctx.timeouts.playbook)) -%}
-{%- set ns = namespace(argv = [], inv = none, invvars = {}, kill = none, pbargs = []) -%}
+{%- set ns = namespace(argv = [], inv = none, invvars = {}, kill = none, pbargs = [], sl = {}) -%}
 {%- if act.kind == 'seed' -%}
 {%- set bdir = ctx.bundles[act.bundle] if act.bundle in ctx.bundles else act.bundle -%}
-{%- set ns.argv = (envp(ctx, act.env | default({}), []) | from_json)
-                  + ([bs.os_tools.sh.path] if (act.invoke | default('')) == 'declared_sh' else [])
-                  + [bdir ~ '/' ~ ctx.entry.seed, act.op, '--root', act.root] -%}
-{%- if act.op == 'purge' -%}{%- set ns.argv = ns.argv + ['--confirm', act.root] -%}{%- endif -%}
-{%- if act.op == 'run' and not (act.no_ssh_auth | default(false)) -%}{%- set ns.argv = ns.argv + ['--ssh-auth', act.ssh_auth | default(ctx.seed_run_auth_mode)] -%}{%- endif -%}
-{%- set ns.argv = ns.argv + (act.raw_args | default([])) + (act.args | default([])) -%}
+{#- the declared seed launch (seed_launch above); run / run-local words from the declared args; any other mode's args
+    are appended after the mode words as a declared deviation (the seed's own usage refuses them) -#}
+{%- set sw = seed_words(act.op, act.args) | from_json -%}
+{%- set consumed = act.op in ['run', 'run-local'] -%}
+{%- set ns.sl = seed_launch(ctx, act, bdir, act.op, act.root, sw.words if consumed else [], sw.runner) | from_json -%}
+{%- set ns.argv = ns.sl.argv + ([] if consumed else (act.args | default([]))) -%}
 {%- set ns.kill = ' --root ' ~ act.root -%}
 {%- elif act.kind == 'command' -%}
 {%- set ns.argv = (envp(ctx, act.env | default({}), act.unset_env | default([])) | from_json) + act.argv -%}
@@ -258,8 +343,9 @@
 {%- if via == 'seed_run' -%}
 {%- set b = act.bundle | default('a') -%}
 {%- set bdir = ctx.bundles[b] if b in ctx.bundles else b -%}
-{%- set ns.argv = (envp(ctx, act.env | default({}), []) | from_json)
-                  + [bdir ~ '/' ~ ctx.entry.seed, 'run', '--root', act.root | default(ctx.t.shared), '--ssh-auth', act.ssh_auth | default(ctx.seed_run_auth_mode), '--'] + ns.pbargs -%}
+{#- `seed run` is a seed launch: the declared vector (seed_launch above), {args} = the playbook words -#}
+{%- set ns.sl = seed_launch(ctx, act, bdir, 'run', act.root | default(ctx.t.shared), ns.pbargs, '') | from_json -%}
+{%- set ns.argv = ns.sl.argv -%}
 {%- elif via == 'generation' -%}
 {%- set ns.argv = (envp(ctx, {'ANSIBLE_CONFIG': ctx.receipt.ansible_config, 'ANSIBLE_COLLECTIONS_PATH': ctx.receipt.collections_path} | combine(act.env | default({})), act.unset_env | default([])) | from_json)
                   + [ctx.receipt.ansible_playbook] + ns.pbargs -%}
@@ -280,7 +366,7 @@
     'strace': (base ~ '.strace') if pre else '', 'inventory': ns.inv, 'inventory_vars': ns.invvars,
     'inventory_targets': act.inventory_targets | default({}), 'target_group': (bs.inventory | default({})).target_group | default(''),
     'kill_token': ns.kill, 'timeout_s': to | int, 'async': act.async | default(false),
-    'kind': act.kind, 'op': act.op | default('')} | to_json }}
+    'kind': act.kind, 'op': act.op | default(''), 'seed_launch': ns.sl} | to_json }}
 {%- endmacro -%}
 
 {#- ------------------------------------------------------------ parsing ---------------------------------- -#}
