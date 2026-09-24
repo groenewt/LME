@@ -10,16 +10,39 @@
   ansible.builtin.set_fact:
     _rhc_plan: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_act', 'args': [_rhc_step, _rhc_ctx]}}) | from_json }}"
 
-- name: Refuse a seed launch the resolved seed_launch does not fully bind (RH-SEED-LAUNCH; lifecycle E78; before any process)
+# R1 launcher consumption (codex 192321; ported from m1-1g): a seed launch is the bundle's generated launcher by
+# seed_launcher.caller_argv (form launcher) or, only as a declared deviation (act.invoke seed_direct / declared_sh), the
+# seed_launch vector itself
+- name: Refuse a seed launch the resolved seed_launch / seed_launcher does not fully bind (RH-SEED-LAUNCH; lifecycle E78 / E82-E85; before any process)
   ansible.builtin.assert:
     that:
       - _rhc_plan.seed_launch.unresolved | length == 0
       - _rhc_plan.seed_launch.argv | length > 0
+      - _rhc_plan.seed_launch.form in ['launcher', 'seed_direct']
+      - _rhc_plan.seed_launch.form == 'launcher' or (_rhc_step.act.invoke | default('')) in ['seed_direct', 'declared_sh']
     fail_msg: >-
-      REFUSED RHC-SEED-LAUNCH: {{ _rhc_step.id }} launches the seed, but the resolved controller.bootstrap.seed_launch leaves
-      {{ _rhc_plan.seed_launch.unresolved }} without a value; G never substitutes a default.
+      REFUSED RHC-SEED-LAUNCH: {{ _rhc_step.id }} launches the seed ({{ _rhc_plan.seed_launch.form | default('?') }}), but the
+      resolved controller.bootstrap.seed_launch / seed_launcher leaves {{ _rhc_plan.seed_launch.unresolved }} without a
+      value, or a direct vector was not a declared act.invoke deviation; G never substitutes a default.
     quiet: true
   when: _rhc_plan.seed_launch | default({}) | length > 0
+
+# SEED DIRECT LABEL (codex 210509): the direct vector is a labelled fault-injection / control path -- a declared
+# direct_purpose (vocabulary.direct_purposes) AND a step that expects a refusal; never an ordinary or positive launch
+- name: Refuse a direct seed launch that is not a labelled refusal-expecting fault injection (RHC-SEED-DIRECT; before any process)
+  vars:
+    _exp: "{{ _rhc_step.expect | default({}) }}"
+  ansible.builtin.assert:
+    that:
+      - (_rhc_step.act.direct_purpose | default('')) in rhc_decl.vocabulary.direct_purposes
+      - (_exp.rc_nonzero | default(false)) or _exp.refusal is defined or _exp.refusal_any is defined or _exp.refused_at is defined
+    fail_msg: >-
+      REFUSED RHC-SEED-DIRECT: {{ _rhc_step.id }} starts the seed directly (act.invoke {{ _rhc_step.act.invoke | default('') }})
+      without a declared direct_purpose ({{ rhc_decl.vocabulary.direct_purposes | join(' | ') }}) or without a refusal
+      expectation; ordinary and positive-path launches use the generated launcher, and a direct result proves only the
+      direct seed boundary.
+    quiet: true
+  when: (_rhc_plan.seed_launch | default({})).form | default('') == 'seed_direct'
 
 - name: Refuse a working directory outside this run (a decoy cwd is created by the control itself)
   ansible.builtin.assert:

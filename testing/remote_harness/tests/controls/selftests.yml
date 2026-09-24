@@ -65,6 +65,54 @@ fixtures:
     timeouts: {command: 120, playbook: 900}
     wraps: {none: []}
     act_scope: {default: own, unit_prefix: rhc-act-}
+  # seed_launch + seed_launcher fixture (ported from m1-1g; RH-SEED-LAUNCH / E78 direct form; R1 launcher form E82-E85):
+  # the declared shapes, fixture values only (bundle.launcher_file / launcher_mode / launcher_custody as the profile declares them)
+  act_ctx_seed: &act_ctx_seed
+    rh: {controller: {bootstrap: {base_env: {PATH: /usr/bin:/bin, LC_ALL: C.UTF-8}, os_tools: {env: {path: /usr/bin/env}, sh: {path: /bin/sh}},
+                                  bundle: {seed_file: lme-controller-seed.sh, launcher_file: lme-seed-launch.sh, launcher_mode: '0500', launcher_custody: seed_file},
+                                  seed_launcher: {template_rel: testing/remote_harness/templates/lme-seed-launcher.sh.j2, member: bundle.launcher_file,
+                                                  caller_argv: ['{bundle_dir}/{bundle.launcher_file}', '{mode}', '{root}', '{mode_params}', '{args}'],
+                                                  mode_params: mode_args_placeholders, carried_param: ssh_auth_mode, self_path: absolute_realpath_dirname},
+                                  ssh_auth: {modes: {agent: {agent: carried, socket_env: SSH_AUTH_SOCK}, explicit_key: {agent: disabled}}},
+                                  seed_launch: {argv: ['{os_tools.env.path}', '-i', '{env_pairs}', '{bundle_dir}/{bundle.seed_file}', '{mode}', '--root', '{root}', '{mode_args}'],
+                                                mode_args: {apply: [], verify: [], purge: ['--confirm', '{root}'], run: ['--ssh-auth', '{ssh_auth_mode}', '--', '{args}'],
+                                                            run-local: ['--runner', '{runner}', '--', '{args}']},
+                                                env: {clear: true, order: [PATH, LC_ALL, HOME], base: base_env, inherited: {HOME: invoker_passwd_home},
+                                                      carried: {when: {mode: run, ssh_auth_agent: carried}, name_from: ssh_auth.modes.<mode>.socket_env}}}}}}
+    env: {HOME: /runner-home, XDG_RUNTIME_DIR: /run/user/1, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1/bus', SSH_AUTH_SOCK: /run/user/1/agent.sock}
+    passwd_home: /home/u
+    seed_run_auth_mode: agent
+    bundles: {a: /b/a}
+    tools: {env: /usr/bin/env, timeout: /usr/bin/timeout, strace: /usr/bin/strace, systemd_run: /usr/bin/systemd-run}
+    t: {ctl: /h/c}
+    timeouts: {command: 120, playbook: 900, seed_apply: 600, seed_run: 900}
+    wraps: {none: []}
+    act_scope: {default: shared, unit_prefix: rhc-act-}
+    # launch_params: the ROUTE's export (seed_launcher.params_rel -> controller_seed.j2 launch_params) rendered with
+    # THIS fixture's bootstrap by tasks/selftest.yml (codex 211754); never a literal here
+    launch_params_from: route_export
+    vocab: {direct_purposes: [seed_refusal, launcher_member]}
+  # the same fixture with NO route export (launch_params absent): the absence case
+  act_ctx_seed_noexport: &act_ctx_seed_noexport
+    <<: *act_ctx_seed
+    launch_params_from: none
+  # G-LAUNCHER-CARRIED-PARAM-RENAME (codex 210509): C1's admitted consistent rename (cases-c1-contract-admission.yml
+  # "variation: a renamed carried parameter, consistent in mode_args.run and carried_param, is admitted": mode_args.run
+  # ['--ssh-auth', '{auth_mode}', '--', '{args}'] + seed_launcher.carried_param auth_mode) -- same fixture otherwise
+  act_ctx_seed_renamed: &act_ctx_seed_renamed
+    <<: *act_ctx_seed
+    rh: {controller: {bootstrap: {base_env: {PATH: /usr/bin:/bin, LC_ALL: C.UTF-8}, os_tools: {env: {path: /usr/bin/env}, sh: {path: /bin/sh}},
+                                  bundle: {seed_file: lme-controller-seed.sh, launcher_file: lme-seed-launch.sh, launcher_mode: '0500', launcher_custody: seed_file},
+                                  seed_launcher: {template_rel: testing/remote_harness/templates/lme-seed-launcher.sh.j2, member: bundle.launcher_file,
+                                                  caller_argv: ['{bundle_dir}/{bundle.launcher_file}', '{mode}', '{root}', '{mode_params}', '{args}'],
+                                                  mode_params: mode_args_placeholders, carried_param: auth_mode, self_path: absolute_realpath_dirname},
+                                  ssh_auth: {modes: {agent: {agent: carried, socket_env: SSH_AUTH_SOCK}, explicit_key: {agent: disabled}}},
+                                  seed_launch: {argv: ['{os_tools.env.path}', '-i', '{env_pairs}', '{bundle_dir}/{bundle.seed_file}', '{mode}', '--root', '{root}', '{mode_args}'],
+                                                mode_args: {apply: [], verify: [], purge: ['--confirm', '{root}'], run: ['--ssh-auth', '{auth_mode}', '--', '{args}'],
+                                                            run-local: ['--runner', '{runner}', '--', '{args}']},
+                                                env: {clear: true, order: [PATH, LC_ALL, HOME], base: base_env, inherited: {HOME: invoker_passwd_home},
+                                                      carried: {when: {mode: run, ssh_auth_agent: carried}, name_from: ssh_auth.modes.<mode>.socket_env}}}}}}
+    # launch_params_from: route_export (inherited): the rename reaches the canonical launch_params(words) through the export
   # record writer fixture (G-RECORD-OPEN-BEFORE-TIMEOUT; ported from m1-1g): fixture tool paths and records only
   writer_ctx: &writer_ctx
     rh: {controller: {bootstrap: {os_tools: {stat: {path: /usr/bin/stat}, sh: {path: /bin/sh}}}}}
@@ -211,6 +259,17 @@ cases:
      args: [{id: D, declaration: cfg}, {id: base}, *deps, []], expect: {equals: {status: READY, why: []}}}
   - {id: plan-unimplemented, gate: plan_status, fn: plan_status, negative: true,
      args: [{id: U}, {id: base}, *deps, [op retarget]], expect: {search: '"status": "UNIMPLEMENTED"'}}
+  # codex 212700: a seed act implicitly requires the route launch-parameter export; unmet -> visibly QUEUED on it
+  - {id: plan-seed-act-needs-route-export, gate: plan_status, fn: plan_status, negative: true,
+     args: [{id: SE, steps: [{id: s, act: {kind: seed, op: apply}}]}, {id: base},
+            {route_launch_params_export: {met: false, kind: derived, why: 'seed_launcher.params_rel undeclared'},
+             bound_bytes_current: {met: true, kind: binding, why: current}}, []],
+     expect: {equals: {status: QUEUED, why: ['route_launch_params_export: seed_launcher.params_rel undeclared']}}}
+  - {id: plan-seed-act-with-route-export-ready, gate: plan_status, fn: plan_status, negative: false,
+     args: [{id: SE, steps: [{id: s, act: {kind: seed, op: apply}}]}, {id: base},
+            {route_launch_params_export: {met: true, kind: derived, why: present},
+             bound_bytes_current: {met: true, kind: binding, why: current}}, []],
+     expect: {search: '"status": "READY"'}}
   - {id: plan-undeclared-dependency-queued, gate: plan_status, fn: plan_status, negative: true,
      args: [{id: X, requires: [no_such_dependency]}, {id: base}, *deps, []], expect: {search: 'undeclared dependency'}}
   - {id: plan-residual-never-ready, gate: plan_status, fn: plan_status, negative: true,
@@ -301,6 +360,55 @@ cases:
   - {id: plan-act-shared-scope-has-no-unit, gate: plan_act, fn: plan_act, negative: true,
      args: [{id: p1, act: {kind: command, argv: [/usr/bin/true], scope: shared}}, *act_ctx],
      expect: {search: '"argv": \["/usr/bin/timeout"', not_search: 'systemd-run'}}
+  # ---- plan_act seed launches (ported from m1-1g; R1 launcher consumption, codex 192321): the bundle's generated
+  # launcher by seed_launcher.caller_argv, positional, no `--` of G's, NO environment vector (no env -i, no NAME=value) ----
+  - {id: plan-act-seed-apply-launcher, gate: plan_act, fn: plan_act, negative: false,
+     args: [{id: s1, act: {kind: seed, bundle: a, op: apply, root: /R}}, *act_ctx_seed], needs_route_export: true,
+     expect: {search: '"argv": \["/usr/bin/timeout", "--kill-after=10", "600s", "/b/a/lme-seed-launch\.sh", "apply", "/R"\]',
+              not_search: '"-i"|PATH=|LC_ALL=|HOME=|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|USER=|SSH_AUTH_SOCK=|lme-controller-seed\.sh|"--root"'}}
+  - {id: plan-act-seed-purge-launcher-supplies-confirm, gate: plan_act, fn: plan_act, negative: false,
+     args: [{id: s4, act: {kind: seed, bundle: a, op: purge, root: /R}}, *act_ctx_seed], needs_route_export: true,
+     expect: {search: '"/b/a/lme-seed-launch\.sh", "purge", "/R"\]', not_search: '--confirm'}}
+  - {id: plan-act-seed-run-mode-param-positional, gate: plan_act, fn: plan_act, negative: false,
+     args: [{id: s2, act: {kind: seed, bundle: a, op: run, root: /R, args: ['--', '-i', inv.yml, pb.yml]}}, *act_ctx_seed], needs_route_export: true,
+     expect: {search: '"/b/a/lme-seed-launch\.sh", "run", "/R", "agent", "-i", "inv\.yml", "pb\.yml"\]', not_search: '"--"|--ssh-auth|SSH_AUTH_SOCK=|"carried": ""'}}
+  - {id: plan-act-seed-run-local-runner-positional, gate: plan_act, fn: plan_act, negative: false,
+     args: [{id: s5, act: {kind: seed, bundle: a, op: run-local, root: /R, args: ['--runner', acceptance, '--', '-e', 'x=a b']}}, *act_ctx_seed], needs_route_export: true,
+     expect: {search: '"/b/a/lme-seed-launch\.sh", "run-local", "/R", "acceptance", "-e", "x=a b"\]', not_search: '--runner|"--"'}}
+  - {id: plan-act-seed-run-explicit-key-not-carried, gate: plan_act, fn: plan_act, negative: true,
+     args: [{id: s3, act: {kind: seed, bundle: a, op: run, root: /R, ssh_auth: explicit_key, args: ['--', pb.yml]}}, *act_ctx_seed], needs_route_export: true,
+     expect: {search: '"run", "/R", "explicit_key", "pb\.yml"\].*"carried": ""', not_search: 'SSH_AUTH_SOCK='}}
+  - {id: plan-act-seed-ambient-deviation-before-launcher, gate: plan_act, fn: plan_act, negative: false,
+     args: [{id: s6, act: {kind: seed, bundle: a, op: run, root: /R, ssh_auth: agent, unset_env: [SSH_AUTH_SOCK], env: {USER: nobody}, args: ['--', pb.yml]}}, *act_ctx_seed], needs_route_export: true,
+     expect: {search: '"900s", "/usr/bin/env", "-u", "SSH_AUTH_SOCK", "USER=nobody", "/b/a/lme-seed-launch\.sh", "run", "/R", "agent", "pb\.yml"\]', not_search: '"-i"'}}
+  - {id: plan-act-seed-count-and-relative-deviations, gate: plan_act, fn: plan_act, negative: true,
+     args: [{id: s7, act: {kind: seed, bundle: a, op: run, root: /R, no_ssh_auth: true, launcher_path: ./lme-seed-launch.sh}}, *act_ctx_seed], needs_route_export: true,
+     expect: {search: '"900s", "\./lme-seed-launch\.sh", "run", "/R"\]'}}
+  - {id: plan-act-seed-direct-is-the-declared-vector, gate: plan_act, fn: plan_act, negative: true,
+     args: [{id: s8, act: {kind: seed, bundle: a, op: verify, root: /R, invoke: seed_direct, direct_purpose: seed_refusal, env: {LC_ALL: POSIX}}}, *act_ctx_seed], needs_route_export: true,
+     expect: {search: '"/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LC_ALL=POSIX", "HOME=/home/u", "/b/a/lme-controller-seed\.sh", "verify", "--root", "/R"\].*"form": "seed_direct"',
+              not_search: 'lme-seed-launch\.sh|direct_purpose'}}
+  # ---- codex 210509: seed_direct is LABELLED (direct_purpose) and shares the launcher's parameter derivation ----
+  - {id: plan-act-seed-direct-needs-label, gate: plan_act, fn: plan_act, negative: true,
+     args: [{id: s9, act: {kind: seed, bundle: a, op: verify, root: /R, invoke: seed_direct}}, *act_ctx_seed], needs_route_export: true,
+     expect: {search: '"unresolved": \[[^\]]*seed_direct without a declared direct_purpose \(seed_refusal \| launcher_member\)'}}
+  # G-LAUNCHER-CARRIED-PARAM-RENAME: the admitted rename reaches G's launcher construction (the pre-fix literal
+  # `ssh_auth_mode` left {auth_mode} unresolved and dropped the mode word)
+  - {id: plan-act-seed-run-renamed-carried-param, gate: plan_act, fn: plan_act, negative: false,
+     args: [{id: s10, act: {kind: seed, bundle: a, op: run, root: /R, args: ['--', pb.yml]}}, *act_ctx_seed_renamed], needs_route_export: true,
+     expect: {search: '"/b/a/lme-seed-launch\.sh", "run", "/R", "agent", "pb\.yml"\].*"carried": "SSH_AUTH_SOCK"',
+              not_search: 'mode param|auth_mode\}|"--ssh-auth"'}}
+  - {id: plan-act-seed-direct-renamed-carried-param, gate: plan_act, fn: plan_act, negative: false,
+     args: [{id: s11, act: {kind: seed, bundle: a, op: run, root: /R, invoke: seed_direct, direct_purpose: seed_refusal, args: ['--', pb.yml]}}, *act_ctx_seed_renamed], needs_route_export: true,
+     expect: {search: '"/b/a/lme-controller-seed\.sh", "run", "--root", "/R", "--ssh-auth", "agent", "--", "pb\.yml"\]', not_search: 'mode_args|auth_mode\}'}}
+  - {id: plan-act-seed-direct-renamed-no-ssh-auth-drops-carried-word, gate: plan_act, fn: plan_act, negative: true,
+     args: [{id: s12, act: {kind: seed, bundle: a, op: run, root: /R, invoke: seed_direct, direct_purpose: seed_refusal, no_ssh_auth: true, args: ['--', pb.yml]}}, *act_ctx_seed_renamed], needs_route_export: true,
+     expect: {search: '"/b/a/lme-controller-seed\.sh", "run", "--root", "/R", "--", "pb\.yml"\]', not_search: '--ssh-auth|"agent"'}}
+  # ---- codex 211754: no route export -> every seed mode unresolved (an ABSENT key, never read as zero parameters);
+  # runs without the export (it is the absence case) ----
+  - {id: plan-act-seed-no-route-export-unresolved, gate: plan_act, fn: plan_act, negative: true,
+     args: [{id: s13, act: {kind: seed, bundle: a, op: apply, root: /R}}, *act_ctx_seed_noexport],
+     expect: {search: '"unresolved": \[[^\]]*launch_params\.apply absent \(route export seed_launcher\.params_rel\)'}}
   # ---- plan_act extra_vars_json: ONE structured JSON -e (lme_resolved_run; RH-RUNNER-RESOLVED-WORKROOT controls) ----
   - {id: plan-act-extra-vars-json, gate: plan_act, fn: plan_act, negative: false,
      args: [{id: p2, act: {kind: playbook, playbook: acceptance, via: builder, inventory_omit_root: true,
