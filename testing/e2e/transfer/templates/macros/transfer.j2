@@ -170,19 +170,37 @@ exit $_fail
      B includes must be written "{{ '{{' }} tr_dir {{ '}}' }}/<tasks_dir>/<file>" and are loaded and walked; route includes must be
      written with the rh_repo_root or playbook_dir-based repository prefix and are emitted (not walked) for binding
      by path + sha256; anything else is emitted as UNRESOLVED and refused by check.yml. -#}
-{#- ---- execution scope (codex 163642 B-CONTROLLER-LEDGER-ANCESTRY-REFRESH): '1' when a task / block / include `apply`
-     runs on the OWNER CONTROLLER -- delegate_to == controller_scope.delegate_to AND every controller_scope.pin_vars
-     key bound as a task var whose expression names the declared source (controller_delegation.* / TMPDIR). -#}
-{%- macro ctl_pinned(cs, d, vs) -%}
-{%- set vs = vs if vs is mapping else {} -%}
-{%- if d is not none and d == cs.delegate_to and (cs.pin_vars.keys() | reject('in', vs) | list | length) == 0 -%}
-{%- set ns = namespace(ok=true) -%}
-{%- for k, want in cs.pin_vars.items() -%}{%- if want not in (vs[k] | string) -%}{%- set ns.ok = false -%}{%- endif -%}{%- endfor -%}
-{{ '1' if ns.ok else '' }}
+{#- ---- execution scope (codex 163642 B-CONTROLLER-LEDGER-ANCESTRY-REFRESH; codex 164854
+     B-CONTROLLER-SCOPE-CHECKER-FALSE-PASS). The walker carries the EFFECTIVE execution settings down the nesting the
+     way Ansible inherits them: `scope_fold` overlays one level (a task, a block, an include's `apply`, an include's own
+     parameters) onto its parent -- every keyword in controller_scope.tracked_keywords the level defines, and every
+     var in controller_scope.pin_vars / invalidating_vars it binds, REPLACES the inherited value (a descendant override
+     always recomputes). `scope_is_ctl` classifies the result as OWNER-CONTROLLER only when delegate_to is exactly
+     controller_scope.delegate_to, no other tracked keyword is set, every pin var is the EXACT declared expression
+     (a structural string equality; nothing is evaluated, so `'ssh' if 'controller_delegation.connection' else ...`
+     is simply not the declared form), and no invalidating var is bound anywhere on the chain. -#}
+{%- macro scope_fold(cs, eff, node, with_keywords) -%}
+{%- set m = dict(eff if eff is mapping else {}) -%}
+{%- set node = node if node is mapping else {} -%}
+{%- if with_keywords -%}
+{%- for k in cs.tracked_keywords if k in node -%}{{ m.update({'kw:' ~ k: node[k] | string}) or '' }}{%- endfor -%}
 {%- endif -%}
+{%- set vs = node.vars if node.vars is defined and node.vars is mapping else {} -%}
+{%- for k in (cs.pin_vars.keys() | list) + cs.invalidating_vars if k in vs -%}{{ m.update({'var:' ~ k: vs[k] | string}) or '' }}{%- endfor -%}
+{{ m | to_json }}
 {%- endmacro -%}
 
-{%- macro walk(tasks, via, tr, tr_dir, depth, ctl=false) -%}
+{%- macro scope_is_ctl(cs, eff) -%}
+{%- set ns = namespace(ok=(eff['kw:delegate_to'] | default(none)) == cs.delegate_to) -%}
+{%- for k in cs.tracked_keywords if k != 'delegate_to' and ('kw:' ~ k) in eff -%}{%- set ns.ok = false -%}{%- endfor -%}
+{%- for k, want in cs.pin_vars.items() if (eff['var:' ~ k] | default(none)) != want -%}{%- set ns.ok = false -%}{%- endfor -%}
+{%- for k in cs.invalidating_vars if ('var:' ~ k) in eff -%}{%- set ns.ok = false -%}{%- endfor -%}
+{{ '1' if ns.ok else '' }}
+{%- endmacro -%}
+
+{%- macro walk(tasks, via, tr, tr_dir, depth, eff=none) -%}
+{%- set eff = eff if eff is mapping else {} -%}
+{%- set cs = tr.controller_scope -%}
 {%- set kw = ['name', 'when', 'register', 'vars', 'loop', 'loop_control', 'changed_when', 'failed_when', 'tags',
               'delegate_to', 'run_once', 'environment', 'no_log', 'become', 'become_user', 'args', 'until', 'retries',
               'delay', 'ignore_errors', 'check_mode', 'notify', 'any_errors_fatal', 'listen', 'throttle', 'timeout',
@@ -190,14 +208,20 @@ exit $_fail
 {%- set bprefix = '{' ~ '{ tr_dir }' ~ '}/' ~ tr.tasks_dir ~ '/' -%}
 {%- set rprefix = '^\\{\\{ (rh_repo_root|playbook_dir \\| dirname \\| dirname \\| dirname) \\}\\}/' -%}
 {%- for t in (tasks or []) -%}
-{%- set tctl = ctl or (ctl_pinned(tr.controller_scope, t.delegate_to | default(none), t.vars | default({})) | trim == '1') -%}
+{#- teff: this task/block's own effective settings (keywords + vars overlay the inherited ones) -#}
+{%- set teff = scope_fold(cs, eff, t, true) | trim | from_json -%}
 {%- if t.block is defined -%}
-{{ walk(t.block, via, tr, tr_dir, depth, tctl) }}{{ walk(t.rescue | default([]), via, tr, tr_dir, depth, tctl) }}{{ walk(t.always | default([]), via, tr, tr_dir, depth, tctl) }}
+{{ walk(t.block, via, tr, tr_dir, depth, teff) }}{{ walk(t.rescue | default([]), via, tr, tr_dir, depth, teff) }}{{ walk(t.always | default([]), via, tr, tr_dir, depth, teff) }}
 {%- else -%}
 {%- set mods = t.keys() | reject('in', kw) | list -%}
 {%- set mod = (mods | first) if (mods | length == 1) else 'AMBIGUOUS:' ~ (mods | join(',')) -%}
-{%- set ap = (t[mod].apply | default({})) if (t[mod] is defined and t[mod] is mapping) else {} -%}
-{%- set cctl = tctl or (ctl_pinned(tr.controller_scope, ap.delegate_to | default(none), ap.vars | default({})) | trim == '1') -%}
+{%- set isinc = mod in ['ansible.builtin.include_tasks', 'ansible.builtin.import_tasks'] -%}
+{%- set ap = (t[mod].apply | default({})) if (isinc and t[mod] is mapping) else {} -%}
+{#- an include's CHILDREN: the inherited settings, overlaid by `apply` (keywords + task vars), then by the include's
+    own parameters (vars only; they outrank task vars). The include task's own keywords do not reach its children. -#}
+{%- set ceff = (scope_fold(cs, scope_fold(cs, eff, ap, true) | trim | from_json, {'vars': t.vars | default({})}, false) | trim | from_json)
+               if isinc else teff -%}
+{%- set cctl = scope_is_ctl(cs, ceff) | trim == '1' -%}
 {%- set row = {'module': mod, 'task': t.name | default(''), 'via': via, 'ctl': cctl,
                'delegate_to': t.delegate_to | default(none),
                'changed_when': (t.changed_when | string) if t.changed_when is defined else none,
@@ -208,7 +232,7 @@ exit $_fail
 {%- set f = t[mod] if t[mod] is string else (t[mod].file | default('')) -%}
 {%- if f.startswith(bprefix) and depth < 6 -%}
 {{ (row | combine({'include': 'b', 'file': f[bprefix | length:]}) | to_json) ~ '\n' }}
-{{- walk(lookup('ansible.builtin.file', tr_dir ~ '/' ~ tr.tasks_dir ~ '/' ~ f[bprefix | length:]) | from_yaml, via ~ '>' ~ f[bprefix | length:], tr, tr_dir, depth + 1, cctl) -}}
+{{- walk(lookup('ansible.builtin.file', tr_dir ~ '/' ~ tr.tasks_dir ~ '/' ~ f[bprefix | length:]) | from_yaml, via ~ '>' ~ f[bprefix | length:], tr, tr_dir, depth + 1, ceff) -}}
 {%- elif f is match(rprefix) -%}
 {{ (row | combine({'include': 'route', 'file': f | regex_replace(rprefix, '')}) | to_json) ~ '\n' }}
 {%- else -%}
