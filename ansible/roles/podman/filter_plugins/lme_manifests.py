@@ -2501,7 +2501,7 @@ def _rh_int(v):
 # DATA; this code names no contract, tool, env name or deployment value.
 _RH_CA_KINDS = frozenset(('keys', 'has_keys', 'enum', 'pattern', 'key_pattern', 'positive_int', 'strings', 'within',
                           'ere', 'ere_compose', 'umask_yields', 'not_in', 'rejects',
-                          'matches_ere', 'distinct_from', 'placeholder_words'))
+                          'matches_ere', 'distinct_from', 'placeholder_words', 'equals_registry'))
 _RH_CA_EACH = frozenset(('enum', 'pattern', 'strings', 'positive_int', 'has_keys', 'placeholder_words'))
 _RH_CA_MODS = {'each': _RH_CA_EACH, 'where': _RH_CA_EACH,
                'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',)), 'subject': frozenset(('within',)),
@@ -2625,7 +2625,9 @@ def _rh_ca_registry(ca, schema):
                   'distinct_from': strs(arg),
                   'placeholder_words': isinstance(arg, dict) and 'known' in arg and not set(arg) - {'known', 'whole_word', 'params', 'refused'}
                   and all(isinstance(arg[k], list) and all(isinstance(x, str) and x for x in arg[k]) for k in ('known', 'whole_word', 'refused') if k in arg)
-                  and ('params' not in arg or (isinstance(arg['params'], str) and arg['params'] in pats))}[kind]
+                  and ('params' not in arg or (isinstance(arg['params'], str) and arg['params'] in pats)),
+                  'equals_registry': isinstance(arg, dict) and 'path' in arg and not set(arg) - {'path', 'index'}
+                  and isinstance(arg['path'], str) and bool(arg['path']) and ('index' not in arg or (_rh_int(arg['index']) and arg['index'] >= 0))}[kind]
             for m in mods:
                 v = chk[m]
                 ok = ok and kind in _RH_CA_MODS[m] and {
@@ -2737,6 +2739,16 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
         return None
     if kind == 'placeholder_words':
         return _rh_ca_words(s, arg, pats)
+    if kind == 'equals_registry':
+        # one literal, owned by the registry (remote_harness_schema): the policy value must equal it; a registry
+        # path that is absent (or an index outside its list) refuses, never admits vacuously
+        where = arg['path'] + ('[%d]' % arg['index'] if 'index' in arg else '')
+        fg, want = _rh_get(schema, arg['path'])
+        if fg and 'index' in arg:
+            fg, want = (True, want[arg['index']]) if isinstance(want, list) and arg['index'] < len(want) else (False, None)
+        if not fg:
+            return 'requires registry %s declared (missing dependency)' % (where,)
+        return None if _rh_ca_same(s, want) else 'must equal registry %s (%r)' % (where, want)
     if kind == 'ere':
         return _rh_ca_ere(s, arg, chk.get('sed_delimited', False))
     if kind == 'ere_compose':
