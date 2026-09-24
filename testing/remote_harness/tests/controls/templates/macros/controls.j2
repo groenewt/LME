@@ -121,12 +121,14 @@
 {#- status before execution. deps: {name: {met: bool, kind, why}}; unimpl: [reasons] for this variant.
     applies_when {ruling: <dependency of kind ruling>, options: [...]}: unruled -> QUEUED; ruled another option -> NOT-APPLICABLE.
     retire_when <dependency>: once it is met the control is RETIRED -> NOT-APPLICABLE (recorded, never coverage).
-    Returns {status: QUEUED|UNIMPLEMENTED|RESIDUAL|OPEN-REGRESSION|NOT-APPLICABLE|READY, why: [...]} -#}
+    A requirement of kind main_only -> MAIN-ONLY (MAIN's run population; G never runs it; never PASS/coverage on G).
+    Returns {status: QUEUED|MAIN-ONLY|UNIMPLEMENTED|RESIDUAL|OPEN-REGRESSION|NOT-APPLICABLE|READY, why: [...]} -#}
 {%- macro plan_status(c, variant, deps, unimpl) -%}
 {%- set req = (c.requires | default([])) + (variant.requires | default([])) + ((['variant:' ~ (variant.declaration | default(c.declaration))]) if (variant.declaration | default(c.declaration | default(''))) else []) -%}
-{%- set ns = namespace(queued = [], after = []) -%}
+{%- set ns = namespace(queued = [], after = [], main = false) -%}
 {%- for r in req -%}
 {%- set d = deps[r] | default({'met': false, 'kind': 'undeclared', 'why': 'undeclared dependency'}) -%}
+{%- if d.kind == 'main_only' -%}{%- set ns.main = true -%}{%- endif -%}
 {%- if d.kind == 'control' and not d.met -%}{%- set ns.after = ns.after + ['after ' ~ d.control] -%}
 {%- elif not d.met -%}{%- set ns.queued = ns.queued + [r ~ ': ' ~ d.why] -%}{%- endif -%}
 {%- endfor -%}
@@ -143,6 +145,9 @@
 {%- elif rw and rd.met -%}{{ {'status': 'NOT-APPLICABLE', 'why': ['retired: ' ~ rw ~ ' is met (' ~ rd.why ~ ')']} | to_json }}
 {%- elif aw and ad.met and ad.value not in aw.options -%}{{ {'status': 'NOT-APPLICABLE', 'why': [aw.ruling ~ ' ruled ' ~ ad.value ~ '; this control declares option ' ~ (aw.options | join('|'))]} | to_json }}
 {%- elif aw and not ad.met -%}{{ {'status': 'QUEUED', 'why': [aw.ruling ~ ': ' ~ ad.why] + ns.queued} | to_json }}
+{#- a variant requiring a main_only dependency is MAIN's run population (root / another uid / a real target, or a codex
+    ruling that made it MAIN's): never QUEUED on G, never NOT-APPLICABLE, never coverage here; its other unmet deps are listed -#}
+{%- elif ns.main -%}{{ {'status': 'MAIN-ONLY', 'why': ns.queued} | to_json }}
 {%- elif c.result_class is defined -%}{{ {'status': c.result_class, 'why': [c.declared_only | default(c.note | default(''))] + ns.queued} | to_json }}
 {%- elif ns.queued -%}{{ {'status': 'QUEUED', 'why': ns.queued} | to_json }}
 {%- elif unimpl -%}{{ {'status': 'UNIMPLEMENTED', 'why': unimpl} | to_json }}
@@ -167,7 +172,10 @@
 {#- ------------------------------------------------------------ argv ------------------------------------- -#}
 {%- macro envp(ctx, extra, unset) -%}
 {%- set bs = ctx.rh.controller.bootstrap -%}
-{%- set ns = namespace(e = {'HOME': ctx.env.HOME, 'XDG_RUNTIME_DIR': ctx.env.XDG_RUNTIME_DIR, 'DBUS_SESSION_BUS_ADDRESS': ctx.env.DBUS_SESSION_BUS_ADDRESS}) -%}
+{#- TMPDIR = <run dir>/act-tmp (created by execute.yml): a direct entrypoint (package/acquire via the builder, command acts)
+    never falls back to /tmp under env -i; a seed sets its own TMPDIR for what it runs; an act's env may still override it -#}
+{%- set ns = namespace(e = {'HOME': ctx.env.HOME, 'XDG_RUNTIME_DIR': ctx.env.XDG_RUNTIME_DIR, 'DBUS_SESSION_BUS_ADDRESS': ctx.env.DBUS_SESSION_BUS_ADDRESS,
+                            'TMPDIR': (ctx.t.run ~ '/act-tmp') if (ctx.t.run | default('')) else ''}) -%}
 {%- set ns.e = ns.e | combine(bs.base_env) | combine(extra | default({})) -%}
 {%- set ns.a = [ctx.tools.env, '-i'] -%}
 {%- for k in ns.e | sort if k not in (unset | default([])) and (ns.e[k] | string | length) > 0 -%}{%- set ns.a = ns.a + [k ~ '=' ~ ns.e[k]] -%}{%- endfor -%}
