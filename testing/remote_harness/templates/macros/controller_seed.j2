@@ -86,22 +86,41 @@ lme_refuse {{ sl.refusal }} {{ shq('undeclared seed_launch.base_check mode: ' ~ 
 {% endif %}
 {%- endmacro -%}
 
-{#- (2) the ONE invoker derivation (after the os-tool identity checks): uid, passwd home == HOME, the user manager
-    runtime dir (declared {uid} rule, owned, declared mode) and bus socket, caller-supplied names unset or equal,
-    the account name. Sets _uid _home _xrd _bus _user; run-local and the budget scope consume these. -#}
-{%- macro launch_derive(bs) -%}
+{#- the invoker's uid and passwd home (seed_launch.derive.home: declared tool, database, field): the ONE home
+    derivation, shared by the seed (launch_derive) and the generated launcher (seed_launcher). Sets _uid _pw _home.
+    The uid class is spelled out (no bracket range): the launcher runs it under the caller's ambient locale. -#}
+{%- macro launch_home(bs) -%}
 {% set sl = bs.seed_launch %}
 {% set dh = sl.derive.home %}
-{% set um = bs.target_bootstrap.user_manager %}
-{% set un = bs.work_roots.run_local.user_manager_env %}
-{% set rt = um.runtime_dir.split('{uid}') %}
 {% set hp = '*:' * ((dh.field | int) - 1) %}
 _uid=$({{ x(bs, 'id') }} -u) || lme_refuse {{ sl.refusal }} 'seed launch: cannot read the invoking uid'
-case "$_uid" in ''|*[!0-9]*) lme_refuse {{ sl.refusal }} "seed launch: unadmitted uid: $_uid" ;; esac
+case "$_uid" in ''|*[!0123456789]*) lme_refuse {{ sl.refusal }} "seed launch: unadmitted uid: $_uid" ;; esac
 _pw=$({{ x(bs, dh.tool) }} {{ shq(dh.database) }} "$_uid") || lme_refuse {{ sl.refusal }} "seed launch: no {{ dh.database }} entry for uid $_uid"
 _home=${_pw#{{ hp ~ '}' }}
 _home=${_home%%:*}
 case "$_home" in /*) : ;; *) lme_refuse {{ sl.refusal }} "seed launch: the {{ dh.database }} home of uid $_uid is not absolute: $_home" ;; esac
+{%- endmacro -%}
+
+{#- (2) the ONE invoker derivation (after the os-tool identity checks): uid, passwd home == HOME, the user manager
+    runtime dir (declared {uid} rule, owned, declared mode) and bus socket, caller-supplied names unset or equal,
+    the account name. Sets _uid _home _xrd _bus _user; run-local and the budget scope consume these. The runtime and
+    name nodes are READ through the declared pointers seed_launch.derive.runtime / .names (paths relative to
+    controller.bootstrap), never assumed. -#}
+{%- macro launch_derive(bs) -%}
+{% set sl = bs.seed_launch %}
+{% set dh = sl.derive.home %}
+{% set pr = namespace(n=bs) %}
+{% for k in sl.derive.runtime.split('.') %}
+{% set pr.n = pr.n[k] %}
+{% endfor %}
+{% set pn = namespace(n=bs) %}
+{% for k in sl.derive.names.split('.') %}
+{% set pn.n = pn.n[k] %}
+{% endfor %}
+{% set um = pr.n %}
+{% set un = pn.n %}
+{% set rt = um.runtime_dir.split('{uid}') %}
+{{ launch_home(bs) }}
 [ -d "$_home" ] && [ ! -L "$_home" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$_home")" = "$_uid" ] || lme_refuse {{ sl.refusal }} "seed launch: the {{ dh.database }} home $_home of uid $_uid is not an owned real directory"
 [ "${HOME-}" = "$_home" ] || lme_refuse {{ sl.refusal }} "seed launch: HOME=${HOME-} is not the {{ dh.database }} home $_home of uid $_uid"
 _xrd={{ shq(rt[0]) }}"$_uid"{{ shq(rt[1] if rt | length > 1 else '') }}
@@ -122,7 +141,9 @@ lme_refuse {{ sl.refusal }} {{ shq('undeclared seed_launch.derive.caller_values 
 {#- (3) the ONLY environment of `systemd-run --user` (probe and scope exec): env -i with exactly seed_launch.scope_env -#}
 {%- macro launch_scope_env(bs) -%}
 {%- set sl = bs.seed_launch -%}
-{%- set un = bs.work_roots.run_local.user_manager_env -%}
+{%- set pn = namespace(n=bs) -%}
+{%- for k in sl.derive.names.split('.') -%}{%- set pn.n = pn.n[k] -%}{%- endfor -%}
+{%- set un = pn.n -%}
 {%- set ns = namespace(w=[]) -%}
 {%- for e in sl.scope_env -%}
 {%- if e == 'HOME' -%}{%- set ns.w = ns.w + ['HOME="$HOME"'] -%}
@@ -132,6 +153,113 @@ lme_refuse {{ sl.refusal }} {{ shq('undeclared seed_launch.derive.caller_values 
 {%- else -%}{{ sl['undeclared scope_env entry ' ~ e].render_error }}{%- endif -%}
 {%- endfor -%}
 {{ x(bs, 'env') }} -i {{ ns.w | join(' ') }}
+{%- endmacro -%}
+
+{#- ---- SEED LAUNCHER (controller.bootstrap.seed_launcher; codex-tick217 R1): the generated caller entry of
+     seed_launch, rendered next to the seed as bundle.launcher_file (templates/lme-seed-launcher.sh.j2). It is the
+     ONLY renderer of the seed_launch exec vector: target_bootstrap.yml, B's gate, G's acts and MAIN run THIS file. ---- -#}
+{#- the positional parameters of one mode: each placeholder of its mode_args other than {root} / {args}, in order -#}
+{%- macro launch_params(words) -%}
+{%- set q = namespace(l=[]) -%}
+{%- for w in words -%}{%- for p in w.split('{')[1:] -%}{%- set n = p.split('}')[0] -%}{%- if n not in ['root', 'args'] and n not in q.l -%}{%- set q.l = q.l + [n] -%}{%- endif -%}{%- endfor -%}{%- endfor -%}
+{{ q.l | join(' ') }}
+{%- endmacro -%}
+
+{#- one declared argv word as ONE shell word: literal text single-quoted, each {placeholder} replaced by its runtime
+    value (a double-quoted expansion); an undeclared or unterminated placeholder is a render error -#}
+{%- macro launch_word(bs, w, m, ps) -%}
+{%- set pm = {'os_tools.env.path': x(bs, 'env') | string, 'bundle_dir': '"$_B"', 'bundle.seed_file': shq(bs.bundle.seed_file) | string,
+              'mode': shq(m) | string, 'root': '"$_root"'} -%}
+{%- set parts = w.split('{') -%}
+{%- set ns = namespace(o=(shq(parts[0]) | string if parts[0] | length > 0 else '')) -%}
+{%- for p in parts[1:] -%}
+{%- set kv = p.split('}', 1) -%}
+{%- if kv | length != 2 -%}{{ bs.seed_launch['unterminated placeholder in ' ~ w].render_error }}{%- endif -%}
+{%- set ns.o = ns.o ~ (pm[kv[0]] if kv[0] in pm else ('"$_p' ~ (ps.index(kv[0]) + 1) ~ '"' if kv[0] in ps
+                  else bs.seed_launch['undeclared seed_launch placeholder {' ~ kv[0] ~ '}'].render_error))
+                  ~ (shq(kv[1]) | string if kv[1] | length > 0 else '') -%}
+{%- endfor -%}
+{{ ns.o if ns.o | length > 0 else "''" }}
+{%- endmacro -%}
+
+{#- the exec vector of one mode: seed_launch.argv with {env_pairs} = env.order (env.base values, env.inherited HOME =
+    the derived $_home) [+ the carried socket name, the caller's value], {mode_args} = mode_args.<mode> ({args} = "$@") -#}
+{%- macro launch_exec(bs, m, ps, carry) -%}
+{%- set sl = bs.seed_launch -%}
+{%- set ns = namespace(w=[]) -%}
+{%- for w in sl.argv -%}
+{%- if w == '{env_pairs}' -%}
+{%- for n in sl.env.order -%}
+{%- if n in sl.env.inherited -%}
+{%- if sl.env.inherited[n] == 'invoker_passwd_home' -%}{%- set ns.w = ns.w + [n ~ '="$_home"'] -%}
+{%- else -%}{{ sl.env['undeclared seed_launch.env.inherited kind ' ~ sl.env.inherited[n]].render_error }}{%- endif -%}
+{%- else -%}{%- set ns.w = ns.w + [n ~ '=' ~ shq(bs[sl.env.base][n])] -%}{%- endif -%}
+{%- endfor -%}
+{%- if carry -%}{%- set ns.w = ns.w + [carry ~ '="${' ~ carry ~ '-}"'] -%}{%- endif -%}
+{%- elif w == '{mode_args}' -%}
+{%- for a in sl.mode_args[m] -%}
+{%- if a == '{args}' -%}{%- set ns.w = ns.w + ['"$@"'] -%}{%- else -%}{%- set ns.w = ns.w + [launch_word(bs, a, m, ps) | string] -%}{%- endif -%}
+{%- endfor -%}
+{%- else -%}{%- set ns.w = ns.w + [launch_word(bs, w, m, ps) | string] -%}
+{%- endif -%}
+{%- endfor -%}
+{{ ns.w | join(' ') }}
+{%- endmacro -%}
+
+{%- macro seed_launcher(bs) -%}
+{% set sl = bs.seed_launch %}
+{% set ln = bs.seed_launcher %}
+{% set b = bs.bundle %}
+{% set sa = bs.ssh_auth %}
+{% set cw = sl.env.carried.when %}
+{% if ln.caller_argv != ['{bundle_dir}/{bundle.launcher_file}', '{mode}', '{root}', '{mode_params}', '{args}'] or ln.member != 'bundle.launcher_file' or ln.mode_params != 'mode_args_placeholders' or ln.self_path != 'absolute_realpath_dirname' or b.launcher_custody != 'seed_file' or sl.env['clear'] != true or sl.env.carried.name_from != 'ssh_auth.modes.<mode>.socket_env' or bs.os_tools.sh.path.split() | length != 1 or bs.os_tools.sh.path[:1] != '/' %}
+{{ ln['a seed_launcher / seed_launch shape this macro does not implement'].render_error }}
+{% endif %}
+#!{{ bs.os_tools.sh.path }}
+# GENERATED by testing/remote_harness/package.yml from {{ cmt(ln.template_rel) }} (macro seed_launcher of
+# {{ cmt(bs.macros_rel) }}) and manifests/profiles/remote-harness.yml (controller.bootstrap.seed_launch, .seed_launcher).
+# A BUILD OUTPUT next to {{ cmt(b.seed_file) }} in the same bundle; never committed, never hand-edited.
+#
+# {{ cmt(b.launcher_file) }} -- the ONE caller entry of seed_launch: it starts <this file's directory>/{{ cmt(b.seed_file) }} with
+#   EXACTLY the declared launch environment ({{ cmt(sl.env.order | join(' ')) }}; HOME = the invoker's {{ cmt(sl.derive.home.database) }} home),
+#   whatever the caller's environment holds (PATH, locale, XDG_*, DBUS_*, USER, ...). Nothing ambient reaches the seed
+#   except, for mode {{ cmt(cw.mode) }} with an ssh auth mode whose agent is {{ cmt(cw.ssh_auth_agent) }}, that mode's socket variable.
+#   Argument boundaries are preserved ("$@"; no eval). Only admitted absolute tool paths; no PATH lookup.
+# Custody: this file is admitted as a generated member of the bundle ({{ cmt(b.checksum_file) }}, {{ cmt(b.manifest_file) }}, exact members).
+#   It runs BEFORE the seed's checks, so the seed it starts cannot vouch for it; the seed's bundle check is additional.
+# usage (invoke by its ABSOLUTE path; its directory is the bundle):
+{% for mode, words in sl.mode_args | dictsort %}
+{% set ps = (launch_params(words) | string).split() %}
+#   <bundle>/{{ cmt(b.launcher_file) }} {{ cmt(mode) }} <root>{% for p in ps %} <{{ cmt(p) }}>{% endfor %}{{ ' [<args> ...]' if '{args}' in words else '' }}
+{% endfor %}
+set -u
+{{ refusal_fn(bs.refusals) }}
+case "$0" in /*) : ;; *) lme_refuse {{ sl.refusal }} 'seed launcher: invoke it by its absolute path (its directory is the bundle)' ;; esac
+_self=$({{ x(bs, 'realpath') }} -e -- "$0") || lme_refuse {{ sl.refusal }} 'seed launcher: cannot resolve its own path'
+_B=${_self%/*}
+[ $# -ge 2 ] || lme_refuse {{ sl.refusal }} {{ shq('seed launcher: usage: <mode> <root> [<mode params>] [<args> ...]; modes: ' ~ (sl.mode_args | list | sort | join(', '))) }}
+_mode=$1; _root=$2; shift 2
+{{ launch_home(bs) }}
+case "$_mode" in
+{% for mode, words in sl.mode_args | dictsort %}
+{% set ps = (launch_params(words) | string).split() %}
+  {{ shq(mode) }})
+    [ $# -{{ 'ge' if '{args}' in words else 'eq' }} {{ ps | length }} ] || lme_refuse {{ sl.refusal }} {{ shq('seed launcher: ' ~ mode ~ ' takes <root>' ~ ((' <' ~ (ps | join('> <')) ~ '>') if ps else '') ~ (' [<args> ...]' if '{args}' in words else ' and nothing else')) }}
+{% for p in ps %}
+    _p{{ loop.index }}=$1; shift
+{% endfor %}
+{% if mode == cw.mode %}
+    case "$_p{{ ps.index(ln.carried_param) + 1 }}" in
+{% for k, d in sa.modes | dictsort if d.agent == cw.ssh_auth_agent %}
+      {{ shq(k) }}) exec {{ launch_exec(bs, mode, ps, d.socket_env) }} ;;
+{% endfor %}
+    esac
+{% endif %}
+    exec {{ launch_exec(bs, mode, ps, none) }}
+    ;;
+{% endfor %}
+  *) lme_refuse {{ sl.refusal }} "seed launcher: unknown mode: $_mode" ;;
+esac
 {%- endmacro -%}
 
 {%- macro managed_env(bs, home_dir, tmp_dir, extra=[]) -%}
@@ -778,13 +906,14 @@ fi
 {%- endmacro -%}
 
 {#- ---- SEED2-BUNDLE-COMPLETION: apply refuses before ANY mutation unless its own directory is a complete, bound
-     package.yml bundle (exact members with modes, exact check-file names, seed line = running seed digest,
+     package.yml bundle (exact members with modes -- the launcher bundle.launcher_file included, with the seed's
+     custody --, exact check-file names, seed line = running seed digest,
      sha256sum --check, bundle.json binds the seed and check-file digests). ---- -#}
 {%- macro bundle_check(bs, lock) -%}
 {% set b = bs.bundle %}
 {% set cf = b.checksum_format %}
 {% set rows = bs.artifacts + lock.packages + lock.collections %}
-{% set ns = namespace(members=['d 700 ' ~ b.artifacts_dir, 'f 500 ' ~ b.seed_file, 'f 400 ' ~ b.manifest_file, 'f 400 ' ~ b.checksum_file], names=[b.seed_file]) %}
+{% set ns = namespace(members=['d 700 ' ~ b.artifacts_dir, 'f 500 ' ~ b.seed_file, 'f ' ~ (b.launcher_mode | string)[1:] ~ ' ' ~ b.launcher_file, 'f 400 ' ~ b.manifest_file, 'f 400 ' ~ b.checksum_file], names=[b.seed_file, b.launcher_file]) %}
 {% for a in rows %}
 {% set ns.members = ns.members + ['f 400 ' ~ b.artifacts_dir ~ '/' ~ a.file] %}
 {% set ns.names = ns.names + [b.artifacts_dir ~ '/' ~ a.file] %}
@@ -965,12 +1094,15 @@ fi
 {% set wr = bs.work_roots %}
 {% set rl = wr.run_local %}
 {% set rs = rl.resolved_run %}
+{% set pn = namespace(n=bs) %}
+{% for k in bs.seed_launch.derive.names.split('.') %}{% set pn.n = pn.n[k] %}{% endfor %}
+{% set un = pn.n %}
 {% set ap = '$G/' ~ bs.layout.gen_dirs.venv ~ '/bin/ansible-playbook' %}
 {% set rcpt = '$G/' ~ bs.layout.receipts_dir ~ '/toolchain.json' %}
 {#- the exported path-valued names (one list: exported AND recorded in lme_resolved_run.env) -#}
 {% set ns = namespace(extra=[]) %}
 {% for e in wr.run_env %}{% set ns.extra = ns.extra + [e.name ~ '=$W/' ~ wr.sub_roots[e.sub] ~ '/' ~ e.rel] %}{% endfor %}
-{% set ns.extra = ns.extra + [rs.remote_tmp_env ~ '=$_run/tmp', rl.user_manager_env.runtime_dir_env ~ '=$_xrd'] %}
+{% set ns.extra = ns.extra + [rs.remote_tmp_env ~ '=$_run/tmp', un.runtime_dir_env ~ '=$_xrd'] %}
 {% set env_rec = (managed_pairs(bs, '$_run/ansible-home', '$_run/tmp') | string).split('\n') + ns.extra + ['HOME=$HOME'] %}
 [ -n "$_co" ] && [ -n "$W" ] || lme_refuse RH-SEED-USAGE '{{ rl.mode }} without an admitted workspace anchor'
 {{ path_arg_check(bs, 'HOME', 'HOME') }}
@@ -1010,7 +1142,7 @@ _rr=$(printf {{ shq('{"' ~ rs.var ~ '":{"runner":"%s","work_root":"%s","ansible_
 set -- "$@" {{ shq(rl.arg_flags | first) }} "$_rr"
 lme_ancestry "$_ev/."
 lme_ancestry "$_pb"
-{{ managed_env(bs, '$_run/ansible-home', '$_run/tmp', ns.extra) }} {{ rl.user_manager_env.bus_env }}="$_bus" {{ rl.user_manager_env.user_env }}="$_user" "{{ ap }}" -i {{ shq(rl.inventory) }} -c {{ shq(rl.connection) }} "$_pb" "$@" 9<&-
+{{ managed_env(bs, '$_run/ansible-home', '$_run/tmp', ns.extra) }} {{ un.bus_env }}="$_bus" {{ un.user_env }}="$_user" "{{ ap }}" -i {{ shq(rl.inventory) }} -c {{ shq(rl.connection) }} "$_pb" "$@" 9<&-
 exit $?
 {%- endmacro -%}
 

@@ -8,7 +8,8 @@
 #   rh_admit_policy  the class scope's own resolved policy (what the seed was rendered from)
 #   rh_admit_lock    that policy's lock
 #
-# Admitted only when the bundle holds EXACTLY: the seed (0500), bundle.json and bundle.sha256 (0400), and
+# Admitted only when the bundle holds EXACTLY: the seed (0500), the seed launcher (bundle.launcher_file,
+# bundle.launcher_mode = the seed's custody; byte-identical to a fresh render and recorded in bundle.json), bundle.json and bundle.sha256 (0400), and
 # artifacts/ (0700) with exactly the class's declared files (0400), no links, no other entry; every artifact has its
 # declared sha256; the seed is byte-identical to a FRESH render of the class policy; bundle.json names that seed
 # digest, the declared artifact rows and THIS class key (a bundle of another class, or a stale one, refuses: never a
@@ -63,7 +64,8 @@
     get_checksum: true
     checksum_algorithm: sha256
   loop: >-
-    {{ [rh.controller.bootstrap.bundle.seed_file, rh.controller.bootstrap.bundle.manifest_file, rh.controller.bootstrap.bundle.checksum_file]
+    {{ [rh.controller.bootstrap.bundle.seed_file, rh.controller.bootstrap.bundle.manifest_file, rh.controller.bootstrap.bundle.checksum_file,
+        rh.controller.bootstrap.bundle.launcher_file]
        + ((rh_admit_policy.controller.bootstrap.artifacts + rh_admit_lock.packages + rh_admit_lock.collections)
           | map(attribute='file') | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/') | list) }}
   register: _rh_bnd_stat
@@ -78,7 +80,8 @@
     _rows: "{{ rh_admit_policy.controller.bootstrap.artifacts + rh_admit_lock.packages + rh_admit_lock.collections }}"
     _expect_members: >-
       {{ ([rh.controller.bootstrap.bundle.seed_file, rh.controller.bootstrap.bundle.manifest_file,
-           rh.controller.bootstrap.bundle.checksum_file, rh.controller.bootstrap.bundle.artifacts_dir]
+           rh.controller.bootstrap.bundle.checksum_file, rh.controller.bootstrap.bundle.launcher_file,
+           rh.controller.bootstrap.bundle.artifacts_dir]
           + (_rows | map(attribute='file') | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/') | list))
          | sort }}
     _fresh_seed_sha256: >-
@@ -92,10 +95,19 @@
       - _rh_bnd_list.files | selectattr('islnk') | list | length == 0
       - _rh_bnd_stat.results | rejectattr('stat.isreg') | list | length == 0
       - _rh_bnd_stat.results[0].stat.mode == '0500'
-      - _rh_bnd_stat.results[1:] | map(attribute='stat.mode') | unique | list == ['0400']
+      - _rh_bnd_stat.results[3].stat.mode == rh.controller.bootstrap.bundle.launcher_mode
+      - (_rh_bnd_stat.results[1:3] + _rh_bnd_stat.results[4:]) | map(attribute='stat.mode') | unique | list == ['0400']
       - _rh_bnd_list.files | selectattr('isdir') | map(attribute='mode') | list == ['0700']
-      - _rh_bnd_stat.results[3:] | map(attribute='stat.checksum') | list == _rows | map(attribute='sha256') | list
+      - _rh_bnd_stat.results[4:] | map(attribute='stat.checksum') | list == _rows | map(attribute='sha256') | list
       - _rh_bnd_stat.results[0].stat.checksum == _fresh_seed_sha256
+      # the launcher (seed_launcher) is admitted as a generated artifact: byte-identical to a FRESH render of the class
+      # policy and recorded in bundle.json; it runs before the seed, so this admission (not the seed) is its boundary
+      - >-
+        _rh_bnd_stat.results[3].stat.checksum
+        == lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ rh.controller.bootstrap.seed_launcher.template_rel,
+                  template_vars={'lme_seed_bs': rh_admit_policy.controller.bootstrap}) | hash('sha256')
+      - _m.launcher_file | default('') == rh.controller.bootstrap.bundle.launcher_file
+      - _m.launcher_sha256 | default('') == _rh_bnd_stat.results[3].stat.checksum
       - _m.schema == rh.controller.bootstrap.bundle.schema
       - _m.seed_sha256 == _fresh_seed_sha256
       - _m.checksum_file_sha256 == _rh_bnd_stat.results[2].stat.checksum
@@ -113,6 +125,7 @@
       dir: "{{ rh_admit_dir }}"
       class_key: "{{ rh_admit_key }}"
       seed_sha256: "{{ _rh_bnd_stat.results[0].stat.checksum }}"
+      launcher_sha256: "{{ _rh_bnd_stat.results[3].stat.checksum }}"
       checksum_file_sha256: "{{ _rh_bnd_stat.results[2].stat.checksum }}"
       manifest_sha256: "{{ _rh_bnd_stat.results[1].stat.checksum }}"
       bytes: "{{ _rh_bnd_stat.results | map(attribute='stat.size') | sum }}"
@@ -122,6 +135,7 @@
       members: >-
         {{ (['d 700 ' ~ rh.controller.bootstrap.bundle.artifacts_dir,
              'f 500 ' ~ rh.controller.bootstrap.bundle.seed_file,
+             'f ' ~ (rh.controller.bootstrap.bundle.launcher_mode | string)[1:] ~ ' ' ~ rh.controller.bootstrap.bundle.launcher_file,
              'f 400 ' ~ rh.controller.bootstrap.bundle.manifest_file,
              'f 400 ' ~ rh.controller.bootstrap.bundle.checksum_file]
             + ((rh_admit_policy.controller.bootstrap.artifacts + rh_admit_lock.packages + rh_admit_lock.collections) | map(attribute='file')

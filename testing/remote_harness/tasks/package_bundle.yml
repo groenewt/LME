@@ -132,7 +132,7 @@
       {{ (_rh_pkg_src.results | map(attribute='stat.size') | sum)
          * rh.controller.bootstrap.bundle.staging_retention.budget.free_bytes_factor_package }}
     rh_reap_members: >-
-      {{ [rh.controller.bootstrap.bundle.seed_file, rh.controller.bootstrap.bundle.manifest_file,
+      {{ [rh.controller.bootstrap.bundle.seed_file, rh.controller.bootstrap.bundle.launcher_file, rh.controller.bootstrap.bundle.manifest_file,
           rh.controller.bootstrap.bundle.checksum_file, rh.controller.bootstrap.bundle.artifacts_dir]
          + ((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections) | map(attribute='file')
             | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/') | list) }}
@@ -167,6 +167,40 @@
     lme_seed_bs: "{{ rh_pub_policy.controller.bootstrap }}"
     lme_seed_ctl: "{{ rh_pub_policy.controller }}"
     lme_seed_lock: "{{ rh_pub_lock }}"
+
+# SEED LAUNCHER (controller.bootstrap.seed_launcher; codex-tick217 R1): the generated caller entry of seed_launch,
+# rendered from the SAME class policy by the shared macro seed_launcher, next to the seed with the seed's custody
+# (bundle.launcher_mode / launcher_custody): a bundle member, a check-file line and a bundle.json digest.
+- name: Render the seed launcher from the declarations (the ONLY way a launcher comes to exist)
+  ansible.builtin.template:
+    src: "{{ rh_repo_root }}/{{ rh.controller.bootstrap.seed_launcher.template_rel }}"
+    dest: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.launcher_file }}"
+    mode: "{{ rh.controller.bootstrap.bundle.launcher_mode }}"
+  vars:
+    lme_seed_bs: "{{ rh_pub_policy.controller.bootstrap }}"
+
+- name: Digest the rendered seed launcher
+  ansible.builtin.stat:
+    path: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.launcher_file }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+    follow: false
+  register: _rh_pkg_lnch
+
+- name: Refuse a staged launcher that differs from a fresh render (or is not a regular file of the declared mode)
+  ansible.builtin.assert:
+    that:
+      - _rh_pkg_lnch.stat.exists and _rh_pkg_lnch.stat.isreg and not _rh_pkg_lnch.stat.islnk
+      - _rh_pkg_lnch.stat.mode == rh.controller.bootstrap.bundle.launcher_mode
+      - >-
+        _rh_pkg_lnch.stat.checksum
+        == lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ rh.controller.bootstrap.seed_launcher.template_rel,
+                  template_vars={'lme_seed_bs': rh_pub_policy.controller.bootstrap}) | hash('sha256')
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.bundle.refusals.staged }}: the staged {{ rh.controller.bootstrap.bundle.launcher_file }}
+      is not a fresh render of the declarations (mode {{ rh.controller.bootstrap.bundle.launcher_mode }}); nothing was
+      published (staging {{ _rh_pkg_stage.path }} is left for inspection; the next run reaps it under bundle.staging_retention).
+    quiet: true
 
 - name: Digest the staged copies and the rendered seed
   ansible.builtin.stat:
@@ -205,14 +239,15 @@
 # newline). Statement ({% %}) string constants are NOT escaped (same tokeniter: only between variable_begin/_end), so
 # Jinja unescapes '\n' there to a newline. The published file is re-read and refused below if it is not the exact
 # sha256sum --check form.
-- name: Write the Ansible-free consumer check (sha256sum --check format; seed + every artifact)
+- name: Write the Ansible-free consumer check (sha256sum --check format; seed + launcher + every artifact)
   ansible.builtin.copy:
     dest: "{{ _rh_pkg_stage.path }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
     mode: '0400'
     content: >-
       {% set cf = rh.controller.bootstrap.bundle.checksum_format -%}
       {% set nl = {'newline': '\n'}[cf.terminator] -%}
-      {{ ([_rh_pkg_dst.results[-1].stat.checksum ~ cf.separator ~ rh.controller.bootstrap.bundle.seed_file]
+      {{ ([_rh_pkg_dst.results[-1].stat.checksum ~ cf.separator ~ rh.controller.bootstrap.bundle.seed_file,
+           _rh_pkg_lnch.stat.checksum ~ cf.separator ~ rh.controller.bootstrap.bundle.launcher_file]
           + ((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
              | map(attribute='sha256')
              | zip((rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections)
@@ -224,7 +259,8 @@
     _cf: "{{ rh.controller.bootstrap.bundle.checksum_format }}"
     _rows: "{{ rh_pub_policy.controller.bootstrap.artifacts + rh_pub_lock.packages + rh_pub_lock.collections }}"
     _want: >-
-      {{ [_rh_pkg_dst.results[-1].stat.checksum ~ _cf.separator ~ rh.controller.bootstrap.bundle.seed_file]
+      {{ [_rh_pkg_dst.results[-1].stat.checksum ~ _cf.separator ~ rh.controller.bootstrap.bundle.seed_file,
+          _rh_pkg_lnch.stat.checksum ~ _cf.separator ~ rh.controller.bootstrap.bundle.launcher_file]
          + (_rows | map(attribute='sha256')
             | zip(_rows | map(attribute='file') | map('regex_replace', '^', rh.controller.bootstrap.bundle.artifacts_dir ~ '/'))
             | map('join', _cf.separator) | list) }}
@@ -232,7 +268,7 @@
     # conditionals are evaluated with escape_backslashes=False (_engine.py evaluate_conditional), so '\n' below IS a
     # newline; the file is read unstripped (rstrip=false) on the controller (genesis is localhost, connection local)
     that:
-      - _want | length == 1 + (_rows | length)
+      - _want | length == 2 + (_rows | length)
       # the ONE grammar (bundle.checksum_format), the same the seed's lme_bundle_check applies with grep -x -E
       - _want | reject('match', '^' ~ _cf.digest ~ _cf.separator ~ _cf.name ~ '$') | list | length == 0
       - >-
@@ -240,8 +276,8 @@
         == (_want | join({'newline': '\n'}[_cf.terminator])) ~ {'newline': '\n'}[_cf.terminator]
     fail_msg: >-
       REFUSED {{ rh.controller.bootstrap.bundle.refusals.staged }}: the staged {{ rh.controller.bootstrap.bundle.checksum_file }}
-      is not exactly {{ _want | length }} newline-terminated lines '<64 hex>  <path>' in the declared order (seed, then
-      every artifact) -- the seed's bundle check would refuse it; nothing was published (staging
+      is not exactly {{ _want | length }} newline-terminated lines '<64 hex>  <path>' in the declared order (seed, launcher,
+      then every artifact) -- the seed's bundle check would refuse it; nothing was published (staging
       {{ _rh_pkg_stage.path }} is left for inspection; the next run reaps it under bundle.staging_retention).
     quiet: true
 
@@ -261,6 +297,8 @@
       {{ {'schema': rh.controller.bootstrap.bundle.schema,
           'seed_file': rh.controller.bootstrap.bundle.seed_file,
           'seed_sha256': _rh_pkg_dst.results[-1].stat.checksum,
+          'launcher_file': rh.controller.bootstrap.bundle.launcher_file,
+          'launcher_sha256': _rh_pkg_lnch.stat.checksum,
           'expected_generation': 'core' ~ rh_pub_policy.controller.expect_core ~ '-py' ~ rh_pub_policy.controller.bootstrap.python.version
                                  ~ '-uv' ~ rh_pub_policy.controller.bootstrap.uv.version ~ '-' ~ _rh_pkg_dst.results[-1].stat.checksum[:12],
           'profile_sha256': rh_profile_sha256,
