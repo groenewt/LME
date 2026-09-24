@@ -2688,6 +2688,76 @@ def lme_project_remote_harness(composed, declared, override, schema, scope=None)
     return _rh_scoped(section, composed, declared, override, schema, scope)
 
 
+_RH_BASE_KEYS = frozenset(('schema_version', 'policy', 'policy_sha256', 'adapter', 'host_scoped_paths',
+                           'scope_invariant_sha256', 'shared_artifact_inputs_sha256'))
+_RH_SCOPED_KEYS = frozenset(('scope', 'binding', 'scope_sha256', 'scopes', 'scopes_sha256'))
+
+
+def _rh_verify_entry(where, sec, keys):
+    if not isinstance(sec, dict) or set(sec) != set(keys):
+        raise ValueError('lme: published %s must carry exactly %s; got %r' % (where, sorted(keys), sorted(sec) if isinstance(sec, dict) else sec))
+    if sec['policy_sha256'] != _digest(sec['policy']):
+        raise ValueError('lme: published %s.policy_sha256 is not the digest of its actual policy content' % (where,))
+    hsp = sec['host_scoped_paths']
+    if not isinstance(hsp, list) or any(not isinstance(p, str) for p in hsp):
+        raise ValueError('lme: published %s.host_scoped_paths must be a list of dotted paths' % (where,))
+    if sec['scope_invariant_sha256'] != _digest({'policy': _rh_without(sec['policy'], hsp), 'host_scoped_paths': hsp}):
+        raise ValueError('lme: published %s.scope_invariant_sha256 is not the digest of its actual content' % (where,))
+
+
+def lme_verify_resolved(resolved, registry):
+    """C1-TYPED-OUTPUT-REVISION (codex 022716). Validates the ACTUAL published lme_resolved -- not a recompute
+    it merely compares equal to. Registry fields present in it must be canonical for their declared type
+    (lme_validate_config: rejects, never coerces -- 3.0 is not an int, 1 is not a bool). The remote-harness
+    section must carry the exact key set of its projection, schema_version must be the declared int (a float
+    or bool 3 refuses), and every digest (policy_sha256, scope_invariant_sha256, and when scoped scope_sha256
+    per scope + scopes_sha256) must be re-derivable from the section's OWN content, so a pre-supplied section
+    whose content changed type/value while keeping an old digest refuses. Returns True; raises otherwise."""
+    if not isinstance(resolved, dict):
+        raise ValueError('lme: published lme_resolved must be a mapping; got %r' % (type(resolved).__name__,))
+    fields = registry.get('fields') if isinstance(registry, dict) else None
+    if not isinstance(fields, dict):
+        raise ValueError('lme: registry fields missing (cannot validate the published lme_resolved)')
+    lme_validate_config(registry, {k: v for k, v in resolved.items() if k in fields})
+    schema = registry.get('remote_harness_schema') or {}
+    outs = schema.get('resolver_outputs')
+    if outs is not None and (not isinstance(outs, list) or any(not isinstance(n, str) for n in outs)
+                             or 'lme_resolved' not in outs or any(n in fields for n in outs)):
+        raise ValueError('lme: registry resolver_outputs must list loader OUTPUT names (incl. lme_resolved), none a '
+                         'declared config field (a declared input must stay usable); got %r' % (outs,))
+    key = schema.get('policy_key')
+    if not key or key not in resolved:
+        return True
+    sec = resolved[key]
+    scoped = isinstance(sec, dict) and 'scope' in sec
+    _rh_verify_entry(key, sec, _RH_BASE_KEYS | (_RH_SCOPED_KEYS if scoped else frozenset()))
+    want = schema['projection_schema_version']
+    if not _leaf_equal(sec['schema_version'], want):
+        raise ValueError('lme: published %s.schema_version is %r (%s); the registry declares %r (%s)' % (
+            key, sec['schema_version'], type(sec['schema_version']).__name__, want, type(want).__name__))
+    if not scoped:
+        return True
+    scopes, binding = sec['scopes'], sec['binding']
+    if not isinstance(scopes, dict) or set(scopes) != {'controller', 'targets'} or not isinstance(scopes['targets'], dict):
+        raise ValueError('lme: published %s.scopes must be {controller, targets}' % (key,))
+    entries = [('controller', scopes['controller'])] + [('targets.' + t, scopes['targets'][t]) for t in sorted(scopes['targets'])]
+    for where, ent in entries:
+        _rh_verify_entry('%s.scopes.%s' % (key, where), ent, set(_RH_SCOPE_ENTRY) | {'kind', 'id', 'scope_sha256'})
+        ident = {'kind': ent['kind'], 'id': ent['id']}
+        if ent['scope_sha256'] != _digest({'scope': ident, 'binding': binding, 'policy_sha256': ent['policy_sha256']}):
+            raise ValueError('lme: published %s.scopes.%s.scope_sha256 is not bound to its scope/binding/policy' % (key, where))
+    if sec['scopes_sha256'] != _digest(scopes):
+        raise ValueError('lme: published %s.scopes_sha256 is not the digest of its actual scopes' % (key,))
+    me = sec['scope']
+    mine = scopes['controller'] if isinstance(me, dict) and me.get('kind') == 'controller' else \
+        scopes['targets'].get(me.get('id')) if isinstance(me, dict) else None
+    if not isinstance(mine, dict) or not _leaf_equal({'kind': mine['kind'], 'id': mine['id']}, me) \
+            or not _leaf_equal({k: mine[k] for k in _RH_SCOPE_ENTRY}, {k: sec[k] for k in _RH_SCOPE_ENTRY}) \
+            or sec['scope_sha256'] != mine['scope_sha256']:
+        raise ValueError('lme: published %s is not its own scope entry %r of scopes' % (key, me))
+    return True
+
+
 def lme_remote_harness_overridden_paths(composed, declared, override, schema):
     """Audit view (not revision-bound): sorted dotted leaf paths the operator override set; same validation."""
     return _rh_validate(composed, declared, override, schema)[1]
@@ -2699,6 +2769,7 @@ class FilterModule(object):
             'strict_enable_bool': strict_enable_bool,
             'lme_project_remote_harness': lme_project_remote_harness,
             'lme_remote_harness_overridden_paths': lme_remote_harness_overridden_paths,
+            'lme_verify_resolved': lme_verify_resolved,
             'lme_resolve_config': lme_resolve_config,
             'lme_validate_config': lme_validate_config,
             'lme_config_revision': lme_config_revision,
