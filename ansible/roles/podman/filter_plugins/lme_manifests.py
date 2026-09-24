@@ -2694,6 +2694,113 @@ def _rh_prove_artifact_templates(hs, sources):
     return True
 
 
+_RH_ENDPOINT_KEY = ('address', 'port', 'proxy_jump', 'owner')
+_RH_FORM_TESTS = frozenset(('undefined', 'equals_empty', 'equals_mode_args', 'match_form_regex'))
+
+
+def _rh_endpoint_vars(pol, hs, key):
+    """C1-EFFECTIVE-ENDPOINT-BINDING (codex 035141): the ONE declared connection rule (registry host_scope.endpoint
+    names where it lives in the policy: rule_path = ssh_auth.composition {address, port, proxy_jump}, owner_var_path =
+    inventory.owner_var) -- the same rule the route's endpoint key and B consume. Returns the inventory variable name
+    per endpoint role and the rule; refuses a rule this resolver cannot apply exactly as declared."""
+    ep = hs.get('endpoint')
+    if not isinstance(ep, dict) or set(ep) != {'rule_path', 'owner_var_path', 'auth_path'}:
+        raise ValueError('lme: registry host_scope.endpoint must be {rule_path, owner_var_path, auth_path}; got %r' % (ep,))
+    f, rule = _rh_get(pol, ep['rule_path'])
+    fo, owner_var = _rh_get(pol, ep['owner_var_path'])
+    fa, auth = _rh_get(pol, ep['auth_path'])
+    if not f or not isinstance(rule, dict) or any(not isinstance(rule.get(r), dict) or not isinstance(rule[r].get('var'), str) or not rule[r]['var']
+                                                  for r in ('address', 'port', 'proxy_jump', 'inventory_forms')):
+        raise ValueError('lme: %s.%s must declare address, port, proxy_jump and inventory_forms, each with its inventory var (the endpoint rule)' % (key, ep['rule_path']))
+    if rule.get('endpoint_key') != list(_RH_ENDPOINT_KEY):
+        raise ValueError('lme: %s.%s.endpoint_key must be %r (the components this resolver binds); got %r' % (key, ep['rule_path'], list(_RH_ENDPOINT_KEY), rule.get('endpoint_key')))
+    if not fo or not isinstance(owner_var, str) or not owner_var:
+        raise ValueError('lme: %s.%s must name the owner inventory variable' % (key, ep['owner_var_path']))
+    if not fa or not isinstance(auth, dict) or not isinstance(auth.get('mode_var'), str) or not auth['mode_var'] \
+            or not isinstance(auth.get('modes'), dict) or any(not isinstance(m, dict) or not isinstance(m.get('ssh_common_args'), str) for m in auth['modes'].values()):
+        raise ValueError('lme: %s.%s must declare mode_var and modes, each mode with its ssh_common_args' % (key, ep['auth_path']))
+    fm = rule['inventory_forms']
+    acc = fm.get('accepted')
+    if fm.get('other') != 'refuse' or not isinstance(acc, list) or not acc or any(
+            not isinstance(a, dict) or set(a) != {'form', 'test', 'proxy_jump'} or a['test'] not in _RH_FORM_TESTS
+            or a['proxy_jump'] not in ('', 'form_regex_capture_1')
+            or (a['proxy_jump'] == 'form_regex_capture_1') != (a['test'] == 'match_form_regex') for a in acc):
+        raise ValueError('lme: %s.%s.inventory_forms must be {var, accepted: [{form, test in %s, proxy_jump in [\'\', form_regex_capture_1]}], other: refuse}; got %r' % (
+            key, ep['rule_path'], sorted(_RH_FORM_TESTS), fm))
+    if fm['var'] != rule['proxy_jump']['var']:
+        raise ValueError('lme: %s.%s.inventory_forms.var must be the proxy_jump var %r' % (key, ep['rule_path'], rule['proxy_jump']['var']))
+    ad, pt, pj = rule['address'], rule['port'], rule['proxy_jump']
+    if ad.get('absent') != 'inventory_hostname' or ad.get('normalize') != 'lower':
+        raise ValueError('lme: %s.%s.address must be {var, absent: inventory_hostname, normalize: lower}; got %r' % (key, ep['rule_path'], ad))
+    if pt.get('absent') != 'delegate_ssh_config' or not isinstance(pt.get('absent_key'), str) or not pt['absent_key'] \
+            or not isinstance(pt.get('explicit_regex'), str) or isinstance(pt.get('explicit_max'), bool) or not isinstance(pt.get('explicit_max'), int):
+        raise ValueError('lme: %s.%s.port must be {var, absent: delegate_ssh_config, absent_key, explicit_regex, explicit_max}; got %r' % (key, ep['rule_path'], pt))
+    if not isinstance(pj.get('form_regex'), str) or re.compile(pj['form_regex']).groups != 1:
+        raise ValueError('lme: %s.%s.proxy_jump.form_regex must capture exactly the jump; got %r' % (key, ep['rule_path'], pj.get('form_regex')))
+    return ({'address': ad['var'], 'port': pt['var'], 'proxy_jump': fm['var'], 'owner': owner_var, 'mode': auth['mode_var']},
+            dict(rule, modes=auth['modes']))
+
+
+def _rh_endpoint(raw, rule, host, key):
+    """One target's effective declared endpoint in the route's key order [address, port_key, proxy_jump, owner]:
+    address = the address var, absent -> the inventory id, lower-cased; port_key = an explicit port as its canonical
+    decimal (explicit_regex, <= explicit_max; bool/float/null refuse), absent -> absent_key (DELEGATED to the owner's
+    ssh configuration, never a guessed number); proxy_jump = per the declared inventory_forms (see below); owner =
+    the owner var, absent -> ''. A value the declared rule refuses is refused here too (same rule, one place)."""
+    a = raw.get('address')
+    a = host if a is None else a
+    if not isinstance(a, str) or not a:
+        raise ValueError('lme: %s endpoint of %r: address must be a non-empty string; got %r' % (key, host, a))
+    p, pt = raw.get('port'), rule['port']
+    if p is None:
+        pk = pt['absent_key']
+    else:
+        s = str(p) if (isinstance(p, int) and not isinstance(p, bool)) or isinstance(p, str) else None
+        if s is None or not re.match(pt['explicit_regex'] + r'\Z', s) or int(s) > pt['explicit_max']:
+            raise ValueError('lme: %s endpoint of %r: port %r (%s) is not an explicit port by the declared rule (%s, <= %d)' % (
+                key, host, p, type(p).__name__, pt['explicit_regex'], pt['explicit_max']))
+        pk = s
+    # The route value: the FIRST declared accepted inventory form (composition.inventory_forms, in order) whose test
+    # holds; equals_mode_args compares with the HOST's declared mode (mode_var) args -- admission (admit_transport.yml)
+    # requires that mode to equal the run's selected mode, so under admission they are the same args. No accepted
+    # form -> refuse (other: refuse). An absent or unknown host mode matches no equals_mode_args form.
+    j = raw.get('proxy_jump')
+    mode = rule['modes'].get(raw.get('mode')) if isinstance(raw.get('mode'), str) else None
+    jump = None
+    for form in rule['inventory_forms']['accepted']:
+        t = form['test']
+        m = re.match(rule['proxy_jump']['form_regex'] + r'\Z', j) if t == 'match_form_regex' and isinstance(j, str) else None
+        if (t == 'undefined' and j is None) or (t == 'equals_empty' and j == '') \
+                or (t == 'equals_mode_args' and mode is not None and isinstance(j, str) and j == mode['ssh_common_args']) or m:
+            jump = m.group(1) if form['proxy_jump'] == 'form_regex_capture_1' else ''
+            break
+    if jump is None:
+        raise ValueError('lme: %s endpoint of %r: %s %r is none of the declared accepted inventory forms %r (host mode %r)' % (
+            key, host, rule['inventory_forms']['var'], j, [f['form'] for f in rule['inventory_forms']['accepted']], raw.get('mode')))
+    o = raw.get('owner')
+    o = '' if o is None else o
+    if not isinstance(o, str):
+        raise ValueError('lme: %s endpoint of %r: owner must be a string; got %r' % (key, host, o))
+    comp = {'address': a.lower(), 'port': pk, 'proxy_jump': jump, 'owner': o}
+    return [comp[c] for c in rule['endpoint_key']]
+
+
+def lme_rh_connection_values(hostvars, ids, composed, schema):
+    """C1-EFFECTIVE-ENDPOINT-BINDING: a SELECTION (no derivation) of the inventory values the declared endpoint rule
+    names, for each host id: {vars: {role: var name}, values: {id: {role: value or None}}}; {} when no remote-harness
+    policy is declared. The scope projection derives each target's endpoint from them (_rh_endpoint)."""
+    key = schema['policy_key']
+    pol = composed.get(key) if isinstance(composed, dict) else None
+    if not isinstance(pol, dict):
+        return {}
+    names = _rh_endpoint_vars(pol, schema['host_scope'], key)[0]
+    values = {}
+    for h in ids:
+        hv = hostvars[h]
+        values[h] = dict((role, hv[v] if v in hv else None) for role, v in sorted(names.items()))
+    return {'vars': names, 'values': values}
+
+
 def _rh_without(tree, dotted_paths):
     """A copy of tree with the named leaves removed (value-pure; the input is not mutated)."""
     drop = [p.split('.') for p in dotted_paths]
@@ -2719,7 +2826,7 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
     bytes) and the operation. scope_invariant_sha256 is an ADDITIONAL compatibility digest only; exact identity
     is scope_sha256 / policy_sha256 of the scope a consumer serves."""
     hs, key = schema['host_scope'], schema['policy_key']
-    need = ('self', 'groups', 'composed', 'overrides', 'edition', 'artifact_sources')
+    need = ('self', 'groups', 'composed', 'overrides', 'edition', 'artifact_sources', 'connections')
     if not isinstance(scope, dict) or any(k not in scope for k in need):
         raise ValueError('lme: remote-harness scope context must carry %s; got %r' % (list(need), sorted(scope) if isinstance(scope, dict) else scope))
     _rh_prove_artifact_templates(hs, scope['artifact_sources'])
@@ -2748,7 +2855,17 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
     # This host's own composition/override ARE its scope entry's (type-aware): a context that disagrees is refused.
     if not _leaf_equal(comp[me], composed) or not _leaf_equal(ovs[me], override if override is not None else {}):
         raise ValueError('lme: the scope context for %r disagrees with this host\'s own composition/override' % (me,))
-    binding = {'deployment': {'profile': ed['profile'], 'controller': cid, 'target_group': tg, 'targets': targets},
+    # C1-EFFECTIVE-ENDPOINT-BINDING (codex 035141): every target's effective declared endpoint (the ONE declared
+    # connection rule; same key order and rules as the route) is part of the deployment binding, so a changed
+    # address / explicit port / ProxyJump route / owner under the same inventory id moves every scope identity.
+    names, rule = _rh_endpoint_vars(pol, hs, key)
+    conn = scope['connections']
+    if not isinstance(conn, dict) or conn.get('vars') != names or not isinstance(conn.get('values'), dict) \
+            or any(not isinstance(conn['values'].get(t), dict) for t in targets):
+        raise ValueError('lme: remote-harness scope connections must carry the declared endpoint vars %r and every target\'s values' % (names,))
+    endpoints = dict((t, _rh_endpoint(conn['values'][t], rule, t, key)) for t in targets)
+    binding = {'deployment': {'profile': ed['profile'], 'controller': cid, 'target_group': tg, 'targets': targets,
+                              'endpoints': endpoints},
                'source_edition': {'global_sha256': ed['global_sha256'], 'profile_sha256': ed['profile_sha256']},
                'operation': op}
 
@@ -2845,6 +2962,12 @@ def lme_verify_resolved(resolved, registry):
     if not scoped:
         return True
     scopes, binding = sec['scopes'], sec['binding']
+    # C1-EFFECTIVE-ENDPOINT-BINDING: the bound endpoints are exactly the bound targets' [address, port_key, proxy_jump, owner].
+    dep = binding.get('deployment') if isinstance(binding, dict) else None
+    eps = dep.get('endpoints') if isinstance(dep, dict) else None
+    if not isinstance(eps, dict) or sorted(eps) != sorted(dep.get('targets') or []) or any(
+            not isinstance(v, list) or len(v) != 4 or any(not isinstance(x, str) for x in v) for v in eps.values()):
+        raise ValueError('lme: published %s.binding.deployment.endpoints must map every bound target to its [address, port_key, proxy_jump, owner] strings' % (key,))
     if not isinstance(scopes, dict) or set(scopes) != {'controller', 'targets'} or not isinstance(scopes['targets'], dict):
         raise ValueError('lme: published %s.scopes must be {controller, targets}' % (key,))
     entries = [('controller', scopes['controller'])] + [('targets.' + t, scopes['targets'][t]) for t in sorted(scopes['targets'])]
@@ -2877,6 +3000,7 @@ class FilterModule(object):
             'lme_project_remote_harness': lme_project_remote_harness,
             'lme_remote_harness_overridden_paths': lme_remote_harness_overridden_paths,
             'lme_verify_resolved': lme_verify_resolved,
+            'lme_rh_connection_values': lme_rh_connection_values,
             'lme_resolve_config': lme_resolve_config,
             'lme_validate_config': lme_validate_config,
             'lme_config_revision': lme_config_revision,
