@@ -2553,12 +2553,100 @@ def _rh_validate(composed, declared, override, schema):
         got = inv.get(name) if fi and isinstance(inv, dict) else None
         if got != want:
             raise ValueError('lme: %s.%s.%s is %r; the registry declares %r' % (key, schema['inventory_var_path'], name, got, want))
+    # PER-HOST-SCOPE-CONTRACT (codex 023332): the registry rule host_scope names the leaves that may differ between
+    # scopes of one deployment (every scoped field of every executable), and the leaves shared artifacts consume
+    # (the path of each executable a shared consumer requires). Both are derived from the declaration, never listed.
+    hs = schema['host_scope']
+    if hs['tool_map'] != ei['entries']:
+        raise ValueError('lme: registry host_scope.tool_map %r must be executable_identity.entries %r' % (hs['tool_map'], ei['entries']))
+    scoped, shared_inputs = [], {}
+    for t in sorted(entries):
+        req = entries[t].get(hs['consumer_field'])
+        if '.' in t or not isinstance(req, list) or not req or any(not isinstance(r, str) for r in req):
+            raise ValueError('lme: %s.%s.%s.%s must be a non-empty list of consumer names (host scope derives from it); got %r' % (key, ei['entries'], t, hs['consumer_field'], req))
+        scoped.extend('%s.%s.%s' % (ei['entries'], t, fld) for fld in hs['scoped_fields'] if fld in entries[t])
+        if any(r in hs['shared_consumers'] for r in req):
+            shared_inputs.update(('%s.%s.%s' % (ei['entries'], t, fld), entries[t][fld]) for fld in hs['shared_fields'] if fld in entries[t])
     section = {'schema_version': schema['projection_schema_version'], 'policy': pol, 'policy_sha256': _digest(pol),
-               'adapter': {'name': sel, 'tools': derived}}
+               'adapter': {'name': sel, 'tools': derived},
+               'host_scoped_paths': scoped,
+               'scope_invariant_sha256': _digest({'policy': _rh_without(pol, scoped), 'host_scoped_paths': scoped}),
+               'shared_artifact_inputs_sha256': _digest(shared_inputs)}
     return section, sorted(overridden)
 
 
-def lme_project_remote_harness(composed, declared, override, schema):
+def _rh_without(tree, dotted_paths):
+    """A copy of tree with the named leaves removed (value-pure; the input is not mutated)."""
+    drop = [p.split('.') for p in dotted_paths]
+
+    def walk(node, at):
+        if not isinstance(node, dict):
+            return node
+        return {k: walk(v, at + [k]) for k, v in node.items() if (at + [k]) not in drop}
+    return walk(tree, [])
+
+
+_RH_SCOPE_ENTRY = ('policy', 'policy_sha256', 'adapter', 'host_scoped_paths', 'scope_invariant_sha256',
+                   'shared_artifact_inputs_sha256')
+
+
+def _rh_scoped(section, composed, declared, override, schema, scope):
+    """PER-HOST-SCOPE-CONTRACT (codex-r3f-scope-binding-and-join-023332). Every host resolves the FULL intended
+    policy of EVERY scope of the deployment -- the controller (registry host_scope.controller_id) and each member
+    of the policy's declared target group -- each composed by the loader's ONE composition (global | profile |
+    that scope's own lme_global_override; the caller composes, this function never merges) and validated by the
+    same projection. Each scope carries its identity and scope_sha256 = digest(scope, binding, policy_sha256),
+    binding = the deployment (profile, controller, target group, members), the source edition (global/profile
+    bytes) and the operation. scope_invariant_sha256 is an ADDITIONAL compatibility digest only; exact identity
+    is scope_sha256 / policy_sha256 of the scope a consumer serves."""
+    hs, key = schema['host_scope'], schema['policy_key']
+    need = ('self', 'groups', 'composed', 'overrides', 'edition')
+    if not isinstance(scope, dict) or any(k not in scope for k in need):
+        raise ValueError('lme: remote-harness scope context must carry %s; got %r' % (list(need), sorted(scope) if isinstance(scope, dict) else scope))
+    ed = scope['edition']
+    if not isinstance(ed, dict) or set(ed) != {'profile', 'global_sha256', 'profile_sha256'} or not isinstance(ed['profile'], str) \
+            or any(not isinstance(ed[k], str) or not re.match('^[0-9a-f]{64}$', ed[k]) for k in ('global_sha256', 'profile_sha256')):
+        raise ValueError('lme: remote-harness scope edition must be {profile, global_sha256, profile_sha256}; got %r' % (ed,))
+    pol = section['policy']
+    ftg, tg = _rh_get(pol, hs['target_group_path'])
+    fop, op = _rh_get(pol, hs['operation_path'])
+    if not ftg or not isinstance(tg, str) or not tg or not fop or not isinstance(op, str) or not op:
+        raise ValueError('lme: %s.%s and %s.%s must be non-empty strings (scope binding)' % (key, hs['target_group_path'], key, hs['operation_path']))
+    cid = hs['controller_id']
+    groups = scope['groups'] if isinstance(scope['groups'], dict) else {}
+    members = groups.get(tg) or []
+    if not isinstance(members, list) or any(not isinstance(m, str) for m in members) or cid in members:
+        raise ValueError('lme: inventory group %s must list target identities other than the controller %r; got %r' % (tg, cid, members))
+    targets = sorted(set(members))
+    me = scope['self']
+    if me != cid and me not in targets:
+        raise ValueError('lme: host %r is neither the declared controller %r nor a member of %s; it has no %s scope' % (me, cid, tg, key))
+    comp, ovs = scope['composed'], scope['overrides']
+    for i in [cid] + targets:
+        if not isinstance(comp, dict) or i not in comp or not isinstance(ovs, dict) or i not in ovs:
+            raise ValueError('lme: remote-harness scope context lacks the composition of scope %r' % (i,))
+    # This host's own composition/override ARE its scope entry's (type-aware): a context that disagrees is refused.
+    if not _leaf_equal(comp[me], composed) or not _leaf_equal(ovs[me], override if override is not None else {}):
+        raise ValueError('lme: the scope context for %r disagrees with this host\'s own composition/override' % (me,))
+    binding = {'deployment': {'profile': ed['profile'], 'controller': cid, 'target_group': tg, 'targets': targets},
+               'source_edition': {'global_sha256': ed['global_sha256'], 'profile_sha256': ed['profile_sha256']},
+               'operation': op}
+
+    def entry(i):
+        sec = section if i == me else _rh_validate(comp[i], declared, ovs[i], schema)[0]
+        if _rh_get(sec['policy'], hs['target_group_path'])[1] != tg or _rh_get(sec['policy'], hs['operation_path'])[1] != op:
+            raise ValueError('lme: scope %r resolves another target group/operation than the deployment binding' % (i,))
+        ident = {'kind': 'controller' if i == cid else 'target', 'id': i}
+        out = dict(ident, **{k: sec[k] for k in _RH_SCOPE_ENTRY})
+        out['scope_sha256'] = _digest({'scope': ident, 'binding': binding, 'policy_sha256': sec['policy_sha256']})
+        return out
+    scopes = {'controller': entry(cid), 'targets': {t: entry(t) for t in targets}}
+    mine = scopes['controller'] if me == cid else scopes['targets'][me]
+    return dict(section, scope={'kind': mine['kind'], 'id': me}, binding=binding, scope_sha256=mine['scope_sha256'],
+                scopes=scopes, scopes_sha256=_digest(scopes))
+
+
+def lme_project_remote_harness(composed, declared, override, schema, scope=None):
     """SEED-06 (codex-tick121-223811, codex-232517): the typed lme_resolved.<policy_key> section
     {schema_version, policy, policy_sha256}, or None when no policy is declared.
 
@@ -2573,8 +2661,15 @@ def lme_project_remote_harness(composed, declared, override, schema):
     executables only and carry no derived field (path/identity): section.adapter.tools.<map>.<tool> is
     DERIVED from the effective executable entry (codex-tick144 CANONICAL-TOOL-OVERRIDES). The section is
     revision-bound; override
-    provenance is NOT in it (lme_remote_harness_overridden_paths is the unhashed audit view)."""
-    return _rh_validate(composed, declared, override, schema)[0]
+    provenance is NOT in it (lme_remote_harness_overridden_paths is the unhashed audit view).
+
+    Every section also carries host_scoped_paths / scope_invariant_sha256 (an ADDITIONAL compatibility digest)
+    and shared_artifact_inputs_sha256. With scope (the loader's inline scope context), the section is bound to
+    this host's scope and carries every scope's full intended policy (PER-HOST-SCOPE-CONTRACT, _rh_scoped)."""
+    section = _rh_validate(composed, declared, override, schema)[0]
+    if section is None or scope is None:
+        return section
+    return _rh_scoped(section, composed, declared, override, schema, scope)
 
 
 def lme_remote_harness_overridden_paths(composed, declared, override, schema):
