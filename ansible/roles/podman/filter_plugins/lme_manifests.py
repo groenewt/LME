@@ -3013,8 +3013,10 @@ def _rh_artifact_decl(hs):
                 raise ValueError('lme: shared_artifacts.%s.%s must map template variables to policy paths; got %r' % (a, n, m))
         if not ins or set(ins) & set(cins):
             raise ValueError('lme: shared_artifacts.%s.inputs must be non-empty and disjoint from checkout_inputs' % (a,))
-        if not isinstance(cons, list) or not cons or any(not isinstance(c, str) for c in cons):
-            raise ValueError('lme: shared_artifacts.%s.consumers must be a non-empty list of consumer names; got %r' % (a, cons))
+        # consumers = the executed-tool required_by labels whose tools the artifact serves; [] is the truthful value
+        # for a pure metadata export that no executed tool consumes (codex 214135; its input proof is unchanged).
+        if not isinstance(cons, list) or any(not isinstance(c, str) for c in cons):
+            raise ValueError('lme: shared_artifacts.%s.consumers must be a list of consumer names ([] for a pure metadata export); got %r' % (a, cons))
         if not isinstance(ne, list) or any(f not in hs['scoped_fields'] for f in ne):
             raise ValueError('lme: shared_artifacts.%s.not_embedded_fields must name scoped_fields %r only; got %r' % (a, hs['scoped_fields'], ne))
     return arts
@@ -3052,13 +3054,148 @@ def _rh_shared_inputs(pol, hs, scoped, key):
     return out
 
 
+def _rh_safe_rel(p):
+    """A normalized, relative repository path: non-empty, not absolute, no '.' / '..' / empty component."""
+    import posixpath
+    return isinstance(p, str) and bool(p) and not p.startswith('/') and posixpath.normpath(p) == p \
+        and '..' not in p.split('/')
+
+
+_RH_IMPORT_FILTERS = ('relpath', 'dirname')
+# SOFT-FRAME (codex 220953): the COMPILER-ONLY known capabilities beyond Jinja's builtin tests -- names the templates
+# may reference, never executed by the proof (inert). `match`: the Ansible test plugin the canonical macros use
+# (controller_seed.j2 `is match(...)` and reject('match', ...)); the pinned cores define it in
+# ansible/plugins/test/core.py (see the edition evidence in the C1 hand-back). No other plugin name is admitted.
+_RH_KNOWN_TESTS = ('match',)
+# filters whose positional argument NAMES another capability: select / reject / selectattr / rejectattr name a TEST,
+# map names a FILTER; {filter: (argument index, 'test' | 'filter')}
+_RH_NAMED_CAPABILITY_ARGS = {'select': (0, 'test'), 'reject': (0, 'test'), 'selectattr': (1, 'test'),
+                             'rejectattr': (1, 'test'), 'map': (0, 'filter')}
+
+
+def _rh_inert_filter(name):
+    """IMPORT-STATIC-FILTER-KNOWLEDGE (codex 214135): a PARSE-ONLY stand-in so the static analysis
+    (meta.find_undeclared_variables compiles the AST; plain Jinja refuses an unknown filter there) knows the two
+    filters of the declared-reference import. The proof never renders; a call is a defect and raises."""
+    def inert(*args, **kwargs):
+        raise ValueError('lme: %s is a parse-only stand-in of the artifact template proof (never rendered)' % (name,))
+    return inert
+
+
+def _rh_declared_import(a, path, i, imp, d, nodes, tree):
+    """C1-DECLARED-REFERENCE-IMPORT (codex 213721; codex 214135). The ONE admitted non-literal import target, an
+    explicitly bounded AST (no evaluation, no calls, no lookups, no ambient context):
+        {% import <ref A> | relpath(<ref B> | dirname) as <name> %}
+    Import(template=Filter(relpath, node=<ref A>, args=[Filter(dirname, node=<ref B>, args=[])]), with_context=False),
+    every Filter without kwargs / *args / **kwargs; each <ref> a Getattr chain of constant attribute names rooted at
+    Name(<a declared INPUT of this artifact>, load) -- no Getitem, no Call, no other filter or node. Only in the entry
+    template; never with context. IMPORT-LEXICAL-BINDING: the template may not bind a referenced root anywhere
+    (set / block set / for / with target, macro or call-block parameter, import-as / from-import alias), since the
+    references are resolved against the DECLARED binding, not a template-local value (free-variable equality alone
+    does not prove the importer still reads the declared input). POLICY-FREE (the shape only); runs BEFORE the
+    free-variable analysis. Returns the proved reference record; the VALUES are bound per scope by
+    _rh_bind_declared_import. Raises otherwise."""
+    at = 'lme: shared artifact %s template %s declared import' % (a, path)
+    shape = ('%s must be exactly `<declared input>.<attr>... | relpath(<declared input>.<attr>... | dirname)`: attribute'
+             ' references only, filters relpath / dirname only, no call, item access, other filter or argument' % at)
+    if i != 0:
+        raise ValueError('%s is admitted in the entry template only (non-entry templates read no variables)' % (at,))
+    if type(imp) is not nodes.Import:
+        raise ValueError(shape + ' (got a from-import)')
+    if imp.with_context:
+        raise ValueError('%s carries context (only declared templates, without context)' % (at,))
+
+    def plain(f, name, nargs):
+        return type(f) is nodes.Filter and f.name == name and len(f.args) == nargs and not f.kwargs \
+            and f.dyn_args is None and f.dyn_kwargs is None
+
+    t = imp.template
+    if not plain(t, 'relpath', 1) or not plain(t.args[0], 'dirname', 0):
+        got = type(t).__name__
+        if type(t) is nodes.Filter:
+            got = 'filter %s over %s' % (t.name, ('filter ' + str(t.args[0].name)) if (t.args and type(t.args[0]) is nodes.Filter)
+                                          else (type(t.args[0]).__name__ if t.args else 'no argument'))
+        raise ValueError(shape + ' (got %s)' % (got,))
+
+    def ref(n, role):
+        chain = []
+        while type(n) is nodes.Getattr and isinstance(n.attr, str):
+            chain.append(n.attr)
+            n = n.node
+        if type(n) is not nodes.Name or n.ctx != 'load' or not chain:
+            raise ValueError(shape + ' (%s reference is a %s)' % (role, type(n).__name__))
+        if n.name not in d['inputs']:
+            raise ValueError('%s %s reference root %r is not a declared input of this artifact %r (undeclared variable)' % (
+                at, role, n.name, sorted(d['inputs'])))
+        return n.name, tuple(reversed(chain))
+
+    refs = {'target': ref(t.node, 'target'), 'entry-path': ref(t.args[0].node, 'entry-path')}
+    bound = set(n.name for n in tree.find_all(nodes.Name) if n.ctx in ('store', 'param'))
+    for m in tree.find_all((nodes.Import, nodes.FromImport)):
+        if type(m) is nodes.Import:
+            bound.add(m.target)
+        else:
+            bound.update(x[1] if isinstance(x, tuple) else x for x in m.names)
+    # C1-IMPORT-MACRO-NAME-SHADOW (codex 221058): a macro declaration binds its NAME (a plain string, not a Name node;
+    # jinja2 idtracking visit_Macro stores node.name), so `{% macro <root>() %}` shadows the root like any binder.
+    # The string-named binders are exactly Macro.name, Import.target and FromImport names / aliases (idtracking).
+    bound.update(m.name for m in tree.find_all(nodes.Macro))
+    rebound = sorted(set(r[0] for r in refs.values()) & set(n for n in bound if isinstance(n, str)))
+    if rebound:
+        raise ValueError('%s: the template binds referenced input root(s) %s locally (set / for / with / macro or call parameter /'
+                         ' import alias): a template-local value would replace the declared binding (lexical binding)' % (at, rebound))
+    return {'artifact': a, 'template': path, 'refs': refs}
+
+
+def _rh_bind_declared_import(rec, d, label, pol):
+    """C1-DECLARED-REFERENCE-IMPORT, the VALUE binding (codex 213721; IMPORT-PER-SCOPE-BINDING + IMPORT-LOADER-LAYOUT,
+    codex 214135), against ONE already-resolved scope policy `pol` (the caller passes EVERY scope's; no merge here).
+    Each reference resolves through the artifact's declared input binding (the same subtree _rh_shared_inputs binds
+    into that scope's shared_artifact_inputs_sha256) to a normalized relative repository path. The entry-path
+    reference must equal the artifact's entry template; the target must lie strictly inside the entry's directory
+    and be a declared NON-entry template (a member of artifact_sources, parsed and proved). LOADER LAYOUT: the render
+    resolves relpath(target, dirname(entry)) against the entry's directory (the template's own search path);
+    jinja2's loader refuses a '..' piece and drops '.' / empty pieces, so only a normalized path with no '..' is
+    admitted and entry_dir + '/' + relpath is then exactly the declared target: what the proof binds is what the
+    loader opens. Any other layout refuses here, at resolve, before any render; there is no fixed-path fallback."""
+    at = 'lme: shared artifact %s template %s declared import' % (rec['artifact'], rec['template'])
+    where = ' [scope %s]' % (label,)
+    vals = {}
+    for role in ('target', 'entry-path'):
+        root, attrs = rec['refs'][role]
+        dotted = d['inputs'][root] + '.' + '.'.join(attrs)
+        f, v = _rh_get(pol, dotted)
+        if not f or not isinstance(v, str) or not v:
+            raise ValueError('%s %s reference %s names %s, which the resolved policy does not declare as a non-empty string (missing target)%s' % (
+                at, role, root + '.' + '.'.join(attrs), dotted, where))
+        if not _rh_safe_rel(v):
+            raise ValueError('%s %s reference %s = %r is not a normalized relative repository path (unsafe path)%s' % (at, role, dotted, v, where))
+        vals[role] = v
+    tgt, entry = vals['target'], vals['entry-path']
+    if entry != d['templates'][0]:
+        raise ValueError('%s entry-path reference = %r is not this artifact\'s entry template %r%s' % (at, entry, d['templates'][0], where))
+    start = entry.rsplit('/', 1)[0] if '/' in entry else ''
+    if not start or not tgt.startswith(start + '/'):
+        raise ValueError('%s target %r lies outside the entry directory %r: relpath would carry \'..\', which the template loader refuses (unsafe path)%s' % (
+            at, tgt, start, where))
+    if tgt not in d['templates'][1:]:
+        raise ValueError('%s resolves to %r (relpath %r), which is not a declared non-entry template of this artifact %r (mismatch)%s' % (
+            at, tgt, tgt[len(start) + 1:], d['templates'][1:], where))
+    return tgt[len(start) + 1:]
+
+
 def _rh_prove_artifact_templates(hs, sources):
     """C1-ARTIFACT-REUSE-INPUT-COVERAGE: prove the shared_artifacts declaration against the ACTUAL template sources
     (the loader reads them; artifact_sources = {repository-relative path: content}). The entry template's free
     variables must EQUAL inputs + checkout_inputs (anything else it consumes is missing from the declaration); it
     and every other template import only declared templates, never with context, and never include/extend (a
     context-carrying load could read undeclared variables); non-entry templates have no free variables; a
-    not_embedded field name is never an attribute, item or string constant of any template. Raises otherwise."""
+    not_embedded field name is never an attribute, item or string constant of any template. Raises otherwise.
+    A literal (Const) import keeps exactly this proof. The entry template may instead import through the ONE
+    declared-reference form (_rh_declared_import; codex 213721 / 214135): its SHAPE is proved here, before the
+    free-variable analysis; relpath / dirname are known to that analysis as parse-only stand-ins and admitted in
+    that proved operand ONLY. Returns the proved reference records; the caller binds their VALUES against every
+    scope policy (_rh_bind_declared_import) -- a record left unbound is never admitted."""
     import jinja2
     from jinja2 import meta, nodes
     arts = _rh_artifact_decl(hs)
@@ -3067,6 +3204,11 @@ def _rh_prove_artifact_templates(hs, sources):
         raise ValueError('lme: remote-harness scope artifact_sources must carry exactly the declared templates %r; got %r' % (
             want, sorted(sources) if isinstance(sources, dict) else sources))
     env = jinja2.Environment(extensions=['jinja2.ext.do', 'jinja2.ext.loopcontrols'])
+    builtin_filters = frozenset(env.filters)
+    known_tests = frozenset(env.tests) | frozenset(_RH_KNOWN_TESTS)
+    env.filters.update((n, _rh_inert_filter(n)) for n in _RH_IMPORT_FILTERS)
+    env.tests.update((n, _rh_inert_filter(n)) for n in _RH_KNOWN_TESTS)
+    found = []
     for a, d in sorted(arts.items()):
         base = d['templates'][0].rsplit('/', 1)[0] if '/' in d['templates'][0] else ''
         for i, path in enumerate(d['templates']):
@@ -3074,7 +3216,45 @@ def _rh_prove_artifact_templates(hs, sources):
                 ast = env.parse(sources[path])
             except jinja2.TemplateSyntaxError as e:
                 raise ValueError('lme: shared artifact %s template %s does not parse: %s' % (a, path, e))
-            free = set(meta.find_undeclared_variables(ast))
+            admitted = set()
+            for imp in ast.find_all((nodes.Import, nodes.FromImport)):
+                if not isinstance(imp.template, nodes.Const):
+                    found.append(_rh_declared_import(a, path, i, imp, d, nodes, ast))
+                    admitted.update((id(imp.template), id(imp.template.args[0])))
+            filters = list(ast.find_all(nodes.Filter))
+            stray = sorted(set(f.name for f in filters if f.name in _RH_IMPORT_FILTERS and id(f) not in admitted))
+            if stray:
+                raise ValueError('lme: shared artifact %s template %s uses filter(s) %s outside the declared import operand (the static proof admits them there only)' % (a, path, stray))
+            # SOFT-FRAME (codex 220953): every filter and test NAME is checked explicitly, in EVERY frame -- the
+            # compile inside find_undeclared_variables refuses an unknown name only in hard frames (an if test / body
+            # and a condexpr are soft: jinja2 compiler.py _filter_test_common), so it is not relied on here.
+            unknown = sorted(set(f.name for f in filters if f.name not in builtin_filters and f.name not in _RH_IMPORT_FILTERS))
+            if unknown:
+                raise ValueError('lme: shared artifact %s template %s uses filter(s) %s the static proof does not know (Jinja builtin filters only, in every frame; relpath / dirname in the declared import operand only)' % (a, path, unknown))
+            tests = set(t.name for t in ast.find_all(nodes.Test))
+            for f in filters:
+                if f.name not in _RH_NAMED_CAPABILITY_ARGS:
+                    continue
+                pos, what = _RH_NAMED_CAPABILITY_ARGS[f.name]
+                arg = f.args[pos] if len(f.args) > pos else None
+                if f.dyn_args is not None or (arg is not None and (type(arg) is not nodes.Const or not isinstance(arg.value, str))):
+                    raise ValueError('lme: shared artifact %s template %s passes a non-literal %s name to %s (the static proof admits literal names only)' % (a, path, what, f.name))
+                if arg is not None and what == 'test':
+                    tests.add(arg.value)
+                elif arg is not None and arg.value in _RH_NAMED_CAPABILITY_ARGS:
+                    # C1-NESTED-CAPABILITY-DISPATCH (codex 222326): map forwards its remaining arguments to
+                    # environment.call_filter (jinja2 filters.py prepare_map), so a higher-order named-dispatch filter
+                    # named through map would dispatch an inner name this check never sees -- refused, not chased.
+                    raise ValueError('lme: shared artifact %s template %s composes higher-order filter %r through map; unsupported (the static proof checks one named dispatch per filter)' % (a, path, arg.value))
+                elif arg is not None and arg.value not in builtin_filters:
+                    raise ValueError('lme: shared artifact %s template %s names filter %r through map (Jinja builtin filters only)' % (a, path, arg.value))
+            unknown = sorted(tests - known_tests)
+            if unknown:
+                raise ValueError('lme: shared artifact %s template %s uses test(s) %s the static proof does not know (Jinja builtin tests plus the declared known capability %s, in every frame)' % (a, path, unknown, list(_RH_KNOWN_TESTS)))
+            try:
+                free = set(meta.find_undeclared_variables(ast))
+            except jinja2.TemplateError as e:
+                raise ValueError('lme: shared artifact %s template %s does not analyze statically (plain Jinja plus the declared-import stand-ins): %s' % (a, path, e))
             declared = set(d['inputs']) | set(d['checkout_inputs'])
             if i == 0 and free != declared:
                 raise ValueError('lme: shared artifact %s entry template %s consumes %s; the declaration names %s (undeclared: %s; unconsumed: %s)' % (
@@ -3084,6 +3264,8 @@ def _rh_prove_artifact_templates(hs, sources):
             if list(ast.find_all((nodes.Include, nodes.Extends))):
                 raise ValueError('lme: shared artifact %s template %s includes/extends (context-carrying; undeclared inputs)' % (a, path))
             for imp in ast.find_all((nodes.Import, nodes.FromImport)):
+                if not isinstance(imp.template, nodes.Const):
+                    continue  # the declared-reference form, shape-proved above; its values bind per scope
                 tgt = imp.template.value if isinstance(imp.template, nodes.Const) else None
                 if imp.with_context or not isinstance(tgt, str) or ((base + '/' if base else '') + tgt) not in d['templates']:
                     raise ValueError('lme: shared artifact %s template %s imports %r (only declared templates, without context)' % (a, path, tgt))
@@ -3092,7 +3274,7 @@ def _rh_prove_artifact_templates(hs, sources):
             hit = sorted(set(d['not_embedded_fields']) & names)
             if hit:
                 raise ValueError('lme: shared artifact %s template %s reads %s, declared not_embedded (the reuse key would omit an embedded input)' % (a, path, hit))
-    return True
+    return found
 
 
 _RH_ENDPOINT_KEY = ('address', 'port', 'proxy_jump', 'owner')
@@ -3259,7 +3441,7 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
     need = ('self', 'groups', 'composed', 'overrides', 'edition', 'artifact_sources', 'connections')
     if not isinstance(scope, dict) or any(k not in scope for k in need):
         raise ValueError('lme: remote-harness scope context must carry %s; got %r' % (list(need), sorted(scope) if isinstance(scope, dict) else scope))
-    _rh_prove_artifact_templates(hs, scope['artifact_sources'])
+    imports = _rh_prove_artifact_templates(hs, scope['artifact_sources'])
     ed = scope['edition']
     if not isinstance(ed, dict) or set(ed) != {'profile', 'global_sha256', 'profile_sha256'} or not isinstance(ed['profile'], str) \
             or any(not isinstance(ed[k], str) or not re.match('^[0-9a-f]{64}$', ed[k]) for k in ('global_sha256', 'profile_sha256')):
@@ -3308,7 +3490,15 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
         out['scope_sha256'] = _digest({'scope': ident, 'binding': binding, 'policy_sha256': sec['policy_sha256']})
         return out
     scopes = {'controller': entry(cid), 'targets': {t: entry(t) for t in targets}}
-    mine = scopes['controller'] if me == cid else scopes['targets'][me]
+    # IMPORT-PER-SCOPE-BINDING (codex 214135): every declared-reference import binds against EVERY already-resolved
+    # scope policy (the ONE composition per scope, derived above; nothing merged here), so a scope whose declared
+    # target differs is proved on its own values, not on this host's.
+    arts = _rh_artifact_decl(hs)
+    for label, spol in [('controller ' + cid, scopes['controller']['policy'])] + [
+            ('target ' + t, scopes['targets'][t]['policy']) for t in targets]:
+        for rec in imports:
+            _rh_bind_declared_import(rec, arts[rec['artifact']], label, spol)
+    mine =scopes['controller'] if me == cid else scopes['targets'][me]
     return dict(section, scope={'kind': mine['kind'], 'id': me}, binding=binding, scope_sha256=mine['scope_sha256'],
                 scopes=scopes, scopes_sha256=_digest(scopes))
 
