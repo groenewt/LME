@@ -450,7 +450,8 @@ profile_overlay:
             id: {path: /usr/bin/id, required_by: [seed, uv_installer], identity: {kind: file_sha256, sha256: 50629fa0ab5c003b538d4ccf7de34e85d2df4e799a79eb2dd4c2f7b1e0d7ca59}}
             uname: {path: /usr/bin/uname, required_by: [seed, uv_installer], identity: {kind: file_sha256, sha256: 458ea035850a5802a46ceb931e2864f9649a9030f43342156c54768f7ffddb3e}}
             ldd: {path: /usr/bin/ldd, required_by: [seed, uv_installer], identity: {kind: file_sha256, sha256: 7bcd61a279946cb376d36fd91f4938ab4f4aba48e793c652a9797319d23f8dd3}}
-            getent: {path: /usr/bin/getent, required_by: [uv_installer], identity: {kind: file_sha256, sha256: 15e94df587fe67e13e9b4255163d5d5c854d48272aff771a1773eeb222f41fb5}}
+            getent: {path: /usr/bin/getent, required_by: [seed, uv_installer], note: 'seed: owner-private-group passwd/group enumeration (path_admission.ancestry.owner_private_group)', identity: {kind: file_sha256, sha256: 15e94df587fe67e13e9b4255163d5d5c854d48272aff771a1773eeb222f41fb5}}
+            getfacl: {path: /usr/bin/getfacl, required_by: [seed], note: 'seed: owner-private-group ACL writers (path_admission.ancestry.owner_private_group); package acl; identity measured on the controller fixture (per-host identities through the admitted os_tools.*.identity override)', identity: {kind: file_sha256, sha256: 232aba10b2d0afc9ccc02ec4dfd3ef8299896091bc506eed5896edf8a1dfdc71}}
             cut: {path: /usr/bin/cut, required_by: [uv_installer], identity: {kind: file_sha256, sha256: f7f5511ede2187fbb7646581470c84647d087fb87cb74836c0237b0943d3dbc2}}
             stat: {path: /usr/bin/stat, required_by: [seed], identity: {kind: file_sha256, sha256: 128754b37ab743a539d889a91441c440f9b52df77f4e008b345ff221ce1daeaa}}
             realpath: {path: /usr/bin/realpath, required_by: [seed], identity: {kind: file_sha256, sha256: 43708156c6862ae153685c621c4b9c601ae3f77fefa737cf2f47f3a0f5afaf24}}
@@ -535,17 +536,50 @@ profile_overlay:
               loader_integration: loader-integration
               acceptance: acceptance
               transfer_check: transfer-check
+              loader_cases: loader-cases  # C1 loader-case suite (testing/loader-tests-r4/run_loader_tests.yml reads this key)
+              private_group_fixtures: private-group-fixtures   # route: owner-private-group synthetic fixtures (E51)
+            # WORKSPACE ANCHOR (codex 143844 RH-WORKSPACE-ANCHOR). `run` / `run-local` never take W as dirname(R):
+            #   W = the prefix of R through its LAST `/<root_rel>/` component (R must contain one), <checkout> = W's
+            #   parent; `run-local` additionally requires R == W/<sub_roots.toolchain> exactly (`run` admits any root
+            #   under W, e.g. G's throwaway roots under W/<sub_roots.run>/...). Before any write or exec the seed binds
+            #   that checkout to the bundle it was packaged from: the bundle manifest (bundle.json, next to the seed,
+            #   which names this seed's sha256) must record source.checkout == <checkout> AND the digest of
+            #   <checkout>/<checkout_binding.file_rel> must equal that file's digest in source.inputs. A root under
+            #   another checkout's `.work` (same basename) therefore refuses (path AND declared-profile identity).
+            #   apply / verify / purge keep their root semantics (targets have no checkout): their storage is
+            #   admitted at the root's actual parent.
+            checkout_binding:
+              manifest_field_checkout: checkout            # bundle.json source.checkout (package_bundle.yml)
+              file_rel: manifests/profiles/remote-harness.yml   # bundle.json source.inputs "<rel>  <sha256>" entry
+              refusal: RH-SEED-USAGE
+            # STORAGE ADMISSION ORDER + CUSTODY (codex 143844 RH-STORAGE-ADMISSION-ORDER, RH-ENGINE-CONFIG-CUSTODY). In
+            # apply, verify, run and run-local the seed admits, BEFORE any create, prune, log write or install (right
+            # after the budget scope, before root creation and the root lock), the storage it will write:
+            #   the admitted work root (run / run-local: W above; apply / verify: the root's parent): refused_prefixes,
+            #   refused_fs_types, free_bytes_min and free_inodes_min (admission below);
+            #   every EXISTING destination (R and its layout dirs; run / run-local also every declared sub-root dir,
+            #   config file and runner evidence dir): not a link, owned by the running uid, not group/other-writable,
+            #   directory or regular file as declared, on the SAME device as the admitted work root (a nested mount
+            #   -- tmpfs or any other filesystem mounted inside -- refuses) and not on a refused fs type.
+            # purge is exempt from capacity admission (it only removes owned entries; refusing it on a full disk would
+            # block recovery) but keeps the ancestry and ownership inventory.
+            # Engine configs are published safely: written to a fresh mktemp file in the admitted dir, then renamed
+            # onto the name (`mv -T`; a rename never follows a link); an existing config that is a link or not an
+            # owned, non-group/other-writable regular file refuses (never replaced).
+            # The ancestry rule (path_admission.ancestry) is re-checked at the use boundary: after the root lock is
+            # held and before the first write under R, and again immediately before the playbook exec.
+            destination_custody: {same_device_as_work_root: true, owner: running_uid, refuse_group_other_writable: true, refuse_links: true}
             # RUN-LOCAL (MAIN-approved launcher for the local runners; codex 135500 / 135903): the SAME generated seed
             #   lme-controller-seed.sh run-local --root <work root>/<sub_roots.toolchain> --runner <runners key> [-- -e <v> ...]
             # runs ONE declared runner playbook with the generation's ansible-playbook, inventory `localhost,` and
-            # connection local (forced: -c local AND a final -e ansible_connection=local, after the caller's -e). It
-            # takes no --ssh-auth. It performs the same verify, run-dir retention, work-root admission (prefix, fs type,
-            # bytes, inodes) and sub-root preparation as `run`, execs under the same managed_env + run_env, creates
-            # <work root>/<sub_roots.run>/<runners.<key>> and passes it as the runner's work_root_var (last -e, so it
-            # wins), and propagates the playbook's exit status (exit $?). The playbook is selected ONLY by runner key
-            # (<checkout>/<playbook>, where <checkout> is the work root's parent and the work root's basename must be
-            # root_rel); after `--` only `-e`/`--extra-vars <value>` pairs (arg_flags) are accepted, so no arbitrary
-            # playbook, inventory or connection can be passed.
+            # connection local (forced: -c local AND the final pinned JSON -e, after the caller's screened -e). It
+            # takes no --ssh-auth. It performs the same admission (before effects), verify, run-dir retention and
+            # sub-root preparation as `run`, execs under the same managed_env + run_env, creates
+            # <work root>/<sub_roots.run>/<runners.<key>> and passes it as the runner's work_root_var (in the final -e,
+            # so it wins), and propagates the playbook's exit status (exit $?). The playbook is selected ONLY by runner
+            # key (<checkout>/<playbook>; <checkout> per WORKSPACE ANCHOR, bound to the bundle); after `--` only
+            # `-e`/`--extra-vars <value>` pairs (arg_flags) are accepted, so no arbitrary playbook, inventory or
+            # connection can be passed.
             # The playbook env carries NO LME_SEED_SCOPED: a seed a runner invokes enters its OWN declared budget scope.
             # The runner itself runs inside this seed's budget scope (controller.bootstrap.budget).
             # user_manager: the runner env carries the owner's systemd user manager -- XDG_RUNTIME_DIR =
@@ -554,22 +588,78 @@ profile_overlay:
             # carried from the caller; plus USER = `id -un`. XDG_RUNTIME_DIR is the user-manager runtime dir (tmpfs
             # by design, runtime state only), NOT a work location: moving it to the work root would sever
             # systemd-run --user and rootless podman's systemd/cgroup and lock state.
-            # BOOTSTRAP EXCEPTION (the ONE disclosed one): the FIRST testing/remote_harness/package.yml build runs
-            # under the declared genesis builder (/usr/bin/ansible-playbook, genesis.builder) WITHOUT this launcher,
-            # because the seed is that build's product; its temp is the invoker's environment. Every later runner in
-            # `runners` goes through run-local.
+            # SELECTORS (codex 143844 RH-RUNLOCAL-OVERRIDES): before any effect the seed REFUSES any caller -e value --
+            # inline, or the content of an `@file` value (a regular file) -- that sets an executor, interpreter,
+            # privilege or temp selector (forbidden_selector_regex, matched by the declared grep -E on key=value,
+            # JSON and YAML key forms). Then the seed appends ONE final JSON -e of pinned_vars (local connection,
+            # the run's own module temp, the generation interpreter, no become) and the runner's work_root_var, so
+            # the effective values are the pinned ones. Operator overrides reach a runner only through admitted
+            # declarations (lme_global_override tunable paths), never through escape variables.
+            # required_inputs: names each runner needs as INLINE `-e <name>=<value>` pairs (no defaults are supplied
+            # by the seed; absent -> refused before any effect).
+            # BOOTSTRAP EXCEPTION (the ONE disclosed one; authority genesis.decision.ref =
+            # codex-tick127-bootstrap-and-E-B-decisions-20260923-231751 field genesis; execution binding
+            # controller.bootstrap.genesis.builder): the FIRST testing/remote_harness/package.yml build runs WITHOUT this
+            # launcher, under exactly the declared genesis builder -- executable genesis.builder.executable with first line
+            # genesis.builder.shebang, interpreter genesis.builder.python (genesis.builder.python_major_minor), core
+            # genesis.builder.core, ansible package genesis.builder.ansible_package_dir, no ansible config, no ANSIBLE_*
+            # but genesis.builder.env_allow -- all ENFORCED by tasks/admit_builder.yml before any package write. The
+            # executable and interpreter sha256 are RECORDED measurements in bundle.json (builder), NOT compared with a
+            # declared digest (none is declared). It never authorizes another interpreter, an unpinned ansible or a
+            # scratch script. Its temp is the invoker's environment. Every later runner in `runners` goes through run-local.
             run_local:
               mode: run-local
               inventory: 'localhost,'
               connection: local
               arg_flags: ['-e', '--extra-vars']
               user_manager_env: {runtime_dir_env: XDG_RUNTIME_DIR, bus_env: DBUS_SESSION_BUS_ADDRESS, user_env: USER}
+              forbidden_selector_regex: '(^|[^A-Za-z0-9_])(ansible_[A-Za-z0-9_]*|become[A-Za-z0-9_]*|lme_resolved_run)"?[[:space:]]*[:=]'
+              # the final -e (JSON); {run_tmp} = this run's tmp dir, {venv_python} = the generation interpreter
+              pinned_vars:
+                ansible_connection: local
+                ansible_remote_tmp: '{run_tmp}'
+                ansible_python_interpreter: '{venv_python}'
+                ansible_become: false
+              # RH-RUNNER-RESOLVED-WORKROOT (codex 144541): the ONE resolved-run contract. The seed passes, LAST, one JSON
+              # -e {"<var>": {...}} with EXACTLY `fields` (consumers refuse any other key set; C1 a0e341e run_loader_tests.yml):
+              #   runner           the run_local.runners key selected by --runner
+              #   work_root        <work root>/<sub_roots.run>/<runners.<key>> (absolute, no trailing slash, admitted, created)
+              #                    -- ALSO passed as -e <work_root_var>=<same> before it, so existing entrypoints keep working
+              #   ansible_playbook <generation>/<venv>/bin/ansible-playbook, the executable the seed execs (receipt-bound)
+              #   python           <generation>/<venv>/bin/python = the receipt's `python` = the runner's
+              #                    ansible_playbook_python (sys.executable as run, never link-resolved); the seed refuses
+              #                    RH-SEED-GENERATION-DRIFT unless ansible-playbook runs exactly it: first line `#!<python>`,
+              #                    or (shebang too long for the kernel) first line `#!/bin/sh` with the launcher line
+              #                    `'''exec' '<python>' ...`; also pinned_vars.ansible_python_interpreter
+              #   env              every PATH-VALUED name the seed exports into the runner env with its identical value:
+              #                    ANSIBLE_HOME, ANSIBLE_LOCAL_TEMP, ANSIBLE_GALAXY_CACHE_DIR, ANSIBLE_COLLECTIONS_PATH,
+              #                    ANSIBLE_CONFIG, TMPDIR (managed_env), each run_env name (XDG_CACHE_HOME, UV_CACHE_DIR,
+              #                    PIP_CACHE_DIR, XDG_DATA_HOME, CONTAINERS_STORAGE_CONF, CONTAINERS_CONF), remote_tmp_env
+              #                    (= the pinned ansible_remote_tmp), XDG_RUNTIME_DIR and HOME. Non-path exports (base_env
+              #                    PATH/LC_ALL, managed_env flags, DBUS_SESSION_BUS_ADDRESS, USER) are exported but NOT listed.
+              #   receipt          {path: <generation>/<receipts_dir>/toolchain.json (sealed, regular), sha256: its digest}
+              # A caller extra-var that sets <var> refuses before any effect (forbidden_selector_regex). Helpers never reload
+              # the raw profile to default a work root: they consume this record or refuse.
+              resolved_run:
+                var: lme_resolved_run
+                fields: [runner, work_root, ansible_playbook, python, env, receipt]
+                receipt_fields: [path, sha256]
+                env_value: absolute_path
+                remote_tmp_env: ANSIBLE_REMOTE_TMP
               runners:
-                remote_harness_controls: {playbook: testing/remote_harness/tests/run_controls.yml, work_root_var: rhc_work_root}
-                transfer_controls: {playbook: testing/e2e/transfer/controls/run_controls.yml, work_root_var: work_root}
-                transfer_check: {playbook: testing/e2e/transfer/check.yml, work_root_var: ''}
-                loader_integration: {playbook: testing/tests/loader_integration/run_integration.yml, work_root_var: work_root}
-                acceptance: {playbook: testing/acceptance/run_acceptance.yml, work_root_var: work_root}
+                remote_harness_controls: {playbook: testing/remote_harness/tests/run_controls.yml, work_root_var: rhc_work_root, required_inputs: []}
+                transfer_controls: {playbook: testing/e2e/transfer/controls/run_controls.yml, work_root_var: work_root, required_inputs: []}
+                transfer_check: {playbook: testing/e2e/transfer/check.yml, work_root_var: '', required_inputs: []}
+                loader_integration: {playbook: testing/tests/loader_integration/run_integration.yml, work_root_var: work_root, required_inputs: []}
+                acceptance: {playbook: testing/acceptance/run_acceptance.yml, work_root_var: work_root, required_inputs: []}
+                private_group_fixtures: {playbook: testing/remote_harness/tests/run_private_group_fixtures.yml, work_root_var: pgf_work_root, required_inputs: []}
+                # C1 (0160b1b): every input explicit, no private defaults; baseline_commit stays optional (integration mode)
+                loader_cases:
+                  playbook: testing/loader-tests-r4/run_loader_tests.yml
+                  work_root_var: work_root
+                  required_inputs: [repo_root, cases_file, run_label, probe_ansible_playbook, expected_runner_ansible_core,
+                                    expected_probe_ansible_core, expected_probe_python_executable, expected_probe_python_version,
+                                    run_mode, source_commit, interpreter_policy, managed_interpreter_root]
             # names the seed `run` binds from the work root (sub_root + relative dir); the per-run temp names
             # (TMPDIR, ANSIBLE_LOCAL_TEMP, ANSIBLE_HOME, ANSIBLE_GALAXY_CACHE_DIR) stay in the run dir (managed_env).
             run_env:
@@ -604,7 +694,52 @@ profile_overlay:
             forbidden: ['/', '*//*', '*/', '*/./*', '*/../*', '*/.', '*/..']
             regex: '^/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$'
             forbidden_segment_regex: '(^|/)\.{1,2}(/|$)'
-            ancestry: {allow_owner_uids: [0, owner], refuse_group_other_writable: true, refuse_links: true, sticky_exception: false}
+            # ANCESTRY -- the ONE resolved rule (codex 143342 WORK-ROOT-ANCESTRY-PRIVATE-GROUP). Consumers read
+            # rh.controller.bootstrap.path_admission.ancestry (lme_resolved.remote_harness.policy.controller.bootstrap
+            # .path_admission.ancestry): the seed (macros ancestry_check + private_group_admit), and every playbook
+            # consumer through tasks/admit_ancestry.yml (controller-local) or the target initial-contact boundary
+            # (target_bootstrap.yml), all deciding with the SAME generated program (macro private_group_program,
+            # rendered for playbooks by templates/private_group_program.j2 and run by tasks/decide_private_group.yml).
+            # Every existing ancestor: a real directory (links refuse), owned by uid 0 or the owner, NEVER other-writable
+            # (sticky included). group-writable refuses UNLESS owner_private_group admits that directory; nothing else
+            # relaxes it. No user, gid or directory name is declared here: the owner is the running uid.
+            ancestry:
+              allow_owner_uids: [0, owner]
+              refuse_group_other_writable: true      # kept for existing readers; group-writable is refused unless
+              refuse_links: true                     # owner_private_group below admits the directory
+              sticky_exception: false
+              # A group-writable ancestor is admitted ONLY when every condition holds (else REFUSED <refusal>):
+              #   dir: owned by the owner uid (never uid 0 or another uid), not other-writable, a real directory;
+              #   primary group: the dir's gid is the owner's primary gid, the owner uid has exactly ONE passwd record,
+              #     and a FULL passwd enumeration shows NO other account with that primary gid (and no other account
+              #     reusing an owner account name);
+              #   supplementary: exactly ONE group record has that gid and its member list is empty or names only the
+              #     owner's account(s) -- an empty list alone is not the proof, the primary-gid scan above is;
+              #   identity provider: nsswitch `<db>:` lines for every database in `databases` exist exactly once and
+              #     their source list is exactly one of `allowed_sources` (actions such as [NOTFOUND=return], or any
+              #     remote/dynamic backend such as sss, winbind, ldap, nis, are unsupported and refuse); every
+              #     enumeration step exits 0 (a failed, empty or malformed enumeration refuses);
+              #   ACL: getfacl (numeric, physical) of the dir, access AND default entries: a write-granting named user
+              #     other than the owner uid, a write-granting named group other than the dir's gid, or a write-granting
+              #     other entry refuses; an unknown entry tag refuses. (With an ACL the mode's group bits ARE the mask,
+              #     so an effective foreign writer through a named entry always makes the dir group-writable and is
+              #     judged here; mask entries themselves are not writers.)
+              owner_private_group:
+                enabled: true
+                applies_to: owner_owned_group_writable   # uid-0 or foreign group-writable ancestors always refuse
+                identity_provider:
+                  nsswitch_file: /etc/nsswitch.conf
+                  databases: [passwd, group]
+                  allowed_sources: [[files], [files, systemd]]
+                  enumeration_tool: getent               # os_tools.getent (hash-admitted)
+                acl_tool: getfacl                        # os_tools.getfacl (hash-admitted); argv -c -n -p -P -- <dir>
+                decision_tool: awk                       # os_tools.awk runs the generated program (controller for playbooks)
+                facts_schema: private-group-facts/1      # tags: owner path dir rc nsl pwl grl acl (tests/private_group_fixtures.yml)
+                program_template_rel: testing/remote_harness/templates/private_group_program.j2   # rh_pg_part program|facts
+                consumer_tasks_rel: testing/remote_harness/tasks/admit_ancestry.yml               # controller-local consumers (B, G)
+                decide_tasks_rel: testing/remote_harness/tasks/decide_private_group.yml
+                fixtures_rel: testing/remote_harness/tests/private_group_fixtures.yml
+                refusal: RH-SEED-ROOT-NOT-OWNED
           # The seed re-executes itself once inside a transient user scope with these limits and reads the limits
           # back from its own cgroup. No scope -> refusal; it never runs unbudgeted (apply, verify, purge and run).
           budget:
@@ -956,6 +1091,25 @@ profile_overlay:
                 NOT required for the bootstrap itself (the SSH session carries the user manager). A MAIN-only root
                 precondition (`loginctl enable-linger <owner>`, privileged, performed through the declared MAIN
                 runner) only if a later slice runs owner jobs outside an SSH session.
+            # INITIAL CONTACT (codex 143844 RH-TARGET-FIRST-STAGING). Everything target_bootstrap.yml asserts before this
+            # point is a PRE-CONTACT DECLARATION CHECK (inventory values, derived remote temp, scope binding; nothing on
+            # the target is observed). The first contact is `ansible.builtin.raw` ONLY (no module staging, no remote
+            # temp created), read-only, running exactly these os_tools by their declared paths:
+            #   1 identity: the declared sha256sum answers its known answer (os_tool_identity) and reports the digest of
+            #     every tool below; the controller compares each with os_tools.<tool>.identity (a digest reported by the
+            #     tool under test -- the KAT is the complement; the INDEPENDENT stat-module re-hash of every selected
+            #     executable follows once the staging boundary below is admitted);
+            #   2 staging boundary: every component of the bundle dir, the root and <target work root>/<sub_roots.tmp>/
+            #     <remote_tmp_rel> (the module temp), the work root's fs type, free bytes and inodes. Admitted on the
+            #     controller by path_admission.ancestry (group-writable only through owner_private_group, facts over
+            #     raw + decision by the controller program), work_roots.admission, and the module temp chain
+            #     (absent, or an owned real dir, not group/other-writable, same device as the work root);
+            #   3 owner_private_group facts for each owner-owned group-writable component (private_group_program.j2 facts).
+            # Only after all three are admitted does the first module (stat) stage anything under the module temp.
+            initial_contact:
+              channel: raw
+              tools: [sh, sha256sum, id, stat, df, sed, cat, getent, getfacl]   # raw commands run as `<sh> -c <generated>`
+              refusal: RH-TARGET-BOOTSTRAP
             refusal: RH-TARGET-BOOTSTRAP
           consumer_verification:
             tasks_rel: testing/remote_harness/tasks/verify_toolchain_receipt.yml
@@ -982,14 +1136,22 @@ profile_overlay:
           # unchanged: it locates the profile at playbook_dir or up to THREE parent levels (a consumer playbook at
           # testing/e2e/transfer/ is supported); that depth is fixed, never a tunable (the guard runs before any resolve
           # and a variable could be outranked by an extra-var).
+          # revision 5 (codex 143342 WORK-ROOT-ANCESTRY-PRIVATE-GROUP): the interface is SIX files (interface_sha256 over
+          # six lines). tasks/admit_ancestry.yml is the ONE ancestry admission for every consumer (B, G, route): inputs
+          # rh_anc_bs, rh_anc_repo_root, rh_anc_path, rh_anc_refusal; output rh_anc_admitted_private_groups; it applies
+          # path_admission.ancestry and its owner_private_group rule through tasks/decide_private_group.yml (the generated
+          # program). verify_toolchain_receipt.yml includes it and admits group-writable ancestors ONLY when listed there.
+          # refuse_pinned_outputs.yml is re-pinned to its committed bytes (revision 4 pinned an older edition: drift).
           consumer_interface:
-            revision: 4
+            revision: 5
             files:
-              tasks/refuse_pinned_outputs.yml: 7ad96f6e38d54a4b36d9f1027951d2acefadb244be72aea9b80d2f738feb1edb
+              tasks/admit_ancestry.yml: b3ad800c1fb765d4fe4bd50eab9050600890f82e0a192a80cca426afb062f24b
+              tasks/decide_private_group.yml: 8c10102a995b15d6d9610f7f36634a7f5ae86eabd243c820c0f024b1302e80d9
+              tasks/refuse_pinned_outputs.yml: d408cfcd24cd3af79c2a4bb9572fde3f6278b8e60ae28b44911d9e170b579a0c
               tasks/resolve_harness.yml: 750c8f221915e94c131ce670efd166946c245975592e174ec741396a7d13567c
               tasks/resolve_policy.yml: 93f2855e512903ac4334323a1e7e47ecf210737d34edd62c68c890fd6dff4a86
-              tasks/verify_toolchain_receipt.yml: f26826f8780ac6fd096aa0515fb4414372d80281886142e599974a4112d5dceb
-            interface_sha256: 643a1fc4c38de9476567e1eac2bdd608de409ff1b560218dc8c5cad2b2431eb9
+              tasks/verify_toolchain_receipt.yml: 33ee065d47d01aca5780f5482d9b32f23a38625a71b254270b3df4e504cc8689
+            interface_sha256: d49e4d1d17239ed8072dd60e5c528b84102792855ce665932f14f8e1c0ed48e6
           # SEED-05: the names the harness derives are REGISTRY-owned (C1: manifests/global.yml
           # lme_config_registry.remote_harness_schema.reserved_outputs; retired here, the projection refuses a
           # controller.bootstrap.derived_outputs). tasks/refuse_pinned_outputs.yml reads that list inline.
@@ -1003,9 +1165,9 @@ profile_overlay:
       # logical package so a preflight refusal names what MAIN must install (root step, MAIN-only, not in this slice).
       packages:
         by_os_family:
-          Debian: {git: git, jq: jq, curl: curl, ca_certificates: ca-certificates, tar: tar, gzip: gzip, xz: xz-utils, coreutils: coreutils, diffutils: diffutils, findutils: findutils, util_linux: util-linux, systemd: systemd, libc_tools: libc-bin, sed: sed, grep: grep, awk: mawk, dash: dash}
-          RedHat: {git: git, jq: jq, curl: curl, ca_certificates: ca-certificates, tar: tar, gzip: gzip, xz: xz, coreutils: coreutils, diffutils: diffutils, findutils: findutils, util_linux: util-linux, systemd: systemd, libc_tools: glibc-common, sed: sed, grep: grep, awk: gawk, dash: bash}
-        required: [jq, curl, ca_certificates, tar, gzip, xz, coreutils, diffutils, findutils, util_linux, systemd, libc_tools, sed, grep, awk, dash]
+          Debian: {git: git, jq: jq, curl: curl, ca_certificates: ca-certificates, tar: tar, gzip: gzip, xz: xz-utils, coreutils: coreutils, diffutils: diffutils, findutils: findutils, util_linux: util-linux, systemd: systemd, libc_tools: libc-bin, sed: sed, grep: grep, awk: mawk, dash: dash, acl: acl}
+          RedHat: {git: git, jq: jq, curl: curl, ca_certificates: ca-certificates, tar: tar, gzip: gzip, xz: xz, coreutils: coreutils, diffutils: diffutils, findutils: findutils, util_linux: util-linux, systemd: systemd, libc_tools: glibc-common, sed: sed, grep: grep, awk: gawk, dash: bash, acl: acl}
+        required: [jq, curl, ca_certificates, tar, gzip, xz, coreutils, diffutils, findutils, util_linux, systemd, libc_tools, sed, grep, awk, dash, acl]
         conditional: {git: [package_source_binding, source_edition_binding]}
         provides:
           dash: [sh]
@@ -1022,6 +1184,7 @@ profile_overlay:
           systemd: [systemd-run]
           util_linux: [flock]
           git: [git]
+          acl: [getfacl]
 
       # ---- deploy transfer (codex-tick119 R1_R3_seam_direction R1) ----
       # The transfer operation's dependencies are declared on BOTH ends. Selected: the managed_archive adapter, which

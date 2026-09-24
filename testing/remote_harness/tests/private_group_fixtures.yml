@@ -1,0 +1,128 @@
+---
+# testing/remote_harness/tests/private_group_fixtures.yml -- SYNTHETIC fixtures of the owner-private-group decision
+# (profile controller.bootstrap.path_admission.ancestry.owner_private_group; codex 143342 required controls).
+# Each fixture is a private-group-facts/1 stream (list of [tag, value]; the runner joins tag TAB value lines) and the
+# expected verdict of the ONE generated program (macro private_group_program, rendered by
+# templates/private_group_program.j2). No real host user, group, ACL or directory is read or changed: every account,
+# uid, gid and path below is synthetic. Host: tests/run_private_group_fixtures.yml, launched by the declared seed
+# `run-local --runner private_group_fixtures` (work_roots.run_local.runners.private_group_fixtures).
+# expect: ADMIT (rc 0, stdout `ADMIT <path>`) or REFUSE (rc 1, stdout `REFUSE <path>: ...` containing every `reasons`
+# substring). Case rows: tests/lifecycle-cases.yml E51 (ids PG01..PG12 here are its variants).
+schema: private-group-fixtures/1
+facts_schema: private-group-facts/1
+# the shared positive baseline: owner 5001 (owner1), dir owned 5001:5001 mode 2775 (setgid group-writable),
+# nsswitch files+systemd, no other account with primary gid 5001, group 5001 has no members, ACL = mode only
+base:
+  - [owner, '5001']
+  - [path, /fixture/ws/.work]
+  - [dir, '5001 5001 2775']
+  - [rc, "dir\t0"]
+  - [rc, "nss\t0"]
+  - [rc, "passwd\t0"]
+  - [rc, "group\t0"]
+  - [rc, "acl\t0"]
+  - [nsl, '# synthetic nsswitch.conf']
+  - [nsl, 'passwd:         files systemd']
+  - [nsl, 'group:          files systemd']
+  - [nsl, 'shadow:         files systemd']
+  - [nsl, 'hosts:          files dns']
+  - [pwl, 'root:x:0:0:root:/root:/bin/sh']
+  - [pwl, 'owner1:x:5001:5001:synthetic owner:/fixture/home/owner1:/bin/sh']
+  - [pwl, 'other2:x:5002:5002:synthetic other:/fixture/home/other2:/bin/sh']
+  - [grl, 'root:x:0:']
+  - [grl, 'owner1:x:5001:']
+  - [grl, 'other2:x:5002:']
+  - [acl, 'user::rwx']
+  - [acl, 'group::rwx']
+  - [acl, 'other::r-x']
+# each fixture = base with `replace` (tag + old value -> new value), `drop` (tag + value removed) and `add` applied
+fixtures:
+  - id: PG01-owner-only-positive
+    required: owner-only primary group positive
+    expect: ADMIT
+  - id: PG02-second-user-shares-primary-gid-empty-members
+    required: second user sharing the primary gid with an empty group member list
+    replace: [[pwl, 'other2:x:5002:5002:synthetic other:/fixture/home/other2:/bin/sh', 'other2:x:5002:5001:synthetic other:/fixture/home/other2:/bin/sh']]
+    expect: REFUSE
+    reasons: [account-other2-shares-primary-gid-5001]
+  - id: PG03-supplementary-member
+    required: supplementary member
+    replace: [[grl, 'owner1:x:5001:', 'owner1:x:5001:other2']]
+    expect: REFUSE
+    reasons: [supplementary-member-other2]
+  - id: PG03b-owner-listed-as-member-positive
+    replace: [[grl, 'owner1:x:5001:', 'owner1:x:5001:owner1']]
+    expect: ADMIT
+  - id: PG04-other-writable
+    required: other-writable
+    replace: [[dir, '5001 5001 2775', '5001 5001 2777']]
+    expect: REFUSE
+    reasons: [other-writable]
+  - id: PG05-acl-foreign-user-writer
+    required: ACL-granted foreign writer
+    add: [[acl, 'user:5002:rwx'], [acl, 'mask::rwx']]
+    expect: REFUSE
+    reasons: [acl-user-5002-writes]
+  - id: PG05b-default-acl-foreign-group-writer
+    add: [[acl, 'default:group:5003:rwx']]
+    expect: REFUSE
+    reasons: [acl-group-5003-writes]
+  - id: PG05c-acl-foreign-reader-positive
+    add: [[acl, 'user:5002:r-x'], [acl, "mask::rwx\t#effective:r-x"]]
+    expect: ADMIT
+  - id: PG06-incomplete-lookup-failed-enumeration
+    required: ambiguous or incomplete lookup (enumeration failed)
+    replace: [[rc, "passwd\t0", "passwd\t2"]]
+    expect: REFUSE
+    reasons: [step-passwd-failed-rc-2]
+  - id: PG06b-ambiguous-owner-uid
+    required: ambiguous or incomplete lookup (two accounts with the owner uid)
+    add: [[pwl, 'alias1:x:5001:5001::/fixture/home/alias1:/bin/sh']]
+    expect: REFUSE
+    reasons: [owner-uid-5001-passwd-records-2]
+  - id: PG06c-empty-enumeration
+    required: ambiguous or incomplete lookup (empty passwd enumeration)
+    drop: [[pwl, 'root:x:0:0:root:/root:/bin/sh'], [pwl, 'owner1:x:5001:5001:synthetic owner:/fixture/home/owner1:/bin/sh'], [pwl, 'other2:x:5002:5002:synthetic other:/fixture/home/other2:/bin/sh']]
+    expect: REFUSE
+    reasons: [passwd-enumeration-empty]
+  - id: PG06d-duplicate-group-gid
+    required: ambiguous or incomplete lookup (two group records with the gid)
+    add: [[grl, 'shadowgrp:x:5001:']]
+    expect: REFUSE
+    reasons: [group-gid-5001-records-2]
+  - id: PG07-nsswitch-remote-backend
+    required: identity-provider completeness (this controller's own configuration shape)
+    replace: [[nsl, 'passwd:         files systemd', 'passwd:         files systemd sss winbind'], [nsl, 'group:          files systemd', 'group:          files systemd sss winbind']]
+    expect: REFUSE
+    reasons: ['nsswitch-passwd-sources-unsupported:files+systemd+sss+winbind', 'nsswitch-group-sources-unsupported:files+systemd+sss+winbind']
+  - id: PG07b-nsswitch-action
+    replace: [[nsl, 'passwd:         files systemd', 'passwd:         files [NOTFOUND=return] systemd']]
+    expect: REFUSE
+    reasons: [nsswitch-passwd-sources-unsupported]
+  - id: PG07c-nsswitch-files-only-positive
+    replace: [[nsl, 'passwd:         files systemd', 'passwd: files'], [nsl, 'group:          files systemd', 'group: files']]
+    expect: ADMIT
+  - id: PG07d-nsswitch-missing-db
+    drop: [[nsl, 'group:          files systemd']]
+    expect: REFUSE
+    reasons: [nsswitch-group-absent]
+  - id: PG08-dir-gid-not-owner-primary
+    replace: [[dir, '5001 5001 2775', '5001 5002 2775']]
+    expect: REFUSE
+    reasons: [dir-gid-5002-is-not-owner-primary-gid-5001]
+  - id: PG09-dir-owner-foreign
+    replace: [[dir, '5001 5001 2775', '5002 5001 2775']]
+    expect: REFUSE
+    reasons: [dir-owner-5002-is-not-owner-5001]
+  - id: PG10-unknown-fact
+    add: [[xyz, 'anything']]
+    expect: REFUSE
+    reasons: [unknown-fact-xyz]
+  - id: PG11-acl-step-failed
+    replace: [[rc, "acl\t0", "acl\t1"]]
+    expect: REFUSE
+    reasons: [step-acl-failed-rc-1]
+  - id: PG12-acl-unknown-tag
+    add: [[acl, 'weird:5002:rwx']]
+    expect: REFUSE
+    reasons: [acl-entry-weird-unknown]

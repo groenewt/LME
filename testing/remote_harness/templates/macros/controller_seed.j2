@@ -61,8 +61,21 @@ lme_refuse() {
 {%- endmacro -%}
 
 {#- managed ansible environment: declared managed_env + the SEALED generation ansible.cfg (SEED-01) -#}
-{%- macro managed_env(bs, home_dir, tmp_dir) -%}
-{{ env_i(bs, bs.managed_env, ['ANSIBLE_HOME="' ~ home_dir ~ '"', 'ANSIBLE_LOCAL_TEMP="' ~ tmp_dir ~ '/ansible-local"', 'ANSIBLE_GALAXY_CACHE_DIR="' ~ tmp_dir ~ '/galaxy-cache"', 'ANSIBLE_COLLECTIONS_PATH="$G/' ~ bs.layout.gen_dirs.collections ~ '"', 'ANSIBLE_CONFIG="$G/' ~ bs.layout.config_file ~ '"', 'TMPDIR="' ~ tmp_dir ~ '"']) }}
+{#- the managed runtime names as `NAME=<shell value>` lines: the ONE list behind managed_env and the run-local
+    lme_resolved_run.env record (so the record is exactly what is exported) -#}
+{%- macro managed_pairs(bs, home_dir, tmp_dir) -%}
+ANSIBLE_HOME={{ home_dir }}
+ANSIBLE_LOCAL_TEMP={{ tmp_dir }}/ansible-local
+ANSIBLE_GALAXY_CACHE_DIR={{ tmp_dir }}/galaxy-cache
+ANSIBLE_COLLECTIONS_PATH=$G/{{ bs.layout.gen_dirs.collections }}
+ANSIBLE_CONFIG=$G/{{ bs.layout.config_file }}
+TMPDIR={{ tmp_dir }}
+{%- endmacro -%}
+
+{%- macro managed_env(bs, home_dir, tmp_dir, extra=[]) -%}
+{%- set ns = namespace(w=[]) -%}
+{%- for l in (managed_pairs(bs, home_dir, tmp_dir) | string).split('\n') + extra -%}{%- set kv = l.split('=', 1) -%}{%- set ns.w = ns.w + [kv[0] ~ '="' ~ kv[1] ~ '"'] -%}{%- endfor -%}
+{{ env_i(bs, bs.managed_env, ns.w) }}
 {%- endmacro -%}
 
 {#- ---- preconditions that need no root and no artifact ---- -#}
@@ -135,8 +148,100 @@ case "${{ var }}" in
 esac
 {%- endmacro -%}
 
-{#- ---- ancestry: every existing ancestor is a real dir owned by 0/us and not group/other-writable ---- -#}
+{#- ---- OWNER-PRIVATE-GROUP decision (path_admission.ancestry.owner_private_group; codex 143342): ONE generated awk
+     program, a pure function of a tagged facts stream (facts_schema private-group-facts/1: `<tag>TAB<value>` lines,
+     tags owner path dir rc nsl pwl grl acl). The seed pipes the facts it gathers into it; playbook consumers render
+     the same program (templates/private_group_program.j2) and run it on the controller (tasks/decide_private_group.yml);
+     the synthetic fixtures (tests/private_group_fixtures.yml) run it unchanged. Prints `ADMIT <dir>` (exit 0) or
+     `REFUSE <dir>: <reasons>` (exit 1). No single quote inside (it travels through shq). ---- -#}
+{%- macro private_group_program(bs) -%}
+{% set pg = bs.path_admission.ancestry.owner_private_group %}
+function no(m) { ok = 0; why = why " " m }
+BEGIN { ok = 1; why = ""; np = 0; ng = 0; na = 0; nallow = 0; ndb = 0; ou = ""; dp = ""; du = ""; dg = ""; dm = ""
+{% for s in pg.identity_provider.allowed_sources %}
+  allow[{{ loop.index }}] = "{{ s | join(' ') }}"; nallow = {{ loop.index }}
+{% endfor %}
+{% for d in pg.identity_provider.databases %}
+  dbs[{{ loop.index }}] = "{{ d }}"; ndb = {{ loop.index }}
+{% endfor %}
+  nstep = split("dir nss passwd group acl", steps, " ") }
+{ t = index($0, "\t"); if (t == 0) { no("malformed-fact"); next }; tag = substr($0, 1, t - 1); v = substr($0, t + 1) }
+tag == "owner" { if (ou != "") no("owner-fact-repeated"); ou = v; next }
+tag == "path" { if (dp != "") no("path-fact-repeated"); dp = v; next }
+tag == "dir" { n = split(v, d, " "); if (n != 3) no("dir-fact-malformed"); du = d[1]; dg = d[2]; dm = d[3]; next }
+tag == "rc" { n = split(v, r, "\t"); if (n != 2) { no("rc-fact-malformed"); next }; rc[r[1]] = r[2]; next }
+tag == "nsl" { s = v; sub(/#.*/, "", s); c = index(s, ":"); if (c == 0) next; db = substr(s, 1, c - 1); gsub(/[ \t]/, "", db)
+  src = substr(s, c + 1); gsub(/[ \t]+/, " ", src); sub(/^ /, "", src); sub(/ $/, "", src)
+  if (db in nss) nssdup[db] = 1; nss[db] = src; next }
+tag == "pwl" { n = split(v, f, ":"); if (n != 7) { no("passwd-record-malformed"); next }; np++; pwn[np] = f[1]; pwu[np] = f[3]; pwg[np] = f[4]; next }
+tag == "grl" { n = split(v, f, ":"); if (n != 4) { no("group-record-malformed"); next }; ng++; grn[ng] = f[1]; grg[ng] = f[3]; grm[ng] = f[4]; next }
+tag == "acl" { na++; ae[na] = v; next }
+{ no("unknown-fact-" tag) }
+END {
+  for (i = 1; i <= nstep; i++) { s = steps[i]; if (!(s in rc)) no("step-" s "-unreported"); else if (rc[s] != "0") no("step-" s "-failed-rc-" rc[s]) }
+  if (ou == "" || dp == "" || du == "" || dg == "" || dm == "") no("facts-incomplete")
+  for (i = 1; i <= ndb; i++) { db = dbs[i]
+    if (!(db in nss)) no("nsswitch-" db "-absent")
+    else if (db in nssdup) no("nsswitch-" db "-repeated")
+    else { hit = 0; for (a = 1; a <= nallow; a++) if (nss[db] == allow[a]) hit = 1
+      if (!hit) { x = nss[db]; gsub(/ /, "+", x); no("nsswitch-" db "-sources-unsupported:" x) } } }
+  if (np == 0) no("passwd-enumeration-empty")
+  if (ng == 0) no("group-enumeration-empty")
+  if (du != ou) no("dir-owner-" du "-is-not-owner-" ou)
+  if (substr(dm, length(dm), 1) ~ /[2367]/) no("other-writable")
+  oc = 0; og = ""
+  for (i = 1; i <= np; i++) if (pwu[i] == ou) { oc++; og = pwg[i]; oname[pwn[i]] = 1 }
+  if (oc != 1) no("owner-uid-" ou "-passwd-records-" oc)
+  if (oc == 1 && dg != og) no("dir-gid-" dg "-is-not-owner-primary-gid-" og)
+  for (i = 1; i <= np; i++) {
+    if (pwg[i] == dg && pwu[i] != ou) no("account-" pwn[i] "-shares-primary-gid-" dg)
+    if ((pwn[i] in oname) && pwu[i] != ou) no("account-name-" pwn[i] "-ambiguous") }
+  gc = 0; mem = ""
+  for (j = 1; j <= ng; j++) if (grg[j] == dg) { gc++; mem = grm[j] }
+  if (gc != 1) no("group-gid-" dg "-records-" gc)
+  if (gc == 1 && mem != "") { k = split(mem, mm, ","); for (i = 1; i <= k; i++) if (!(mm[i] in oname)) no("supplementary-member-" mm[i]) }
+  for (i = 1; i <= na; i++) { e = ae[i]; sub(/#.*/, "", e); gsub(/[ \t]/, "", e); if (e == "") continue
+    sub(/^default:/, "", e); n = split(e, p, ":"); if (n != 3) { no("acl-entry-malformed"); continue }
+    if (index(p[3], "w") == 0) continue
+    if (p[1] == "user") { if (p[2] != "" && p[2] != ou) no("acl-user-" p[2] "-writes") }
+    else if (p[1] == "group") { if (p[2] != "" && p[2] != dg) no("acl-group-" p[2] "-writes") }
+    else if (p[1] == "other") no("acl-other-writes")
+    else if (p[1] != "mask") no("acl-entry-" p[1] "-unknown") }
+  if (ok) { print "ADMIT " dp; exit 0 }
+  print "REFUSE " dp ":" why; exit 1 }
+{%- endmacro -%}
+
+{#- the fact gathering for ONE group-writable directory ${dvar} (declared tools only; needs $_uid): prints the
+    private-group-facts/1 stream on stdout. The seed pipes it into the program; target_bootstrap.yml runs the same
+    text over its initial-contact raw channel and decides on the controller (tasks/decide_private_group.yml). -#}
+{%- macro private_group_facts(bs, dvar) -%}
+{% set pg = bs.path_admission.ancestry.owner_private_group %}
+_pgd=$({{ x(bs, 'stat') }} -c '%u %g %a' -- "${{ dvar }}"); _pgd_rc=$?
+_pgn=$({{ x(bs, 'cat') }} -- {{ shq(pg.identity_provider.nsswitch_file) }}); _pgn_rc=$?
+_pgp=$({{ x(bs, pg.identity_provider.enumeration_tool) }} passwd); _pgp_rc=$?
+_pgg=$({{ x(bs, pg.identity_provider.enumeration_tool) }} group); _pgg_rc=$?
+_pga=$({{ x(bs, pg.acl_tool) }} -c -n -p -P -- "${{ dvar }}"); _pga_rc=$?
+{
+  printf 'owner\t%s\npath\t%s\ndir\t%s\n' "$_uid" "${{ dvar }}" "$_pgd"
+  printf 'rc\tdir\t%s\nrc\tnss\t%s\nrc\tpasswd\t%s\nrc\tgroup\t%s\nrc\tacl\t%s\n' "$_pgd_rc" "$_pgn_rc" "$_pgp_rc" "$_pgg_rc" "$_pga_rc"
+  printf '%s\n' "$_pgn" | {{ x(bs, 'sed') }} 's/^/nsl\t/'
+  printf '%s\n' "$_pgp" | {{ x(bs, 'sed') }} 's/^/pwl\t/'
+  printf '%s\n' "$_pgg" | {{ x(bs, 'sed') }} 's/^/grl\t/'
+  printf '%s\n' "$_pga" | {{ x(bs, 'sed') }} 's/^/acl\t/'
+}
+{%- endmacro -%}
+
+{%- macro private_group_admit(bs, dvar) -%}
+{% set pg = bs.path_admission.ancestry.owner_private_group %}
+_pgv=$(
+{{ private_group_facts(bs, dvar) }} | {{ x(bs, pg.decision_tool) }} {{ shq(private_group_program(bs)) }}
+) || lme_refuse {{ pg.refusal }} "group-writable directory ${{ dvar }} is not an admitted owner-private group: $_pgv"
+{%- endmacro -%}
+
+{#- ---- ancestry (path_admission.ancestry, the ONE rule): every existing ancestor a real dir owned by 0 or the owner;
+     other-writable (sticky included) refuses; group-writable refuses unless owner_private_group admits it ---- -#}
 {%- macro ancestry_check(bs, var) -%}
+{% set pg = bs.path_admission.ancestry.owner_private_group %}
 _a=${{ var }}
 while [ "$_a" != / ]; do
   _a=${_a%/*}; [ -n "$_a" ] || _a=/
@@ -147,9 +252,58 @@ while [ "$_a" != / ]; do
   [ "$_o" = 0 ] || [ "$_o" = "$_uid" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "ancestor $_a owned by uid $_o (allowed: 0, $_uid)"
   _go=${_m#"${_m%??}"}
   case "$_go" in
-    [2367]?|?[2367]) lme_refuse RH-SEED-ROOT-NOT-OWNED "ancestor $_a is group/other-writable (mode $_m; sticky directories are not excepted)" ;;
+    ?[2367]) lme_refuse RH-SEED-ROOT-NOT-OWNED "ancestor $_a is other-writable (mode $_m; sticky directories are not excepted)" ;;
+    [2367]?)
+{% if pg.enabled %}
+      [ "$_o" = "$_uid" ] || lme_refuse {{ pg.refusal }} "ancestor $_a is group-writable and owned by uid $_o, not the owner $_uid (mode $_m)"
+      {{ private_group_admit(bs, '_a') | indent(6) }}
+{% else %}
+      lme_refuse RH-SEED-ROOT-NOT-OWNED "ancestor $_a is group-writable (mode $_m)"
+{% endif %}
+      ;;
   esac
 done
+{%- endmacro -%}
+
+{#- the rule as ONE shell function (lme_ancestry <path>), called at admission and re-called at every use boundary -#}
+{%- macro ancestry_fn(bs) -%}
+lme_ancestry() {
+  _anc=$1
+  {{ ancestry_check(bs, '_anc') | indent(2) }}
+  return 0
+}
+{%- endmacro -%}
+
+{#- ---- DESTINATION CUSTODY (work_roots.destination_custody; codex 143844 RH-ENGINE-CONFIG-CUSTODY): lme_dest <path>
+     <d|f> admits an EXISTING destination (absent -> nothing to admit): not a link, the declared type, owned by the
+     running uid, not other-writable, group-writable only as an admitted owner-private-group directory (files never),
+     on the admitted work root's device $_wdev (a nested mount refuses) and not on a refused fs type ---- -#}
+{%- macro dest_fn(bs) -%}
+{% set a = bs.work_roots.admission %}
+{% set pg = bs.path_admission.ancestry.owner_private_group %}
+lme_dest() {
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  [ ! -L "$1" ] || lme_refuse {{ a.refusal }} "destination is a link: $1"
+  case "$2" in d) [ -d "$1" ] ;; *) [ -f "$1" ] ;; esac || lme_refuse {{ a.refusal }} "destination is not of type $2: $1"
+  _ds=$({{ x(bs, 'stat') }} -c '%u %a %d' -- "$1") || lme_refuse {{ a.refusal }} "cannot stat destination $1"
+  _du=${_ds%% *}; _dr=${_ds#* }; _dm=${_dr%% *}; _dd=${_dr#* }
+  [ "$_du" = "$_uid" ] || lme_refuse {{ a.refusal }} "destination $1 is owned by uid $_du, not $_uid"
+  case "${_dm#"${_dm%??}"}" in
+    ?[2367]) lme_refuse {{ a.refusal }} "destination $1 is other-writable (mode $_dm)" ;;
+    [2367]?)
+{% if pg.enabled %}
+      [ "$2" = d ] || lme_refuse {{ a.refusal }} "destination file $1 is group-writable (mode $_dm)"
+      {{ private_group_admit(bs, '1') | indent(6) }}
+{% else %}
+      lme_refuse {{ a.refusal }} "destination $1 is group-writable (mode $_dm)"
+{% endif %}
+      ;;
+  esac
+  [ "$_dd" = "$_wdev" ] || lme_refuse {{ a.refusal }} "destination $1 is on device $_dd, not the admitted work root device $_wdev (nested mount)"
+  _dt=$({{ x(bs, 'stat') }} -f -c %T -- "$1") || lme_refuse {{ a.refusal }} "filesystem type unreadable for $1"
+  case "$_dt" in {% for t in a.refused_fs_types %}{{ shq(t) }}{% if not loop.last %}|{% endif %}{% endfor %}) lme_refuse {{ a.refusal }} "destination $1 is on $_dt (refused: {{ a.refused_fs_types | join(' ') }})" ;; esac
+  return 0
+}
 {%- endmacro -%}
 
 {#- ---- an EXISTING root is admitted only as this seed's: real dir, resolves to itself, uid + 0700, our marker ---- -#}
@@ -166,7 +320,7 @@ done
 {%- macro root_check(bs) -%}
 _uid=$({{ x(bs, 'id') }} -u)
 _marker="lme-controller-root v1 uid=$_uid"
-{{ ancestry_check(bs, 'R') }}
+lme_ancestry "$R"
 if [ -e "$R" ] || [ -L "$R" ]; then
   {{ root_existing(bs) | indent(2) }}
   ROOT_STATE=present
@@ -224,23 +378,90 @@ case "$_iavail" in ''|*[!0-9]*) lme_refuse {{ a.refusal }} "free inodes unreadab
 [ "$_iavail" -ge {{ a.free_inodes_min | int }} ] || lme_refuse {{ a.refusal }} "free inodes $_iavail < required {{ a.free_inodes_min | int }} at work root ${{ var }}"
 {%- endmacro -%}
 
+{#- the declared sub-root dirs of a work root (relative), the ONE list behind admission and preparation -#}
+{%- macro work_dirs(bs) -%}
+{%- set w = bs.work_roots -%}
+{%- set ns = namespace(d=[]) -%}
+{%- for s in w.run_env | map(attribute='sub') | unique -%}{%- set ns.d = ns.d + [w.sub_roots[s]] -%}{%- endfor -%}
+{%- for e in w.run_env | selectattr('kind', 'equalto', 'dir') -%}{%- set ns.d = ns.d + [w.sub_roots[e.sub] ~ '/' ~ e.rel] -%}{%- endfor -%}
+{%- for r in [w.engine_storage_conf.graphroot_rel, w.engine_storage_conf.runroot_rel, w.engine_containers_conf.image_copy_tmp_rel] -%}{%- set ns.d = ns.d + [w.sub_roots.engine_storage ~ '/' ~ r] -%}{%- endfor -%}
+{{ ns.d | join('\n') }}
+{%- endmacro -%}
+
+{#- ---- WORKSPACE ANCHOR + STORAGE ADMISSION (codex 143844 RH-WORKSPACE-ANCHOR, RH-STORAGE-ADMISSION-ORDER,
+     RH-ENGINE-CONFIG-CUSTODY): runs after the budget scope and BEFORE root creation, the root lock, any prune, log
+     write, sub-root creation or install, in apply / verify / run / run-local (purge exempt). ---- -#}
+{%- macro admit_storage(bs, rlm) -%}
+{% set wr = bs.work_roots %}
+{% set cb = wr.checkout_binding %}
+{% set L = bs.layout %}
+{% set rr = wr.root_rel %}
+if [ "$MODE" != purge ]; then
+  if [ "$MODE" = run ] || [ "$MODE" = {{ rlm }} ]; then
+    case "$R" in */{{ shq(rr) }}/*) : ;; *) lme_refuse {{ cb.refusal }} "$MODE needs a root under <checkout>/{{ rr }}/: $R" ;; esac
+    W=${R%/{{ shq(rr) }}/*}/{{ shq(rr) }}
+    _co=${W%/*}
+    [ -n "$_co" ] || lme_refuse {{ cb.refusal }} "the work root $W has no checkout parent"
+    [ "$W" != "$HOME" ] && [ "$W" != "${HOME%/}" ] || lme_refuse {{ wr.admission.refusal }} "the work root $W is \$HOME"
+    if [ "$MODE" = {{ rlm }} ]; then
+      [ "$R" = "$W/"{{ shq(wr.sub_roots.toolchain) }} ] || lme_refuse {{ cb.refusal }} "{{ rlm }} needs --root exactly <checkout>/{{ rr }}/{{ wr.sub_roots.toolchain }}, not $R"
+    fi
+    # the checkout is the one this bundle was packaged from: bundle.json (bound to this seed's sha256) names it, and
+    # the declared file's digest there equals its digest in the checkout
+    _bm="${SELF%/*}/"{{ shq(bs.bundle.manifest_file) }}
+    [ -f "$_bm" ] && [ ! -L "$_bm" ] || lme_refuse {{ cb.refusal }} "no bundle manifest next to the seed: $_bm"
+    {{ x(bs, 'grep') }} -q -F "\"seed_sha256\": \"$SEED_SHA\"" -- "$_bm" || lme_refuse {{ cb.refusal }} "$_bm does not bind this seed"
+    {{ x(bs, 'grep') }} -q -F "\"{{ cb.manifest_field_checkout }}\": \"$_co\"" -- "$_bm" || lme_refuse {{ cb.refusal }} "checkout $_co is not the checkout this bundle was packaged from ($_bm {{ cb.manifest_field_checkout }})"
+    _cf="$_co/"{{ shq(cb.file_rel) }}
+    [ -f "$_cf" ] && [ ! -L "$_cf" ] || lme_refuse {{ cb.refusal }} "checkout $_co has no regular {{ cb.file_rel }}"
+    _cfs=$({{ x(bs, 'sha256sum') }} -- "$_cf") || lme_refuse {{ cb.refusal }} "cannot digest $_cf"
+    {{ x(bs, 'grep') }} -q -F "\"{{ cb.file_rel }}  ${_cfs%% *}\"" -- "$_bm" || lme_refuse {{ cb.refusal }} "checkout $_co {{ cb.file_rel }} differs from the packaged source ($_bm)"
+  else
+    W=${R%/*}; [ -n "$W" ] || W=/
+  fi
+  [ -d "$W" ] && [ ! -L "$W" ] || lme_refuse {{ wr.admission.refusal }} "work root $W is not an existing real directory"
+  lme_ancestry "$W/."
+  {{ work_root_check(bs, 'W') | indent(2) }}
+  _wdev=$({{ x(bs, 'stat') }} -c %d -- "$W") || lme_refuse {{ wr.admission.refusal }} "cannot stat work root $W"
+  lme_dest "$R" d
+{% for d in [L.generations_dir, L.abandoned_dir, L.check_dir, L.run_dir] %}
+  lme_dest "$R/"{{ shq(d) }} d
+{% endfor %}
+{% for f in [L.root_marker, L.operations_log, L.active_file, bs.toolchain_receipt] %}
+  lme_dest "$R/"{{ shq(f) }} f
+{% endfor %}
+  if [ "$MODE" = run ] || [ "$MODE" = {{ rlm }} ]; then
+    for _wd in {% for d in (work_dirs(bs) | string).split('\n') %}"$W/"{{ shq(d) }} {% endfor %}"$W/"{{ shq(wr.sub_roots.run) }}{% for k, v in wr.runners | dictsort %} "$W/"{{ shq(wr.sub_roots.run ~ '/' ~ v) }}{% endfor %}; do
+      lme_dest "$_wd" d
+    done
+{% for e in wr.run_env | selectattr('kind', 'in', ['engine_storage_conf', 'engine_containers_conf']) %}
+    lme_dest "$W/"{{ shq(wr.sub_roots[e.sub] ~ '/' ~ e.rel) }} f
+{% endfor %}
+  fi
+fi
+{%- endmacro -%}
+
 {#- ---- WORK-ROOT sub-roots of ${var} for `seed run`: each declared dir (no -p; a link refuses) and the rootless engine
-     storage.conf (graphroot/runroot on the work root) ---- -#}
+     configs, published safely (mktemp in the admitted dir + mv -T; admit_storage already refused a linked or foreign
+     existing config) ---- -#}
 {%- macro work_root_prepare(bs, var) -%}
 {% set w = bs.work_roots %}
-{% set ns = namespace(d=[]) %}
-{% for s in w.run_env | map(attribute='sub') | unique %}{% set ns.d = ns.d + [w.sub_roots[s]] %}{% endfor %}
-{% for e in w.run_env | selectattr('kind', 'equalto', 'dir') %}{% set ns.d = ns.d + [w.sub_roots[e.sub] ~ '/' ~ e.rel] %}{% endfor %}
-{% for r in [w.engine_storage_conf.graphroot_rel, w.engine_storage_conf.runroot_rel, w.engine_containers_conf.image_copy_tmp_rel] %}{% set ns.d = ns.d + [w.sub_roots.engine_storage ~ '/' ~ r] %}{% endfor %}
-for _wd in {% for d in ns.d %}"${{ var }}/"{{ shq(d) }}{% if not loop.last %} {% endif %}{% endfor %}; do
+for _wd in {% for d in (work_dirs(bs) | string).split('\n') %}"${{ var }}/"{{ shq(d) }}{% if not loop.last %} {% endif %}{% endfor %}; do
   [ ! -L "$_wd" ] || lme_refuse {{ w.admission.refusal }} "$_wd is a link"
   [ -d "$_wd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_wd" || lme_refuse {{ w.admission.refusal }} "cannot create $_wd"
+  lme_dest "$_wd" d
 done
-{% for e in w.run_env | selectattr('kind', 'equalto', 'engine_storage_conf') %}
-printf '[storage]\nrunroot = "%s"\ngraphroot = "%s"\n' "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_storage_conf.runroot_rel) }} "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_storage_conf.graphroot_rel) }} > "${{ var }}/"{{ shq(w.sub_roots[e.sub] ~ '/' ~ e.rel) }} || lme_refuse {{ w.admission.refusal }} "cannot write the engine storage.conf under ${{ var }}"
-{% endfor %}
-{% for e in w.run_env | selectattr('kind', 'equalto', 'engine_containers_conf') %}
-printf '[engine]\nimage_copy_tmp_dir = "%s"\n' "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_containers_conf.image_copy_tmp_rel) }} > "${{ var }}/"{{ shq(w.sub_roots[e.sub] ~ '/' ~ e.rel) }} || lme_refuse {{ w.admission.refusal }} "cannot write the engine containers.conf under ${{ var }}"
+{% for e in w.run_env | selectattr('kind', 'in', ['engine_storage_conf', 'engine_containers_conf']) %}
+_cd="${{ var }}/"{{ shq(w.sub_roots[e.sub]) }}
+_cn="$_cd/"{{ shq(e.rel) }}
+lme_dest "$_cn" f
+_ct=$({{ x(bs, 'mktemp') }} "$_cd/."{{ shq(e.rel) }}".XXXXXXXX") || lme_refuse {{ w.admission.refusal }} "cannot create a temp file in $_cd"
+{% if e.kind == 'engine_storage_conf' %}
+printf '[storage]\nrunroot = "%s"\ngraphroot = "%s"\n' "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_storage_conf.runroot_rel) }} "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_storage_conf.graphroot_rel) }} > "$_ct" \
+{% else %}
+printf '[engine]\nimage_copy_tmp_dir = "%s"\n' "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_containers_conf.image_copy_tmp_rel) }} > "$_ct" \
+{% endif %}
+  && {{ x(bs, 'mv') }} -f -T -- "$_ct" "$_cn" || { {{ x(bs, 'rm') }} -f -- "$_ct"; lme_refuse {{ w.admission.refusal }} "cannot publish $_cn"; }
 {% endfor %}
 {%- endmacro -%}
 
@@ -588,24 +809,48 @@ _foreign=$({{ x(bs, 'find') }} -P "$R" ! -user "$_uid" -print -quit 2>&1) || lme
      arg_flags <value> pairs are admitted (no playbook, inventory or connection can be passed) ---- -#}
 {%- macro run_local_args(bs) -%}
 {% set rl = bs.work_roots.run_local %}
-_rl_pb=''; _rl_dir=''; _rl_var=''
+_rl_pb=''; _rl_dir=''; _rl_var=''; _rl_req=''
 if [ "$MODE" = {{ shq(rl.mode) }} ]; then
   case "$RUNNER" in
 {% for k, d in rl.runners | dictsort %}
-    {{ shq(k) }}) _rl_pb={{ shq(d.playbook) }}; _rl_dir={{ shq(bs.work_roots.runners[k]) }}; _rl_var={{ shq(d.work_root_var) }} ;;
+    {{ shq(k) }}) _rl_pb={{ shq(d.playbook) }}; _rl_dir={{ shq(bs.work_roots.runners[k]) }}; _rl_var={{ shq(d.work_root_var) }}; _rl_req={{ shq(d.required_inputs | join(' ')) }} ;;
 {% endfor %}
     '') lme_refuse RH-SEED-USAGE {{ shq(rl.mode ~ ' needs --runner <key> (no default): ' ~ (rl.runners | list | sort | join(', '))) }} ;;
     *) lme_refuse RH-SEED-USAGE "unknown runner key: $RUNNER" ;;
   esac
+  # RH-RUNLOCAL-OVERRIDES: every caller -e value (inline, or an @file's content) is screened before any effect; an
+  # executor / interpreter / privilege / temp selector or the reserved lme_resolved_run refuses
   _pair=''
   for _a in "$@"; do
-    if [ -n "$_pair" ]; then _pair=''; continue; fi
+    if [ -n "$_pair" ]; then
+      _pair=''
+      case "$_a" in
+        @*)
+          _sf=${_a#@}
+          [ -f "$_sf" ] && [ ! -L "$_sf" ] || lme_refuse RH-SEED-USAGE "{{ rl.mode }}: extra-vars file is not a regular file: $_sf"
+          ! {{ x(bs, 'grep') }} -E -q -- {{ shq(rl.forbidden_selector_regex) }} "$_sf" || lme_refuse RH-SEED-USAGE "{{ rl.mode }}: extra-vars file $_sf sets a pinned selector (executor/interpreter/privilege/temp or lme_resolved_run)"
+          ;;
+        *)
+          ! printf '%s\n' "$_a" | {{ x(bs, 'grep') }} -E -q -- {{ shq(rl.forbidden_selector_regex) }} || lme_refuse RH-SEED-USAGE "{{ rl.mode }}: extra-var sets a pinned selector (executor/interpreter/privilege/temp or lme_resolved_run): $_a"
+          ;;
+      esac
+      continue
+    fi
     case "$_a" in
       {% for f in rl.arg_flags %}{{ shq(f) }}{% if not loop.last %}|{% endif %}{% endfor %}) _pair=1 ;;
       *) lme_refuse RH-SEED-USAGE "{{ rl.mode }} accepts only {{ rl.arg_flags | join('/') }} <value> pairs after --, not: $_a" ;;
     esac
   done
   [ -z "$_pair" ] || lme_refuse RH-SEED-USAGE "{{ rl.mode }}: {{ rl.arg_flags | join('/') }} without a value"
+  # required_inputs: each as an INLINE `<name>=<non-empty value>` pair (the seed supplies no default)
+  for _rq in $_rl_req; do
+    _hit=''; _pair=''
+    for _a in "$@"; do
+      if [ -n "$_pair" ]; then _pair=''; case "$_a" in "$_rq"=?*) _hit=1 ;; esac; continue; fi
+      _pair=1
+    done
+    [ -n "$_hit" ] || lme_refuse RH-SEED-USAGE "runner $RUNNER needs -e $_rq=<value> (required input; no default)"
+  done
 else
   [ -z "$RUNNER" ] || lme_refuse RH-SEED-USAGE "--runner applies to {{ rl.mode }} only"
 fi
@@ -620,24 +865,56 @@ fi
 {% set rl = wr.run_local %}
 {% set um = bs.target_bootstrap.user_manager %}
 {% set rt = um.runtime_dir.split('{uid}') %}
-case "${W##*/}" in {{ shq(wr.root_rel) }}) : ;; *) lme_refuse RH-SEED-USAGE "{{ rl.mode }} needs --root <checkout>/{{ wr.root_rel }}/{{ wr.sub_roots.toolchain }}; the work root $W is not named {{ wr.root_rel }}" ;; esac
-_co=${W%/*}
-[ -n "$_co" ] || lme_refuse RH-SEED-USAGE "the work root $W has no checkout parent"
+{% set rs = rl.resolved_run %}
+{% set ap = '$G/' ~ bs.layout.gen_dirs.venv ~ '/bin/ansible-playbook' %}
+{% set rcpt = '$G/' ~ bs.layout.receipts_dir ~ '/toolchain.json' %}
+{#- the exported path-valued names (one list: exported AND recorded in lme_resolved_run.env) -#}
+{% set ns = namespace(extra=[]) %}
+{% for e in wr.run_env %}{% set ns.extra = ns.extra + [e.name ~ '=$W/' ~ wr.sub_roots[e.sub] ~ '/' ~ e.rel] %}{% endfor %}
+{% set ns.extra = ns.extra + [rs.remote_tmp_env ~ '=$_run/tmp', rl.user_manager_env.runtime_dir_env ~ '=$_xrd'] %}
+{% set env_rec = (managed_pairs(bs, '$_run/ansible-home', '$_run/tmp') | string).split('\n') + ns.extra + ['HOME=$HOME'] %}
+[ -n "$_co" ] && [ -n "$W" ] || lme_refuse RH-SEED-USAGE '{{ rl.mode }} without an admitted workspace anchor'
+{{ path_arg_check(bs, 'HOME', 'HOME') }}
 _pb="$_co/$_rl_pb"
 [ -f "$_pb" ] && [ ! -L "$_pb" ] || lme_refuse RH-SEED-USAGE "runner $RUNNER: $_pb is not a regular file"
 _ev="$W/"{{ shq(wr.sub_roots.run) }}"/$_rl_dir"
 for _wd in "$W/"{{ shq(wr.sub_roots.run) }} "$_ev"; do
   [ ! -L "$_wd" ] || lme_refuse {{ wr.admission.refusal }} "$_wd is a link"
   [ -d "$_wd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_wd" || lme_refuse {{ wr.admission.refusal }} "cannot create $_wd"
+  lme_dest "$_wd" d
 done
 _xrd={{ shq(rt[0]) }}"$_uid"{{ shq(rt[1] if rt | length > 1 else '') }}
 [ -d "$_xrd" ] && [ ! -L "$_xrd" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$_xrd")" = "$_uid" ] || lme_refuse RH-SEED-USAGE "the user manager runtime dir $_xrd is not an owned directory (no user manager for uid $_uid)"
 [ -S "$_xrd/"{{ shq(um.bus) }} ] || lme_refuse RH-SEED-USAGE "no user manager bus socket at $_xrd/{{ um.bus }}"
 _user=$({{ x(bs, 'id') }} -un) || lme_refuse RH-SEED-USAGE 'cannot read the account name'
 case "$_user" in ''|*[!A-Za-z0-9._-]*) lme_refuse RH-SEED-USAGE "unadmitted account name: $_user" ;; esac
+# the interpreter = the receipt's `python` (the generation venv python, never link-resolved), which must be what the
+# generation's ansible-playbook runs: its shebang line is exactly #!<that path>, or (a shebang too long for the kernel)
+# its launcher execs exactly '<that path>'. The runner then sees it as ansible_playbook_python (sys.executable).
+_py="$G/{{ bs.layout.gen_dirs.venv }}/bin/python"
+[ -x "$_py" ] || lme_refuse RH-SEED-GENERATION-DRIFT "the generation interpreter $_py is not executable"
+_sb=$({{ x(bs, 'sed') }} -n '1p' -- "{{ ap }}") || lme_refuse RH-SEED-GENERATION-DRIFT 'cannot read the ansible-playbook first line'
+[ "$_sb" = "#!$_py" ] || { [ "$_sb" = '#!/bin/sh' ] && {{ x(bs, 'grep') }} -q -F -- "'''exec' '$_py' " "{{ ap }}"; } || lme_refuse RH-SEED-GENERATION-DRIFT "ansible-playbook does not run $_py (first line: $_sb)"
+_rc=$({{ x(bs, 'sha256sum') }} -- "{{ rcpt }}") || lme_refuse RH-SEED-GENERATION-DRIFT 'cannot digest the generation receipt'
+_rc=${_rc%% *}
 [ -z "$_rl_var" ] || set -- "$@" {{ shq(rl.arg_flags | first) }} "$_rl_var=$_ev"
-set -- "$@" {{ shq(rl.arg_flags | first) }} {{ shq('ansible_connection=' ~ rl.connection) }}
-{{ managed_env(bs, '$_run/ansible-home', '$_run/tmp') }} {{ work_env(bs, 'W') }} {{ rl.user_manager_env.runtime_dir_env }}="$_xrd" {{ rl.user_manager_env.bus_env }}="unix:path=$_xrd/"{{ shq(um.bus) }} {{ rl.user_manager_env.user_env }}="$_user" "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" -i {{ shq(rl.inventory) }} -c {{ shq(rl.connection) }} "$_pb" "$@" 9<&-
+{#- pinned_vars (RH-RUNLOCAL-OVERRIDES): one JSON -e after every caller value -#}
+{% set pv = namespace(fmt=[], args=[]) %}
+{% for k, v in rl.pinned_vars | dictsort %}
+{% if v is sameas true or v is sameas false %}{% set pv.fmt = pv.fmt + ['"' ~ k ~ '":' ~ (v | string | lower)] %}
+{% else %}{% set pv.fmt = pv.fmt + ['"' ~ k ~ '":"%s"'] %}{% set pv.args = pv.args + ['"' ~ (v | string | replace('{run_tmp}', '$_run/tmp') | replace('{venv_python}', '$_py')) ~ '"'] %}{% endif %}
+{% endfor %}
+_pin=$(printf {{ shq('{' ~ (pv.fmt | join(',')) ~ '}') }} {{ pv.args | join(' ') }})
+set -- "$@" {{ shq(rl.arg_flags | first) }} "$_pin"
+{#- lme_resolved_run (RH-RUNNER-RESOLVED-WORKROOT, codex 144541; exactly rs.fields), passed LAST -#}
+{% set rv = namespace(fmt=[], args=[]) %}
+{% for l in env_rec %}{% set kv = l.split('=', 1) %}{% set rv.fmt = rv.fmt + ['"' ~ kv[0] ~ '":"%s"'] %}{% set rv.args = rv.args + ['"' ~ kv[1] ~ '"'] %}{% endfor %}
+_rr=$(printf {{ shq('{"' ~ rs.var ~ '":{"runner":"%s","work_root":"%s","ansible_playbook":"%s","python":"%s","env":{' ~ (rv.fmt | join(',')) ~ '},"receipt":{"path":"%s","sha256":"%s"}}}') }} \
+  "$RUNNER" "$_ev" "{{ ap }}" "$_py" {{ rv.args | join(' ') }} "{{ rcpt }}" "$_rc")
+set -- "$@" {{ shq(rl.arg_flags | first) }} "$_rr"
+lme_ancestry "$_ev/."
+lme_ancestry "$_pb"
+{{ managed_env(bs, '$_run/ansible-home', '$_run/tmp', ns.extra) }} {{ rl.user_manager_env.bus_env }}="unix:path=$_xrd/"{{ shq(um.bus) }} {{ rl.user_manager_env.user_env }}="$_user" "{{ ap }}" -i {{ shq(rl.inventory) }} -c {{ shq(rl.connection) }} "$_pb" "$@" 9<&-
 exit $?
 {%- endmacro -%}
 
@@ -665,7 +942,12 @@ exit $?
 #   (mode: one of remote_harness.ssh_auth.modes; no default; agent mode carries a validated SSH_AUTH_SOCK)
 #   lme-controller-seed.sh {{ bs.work_roots.run_local.mode }} --root <work root>/{{ bs.work_roots.sub_roots.toolchain }} --runner <key> [-- {{ bs.work_roots.run_local.arg_flags | first }} <value> ...]
 #   (key: one of {{ bs.work_roots.run_local.runners | list | sort | join(', ') }}; inventory {{ bs.work_roots.run_local.inventory }}
-#   connection {{ bs.work_roots.run_local.connection }}; no --ssh-auth; only {{ bs.work_roots.run_local.arg_flags | join('/') }} <value> pairs after --)
+#   connection {{ bs.work_roots.run_local.connection }}; no --ssh-auth; only {{ bs.work_roots.run_local.arg_flags | join('/') }} <value> pairs after --, screened
+#   for pinned selectors; each runner's required_inputs as inline name=value; the seed appends -e <work_root_var>=<dir>,
+#   the pinned_vars JSON and, LAST, -e {"{{ bs.work_roots.run_local.resolved_run.var }}": {...}})
+# Before ANY effect (apply/verify/run/{{ rlm }}): the work root (run/{{ rlm }}: through the last /{{ bs.work_roots.root_rel }}/ of --root,
+#   its checkout bound to bundle.json) and every existing destination are admitted (capacity, fs type, custody,
+#   same device); path_admission.ancestry (incl. owner_private_group) is re-checked after the lock and before exec.
 # Every mode runs inside the declared budget scope and holds an exclusive lock on the root (busy -> RH-SEED-BUSY).
 # apply: complete generation for THIS seed -> verify + republish (UNCHANGED); incomplete generation recorded by this
 #        seed in {{ cmt(bs.layout.operations_log) }} -> moved to {{ cmt(bs.layout.abandoned_dir) }}/ and removed, then install; unrecorded
@@ -704,10 +986,12 @@ case "$MODE" in apply|verify|purge) [ $# -eq 0 ] || lme_refuse RH-SEED-USAGE "$M
 {{ path_arg_check(bs, 'R', '--root') }}
 [ "$MODE" != purge ] || [ "$CONFIRM" = "$R" ] || lme_refuse RH-SEED-USAGE 'purge needs --confirm equal to --root'
 {{ ssh_auth_check(bs, ssh_auth) }}
-{{ run_local_args(bs) }}
 {{ combination_check(bs, ctl) }}
 {{ os_tool_checks(bs) }}
+{{ run_local_args(bs) }}
 {{ platform_check(bs) }}
+{{ ancestry_fn(bs) }}
+{{ dest_fn(bs) }}
 {{ root_check(bs) }}
 
 SELF=$({{ x(bs, 'realpath') }} -e -- "$0") || lme_refuse RH-SEED-USAGE 'cannot resolve the seed path'
@@ -734,6 +1018,8 @@ GEN_ID="core{{ ctl.expect_core }}-py{{ bs.python.version }}-uv{{ bs.uv.version }
 G="$R/{{ bs.layout.generations_dir }}/$GEN_ID"
 {{ verify_fns(bs, ctl) }}
 {{ bundle_check(bs, lock) }}
+W=''; _co=''
+{{ admit_storage(bs, rlm) }}
 
 # ---- root creation (apply only) and the operation lock (every mode) ----
 if [ "$ROOT_STATE" = absent ]; then
@@ -790,6 +1076,8 @@ exec 9<"$R" || lme_refuse RH-SEED-ROOT-NOT-OWNED "cannot open $R for locking"
 # the creator keeps the parent lock until it holds the root lock, so a serialized second apply meets BUSY, never a
 # half-initialised root
 [ -z "${_pl:-}" ] || exec 8<&-
+# use boundary: the ancestry rule again, now that the root lock is held and before the first write under R
+lme_ancestry "$R/."
 
 if [ "$MODE" = purge ]; then
   {{ purge_inventory(bs) | indent(2) }}
@@ -813,11 +1101,10 @@ if [ "$MODE" = verify ] || [ "$MODE" = run ] || [ "$MODE" = {{ rlm }} ]; then
   [ -d "$_rd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_rd" || lme_refuse RH-SEED-STORAGE "cannot create $_rd"
   {{ prune_dir(bs, '"$_rd"', bs.layout.run_dir, bs.run_retention.keep) | indent(2) }}
   {{ storage_check(bs, 'R', bs.run_retention.free_required_bytes) | indent(2) }}
-  # WORK ROOT (work_roots): the parent of this root, admitted (prefix, filesystem type, bytes, inodes) before the run;
-  # caches and rootless engine storage are its declared sub-roots (derived here from R, never from a controller path)
-  W=${R%/*}
-  [ -n "$W" ] || lme_refuse {{ bs.work_roots.admission.refusal }} "the root $R has no parent work root"
-  [ "$W" != "$HOME" ] && [ "$W" != "${HOME%/}" ] || lme_refuse {{ bs.work_roots.admission.refusal }} "the root $R has \$HOME as its work root (declare <work root>/{{ bs.work_roots.sub_roots.toolchain }})"
+  # WORK ROOT (work_roots): W, anchored and admitted by admit_storage BEFORE any effect (WORKSPACE ANCHOR: through
+  # the last /{{ bs.work_roots.root_rel }}/ of R, bound to the packaged checkout); its capacity is re-read here, after
+  # the retention prune, immediately before the sub-roots are prepared
+  [ -n "$W" ] || lme_refuse {{ bs.work_roots.admission.refusal }} "no admitted work root for $R"
   {{ work_root_check(bs, 'W') | indent(2) }}
   {{ work_root_prepare(bs, 'W') | indent(2) }}
   _run=$({{ x(bs, 'mktemp') }} -d "$_rd/$UTC.XXXXXXXX") || lme_refuse RH-SEED-STORAGE "cannot create a run directory under $_rd"
@@ -830,6 +1117,7 @@ if [ "$MODE" = verify ] || [ "$MODE" = run ] || [ "$MODE" = {{ rlm }} ]; then
   # Q-D12 (codex-001716): the playbook inherits THIS run's budget scope (LME_SEED_SCOPED=1); a seed it invokes
   # re-verifies the declared limits from its own cgroup (budget enforcement kept) and then meets the root lock held
   # by this process: a nested same-root call refuses BUSY (15) at once, never waits, never runs unbudgeted.
+  lme_ancestry "$_run/."
   {{ managed_env(bs, '$_run/ansible-home', '$_run/tmp') }} {{ work_env(bs, 'W') }} LME_SEED_SCOPED=1 {{ ssh_auth.env_mode }}="$SSH_AUTH" ANSIBLE_SSH_COMMON_ARGS="$_ssh_args" ${LME_CARRY_SOCK:+{{ ssh_auth.modes.agent.socket_env }}="$LME_CARRY_SOCK"} "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" "$@" 9<&-
   exit $?
 fi

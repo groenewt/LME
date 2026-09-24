@@ -1,0 +1,104 @@
+---
+# testing/remote_harness/tasks/admit_ancestry.yml -- the ONE resolved ancestry rule for playbook consumers
+# (rh.controller.bootstrap.path_admission.ancestry, = lme_resolved.remote_harness.policy.controller.bootstrap
+# .path_admission.ancestry; codex 143342 WORK-ROOT-ANCESTRY-PRIVATE-GROUP). The seed applies the same rule (macros
+# ancestry_check / private_group_admit); consumers include THIS file instead of keeping a private copy
+# (verify_toolchain_receipt.yml; B admit_state_dir.yml / CONTROLS-WORK-ROOT; G tests/controls/tasks/execute.yml).
+# Every EXISTING component of rh_anc_path, from / down to rh_anc_path itself: a real directory (a link refuses),
+# owned by uid 0 or the running uid, never other-writable (sticky included); group-writable only when owned by the
+# running uid AND admitted by owner_private_group (facts gathered here with the declared, hash-admitted tools; decided
+# on the controller by tasks/decide_private_group.yml with the generated program). Read-only.
+# Include it at the USE boundary (right before the first write under rh_anc_path), not only at admission.
+# Inputs (no defaults):
+#   rh_anc_bs         the resolved remote_harness.controller.bootstrap map (rh.controller.bootstrap)
+#   rh_anc_repo_root  the checkout holding the program template (absolute)
+#   rh_anc_path       the path to admit (absolute, path_admission.regex)
+#   rh_anc_refusal    the caller's refusal code
+# Output: rh_anc_admitted_private_groups (the group-writable components admitted by owner_private_group).
+- name: Admit the ancestry inputs (the ONE path-admission rule; no default)
+  ansible.builtin.assert:
+    that:
+      - rh_anc_bs is mapping and rh_anc_bs.path_admission.ancestry is mapping
+      - rh_anc_bs.path_admission.ancestry.owner_private_group is mapping
+      - rh_anc_repo_root is string and rh_anc_repo_root is match(rh_anc_bs.path_admission.regex)
+      - rh_anc_path is string and rh_anc_path is match(rh_anc_bs.path_admission.regex)
+      - rh_anc_path is not search(rh_anc_bs.path_admission.forbidden_segment_regex)
+      - rh_anc_refusal is string and rh_anc_refusal | length > 0
+    fail_msg: >-
+      REFUSED {{ rh_anc_refusal | default('RH-SEED-ROOT-NOT-OWNED') }}: admit_ancestry.yml needs rh_anc_bs, rh_anc_repo_root,
+      rh_anc_path (a normalized absolute path; got '{{ rh_anc_path | default('') }}') and rh_anc_refusal (no defaults).
+    quiet: true
+
+- name: Read the running uid (the owner principal) with the declared tool
+  ansible.builtin.command:
+    argv: ["{{ rh_anc_bs.os_tools.id.path }}", -u]
+  register: _rh_anc_uid
+  changed_when: false
+
+- name: Stat every component of the path (no link followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ '/' ~ (rh_anc_path.split('/')[1:item] | join('/')) }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ range(1, (rh_anc_path.split('/') | length) + 1) | list }}"
+  register: _rh_anc_st
+
+- name: Refuse linked, non-directory, foreign-owned, other-writable or foreign group-writable components
+  vars:
+    _ex: "{{ _rh_anc_st.results | map(attribute='stat') | selectattr('exists') | list }}"
+    _u: "{{ _rh_anc_uid.stdout | int }}"
+  ansible.builtin.assert:
+    that:
+      - _u | int != 0
+      - _ex | selectattr('islnk') | list | length == 0
+      - _ex | rejectattr('isdir') | list | length == 0
+      - _ex | map(attribute='uid') | reject('in', [0, _u | int]) | list | length == 0
+      - _ex | selectattr('woth') | list | length == 0
+      - _ex | selectattr('wgrp') | rejectattr('uid', 'equalto', _u | int) | list | length == 0
+      - rh_anc_bs.path_admission.ancestry.owner_private_group.enabled | bool or (_ex | selectattr('wgrp') | list | length == 0)
+    fail_msg: >-
+      REFUSED {{ rh_anc_refusal }}: {{ rh_anc_path }} has a component that is a link, not a directory, owned by a uid
+      other than 0/{{ _u }}, other-writable (sticky directories are not excepted), or group-writable without being owned
+      by uid {{ _u }}: {{ _ex | selectattr('islnk') | map(attribute='path') | list + (_ex | rejectattr('isdir') | map(attribute='path') | list)
+      + (_ex | rejectattr('uid', 'in', [0, _u | int]) | map(attribute='path') | list) + (_ex | selectattr('woth') | map(attribute='path') | list)
+      + (_ex | selectattr('wgrp') | rejectattr('uid', 'equalto', _u | int) | map(attribute='path') | list) }}
+      (path_admission.ancestry).
+    quiet: true
+
+- name: Select the owner-owned group-writable components that need the owner-private-group proof
+  ansible.builtin.set_fact:
+    _rh_anc_pg: "{{ _rh_anc_st.results | map(attribute='stat') | selectattr('exists') | selectattr('wgrp') | map(attribute='path') | list }}"
+
+- name: Gather the private-group facts of each such component (declared tools; the same text the seed runs; read-only)
+  vars:
+    _pg: "{{ rh_anc_bs.path_admission.ancestry.owner_private_group }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ rh_anc_bs.os_tools.sh.path }}"
+      - -c
+      - >-
+        {{ lookup('ansible.builtin.template', rh_anc_repo_root ~ '/' ~ _pg.program_template_rel,
+                  template_vars={'rh_pg_bs': rh_anc_bs, 'rh_pg_part': 'facts'}) }}
+      - lme-private-group-facts
+  # the generated text reads the directory from $_pgdir (task environment of this one command; nothing is exported)
+  environment:
+    _pgdir: "{{ item }}"
+  loop: "{{ _rh_anc_pg }}"
+  register: _rh_anc_facts
+  changed_when: false
+
+- name: Decide each group-writable component with the ONE generated program (controller)
+  ansible.builtin.include_tasks: decide_private_group.yml
+  vars:
+    rh_pg_bs: "{{ rh_anc_bs }}"
+    rh_pg_repo_root: "{{ rh_anc_repo_root }}"
+    rh_pg_facts: "{{ _rh_anc_fact.stdout }}"
+    rh_pg_refusal: "{{ rh_anc_refusal }}"
+  loop: "{{ _rh_anc_facts.results }}"
+  loop_control:
+    loop_var: _rh_anc_fact
+    label: "{{ _rh_anc_fact.item }}"
+
+- name: Record the admitted owner-private-group components (output)
+  ansible.builtin.set_fact:
+    rh_anc_admitted_private_groups: "{{ _rh_anc_pg }}"
