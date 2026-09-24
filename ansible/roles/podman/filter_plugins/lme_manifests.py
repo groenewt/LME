@@ -2500,9 +2500,12 @@ def _rh_int(v):
 # remote_harness_schema.contract_admission. Generic: every contract, path, enum, pattern and reference is registry
 # DATA; this code names no contract, tool, env name or deployment value.
 _RH_CA_KINDS = frozenset(('keys', 'has_keys', 'enum', 'pattern', 'key_pattern', 'positive_int', 'strings', 'within',
-                          'ere', 'ere_compose', 'umask_yields', 'not_in'))
+                          'ere', 'ere_compose', 'umask_yields', 'not_in', 'rejects'))
 _RH_CA_MODS = {'each': frozenset(('enum', 'pattern', 'strings', 'positive_int')),
-               'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',))}
+               'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',)), 'subject': frozenset(('within',))}
+# C1-CONTRACT-SCALAR-SHAPE (codex 193253): the declared shape of a `within` value (REQUIRED on every within check):
+# scalar = one non-empty string; list = a non-empty list of strings; keys = a non-empty mapping (its keys checked).
+_RH_CA_SUBJECTS = ('scalar', 'list', 'keys')
 _RH_CA_ERE_BANNED = ('\\', '\n', '|', '[:', '(?', '*?', '+?', '??', '}?')
 
 
@@ -2518,12 +2521,14 @@ def _rh_ca_members(x):
 
 
 def _rh_ca_ere(v, form, sed):
-    """None when v is an admitted portable ERE of the declared form, else the reason."""
+    """None when v is inside the admitted BOUNDED ERE subset of the declared form, else the reason. This is a
+    conservative subset (Python re compiles it + a substring blacklist), NOT a complete portable-ERE grammar check;
+    bracket negation ('[^...]') is refused by the '^' substring rule and is unsupported by design (codex 193337)."""
     if not isinstance(v, str) or not v:
         return 'must be a non-empty string'
     bad = [t for t in _RH_CA_ERE_BANNED + (('/',) if sed else ()) if t in v]
     if bad:
-        return 'contains %r (portable ERE: no backslash, newline, alternation, class name, extension or lazy quantifier%s)' % (
+        return 'contains %r (bounded ERE subset: no backslash, newline, alternation, class name, extension or lazy quantifier%s)' % (
             bad, '; sed-delimited: no /' if sed else '')
     body = v
     if form == 'anchored':
@@ -2531,7 +2536,7 @@ def _rh_ca_ere(v, form, sed):
             return "must be anchored: exactly a leading '^' and a trailing '$'"
         body = v[1:-1]
     if '^' in body or '$' in body:
-        return "must carry no other '^' or '$' (%s)" % ('an anchored ERE is anchored once' if form == 'anchored' else 'a fragment is composed inside ^...$')
+        return "must carry no other '^' or '$' (%s; bracket negation is unsupported)" % ('an anchored ERE is anchored once' if form == 'anchored' else 'a fragment is composed inside ^...$')
     try:
         re.compile(v)
     except re.error as e:
@@ -2541,10 +2546,11 @@ def _rh_ca_ere(v, form, sed):
 
 def _rh_ca_registry(ca, schema):
     """The registry declaration contract_admission, shape-checked (fail-closed: admission can never be disabled or
-    weakened by a malformed or missing registry entry). Returns ({pattern name: compiled}, contracts)."""
-    if not isinstance(ca, dict) or set(ca) != {'patterns', 'contracts'} or not isinstance(ca['patterns'], dict) \
-            or not isinstance(ca['contracts'], dict) or not ca['contracts']:
-        raise ValueError('lme: registry remote_harness_schema.contract_admission must declare {patterns, contracts} (bootstrap contract admission is fail-closed); got %r' % (ca,))
+    weakened by a malformed or missing registry entry). Returns ({pattern name: compiled}, contracts, required_values)."""
+    if not isinstance(ca, dict) or set(ca) != {'patterns', 'contracts', 'required_values'} or not isinstance(ca['patterns'], dict) \
+            or not isinstance(ca['contracts'], dict) or not ca['contracts'] \
+            or not isinstance(ca['required_values'], dict) or not ca['required_values']:
+        raise ValueError('lme: registry remote_harness_schema.contract_admission must declare {patterns, contracts, required_values} (bootstrap contract admission is fail-closed); got %r' % (ca,))
     pats = {}
     for n in sorted(ca['patterns']):
         p = ca['patterns'][n]
@@ -2577,14 +2583,25 @@ def _rh_ca_registry(ca, schema):
                   'strings': isinstance(arg, dict) and not set(arg) - {'nonempty', 'distinct'} and all(isinstance(x, bool) for x in arg.values()),
                   'ere': arg in ('fragment', 'anchored'),
                   'umask_yields': isinstance(arg, str) and bool(arg),
-                  'not_in': strs(arg) and all(isinstance(schema.get(n), list) for n in arg)}[kind]
+                  'not_in': strs(arg) and all(isinstance(schema.get(n), list) for n in arg),
+                  'rejects': isinstance(arg, list) and bool(arg) and all(isinstance(x, str) for x in arg)}[kind]
             for m in mods:
                 ok = ok and kind in _RH_CA_MODS[m] and (
                     isinstance(chk[m], dict) and set(chk[m]) == {'field', 'contains'} and all(isinstance(x, str) and x for x in chk[m].values())
-                    if m == 'having' else isinstance(chk[m], bool))
+                    if m == 'having' else chk[m] in _RH_CA_SUBJECTS if m == 'subject' else isinstance(chk[m], bool))
+            if kind == 'within' and 'subject' not in chk:
+                ok = False    # C1-CONTRACT-SCALAR-SHAPE: a membership check must declare its value's shape
             if not ok:
                 raise ValueError('lme: registry contract_admission.contracts.%s.checks[%d] %s argument/modifiers are malformed; got %r' % (cname, i, kind, chk))
-    return pats, ca['contracts']
+    # C1-ACT-REQUIRED-COMPONENT (codex 193337): each required runtime value names the policy leaf holding its variable
+    # name (var_at) and a declared pattern its value must fully match independently of any configurable pattern.
+    for rname in sorted(ca['required_values']):
+        r = ca['required_values'][rname]
+        if not isinstance(r, dict) or not {'var_at', 'pattern'} <= set(r) or set(r) - {'var_at', 'pattern', 'when_present'} \
+                or not isinstance(r['var_at'], str) or not r['var_at'] or not isinstance(r['pattern'], str) or r['pattern'] not in pats \
+                or ('when_present' in r and (not isinstance(r['when_present'], str) or not r['when_present'])):
+            raise ValueError('lme: registry contract_admission.required_values.%s must be {var_at, pattern (a declared patterns name)[, when_present]}; got %r' % (rname, r))
+    return pats, ca['contracts'], ca['required_values']
 
 
 def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
@@ -2617,6 +2634,15 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
             return 'must hold distinct entries'
         return None
     if kind == 'within':
+        # C1-CONTRACT-SCALAR-SHAPE (codex 193253): the value must have its DECLARED shape before membership is judged;
+        # an empty or differently shaped value never passes vacuously (e.g. {} / [] / [getent] for a scalar key).
+        shape = chk['subject']
+        if shape == 'scalar' and not (isinstance(s, str) and s):
+            return 'must be a non-empty string (subject: scalar; a %s is not a key)' % (_rh_kind(s),)
+        if shape == 'list' and not (isinstance(s, list) and s and all(isinstance(x, str) and x for x in s)):
+            return 'must be a non-empty list of non-empty strings (subject: list); got a %s' % (_rh_kind(s),)
+        if shape == 'keys' and not (isinstance(s, dict) and s and all(isinstance(x, str) and x for x in s)):
+            return 'must be a non-empty mapping with string keys (subject: keys); got a %s' % (_rh_kind(s),)
         allowed, hv = [], chk.get('having')
         for ref in arg:
             nodes = _rh_expand(pol, ref)
@@ -2652,6 +2678,15 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
     if kind == 'not_in':
         hit = [n for n in arg if s in schema[n]]
         return 'is a registry %s name (a route/loader OUTPUT, never an external input)' % (hit,) if hit else None
+    if kind == 'rejects':
+        if not isinstance(s, str) or not s:
+            return 'must be a non-empty regex string'
+        try:
+            rx = re.compile(s)
+        except re.error as e:
+            return 'does not compile: %s' % (e,)
+        hit = [p for p in arg if rx.fullmatch(p)]
+        return 'admits the refused probe values %r (a configurable pattern may never admit them)' % (hit,) if hit else None
     return 'unknown check kind'
 
 
@@ -2659,7 +2694,15 @@ def _rh_admit_contracts(pol, schema, key):
     """C1-BOOTSTRAP-CONTRACT-VALUE-ADMISSION: shape, enum and reference admission of every registry-declared
     controller.bootstrap contract on the COMPOSED policy, at resolve, before any mutation. Raises on the first
     refusal (named by the policy path, the contract and the check kind)."""
-    pats, contracts = _rh_ca_registry(schema.get('contract_admission'), schema)
+    pats, contracts, required = _rh_ca_registry(schema.get('contract_admission'), schema)
+    for rname in sorted(required):
+        r = required[rname]
+        if 'when_present' in r and not _rh_get(pol, r['when_present'])[0]:
+            continue
+        fv, var = _rh_get(pol, r['var_at'])
+        if not fv or not isinstance(var, str) or not var:
+            raise ValueError('lme: %s.%s fails contract_admission.required_values.%s: must declare the variable name of the required value; got %r' % (
+                key, r['var_at'], rname, var if fv else '<absent>'))
     for cname in sorted(contracts):
         c = contracts[cname]
         if 'when_present' in c and not _rh_get(pol, c['when_present'])[0]:
