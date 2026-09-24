@@ -2329,6 +2329,65 @@ def lme_service_overrides_applied(services, effective_overrides):
     return sorted(out)
 
 
+def lme_service_typed_inputs(services, registry):
+    """MULTINODE-217-TEMPLATED-PORT-TYPE (codex choice a). `services` = {service id: service entry or partial
+    override entry}. Returns a copy in which ONLY the integer fields registry.service_input_types declares
+    (<list field>.item_int_fields) are normalized: an int (not a bool) within [min, max] is kept; a string matching
+    canonical_regex within [min, max] becomes that int; anything else (bool, float, null, another string, out of
+    range) raises. Absent leaves stay absent; every other field is returned as given (no recursive coercion).
+    Value-pure; applied at the lme_services build and to the faithful-application re-derivation only."""
+    decl = (registry or {}).get('service_input_types') if isinstance(registry, dict) else None
+    if not isinstance(decl, dict) or not decl:
+        raise ValueError('lme: registry service_input_types must declare the integer service input fields')
+    for lf, d in decl.items():
+        if not isinstance(d, dict) or set(d) != {'item_int_fields', 'canonical_regex', 'min', 'max'} \
+                or not isinstance(d['item_int_fields'], list) or not d['item_int_fields'] \
+                or any(not isinstance(f, str) for f in d['item_int_fields']) or not isinstance(d['canonical_regex'], str) \
+                or any(isinstance(d[b], bool) or not isinstance(d[b], int) for b in ('min', 'max')) or d['min'] > d['max']:
+            raise ValueError('lme: registry service_input_types.%s must be {item_int_fields, canonical_regex, min, max}; got %r' % (lf, d))
+    if not isinstance(services, dict):
+        raise ValueError('lme: service_input_types applies to a {service id: entry} mapping; got %r' % (type(services).__name__,))
+
+    def one(v, where, d):
+        if isinstance(v, bool) or not (isinstance(v, int) or isinstance(v, str)):
+            raise ValueError('lme: %s = %r (%s) is not a declared integer input (int or canonical decimal string, %d..%d)' % (
+                where, v, type(v).__name__, d['min'], d['max']))
+        if isinstance(v, str):
+            if not re.match(d['canonical_regex'] + r'\Z', v):
+                raise ValueError('lme: %s = %r (str) is not a canonical decimal (%s)' % (where, v, d['canonical_regex']))
+            v = int(v)
+        else:
+            v = int(v)
+        if not d['min'] <= v <= d['max']:
+            raise ValueError('lme: %s = %r is outside the declared range %d..%d' % (where, v, d['min'], d['max']))
+        return v
+
+    out = {}
+    for sid, svc in services.items():
+        if not isinstance(svc, dict):
+            out[sid] = svc
+            continue
+        new = dict(svc)
+        for lf, d in decl.items():
+            if lf not in svc:
+                continue
+            items = svc[lf]
+            if not isinstance(items, list):
+                raise ValueError('lme: %s.%s must be a list; got %r' % (sid, lf, type(items).__name__))
+            typed = []
+            for i, it in enumerate(items):
+                if not isinstance(it, dict):
+                    raise ValueError('lme: %s.%s[%d] must be a mapping; got %r' % (sid, lf, i, it))
+                it = dict(it)
+                for f in d['item_int_fields']:
+                    if f in it:
+                        it[f] = one(it[f], '%s.%s[%d].%s' % (sid, lf, i, f), d)
+                typed.append(it)
+            new[lf] = typed
+        out[sid] = new
+    return out
+
+
 def lme_unknown_service_override_ids(operator_overrides, declared_universe):
     """codex-1045 admission / C1-OVERRIDE-MISSING-SERVICE-SKIP (codex-1100): the sorted OPERATOR
     override service ids that are NOT in the COMPLETE ADMITTED catalog `declared_universe` (every
@@ -2997,6 +3056,7 @@ class FilterModule(object):
     def filters(self):
         return {
             'strict_enable_bool': strict_enable_bool,
+            'lme_service_typed_inputs': lme_service_typed_inputs,
             'lme_project_remote_harness': lme_project_remote_harness,
             'lme_remote_harness_overridden_paths': lme_remote_harness_overridden_paths,
             'lme_verify_resolved': lme_verify_resolved,
