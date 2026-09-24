@@ -207,6 +207,45 @@ case "$_avail" in ''|*[!0-9]*) lme_refuse RH-SEED-STORAGE "free space unreadable
 [ "$_avail" -ge {{ need }} ] || lme_refuse RH-SEED-STORAGE "free $_avail < required {{ need }} bytes at ${{ var }}"
 {%- endmacro -%}
 
+{#- ---- WORK-ROOT admission (profile controller.bootstrap.work_roots.admission): the work root in ${var} is not under a
+     refused prefix, not on a refused filesystem type, and has the declared free bytes AND free inodes ---- -#}
+{%- macro work_root_check(bs, var) -%}
+{% set a = bs.work_roots.admission %}
+case "${{ var }}/" in
+  {% for p in a.refused_prefixes %}{{ shq(p) }}*{% if not loop.last %}|{% endif %}{% endfor %}) lme_refuse {{ a.refusal }} "work root ${{ var }} is under a refused prefix ({{ a.refused_prefixes | join(' ') }})" ;;
+esac
+_fst=$({{ x(bs, 'stat') }} -f -c %T -- "${{ var }}") || lme_refuse {{ a.refusal }} "filesystem type unreadable for work root ${{ var }}"
+case "$_fst" in
+  {% for t in a.refused_fs_types %}{{ shq(t) }}{% if not loop.last %}|{% endif %}{% endfor %}) lme_refuse {{ a.refusal }} "work root ${{ var }} is on $_fst (refused: {{ a.refused_fs_types | join(' ') }})" ;;
+esac
+{{ storage_check(bs, var, a.free_bytes_min) }}
+_iavail=$({{ x(bs, 'df') }} --output=iavail -- "${{ var }}" | {{ x(bs, 'sed') }} -n '2p' | {{ x(bs, 'sed') }} 's/ //g')
+case "$_iavail" in ''|*[!0-9]*) lme_refuse {{ a.refusal }} "free inodes unreadable for work root ${{ var }}" ;; esac
+[ "$_iavail" -ge {{ a.free_inodes_min | int }} ] || lme_refuse {{ a.refusal }} "free inodes $_iavail < required {{ a.free_inodes_min | int }} at work root ${{ var }}"
+{%- endmacro -%}
+
+{#- ---- WORK-ROOT sub-roots of ${var} for `seed run`: each declared dir (no -p; a link refuses) and the rootless engine
+     storage.conf (graphroot/runroot on the work root) ---- -#}
+{%- macro work_root_prepare(bs, var) -%}
+{% set w = bs.work_roots %}
+{% set ns = namespace(d=[]) %}
+{% for s in w.run_env | map(attribute='sub') | unique %}{% set ns.d = ns.d + [w.sub_roots[s]] %}{% endfor %}
+{% for e in w.run_env | selectattr('kind', 'equalto', 'dir') %}{% set ns.d = ns.d + [w.sub_roots[e.sub] ~ '/' ~ e.rel] %}{% endfor %}
+{% for r in [w.engine_storage_conf.graphroot_rel, w.engine_storage_conf.runroot_rel] %}{% set ns.d = ns.d + [w.sub_roots.engine_storage ~ '/' ~ r] %}{% endfor %}
+for _wd in {% for d in ns.d %}"${{ var }}/"{{ shq(d) }}{% if not loop.last %} {% endif %}{% endfor %}; do
+  [ ! -L "$_wd" ] || lme_refuse {{ w.admission.refusal }} "$_wd is a link"
+  [ -d "$_wd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_wd" || lme_refuse {{ w.admission.refusal }} "cannot create $_wd"
+done
+{% for e in w.run_env | selectattr('kind', 'equalto', 'engine_storage_conf') %}
+printf '[storage]\nrunroot = "%s"\ngraphroot = "%s"\n' "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_storage_conf.runroot_rel) }} "${{ var }}/"{{ shq(w.sub_roots.engine_storage ~ '/' ~ w.engine_storage_conf.graphroot_rel) }} > "${{ var }}/"{{ shq(w.sub_roots[e.sub] ~ '/' ~ e.rel) }} || lme_refuse {{ w.admission.refusal }} "cannot write the engine storage.conf under ${{ var }}"
+{% endfor %}
+{%- endmacro -%}
+
+{#- the run_env words (NAME="<work root>/<sub>/<rel>") appended to the managed env of `seed run` -#}
+{%- macro work_env(bs, var) -%}
+{% for e in bs.work_roots.run_env %}{{ e.name }}="${{ var }}/"{{ shq(bs.work_roots.sub_roots[e.sub] ~ '/' ~ e.rel) }}{% if not loop.last %} {% endif %}{% endfor %}
+{%- endmacro -%}
+
 {#- ---- S4 retention: keep the newest keep-1 seed scratch dirs (names of the declared mktemp shape) before a new one
      is created. A matching name that is not an owned real directory refuses; other names (verify.log, receipts)
      are neither counted nor touched. Removal is logged. Runs only under the exclusive root lock. ---- -#}
@@ -707,6 +746,13 @@ if [ "$MODE" = verify ] || [ "$MODE" = run ]; then
   [ -d "$_rd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_rd" || lme_refuse RH-SEED-STORAGE "cannot create $_rd"
   {{ prune_dir(bs, '"$_rd"', bs.layout.run_dir, bs.run_retention.keep) | indent(2) }}
   {{ storage_check(bs, 'R', bs.run_retention.free_required_bytes) | indent(2) }}
+  # WORK ROOT (work_roots): the parent of this root, admitted (prefix, filesystem type, bytes, inodes) before the run;
+  # caches and rootless engine storage are its declared sub-roots (derived here from R, never from a controller path)
+  W=${R%/*}
+  [ -n "$W" ] || lme_refuse {{ bs.work_roots.admission.refusal }} "the root $R has no parent work root"
+  [ "$W" != "$HOME" ] && [ "$W" != "${HOME%/}" ] || lme_refuse {{ bs.work_roots.admission.refusal }} "the root $R has \$HOME as its work root (declare <work root>/{{ bs.work_roots.sub_roots.toolchain }})"
+  {{ work_root_check(bs, 'W') | indent(2) }}
+  {{ work_root_prepare(bs, 'W') | indent(2) }}
   _run=$({{ x(bs, 'mktemp') }} -d "$_rd/$UTC.XXXXXXXX") || lme_refuse RH-SEED-STORAGE "cannot create a run directory under $_rd"
   {{ x(bs, 'mkdir') }} -- "$_run/ansible-home" "$_run/tmp" || lme_refuse RH-SEED-STORAGE "cannot create $_run"
   # the lock (fd 9) stays held BY THIS PROCESS for the whole playbook run (no concurrent apply/purge can swap the
@@ -714,7 +760,7 @@ if [ "$MODE" = verify ] || [ "$MODE" = run ]; then
   # Q-D12 (codex-001716): the playbook inherits THIS run's budget scope (LME_SEED_SCOPED=1); a seed it invokes
   # re-verifies the declared limits from its own cgroup (budget enforcement kept) and then meets the root lock held
   # by this process: a nested same-root call refuses BUSY (15) at once, never waits, never runs unbudgeted.
-  {{ managed_env(bs, '$_run/ansible-home', '$_run/tmp') }} LME_SEED_SCOPED=1 {{ ssh_auth.env_mode }}="$SSH_AUTH" ANSIBLE_SSH_COMMON_ARGS="$_ssh_args" ${LME_CARRY_SOCK:+{{ ssh_auth.modes.agent.socket_env }}="$LME_CARRY_SOCK"} "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" "$@" 9<&-
+  {{ managed_env(bs, '$_run/ansible-home', '$_run/tmp') }} {{ work_env(bs, 'W') }} LME_SEED_SCOPED=1 {{ ssh_auth.env_mode }}="$SSH_AUTH" ANSIBLE_SSH_COMMON_ARGS="$_ssh_args" ${LME_CARRY_SOCK:+{{ ssh_auth.modes.agent.socket_env }}="$LME_CARRY_SOCK"} "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" "$@" 9<&-
   exit $?
 fi
 

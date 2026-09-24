@@ -67,6 +67,10 @@
   connection: local
   gather_facts: false
   become: false
+  # WORK ROOT (work_roots): on the controller the module temp is this seed run's own tmp dir (TMPDIR, which the
+  # play admits below as <root>/<layout.run_dir>/<run>/tmp); outside `seed run` the entry refuses at that check.
+  vars:
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') or '~/.ansible/tmp' }}"
   tasks:
     - name: Refuse pre-supplied derived outputs and derive the repository root
       ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
@@ -87,9 +91,16 @@
           - rh.controller.bootstrap.applies_to is contains('target')
           - rh.transfer.adapter == 'managed_archive'
           - lookup('ansible.builtin.env', 'TMPDIR') is match('^' ~ (rh_owned_root | regex_escape) ~ '/' ~ rh.controller.bootstrap.layout.run_dir ~ '/[^/]+/tmp$')
+          # WORK ROOT: the controller root's parent is its work root, admitted by `seed run` (prefix, fs type, bytes,
+          # inodes; the declared default is <checkout>/<work_roots.root_rel>/<sub_roots.toolchain>); here: not under
+          # a refused prefix, and the local module temp is this seed run's TMPDIR
+          - ((rh_owned_root | dirname) ~ '/') is not match('(' ~ (rh.controller.bootstrap.work_roots.admission.refused_prefixes | map('regex_escape') | join('|')) ~ ')')
+          - ansible_remote_tmp == lookup('ansible.builtin.env', 'TMPDIR')
         fail_msg: >-
-          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }}: target group, adapter or run scratch dir is not
-          the declared one (TMPDIR must be this seed run's <root>/{{ rh.controller.bootstrap.layout.run_dir }}/<run>/tmp).
+          REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }}: target group, adapter, run scratch dir or work
+          root is not the declared one (TMPDIR and the local module temp must be this seed run's
+          <root>/{{ rh.controller.bootstrap.layout.run_dir }}/<run>/tmp; the root's work root must not lie under
+          {{ rh.controller.bootstrap.work_roots.admission.refused_prefixes }}).
         quiet: true
 
     # r3g ACCEPTED-FORMS (codex 040323): the inventory value is read per the declared ssh_auth.composition.inventory_forms
@@ -138,12 +149,37 @@
     ansible_user: "{{ lme_toolchain_owner | default('') }}"
     ansible_ssh_private_key_file: "{{ lme_toolchain_owner_key | default('') }}"
     ansible_ssh_common_args: "{{ hostvars['localhost'].rh_conn[inventory_hostname].ansible_ssh_common_args | default('') }}"
+    # WORK ROOT (work_roots): the target's module temp derives from THIS target's own declaration (inventory
+    # root_var): <parent of the target root>/<sub_roots.tmp>/<remote_tmp_rel>; never a controller path. Until the
+    # policy is resolved no module runs; the assert below admits the value before the first target contact.
+    ansible_remote_tmp: >-
+      {{ ((lme_toolchain_root | default('') | dirname) ~ '/' ~ rh.controller.bootstrap.work_roots.sub_roots.tmp ~ '/'
+          ~ rh.controller.bootstrap.work_roots.remote_tmp_rel)
+         if (rh is defined and (lme_toolchain_root | default('')) is match('^/.+/[^/]+$')) else '~/.ansible/tmp' }}
   tasks:
     - name: Refuse pre-supplied derived outputs and derive the repository root
       ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
 
     - name: Resolve the harness policy through the engine
       ansible.builtin.include_tasks: tasks/resolve_policy.yml
+
+    - name: Refuse a target module temp that is not derived from this target's declared work root (work_roots)
+      vars:
+        _wr: "{{ rh.controller.bootstrap.work_roots }}"
+        _troot: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.root_var, default='') }}"
+      ansible.builtin.assert:
+        that:
+          - rh.controller.bootstrap.inventory.root_var == 'lme_toolchain_root'
+          - _troot is string and _troot is match(rh.controller.bootstrap.path_admission.regex)
+          - _troot is match('^/.+/[^/]+$')
+          - ansible_remote_tmp == (_troot | dirname) ~ '/' ~ _wr.sub_roots.tmp ~ '/' ~ _wr.remote_tmp_rel
+          - ((_troot | dirname) ~ '/') is not match('(' ~ (_wr.admission.refused_prefixes | map('regex_escape') | join('|')) ~ ')')
+        fail_msg: >-
+          REFUSED {{ _wr.admission.refusal }} on {{ inventory_hostname }}: the target module temp must be
+          <parent of {{ rh.controller.bootstrap.inventory.root_var }}>/{{ _wr.sub_roots.tmp }}/{{ _wr.remote_tmp_rel }}
+          (got '{{ ansible_remote_tmp }}' for root '{{ _troot }}'), and that work root must not lie under
+          {{ _wr.admission.refused_prefixes }}.
+        quiet: true
 
     - name: Admit transport authentication, owner connection and no-become (no contact yet)
       ansible.builtin.include_tasks: tasks/admit_transport.yml
