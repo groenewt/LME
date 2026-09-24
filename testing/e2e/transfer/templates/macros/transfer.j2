@@ -172,29 +172,39 @@ exit $_fail
      by path + sha256; anything else is emitted as UNRESOLVED and refused by check.yml. -#}
 {#- ---- execution scope (codex 163642 B-CONTROLLER-LEDGER-ANCESTRY-REFRESH; codex 164854
      B-CONTROLLER-SCOPE-CHECKER-FALSE-PASS). The walker carries the EFFECTIVE execution settings down the nesting the
-     way Ansible inherits them: `scope_fold` overlays one level (a task, a block, an include's `apply`, an include's own
-     parameters) onto its parent -- every keyword in controller_scope.tracked_keywords the level defines, and every
-     var in controller_scope.pin_vars / invalidating_vars it binds, REPLACES the inherited value (a descendant override
-     always recomputes). `scope_is_ctl` classifies the result as OWNER-CONTROLLER only when delegate_to is exactly
-     controller_scope.delegate_to, no other tracked keyword is set, every pin var is the EXACT declared expression
-     (a structural string equality; nothing is evaluated, so `'ssh' if 'controller_delegation.connection' else ...`
-     is simply not the declared form), and no invalidating var is bound anywhere on the chain. -#}
-{%- macro scope_fold(cs, eff, node, with_keywords) -%}
+     way Ansible inherits them, in TWO var layers (codex 170810 B-CONTROLLER-SCOPE-INCLUDE-PRECEDENCE; Ansible 2.19.11
+     vars/manager.py:380-403 merges task vars -- the parent chain's block/`apply`/task vars, playbook/task.py get_vars --
+     BEFORE include params, playbook/task.py:483-488 + block.py:413-417 get_include_params, the vars of EVERY ancestor
+     include task, deeper ones replacing outer ones):
+       layer 'task'  (a task, a block, an include's `apply`): every keyword in controller_scope.tracked_keywords the
+                     level defines, and every pin_vars / invalidating_vars var it binds, replaces the inherited 'kw:' /
+                     'var:' value (a descendant override always recomputes);
+       layer 'param' (an include's own `vars`): replaces the inherited 'ip:' value, and an 'ip:' value OUTRANKS any
+                     'var:' value of the same name at every depth below it -- a descendant block or task var can never
+                     re-pin over an inherited include parameter.
+     `scope_is_ctl` classifies the result as OWNER-CONTROLLER only when delegate_to is exactly
+     controller_scope.delegate_to, no other tracked keyword is set, every pin var's EFFECTIVE value ('ip:' if bound,
+     else 'var:') is the EXACT declared expression (a structural string equality; nothing is evaluated, so
+     `'ssh' if 'controller_delegation.connection' else ...` is simply not the declared form), and no invalidating var is
+     bound in either layer. Not modelled (no static source in B): extra vars (refused elsewhere), set_fact /
+     include_vars caches (between the two layers). -#}
+{%- macro scope_fold(cs, eff, node, layer) -%}
 {%- set m = dict(eff if eff is mapping else {}) -%}
 {%- set node = node if node is mapping else {} -%}
-{%- if with_keywords -%}
+{%- set vp = 'ip:' if layer == 'param' else 'var:' -%}
+{%- if layer == 'task' -%}
 {%- for k in cs.tracked_keywords if k in node -%}{{ m.update({'kw:' ~ k: node[k] | string}) or '' }}{%- endfor -%}
 {%- endif -%}
 {%- set vs = node.vars if node.vars is defined and node.vars is mapping else {} -%}
-{%- for k in (cs.pin_vars.keys() | list) + cs.invalidating_vars if k in vs -%}{{ m.update({'var:' ~ k: vs[k] | string}) or '' }}{%- endfor -%}
+{%- for k in (cs.pin_vars.keys() | list) + cs.invalidating_vars if k in vs -%}{{ m.update({vp ~ k: vs[k] | string}) or '' }}{%- endfor -%}
 {{ m | to_json }}
 {%- endmacro -%}
 
 {%- macro scope_is_ctl(cs, eff) -%}
 {%- set ns = namespace(ok=(eff['kw:delegate_to'] | default(none)) == cs.delegate_to) -%}
 {%- for k in cs.tracked_keywords if k != 'delegate_to' and ('kw:' ~ k) in eff -%}{%- set ns.ok = false -%}{%- endfor -%}
-{%- for k, want in cs.pin_vars.items() if (eff['var:' ~ k] | default(none)) != want -%}{%- set ns.ok = false -%}{%- endfor -%}
-{%- for k in cs.invalidating_vars if ('var:' ~ k) in eff -%}{%- set ns.ok = false -%}{%- endfor -%}
+{%- for k, want in cs.pin_vars.items() if (eff['ip:' ~ k] if ('ip:' ~ k) in eff else (eff['var:' ~ k] | default(none))) != want -%}{%- set ns.ok = false -%}{%- endfor -%}
+{%- for k in cs.invalidating_vars if ('var:' ~ k) in eff or ('ip:' ~ k) in eff -%}{%- set ns.ok = false -%}{%- endfor -%}
 {{ '1' if ns.ok else '' }}
 {%- endmacro -%}
 
@@ -209,7 +219,7 @@ exit $_fail
 {%- set rprefix = '^\\{\\{ (rh_repo_root|playbook_dir \\| dirname \\| dirname \\| dirname) \\}\\}/' -%}
 {%- for t in (tasks or []) -%}
 {#- teff: this task/block's own effective settings (keywords + vars overlay the inherited ones) -#}
-{%- set teff = scope_fold(cs, eff, t, true) | trim | from_json -%}
+{%- set teff = scope_fold(cs, eff, t, 'task') | trim | from_json -%}
 {%- if t.block is defined -%}
 {{ walk(t.block, via, tr, tr_dir, depth, teff) }}{{ walk(t.rescue | default([]), via, tr, tr_dir, depth, teff) }}{{ walk(t.always | default([]), via, tr, tr_dir, depth, teff) }}
 {%- else -%}
@@ -217,9 +227,10 @@ exit $_fail
 {%- set mod = (mods | first) if (mods | length == 1) else 'AMBIGUOUS:' ~ (mods | join(',')) -%}
 {%- set isinc = mod in ['ansible.builtin.include_tasks', 'ansible.builtin.import_tasks'] -%}
 {%- set ap = (t[mod].apply | default({})) if (isinc and t[mod] is mapping) else {} -%}
-{#- an include's CHILDREN: the inherited settings, overlaid by `apply` (keywords + task vars), then by the include's
-    own parameters (vars only; they outrank task vars). The include task's own keywords do not reach its children. -#}
-{%- set ceff = (scope_fold(cs, scope_fold(cs, eff, ap, true) | trim | from_json, {'vars': t.vars | default({})}, false) | trim | from_json)
+{#- an include's CHILDREN: the inherited settings, overlaid by `apply` (layer 'task': keywords + task vars), then by
+    the include's own parameters (layer 'param': vars only, kept SEPARATE so they outrank every task/block var below).
+    The include task's own keywords do not reach its children. -#}
+{%- set ceff = (scope_fold(cs, scope_fold(cs, eff, ap, 'task') | trim | from_json, {'vars': t.vars | default({})}, 'param') | trim | from_json)
                if isinc else teff -%}
 {%- set cctl = scope_is_ctl(cs, ceff) | trim == '1' -%}
 {%- set row = {'module': mod, 'task': t.name | default(''), 'via': via, 'ctl': cctl,
