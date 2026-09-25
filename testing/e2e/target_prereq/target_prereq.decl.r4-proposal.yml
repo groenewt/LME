@@ -1,0 +1,206 @@
+---
+# testing/e2e/target_prereq/target_prereq.decl.r4-proposal.yml -- REPLACEMENT PROPOSAL for C1 (B-owned; codex-tick360
+# identity-preservation decisions, inbox/2026-09-25-codex-tick360-identity-preservation-render-decisions.yaml sha256
+# 48f026eaec7927a91f0e9b69cdf4fe9f1366ddb23099c61d80ed4b5f1d783086, `preservation` rules 1-6).
+# It is NOT policy and nothing reads it. It REPLACES the FROZEN proposal
+#   testing/remote_harness/target_prereq.decl.yml  sha256 743b68e8067d5aebf9f6c1c61ab6df629e35efe77d31f9f0b39777627440d064
+#   (target_prereq revision 3; left byte-unchanged -- frozen)
+# as rh.controller.bootstrap.target_prereq REVISION 3 -> 4, for C1 to register. It lists ONLY the added / changed /
+# removed nodes (a DELTA over revision 3); every node not named here keeps its revision-3 value byte-for-byte. Nothing
+# is copied silently: C1 composes r4 = r3 + `changed` + `added` - `removed`.
+# CONSUMERS that require revision 4 (both refuse RH-TARGET-PREREQ before any contact while the resolved policy is r3):
+#   testing/remote_harness/target_prereq.yml                   (controller assert `_tpr.revision == 4`)
+#   testing/e2e/target_prereq/prereq_observe.yml               (same assert)
+#   testing/e2e/target_prereq/tasks/prereq_preflight.yml       (reads tp.preservation, tp.preflight.record_schema)
+target_prereq_r4_delta:
+  replaces: {file: testing/remote_harness/target_prereq.decl.yml, sha256: 743b68e8067d5aebf9f6c1c61ab6df629e35efe77d31f9f0b39777627440d064, revision: 3}
+  revision: 4
+
+  changed:
+    revision: 4
+    # the preflight record body changed shape (preserved_units -> preservation), so its schema id moves.
+    preflight.record_schema: lme-target-prereq-preflight/v2
+    # reuse gains the shared B-owned preflight tasks file (was inline in target_prereq.yml)
+    reuse.preflight_rel: testing/e2e/target_prereq/tasks/prereq_preflight.yml
+
+  removed:
+    # rev 3 hypervisor.preserved_refused_states / preserved_refused_status: the per-member expected-state vocabulary
+    # below replaces them (the values move into expected_states.inactive_not_enabled; nothing is weakened).
+    - hypervisor.preserved_refused_states       # r3 value [running]
+    - hypervisor.preserved_refused_status       # r3 value [enabled, enabled-runtime]
+
+  added:
+    # PRESERVATION (codex-tick360 rules 1-5). Inventory DECLARES the selection (members + expected state per member,
+    # or verified_none) as desired lab configuration; the read-only preflight OBSERVES all selected units and their
+    # current states and evaluates each member against ITS expected state. The scope is never derived by filtering on
+    # observed state. Applies to EVERY member of inventory.target_group (a hypervisor does not imply a prior stack; a
+    # non-hypervisor may carry one). Only MAIN runs the privileged observation.
+    preservation:
+      refusal: RH-TARGET-PREREQ-PRESERVATION
+      applies_to: every_target_group_member
+      unit_regex: '^[A-Za-z0-9@_.:-]+[.]service$'      # == the registry pattern service_name (global.yml :1094)
+      # BASIS vocabulary (explicit; no default; rule 3). Exactly one per member; anything else refuses before contact
+      # in target_prereq.yml (prereq_observe.yml also admits `undeclared`: it records matches and evaluates nothing).
+      bases:
+        known_set:
+          means: the member units are KNOWN (prior deployment declarations / preservation records); each has an expected state
+          evidence: at least one member role (expected_states.<state>.role) is bound; the verified_none role is absent
+          absence: an absent member REFUSES (outcome absent); observation never shrinks the declared set
+        verified_none:
+          means: verified no prior deployment on this member
+          role: prereq_verified_no_prior_deployment    # bool target input; must be true when present (false refuses)
+          requires: [the discovery selector role is bound (non-empty), no member role is bound]
+          check: any LISTED unit matching the discovery selectors REFUSES unless its status is in absent_status AND its state is in absent_states
+      # EXPECTED-STATE vocabulary (per member; rule 1). One string_list target-input role per state (no new pattern:
+      # both roles use the registered service_name pattern). A unit named in two roles refuses (conflicting basis).
+      expected_states:
+        inactive_not_enabled:
+          role: prereq_preserved_units                 # existing role (var lme_lab_preserved_units)
+          present: required
+          refused_states: [running]                    # moved from r3 hypervisor.preserved_refused_states
+          refused_status: [enabled, enabled-runtime]   # moved from r3 hypervisor.preserved_refused_status
+        retired_absent:
+          role: prereq_retired_units                   # NEW role (C1 join TP4-ROLE-RETIRED)
+          present: refused                             # present again = an interrupted / reverted retirement
+      absent_status: [not-found]                       # service_facts status of a LOADED unit whose unit file is gone
+      # ABSENT (codex-tick370 PREREQ-RUNNING-NOTFOUND-ABSENCE) == NOT LISTED by service_facts, OR status in absent_status
+      # AND state in absent_states. Any other state with an absent_status is outcome loaded_without_unit_file (refuses,
+      # route recorded) for every basis. service_facts reports a not-found unit (list-units only) as `running` or
+      # `stopped`, where `stopped` means only sub-state != running (exited / activating / auto-restart / failed are all
+      # `stopped`), so `stopped` is NOT runtime inactivity and is not admitted: with service_facts as the source a
+      # listed not-found unit is never proven inactive and absence today means NOT LISTED (join TP4-ACTIVESTATE-PROBE).
+      absent_states: [inactive]
+      # outcome -> route (rule 5). The preflight RECORDS the outcome and the route and refuses; it never starts, stops,
+      # enables, disables or masks a unit, and never touches a unit outside the declared selection.
+      routes:
+        as_expected: null
+        absent:
+          mechanism: null
+          action: >-
+            MAIN reconciles the preservation record (an interrupted retirement is declared retired_absent only on
+            retirement evidence; evidence loss is reported). The known set is never shrunk by observation.
+        running: &retire
+          mechanism: testing/e2e/reclaim/reclaim.yml
+          op: native_service_remove                    # reclaim.decl.yml :74-78 (exact removal of ONE owned native service)
+          service_var: lme_reclaim_service
+          status: obstructed
+          obstruction: >-
+            reclaim acts only on units named in the target's NATIVE OWNERSHIP LEDGER (/var/lib/lme-owned/ledger.json,
+            reclaim.decl.yml :109-124); ops.native_service_remove.absent_ledger.native is refuse (:78) and the ledger
+            producer is the open join JOIN-NATIVE-LEDGER-PRODUCER (:174). The pre-observability development stack is in
+            no ledger, so no owned retirement authority exists for it today; the legacy blanket wipe
+            (scripts/wipe_lme.sh via deploy_gate.sh do_wipe) is quarantined by reclaim.decl.yml (:7-12, :152-168) and is
+            never a route.
+        enabled: *retire
+        present_after_retirement: *retire
+        loaded_without_unit_file: *retire              # listed, absent_status, state not in absent_states (every basis)
+      # DISCOVERY (rule 2): a declared bounded selector where names are not recorded. Matches outside the member set
+      # are RECORDED (unclassified). Observation alone grants no ownership or retirement authority.
+      discovery:
+        selector_role: obs_unit_patterns               # existing role (var lme_obs_unit_patterns, pattern unit_glob)
+        selector_regex: '^[A-Za-z0-9@_.:*-]+$'         # == the registry pattern unit_glob (global.yml :1065)
+        glob_to_regex: '"^" ~ (glob | regex_escape | replace("\*", ".*")) ~ "$"'   # the one translation (prereq_preflight.yml)
+        source: ansible.builtin.service_facts
+        limit: >-
+          service_facts lists SYSTEM .service units only (loaded units and unit files). .path / .timer / .socket
+          units (e.g. lme-llama-model.path) and user-manager units are NOT seen; the route's observe.yml O-PRIOR-STATE
+          job (system-units / user-units) covers those as recorded evidence. A clean RERUN (cases DR07 / PF14) stays
+          positive only because the new stack's units are owner (user-manager) units: a SYSTEM unit named by a
+          selector (lme-*) that runs refuses as an unclassified running match. inactive_not_enabled refuses only
+          UnitFileState enabled / enabled-runtime (r3 values): a podman-quadlet unit reports `generated` and can still
+          autostart through generator wants links, yet evaluates as_expected -- MAIN checks the observed status of
+          each member in the observe record before trusting the expectation (UNRESOLVED; a `generated` refusal would
+          be a further changed node). `generated` stays ADMITTED despite possible autostart until exact ownership /
+          lifecycle evidence is joined. Absence is proven only by NOT LISTED (absent_states: a listed not-found unit
+          is never proven inactive by service_facts). The observation stages ordinary admitted Ansible module
+          payloads under the root module temp; no deployment-state mutation is intended.
+        outside_known:
+          refused_states: [running]                    # known_set: an unclassified RUNNING match refuses (recorded)
+      # the read-only OBSERVATION leg that seeds the declaration (rules 2, 6; testing/e2e/target_prereq/prereq_observe.yml)
+      # -- same preflight tasks, no owner key, no effect dependency; MAIN only.
+    observe:
+      runner: MAIN_only
+      playbook_rel: testing/e2e/target_prereq/prereq_observe.yml
+      record_suffix: .prereq-observe.json              # <state dir>/<tr.outputs.prefix><label><suffix>, mode 0600
+      record_schema: lme-target-prereq-observe/v1
+      # the MINIMUM bound target inputs the observation needs (every one input-only; nothing an effect creates; no
+      # owner_key / owner_pubkey / bundle_dir / toolchain_root / prereq_owner_shell / prereq_bundle_root)
+      required_roles: [owner, prereq_owner_home, prereq_work_root, prereq_work_parent_path, prereq_work_parent_owner,
+                       prereq_work_parent_group, prereq_work_parent_mode, obs_paths]
+      optional_roles: [prereq_preserved_units, prereq_retired_units, prereq_verified_no_prior_deployment, obs_unit_patterns]
+      listing: {depth: 1, hidden: true, follow: false, fields: [type, owner, group, mode]}   # per obs_paths entry
+      # refusal policy: the record is ALWAYS written once the controller admitted the inputs; the leg refuses only
+      # when the privileged contact was not admitted. Preflight refusals are recorded as `findings` (what
+      # target_prereq.yml would refuse), never acted on.
+      schema_fields:
+        schema: lme-target-prereq-observe/v1
+        target: inventory alias
+        label: lme_transfer_label
+        scope: '{id, scope_sha256}'
+        declared: '{preservation: {basis, members: {<unit>: <expected state>}, selectors}, obs_paths}'
+        preflight: 'the lme-target-prereq-preflight/v2 body (contact, principal, endpoint, paths incl. the work parent chain, account, os_family, packages, preservation, capacity, linger_tool, refusals)'
+        preservation: 'preflight.preservation: {basis, selectors, selector_regex, evaluated, members: {<unit>: {expected, observed: {state, status, source, selected_by}, outcome, route}}, outside_known: {<unit>: {state, status, source, selected_by}}, limit, refusals}'
+        obs_paths: '{<entry>: {chain: {<ancestor or entry>: {exists, type, uid, gid, owner, group, mode}}, listing: {<child path>: {type, uid, gid, owner, group, mode}} | null, listing_skipped: [...]}}'
+        findings: preflight refusals + preservation refusals (collected; not enforced by this leg)
+        contact: admitted | not_admitted
+
+# ---- which added keys SOURCE READS (C1 types these; every other added key -- means, evidence, absence, requires,
+# check, applies_to, glob_to_regex, source, optional_roles, listing.fields, schema_fields -- is rationale C1 may move to
+# comments). The null values (routes.as_expected, routes.absent.mechanism) and the YAML anchor &retire (routes.running
+# reused by enabled / present_after_retirement) may not be admitted registry forms: C1 names the admitted form. ----
+consumed_by_source:
+  - preservation.refusal
+  - preservation.unit_regex
+  - preservation.bases              # key set (known_set, verified_none) + bases.verified_none.role
+  - preservation.expected_states    # key set + each .role, .present, .refused_states, .refused_status
+  - preservation.absent_status
+  - preservation.absent_states      # codex-tick370
+  - preservation.routes             # the whole mapping, recorded verbatim per outcome
+  - preservation.discovery.selector_role
+  - preservation.discovery.selector_regex
+  - preservation.discovery.limit    # recorded verbatim
+  - preservation.discovery.outside_known.refused_states
+  - observe.runner
+  - observe.playbook_rel
+  - observe.record_suffix
+  - observe.record_schema
+  - observe.required_roles
+  - observe.listing.depth
+  - observe.listing.hidden
+  - observe.listing.follow
+  - reuse.preflight_rel
+  - preflight.record_schema
+
+# ---- C1 / route JOIN ITEMS (B cannot edit the profile or global.yml) ----
+joins:
+  - id: TP4-REVISION
+    owner: C1
+    what: register rh.controller.bootstrap.target_prereq revision 4 = r3 + this delta (contract revision enum [4]);
+      until then target_prereq.yml AND prereq_observe.yml refuse RH-TARGET-PREREQ before contact (inert).
+  - id: TP4-ROLE-RETIRED
+    owner: C1
+    what: new target input role (profile controller.bootstrap.inventory.target_inputs + global.yml host_scope.target_inputs)
+    entry: {prereq_retired_units: {var: lme_lab_retired_units, type: string_list, required: false, pattern: service_name}}
+  - id: TP4-ROLE-VERIFIED-NONE
+    owner: C1
+    what: new target input role
+    entry: {prereq_verified_no_prior_deployment: {var: lme_lab_verified_no_prior_deployment, type: bool, required: false}}
+    note: type bool is in the registry type vocabulary (string / bool / string_list); no pattern (bool). If the registry
+      requires a pattern key for bool roles, C1 names the admitted form.
+  - id: TP4-OBSERVE-ENTRY
+    owner: C1 + route
+    what: >-
+      reserved names -- prereq_observe.yml derives only tp_ / _tp_ family names and the bare tp / tr (already reserved by
+      reserved_prereq_vars and the bare-name guard); no new family. If the route's observation registry
+      (controller.bootstrap.observation) must list prereq_observe.yml as a declared observation playbook, route adds it.
+  - id: TP4-ACTIVESTATE-PROBE
+    owner: route + C1 (privileged tool admission)
+    what: >-
+      codex-tick370: an ADMITTED read-only probe of systemd ActiveState/SubState for listed absent_status units (e.g.
+      systemctl show --property=Id,LoadState,ActiveState,SubState) -- systemctl is not among the privileged-contact
+      tools and ansible.builtin.systemd_service requires a mutating parameter, so B adds none. Until joined, a listed
+      not-found unit refuses loaded_without_unit_file (e.g. a retirement that removes the unit file but leaves a
+      drop-in keeps the unit loaded and refuses until MAIN reconciles).
+  - id: TP4-LAB-DECLARATION
+    owner: coordinator (graph_lab_example.yml)
+    what: the graph host vars snippet in the B hand-back (preservation basis + members + selectors + obs_paths).

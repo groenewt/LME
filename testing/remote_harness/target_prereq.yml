@@ -1,0 +1,1200 @@
+---
+# testing/remote_harness/target_prereq.yml -- ENTRY: the MAIN-only privileged PREREQUISITE leg of one target
+# (codex-tick302 (B)/(D); codex-graph-guest-security-prerequisite-decisions; codex-tick318-321 item 3; codex tick320
+# findings 1-4). Started only through the seed launcher, by MAIN, after controller package + apply and BEFORE
+# target_bootstrap.yml (codex ACCEPTED order):
+#   <bundle>/lme-seed-launch.sh run <controller root> explicit_key -i <run inventory dir> \
+#     testing/remote_harness/target_prereq.yml -e lme_transfer_target=<alias> -e lme_transfer_ssh_key= \
+#     -e lme_transfer_state_dir=<abs> -e lme_transfer_label=<label>
+# POLICY: ONLY the resolved rh.controller.bootstrap.target_prereq (C1 registers the decl there; this consumer needs
+# REVISION 4 = testing/e2e/target_prereq/target_prereq.decl.r4-proposal.yml over the frozen revision-3
+# target_prereq.decl.yml). Anything else REFUSES RH-TARGET-PREREQ before any contact (no raw-lookup policy beside rh).
+# PRESERVATION (codex-tick360): every target member declares a preservation BASIS through its bound target inputs
+# (known_set: exact member units with an expected state each; verified_none: explicitly no prior deployment, checked by
+# the discovery selectors). Absent basis refuses before contact; the preflight evaluates EVERY declared member against
+# its expected state and never filters the scope by observed state (testing/e2e/target_prereq/tasks/prereq_preflight.yml).
+# The read-only OBSERVATION that seeds that declaration is testing/e2e/target_prereq/prereq_observe.yml (same preflight
+# tasks, no owner key).
+# Target input VALUES come only from the loader binding (binding.deployment.target_inputs.<host>.<role>); every role is
+# declared optional, so this leg refuses an absent role it needs (owner and toolchain_root included) and never defaults
+# one. Guest values (storage root, base image, memory budget, kvm device) come from THIS host's resolved rh.guest.
+# CONNECTION: B's ONE privileged contract (testing/e2e/transfer tasks/bind_controller.yml -> tr_conn; user root, the
+# privileged key reference); then the route's privileged INITIAL CONTACT before any module, in EVERY target play.
+# Plays:
+#   prereq-controller        (localhost) route guard + first-entry guard, the ONE contract, the leg's controller values
+#   prereq-preflight         (target)    READ-ONLY (testing/e2e/target_prereq/tasks/prereq_preflight.yml): contact, SSH
+#                                        ancestry + listener (record), root-only path metadata (incl. /data), account,
+#                                        os family + package mapping, the declared preservation selection (every member
+#                                        vs its expected state + discovery matches), memory, linger tool identity;
+#                                        failures are rescued into the record. READ-ONLY = no deployment-state
+#                                        mutation intended; ordinary admitted Ansible module staging (root module temp)
+#                                        occurs. service_facts covers SYSTEM .service units only (no timer / socket /
+#                                        path / user units); status `generated` is admitted despite possible autostart
+#                                        until ownership/lifecycle evidence is joined; a LISTED not-found unit is never
+#                                        absent (decl r4 preservation.absent_states; codex-tick370)
+#   prereq-preflight-record  (localhost) ALWAYS writes <state dir>/gate.<label>.prereq-preflight.json (0600), THEN
+#                                        refuses when the preflight refused
+#   prereq-target            (target)    classify, READ BACK every done op, then the effects (each only when absent)
+#   prereq-record            (localhost) <state dir>/gate.<label>.prereq.json
+# Effects on the target (each only when ABSENT, after observation; matching state is observation-only; foreign or
+# drifted state is preserved and REFUSED): packages (rh.packages logical names), the work parent (root-owned
+# intermediate), the root journal, the owner account (+kvm on hypervisor members), .ssh + authorized_keys (only while
+# authorized_key is pending), linger (the admitted os_tools loginctl), the work root and its children (created while
+# the work root is root-owned 0700, handed to the owner LAST), the guest storage root.
+# Never: usermod/chown/chmod of state no run of this leg created, a unit start/stop/enable/disable/mask, a base image
+# fetch or rewrite, a read of any private key, an operator-key write, a rotation (J-KEY is its own leg).
+- name: prereq-controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Refuse pre-supplied harness outputs and derive the repository root (route author; first task)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/refuse_pinned_outputs.yml"
+
+    # FIRST-ENTRY GUARD (codex-tick318-321 item 2; codex-tick333 (2) families): every name this entry derives is
+    # refused when it is already defined (an extra var or an inventory var would outrank the set_fact that derives it).
+    # The FAMILIES (tr_ / _tr_ / tp_ / _tp_ / ... every registered reserved_output_patterns entry) are refused by B's
+    # family guard, magic-rooted (playbook_dir, never an input); the BARE names no family covers are refused inline
+    # right after it. Both run before any value of these names reaches an include path, a lookup or privilege selection.
+    - name: Refuse pre-supplied names of a reserved family (B family guard; second task, first entry)
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname | dirname }}/testing/e2e/transfer/tasks/refuse_reserved_families.yml"
+
+    - name: Refuse a pre-supplied bare derived name of this leg (first entry; before any use)
+      ansible.builtin.assert:
+        that:
+          - "['tr', 'tp'] | select('in', vars) | list | length == 0"
+        fail_msg: >-
+          REFUSED RH-TARGET-PREREQ-DERIVED-OUTPUT-PINNED: {{ ['tr', 'tp'] | select('in', vars) | list }} were supplied
+          from outside (extra-var / inventory); they are derived by this leg, never inputs.
+        quiet: true
+
+    - name: Derive the transfer declaration and its directory (derived here; never a play var or an input)
+      ansible.builtin.set_fact:
+        tr_dir: "{{ rh_repo_root ~ '/testing/e2e/transfer' }}"
+        tr: "{{ (lookup('ansible.builtin.file', rh_repo_root ~ '/testing/e2e/transfer/transfer.decl.yml') | from_yaml).transfer }}"
+
+    - name: Controller prelude (policy, executor, the ONE privileged contract, state dir)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/e2e/transfer/tasks/bind_controller.yml"
+
+    - name: Refuse an unregistered leg, a moved transfer dir, a foreign contract, or an unregistered tool / group / runtime
+      vars:
+        _tpr: "{{ rh.controller.bootstrap.target_prereq | default({}) }}"
+        _tools: "{{ rh.controller.bootstrap.os_tools }}"
+      ansible.builtin.assert:
+        that:
+          - _tpr is mapping and _tpr.revision | default(0) == 4
+          - _tpr.runner | default('') == 'MAIN_only'
+          - tr_dir == rh_repo_root ~ '/' ~ _tpr.reuse.transfer_dir_rel
+          - tr.contract.connection_profile == _tpr.connection_profile
+          - _tpr.linger.tool in _tools and _tools[_tpr.linger.tool].path is match(rh.controller.bootstrap.path_admission.regex)
+          - (_tools[_tpr.linger.tool].identity.sha256 | default('')) is match('^[0-9a-f]{64}$')
+          - "'target_prereq' in (_tools[_tpr.linger.tool].required_by | default([]))"
+          - (rh.controller.bootstrap.inventory.role_groups.hypervisors | default('')) is match('^[A-Za-z_][A-Za-z0-9_]*$')
+          - (rh.controller.bootstrap.target_bootstrap.user_manager.runtime_dir | default('')) is match('^/.*[{]uid[}]')
+          - (rh.controller.bootstrap.target_bootstrap.user_manager.bus | default('')) is match('^[^/]+$')
+        fail_msg: >-
+          REFUSED RH-TARGET-PREREQ: rh.controller.bootstrap.target_prereq is not registered at revision 4 (runner
+          MAIN_only; C1 registers testing/e2e/target_prereq/target_prereq.decl.r4-proposal.yml over the frozen
+          revision-3 testing/remote_harness/target_prereq.decl.yml), or its transfer dir / contract profile
+          differs from B's, or os_tools.{{ _tpr.linger.tool | default('?') }} (path + identity sha256, required_by
+          target_prereq), inventory.role_groups.hypervisors or target_bootstrap.user_manager.{runtime_dir, bus} is not
+          registered (C1 joins). Nothing was contacted.
+        quiet: true
+
+    - name: Bind the leg policy (resolved rh only)
+      ansible.builtin.set_fact:
+        tp: "{{ rh.controller.bootstrap.target_prereq }}"
+
+    - name: Refuse a roster other than the registry's (target group membership; the toolchain sub-root)
+      ansible.builtin.assert:
+        that:
+          - tp == rh.controller.bootstrap.target_prereq
+          - tp.layout.toolchain_rel == rh.controller.bootstrap.work_roots.sub_roots.toolchain
+          - lme_transfer_target in (groups[rh.controller.bootstrap.inventory.target_group] | default([]))
+        fail_msg: >-
+          REFUSED {{ tp.refusal }}: tp is not the resolved policy, its toolchain_rel is not the work_roots toolchain
+          sub-root, or {{ lme_transfer_target }} is not a member of {{ rh.controller.bootstrap.inventory.target_group }}.
+        quiet: true
+
+    - name: Bind this target's typed target inputs (ONLY the loader binding; the host vars are never read raw)
+      ansible.builtin.set_fact:
+        tp_ti: "{{ ((lme_resolved.remote_harness.binding.deployment.target_inputs | default({}))[lme_transfer_target] | default({})) }}"
+
+    - name: Refuse an absent target input this leg needs (every role is optional in the registry; no default here)
+      ansible.builtin.assert:
+        that:
+          - >-
+            ['owner', 'toolchain_root', 'bundle_dir', 'owner_key', 'privileged_key', 'owner_pubkey', 'prereq_owner_shell',
+             'prereq_owner_home', 'prereq_work_root', 'prereq_bundle_root', 'prereq_work_parent_path',
+             'prereq_work_parent_owner', 'prereq_work_parent_group', 'prereq_work_parent_mode']
+            | reject('in', tp_ti) | list | length == 0
+        fail_msg: >-
+          REFUSED {{ tp.refusal }}: {{ lme_transfer_target }} has no bound target input(s)
+          {{ ['owner', 'toolchain_root', 'bundle_dir', 'owner_key', 'privileged_key', 'owner_pubkey', 'prereq_owner_shell',
+              'prereq_owner_home', 'prereq_work_root', 'prereq_bundle_root', 'prereq_work_parent_path',
+              'prereq_work_parent_owner', 'prereq_work_parent_group', 'prereq_work_parent_mode'] | reject('in', tp_ti) | list }}
+          (binding.deployment.target_inputs; C1 declares the prereq_work_parent_* roles). Nothing was contacted.
+        quiet: true
+
+    - name: Refuse malformed target inputs, a layout other than the declared one, or shared keys (pre-contact)
+      vars:
+        _rx: "{{ rh.controller.bootstrap.path_admission.regex }}"
+        _w: "{{ tp_ti.prereq_work_root }}"
+        _refp: "{{ rh.controller.bootstrap.work_roots.admission.refused_prefixes }}"
+      ansible.builtin.assert:
+        that:
+          - tp_ti.owner is string and tp_ti.owner is match('^[a-z_][a-z0-9_-]{0,31}$')
+          - tp_ti.prereq_owner_shell is match(_rx) and tp_ti.prereq_owner_home is match(_rx)
+          - _w is match(_rx) and _w is match('^/.+/[^/]+$')
+          - (_w ~ '/') is not match('(' ~ (_refp | map('regex_escape') | join('|')) ~ ')')
+          - tp_ti.toolchain_root == _w ~ '/' ~ tp.layout.toolchain_rel
+          - tp_ti.prereq_bundle_root == _w ~ '/' ~ tp.layout.bundles_rel
+          - (tp_ti.bundle_dir | dirname) == tp_ti.prereq_bundle_root
+          - (tp_ti.bundle_dir | basename) is match(tp.layout.bundle_leaf_regex)
+          - tp_ti.prereq_work_parent_path == (_w | dirname)
+          - tp_ti.prereq_work_parent_owner == tp.layout.work_parent_rule.owner
+          - tp_ti.prereq_work_parent_mode is string and tp_ti.prereq_work_parent_mode is match(tp.layout.work_parent_rule.mode_regex)
+          - tp_ti.prereq_work_parent_group is match('^[a-z_][a-z0-9_-]{0,31}$')
+          - tp_ti.owner_key is match(_rx) and tp_ti.privileged_key is match(_rx) and tp_ti.owner_key != tp_ti.privileged_key
+          # the public-half naming is the J-KEY producer contract's (owner_key.storage.pub_suffix; C3 naming join), never
+          # a literal here; an unregistered suffix fails the comparison (fail closed)
+          - (rh.controller.bootstrap.owner_key.storage.pub_suffix | default('')) | length > 0
+          - tp_ti.owner_pubkey == tp_ti.owner_key ~ rh.controller.bootstrap.owner_key.storage.pub_suffix
+        fail_msg: >-
+          REFUSED {{ tp.refusal }}: {{ lme_transfer_target }}'s bound target inputs {{ tp_ti | list }} must give an
+          account-name owner, toolchain root == <work root>/{{ tp.layout.toolchain_rel }}, bundle root == <work
+          root>/{{ tp.layout.bundles_rel }}, bundle dir == <bundle root>/<64-hex leaf>, a work parent {path: dirname(work
+          root), owner: root, group, mode matching {{ tp.layout.work_parent_rule.mode_regex }}}, a work root outside
+          {{ _refp }}, distinct owner/privileged key PATHS and the owner public key at <owner key><owner_key.storage.pub_suffix
+          = {{ rh.controller.bootstrap.owner_key.storage.pub_suffix | default('<unregistered>') }}>. Nothing was contacted.
+        quiet: true
+
+    # UNVALIDATED CANDIDATE (the J-KEY C2 rule, applied to this consumer): the owner .pub file is not public material
+    # until admitted. Its read and the pattern match run under no_log; the refusal names the PATH only; only the
+    # admitted line is bound.
+    - name: Read the owner PUBLIC key candidate (the only key file this leg reads; no_log until admitted)
+      ansible.builtin.set_fact:
+        _tp_cand: "{{ lookup('ansible.builtin.file', tp_ti.owner_pubkey) | trim }}"
+      no_log: true
+
+    - name: Match the candidate against the declared public-key form (no_log; only a boolean leaves this task)
+      ansible.builtin.set_fact:
+        _tp_admit: >-
+          {{ (_tp_cand is match(tp.authorized_keys.pubkey_regex)) and ('\n' not in _tp_cand)
+             and ('PRIVATE KEY' not in _tp_cand) }}
+      no_log: true
+
+    - name: Refuse anything but one public-key line (path only; the content is withheld)
+      ansible.builtin.assert:
+        that:
+          - _tp_admit | bool
+        fail_msg: >-
+          REFUSED {{ tp.refusal }}: {{ tp_ti.owner_pubkey }} is not one public-key line; its content was never admitted
+          and is not shown. Nothing was contacted.
+        quiet: true
+
+    - name: Admit the owner public line (from here on it is public material) and drop the candidate
+      ansible.builtin.set_fact:
+        _tp_pub: "{{ _tp_cand }}"
+        _tp_cand: ''
+      no_log: true
+
+    # PRESERVATION SELECTION (codex-tick360 items 1-3; decl r4 `preservation`): DESIRED configuration of the lab
+    # inventory, bound by the loader as target inputs; one member role per expected state (expected_states.<state>.role),
+    # the verified_none bool role, the discovery selector role (obs_unit_patterns). Derived here, never an input.
+    - name: Bind the declared preservation selection (loader binding only; no default)
+      vars:
+        _pvd: "{{ tp.preservation }}"
+      ansible.builtin.set_fact:
+        tp_pv: >-
+          {%- set m = namespace(d={}, dup=[]) -%}
+          {%- for st in _pvd.expected_states | list | sort if _pvd.expected_states[st].role in tp_ti -%}
+          {%- for u in tp_ti[_pvd.expected_states[st].role] -%}
+          {%- if u in m.d -%}{%- set m.dup = m.dup + [u] -%}{%- endif -%}
+          {%- set m.d = m.d | combine({u: st}) -%}
+          {%- endfor -%}{%- endfor -%}
+          {%- set vr = _pvd.bases.verified_none.role -%}
+          {%- set vn = tp_ti[vr] if vr in tp_ti else none -%}
+          {{ {'basis': ('conflicting' if (m.dup | length > 0 or (vn is not none and (vn is not sameas true or m.d | length > 0)))
+                        else ('verified_none' if vn is sameas true else ('known_set' if m.d | length > 0 else 'undeclared'))),
+              'members': m.d, 'duplicates': m.dup,
+              'selectors': tp_ti[_pvd.discovery.selector_role] if (_pvd.discovery.selector_role in tp_ti) else []} }}
+
+    - name: Publish the controller-decided leg values (derived output)
+      vars:
+        _um: "{{ rh.controller.bootstrap.target_bootstrap.user_manager }}"
+        _lt: "{{ rh.controller.bootstrap.os_tools[tp.linger.tool] }}"
+      ansible.builtin.set_fact:
+        tp_ctl:
+          owner: "{{ tp_ti.owner }}"
+          shell: "{{ tp_ti.prereq_owner_shell }}"
+          home: "{{ tp_ti.prereq_owner_home }}"
+          work_root: "{{ tp_ti.prereq_work_root }}"
+          work_parent:
+            path: "{{ tp_ti.prereq_work_parent_path }}"
+            owner: "{{ tp_ti.prereq_work_parent_owner }}"
+            group: "{{ tp_ti.prereq_work_parent_group }}"
+            mode: "{{ tp_ti.prereq_work_parent_mode }}"
+          children: >-
+            {{ [tp.layout.toolchain_rel, tp.layout.bundles_rel, rh.controller.bootstrap.work_roots.sub_roots.tmp,
+                rh.controller.bootstrap.work_roots.sub_roots.tmp ~ '/' ~ rh.controller.bootstrap.work_roots.remote_tmp_rel] }}
+          pubkey: "{{ _tp_pub }}"
+          pubkey_sha256: "{{ _tp_pub | hash('sha256') }}"
+          authorized_sha256: "{{ (_tp_pub ~ '\n') | hash('sha256') }}"
+          hypervisor: "{{ lme_transfer_target in (groups[rh.controller.bootstrap.inventory.role_groups.hypervisors] | default([])) }}"
+          preservation: {basis: "{{ tp_pv.basis }}", members: "{{ tp_pv.members }}", selectors: "{{ tp_pv.selectors }}"}
+          linger_tool: {name: "{{ tp.linger.tool }}", path: "{{ _lt.path }}", sha256: "{{ _lt.identity.sha256 }}"}
+          runtime_dir_tpl: "{{ _um.runtime_dir }}"
+          bus_rel: "{{ _um.bus }}"
+          preflight_path: "{{ lme_transfer_state_dir }}/{{ tr.outputs.prefix }}{{ lme_transfer_label }}{{ tp.preflight.record_suffix }}"
+          record_path: "{{ lme_transfer_state_dir }}/{{ tr.outputs.prefix }}{{ lme_transfer_label }}{{ tp.observation.record_suffix }}"
+
+    # codex-tick360 item 3: a hypervisor does NOT imply a non-empty old stack, and no member may leave its prior state
+    # unstated. EVERY member declares known_set (exact members, each with an expected state) or verified_none (explicitly
+    # no prior deployment, verified by at least one discovery selector). Absence never shrinks a known set: an absent
+    # known member refuses in the preflight (outcome absent), it is never dropped here.
+    - name: Refuse a member without an explicit preservation basis, a conflicting one, or malformed members / selectors
+      vars:
+        _pvd: "{{ tp.preservation }}"
+      ansible.builtin.assert:
+        that:
+          - tp_pv.basis in (_pvd.bases | list)
+          - tp_pv.members.keys() | list | reject('match', _pvd.unit_regex) | list | length == 0
+          - tp_pv.members.values() | list | reject('in', _pvd.expected_states | list) | list | length == 0
+          - tp_pv.selectors | reject('match', _pvd.discovery.selector_regex) | list | length == 0
+          - tp_pv.basis != 'verified_none' or tp_pv.selectors | length > 0
+          - tp_ctl.preservation.basis == tp_pv.basis and tp_ctl.preservation.members == tp_pv.members
+        fail_msg: >-
+          REFUSED {{ _pvd.refusal }}: {{ lme_transfer_target }} preservation basis is {{ tp_pv.basis }} (members
+          {{ tp_pv.members | to_json }}, duplicates {{ tp_pv.duplicates | to_json }}, selectors {{ tp_pv.selectors | to_json }}).
+          Declare exactly one of: known_set = the member roles {{ _pvd.expected_states | dict2items | map(attribute='value.role') | list }}
+          (exact .service names, each in one role only), or verified_none = {{ _pvd.bases.verified_none.role }}: true with
+          the discovery selector role {{ _pvd.discovery.selector_role }} and no member role. Nothing was contacted.
+        quiet: true
+
+# ---- PREFLIGHT (codex-tick318-321 item 3): READ-ONLY on the admitted privileged contact, before any effect. It
+# depends on nothing an effect provides. Every refusal is COLLECTED into tp_pre.refusals (never asserted here); a
+# contact or observation failure is rescued into it; prereq-preflight-record writes the record and only then refuses.
+- name: prereq-preflight
+  hosts: "{{ lme_transfer_target }}"
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    ansible_connection: "{{ hostvars['localhost'].tr_conn.ansible_connection }}"
+    ansible_host: "{{ hostvars['localhost'].tr_conn.ansible_host }}"
+    ansible_user: "{{ hostvars['localhost'].tr_conn.ansible_user }}"
+    ansible_ssh_executable: "{{ hostvars['localhost'].tr_conn.ansible_ssh_executable }}"
+    ansible_ssh_common_args: "{{ hostvars['localhost'].tr_conn.ansible_ssh_common_args }}"
+    ansible_ssh_extra_args: "{{ hostvars['localhost'].tr_conn.ansible_ssh_extra_args }}"
+    ansible_ssh_private_key_file: "{{ hostvars['localhost'].tr_conn.ansible_ssh_private_key_file }}"
+    ansible_private_key_file: "{{ hostvars['localhost'].tr_conn.ansible_private_key_file }}"
+    ansible_password: "{{ hostvars['localhost'].tr_conn.ansible_password }}"
+    ansible_ssh_pass: "{{ hostvars['localhost'].tr_conn.ansible_ssh_pass }}"
+    ansible_ssh_pkcs11_provider: "{{ hostvars['localhost'].tr_conn.ansible_ssh_pkcs11_provider }}"
+    ansible_ssh_password: "{{ hostvars['localhost'].tr_conn.ansible_ssh_password }}"
+    ansible_private_key: "{{ hostvars['localhost'].tr_conn.ansible_private_key }}"
+    ansible_ssh_private_key: "{{ hostvars['localhost'].tr_conn.ansible_ssh_private_key }}"
+    ansible_private_key_passphrase: "{{ hostvars['localhost'].tr_conn.ansible_private_key_passphrase }}"
+    ansible_ssh_private_key_passphrase: "{{ hostvars['localhost'].tr_conn.ansible_ssh_private_key_passphrase }}"
+    # no ansible_remote_tmp / ansible_python_interpreter / become: the PRIVILEGED contact sets both as host facts.
+    # No play var carries leg values (an extra-var outranks a play var); they are the controller's derived output
+    # tp_ctl, copied below AFTER refuse_pinned_outputs.
+  tasks:
+    - name: Refuse pre-supplied harness outputs (route author; first task on this host -- never again in this run)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/refuse_pinned_outputs.yml"
+
+    - name: Refuse pre-supplied names of a reserved family on this host (B family guard; second task, first entry)
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname | dirname }}/testing/e2e/transfer/tasks/refuse_reserved_families.yml"
+
+    - name: Refuse a pre-supplied bare derived name on this host (first entry; inventory host vars included)
+      ansible.builtin.assert:
+        that:
+          - "['tr', 'tp'] | select('in', vars) | list | length == 0"
+        fail_msg: >-
+          REFUSED RH-TARGET-PREREQ-DERIVED-OUTPUT-PINNED on {{ inventory_hostname }}: {{ ['tr', 'tp'] | select('in', vars)
+          | list }} were supplied from outside; they are derived by this leg.
+        quiet: true
+
+    - name: Resolve the harness policy on this host (its OWN scope)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_policy.yml"
+
+    - name: Carry the controller-decided leg values to this host and bind the policy (controller-side; no target module)
+      ansible.builtin.set_fact:
+        tp_ctl: "{{ hostvars['localhost'].tp_ctl }}"
+        tp: "{{ rh.controller.bootstrap.target_prereq }}"
+
+    - name: Refuse a split policy, split target inputs, or a hypervisor member without a resolved guest policy
+      ansible.builtin.assert:
+        that:
+          - tp == hostvars['localhost'].tp
+          - >-
+            ((lme_resolved.remote_harness.binding.deployment.target_inputs | default({}))[inventory_hostname] | default({}))
+            == hostvars['localhost'].tp_ti
+          - not tp_ctl.hypervisor or (rh.guest is defined and rh.guest.allocation is defined and rh.guest.allocation is mapping)
+        fail_msg: >-
+          REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: the target scope's target_prereq or bound target inputs
+          differ from the controller's, or this hypervisor member has no resolved rh.guest.allocation (RS carrier).
+        quiet: true
+
+    # The ONE declared read-only preflight (B-owned tasks file, shared with testing/e2e/target_prereq/prereq_observe.yml;
+    # the former inline lines, unchanged except the preservation evaluation -- decl r4 `preservation`). It starts
+    # tp_pre, runs the privileged initial contact and every observation inside ONE block whose rescue collects a
+    # failure into tp_pre.refusals; the record play below writes it and only then refuses.
+    - name: PREFLIGHT (read-only; the shared declared tasks)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/e2e/target_prereq/tasks/prereq_preflight.yml"
+
+- name: prereq-preflight-record
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Re-admit the state directory ancestry at the write boundary (owner rule; the controller is non-root)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/admit_ancestry.yml"
+      vars:
+        rh_anc_bs: "{{ rh.controller.bootstrap }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ lme_transfer_state_dir }}"
+        rh_anc_refusal: "{{ tp.refusal }}"
+
+    - name: Record the preflight for MAIN, ALSO when it refused (<state dir>/gate.<label>.prereq-preflight.json)
+      ansible.builtin.copy:
+        content: "{{ hostvars[lme_transfer_target].tp_pre | to_nice_json }}\n"
+        dest: "{{ tp_ctl.preflight_path }}"
+        mode: '0600'
+        follow: false
+
+    - name: Refuse when the preflight did not admit the contact or collected a refusal (recorded above; no deployment state changed)
+      ansible.builtin.assert:
+        that:
+          - hostvars[lme_transfer_target].tp_pre.contact == 'admitted'
+          - hostvars[lme_transfer_target].tp_pre.refusals | length == 0
+        fail_msg: >-
+          REFUSED {{ tp.refusal }}-PREFLIGHT on {{ lme_transfer_target }}: {{ hostvars[lme_transfer_target].tp_pre.refusals }}
+          (record {{ tp_ctl.preflight_path }}). No owner, directory, package or unit was touched (no deployment-state
+          mutation; only admitted module staging under the root module temp).
+        quiet: true
+
+
+- name: prereq-target
+  hosts: "{{ lme_transfer_target }}"
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    ansible_connection: "{{ hostvars['localhost'].tr_conn.ansible_connection }}"
+    ansible_host: "{{ hostvars['localhost'].tr_conn.ansible_host }}"
+    ansible_user: "{{ hostvars['localhost'].tr_conn.ansible_user }}"
+    ansible_ssh_executable: "{{ hostvars['localhost'].tr_conn.ansible_ssh_executable }}"
+    ansible_ssh_common_args: "{{ hostvars['localhost'].tr_conn.ansible_ssh_common_args }}"
+    ansible_ssh_extra_args: "{{ hostvars['localhost'].tr_conn.ansible_ssh_extra_args }}"
+    ansible_ssh_private_key_file: "{{ hostvars['localhost'].tr_conn.ansible_ssh_private_key_file }}"
+    ansible_private_key_file: "{{ hostvars['localhost'].tr_conn.ansible_private_key_file }}"
+    ansible_password: "{{ hostvars['localhost'].tr_conn.ansible_password }}"
+    ansible_ssh_pass: "{{ hostvars['localhost'].tr_conn.ansible_ssh_pass }}"
+    ansible_ssh_pkcs11_provider: "{{ hostvars['localhost'].tr_conn.ansible_ssh_pkcs11_provider }}"
+    ansible_ssh_password: "{{ hostvars['localhost'].tr_conn.ansible_ssh_password }}"
+    ansible_private_key: "{{ hostvars['localhost'].tr_conn.ansible_private_key }}"
+    ansible_ssh_private_key: "{{ hostvars['localhost'].tr_conn.ansible_ssh_private_key }}"
+    ansible_private_key_passphrase: "{{ hostvars['localhost'].tr_conn.ansible_private_key_passphrase }}"
+    ansible_ssh_private_key_passphrase: "{{ hostvars['localhost'].tr_conn.ansible_ssh_private_key_passphrase }}"
+  tasks:
+    # no refuse_pinned_outputs.yml here: the preflight play was this host's first entry (a second include refuses
+    # itself); tp / tp_ctl / tp_pre are this run's own facts from that play
+    - name: Refuse unless this run's preflight admitted this host (contact-free)
+      ansible.builtin.assert:
+        that:
+          - tp_pre.contact == 'admitted' and tp_pre.refusals | length == 0
+          - tp == hostvars['localhost'].tp and tp_ctl == hostvars['localhost'].tp_ctl
+        fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: no admitted preflight in this run."
+        quiet: true
+
+    - name: PRIVILEGED INITIAL CONTACT again (route author; raw only) with every root-only path this play writes into
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/initial_contact.yml"
+      vars:
+        rh_ic_variant: privileged
+        # the work parent, the home parent, the journal dir, the linger marker dir, the linger tool's dir and, on a
+        # hypervisor member, the guest storage parent (never an owner-owned directory)
+        rh_ic_paths: >-
+          {{ [tp_ctl.work_parent.path, tp_ctl.home | dirname, tp.journal.dir, tp.linger.marker_dir, tp_ctl.linger_tool.path | dirname]
+             + ([rh.guest.allocation.storage_root | dirname] if tp_ctl.hypervisor else []) }}
+
+    # ---- OBSERVE (read-only) ----
+    - name: Observe the owner account, its primary group and the kvm group
+      ansible.builtin.getent:
+        database: "{{ item.db }}"
+        key: "{{ item.key }}"
+        fail_key: false
+      loop:
+        - {db: passwd, key: "{{ tp_ctl.owner }}"}
+        - {db: group, key: "{{ tp_ctl.owner }}"}
+        - {db: group, key: "{{ tp.hypervisor.kvm_group }}"}
+      register: _tp_ge
+
+    - name: Stat every path this leg decides on (no link followed)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: "{{ item == tp_ctl.home ~ '/' ~ tp.authorized_keys.file_rel }}"
+        checksum_algorithm: sha256
+      loop: >-
+        {{ [tp.journal.dir ~ '/' ~ tp_ctl.owner ~ tp.journal.file_suffix, tp_ctl.home, tp_ctl.home ~ '/' ~ tp.authorized_keys.dir_rel,
+            tp_ctl.home ~ '/' ~ tp.authorized_keys.file_rel, tp.linger.marker_dir ~ '/' ~ tp_ctl.owner, tp_ctl.work_parent.path,
+            tp_ctl.work_root] + (tp_ctl.children | map('regex_replace', '^', tp_ctl.work_root ~ '/') | list) }}
+      register: _tp_st
+
+    - name: Read the journal when it is a root-owned regular file (anything else is refused below)
+      ansible.builtin.slurp:
+        src: "{{ tp.journal.dir }}/{{ tp_ctl.owner }}{{ tp.journal.file_suffix }}"
+      register: _tp_jraw
+      when: _tp_st.results[0].stat.exists and _tp_st.results[0].stat.isreg and not _tp_st.results[0].stat.islnk and _tp_st.results[0].stat.uid == 0
+
+    - name: Classify the observed state (derived output)
+      vars:
+        _pw: "{{ _tp_ge.results[0].ansible_facts.getent_passwd[tp_ctl.owner] }}"
+        _gr: "{{ _tp_ge.results[1].ansible_facts.getent_group[tp_ctl.owner] }}"
+        _s: "{{ dict(['journal', 'home', 'ssh_dir', 'authorized_keys', 'linger', 'work_parent', 'work_root'] | zip(_tp_st.results[:7] | map(attribute='stat'))) }}"
+        _ch: "{{ _tp_st.results[7:] | map(attribute='stat') | list }}"
+      ansible.builtin.set_fact:
+        tp_obs:
+          account: >-
+            {{ none if _pw is none else {'uid': _pw[1] | int, 'gid': _pw[2] | int, 'gecos': _pw[tp.owner_account.passwd_fields.gecos],
+                                          'home': _pw[tp.owner_account.passwd_fields.home], 'shell': _pw[tp.owner_account.passwd_fields.shell]} }}
+          group: "{{ none if _gr is none else {'gid': _gr[1] | int} }}"
+          kvm: "{{ _tp_ge.results[2].ansible_facts.getent_group[tp.hypervisor.kvm_group] }}"
+          st: "{{ _s }}"
+          children: "{{ _ch }}"
+          journal: "{{ (_tp_jraw.content | b64decode | from_json) if (_tp_jraw.content is defined) else none }}"
+          os_family: "{{ tp_pre.os_family }}"
+
+    - name: Decide the account class (absent / campaign / foreign) and the journal class
+      vars:
+        _a: "{{ tp_obs.account }}"
+        _campaign: >-
+          {{ _a is not none and _a.gecos == tp.owner_account.gecos and _a.shell == tp_ctl.shell and _a.home == tp_ctl.home
+             and tp_obs.group is not none and tp_obs.group.gid == _a.gid }}
+        _j: "{{ tp_obs.journal }}"
+        _jok: >-
+          {{ _j is not none and _j.schema | default('') == tp.journal.schema
+             and _j.binding.owner | default('') == tp_ctl.owner and _j.binding.gecos | default('') == tp.owner_account.gecos
+             and _j.binding.pubkey_sha256 | default('') == tp_ctl.pubkey_sha256
+             and (_j.ops | default({})).keys() | list | sort == (tp.journal.ops | reject('equalto', 'storage_root') | list
+                                                                  + (['storage_root'] if tp_ctl.hypervisor else [])) | sort
+             and (_j.ops.values() | reject('in', tp.journal.states) | list | length == 0) }}
+      ansible.builtin.set_fact:
+        tp_class:
+          account: "{{ 'absent' if _a is none else ('campaign' if _campaign | bool else 'foreign') }}"
+          journal: "{{ 'absent' if _j is none else ('bound' if _jok | bool else 'foreign') }}"
+          ops: "{{ tp.journal.ops | reject('equalto', 'storage_root') | list + (['storage_root'] if tp_ctl.hypervisor else []) }}"
+
+    - name: Refuse foreign state (preserved untouched and reported; never converted)
+      vars:
+        _a: "{{ tp_obs.account }}"
+        _j: "{{ tp_obs.journal }}"
+      ansible.builtin.assert:
+        that:
+          - tp_class.account != 'foreign'
+          - tp_class.journal != 'foreign'
+          - not (tp_obs.st.journal.exists and _j is none)
+          # a fresh run: nothing of the owner may pre-exist (no account, group or home)
+          - tp_class.journal != 'absent' or tp_class.account != 'absent' or (tp_obs.group is none and not tp_obs.st.home.exists)
+          # a bound journal with a recorded uid binds THAT account
+          - tp_class.journal != 'bound' or _j.binding.uid is none or (_a is not none and _a.uid == _j.binding.uid)
+          # a bound journal whose account op is done needs the account
+          - tp_class.journal != 'bound' or _j.ops.account != 'done' or _a is not none
+        fail_msg: >-
+          REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: account {{ tp_ctl.owner }} is {{ tp_class.account }}
+          ({{ _a }}), journal is {{ tp_class.journal }}. A historical or foreign account, a journal this leg did not
+          write for THIS owner/key, or leftover owner state without a journal is preserved untouched; no deployment state
+          changed (admitted module staging only).
+        quiet: true
+
+    - name: Refuse a journal that is not resumable (only the FIRST unfinished op may be started; the rest pending)
+      vars:
+        _st: "{{ tp_class.ops | map('extract', tp_obs.journal.ops) | list }}"
+        _first: "{{ (_st | reject('equalto', 'done') | list | length) }}"
+      ansible.builtin.assert:
+        that:
+          - _st[:(_st | length) - (_first | int)] | reject('equalto', 'done') | list | length == 0
+          - _st[(_st | length) - (_first | int) + 1:] | reject('equalto', 'pending') | list | length == 0
+        fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: journal ops {{ tp_class.ops | zip(_st) | list }} are not a done-prefix + one unfinished op + pending suffix."
+        quiet: true
+      when: tp_class.journal == 'bound'
+
+    # ADOPTION of a journal-less campaign account: its complete end state (every op but storage_root, which its own
+    # op re-observes) must read back exactly -- uid AND gid everywhere (tick320 (3)); nothing is written before that.
+    - name: Adopt a journal-less campaign account (candidate journal; read back before it is written)
+      ansible.builtin.set_fact:
+        tp_j: >-
+          {{ {'schema': tp.journal.schema,
+              'binding': {'owner': tp_ctl.owner, 'uid': tp_obs.account.uid, 'gecos': tp.owner_account.gecos, 'pubkey_sha256': tp_ctl.pubkey_sha256},
+              'ops': dict(tp_class.ops | zip(tp_class.ops | map('regex_replace', '^storage_root$', 'pending')
+                                                          | map('regex_replace', '^(?!pending$).*$', 'done')))} }}
+      when: tp_class.journal == 'absent' and tp_class.account == 'campaign'
+
+    - name: Read back the adopted end state (drift refuses; preserved)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_readback.yml"
+      vars:
+        tp_rb_ops: "{{ tp_class.ops | reject('equalto', 'storage_root') | list }}"
+        tp_rb_stage: adopt
+      when: tp_class.journal == 'absent' and tp_class.account == 'campaign'
+
+    - name: Start a fresh journal (nothing of the owner exists)
+      ansible.builtin.set_fact:
+        tp_j: "{{ {'schema': tp.journal.schema, 'binding': {'owner': tp_ctl.owner, 'uid': none, 'gecos': tp.owner_account.gecos, 'pubkey_sha256': tp_ctl.pubkey_sha256}, 'ops': dict(tp_class.ops | zip(tp_class.ops | map('regex_replace', '^.*$', 'pending')))} }}"
+      when: tp_class.journal == 'absent' and tp_class.account == 'absent'
+
+    - name: Resume the bound journal
+      ansible.builtin.set_fact:
+        tp_j: "{{ tp_obs.journal }}"
+      when: tp_class.journal == 'bound'
+
+    - name: Freeze the op states this run started from (the resume rules decide on these, never on later writes)
+      ansible.builtin.set_fact:
+        tp_resume: "{{ tp_j.ops }}"
+
+    # PREREQ-DONE-READBACK (tick320 (2)): every op the bound journal calls done is read back BEFORE any effect
+    - name: Read back every done op of the bound journal (drift refuses; the journal is never trusted alone)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_readback.yml"
+      vars:
+        tp_rb_ops: "{{ tp_class.ops | select('in', tp_resume | dict2items | selectattr('value', 'equalto', 'done') | map(attribute='key') | list) | list }}"
+        tp_rb_stage: resume
+      when: tp_class.journal == 'bound' and (tp_resume | dict2items | selectattr('value', 'equalto', 'done') | list | length) > 0
+
+    # ---- EFFECTS (each after its own fresh use-boundary check; each directory only when ABSENT) ----
+    - name: Install the declared packages (logical names via rh.packages.by_os_family; the preflight refused an unmapped name)
+      vars:
+        _names: "{{ tp_pre.packages.names }}"
+        _map: "{{ rh.packages.by_os_family[tp_obs.os_family] | default({}) }}"
+      block:
+        - name: Refuse a logical package name without a mapping for the observed os family (re-checked)
+          ansible.builtin.assert:
+            that:
+              - _names | reject('in', _map.keys() | list) | list | length == 0
+            fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: no {{ tp_obs.os_family }} package for {{ _names | reject('in', _map.keys() | list) | list }} (rh.packages.by_os_family)."
+            quiet: true
+
+        - name: Install them (distro-neutral module)
+          ansible.builtin.package:
+            name: "{{ _names | map('extract', _map) | list }}"
+            state: present
+
+    - name: Re-observe the kvm group and device after packages (hypervisor members)
+      block:
+        - name: Observe the kvm group
+          ansible.builtin.getent:
+            database: group
+            key: "{{ tp.hypervisor.kvm_group }}"
+            fail_key: false
+
+        - name: Stat the kvm device
+          ansible.builtin.stat:
+            path: "{{ rh.guest.kvm_device }}"
+            follow: false
+            get_checksum: false
+          register: _tp_kvm
+
+        - name: Refuse an absent kvm group or a kvm device that is not a character device of that group
+          ansible.builtin.assert:
+            that:
+              - ansible_facts.getent_group[tp.hypervisor.kvm_group] is not none
+              - _tp_kvm.stat.exists and _tp_kvm.stat.ischr
+              - _tp_kvm.stat.gid == ansible_facts.getent_group[tp.hypervisor.kvm_group][1] | int
+            fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: group {{ tp.hypervisor.kvm_group }} or device {{ rh.guest.kvm_device }} is absent or mismatched."
+            quiet: true
+      when: tp_ctl.hypervisor
+
+    - name: Work parent (root-owned intermediate; created only when absent, observation-only when it matches exactly)
+      block:
+        - name: Re-admit its ancestry (fresh, root_only)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_root_only.yml"
+          vars:
+            tp_ro_path: "{{ tp_ctl.work_parent.path }}"
+            tp_ro_refusal: "{{ tp.refusal }}"
+
+        - name: Fresh stat of the work parent
+          ansible.builtin.stat:
+            path: "{{ tp_ctl.work_parent.path }}"
+            follow: false
+            get_checksum: false
+          register: _tp_wp
+
+        - name: Refuse an existing work parent that is not exactly the declared one (preserved)
+          ansible.builtin.assert:
+            that:
+              - not _tp_wp.stat.exists or (_tp_wp.stat.isdir and not _tp_wp.stat.islnk and _tp_wp.stat.pw_name == tp_ctl.work_parent.owner
+                and _tp_wp.stat.gr_name == tp_ctl.work_parent.group and _tp_wp.stat.mode == tp_ctl.work_parent.mode)
+            fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: {{ tp_ctl.work_parent.path }} exists as {{ _tp_wp.stat.pw_name | default('') }}:{{ _tp_wp.stat.gr_name | default('') }} {{ _tp_wp.stat.mode | default('') }}, not {{ tp_ctl.work_parent }}."
+            quiet: true
+
+        - name: Create it when absent
+          ansible.builtin.file:
+            path: "{{ tp_ctl.work_parent.path }}"
+            state: directory
+            owner: "{{ tp_ctl.work_parent.owner }}"
+            group: "{{ tp_ctl.work_parent.group }}"
+            mode: "{{ tp_ctl.work_parent.mode }}"
+            follow: false
+          when: not _tp_wp.stat.exists
+
+    - name: Journal directory (root-only) and the journal itself, BEFORE the first owner effect
+      block:
+        - name: Re-admit the journal directory ancestry (fresh, root_only)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_root_only.yml"
+          vars:
+            tp_ro_path: "{{ tp.journal.dir }}"
+            tp_ro_refusal: "{{ tp.refusal }}"
+
+        - name: Fresh stat of the journal directory
+          ansible.builtin.stat:
+            path: "{{ tp.journal.dir }}"
+            follow: false
+            get_checksum: false
+          register: _tp_jd
+
+        - name: Refuse a pre-existing journal directory that is not root:root with the declared mode (never chmodded)
+          ansible.builtin.assert:
+            that:
+              - not _tp_jd.stat.exists or (_tp_jd.stat.isdir and not _tp_jd.stat.islnk and _tp_jd.stat.uid == 0 and _tp_jd.stat.gid == 0 and _tp_jd.stat.mode == tp.journal.dir_mode)
+            fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: {{ tp.journal.dir }} exists and is not root:root {{ tp.journal.dir_mode }} (preserved)."
+            quiet: true
+
+        - name: Create the journal directory when absent
+          ansible.builtin.file:
+            path: "{{ tp.journal.dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "{{ tp.journal.dir_mode }}"
+            follow: false
+          when: not _tp_jd.stat.exists
+
+        - name: Write the journal (initial, adopted or resumed state)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars:
+            tp_jop: ''
+            tp_jstate: ''
+
+    # op account: the account module runs ONLY when the account was observed absent (an existing campaign account --
+    # `started` interrupted after creation -- is observation-only; groups + append could usermod)
+    - name: "op account"
+      when: tp_j.ops.account != 'done'
+      block:
+        - name: Journal account started
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: account, tp_jstate: started}
+
+        - name: Re-admit the home parent (fresh, root_only)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_root_only.yml"
+          vars: {tp_ro_path: "{{ tp_ctl.home | dirname }}", tp_ro_refusal: "{{ tp.refusal }}"}
+
+        - name: Create the owner account (campaign marker; +kvm on hypervisor members; no password) -- only when absent
+          ansible.builtin.user:
+            name: "{{ tp_ctl.owner }}"
+            comment: "{{ tp.owner_account.gecos }}"
+            shell: "{{ tp_ctl.shell }}"
+            home: "{{ tp_ctl.home }}"
+            create_home: "{{ tp.owner_account.create_home }}"
+            system: "{{ tp.owner_account.system }}"
+            groups: "{{ [tp.hypervisor.kvm_group] if tp_ctl.hypervisor else omit }}"
+            append: true
+            password_lock: true
+          when: tp_obs.account is none
+
+        - name: Re-observe the account, its primary group and the kvm group
+          ansible.builtin.getent:
+            database: "{{ item.db }}"
+            key: "{{ item.key }}"
+            fail_key: false
+          loop:
+            - {db: passwd, key: "{{ tp_ctl.owner }}"}
+            - {db: group, key: "{{ tp_ctl.owner }}"}
+            - {db: group, key: "{{ tp.hypervisor.kvm_group }}"}
+          register: _tp_ga
+
+        - name: Refuse an account that is not exactly the campaign account (incl. primary group and kvm membership)
+          vars:
+            _pw: "{{ _tp_ga.results[0].ansible_facts.getent_passwd[tp_ctl.owner] }}"
+            _gr: "{{ _tp_ga.results[1].ansible_facts.getent_group[tp_ctl.owner] }}"
+            _kv: "{{ _tp_ga.results[2].ansible_facts.getent_group[tp.hypervisor.kvm_group] }}"
+          ansible.builtin.assert:
+            that:
+              - _pw is not none and _gr is not none and (_gr[1] | int) == (_pw[2] | int)
+              - _pw[tp.owner_account.passwd_fields.gecos] == tp.owner_account.gecos
+              - _pw[tp.owner_account.passwd_fields.home] == tp_ctl.home and _pw[tp.owner_account.passwd_fields.shell] == tp_ctl.shell
+              - tp_j.binding.uid is none or tp_j.binding.uid == _pw[1] | int
+              - not tp_ctl.hypervisor or (_kv is not none and tp_ctl.owner in (_kv[2] | default('')).split(','))
+            fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: {{ tp_ctl.owner }} is {{ _pw }} (group {{ _gr }}, kvm {{ _kv }}) after the account op (preserved; never modified)."
+            quiet: true
+
+        - name: Journal account done (binds the uid)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: account, tp_jstate: done, tp_juid: "{{ _tp_ga.results[0].ansible_facts.getent_passwd[tp_ctl.owner][1] }}"}
+
+    # ops ssh_dir + authorized_key (tick320 (1) PREREQ-KEY-RESUME): root writes inside the owner's home ONLY while
+    # authorized_key is still PENDING in the journal this run started from -- before it no key has ever existed, so no
+    # key-authenticated owner process can. authorized_key STARTED is observation-only: the exact file marks it done,
+    # anything else (absent included) refuses. Linger marker / runtime dir absence is recorded, never proof.
+    - name: "ops ssh_dir, authorized_key"
+      when: tp_j.ops.ssh_dir != 'done' or tp_j.ops.authorized_key != 'done'
+      block:
+        - name: Observe the owner's passwd entry (uid / gid for the exact-match checks)
+          ansible.builtin.getent:
+            database: passwd
+            key: "{{ tp_ctl.owner }}"
+          register: _tp_kp
+
+        - name: Fresh stat of the home, .ssh, authorized_keys, the linger marker and the runtime dir (no link followed)
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            follow: false
+            get_checksum: "{{ item.endswith(tp.authorized_keys.file_rel) }}"
+            checksum_algorithm: sha256
+          loop:
+            - "{{ tp_ctl.home }}"
+            - "{{ tp_ctl.home }}/{{ tp.authorized_keys.dir_rel }}"
+            - "{{ tp_ctl.home }}/{{ tp.authorized_keys.file_rel }}"
+            - "{{ tp.linger.marker_dir }}/{{ tp_ctl.owner }}"
+            - "{{ tp_ctl.runtime_dir_tpl | replace('{uid}', tp_j.binding.uid | string) }}"
+          register: _tp_hs
+
+        - name: Refuse a home that is not the owner's real directory, or .ssh / authorized_keys state this rule cannot admit
+          vars:
+            _u: "{{ tp_j.binding.uid | int }}"
+            _g: "{{ _tp_kp.ansible_facts.getent_passwd[tp_ctl.owner][2] | int }}"
+            _h: "{{ _tp_hs.results[0].stat }}"
+            _d: "{{ _tp_hs.results[1].stat }}"
+            _f: "{{ _tp_hs.results[2].stat }}"
+            _d_exact: "{{ _d.exists and _d.isdir and not _d.islnk and _d.uid == _u | int and _d.gid == _g | int and _d.mode == tp.authorized_keys.dir_mode }}"
+            _f_exact: >-
+              {{ _d_exact | bool and _f.exists and _f.isreg and not _f.islnk and _f.uid == _u | int and _f.gid == _g | int
+                 and _f.mode == tp.authorized_keys.file_mode and _f.checksum == tp_ctl.authorized_sha256 }}
+          ansible.builtin.assert:
+            that:
+              - _h.exists and _h.isdir and not _h.islnk and _h.uid == _u | int and _h.mode is match(tp.owner_account.home_mode_regex)
+              # ssh_dir not done: authorized_key is necessarily pending (journal order); .ssh absent or exact
+              - tp_resume.ssh_dir == 'done' or (not _d.exists or _d_exact | bool)
+              # authorized_key pending: the file must not exist (only this op may create it)
+              - tp_resume.authorized_key != 'pending' or not _f.exists
+              # authorized_key started: OBSERVATION ONLY -- exact or refused (absent included)
+              - tp_resume.authorized_key != 'started' or _f_exact | bool
+            fail_msg: >-
+              REFUSED {{ tp.refusal }}-KEY-RESUME on {{ inventory_hostname }}: {{ tp_ctl.home }} / .ssh / authorized_keys
+              ({{ _tp_hs.results[:3] | map(attribute='stat') | list }})
+              are not admissible for journal state ssh_dir={{ tp_resume.ssh_dir }} authorized_key={{ tp_resume.authorized_key }}:
+              after the key install began only the exact file is accepted (observation only); root never writes into the
+              owner's home again. Recorded, not proof: linger marker {{ _tp_hs.results[3].stat.exists }}, runtime dir
+              {{ _tp_hs.results[4].stat.exists }}. Preserved; nothing written to them (admitted module staging only).
+            quiet: true
+
+        - name: Journal ssh_dir started
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: ssh_dir, tp_jstate: started}
+          when: tp_resume.ssh_dir != 'done'
+
+        - name: Create .ssh (owner, 0700) -- only when absent, only while authorized_key is pending
+          ansible.builtin.file:
+            path: "{{ tp_ctl.home }}/{{ tp.authorized_keys.dir_rel }}"
+            state: directory
+            owner: "{{ tp_ctl.owner }}"
+            group: "{{ tp_ctl.owner }}"
+            mode: "{{ tp.authorized_keys.dir_mode }}"
+            follow: false
+          when: tp_resume.ssh_dir != 'done' and tp_resume.authorized_key == 'pending' and not _tp_hs.results[1].stat.exists
+
+        - name: Journal ssh_dir done
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: ssh_dir, tp_jstate: done}
+          when: tp_resume.ssh_dir != 'done'
+
+        - name: Journal authorized_key started (from pending only)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: authorized_key, tp_jstate: started}
+          when: tp_resume.authorized_key == 'pending'
+
+        - name: Install the owner PUBLIC key (exact content) -- only from pending, only when absent
+          ansible.builtin.copy:
+            content: "{{ tp_ctl.pubkey }}\n"
+            dest: "{{ tp_ctl.home }}/{{ tp.authorized_keys.file_rel }}"
+            owner: "{{ tp_ctl.owner }}"
+            group: "{{ tp_ctl.owner }}"
+            mode: "{{ tp.authorized_keys.file_mode }}"
+            follow: false
+            force: false
+          when: tp_resume.authorized_key == 'pending'
+
+        - name: Read back .ssh and authorized_keys (ssh_dir + authorized_key exact end state)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_readback.yml"
+          vars:
+            tp_rb_ops: [ssh_dir, authorized_key]
+            tp_rb_stage: resume
+
+        - name: Journal authorized_key done
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: authorized_key, tp_jstate: done}
+
+    # op linger: only AFTER the key (linger starts owner processes); argv[0] is the ADMITTED os_tools path, re-verified
+    # immediately before the one command (tick320 (4) PREREQ-LINGER-TOOL); no second path authority
+    - name: "op linger"
+      when: tp_j.ops.linger != 'done'
+      block:
+        - name: Journal linger started
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: linger, tp_jstate: started}
+
+        - name: Re-admit the linger marker dir (fresh, root_only)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_root_only.yml"
+          vars: {tp_ro_path: "{{ tp.linger.marker_dir }}", tp_ro_refusal: "{{ tp.refusal }}"}
+
+        - name: Re-admit the linger tool's directory (fresh, root_only)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_root_only.yml"
+          vars: {tp_ro_path: "{{ tp_ctl.linger_tool.path | dirname }}", tp_ro_refusal: "{{ tp.refusal }}"}
+
+        - name: Fresh stat of the linger tool (identity digest; no link followed)
+          ansible.builtin.stat:
+            path: "{{ tp_ctl.linger_tool.path }}"
+            follow: false
+            get_checksum: true
+            checksum_algorithm: sha256
+          register: _tp_lt
+
+        - name: Refuse a linger tool that is not its admitted os_tools identity (use boundary)
+          ansible.builtin.assert:
+            that:
+              - _tp_lt.stat.exists and _tp_lt.stat.isreg and not _tp_lt.stat.islnk and _tp_lt.stat.uid == 0
+              - not _tp_lt.stat.wgrp and not _tp_lt.stat.woth
+              - _tp_lt.stat.checksum == tp_ctl.linger_tool.sha256
+              - tp_ctl.linger_tool.path == rh.controller.bootstrap.os_tools[tp.linger.tool].path
+            fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: {{ tp_ctl.linger_tool.path }} is not the admitted os_tools.{{ tp.linger.tool }} (root-owned regular file, sha256 {{ tp_ctl.linger_tool.sha256 }})."
+            quiet: true
+
+        - name: Enable linger for the owner (the admitted tool; idempotent via its marker)
+          ansible.builtin.command:
+            argv: ["{{ tp_ctl.linger_tool.path }}", enable-linger, "{{ tp_ctl.owner }}"]
+            creates: "{{ tp.linger.marker_dir }}/{{ tp_ctl.owner }}"
+
+        - name: Read back the linger marker
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_readback.yml"
+          vars:
+            tp_rb_ops: [linger]
+            tp_rb_stage: resume
+
+        - name: Journal linger done
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: linger, tp_jstate: done}
+
+    - name: "Wait for the owner's user manager (target_bootstrap.user_manager: runtime dir + bus socket)"
+      ansible.builtin.stat:
+        path: "{{ tp_ctl.runtime_dir_tpl | replace('{uid}', tp_j.binding.uid | string) }}/{{ tp_ctl.bus_rel }}"
+        follow: false
+        get_checksum: false
+      register: _tp_bus
+      until: _tp_bus.stat.exists and _tp_bus.stat.issock
+      retries: "{{ tp.linger.wait.retries }}"
+      delay: "{{ tp.linger.wait.delay }}"
+
+    # ops work_root, work_children, work_handover: root writes under the work root ONLY while it is root-owned 0700
+    # (its parent is root-only, so no owner can replace it); each directory only when ABSENT; the chown only at uid 0
+    - name: "ops work_root, work_children, work_handover"
+      when: tp_j.ops.work_root != 'done' or tp_j.ops.work_children != 'done' or tp_j.ops.work_handover != 'done'
+      block:
+        - name: Observe the owner's passwd entry (uid / gid for the exact-match checks)
+          ansible.builtin.getent:
+            database: passwd
+            key: "{{ tp_ctl.owner }}"
+          register: _tp_wpw
+
+        - name: Re-admit the work root (fresh, root_only; it is root-owned until the handover)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_root_only.yml"
+          vars: {tp_ro_path: "{{ tp_ctl.work_root }}", tp_ro_refusal: "{{ tp.refusal }}"}
+          when: tp_resume.work_handover == 'pending'
+
+        - name: Fresh stat of the work root before its op
+          ansible.builtin.stat:
+            path: "{{ tp_ctl.work_root }}"
+            follow: false
+            get_checksum: false
+          register: _tp_w0
+          when: tp_resume.work_root != 'done'
+
+        - name: Refuse a work root this leg did not create (absent; or root:root 0700 only when the journal says started)
+          ansible.builtin.assert:
+            that:
+              - >-
+                not _tp_w0.stat.exists
+                or (tp_resume.work_root == 'started' and _tp_w0.stat.isdir and not _tp_w0.stat.islnk
+                    and _tp_w0.stat.uid == 0 and _tp_w0.stat.gid == 0 and _tp_w0.stat.mode == tp.layout.owner_dir_mode)
+            fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: {{ tp_ctl.work_root }} already exists and is not this leg's unfinished work root (preserved; it was not changed)."
+            quiet: true
+          when: tp_resume.work_root != 'done'
+
+        - name: Journal work_root started
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: work_root, tp_jstate: started}
+          when: tp_resume.work_root == 'pending'
+
+        - name: Create the work root root:root 0700 (the owner cannot traverse it yet) -- only when absent
+          ansible.builtin.file:
+            path: "{{ tp_ctl.work_root }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "{{ tp.layout.owner_dir_mode }}"
+            follow: false
+          when: tp_resume.work_root != 'done' and not _tp_w0.stat.exists
+
+        - name: Journal work_root done
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: work_root, tp_jstate: done}
+          when: tp_resume.work_root != 'done'
+
+        - name: Fresh stat of the work root and its children
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            follow: false
+            get_checksum: false
+          loop: "{{ [tp_ctl.work_root] + (tp_ctl.children | map('regex_replace', '^', tp_ctl.work_root ~ '/') | list) }}"
+          register: _tp_ws
+
+        # resumable states: the work root root:root 0700 (before the handover), or -- only when the journal says the
+        # handover STARTED -- already the owner's u:g 0700 directory. Children: all absent while work_children is
+        # pending; absent or exact (u:g 0700, real directory) while it is started; all exact once done.
+        - name: Refuse a work root / children that are not in a resumable campaign state (complete metadata incl. gid)
+          vars:
+            _u: "{{ tp_j.binding.uid | int }}"
+            _g: "{{ _tp_wpw.ansible_facts.getent_passwd[tp_ctl.owner][2] | int }}"
+            _w: "{{ _tp_ws.results[0].stat }}"
+            _all: "{{ _tp_ws.results[1:] | map(attribute='stat') | list }}"
+            _ch: "{{ _tp_ws.results[1:] | map(attribute='stat') | selectattr('exists') | list }}"
+          ansible.builtin.assert:
+            that:
+              - _w.isdir and not _w.islnk and _w.mode == tp.layout.owner_dir_mode
+              - (_w.uid == 0 and _w.gid == 0) or (tp_resume.work_handover == 'started' and _w.uid == _u | int and _w.gid == _g | int)
+              - tp_resume.work_children != 'pending' or _ch | length == 0
+              - tp_resume.work_children != 'done' or (_all | rejectattr('exists') | list | length == 0)
+              - _ch | selectattr('islnk') | list | length == 0
+              - _ch | rejectattr('isdir') | list | length == 0
+              - _ch | rejectattr('uid', 'equalto', _u | int) | list | length == 0
+              - _ch | rejectattr('gid', 'equalto', _g | int) | list | length == 0
+              - _ch | rejectattr('mode', 'equalto', tp.layout.owner_dir_mode) | list | length == 0
+            fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: {{ tp_ctl.work_root }} or its children {{ tp_ctl.children }} are not in a resumable campaign state (preserved)."
+            quiet: true
+
+        - name: Journal work_children started
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: work_children, tp_jstate: started}
+          when: tp_resume.work_children == 'pending'
+
+        - name: Create each ABSENT child owner-owned 0700 (declared order; parents first; an existing exact child is kept)
+          ansible.builtin.file:
+            path: "{{ item.item }}"
+            state: directory
+            owner: "{{ tp_ctl.owner }}"
+            group: "{{ tp_ctl.owner }}"
+            mode: "{{ tp.layout.owner_dir_mode }}"
+            follow: false
+          loop: "{{ _tp_ws.results[1:] }}"
+          loop_control:
+            label: "{{ item.item }}"
+          when: tp_resume.work_children != 'done' and not item.stat.exists
+
+        - name: Journal work_children done
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: work_children, tp_jstate: done}
+          when: tp_resume.work_children != 'done'
+
+        - name: Re-admit the work parent (fresh, root_only) right before the handover
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_root_only.yml"
+          vars: {tp_ro_path: "{{ tp_ctl.work_parent.path }}", tp_ro_refusal: "{{ tp.refusal }}"}
+
+        - name: Journal work_handover started
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: work_handover, tp_jstate: started}
+          when: tp_resume.work_handover == 'pending'
+
+        - name: Hand the work root to the owner LAST (non-recursive) -- only while it is still uid 0
+          ansible.builtin.file:
+            path: "{{ tp_ctl.work_root }}"
+            state: directory
+            owner: "{{ tp_ctl.owner }}"
+            group: "{{ tp_ctl.owner }}"
+            mode: "{{ tp.layout.owner_dir_mode }}"
+            follow: false
+          when: _tp_ws.results[0].stat.uid == 0
+
+        - name: Read back the work root, its children and the handover
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_readback.yml"
+          vars:
+            tp_rb_ops: [work_root, work_children, work_handover]
+            tp_rb_stage: resume
+
+        - name: Journal work_handover done
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: work_handover, tp_jstate: done}
+
+    # op storage_root (hypervisor members; tick320 (3) PREREQ-STORAGE-ADOPTION): absent -> created; the COMPLETE
+    # declared metadata (real directory, uid, gid, mode) -> observation-only; anything else refuses before any mutation
+    - name: "op storage_root"
+      when: tp_ctl.hypervisor and tp_j.ops.storage_root != 'done'
+      block:
+        - name: Observe the owner's passwd entry (uid / gid for the exact-match check)
+          ansible.builtin.getent:
+            database: passwd
+            key: "{{ tp_ctl.owner }}"
+          register: _tp_spw
+
+        - name: Re-admit the storage root's parent (fresh, root_only)
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_root_only.yml"
+          vars: {tp_ro_path: "{{ rh.guest.allocation.storage_root | dirname }}", tp_ro_refusal: "{{ tp.refusal }}"}
+
+        - name: Fresh stat of the storage root
+          ansible.builtin.stat:
+            path: "{{ rh.guest.allocation.storage_root }}"
+            follow: false
+            get_checksum: false
+          register: _tp_sr
+
+        - name: Refuse a storage root that is not absent or exactly the owner's directory (uid, gid, mode; preserved)
+          vars:
+            _g: "{{ _tp_spw.ansible_facts.getent_passwd[tp_ctl.owner][2] | int }}"
+          ansible.builtin.assert:
+            that:
+              - >-
+                not _tp_sr.stat.exists
+                or (_tp_sr.stat.isdir and not _tp_sr.stat.islnk and _tp_sr.stat.uid == tp_j.binding.uid | int
+                    and _tp_sr.stat.gid == _g | int and _tp_sr.stat.mode == tp.hypervisor.storage_mode)
+            fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: {{ rh.guest.allocation.storage_root }} exists and is not {{ tp_ctl.owner }}'s {{ tp.hypervisor.storage_mode }} directory (uid, gid, mode); preserved, it was not changed."
+            quiet: true
+
+        - name: Journal storage_root started
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: storage_root, tp_jstate: started}
+
+        - name: Create the storage root (owner, declared mode) -- only when absent
+          ansible.builtin.file:
+            path: "{{ rh.guest.allocation.storage_root }}"
+            state: directory
+            owner: "{{ tp_ctl.owner }}"
+            group: "{{ tp_ctl.owner }}"
+            mode: "{{ tp.hypervisor.storage_mode }}"
+            follow: false
+          when: not _tp_sr.stat.exists
+
+        - name: Read back the storage root
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_readback.yml"
+          vars:
+            tp_rb_ops: [storage_root]
+            tp_rb_stage: resume
+
+        - name: Journal storage_root done
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_journal.yml"
+          vars: {tp_jop: storage_root, tp_jstate: done}
+
+    # ---- END STATE (read-only) ----
+    - name: Read back EVERY op of this member (end state; drift refuses)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_readback.yml"
+      vars:
+        tp_rb_ops: "{{ tp_class.ops }}"
+        tp_rb_stage: end
+
+    - name: Observe the read-only base image (MAIN acquires it; never fetched or rewritten here)
+      ansible.builtin.stat:
+        path: "{{ rh.guest.allocation.storage_root }}/{{ rh.guest.layout.bases_dir }}/{{ rh.guest.allocation.base_image.file }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: "{{ tp.hypervisor.base_image_checksum }}"
+      register: _tp_base
+      when: tp_ctl.hypervisor
+
+    - name: Refuse a present base image that is a link, writable by anyone, or not the declared digest
+      ansible.builtin.assert:
+        that:
+          - not _tp_base.stat.exists or (_tp_base.stat.isreg and not _tp_base.stat.islnk
+            and not _tp_base.stat.wusr and not _tp_base.stat.wgrp and not _tp_base.stat.woth
+            and _tp_base.stat.checksum == rh.guest.allocation.base_image.sha512)
+        fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: base image {{ _tp_base.stat.path | default('') }} is not a read-only regular file with the declared sha512 (preserved)."
+        quiet: true
+      when: tp_ctl.hypervisor
+
+    - name: Hash every os_tools entry with a TARGET label this member needs (D; controller labels are never hashed here)
+      ansible.builtin.stat:
+        path: "{{ item.value.path }}"
+        follow: true
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: "{{ rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: >-
+        item.value.required_by
+        | intersect(tp.observation.required_by + (tp.observation.hypervisor_required_by if tp_ctl.hypervisor else []))
+        | length > 0
+      register: _tp_tools
+
+    - name: Refuse a required tool that is still missing after the declared packages
+      vars:
+        _ran: "{{ _tp_tools.results | selectattr('stat', 'defined') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _ran | rejectattr('stat.exists') | list | length == 0
+        fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: missing tools {{ _ran | rejectattr('stat.exists') | map(attribute='item.key') | list }} (rh.packages.provides names their packages)."
+        quiet: true
+
+    - name: Publish the observation record (derived output; the override is a CANDIDATE, never applied)
+      vars:
+        _ran: "{{ _tp_tools.results | selectattr('stat', 'defined') | list }}"
+        # "<tool> <observed sha256> <declared sha256>" per hashed tool; a mismatch is a line whose two digests differ
+        _trip: >-
+          {{ _ran | map(attribute='item.key')
+             | zip(_ran | map(attribute='stat.checksum'), _ran | map(attribute='item.value.identity.sha256', default='-'))
+             | map('join', ' ') | list }}
+        _mis: "{{ _trip | select('match', '^[^ ]+ ([0-9a-f]{64}) (?!\\1$)') | list }}"
+        _leaves: >-
+          {{ dict(_mis | map('regex_replace', ' .*$', '')
+                  | zip(_mis | map('regex_replace', '^[^ ]+ ([0-9a-f]{64}) .*$',
+                                   '{"identity": {"kind": "' ~ tp.observation.identity_kind ~ '", "sha256": "\1"}}')
+                        | map('from_json'))) }}
+      ansible.builtin.set_fact:
+        tp_record:
+          schema: "{{ tp.observation.record_schema }}"
+          target: "{{ inventory_hostname }}"
+          scope: "{{ tp_pre.scope }}"
+          preflight_record: "{{ tp_ctl.preflight_path }}"
+          os_family: "{{ tp_obs.os_family }}"
+          account_class: "{{ tp_class.account }}"
+          journal_class: "{{ tp_class.journal }}"
+          resumed_from: "{{ tp_resume }}"
+          journal: "{{ tp_j }}"
+          end_readback: "{{ tp_rb }}"
+          endpoint: "{{ tp_pre.endpoint }}"
+          hypervisor: "{{ tp_ctl.hypervisor }}"
+          capacity: "{{ tp_pre.capacity }}"
+          base_image: "{{ {'exists': _tp_base.stat.exists, 'sha512_match': _tp_base.stat.exists and _tp_base.stat.checksum == rh.guest.allocation.base_image.sha512} if tp_ctl.hypervisor else none }}"
+          tools: "{{ dict(_ran | map(attribute='item.key') | zip(_ran | map(attribute='stat.checksum'))) }}"
+          identity_mismatches: "{{ _mis }}"
+          # MAIN decides; admitted only through the per-run binding (gb_os_tools_override). Empty when all match.
+          candidate_override: >-
+            {{ {} if (_leaves | length == 0) else
+               {'lme_global_override': {tp.observation.override_path[0]: {tp.observation.override_path[1]:
+                 {tp.observation.override_path[2]: {tp.observation.override_path[3]: _leaves}}}}} }}
+
+- name: prereq-record
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Re-admit the state directory ancestry at the write boundary (owner rule; the controller is non-root)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/admit_ancestry.yml"
+      vars:
+        rh_anc_bs: "{{ rh.controller.bootstrap }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ lme_transfer_state_dir }}"
+        rh_anc_refusal: "{{ tp.refusal }}"
+
+    - name: Record the observation for MAIN (<state dir>/gate.<label>.prereq.json)
+      ansible.builtin.copy:
+        content: "{{ hostvars[lme_transfer_target].tp_record | to_nice_json }}\n"
+        dest: "{{ tp_ctl.record_path }}"
+        mode: '0600'
+        follow: false

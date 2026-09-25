@@ -1,0 +1,297 @@
+---
+# testing/e2e/target_prereq/tasks/prereq_preflight.yml -- the ONE declared READ-ONLY privileged preflight of a target
+# (B-owned; codex-tick318-321 item 3, codex-tick360 preservation). FACTORED out of
+# testing/remote_harness/target_prereq.yml (play prereq-preflight, formerly its lines 289-494) WITHOUT a behaviour
+# change except the PRESERVATION evaluation (codex-tick360 items 1-5; decl revision 4 `preservation`). Included by
+# BOTH entries, on the target host, AFTER that entry's own first-entry guards and its resolve/bind of tp and tp_ctl:
+#   testing/remote_harness/target_prereq.yml   play prereq-preflight   (then its record play refuses on a refusal)
+#   testing/e2e/target_prereq/prereq_observe.yml play observe-preflight (records; never mutates, never refuses on a
+#                                                                        finding once the contact was admitted)
+# Inputs (derived by the caller, never extra-vars; the tp_ / _tp_ family guard refuses pinned ones):
+#   tp       rh.controller.bootstrap.target_prereq (resolved; revision 4)
+#   tp_ctl   the controller-decided values; this file reads ONLY: owner, home, work_root, work_parent{path, owner,
+#            group, mode}, hypervisor, linger_tool{name, path, sha256}, preservation{basis, members, selectors}.
+#            NOTHING key-related (no pubkey, no owner_key / owner_pubkey role), nothing an effect creates.
+#   rh, lme_resolved, lme_transfer_label (this host's resolve)
+# Output: tp_pre (the preflight record body; every refusal COLLECTED into tp_pre.refusals, never asserted here; a
+# contact or observation failure is rescued into it). The caller writes it and decides.
+# Never: a unit start/stop/enable/disable/mask, a deployment-state write of any kind, a read of any private key. (No
+# deployment-state mutation is intended; ordinary ADMITTED Ansible module staging still occurs -- each module task
+# stages and removes its payload under the admitted root module temp, ansible_remote_tmp, set by initial_contact.)
+# Coverage (codex-tick370): service_facts lists SYSTEM .service units only (no .timer / .socket / .path / user-manager
+# units); status `generated` is admitted despite possible autostart until ownership/lifecycle evidence is joined; a
+# listed absent_status unit is ABSENT only in a state in tp.preservation.absent_states (see the evaluation below).
+
+- name: Start the preflight record (contact-free; written by the caller's record play even if everything below fails)
+  ansible.builtin.set_fact:
+    tp_pre:
+      schema: "{{ tp.preflight.record_schema }}"
+      target: "{{ inventory_hostname }}"
+      label: "{{ lme_transfer_label }}"
+      scope:
+        id: "{{ lme_resolved.remote_harness.scope.id | default('') }}"
+        scope_sha256: "{{ lme_resolved.remote_harness.scope_sha256 | default('') }}"
+      hypervisor: "{{ tp_ctl.hypervisor }}"
+      contact: not_admitted
+      refusals: []
+
+- name: PREFLIGHT (read-only)
+  block:
+    - name: PRIVILEGED INITIAL CONTACT (route author; raw only; principal, interpreter, tools) -- no caller paths
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/initial_contact.yml"
+      vars:
+        rh_ic_variant: privileged
+        rh_ic_paths: []
+
+    - name: Record the admitted contact (principal and interpreter)
+      ansible.builtin.set_fact:
+        tp_pre: "{{ tp_pre | combine({'contact': 'admitted', 'principal': {'uid': _rh_tb_ic_uid, 'user': _rh_tb_ic_uname, 'python': _rh_tb_ic_py}}) }}"
+
+    - name: Observe the os family and the session environment (facts only)
+      ansible.builtin.setup:
+        gather_subset: ['!all', '!min', distribution, env]
+
+    - name: Read this session's process ancestry (declared program; privileged-contact tools only; read-only)
+      ansible.builtin.command:
+        argv:
+          - "{{ _rh_tb_ic_tools.sh.path }}"
+          - -c
+          - "{{ tp.endpoint.ancestry_program }}"
+          - lme-endpoint-ancestry
+          - "{{ tp.endpoint.ancestry_max_depth | string }}"
+          - "{{ _rh_tb_ic_tools.realpath.path }}"
+          - "{{ _rh_tb_ic_tools.sed.path }}"
+      register: _tp_anc
+      changed_when: false
+
+    - name: Stat the listener sources (an IPv6-disabled host has no tcp6)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: "{{ tp.preflight.listener_sources }}"
+      register: _tp_pf_ls
+
+    - name: Read the listener sources that exist (record only)
+      ansible.builtin.slurp:
+        src: "{{ item.item }}"
+      loop: "{{ _tp_pf_ls.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists
+      register: _tp_pf_net
+
+    - name: Stat every component of the root-only paths and the leaves this leg decides on (no link followed)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: >-
+        {%- set roots = [tp_ctl.work_parent.path, tp_ctl.home | dirname, tp.journal.dir, tp.linger.marker_dir,
+                         tp_ctl.linger_tool.path | dirname]
+                        + ([rh.guest.allocation.storage_root | dirname] if tp_ctl.hypervisor else []) -%}
+        {%- set ns = namespace(p=[]) -%}
+        {%- for full in roots -%}{%- for i in range(1, (full.split('/') | length) + 1) -%}
+        {%- set ns.p = ns.p + ['/' ~ (full.split('/')[1:i] | join('/'))] -%}{%- endfor -%}{%- endfor -%}
+        {{ (ns.p | unique | list) + [tp_ctl.work_root, tp_ctl.home]
+           + ([rh.guest.allocation.storage_root] if tp_ctl.hypervisor else []) }}
+      register: _tp_pf_st
+
+    - name: Observe the owner account, its primary group and the kvm group
+      ansible.builtin.getent:
+        database: "{{ item.db }}"
+        key: "{{ item.key }}"
+        fail_key: false
+      loop:
+        - {db: passwd, key: "{{ tp_ctl.owner }}"}
+        - {db: group, key: "{{ tp_ctl.owner }}"}
+        - {db: group, key: "{{ tp.hypervisor.kvm_group }}"}
+      register: _tp_pf_ge
+
+    - name: Stat the journal (existence only)
+      ansible.builtin.stat:
+        path: "{{ tp.journal.dir ~ '/' ~ tp_ctl.owner ~ tp.journal.file_suffix }}"
+        follow: false
+        get_checksum: false
+      register: _tp_pf_js
+
+    - name: Stat the linger tool by its admitted os_tools path (identity digest; no link followed)
+      ansible.builtin.stat:
+        path: "{{ tp_ctl.linger_tool.path }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: _tp_pf_lt
+
+    # PRESERVATION (codex-tick360 items 1-3): EVERY member of the target group (a hypervisor does not imply a prior
+    # stack, and a non-hypervisor may carry one), ALL system .service units (service_facts); the scope is the DECLARED
+    # selection (members + discovery selectors), never a filter on the observed state.
+    - name: Observe the system service units (read-only; the declared selection is evaluated below)
+      ansible.builtin.service_facts:
+
+    - name: Read /proc/meminfo (hypervisor members; capacity MEASUREMENT, never an admission)
+      ansible.builtin.slurp:
+        src: "{{ tp.hypervisor.capacity.meminfo }}"
+      register: _tp_pf_mem
+      when: tp_ctl.hypervisor
+
+    # Every declared member is observed and evaluated against ITS expected state (tp.preservation.expected_states);
+    # discovery-selector matches outside the member set are recorded (unclassified: observation grants no ownership
+    # or retirement authority). An outcome other than as_expected is a COLLECTED refusal naming the declared route;
+    # no unit is ever started, stopped, enabled, disabled or masked here. basis `undeclared` (prereq_observe.yml only;
+    # target_prereq.yml refuses it before contact) records the matches and evaluates nothing.
+    - name: Evaluate the declared preservation selection against the observed units (derived output)
+      vars:
+        _pvd: "{{ tp.preservation }}"
+        _pv: "{{ tp_ctl.preservation }}"
+      ansible.builtin.set_fact:
+        _tp_pv_eval: >-
+          {%- set svc = ansible_facts.services | default({}) -%}
+          {%- set gone = _pvd.absent_status -%}
+          {%- set idle = _pvd.absent_states -%}
+          {%- set sel = namespace(rx=[]) -%}
+          {%- for g in _pv.selectors -%}
+          {%- set sel.rx = sel.rx + ['^' ~ (g | regex_escape | replace('\\*', '.*')) ~ '$'] -%}
+          {%- endfor -%}
+          {%- set seen = namespace(d={}) -%}
+          {%- for n in svc.keys() | list | sort -%}
+          {%- set hit = namespace(sel=false) -%}
+          {%- for r in sel.rx if n is match(r) -%}{%- set hit.sel = true -%}{%- endfor -%}
+          {%- if hit.sel or n in _pv.members -%}
+          {%- set seen.d = seen.d | combine({n: {'state': svc[n].state | default(none), 'status': svc[n].status | default(none),
+                'source': svc[n].source | default(none),
+                'selected_by': (['member'] if n in _pv.members else []) + (['selector'] if hit.sel else [])}}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set ev = namespace(m={}, ref=[]) -%}
+          {%- for u in _pv.members | list | sort -%}
+          {%- set want = _pv.members[u] -%}
+          {%- set spec = _pvd.expected_states[want] -%}
+          {%- set o = seen.d[u] if u in seen.d else none -%}
+          {#- PREREQ-RUNNING-NOTFOUND-ABSENCE (codex-tick370): ABSENT only when NOT LISTED, or listed with an absent_status
+              AND a state in absent_states (runtime inactivity). A listed absent_status unit in any other state (running,
+              or service_facts `stopped` = sub-state not running: exited / activating / auto-restart / failed) is a
+              loaded unit whose file is gone -- an ACTIVE outcome, never absence. -#}
+          {%- set nofile = o is not none and o.status in gone -%}
+          {%- set loaded_nofile = nofile and o.state not in idle -%}
+          {%- set absent = o is none or (nofile and o.state in idle) -%}
+          {%- if loaded_nofile -%}
+          {%- set out = 'loaded_without_unit_file' -%}
+          {%- elif spec.present == 'required' -%}
+          {%- set out = 'absent' if absent else ('running' if o.state in spec.refused_states
+                          else ('enabled' if o.status in spec.refused_status else 'as_expected')) -%}
+          {%- else -%}
+          {%- set out = 'as_expected' if absent else 'present_after_retirement' -%}
+          {%- endif -%}
+          {%- set ev.m = ev.m | combine({u: {'expected': want, 'observed': o, 'outcome': out, 'route': _pvd.routes[out]}}) -%}
+          {%- if out != 'as_expected' -%}
+          {%- set ev.ref = ev.ref + [_pvd.refusal ~ ': ' ~ u ~ ' is declared ' ~ want ~ ' but observed ' ~ out ~ ' '
+                ~ (o | to_json) ~ '; route ' ~ (_pvd.routes[out] | to_json) ~ '; the unit was not touched'] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set ext = namespace(m={}) -%}
+          {%- for n, o in seen.d.items() if n not in _pv.members -%}
+          {%- set ext.m = ext.m | combine({n: o}) -%}
+          {%- if _pv.basis == 'verified_none' and not (o.status in gone and o.state in idle) -%}
+          {%- set ev.ref = ev.ref + [_pvd.refusal ~ ': ' ~ n ~ ' ' ~ (o | to_json) ~ ' matches the discovery selectors '
+                ~ (_pv.selectors | to_json) ~ ' on a target declared verified_none (no prior deployment)'
+                ~ (' and is LOADED WITHOUT ITS UNIT FILE (state not in ' ~ (idle | to_json) ~ ')' if o.status in gone else '')
+                ~ '; declare it or correct the basis'] -%}
+          {%- elif _pv.basis == 'known_set' and o.state in _pvd.discovery.outside_known.refused_states -%}
+          {%- set ev.ref = ev.ref + [_pvd.refusal ~ ': ' ~ n ~ ' ' ~ (o | to_json) ~ ' matches the discovery selectors, is '
+                ~ o.state ~ ' and is not a declared member (unclassified; observation grants no ownership or retirement authority)'] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ {'basis': _pv.basis, 'selectors': _pv.selectors, 'selector_regex': sel.rx,
+              'evaluated': _pv.basis in (_pvd.bases | list),
+              'members': ev.m, 'outside_known': ext.m, 'limit': _pvd.discovery.limit,
+              'refusals': ev.ref if (_pv.basis in (_pvd.bases | list)) else []} }}
+
+    - name: Decide the preflight (collected refusals; derived output)
+      ansible.builtin.set_fact:
+        tp_pre: >-
+          {%- set anc = _tp_anc.stdout_lines -%}
+          {%- set conn = (ansible_facts.env.SSH_CONNECTION | default('')).split() -%}
+          {%- set port = (conn[3] | int) if conn | length == 4 else -1 -%}
+          {%- set ph = '%04X' | format(port) if port > 0 else 'NONE' -%}
+          {%- set lst = namespace(m={}) -%}
+          {%- for r in _tp_pf_net.results if r.content is defined -%}
+          {#- PREREQ-PREFLIGHT-NEWLINE (codex-tick333): lines come from str.splitlines(), no escape sequence at all #}
+          {%- set lst.m = lst.m | combine({r.item.item: ((r.content | b64decode).splitlines()
+                | select('match', '^\\s*[0-9]+: [0-9A-F]+:' ~ ph ~ ' [0-9A-F]+:[0-9A-F]+ 0A ') | list | length)}) -%}
+          {%- endfor -%}
+          {%- set st = namespace(m={}) -%}
+          {%- for r in _tp_pf_st.results -%}
+          {%- set st.m = st.m | combine({r.item: {'exists': r.stat.exists, 'isdir': r.stat.isdir | default(none),
+                'islnk': r.stat.islnk | default(none), 'uid': r.stat.uid | default(none), 'gid': r.stat.gid | default(none),
+                'owner': r.stat.pw_name | default(none), 'group': r.stat.gr_name | default(none), 'mode': r.stat.mode | default(none),
+                'wgrp': r.stat.wgrp | default(none), 'woth': r.stat.woth | default(none)}}) -%}
+          {%- endfor -%}
+          {%- set leaves = [tp_ctl.work_root, tp_ctl.home] + ([rh.guest.allocation.storage_root] if tp_ctl.hypervisor else []) -%}
+          {%- set ref = namespace(v=[]) -%}
+          {%- if anc | select('match', tp.endpoint.admitted_server_exe_regex) | list | length == 0
+                or anc | select('search', tp.endpoint.refused_exe_regex) | list | length > 0 -%}
+          {%- set ref.v = ref.v + [tp.endpoint.refusal ~ ': session ancestry ' ~ (anc | to_json) ~ ' has no admitted OpenSSH server process or has a Tailscale daemon'] -%}
+          {%- endif -%}
+          {%- for p, s in st.m.items() if s.exists and p not in leaves -%}
+          {%- if s.islnk or not s.isdir or s.uid != 0 or s.wgrp or s.woth -%}
+          {%- set ref.v = ref.v + [tp.refusal ~ ': root-only component ' ~ p ~ ' is ' ~ ('a link' if s.islnk else ('not a directory' if not s.isdir else (s.owner ~ ':' ~ s.group ~ ' ' ~ s.mode)))] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set wp = st.m[tp_ctl.work_parent.path] -%}
+          {%- if wp.exists and (wp.owner != tp_ctl.work_parent.owner or wp.group != tp_ctl.work_parent.group or wp.mode != tp_ctl.work_parent.mode) -%}
+          {%- set ref.v = ref.v + [tp.refusal ~ ': work parent ' ~ tp_ctl.work_parent.path ~ ' exists as ' ~ wp.owner ~ ':' ~ wp.group ~ ' ' ~ wp.mode ~ ', not ' ~ (tp_ctl.work_parent | to_json)] -%}
+          {%- endif -%}
+          {%- set names = (rh.packages.required + rh.transfer.adapters[rh.transfer.adapter].target.packages
+                           + (tp.packages.hypervisor_required if tp_ctl.hypervisor else [])) | unique | list -%}
+          {%- set pmap = rh.packages.by_os_family[ansible_facts.os_family] | default({}) -%}
+          {%- set unmapped = names | reject('in', pmap.keys() | list) | list -%}
+          {%- if unmapped | length > 0 -%}
+          {%- set ref.v = ref.v + [tp.refusal ~ ': no ' ~ ansible_facts.os_family ~ ' package for ' ~ (unmapped | to_json) ~ ' (rh.packages.by_os_family)'] -%}
+          {%- endif -%}
+          {%- set lt = _tp_pf_lt.stat -%}
+          {%- set lt_ok = lt.exists and lt.isreg and not lt.islnk and lt.uid == 0 and not lt.wgrp and not lt.woth and lt.checksum == tp_ctl.linger_tool.sha256 -%}
+          {%- if not lt_ok -%}
+          {%- set ref.v = ref.v + [tp.refusal ~ ': linger tool ' ~ tp_ctl.linger_tool.path ~ ' is absent, a link, not root-owned, writable by others or not its os_tools identity'] -%}
+          {%- endif -%}
+          {%- set cap = none -%}
+          {%- if tp_ctl.hypervisor -%}
+          {%- set ml = (_tp_pf_mem.content | b64decode).splitlines() -%}
+          {%- set tot = ml | select('match', '^MemTotal:\\s+[0-9]+ kB$') | first | default('') -%}
+          {%- set avl = ml | select('match', '^MemAvailable:\\s+[0-9]+ kB$') | first | default('') -%}
+          {%- set tmib = ((tot | regex_replace('^MemTotal:\\s+([0-9]+) kB$', '\\1') | int) // 1024) if tot | length > 0 else -1 -%}
+          {%- set amib = ((avl | regex_replace('^MemAvailable:\\s+([0-9]+) kB$', '\\1') | int) // 1024) if avl | length > 0 else -1 -%}
+          {%- set bud = (rh.guest.allocation.memory_mib | int) + (rh.guest.allocation.host_headroom_mib | int) -%}
+          {%- set unmeasured = tmib < 0 or amib < 0 -%}
+          {%- set never = unmeasured or tmib < bud -%}
+          {%- set cap = {'mem_total_mib': tmib, 'mem_available_mib': amib, 'guest_memory_mib': rh.guest.allocation.memory_mib | int,
+                         'host_headroom_mib': rh.guest.allocation.host_headroom_mib | int, 'budget_mib': bud,
+                         'shortfall_mib': ([bud - tmib, 0] | max) if tmib >= 0 else none,
+                         'available_now_ge_budget': amib >= bud, 'admits_provision': tp.hypervisor.capacity.admits_provision,
+                         'class': 'unmeasured' if unmeasured else ('never_fits' if never else 'total_holds_budget'),
+                         'alternatives': tp.hypervisor.capacity.alternatives if never else []} -%}
+          {%- if never -%}
+          {%- set ref.v = ref.v + [tp.hypervisor.capacity.refusal ~ ': MemTotal ' ~ tmib ~ ' MiB < budget ' ~ bud ~ ' MiB (guest '
+                ~ (rh.guest.allocation.memory_mib | int) ~ ' + headroom ' ~ (rh.guest.allocation.host_headroom_mib | int)
+                ~ ') or /proc/meminfo unreadable; alternatives ' ~ (tp.hypervisor.capacity.alternatives | to_json)] -%}
+          {%- endif -%}
+          {%- endif -%}
+          {%- set pw = _tp_pf_ge.results[0].ansible_facts.getent_passwd[tp_ctl.owner] -%}
+          {{ tp_pre | combine({
+               'endpoint': {'ancestry': anc, 'ssh_connection_port': port, 'listeners_on_port': lst.m,
+                            'claim': 'an OpenSSH server process is an ancestor of this session (and, recorded only, listeners on the connected port); the auth method that succeeded is NOT proven'},
+               'paths': st.m,
+               'account': {'passwd': pw, 'group': _tp_pf_ge.results[1].ansible_facts.getent_group[tp_ctl.owner],
+                           'kvm': _tp_pf_ge.results[2].ansible_facts.getent_group[tp.hypervisor.kvm_group]},
+               'journal_exists': _tp_pf_js.stat.exists,
+               'os_family': ansible_facts.os_family,
+               'packages': {'names': names, 'unmapped': unmapped},
+               'preservation': _tp_pv_eval, 'capacity': cap,
+               'linger_tool': {'name': tp_ctl.linger_tool.name, 'path': tp_ctl.linger_tool.path, 'observed_sha256': lt.checksum | default(none), 'ok': lt_ok},
+               'refusals': tp_pre.refusals + ref.v + _tp_pv_eval.refusals}) }}
+  rescue:
+    - name: Record the failed contact or observation (the caller's record play still writes it)
+      ansible.builtin.set_fact:
+        tp_pre: >-
+          {{ tp_pre | combine({'refusals': tp_pre.refusals + [tp.refusal ~ ': preflight stopped at "' ~ (ansible_failed_task.name | default('?'))
+                               ~ '": ' ~ (ansible_failed_result.msg | default('') | string)[:2000]]}) }}

@@ -373,9 +373,131 @@ profile_overlay:
               filter_plugins_rel: [ansible/roles/podman/filter_plugins]   # engine resolve filters; digests recorded
               config_file: none                              # ansible_config_file must be unset: no ANSIBLE_CONFIG,
                                                              # no ./ansible.cfg, ~/.ansible.cfg, /etc/ansible/ansible.cfg
-              env_allow: [ANSIBLE_NOCOLOR]                   # any other ANSIBLE_* variable in the builder env refuses
+              # EXACTLY the ANSIBLE_* names genesis.launch.env declares (each admitted at its declared value by
+              # tasks/admit_builder.yml); any other ANSIBLE_* variable in the builder env refuses
+              env_allow: [ANSIBLE_HOME, ANSIBLE_LOCAL_TEMP, ANSIBLE_NOCOLOR, ANSIBLE_REMOTE_TMP]
               packages: {Debian: ansible-core, RedHat: ansible-core}   # missing builder -> refusal naming these
               refusal: RH-BUILDER-UNSUPPORTED
+            # LAUNCH (codex-tick184 RH-GENESIS-TEMP-BINDING; evidence-capture ruling: invocation and capture contract in
+            # YAML, no handwritten launcher script, no second loader, no shell-success fallback). The genesis stages
+            # (acquire.yml, package.yml) run under /usr/bin/ansible-playbook BEFORE any managed generation, so no seed
+            # binds their environment: THIS block does, from the FIRST builder process on. Every local write location
+            # of the builder is under the stage root <work root>/<work_roots.sub_roots.tmp>/<stage_root_rel>/<stage>/<act>
+            # (work root = <checkout>/<work_roots.root_rel>, the WORK-ROOT DECLARATION), with the SAME names and
+            # layout as the seed's managed_pairs(home_dir, tmp_dir) and the run-local pinned remote temp ({run_tmp}):
+            #   TMPDIR              <stage>/tmp                 Python tempfile (ansible.builtin.tempfile without path,
+            #                                                   the engine's own temp), mkstemp downloads
+            #   ANSIBLE_LOCAL_TEMP  <stage>/tmp/ansible-local   DEFAULT_LOCAL_TMP (base.yml: ini/env only, NOT an
+            #                                                   inventory var): the builder creates it at start-up
+            #                                                   (makedirs 0700 + mkdtemp ansible-local-<pid>) -- which
+            #                                                   also creates <stage>/tmp -- and the AnsiballZ cache
+            #   ANSIBLE_REMOTE_TMP  <stage>/tmp                 remote_tmp of the LOCAL connection (module tmpdirs,
+            #                                                   get_url's download temp); an inventory/extra-var
+            #                                                   ansible_remote_tmp would outrank it and refuses unless equal
+            #   ANSIBLE_HOME        <stage>/ansible-home        every ANSIBLE_HOME-derived default (base.yml: plugin,
+            #                                                   collection and role search paths, galaxy_cache,
+            #                                                   galaxy_token, persistent control path pc/) -- nothing of
+            #                                                   ~/.ansible is read or written; created only if used
+            # Deliberately NOT bound (nothing in the genesis stages uses them; binding them would widen env_allow):
+            # ANSIBLE_GALAXY_CACHE_DIR (no galaxy; its default is under ANSIBLE_HOME anyway), ANSIBLE_ASYNC_DIR (no
+            # async task in acquire.yml / package.yml or their tasks), ANSIBLE_COLLECTIONS_PATH (builder.collections []),
+            # ANSIBLE_CONFIG (builder.config_file none: the no-ansible.cfg rule stands; cwd = the checkout, which holds
+            # no ansible.cfg). HOME is carried, NEVER redirected (the invoker's passwd home). No shared cache is cleaned:
+            # each run's ansible-local-<pid> is removed by the builder at exit; stray module tmpdirs of a killed run
+            # stay in the stage root (owned, reported by the next admission, never reaped here).
+            # PER-ACT ISOLATION (codex 183510; RH-GENESIS-ACT-ISOLATION). A stage root shared by every launch of a stage
+            # (G acts, MAIN runs) is not isolation, and sequential execution proves none. Each launch has its OWN act
+            # identity, carried IN the resolved stage root, so no two launches share a writable stage root:
+            #   stage root = <work root>/<sub_roots.tmp>/<stage_root.rel>/<stage>/<act>
+            # act: the launcher's name for this one launch (MAIN: the step record's `act`, the same token as its
+            # evidence dir; G: the control act id), matching act.regex, passed as the extra var act.var (argv
+            # below; no default: absent or malformed refuses before any module) and created EXCLUSIVELY by the
+            # preparation (mkdir without -p: an existing act dir is refused, never reused). No second temp tree, no
+            # chmod of any ancestor: the parents stay the declared prepare dirs (only-if-absent, 0700).
+            launch:
+              stage_root:
+                sub: tmp
+                rel: genesis
+                # regex is matched as a FULL match of the whole value (match: fullmatch -> Python re.fullmatch via the
+                # ansible.builtin.regex test's match_type): `$` alone would admit a trailing newline under re.match
+                # (RH-GENESIS-ACT-STRICT-END); the regex itself stays backslash-free portable ERE
+                act: {var: rh_gen_act, regex: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$', match: fullmatch, created: exclusive}   # <work root>/<sub_roots.tmp>/genesis/<stage>/<act>
+              stages:
+                acquire: {playbook_rel: testing/remote_harness/acquire.yml}
+                package: {playbook_rel: testing/remote_harness/package.yml}
+              cwd: checkout                                  # the checkout the work root belongs to
+              # the operator's controller-only inventory carries the stages' localhost host vars (rh_artifact_source,
+              # rh_acquisition_receipt, rh_bundle_dir); it must not set any ansible_* temp/interpreter/connection var
+              inventory: operator_controller_inventory
+              # exec vector: <os_tools.env.path> -i <env pairs, in this order> <builder.executable> -i <inventory> -e <act.var>=<act> <checkout>/<playbook_rel>
+              # (env -i: nothing ambient survives; no shell, no wrapper; the process's exit status is the step's)
+              argv: ['{os_tools.env.path}', '-i', '{env_pairs}', '{builder.executable}', '-i', '{inventory}', '-e', '{stage_root.act.var}={act}', '{checkout}/{playbook_rel}']
+              env:
+                clear: true                                  # env -i
+                order: [PATH, LC_ALL, HOME, ANSIBLE_NOCOLOR, PYTHONDONTWRITEBYTECODE, TMPDIR, ANSIBLE_LOCAL_TEMP, ANSIBLE_REMOTE_TMP, ANSIBLE_HOME]
+                base: base_env                               # PATH=/usr/bin:/bin, LC_ALL=C.UTF-8 (controller.bootstrap.base_env)
+                inherited: {HOME: invoker_passwd_home}       # == the running uid's passwd home directory
+                literal: {ANSIBLE_NOCOLOR: '1', PYTHONDONTWRITEBYTECODE: '1'}   # = managed_env values (no bytecode written into the checkout)
+                stage_paths:                                 # value = <stage root>/<rel>
+                  TMPDIR: tmp
+                  ANSIBLE_LOCAL_TEMP: tmp/ansible-local
+                  ANSIBLE_REMOTE_TMP: tmp
+                  ANSIBLE_HOME: ansible-home
+                # must be existing owned real dirs when the first module runs (the builder's start-up creates them);
+                # ANSIBLE_HOME may be absent (created only if used), and is admitted the same way when present
+                must_exist: [TMPDIR, ANSIBLE_LOCAL_TEMP, ANSIBLE_REMOTE_TMP]
+              # PREPARATION (declared bootstrap, before the first builder process; part of MAIN's checkout preparation,
+              # never an ad hoc repair): the builder's start-up makedirs gives INTERMEDIATE directories the invoker's
+              # umask (0002 on the operator account -> group-writable -> refused), so these exist beforehand, owned by
+              # the invoker, mode 0700, each created only if absent (an existing one is admitted, never re-moded):
+              #   <work root>/<sub_roots.tmp>, <work root>/<sub_roots.tmp>/<stage_root.rel>, <stage dir> ('..'),
+              # EXCEPT the act dir <stage root> ('.', listed in `exclusive`): created by ONE mkdir without -p, mode 0700;
+              # an existing one refuses the launch (never reused, never re-moded); then <stage root>/tmp inside it.
+              # (<stage root>/tmp/ansible-local is the makedirs leaf, 0700; ansible-home is created only if used).
+              prepare: {dirs_rel_to_stage_root: ['..', '.', tmp], work_root_dirs: ['{sub_roots.tmp}', '{sub_roots.tmp}/{stage_root.rel}'], mode: '0700', only_if_absent: true, exclusive: ['.']}
+              # admission (tasks/admit_builder.yml, FIRST tasks, before any module): every env name above at its declared
+              # value; env_allow == the declared ANSIBLE_* names exactly; effective DEFAULT_LOCAL_TMP is an
+              # ansible-local-* dir directly in ANSIBLE_LOCAL_TEMP; effective ANSIBLE_HOME and shell remote_tmp are the
+              # declared ones; ansible_remote_tmp unset or equal; no component from / to the stage paths is a link;
+              # the stage root is not under work_roots.admission.refused_prefixes. Right after (first module, stat):
+              # every component above the work root owned by 0 or the invoker and not group/other-writable (no
+              # private-group exception at genesis: its decision tools are not yet identity-admitted); the work root
+              # and everything below it to the stage paths owned by the invoker, real dirs, not group/other-writable,
+              # on the work root's device; the work root's filesystem not in refused_fs_types with free_bytes_min /
+              # free_inodes_min available.
+              refusal: RH-BUILDER-UNSUPPORTED               # fail_msg tagged (RH-GENESIS-TEMP-BINDING)
+              # STEP RECORD (one per stage run; written by MAIN's declared runner, not by the stage; a record missing a
+              # field is a FAILED step -- never inferred success). Capture is the runner tool's NATIVE process output
+              # and exit status (codex-tick190-preparation-capture-rulings-20260924-170719): no separately authored
+              # capture file; any retained output bytes live INSIDE this YAML record (text, or binary data), never as an
+              # executable body. The record binds the native capture reference and states the ACTUAL fidelity -- merged
+              # or separate streams, complete or truncated; separate streams or digests are never fabricated from
+              # merged or truncated output.
+              step_record:
+                schema: lme-genesis-step/2
+                format: yaml
+                evidence_dir: '<work root>/<work_roots.sub_roots.run>/genesis/<stage>/<act>'
+                files: {record: step.yml}                    # the ONLY file; no stdout/stderr capture files
+                fields:
+                  stage: 'launch.stages key'
+                  act: 'launch.stage_root.act: this launch''s act identity (act.regex; its exclusive stage root and evidence dir name)'
+                  stage_root: 'absolute: <work root>/<sub_roots.tmp>/<stage_root.rel>/<stage>/<act>'
+                  argv: 'the exact exec vector, as a list (after placeholder substitution)'
+                  cwd: 'absolute'
+                  env: {declaration: controller.bootstrap.genesis.launch.env, pairs: 'the exact NAME=value list passed to env -i, in order'}
+                  source: {checkout: 'absolute', commit: 'git HEAD', tree: 'git HEAD^{tree}', status: 'porcelain output (empty = clean)'}
+                  config: {profile_rel: manifests/profiles/remote-harness.yml, profile_sha256: 'sha256', inventory: 'absolute path', inventory_sha256: 'sha256', ansible_config_file: none}
+                  builder: {executable: 'builder.executable', executable_sha256: 'sha256 (recorded measurement)'}
+                  started_at_utc: 'ISO-8601 UTC, taken immediately before exec'
+                  ended_at_utc: 'ISO-8601 UTC, taken immediately after the process exits'
+                  capture:
+                    reference: 'the runner tool''s native capture of this process (its own identifier / location for the output and status, exactly as the tool reports it)'
+                    fidelity:
+                      streams: 'merged | separate -- as the tool actually captured them'
+                      complete: 'bool -- false when the tool truncated or the capture was cut off'
+                    retained_output: 'OPTIONAL: the captured output as YAML text (a block scalar), or YAML !!binary when not text; one entry when merged, {stdout, stderr} only when separate; stated as retained, never as more than fidelity says'
+                  exit_status: 'the process''s actual exit status as the tool captured it (int; signal -> 128+n); never coerced, never inferred from output'
+                  outputs: {acquire: 'the receipt path + sha256 (rh_acquisition_receipt)', package: 'rh_bundle_dir + bundle.sha256 digest, or none on refusal'}
             # SEED-LAUNCH STEP RECORD (codex 235900): the evidence layout of ONE seed-launcher invocation by MAIN's route
             # (controller.bootstrap.seed_launcher caller_argv, any seed_launch.mode_args mode). DECLARATION ONLY, through
             # the same runner/record contract as the genesis stage step record (lme-genesis-step/2): written by MAIN's
@@ -595,6 +717,44 @@ profile_overlay:
             # needs nor checks it (the seed checks only entries required_by seed or uv_installer). Never installed ad hoc:
             # missing -> refusal naming packages.by_os_family.<family>.git.
             git: {path: /usr/bin/git, required_by: [package_source_binding, source_edition_binding], conditional: true, identity: {kind: file_sha256, sha256: 356db14e102d68a1a37d8a1ac577dfd678d45d46e92f468bef8b7154e7bfdc60}}
+            # OBSERVATION JOB TOOLS (codex-tick328-329 observation_tool_identities; route tick329 proposal 484539e9): the
+            # executables of the observation jobs (controller.bootstrap.observation), TARGET-ONLY (required_by
+            # [observation]: controller packaging skips them, os_tool_consumers below). Identities are CONTROLLER-FIXTURE
+            # DEFAULTS measured on this declaring controller (Debian 13; regular files, uid 0, mode 0755, not links) -- they
+            # prove NOTHING about graph/trixie: the declared preflight observes each target and binds its approved
+            # per-host override (os_tools.<t>.path/identity, tunable) before any effect; no target identity is substituted
+            # from these values. Logical packages: packages.provides (coreutils / util_linux / systemd).
+            timeout: {path: /usr/bin/timeout, required_by: [observation], identity: {kind: file_sha256, sha256: 6ca1891dfc0b05d7680770c2884c0391b92467c7bb6500a5c84677e6481739f1}}
+            readlink: {path: /usr/bin/readlink, required_by: [observation], identity: {kind: file_sha256, sha256: 1dcaf494f4dec175292b1684b3e978d18a4c3c703c52f81606d9e8eea30eb6db}}
+            findmnt: {path: /usr/bin/findmnt, required_by: [observation], identity: {kind: file_sha256, sha256: 598a23e36910f5cf7a99dfe83b6b29b54dae26ec73faa82fb097c0d5ddc36334}}
+            lsblk: {path: /usr/bin/lsblk, required_by: [observation], identity: {kind: file_sha256, sha256: 764eac47b7a2bdd0fac3597af4ec2acecaf1446c50f10ee7c507d05a47423a86}}
+            systemctl: {path: /usr/bin/systemctl, required_by: [observation], identity: {kind: file_sha256, sha256: 848c70d7e2c2f43f4f93287897ac8946e8eda45e7daa5f2975d9728071856b1a}}
+            systemd-analyze: {path: /usr/bin/systemd-analyze, required_by: [observation], identity: {kind: file_sha256, sha256: d89a879c2c87c4465e3a09588e18f27a14dd9228898679bbdbbc978802f64dce}}
+            busctl: {path: /usr/bin/busctl, required_by: [observation], identity: {kind: file_sha256, sha256: 0ee119c8bf7d610d3d81adee23ddb7892656ce89cc4eccb4ce8e2032c4d001df}}
+            # TARGET-PREREQ LINGER TOOL (B handback c1-delta-from-B-20260925T0250; target_prereq.linger.tool names it):
+            # TARGET-ONLY (required_by [target_prereq]); CONTROLLER-FIXTURE DEFAULT identity measured on this declaring
+            # controller, same rules as the observation tools above -- UNVERIFIED on graph (B), bound per host by the
+            # declared preflight override before any effect. Logical package: packages.provides.systemd.
+            loginctl: {path: /usr/bin/loginctl, required_by: [target_prereq], identity: {kind: file_sha256, sha256: 4e4841997883337cfcf82a5dd410dd1a3f44d5f7c012fb8e4ac81d88bb2b19b0}}
+            # J-KEY OWNER KEY GENERATOR (B-graph c1-jkey-proposal JK-1): CONTROLLER-ONLY (required_by
+            # [owner_key_generation]); NOT conditional -- package.yml hashes and admits it as a controller precondition
+            # (os_tool_consumers.controller). The J-KEY leg (testing/e2e/target_prereq/owner_key.yml) re-admits it by
+            # path + sha256 (stat, no link followed) before every use and refuses JKEY-TOOL-NOT-ADMITTED otherwise; never
+            # installed ad hoc, no fallback. Logical package: packages.provides.openssh_client (JK-1b). Identity measured
+            # by MAIN on the declaring controller (regular file, uid 0, mode 0755; package openssh-client).
+            ssh-keygen: {path: /usr/bin/ssh-keygen, required_by: [owner_key_generation], identity: {kind: file_sha256, sha256: 4a16f170f7c80d6643d3ffada36d396c9d7b1d63238a218628e37af38d6107c0}}
+          # OS-TOOL CONSUMER PARTITION (codex-tick328-329 os_tool_partition; C1 owns the declaration, route package.yml the
+          # consumer): the ONE closed vocabulary of os_tools required_by labels, split into CONTROLLER consumers (an
+          # entry naming ANY of them is a controller precondition: package.yml hashes and admits it) and TARGET consumers
+          # (an entry naming ONLY these is skipped by controller packaging; target execution admits it in its own
+          # namespace -- no target identity check is waived). Not tunable (tunable_paths); pinned EXACTLY by registry
+          # contract_admission.os_tool_consumers (nonempty, disjoint, exact), which also refuses any os_tools entry with
+          # an absent, empty or out-of-vocabulary required_by at resolve (package.yml re-asserts it as
+          # RH-OS-TOOL-CONSUMER before any hash). owner_key_generation binds os_tools.ssh-keygen (J-KEY leg
+          # testing/e2e/target_prereq/owner_key.yml). `guest` is the one guest label (never guest_lifecycle).
+          os_tool_consumers:
+            controller: [seed, uv_installer, package_source_binding, source_edition_binding, owner_key_generation]
+            target: [target_adapter, privileged_contact, target_prereq, guest, observation]
           # SEED-06 os_tools_integrity (codex-232517): a declared tool path is a LOCATION, not an identity. Every selected
           # executable (seed/uv_installer tools on every host; adapter tools on targets) is admitted INDEPENDENTLY of the
           # tool verifying itself BEFORE the first effect: the resolved file is a regular file owned by owner_uid and
@@ -718,6 +878,9 @@ profile_overlay:
               tmp: tmp                    # persistent-free temp of a work root (target remote temp lives here)
               cache: cache
               engine_storage: engine-storage
+              credentials: credentials    # J-KEY owner keys: <work root>/credentials/<owner_key.storage.keys_rel>/... (0700 chain,
+                                          # created level by level by the J-KEY leg; NOT in run_env, so the seed neither creates
+                                          # nor prepares it; the leg applies destination_custody itself: owned, 0700, no link)
             remote_tmp_rel: ansible-remote
             runners:                      # <work root>/<sub_roots.run>/<this> is each runner's work_root default
               remote_harness_controls: remote-harness-controls
@@ -728,6 +891,12 @@ profile_overlay:
               loader_cases: loader-cases  # C1 loader-case suite (testing/loader-tests-r4/run_loader_tests.yml reads this key)
               private_group_fixtures: private-group-fixtures   # route: owner-private-group synthetic fixtures (E51)
               probe_env: probe-env        # route: run-local playbook environment probe (E84 other-modes-set; names only)
+              bootstrap_receipt: bootstrap-receipt   # route X: apply adapter projection R (testing/loader-tests-r4/project_bootstrap_receipt.yml; E87)
+              # route X: independent readback of R (readback_bootstrap_receipt.yml; E88). Review artifact A (codex-tick337 /
+              # codex-tick339-340 location ruling) has NO dir of its own: MAIN relocates A byte-identical into the COMPLETED
+              # readback attempt it reviews, <this>/<attempt>/<catalog review_contract.locator.leaf>; run_loader_tests.yml
+              # derives that dir from this key (catalog locator.runner_key), never from a literal (E90).
+              bootstrap_receipt_readback: bootstrap-receipt-readback
             # WORKSPACE ANCHOR (codex 143844 RH-WORKSPACE-ANCHOR). `run` / `run-local` never take W as dirname(R):
             #   W = the prefix of R through its LAST `/<root_rel>/` component (R must contain one), <checkout> = W's
             #   parent; `run-local` additionally requires R == W/<sub_roots.toolchain> exactly (`run` admits any root
@@ -809,7 +978,9 @@ profile_overlay:
             # but genesis.builder.env_allow -- all ENFORCED by tasks/admit_builder.yml before any package write. The
             # executable and interpreter sha256 are RECORDED measurements in bundle.json (builder), NOT compared with a
             # declared digest (none is declared). It never authorizes another interpreter, an unpinned ansible or a
-            # scratch script. Its temp is the invoker's environment. Every later runner in `runners` goes through run-local.
+            # scratch script. Its process environment and every temp are genesis.launch (codex-tick184 RH-GENESIS-TEMP-BINDING:
+            # env -i + the declared pairs, all under <work root>/<sub_roots.tmp>/genesis/<stage>/<act>), admitted by
+            # tasks/admit_builder.yml. Every later runner in `runners` goes through run-local.
             run_local:
               mode: run-local
               inventory: 'localhost,'
@@ -868,7 +1039,14 @@ profile_overlay:
                 acceptance: {playbook: testing/acceptance/run_acceptance.yml, work_root_var: work_root, required_inputs: []}
                 private_group_fixtures: {playbook: testing/remote_harness/tests/run_private_group_fixtures.yml, work_root_var: pgf_work_root, required_inputs: []}
                 probe_env: {playbook: testing/remote_harness/tests/run_probe_env.yml, work_root_var: pe_work_root, required_inputs: []}
+                # route X (codex-tick332 apply adapter): R is projected ONLY from the resolved run's sealed toolchain.json +
+                # measurements; the readback re-measures in its own process. Inputs are INLINE -e (never reserved outputs).
+                bootstrap_receipt: {playbook: testing/loader-tests-r4/project_bootstrap_receipt.yml, work_root_var: br_work_root, required_inputs: [br_label]}
+                bootstrap_receipt_readback: {playbook: testing/loader-tests-r4/readback_bootstrap_receipt.yml, work_root_var: brr_work_root, required_inputs: [brr_label, brr_receipt, brr_receipt_sha256]}
                 # C1 (0160b1b): every input explicit, no private defaults; baseline_commit stays optional (integration mode)
+                # managed_only (interpreter_policy) additionally requires, as inline -e (NOT required_inputs: unmanaged_diagnostic
+                # runs omit them; run_loader_tests.yml refuses their absence under managed_only): managed_bootstrap_receipt,
+                # managed_bootstrap_receipt_sha256, managed_bootstrap_review (A's locator rel), managed_bootstrap_review_sha256.
                 loader_cases:
                   playbook: testing/loader-tests-r4/run_loader_tests.yml
                   work_root_var: work_root
@@ -1119,6 +1297,7 @@ profile_overlay:
             RH-POLICY-INPUT-CONFLICT: tasks/resolve_policy.yml (the engine's EFFECTIVE lme_profile / lme_manifests_dir / loaded profile bytes differ from this helper's admitted binding -- an extra-var override of a declared input)
             RH-DERIVED-OUTPUT-PINNED: tasks/refuse_pinned_outputs.yml (a derived output supplied from outside, or the registry reserved_outputs list unreadable)
             RH-OS-TOOL-IDENTITY: package.yml / target_bootstrap.yml (a PRESENT selected executable's stat sha256 differs from its declared identity; adapter divergence -- the engine-derived adapter tool set differs from the declared names, or an adapter tool no adapter package provides; a declared adapter path/identity copy or a name outside os_tools is refused earlier by the engine resolve). An ABSENT tool never raises it
+            RH-OS-TOOL-CONSUMER: package.yml (before any hash -- the controller.bootstrap.os_tool_consumers partition is absent, has an empty controller set or overlapping sets, or an os_tools entry's required_by is absent, empty or names a label outside controller + target; codex-tick328-329; the engine resolve refuses the same shapes first by contract_admission.os_tool_consumers)
             RH-OS-TOOL-MISSING: package.yml (a declared controller executable absent or not executable, named with its logical package; raised after the git source-binding check, which keeps RH-BUILDER-UNSUPPORTED for git -- D05; on targets a missing tool is RH-TARGET-BOOTSTRAP, D08)
             RH-TOOLCHAIN-RECEIPT: tasks/verify_toolchain_receipt.yml (root/receipt/generation custody, pointers, seal, tree digests)
             RH-TARGET-PRIVILEGED-CONTACT: >-
@@ -1299,12 +1478,56 @@ profile_overlay:
             bundle_var: lme_toolchain_bundle_dir     # TARGET host var, no default: where the transferred bundle lands
                                                      # (outside the root; absent or byte-identical; owner-owned parent)
             target_group: lme_toolchain_targets      # the declared role group target_bootstrap.yml selects (no host names)
+            # ROLE GROUPS (TP-REG role_groups join; MAIN relay, approved as proposed): the ONE declaration of the inventory
+            # group NAMES (membership is inventory only). Names from B's lab inventory ansible/inventory/graph_lab_example.yml
+            # (sha256 50ec7fa7, was ec4f35ac / a2aa512e: groups lme_toolchain_targets :57, lme_hypervisors :181,
+            # lme_telemetry_sources :186, lme_workload :189), equal to the graph-shared ROLE_GROUPS fixture. Contract contract_admission.inventory_role_groups
+            # (exact keys, var_name, each distinct from the others and from target_group); readers:
+            # testing/remote_harness/target_prereq.yml:93 / :245 (hypervisors; 9f4babf1) and contract guest_lifecycle (when a guest is declared).
+            role_groups: {hypervisors: lme_hypervisors, telemetry_sources: lme_telemetry_sources, workload: lme_workload}
+            # DECLARED TARGET INPUTS (C1; global.yml host_scope.target_inputs, contract target_input_roles; frozen
+            # contract codex-tick315): each per-target inventory value a consumer reads is named ONCE here; the loader
+            # types it and binds binding.deployment.target_inputs.<host>.<role> = the typed value itself (string / bool /
+            # non-empty list of distinct strings), inside every scope_sha256. An absent OPTIONAL role is omitted (no key),
+            # a declared-required role missing on a target refuses, a supplied null / empty / malformed value refuses;
+            # no raw host-var fallback and no consumer default. owner / toolchain_root restate owner_var / root_var and
+            # stay optional here: the OWNER-ABSENT RULE above binds an absent owner to '' and admit_transport refuses it
+            # before any target effect. Keys and credentials are PATH references only (never read by the loader).
+            target_inputs:
+              owner: {var: lme_toolchain_owner, type: string, required: false, pattern: account_name}
+              toolchain_root: {var: lme_toolchain_root, type: string, required: false, pattern: abs_path}
+              bundle_dir: {var: lme_toolchain_bundle_dir, type: string, required: false, pattern: abs_path}
+              owner_key: {var: lme_toolchain_owner_key, type: string, required: false, pattern: abs_path}
+              privileged_key: {var: lme_privileged_key, type: string, required: false, pattern: abs_path}
+              owner_pubkey: {var: lme_toolchain_owner_pubkey, type: string, required: false, pattern: abs_path}
+              # B-graph target_prereq (decl rev 2) optional roles, B's var names
+              prereq_owner_shell: {var: lme_deploy_owner_shell, type: string, required: false, pattern: abs_path}
+              prereq_owner_home: {var: lme_deploy_owner_home, type: string, required: false, pattern: abs_path}
+              prereq_work_root: {var: lme_deploy_work_root, type: string, required: false, pattern: abs_path}
+              prereq_bundle_root: {var: lme_deploy_bundle_root, type: string, required: false, pattern: abs_path}
+              prereq_preserved_units: {var: lme_lab_preserved_units, type: string_list, required: false, pattern: service_name}
+              # B-graph target_prereq rev 4 preservation roles (TP4-ROLE-RETIRED / TP4-ROLE-VERIFIED-NONE, B's var names):
+              # expected_states.retired_absent members, and the verified_none basis (bool: no pattern key, type-exact)
+              prereq_retired_units: {var: lme_lab_retired_units, type: string_list, required: false, pattern: service_name}
+              prereq_verified_no_prior_deployment: {var: lme_lab_verified_no_prior_deployment, type: bool, required: false}
+              # B-graph target_prereq rev 3 work-parent roles (B accepted these C1 role names; the SAME roles / vars /
+              # patterns the graph-shared TIN fixture already binds). mode is typed lock_mode (never group/other-
+              # writable). The consumer checks work parent == dirname(work root) and the mode against
+              # layout.work_parent_rule.mode_regex on these BOUND values (pre-contact).
+              prereq_work_parent_path: {var: lme_deploy_work_parent_path, type: string, required: false, pattern: abs_path}
+              prereq_work_parent_owner: {var: lme_deploy_work_parent_owner, type: string, required: false, pattern: account_name}
+              prereq_work_parent_group: {var: lme_deploy_work_parent_group, type: string, required: false, pattern: account_name}
+              prereq_work_parent_mode: {var: lme_deploy_work_parent_mode, type: string, required: false, pattern: lock_mode}
+              # route observation runner (observe.yml) host selections
+              obs_paths: {var: lme_obs_paths, type: string_list, required: false, pattern: abs_path}
+              obs_prior_dirs: {var: lme_obs_prior_dirs, type: string_list, required: false, pattern: abs_path}
+              obs_unit_patterns: {var: lme_obs_unit_patterns, type: string_list, required: false, pattern: unit_glob}
             # R-B2: owner-scoped and root-privileged legs coexist through PER-PLAY connection profiles (no host-name
             # branch, no second host alias). Each play binds ansible_user (and, for explicit_key, the key reference)
             # from its profile's inventory variables as PLAY vars, which outrank inventory host vars; the inventory's
             # own ansible_user therefore does not decide the privilege of a play. become stays off everywhere.
             connection_profiles:
-              owner:     {user_var: lme_toolchain_owner, key_var: lme_toolchain_owner_key, used_by: [target_bootstrap.yml], become: false}
+              owner:     {user_var: lme_toolchain_owner, key_var: lme_toolchain_owner_key, pubkey_var: lme_toolchain_owner_pubkey, used_by: [target_bootstrap.yml], become: false}
               privileged: {user: root, key_var: lme_privileged_key, used_by: ['B wipe/install legs (MAIN-run only)'], become: false, runner: MAIN_only}
             roles:
               controller: the play host running route playbooks (localhost, connection local)
@@ -1319,6 +1542,479 @@ profile_overlay:
             # own resolved policy), never from a target's.
             controller_delegation: {host: localhost, connection: local, python_var: ansible_playbook_python}
           applies_to: [controller, target]
+          # OBSERVATION JOB BINDING (codex-tick307; route hunk (a); C1 sole owner of jobs_sha256; contract
+          # observation_jobs, exact keys at every level): the generic read-only runner observe.yml runs ONE declared
+          # job of the data-only job file, admitted by repository-relative path AND exact sha256 (the ONLY digest pin of
+          # this node; the runner compares the read bytes to it before any target contact). Any job-file edit needs this
+          # digest re-declared here (serialized through C1). Host / path / unit selections are declared target inputs
+          # (inventory.target_inputs obs_*), never job-file edits. jobs_sha256 = the m1-1 file after route's repair,
+          # verified by MAIN.
+          observation:
+            playbook_rel: testing/remote_harness/observe.yml
+            jobs_rel: testing/remote_harness/jobs/observations.yml
+            jobs_sha256: db08c451005cb8ba671b752936ce99041705ee9b5bf3c6454eac48121bbd46eb
+            jobs_schema: lme-observation-jobs/1
+            step_template_rel: testing/remote_harness/templates/observation_step.j2
+            macros_rel: testing/remote_harness/templates/macros/observation.j2
+            connect_as: owner
+            channel: raw
+            refusal: RH-OBSERVATION
+            inputs: {job_var: lme_obs_job, attempt_var: lme_obs_attempt, attempt_regex: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'}
+            evidence:
+              run_rel: observations
+              dir_mode: '0700'
+              file_mode: '0600'
+              attempt_file: attempt.json
+              host_dir: hosts
+              host_name_regex: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+              attempt_schema: lme-observation-attempt/1
+              host_schema: lme-observation-host/1
+          # TARGET PREREQUISITE POLICY (TP-REG, BLOCKER-A; codex-tick356; B c1-jkey-proposal b27057d8 TP-REG): registered
+          # ONCE, VERBATIM (values and comments) from testing/remote_harness/target_prereq.decl.yml `target_prereq`
+          # REVISION 3 at the FROZEN sha256 743b68e8067d5aebf9f6c1c61ab6df629e35efe77d31f9f0b39777627440d064 (decl lines
+          # 33-213). REVISION 4 (C1 hunk 2, MAIN relay): r3 + the delta of B's
+          # testing/e2e/target_prereq/target_prereq.decl.r4-proposal.yml at sha256
+          # d96f4ed9f969debe482cde040edf9717bec9b3f5c1eca0581fc3917f5b8a1e23 (C1 hunk 3 rebind; was eb7362cd: + absent_states,
+          # + routes.loaded_without_unit_file, reworded verified_none.check / discovery.limit) (changed: revision, preflight.record_schema,
+          # reuse.preflight_rel; removed: hypervisor.preserved_refused_states / _status; added: preservation, observe),
+          # values and comments verbatim except: the proposal's YAML anchor &retire (routes.running, aliased by
+          # routes.enabled / routes.present_after_retirement) is written out as three identical mappings (this profile
+          # carries no YAML aliases; parsed value unchanged). Contract contract_admission.target_prereq (key_set; revision
+          # [4]); consumers testing/remote_harness/target_prereq.yml, testing/e2e/target_prereq/prereq_observe.yml and
+          # tasks/prereq_preflight.yml (read ONLY rh.controller.bootstrap.target_prereq). Its
+          # packages.hypervisor_required needs a mapping in EVERY os family (package_mapping.required_lists): see packages.
+          target_prereq:
+            revision: 4
+            runner: MAIN_only                     # privileged connection profile; subagents and owner runs never start it
+            connection_profile: privileged        # rh.controller.bootstrap.inventory.connection_profiles.<this> (user root)
+            refusal: RH-TARGET-PREREQ
+            reuse:
+              transfer_dir_rel: testing/e2e/transfer          # tr_dir == <rh_repo_root>/<this> (derived at first entry; asserted)
+              transfer_decl: transfer.decl.yml
+              controller_prelude: tasks/bind_controller.yml   # tr_conn, tr_bs, tr_state, tr_scope_expect (the ONE contract)
+              contact_rel: testing/remote_harness/tasks/initial_contact.yml
+              contact_variant: privileged
+              # reuse gains the shared B-owned preflight tasks file (was inline in target_prereq.yml)
+              preflight_rel: testing/e2e/target_prereq/tasks/prereq_preflight.yml
+            layout:
+              toolchain_rel: toolchain                    # toolchain root == <work root>/<this> (== work_roots.sub_roots.toolchain)
+              bundles_rel: bundles                        # bundle root == <work root>/<this>
+              bundle_leaf_regex: '^[0-9a-f]{64}$'         # bundle dir == <bundle root>/<immutable identity leaf>
+              owner_dir_mode: '0700'
+              # the work root's parent (codex ACCEPTED: a root-owned intermediate as a declared, overridable INVENTORY choice,
+              # the four prereq_work_parent_* roles). Its path must be dirname(<work root>), its owner root, its mode never
+              # group/other-writable (C1: the regex refuses 0722, 0702, 0620 ...: only 0/1/4/5 in the group and other digits).
+              work_parent_rule: {path: dirname_of_work_root, owner: root, mode_regex: '^0[0-7][0145][0145]$'}
+            # ADOPTION (codex-tick302; tick320 (3)): observe first. Absent -> created. Matching campaign state -> OBSERVATION ONLY
+            # (no write; "matching" is the COMPLETE metadata: type, no link, uid, gid, mode, and content digest where declared).
+            # Anything else -> REFUSED before any mutation: preserved untouched and reported. Never a usermod, chown or chmod of
+            # state that neither this run nor a recorded unfinished run of this leg created.
+            owner_account:
+              # the campaign marker: an owner account is campaign state ONLY with exactly this GECOS, the declared shell and
+              # home, and a same-named primary group. A historical account (e.g. shell nologin) is NEVER converted.
+              gecos: 'LME remote-harness deployment owner (target_prereq)'
+              create_home: true
+              system: false
+              passwd_fields: {gecos: 3, home: 4, shell: 5}        # getent passwd value index (after the name key)
+              home_mode_regex: '^0[0-7][0145][0145]$'             # the created home is never group/other-writable
+            authorized_keys:
+              dir_rel: .ssh
+              dir_mode: '0700'
+              file_rel: .ssh/authorized_keys
+              file_mode: '0600'
+              # one line, a public key only (never a private-key block); the comment part is optional
+              pubkey_regex: '^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}( [ -~]*)?$'
+              # written content == <pubkey line> + "\n"; an existing file must equal it byte-for-byte (sha256), else REFUSED
+            # PARTIAL-BOOTSTRAP OWNERSHIP AND RECOVERY. A ROOT-OWNED journal on the target, written BEFORE the first effect and
+            # after each op, binds the campaign state to: owner name, the uid observed right after creation, the GECOS marker, the
+            # owner public-key sha256 and the ordered op list. A run resumes ONLY the first op that is not `done`; every later op
+            # must still be `pending`. The journal is never trusted alone: see `resume`. Ancestry is re-admitted (root-only rule,
+            # fresh stat, no link) immediately before every write. The journal is never deleted by this leg.
+            journal:
+              dir: /var/lib/lme-target-prereq              # root:root, dir_mode; admitted by the privileged contact (rh_ic_paths)
+              dir_mode: '0700'
+              file_mode: '0600'
+              file_suffix: .journal.json                   # <dir>/<owner><suffix>
+              schema: lme-target-prereq-journal/v1
+              # ORDER is the contract: the key is installed BEFORE linger; the work root is handed over LAST.
+              ops: [account, ssh_dir, authorized_key, linger, work_root, work_children, work_handover, storage_root]
+              states: [pending, started, done]
+              binding: [owner, uid, gecos, pubkey_sha256]
+            # RESUME RULES (tick320 (1) PREREQ-KEY-RESUME, (2) PREREQ-DONE-READBACK). Pinned words, enforced by
+            # target_prereq.yml + tasks/prereq_readback.yml:
+            #   done_ops            every op the journal says `done` is READ BACK against the actual target state (the one
+            #                       predicate set of tasks/prereq_readback.yml) after classification and before any effect, and
+            #                       ALL ops again at the end; drift refuses and preserves (never trust the journal, never repair).
+            #   owner_home_writes   root writes inside the owner's home (.ssh, authorized_keys) ONLY while authorized_key is
+            #                       still `pending`: before it no key has ever existed, so no key-authenticated owner process can.
+            #                       (Linger marker / /run/user absence is RECORDED, never proof of quiescence.)
+            #   after_key_install   authorized_key `started` (interrupted after or during the install): OBSERVATION ONLY -- the
+            #                       exact file (home, .ssh, file: no link, uid, gid, mode, sha256) marks it done with no write;
+            #                       anything else, ABSENT included, refuses (an absent file after `started` does not prove the key
+            #                       was never usable). No root write to an owner path follows the key install at all, so no
+            #                       quiescence/adoption rule is needed; any future one is a new declared revision.
+            #   existing_account    the account op never re-runs the account module on an existing account (groups + append can
+            #                       usermod): an existing campaign account is observation-only.
+            #   file_tasks          every directory task runs only when its path is ABSENT (journal dir, work parent, .ssh, work
+            #                       root, each child, storage root); the handover chown only while the work root is uid 0.
+            resume:
+              done_ops: readback_refuse_on_drift
+              owner_home_writes: only_while_authorized_key_pending
+              after_key_install: observation_only
+              existing_account: observation_only
+              file_tasks: only_when_absent
+            linger:
+              tool: loginctl                              # os_tools NAME (C1 join: path + identity, required_by target_prereq);
+                                                          # argv[0] is os_tools.loginctl.path, re-verified (fresh stat, sha256 ==
+                                                          # identity, root_only ancestry) immediately before the one command
+              marker_dir: /var/lib/systemd/linger         # <marker_dir>/<owner> exists <=> linger enabled (root-owned regular file)
+              wait: {retries: 20, delay: 1}               # user manager runtime dir + bus: target_bootstrap.user_manager
+            packages:
+              install_module: ansible.builtin.package      # the distro-neutral module (no package manager literal)
+              # every member: rh.packages.required + the transfer adapter's target packages. Hypervisor members also get
+              # hypervisor_required. A name without a mapping for the observed family REFUSES (in the PREFLIGHT; never guessed).
+              # RedHat names UNVERIFIED.
+              hypervisor_required: [qemu_utils, qemu_system_x86, cloud_image_utils]
+            # RS guest-lifecycle prerequisites on every member of rh.controller.bootstrap.inventory.role_groups.hypervisors. Values
+            # that belong to the guest allocation are READ from this host's resolved rh.guest (RS carrier) and never duplicated
+            # here: storage_root, base_image, memory_mib, host_headroom_mib, kvm_device, layout.bases_dir.
+            hypervisor:
+              kvm_group: kvm                               # the owner's supplementary group for /dev/kvm (created account only;
+                                                           # an adopted account must already hold it, else REFUSED)
+              storage_mode: '0700'                         # rh.guest.allocation.storage_root, owner-owned (uid AND gid)
+              base_image_checksum: sha512                  # observed only (MAIN acquires it; never fetched or rewritten here)
+              # (rev 4: preserved_refused_states / preserved_refused_status removed -- the per-member expected-state
+              # vocabulary preservation.expected_states replaces them; the values move into
+              # expected_states.inactive_not_enabled; nothing is weakened.)
+              # memory (codex-tick308-309; tick318-321 item 3): budget = rh.guest.allocation.memory_mib (13312) +
+              # host_headroom_mib (2048), both READ from rh.guest, never restated here. The PREFLIGHT MEASURES /proc/meminfo
+              # (kB floor-divided to MiB) and RECORDS MemTotal, MemAvailable, the budget and the shortfall. It REFUSES exactly
+              # when MemTotal < budget (class never_fits) or when /proc/meminfo cannot be measured (class unmeasured; fail-closed,
+              # never reported as a measurement) -- the check is never weakened; the guest is never shrunk; headroom is never
+              # cut. It NEVER
+              # admits a provision (admits_provision false): RS admit.yml re-reads MemAvailable immediately before a fresh
+              # provision. A refusal is recorded with the measured values and the declared alternatives below; until MAIN's
+              # preflight record measures a host, any obstruction is PREDICTED only.
+              capacity:
+                meminfo: /proc/meminfo
+                admits_provision: false
+                refusal: RH-TARGET-PREREQ-CAPACITY
+                alternatives:                              # inventory / profile choices only; never a host name; never a shrink
+                  - another_hypervisor_member              # place the guest on another role_groups.hypervisors member
+                  - not_a_hypervisor_member                # remove this target from role_groups.hypervisors (non-hypervisor target)
+                  - more_host_memory                       # raise the host's RAM, then re-run the preflight
+                  - raise_budget_and_fail                  # a larger declared budget refuses the same way (capacity stays failed)
+            # SSH INTERCEPT (codex; tick320 sequencing). Read in the PREFLIGHT after the privileged contact and before any
+            # effect: the session's process ancestry must contain an OpenSSH server process and no Tailscale daemon. This proves
+            # the SERVER PROCESS serving the session (and, recorded only, a listener on the connected port) -- NOT which auth
+            # method succeeded. A Tailscale SSH intercept REFUSES; the remedy is an inventory-declared OpenSSH endpoint or an
+            # explicitly admitted Tailscale SSH profile. UNVERIFIED on graph (Debian 13 OpenSSH layout; sshd-session >= 9.8).
+            endpoint:
+              ancestry_max_depth: 16
+              admitted_server_exe_regex: '^/usr/(sbin/sshd|lib/openssh/sshd-session)$'
+              refused_exe_regex: '(^|/)tailscaled$'
+              refusal: RH-TARGET-PREREQ-SSH-INTERCEPT
+              # program text run with the admitted privileged `sh` (argv: sh -c <text> lme-endpoint-ancestry <max depth>
+              # <admitted realpath> <admitted sed>; no PATH lookup); prints one resolved exe per ancestor, nearest first.
+              ancestry_program: >-
+                p=$PPID; n=0;
+                while [ "$p" -gt 1 ] && [ "$n" -lt "$1" ]; do
+                "$2" -e "/proc/$p/exe" 2>/dev/null || echo "?";
+                p=$("$3" -n 's/^PPid:[[:space:]]*//p' "/proc/$p/status"); n=$((n+1)); done
+            # PREFLIGHT (codex-tick318-321 item 3): a declared READ-ONLY phase (play prereq-preflight) on the admitted
+            # privileged contact, BEFORE any owner creation or effect. It depends on nothing an effect provides (no package, no
+            # account, no directory). It observes: the principal and interpreter (the contact itself), the SSH ancestry, the
+            # connected port's listeners (record only), every component of the root-only paths (work parent incl. /data, home
+            # parent, journal dir, linger marker dir, the linger tool's dir, the guest storage parent) with owner/group/mode, the
+            # work root / home / storage root leaves, the owner account (getent), the os family and the package mapping, the
+            # preserved units (rev 4: preservation, every member) and memory (hypervisor members), and the linger tool's identity. It ALWAYS writes a scoped record
+            # <state dir>/gate.<label><record_suffix> (0600; scope id + scope_sha256 + label + target) -- also when it refuses
+            # (refusals listed; a contact or observation failure is rescued into the record). Only then does the record play
+            # refuse. Not recorded (nothing contacted): a controller-side pre-contact refusal, an UNREACHABLE target (Ansible
+            # does not rescue it). Owner-side observation is NOT here: it follows the owner bootstrap (target_bootstrap.yml);
+            # no ad hoc SSH.
+            preflight:
+              record_suffix: .prereq-preflight.json
+              # the preflight record body changed shape (preserved_units -> preservation), so its schema id moves.
+              record_schema: lme-target-prereq-preflight/v2
+              listener_sources: [/proc/net/tcp, /proc/net/tcp6]
+            # PRESERVATION (codex-tick360 rules 1-5). Inventory DECLARES the selection (members + expected state per member,
+            # or verified_none) as desired lab configuration; the read-only preflight OBSERVES all selected units and their
+            # current states and evaluates each member against ITS expected state. The scope is never derived by filtering on
+            # observed state. Applies to EVERY member of inventory.target_group (a hypervisor does not imply a prior stack; a
+            # non-hypervisor may carry one). Only MAIN runs the privileged observation.
+            preservation:
+              refusal: RH-TARGET-PREREQ-PRESERVATION
+              applies_to: every_target_group_member
+              unit_regex: '^[A-Za-z0-9@_.:-]+[.]service$'      # == the registry pattern service_name (global.yml :1094)
+              # BASIS vocabulary (explicit; no default; rule 3). Exactly one per member; anything else refuses before contact
+              # in target_prereq.yml (prereq_observe.yml also admits `undeclared`: it records matches and evaluates nothing).
+              bases:
+                known_set:
+                  means: the member units are KNOWN (prior deployment declarations / preservation records); each has an expected state
+                  evidence: at least one member role (expected_states.<state>.role) is bound; the verified_none role is absent
+                  absence: an absent member REFUSES (outcome absent); observation never shrinks the declared set
+                verified_none:
+                  means: verified no prior deployment on this member
+                  role: prereq_verified_no_prior_deployment    # bool target input; must be true when present (false refuses)
+                  requires: [the discovery selector role is bound (non-empty), no member role is bound]
+                  check: any LISTED unit matching the discovery selectors REFUSES unless its status is in absent_status AND its state is in absent_states
+              # EXPECTED-STATE vocabulary (per member; rule 1). One string_list target-input role per state (no new pattern:
+              # both roles use the registered service_name pattern). A unit named in two roles refuses (conflicting basis).
+              expected_states:
+                inactive_not_enabled:
+                  role: prereq_preserved_units                 # existing role (var lme_lab_preserved_units)
+                  present: required
+                  refused_states: [running]                    # moved from r3 hypervisor.preserved_refused_states
+                  refused_status: [enabled, enabled-runtime]   # moved from r3 hypervisor.preserved_refused_status
+                retired_absent:
+                  role: prereq_retired_units                   # NEW role (C1 join TP4-ROLE-RETIRED)
+                  present: refused                             # present again = an interrupted / reverted retirement
+              absent_status: [not-found]                       # service_facts status of a LOADED unit whose unit file is gone
+              # ABSENT (codex-tick370 PREREQ-RUNNING-NOTFOUND-ABSENCE) == NOT LISTED by service_facts, OR status in absent_status
+              # AND state in absent_states. Any other state with an absent_status is outcome loaded_without_unit_file (refuses,
+              # route recorded) for every basis. service_facts reports a not-found unit (list-units only) as `running` or
+              # `stopped`, where `stopped` means only sub-state != running (exited / activating / auto-restart / failed are all
+              # `stopped`), so `stopped` is NOT runtime inactivity and is not admitted: with service_facts as the source a
+              # listed not-found unit is never proven inactive and absence today means NOT LISTED (join TP4-ACTIVESTATE-PROBE).
+              absent_states: [inactive]
+              # outcome -> route (rule 5). The preflight RECORDS the outcome and the route and refuses; it never starts, stops,
+              # enables, disables or masks a unit, and never touches a unit outside the declared selection.
+              routes:
+                as_expected: null
+                absent:
+                  mechanism: null
+                  action: >-
+                    MAIN reconciles the preservation record (an interrupted retirement is declared retired_absent only on
+                    retirement evidence; evidence loss is reported). The known set is never shrunk by observation.
+                # running / enabled / present_after_retirement: ONE route (the proposal's &retire anchor, written out)
+                running:
+                  mechanism: testing/e2e/reclaim/reclaim.yml
+                  op: native_service_remove                    # reclaim.decl.yml :74-78 (exact removal of ONE owned native service)
+                  service_var: lme_reclaim_service
+                  status: obstructed
+                  obstruction: >-
+                    reclaim acts only on units named in the target's NATIVE OWNERSHIP LEDGER (/var/lib/lme-owned/ledger.json,
+                    reclaim.decl.yml :109-124); ops.native_service_remove.absent_ledger.native is refuse (:78) and the ledger
+                    producer is the open join JOIN-NATIVE-LEDGER-PRODUCER (:174). The pre-observability development stack is in
+                    no ledger, so no owned retirement authority exists for it today; the legacy blanket wipe
+                    (scripts/wipe_lme.sh via deploy_gate.sh do_wipe) is quarantined by reclaim.decl.yml (:7-12, :152-168) and is
+                    never a route.
+                enabled:
+                  mechanism: testing/e2e/reclaim/reclaim.yml
+                  op: native_service_remove
+                  service_var: lme_reclaim_service
+                  status: obstructed
+                  obstruction: >-
+                    reclaim acts only on units named in the target's NATIVE OWNERSHIP LEDGER (/var/lib/lme-owned/ledger.json,
+                    reclaim.decl.yml :109-124); ops.native_service_remove.absent_ledger.native is refuse (:78) and the ledger
+                    producer is the open join JOIN-NATIVE-LEDGER-PRODUCER (:174). The pre-observability development stack is in
+                    no ledger, so no owned retirement authority exists for it today; the legacy blanket wipe
+                    (scripts/wipe_lme.sh via deploy_gate.sh do_wipe) is quarantined by reclaim.decl.yml (:7-12, :152-168) and is
+                    never a route.
+                present_after_retirement:
+                  mechanism: testing/e2e/reclaim/reclaim.yml
+                  op: native_service_remove
+                  service_var: lme_reclaim_service
+                  status: obstructed
+                  obstruction: >-
+                    reclaim acts only on units named in the target's NATIVE OWNERSHIP LEDGER (/var/lib/lme-owned/ledger.json,
+                    reclaim.decl.yml :109-124); ops.native_service_remove.absent_ledger.native is refuse (:78) and the ledger
+                    producer is the open join JOIN-NATIVE-LEDGER-PRODUCER (:174). The pre-observability development stack is in
+                    no ledger, so no owned retirement authority exists for it today; the legacy blanket wipe
+                    (scripts/wipe_lme.sh via deploy_gate.sh do_wipe) is quarantined by reclaim.decl.yml (:7-12, :152-168) and is
+                    never a route.
+                # listed, absent_status, state not in absent_states (every basis) -- the same &retire route, written out
+                loaded_without_unit_file:
+                  mechanism: testing/e2e/reclaim/reclaim.yml
+                  op: native_service_remove
+                  service_var: lme_reclaim_service
+                  status: obstructed
+                  obstruction: >-
+                    reclaim acts only on units named in the target's NATIVE OWNERSHIP LEDGER (/var/lib/lme-owned/ledger.json,
+                    reclaim.decl.yml :109-124); ops.native_service_remove.absent_ledger.native is refuse (:78) and the ledger
+                    producer is the open join JOIN-NATIVE-LEDGER-PRODUCER (:174). The pre-observability development stack is in
+                    no ledger, so no owned retirement authority exists for it today; the legacy blanket wipe
+                    (scripts/wipe_lme.sh via deploy_gate.sh do_wipe) is quarantined by reclaim.decl.yml (:7-12, :152-168) and is
+                    never a route.
+              # DISCOVERY (rule 2): a declared bounded selector where names are not recorded. Matches outside the member set
+              # are RECORDED (unclassified). Observation alone grants no ownership or retirement authority.
+              discovery:
+                selector_role: obs_unit_patterns               # existing role (var lme_obs_unit_patterns, pattern unit_glob)
+                selector_regex: '^[A-Za-z0-9@_.:*-]+$'         # == the registry pattern unit_glob (global.yml :1065)
+                glob_to_regex: '"^" ~ (glob | regex_escape | replace("\*", ".*")) ~ "$"'   # the one translation (prereq_preflight.yml)
+                source: ansible.builtin.service_facts
+                limit: >-
+                  service_facts lists SYSTEM .service units only (loaded units and unit files). .path / .timer / .socket
+                  units (e.g. lme-llama-model.path) and user-manager units are NOT seen; the route's observe.yml O-PRIOR-STATE
+                  job (system-units / user-units) covers those as recorded evidence. A clean RERUN (cases DR07 / PF14) stays
+                  positive only because the new stack's units are owner (user-manager) units: a SYSTEM unit named by a
+                  selector (lme-*) that runs refuses as an unclassified running match. inactive_not_enabled refuses only
+                  UnitFileState enabled / enabled-runtime (r3 values): a podman-quadlet unit reports `generated` and can still
+                  autostart through generator wants links, yet evaluates as_expected -- MAIN checks the observed status of
+                  each member in the observe record before trusting the expectation (UNRESOLVED; a `generated` refusal would
+                  be a further changed node). `generated` stays ADMITTED despite possible autostart until exact ownership /
+                  lifecycle evidence is joined. Absence is proven only by NOT LISTED (absent_states: a listed not-found unit
+                  is never proven inactive by service_facts). The observation stages ordinary admitted Ansible module
+                  payloads under the root module temp; no deployment-state mutation is intended.
+                outside_known:
+                  refused_states: [running]                    # known_set: an unclassified RUNNING match refuses (recorded)
+              # the read-only OBSERVATION leg that seeds the declaration (rules 2, 6; testing/e2e/target_prereq/prereq_observe.yml)
+              # -- same preflight tasks, no owner key, no effect dependency; MAIN only.
+            observe:
+              runner: MAIN_only
+              playbook_rel: testing/e2e/target_prereq/prereq_observe.yml
+              record_suffix: .prereq-observe.json              # <state dir>/<tr.outputs.prefix><label><suffix>, mode 0600
+              record_schema: lme-target-prereq-observe/v1
+              # the MINIMUM bound target inputs the observation needs (every one input-only; nothing an effect creates; no
+              # owner_key / owner_pubkey / bundle_dir / toolchain_root / prereq_owner_shell / prereq_bundle_root)
+              required_roles: [owner, prereq_owner_home, prereq_work_root, prereq_work_parent_path, prereq_work_parent_owner,
+                               prereq_work_parent_group, prereq_work_parent_mode, obs_paths]
+              optional_roles: [prereq_preserved_units, prereq_retired_units, prereq_verified_no_prior_deployment, obs_unit_patterns]
+              listing: {depth: 1, hidden: true, follow: false, fields: [type, owner, group, mode]}   # per obs_paths entry
+              # refusal policy: the record is ALWAYS written once the controller admitted the inputs; the leg refuses only
+              # when the privileged contact was not admitted. Preflight refusals are recorded as `findings` (what
+              # target_prereq.yml would refuse), never acted on.
+              schema_fields:
+                schema: lme-target-prereq-observe/v1
+                target: inventory alias
+                label: lme_transfer_label
+                scope: '{id, scope_sha256}'
+                declared: '{preservation: {basis, members: {<unit>: <expected state>}, selectors}, obs_paths}'
+                preflight: 'the lme-target-prereq-preflight/v2 body (contact, principal, endpoint, paths incl. the work parent chain, account, os_family, packages, preservation, capacity, linger_tool, refusals)'
+                preservation: 'preflight.preservation: {basis, selectors, selector_regex, evaluated, members: {<unit>: {expected, observed: {state, status, source, selected_by}, outcome, route}}, outside_known: {<unit>: {state, status, source, selected_by}}, limit, refusals}'
+                obs_paths: '{<entry>: {chain: {<ancestor or entry>: {exists, type, uid, gid, owner, group, mode}}, listing: {<child path>: {type, uid, gid, owner, group, mode}} | null, listing_skipped: [...]}}'
+                findings: preflight refusals + preservation refusals (collected; not enforced by this leg)
+                contact: admitted | not_admitted
+            # D -- tool identity observation (codex-tick302 (D); codex-tick328-329 closed required_by partition: controller
+            # [seed, uv_installer, package_source_binding, source_edition_binding, owner_key_generation] / target
+            # [target_adapter, privileged_contact, target_prereq, guest, observation]). After packages, every os_tools entry
+            # labelled with one of the TARGET labels below is hashed on the target and compared with its declared identity:
+            # every member: target_adapter, privileged_contact, target_prereq (loginctl) and observation (the route observation
+            # runner's target tools); hypervisor members additionally guest (the RS guest tools the hypervisor packages provide).
+            # Controller labels are never hashed here (not target tools); that never waives this leg's own target identity
+            # checks (the privileged contact's tools, the linger tool at its use boundary). The record carries a CANDIDATE
+            # per-host lme_global_override ONLY for differing digests; MAIN decides and admits it through the per-run binding;
+            # this leg never applies it. A required tool that is still missing after packages REFUSES.
+            observation:
+              required_by: [target_adapter, privileged_contact, target_prereq, observation]
+              hypervisor_required_by: [guest]
+              override_path: [remote_harness, controller, bootstrap, os_tools]   # lme_global_override nesting (tunable_paths)
+              identity_kind: file_sha256
+              record_suffix: .prereq.json                  # <state dir>/gate.<label><suffix>
+              record_schema: lme-target-prereq/v1
+            # J-KEY (codex: a new leg inside the manifest/credential lifecycle) is NOT a key of this section: it is its own
+            # producer, testing/e2e/target_prereq/owner_key.yml, whose policy source is testing/e2e/target_prereq/owner_key.decl.yml
+            # (registered by C1 as rh.controller.bootstrap.owner_key, JK-1..4 landed; JK-6 delta pending). The generator
+            # (ssh-keygen) is the CONTROLLER os_tools entry required_by [owner_key_generation], delivered through the declared
+            # toolchain (never hand-installed, never target-only). The former proposal text here ('storage_rel: keys',
+            # '<controller state root>/keys/<deployment>/<owner>') is SUPERSEDED: the owned location is
+            #   <W>/<sub_roots.credentials>/<owner_key.storage.keys_rel>/<deployment>/<target>/<owner>/<key_name> (+ pub_suffix),
+            # rendered only by owner_key.location_rule_rel (templates/owner_key_location.j2). The leg's shape, for reference:
+            #   generate  the NON-ROOT controller generates the owner key at that owned location (per target)
+            #   install   MAIN installs the initial authorized key through THIS leg (authorized_key op)
+            #   rotate    an owner-side leg over the CURRENT key: admit the replacement, prove access with it, retire the prior
+          # J-KEY OWNER KEY (B-graph c1-jkey-proposal JK-3; codex-graph-critical-path-key-and-profile-20260925,
+          # codex-tick341): the owner_key_generation PRODUCER's policy, copied VERBATIM (values and comments) from
+          # testing/e2e/target_prereq/owner_key.decl.yml `owner_key` (revision 1): JK-3 from 9c26b51e, re-copied by JK-6 from the
+          # FROZEN decl sha256 4d3ef8880d5a5a934e99f5b3ca7b3ba0b672cce1e3380d9b90ad70eeed0ed2c3 (+ passphrase_argv,
+          # storage.pub_suffix, location_rule_rel, run_order; - storage.deployment_regex). Contract contract_admission.owner_key (exact keys at every level); tunable only
+          # owner_key.generation and owner_key.storage.keys_rel (tunable_paths). Consumer: testing/e2e/target_prereq/owner_key.yml.
+          owner_key:
+            revision: 1
+            runner: controller_non_root         # never root, never become, never SSH; localhost, connection local
+            refusal: JKEY
+            tool_consumer: owner_key_generation # the os_tools required_by label (controller partition); EXACTLY one entry
+            key_type: ed25519
+            # the ed25519 branch of the consumer's tp.authorized_keys.pubkey_regex (target_prereq.decl.yml:70), never looser;
+            # comment_template renders printable ASCII only, so the consumer admits the produced line
+            pubkey_regex: '^ssh-ed25519 [A-Za-z0-9+/]+={0,3}( [ -~]*)?$'
+            name_regex: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'   # storage.sub_root VALUE, keys_rel, key_name, record_name: one segment
+            # DECLARED PROPERTY (MAIN relay 20260925): the automated owner key is UNENCRYPTED. It is generated with -N '' (the
+            # controller runs non-interactively) and the pair check reads it with -P '' (ssh-keygen -y). Its protection is
+            # custody: the 0700 chain + 0600 file owned by the non-root controller on its own work root. An encrypted key at
+            # the owned location fails the pair check (JKEY-PAIR) and is preserved, never re-encrypted or replaced. A passphrase-
+            # protected owner key is a different declared mode (a new revision), never an implicit variant of this one.
+            passphrase: none
+            encryption: unencrypted_by_declaration
+            # The argv the declared mode drives (codex-tick350 C3): consumed by tasks/generate.yml (-N) and tasks/readback.yml
+            # (-P); the leg never embeds a passphrase literal. Keyed by `encryption` so a new declared mode is a new entry (and a
+            # new revision), never an edit of the task argv. Security constraints (uid 0 refusal, custody, no_log) are NOT here:
+            # they are fixed in the leg and independent of topology or naming.
+            passphrase_argv:
+              unencrypted_by_declaration:
+                generate: ['-N', '']
+                pair_check: ['-P', '']
+            comment_template: 'lme-owner:{deployment}:{target}:{owner}:g{generation}'
+            generation: 1                       # bump (declared, C1) to demand a generation change: a PENDING obligation, never
+                                                # an in-place replacement
+            storage:
+              sub_root: credentials             # a key of work_roots.sub_roots (C1 proposal adds credentials: credentials)
+              keys_rel: owner-keys
+              key_name: id_ed25519
+              pub_suffix: .pub                  # the public half: <key><pub_suffix>; the ONE naming source (location rule
+                                                # templates/owner_key_location.j2, the leg, the run-binding macros)
+              next_suffix: .next               # the pending replacement pair: <key>.next / <key>.next.pub
+              record_name: owner_key.record.json
+              dir_mode: '0700'
+              file_mode: '0600'                 # private key and record
+              pub_modes: ['0644', '0600']       # ssh-keygen writes the .pub per umask; both are admitted, nothing is chmod'ed
+              target_regex: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+              owner_regex: '^[a-z_][a-z0-9_-]{0,31}$'
+            # lme_owner_key_op; ensure = fresh or unchanged-reapply; rotate = pending replacement; locate = READ-ONLY: print the
+            # owned location (the exact owner_key / owner_pubkey values MAIN declares in the run binding) and stop before any
+            # write (the owner_key / owner_pubkey inputs are then not required, only the owner)
+            ops: [ensure, rotate, locate]
+            record_schema: lme-owner-key-record/1
+            record_states: [started, done]
+            obligations:
+              kinds: [rotation, generation_change]
+              steps: [admit_replacement, prove_access, retire_prior]
+              # NEVER cleared by this leg: the owner-side rotate leg (target_prereq.decl.yml J-KEY rotate: over the CURRENT key)
+              # admits the replacement, proves access with it and retires the prior; only that leg closes an obligation.
+              closed_by: owner_rotate_leg
+              # OLD RECOVERY MATERIAL (codex-tick341 J-KEY clarification): the CURRENT pair (<key>, <key>.pub) is the recovery
+              # material while an obligation is pending. This leg never moves, overwrites, deletes or chmods it; a reapply keeps
+              # it and keeps reporting the obligation. RETIREMENT CONDITION (all three, recorded by the owner rotate leg in THIS
+              # record's obligation, never inferred): (1) admit_replacement: the .next public line is installed in the target
+              # owner's authorized_keys (readback digest recorded); (2) prove_access: a fresh owner-profile connection
+              # authenticated ONLY with the .next key succeeded on the target (receipt recorded with its fingerprint);
+              # (3) retire_prior: the prior public line is removed from authorized_keys and the removal read back. Only after
+              # (3) may the prior pair be removed and the .next pair promoted to the declared name, by that leg.
+              retirement_condition: [admit_replacement_readback, prove_access_next_only, retire_prior_readback]
+            never_rotated: [privileged_bootstrap_key]
+            # readback (every run, also the no-op; codex-tick341): a fingerprint alone does NOT prove the pair. Adoption needs
+            # BOTH the declared custody (regular file, not a link, owned by the running uid, declared mode, 0700 parent chain)
+            # AND tool-verified pair correspondence: the admitted ssh-keygen may read the private key internally
+            # (ssh-keygen -y -f <key>) and the DERIVED public line (type + base64) must equal the .pub line; then the .pub
+            # fingerprint (ssh-keygen -l -E sha256 -f <pub>) must equal the record's. Private bytes are never slurped, registered
+            # or written to logs / receipts (every tool call touching the private key is no_log; every stat of a private file
+            # sets get_checksum / get_mime / get_attributes false).
+            readback: {fingerprint_hash: sha256, compare_fields: 2}
+            pub_digest: 'sha256 of the TRIMMED one-line public key (the same digest target_prereq tp_ctl.pubkey_sha256 computes)'
+            entry_guard:
+              derived: [jk, jk_dir]
+              family: reserved_owner_key_vars   # '^_?jk_[A-Za-z0-9_]+$' (C1 proposal); the bare name jk is refused inline
+            cases_rel: testing/e2e/target_prereq/controls/CASES.yml
+            # THE location rule (codex-tick350 GRAPH-BINDING-TEMPLATE-TOPOLOGY): the ONE value-pure template that renders
+            # {work_root, chain, keydir, key, pub, next, next_pub, record} from (bootstrap, repo root, deployment, target, owner).
+            # The producer (tasks/bind_controller.yml) and the run-binding macros (ansible/inventory/macros/run_binding.j2)
+            # both render THIS file (repo-relative) by lookup; neither re-encodes the naming.
+            location_rule_rel: testing/e2e/target_prereq/templates/owner_key_location.j2
+            # RUN ORDER (codex-tick356 (b); declared, argv in c1-jkey-proposal main_invocation). The producer runs AFTER the
+            # controller package/apply (its tool is admitted by the controller receipt; resolve_harness verifies it) and the run
+            # binding render (its owner / target inputs and the derived owner_key / owner_pubkey paths come from that binding),
+            # and BEFORE every consumer of its output: target_prereq.yml reads the owner .pub in its FIRST play, pre-contact
+            # (prereq-controller, before prereq-preflight), and installs it (authorized_key); target_bootstrap.yml connects with
+            # the owner key (connection_profiles.owner.key_var). A consumer run before it refuses (absent .pub), never waits.
+            run_order:
+              after: [controller_package_apply, run_binding_render]
+              before: [target_prereq, target_bootstrap]
+          # SEED FRAGMENTS (codex-tick313 R2(a); codex-tick318-321 (c): the SOLE authority, no extra-var fallback):
+          # the installed-set gate fragment the seed imports (global.yml host_scope.shared_artifacts.installed_set_gate,
+          # entry template; contract seed_fragments: the rel must EQUAL that entry template byte-for-byte).
+          seed_fragments:
+            installed_set_gate_rel: testing/remote_harness/templates/lme-seed-installed-set-gate.sh.j2
           # S1 / codex-tick127: the managed TARGET bootstrap is the SAME operation (same bundle, same seed bytes, same
           # receipt schema, same verifier), transported by remote_harness.transfer and applied by the declared NON-ROOT
           # owner (testing/remote_harness/target_bootstrap.yml). It connects AS the owner (ansible_user == owner var,
@@ -1489,13 +2185,19 @@ profile_overlay:
       # logical package so a preflight refusal names what MAIN must install (root step, MAIN-only, not in this slice).
       packages:
         by_os_family:
-          Debian: {git: git, jq: jq, curl: curl, ca_certificates: ca-certificates, tar: tar, gzip: gzip, xz: xz-utils, coreutils: coreutils, diffutils: diffutils, findutils: findutils, util_linux: util-linux, systemd: systemd, libc_tools: libc-bin, sed: sed, grep: grep, awk: mawk, dash: dash, acl: acl}
-          RedHat: {git: git, jq: jq, curl: curl, ca_certificates: ca-certificates, tar: tar, gzip: gzip, xz: xz, coreutils: coreutils, diffutils: diffutils, findutils: findutils, util_linux: util-linux, systemd: systemd, libc_tools: glibc-common, sed: sed, grep: grep, awk: gawk, dash: bash, acl: acl}
+          Debian: {git: git, jq: jq, curl: curl, ca_certificates: ca-certificates, tar: tar, gzip: gzip, xz: xz-utils, coreutils: coreutils, diffutils: diffutils, findutils: findutils, util_linux: util-linux, systemd: systemd, libc_tools: libc-bin, sed: sed, grep: grep, awk: mawk, dash: dash, acl: acl, openssh_client: openssh-client, qemu_utils: qemu-utils, qemu_system_x86: qemu-system-x86, cloud_image_utils: cloud-image-utils}
+          RedHat: {git: git, jq: jq, curl: curl, ca_certificates: ca-certificates, tar: tar, gzip: gzip, xz: xz, coreutils: coreutils, diffutils: diffutils, findutils: findutils, util_linux: util-linux, systemd: systemd, libc_tools: glibc-common, sed: sed, grep: grep, awk: gawk, dash: bash, acl: acl, openssh_client: openssh, qemu_utils: qemu-img, qemu_system_x86: qemu-kvm, cloud_image_utils: cloud-utils}
+        # qemu_utils / qemu_system_x86 / cloud_image_utils (TP-REG): controller.bootstrap.target_prereq.packages
+        # .hypervisor_required, which package_mapping.required_lists (global) requires in EVERY family once the node is
+        # declared. Names from B (graph-shared PKGS fixture / target_prereq.decl 743b68e8 packages comment); the RedHat
+        # names are UNVERIFIED (B).
+        # openssh_client (J-KEY JK-1b) is a CONTROLLER-only logical package (ssh-keygen, required_by owner_key_generation):
+        # mapped in every family and named in provides so a refusal names it, but NOT in `required` (the TARGET install list).
         required: [jq, curl, ca_certificates, tar, gzip, xz, coreutils, diffutils, findutils, util_linux, systemd, libc_tools, sed, grep, awk, dash, acl]
         conditional: {git: [package_source_binding, source_edition_binding]}
         provides:
           dash: [sh]
-          coreutils: [env, id, uname, cut, stat, realpath, df, du, date, mkdir, mktemp, mv, rm, rmdir, chmod, cat, head, tail, base64, sort, sha256sum, 'true']
+          coreutils: [env, id, uname, cut, stat, realpath, df, du, date, mkdir, mktemp, mv, rm, rmdir, chmod, cat, head, tail, base64, sort, sha256sum, 'true', timeout, readlink]
           libc_tools: [ldd, getent]
           grep: [grep]
           sed: [sed]
@@ -1505,10 +2207,11 @@ profile_overlay:
           diffutils: [cmp, diff]
           findutils: [find, xargs]
           curl: [curl]
-          systemd: [systemd-run]
-          util_linux: [flock]
+          systemd: [systemd-run, systemctl, systemd-analyze, busctl, loginctl]
+          util_linux: [flock, findmnt, lsblk]
           git: [git]
           acl: [getfacl]
+          openssh_client: [ssh-keygen]
 
       # ---- deploy transfer (codex-tick119 R1_R3_seam_direction R1) ----
       # The transfer operation's dependencies are declared on BOTH ends. Selected: the managed_archive adapter, which

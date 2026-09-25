@@ -1,0 +1,757 @@
+---
+# testing/e2e/inventory_binding/render_run_binding.yml -- ENTRY: RENDER-RUNNER for the run binding
+# <run>/.work/inventory/<lab>/20-binding.yml (B-owned; B coordinator packet after the JK-6 freeze). AUTHORED, NEVER
+# EXECUTED. Its C1 dependencies are registered in the current profile (2a1eb60c...): rh.controller.bootstrap.owner_key
+# location_rule_rel (~:1955; read by macros/run_binding.j2:78) and inventory.role_groups. The ^_?rb_ family is reserved in
+# global.yml (8997a715..., reserved_rb_vars :1119), so the shared family guard refuses a pinned rb_ name before the inline guard.
+#
+# CHICKEN-AND-EGG, resolved through the EXISTING mechanism: resolve_harness.yml needs the controller root / owner
+# (inventory.root_var / owner_var), which only the binding supplies. This entry therefore stops at the ENGINE resolve
+# (tasks/resolve_policy.yml: profile remote-harness over the checkout), which already yields rh.controller.bootstrap and
+# lme_resolved -- everything the macros need. It never calls resolve_harness.yml / verify_toolchain_receipt.yml; the
+# managed executor is still the seed launcher's `run <controller root>` environment. No second loader, no merge engine,
+# no raw inventory read: the file inputs are the per-run data (MAIN's; read ONCE as exact bytes, hashed and parsed from
+# those bytes) and the lab copy (hashed by stat, never parsed here: the engine resolve read it as inventory).
+#
+# ARGV. Started by MAIN through the route's seed launcher as the NON-ROOT controller owner, AFTER apply (10-lab.yml
+# copied) and BEFORE owner_key.yml:
+#   <bundle>/lme-seed-launch.sh run <run>/.work/toolchain explicit_key \
+#     -i <operator controller inventory> -i <run>/.work/inventory/<lab>/10-lab.yml \
+#     testing/e2e/inventory_binding/render_run_binding.yml \
+#     -e lme_run_binding_data=<run>/.work/inventory/<lab>.run-data.yml \
+#     -e lme_run_binding_dest=<run>/.work/inventory/<lab>/20-binding.yml \
+#     [-e lme_run_binding_supersedes=<sha256 of the receipt being superseded>]
+# (the launcher's SSH auth mode is unused: this leg contacts no host). Both -i reach ansible-playbook unchanged: the
+# launcher execs the seed with "$@" (controller_seed.j2 launch_exec {args}), and seed `run` rebuilds
+# `run --root R --ssh-auth M -- "$@"` and execs the generation's ansible-playbook "$@" UNSCREENED (only run-local
+# screens its arguments). ONE play, localhost, connection local, no become.
+#
+# INPUTS
+#   lme_run_binding_data        MAIN's per-run data file: ONLY hosts.<alias> (e.g. graph: {roles: {privileged_key:
+#                               <path>}, bundle: {leaf: <64 hex>}}); any other top-level key refuses in the macro
+#                               (RUN-BINDING-DERIVED-INPUT). Absolute, normalized, OUTSIDE the binding's directory.
+#   lme_run_binding_dest        the binding path <dir>/20-binding.yml; <dir>/10-lab.yml is the lab copy.
+#   lme_run_binding_supersedes  OPTIONAL, 64 hex: the explicit configuration-revision transition input -- the sha256
+#                               of the CURRENT RECEIPT file <dir>.binding-receipt.yml (its exact bytes, one read; the
+#                               FULL revision identity of the pair: it binds binding_sha256, data/lab digests,
+#                               policy_sha256, engine_revision, controller_inventory and its own transition). The
+#                               superseded pair is retained under <dir>.superseded/<that sha256>/, so equal-output
+#                               (input-only) revisions each keep a distinct retained pair (codex-tick370
+#                               RUN-BINDING-EQUAL-OUTPUT-REVISION-CHAIN).
+#   inventory sources           EXACTLY two: the lab copy <dir>/10-lab.yml (whose all.vars declares
+#                               lme_deployment_identity, codex-tick360) and the operator controller inventory
+#                               (the one package.yml used; localhost carries rh_bundle_dir / rh_artifact_source /
+#                               rh_acquisition_receipt). No source may be (or contain) the binding dir, the binding, the
+#                               receipt, the superseded root or the run data. Membership of the lab in
+#                               ansible_inventory_sources shows the lab was GIVEN to the resolve. The CLI normalizes
+#                               each -i path (ansible/cli/__init__.py: unfrackpath(opt, follow=False)), so the lab must
+#                               be passed as <dir>/10-lab.yml (not through a link to it).
+# DERIVED (rb_derived; never inputs -- every ^_?rb_ name is refused pre-supplied, RUN-BINDING-RENDER-PINNED):
+#   deployment_identity  lme_resolved | lme_validated_deployment_identity (the J-KEY leg's canonical filter,
+#                        bind_controller.yml) -- the EFFECTIVE resolved value. The lab all.vars is its declared source,
+#                        but NOT an exclusive origin: Ansible precedence lets an approved operator input (extra var,
+#                        controller-inventory var) override it, and such approved overrides are preserved; the runner
+#                        validates the effective value only. Never from rb_run (the macro refuses any non-hosts key).
+#   lab_sha256           stat sha256 of <dir>/10-lab.yml.
+#   controller           {toolchain_root: rh_repo_root/<work_roots.root_rel>/<work_roots.sub_roots.toolchain>,
+#                         owner: `<os_tools.id> -un`, bundle_dir / artifact_source / acquisition_receipt: localhost
+#                         rh_bundle_dir / rh_artifact_source / rh_acquisition_receipt of the controller inventory},
+#                        each an admitted absolute path (controller.bootstrap.path_admission).
+#   bound                lme_resolved.remote_harness.binding.deployment.target_inputs (| default({}), mirroring
+#                        target_prereq/tasks/bind_controller.yml:165; an absent binding yields no derived owner_key).
+# OUTPUTS (0600 files, 0700 dirs; created only when absent, never chmod/chown of an existing path):
+#   lme_run_binding_dest                       the rendered binding (exact bytes of the in-memory render)
+#   <dir>.binding-receipt.yml                  {binding, binding_sha256, controller_inventory, data, data_sha256,
+#                                               deployment_identity, engine_revision, lab, lab_sha256, policy_sha256,
+#                                               transition: null | {from (superseded receipt sha256),
+#                                               from_binding_sha256, to (new binding sha256), retained,
+#                                               from_policy_sha256, from_engine_revision}}
+#   <dir>.superseded/<S>/{binding.yml, receipt.yml}   retained superseded pair (transition only; <S> = superseded
+#                                               receipt sha256; dir created exclusively). The member names are FIXED
+#                                               literals, never derived from the dest / receipt basenames, so the two
+#                                               retained members cannot collide (codex-tick370
+#                                               RUN-BINDING-RETAINED-PATH-COLLISION); every path is also refused
+#                                               colliding before any effect (RUN-BINDING-RENDER-COLLISION).
+#   (receipt and superseded tree sit OUTSIDE the -i paths, so no inventory parser ever reads them)
+# RENDER LIFECYCLE (codex-tick360 render_lifecycle). The binding text is rendered IN MEMORY (template lookup of the
+# thin caller ansible/inventory/graph_lab_run_binding.yml.j2) and hashed (H); the destination pair is observed
+# (stat, follow: false). Every CONSUMED receipt (current and retained) is bound with the SAME one-read mechanism as the
+# run data (codex-tick370 RUN-BINDING-LIFECYCLE-RECEIPT-BYTES): ONE slurp, sha256 of those bytes == the stat checksum
+# (else CONFLICT: replaced between observation and read), parsed from those same bytes. Then the pair is classified
+# ONCE into exactly one state, BEFORE any write (S = supersedes = a receipt sha256; B_old = that receipt's
+# binding_sha256):
+#   publish             binding + receipt absent (no supersedes)       -> write binding, read back == H, write receipt
+#   reuse               binding == H, receipt verified, same inputs    -> NO write; report reused (with supersedes: only
+#                                                                         if the receipt's transition.from equals it)
+#   resume_receipt      binding == H, receipt absent (no supersedes)   -> write the receipt only (interrupted publish)
+#   transition          supersedes S given, verified pair whose receipt file sha256 == S, rendered bytes or inputs
+#                       differ (an equal-output, input-only revision included) -> mkdir <dir>.superseded (if absent)
+#                       and .../<S> (EXCLUSIVE), mv -n -T receipt -> <S>/receipt.yml, read back (source gone,
+#                       destination sha256 == S), mv -n -T binding -> <S>/binding.yml, read back (source gone,
+#                       destination sha256 == B_old); a no-clobber move that did not happen refuses CONFLICT with both
+#                       byte sets preserved; then publish the new pair with the transition recorded. EXTENSION (beyond
+#                       the single interrupted case): an interrupted transition resumes from the verified retained pair
+#                       with the SAME -e supersedes (retained dir present; each step done only when its verified
+#                       precondition holds). LINEAGE: while <dir>.superseded exists, publish and resume_receipt are NOT
+#                       admitted without -e supersedes (an absent pair or a receipt-less binding may be an interrupted
+#                       transition) -> CONFLICT; the rerun must name S.
+#   revision            verified pair, binding != H or inputs differ, no supersedes  -> REFUSED RUN-BINDING-RENDER-REVISION
+#   supersedes_mismatch supersedes S is not the verified receipt's sha256 / recorded transition -> REFUSED ...-REVISION
+#   supersedes_nothing  supersedes S given but no pair exists          -> REFUSED ...-REVISION
+#   conflict            anything unverified: receipt without binding, binding != H without a verified receipt, receipt
+#                       unparseable / read bytes != stat digest / wrong key set / other binding path /
+#                       binding_sha256 != file, link or
+#                       non-regular, wrong owner or mode (files 0600, dirs 0700), inconsistent retained state, or a
+#                       read-back mismatch after a write -> REFUSED RUN-BINDING-RENDER-CONFLICT; every byte preserved,
+#                       paths and observed sha256 reported.
+#   Reading (codex-tick360 "changed inputs need an explicit configuration-revision transition"): a verified pair whose
+#   recorded inputs differ from the current ones (policy_sha256, data, lab, ...) is REVISION, not CONFLICT, even when
+#   the rendered bytes are equal; CONFLICT is reserved for receipts that do not vouch for the observed binding.
+#   Receipts from the frozen 07f4c3d8 renderer (different key set) classify as CONFLICT -- intended.
+# Refusals: RUN-BINDING-RENDER-PINNED, RUN-BINDING-RENDER-INPUT, RUN-BINDING-RENDER-COLLISION, RUN-BINDING-RENDER-LAB,
+# RUN-BINDING-RENDER-IDENTITY, RUN-BINDING-RENDER-CONTROLLER, RUN-BINDING-RENDER-REVISION,
+# RUN-BINDING-RENDER-CONFLICT, and every RUN-BINDING-*
+# refusal of ansible/inventory/macros/run_binding.j2 (its REFUSED text appears inside the render task's lookup error
+# chain; the render task is not in a rescue block, so no code is rewritten).
+- name: render-run-binding
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Refuse pre-supplied harness outputs and derive the repository root (route author; first task)
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname | dirname | dirname }}/testing/remote_harness/tasks/refuse_pinned_outputs.yml"
+
+    - name: Refuse pre-supplied names of a reserved family (B family guard; second task)
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/transfer/tasks/refuse_reserved_families.yml"
+
+    # every fact, register, task var and loop var of this entry fully matches ^_?rb_[A-Za-z0-9_]+$; extra-vars outrank
+    # all of them, so the WHOLE family is refused inline (no name list to miss; rb_refused must stay undefined: the
+    # macros' refusal sentinel)
+    - name: Refuse any supplied render-derived name (the ^_?rb_ family; extra-vars / inventory outrank derivations)
+      ansible.builtin.assert:
+        that:
+          - (vars | list) | select('match', '^_?rb_') | list | length == 0
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-PINNED: {{ (vars | list) | select('match', '^_?rb_') | sort | list }} are derived by
+          this entry (the ^_?rb_ family), never inputs.
+        quiet: true
+
+    - name: Refuse undeclared or misplaced inputs (absolute paths; data outside the binding directory; supersedes shape)
+      ansible.builtin.assert:
+        that:
+          - lme_run_binding_data is defined and lme_run_binding_data is string and lme_run_binding_data is abs
+          - lme_run_binding_dest is defined and lme_run_binding_dest is string and lme_run_binding_dest is abs
+          - lme_run_binding_data | normpath == lme_run_binding_data
+          - lme_run_binding_dest | normpath == lme_run_binding_dest
+          - (lme_run_binding_dest | dirname) != '/'
+          - (lme_run_binding_dest | basename) != '10-lab.yml'
+          - (lme_run_binding_data | dirname) != (lme_run_binding_dest | dirname)
+          - not (lme_run_binding_data.startswith((lme_run_binding_dest | dirname) ~ '/'))
+          - not (lme_run_binding_data.startswith((lme_run_binding_dest | dirname) ~ '.superseded/'))
+          - lme_run_binding_data != (lme_run_binding_dest | dirname) ~ '.binding-receipt.yml'
+          - >-
+            lme_run_binding_supersedes is not defined or (lme_run_binding_supersedes is string
+            and lme_run_binding_supersedes is regex('[0-9a-f]{64}', match_type='fullmatch'))
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-INPUT: lme_run_binding_data and lme_run_binding_dest must be normalized absolute
+          paths (dest not 10-lab.yml), the per-run data must live OUTSIDE the binding's directory, receipt and superseded
+          tree (every file under -i is parsed as inventory), and lme_run_binding_supersedes, when given, must be exactly
+          64 lowercase hex.
+        quiet: true
+
+    - name: Derive the render paths (binding, receipt, superseded root, lab copy, run data)
+      ansible.builtin.set_fact:
+        rb_out:
+          binding: "{{ lme_run_binding_dest }}"
+          dir: "{{ lme_run_binding_dest | dirname }}"
+          receipt: "{{ lme_run_binding_dest | dirname }}.binding-receipt.yml"
+          root: "{{ lme_run_binding_dest | dirname }}.superseded"
+          retained: >-
+            {{ ((lme_run_binding_dest | dirname) ~ '.superseded/' ~ lme_run_binding_supersedes)
+               if lme_run_binding_supersedes is defined else '' }}
+          # FIXED member names (never the dest / receipt basenames): the retained members cannot collide
+          kept_binding: >-
+            {{ ((lme_run_binding_dest | dirname) ~ '.superseded/' ~ lme_run_binding_supersedes ~ '/binding.yml')
+               if lme_run_binding_supersedes is defined else '' }}
+          kept_receipt: >-
+            {{ ((lme_run_binding_dest | dirname) ~ '.superseded/' ~ lme_run_binding_supersedes ~ '/receipt.yml')
+               if lme_run_binding_supersedes is defined else '' }}
+          lab: "{{ lme_run_binding_dest | dirname }}/10-lab.yml"
+          data: "{{ lme_run_binding_data }}"
+
+    - name: Refuse colliding render paths (every consumed / written / retained path distinct; before any effect)
+      ansible.builtin.assert:
+        that:
+          - >-
+            ([rb_out.binding, rb_out.receipt, rb_out.lab, rb_out.data, rb_out.dir, rb_out.root]
+             + ([rb_out.retained, rb_out.kept_binding, rb_out.kept_receipt] if lme_run_binding_supersedes is defined else []))
+            | unique | list | length
+            == 6 + (3 if lme_run_binding_supersedes is defined else 0)
+          - >-
+            lme_run_binding_supersedes is not defined
+            or ((rb_out.kept_binding | basename) != (rb_out.kept_receipt | basename)
+                and (rb_out.kept_binding | dirname) == rb_out.retained
+                and (rb_out.kept_receipt | dirname) == rb_out.retained
+                and (rb_out.retained | dirname) == rb_out.root)
+          - (rb_out.binding | dirname) == rb_out.dir and (rb_out.lab | dirname) == rb_out.dir
+          - (rb_out.binding | basename) != (rb_out.lab | basename)
+          - not ((rb_out.data ~ '/').startswith(rb_out.root ~ '/'))
+          - not ((rb_out.root ~ '/').startswith(rb_out.data ~ '/'))
+          - not ((rb_out.dir ~ '/').startswith(rb_out.data ~ '/'))
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-COLLISION: the render paths collide (binding {{ rb_out.binding }}, receipt
+          {{ rb_out.receipt }}, lab {{ rb_out.lab }}, data {{ rb_out.data }}, dir {{ rb_out.dir }}, superseded root
+          {{ rb_out.root }}, retained {{ rb_out.retained | default('-', true) }} {{ rb_out.kept_binding | default('-', true) }}
+          {{ rb_out.kept_receipt | default('-', true) }}); nothing touched.
+        quiet: true
+
+    - name: Refuse a run whose inventory sources are not exactly the lab copy plus one controller inventory
+      ansible.builtin.assert:
+        that:
+          - rb_out.lab in ansible_inventory_sources
+          - ansible_inventory_sources | reject('equalto', rb_out.lab) | list | length == 1
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-LAB: the inventory sources {{ ansible_inventory_sources }} must be exactly the lab
+          copy {{ rb_out.lab }} (the file the resolve reads; its all.vars declares lme_deployment_identity) and ONE
+          operator controller inventory.
+        quiet: true
+
+    - name: Refuse an inventory source that is, contains or lies in a render output or the run data
+      ansible.builtin.assert:
+        that:
+          - rb_src_i is string and rb_src_i is abs
+          - >-
+            rb_src_i == rb_out.lab
+            or ([rb_out.dir, rb_out.binding, rb_out.receipt, rb_out.root, rb_out.data]
+                | map('regex_replace', '$', '/') | select('match', (rb_src_i ~ '/') | regex_escape) | list | length == 0)
+          - >-
+            rb_src_i == rb_out.lab
+            or not ((rb_src_i ~ '/').startswith(rb_out.dir ~ '/') or (rb_src_i ~ '/').startswith(rb_out.root ~ '/'))
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-INPUT: inventory source {{ rb_src_i }} is not absolute, or is / contains / lies in
+          the binding directory {{ rb_out.dir }}, the receipt {{ rb_out.receipt }}, the superseded root {{ rb_out.root }}
+          or the run data {{ rb_out.data }} (only the lab copy may be an -i path there).
+        quiet: true
+      loop: "{{ ansible_inventory_sources }}"
+      loop_control:
+        loop_var: rb_src_i
+
+    - name: Resolve the harness policy through the engine (no controller root / owner needed; rh.controller.bootstrap)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_policy.yml"
+
+    - name: Read the running uid (controller; declared tool)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.id.path }}", -u]
+      register: rb_uid
+      changed_when: false
+
+    - name: Read the running account name (controller owner; declared tool)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.id.path }}", -un]
+      register: rb_user
+      changed_when: false
+
+    - name: Observe the lab copy, the run data and the binding directory (no link followed)
+      ansible.builtin.stat:
+        path: "{{ rb_st_i }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: ["{{ rb_out.lab }}", "{{ rb_out.data }}", "{{ rb_out.dir }}"]
+      loop_control:
+        loop_var: rb_st_i
+      register: rb_st_in
+
+    - name: Refuse an absent or non-regular lab copy / run data, or a binding directory that is not a real directory
+      ansible.builtin.assert:
+        that:
+          - rb_st_in.results[0].stat.exists and rb_st_in.results[0].stat.isreg and not rb_st_in.results[0].stat.islnk
+          - rb_st_in.results[1].stat.exists and rb_st_in.results[1].stat.isreg and not rb_st_in.results[1].stat.islnk
+          - rb_st_in.results[2].stat.exists and rb_st_in.results[2].stat.isdir and not rb_st_in.results[2].stat.islnk
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-LAB: {{ rb_out.lab }} and {{ rb_out.data }} must be existing regular files (no
+          link) and {{ rb_out.dir }} a real directory.
+        quiet: true
+
+    - name: Read the run data ONCE as exact bytes (hashed and parsed from these same bytes)
+      ansible.builtin.slurp:
+        src: "{{ rb_out.data }}"
+      register: rb_data_raw
+
+    - name: Refuse run data whose read bytes are not the observed file, or that is not a mapping
+      ansible.builtin.assert:
+        that:
+          - (rb_data_raw.content | b64decode | hash('sha256')) == rb_st_in.results[1].stat.checksum
+          - (rb_data_raw.content | b64decode | from_yaml) is mapping
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-INPUT: {{ rb_out.data }} changed between observation
+          ({{ rb_st_in.results[1].stat.checksum }}) and read ({{ rb_data_raw.content | b64decode | hash('sha256') }}),
+          or its YAML is not a mapping.
+        quiet: true
+
+    - name: Derive the render inputs (policy and identity from the resolve, controller from the run, hosts from MAIN)
+      ansible.builtin.set_fact:
+        rb_bs: "{{ rh.controller.bootstrap }}"
+        rb_repo_root: "{{ rh_repo_root }}"
+        rb_run: "{{ rb_data_raw.content | b64decode | from_yaml }}"
+        rb_derived:
+          deployment_identity: "{{ lme_resolved | lme_validated_deployment_identity }}"
+          lab_sha256: "{{ rb_st_in.results[0].stat.checksum }}"
+          controller:
+            toolchain_root: >-
+              {{ rh_repo_root ~ '/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/'
+                 ~ rh.controller.bootstrap.work_roots.sub_roots.toolchain }}
+            owner: "{{ rb_user.stdout }}"
+            bundle_dir: "{{ rh_bundle_dir | default(none) }}"
+            artifact_source: "{{ rh_artifact_source | default(none) }}"
+            acquisition_receipt: "{{ rh_acquisition_receipt | default(none) }}"
+          bound: "{{ lme_resolved.remote_harness.binding.deployment.target_inputs | default({}) }}"
+
+    - name: Refuse an absent effective deployment identity (resolved; never minted, never from rb_run)
+      ansible.builtin.assert:
+        that:
+          - rb_derived.deployment_identity is string and rb_derived.deployment_identity | length > 0
+          - rb_derived.deployment_identity == (lme_resolved | lme_validated_deployment_identity)
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-IDENTITY: the effective resolved lme_deployment_identity (declared in the lab copy
+          {{ rb_out.lab }} all.vars unless an approved operator input overrides it by Ansible precedence; validated by
+          lme_validated_deployment_identity) is unset or empty; the render never takes it from the run data or mints one.
+        quiet: true
+
+    - name: Refuse controller values that are not admitted absolute paths / a non-root owner
+      ansible.builtin.assert:
+        that:
+          - (rb_uid.stdout | int) != 0
+          - rb_user.stdout is string and rb_user.stdout is regex('[A-Za-z0-9._][A-Za-z0-9._-]*', match_type='fullmatch')
+          - rh.controller.bootstrap.work_roots.root_rel is regex('[A-Za-z0-9._-]+', match_type='fullmatch')
+          - rh.controller.bootstrap.work_roots.sub_roots.toolchain is regex('[A-Za-z0-9._-]+', match_type='fullmatch')
+          - rb_derived.bound is mapping
+          - >-
+            [rb_derived.controller.toolchain_root, rb_derived.controller.bundle_dir,
+             rb_derived.controller.artifact_source, rb_derived.controller.acquisition_receipt]
+            | reject('string') | list | length == 0
+          - >-
+            [rb_derived.controller.toolchain_root, rb_derived.controller.bundle_dir,
+             rb_derived.controller.artifact_source, rb_derived.controller.acquisition_receipt]
+            | reject('abs') | list | length == 0
+          - >-
+            [rb_derived.controller.toolchain_root, rb_derived.controller.bundle_dir,
+             rb_derived.controller.artifact_source, rb_derived.controller.acquisition_receipt]
+            | map('normpath') | list
+            == [rb_derived.controller.toolchain_root, rb_derived.controller.bundle_dir,
+                rb_derived.controller.artifact_source, rb_derived.controller.acquisition_receipt]
+          - >-
+            [rb_derived.controller.toolchain_root, rb_derived.controller.bundle_dir,
+             rb_derived.controller.artifact_source, rb_derived.controller.acquisition_receipt]
+            | reject('match', rh.controller.bootstrap.path_admission.regex) | list | length == 0
+          - >-
+            [rb_derived.controller.toolchain_root, rb_derived.controller.bundle_dir,
+             rb_derived.controller.artifact_source, rb_derived.controller.acquisition_receipt]
+            | select('search', rh.controller.bootstrap.path_admission.forbidden_segment_regex) | list | length == 0
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-CONTROLLER: the controller values {{ rb_derived.controller }} must be admitted
+          normalized absolute paths (controller.bootstrap.path_admission; bundle_dir / artifact_source /
+          acquisition_receipt are the localhost rh_bundle_dir / rh_artifact_source / rh_acquisition_receipt of the
+          operator controller inventory), the owner the non-root running account, and the lab binding a mapping.
+        quiet: true
+
+    # the macros' RUN-BINDING-* refusals surface in this task's lookup error (it is NOT in a rescue block)
+    - name: Render the run binding IN MEMORY (thin caller over the generic macros; nothing written)
+      ansible.builtin.set_fact:
+        rb_text: >-
+          {{ lookup('ansible.builtin.template', rh_repo_root ~ '/ansible/inventory/graph_lab_run_binding.yml.j2',
+                    template_vars={'rb_bs': rb_bs, 'rb_repo_root': rb_repo_root, 'rb_run': rb_run,
+                                   'rb_derived': rb_derived}) }}
+
+    - name: Hash the rendered text and fix the current receipt inputs
+      ansible.builtin.set_fact:
+        rb_sha256: "{{ rb_text | hash('sha256') }}"
+        rb_in:
+          binding: "{{ rb_out.binding }}"
+          controller_inventory: "{{ ansible_inventory_sources | reject('equalto', rb_out.lab) | list }}"
+          data: "{{ rb_out.data }}"
+          data_sha256: "{{ rb_data_raw.content | b64decode | hash('sha256') }}"
+          deployment_identity: "{{ rb_derived.deployment_identity }}"
+          engine_revision: "{{ rh_engine_revision }}"
+          lab: "{{ rb_out.lab }}"
+          lab_sha256: "{{ rb_derived.lab_sha256 }}"
+          policy_sha256: "{{ rh_config_revision }}"
+
+    - name: Observe the destination pair and the superseded root (no link followed)
+      ansible.builtin.stat:
+        path: "{{ rb_st_i }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: ["{{ rb_out.binding }}", "{{ rb_out.receipt }}", "{{ rb_out.root }}"]
+      loop_control:
+        loop_var: rb_st_i
+      register: rb_st_pair
+
+    - name: Observe the retained pair named by the transition input (no link followed)
+      ansible.builtin.stat:
+        path: "{{ rb_st_i }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: ["{{ rb_out.retained }}", "{{ rb_out.kept_binding }}", "{{ rb_out.kept_receipt }}"]
+      loop_control:
+        loop_var: rb_st_i
+      register: rb_st_ret
+      when: lme_run_binding_supersedes is defined
+
+    # custody: file = regular, no link, owned by the running uid, mode 0600; dir = real dir, no link, owned, 0700
+    - name: Classify the custody of every observed path (absent | ok | bad; n/a without a transition input)
+      ansible.builtin.set_fact:
+        rb_obs:
+          b: >-
+            {{ 'absent' if not rb_st_pair.results[0].stat.exists else ('ok' if (rb_st_pair.results[0].stat.isreg
+               and not rb_st_pair.results[0].stat.islnk and rb_st_pair.results[0].stat.uid == (rb_uid.stdout | int)
+               and rb_st_pair.results[0].stat.mode == '0600') else 'bad') }}
+          b_sha: "{{ rb_st_pair.results[0].stat.checksum | default('') }}"
+          r: >-
+            {{ 'absent' if not rb_st_pair.results[1].stat.exists else ('ok' if (rb_st_pair.results[1].stat.isreg
+               and not rb_st_pair.results[1].stat.islnk and rb_st_pair.results[1].stat.uid == (rb_uid.stdout | int)
+               and rb_st_pair.results[1].stat.mode == '0600') else 'bad') }}
+          r_sha: "{{ rb_st_pair.results[1].stat.checksum | default('') }}"
+          root: >-
+            {{ 'absent' if not rb_st_pair.results[2].stat.exists else ('ok' if (rb_st_pair.results[2].stat.isdir
+               and not rb_st_pair.results[2].stat.islnk and rb_st_pair.results[2].stat.uid == (rb_uid.stdout | int)
+               and rb_st_pair.results[2].stat.mode == '0700') else 'bad') }}
+          rd: >-
+            {{ 'n/a' if lme_run_binding_supersedes is not defined else ('absent' if not rb_st_ret.results[0].stat.exists
+               else ('ok' if (rb_st_ret.results[0].stat.isdir and not rb_st_ret.results[0].stat.islnk
+               and rb_st_ret.results[0].stat.uid == (rb_uid.stdout | int) and rb_st_ret.results[0].stat.mode == '0700')
+               else 'bad')) }}
+          rb: >-
+            {{ 'n/a' if lme_run_binding_supersedes is not defined else ('absent' if not rb_st_ret.results[1].stat.exists
+               else ('ok' if (rb_st_ret.results[1].stat.isreg and not rb_st_ret.results[1].stat.islnk
+               and rb_st_ret.results[1].stat.uid == (rb_uid.stdout | int) and rb_st_ret.results[1].stat.mode == '0600')
+               else 'bad')) }}
+          rb_sha: >-
+            {{ '' if lme_run_binding_supersedes is not defined else (rb_st_ret.results[1].stat.checksum | default('')) }}
+          rr: >-
+            {{ 'n/a' if lme_run_binding_supersedes is not defined else ('absent' if not rb_st_ret.results[2].stat.exists
+               else ('ok' if (rb_st_ret.results[2].stat.isreg and not rb_st_ret.results[2].stat.islnk
+               and rb_st_ret.results[2].stat.uid == (rb_uid.stdout | int) and rb_st_ret.results[2].stat.mode == '0600')
+               else 'bad')) }}
+          rr_sha: >-
+            {{ '' if lme_run_binding_supersedes is not defined else (rb_st_ret.results[2].stat.checksum | default('')) }}
+
+    # RECEIPT BYTES (codex-tick370 RUN-BINDING-LIFECYCLE-RECEIPT-BYTES): each consumed receipt is read ONCE (slurp);
+    # the digest of THOSE bytes must equal the stat checksum the classification uses, and the parse is of THOSE bytes
+    - name: Read the destination receipt ONCE as exact bytes (custody-admitted only)
+      ansible.builtin.slurp:
+        src: "{{ rb_out.receipt }}"
+      register: rb_rc_cur_raw
+      when: rb_obs.r == 'ok'
+
+    - name: Read the retained receipt ONCE as exact bytes (custody-admitted only)
+      ansible.builtin.slurp:
+        src: "{{ rb_out.kept_receipt }}"
+      register: rb_rc_old_raw
+      when: rb_obs.rr == 'ok'
+
+    - name: Refuse a receipt whose read bytes are not the observed file (replaced between stat and read)
+      ansible.builtin.assert:
+        that:
+          - rb_obs.r != 'ok' or (rb_rc_cur_raw.content | b64decode | hash('sha256')) == rb_obs.r_sha
+          - rb_obs.rr != 'ok' or (rb_rc_old_raw.content | b64decode | hash('sha256')) == rb_obs.rr_sha
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-CONFLICT: a receipt changed between observation and read: {{ rb_out.receipt }}
+          (stat {{ rb_obs.r_sha | default('none', true) }}, read
+          {{ (rb_rc_cur_raw.content | b64decode | hash('sha256')) if rb_obs.r == 'ok' else 'none' }}),
+          {{ rb_out.kept_receipt | default('-', true) }} (stat {{ rb_obs.rr_sha | default('none', true) }}, read
+          {{ (rb_rc_old_raw.content | b64decode | hash('sha256')) if rb_obs.rr == 'ok' else 'none' }}); every byte preserved.
+        quiet: true
+
+    # only the receipt parse is in the rescue: an unparseable receipt is an unverified state (CONFLICT), bytes preserved
+    - name: Parse the bound receipts (from the same read bytes)
+      block:
+        - name: Parse the destination receipt and the retained receipt
+          ansible.builtin.set_fact:
+            rb_rc:
+              cur: "{{ (rb_rc_cur_raw.content | b64decode | from_yaml) if rb_obs.r == 'ok' else none }}"
+              old: "{{ (rb_rc_old_raw.content | b64decode | from_yaml) if rb_obs.rr == 'ok' else none }}"
+      rescue:
+        - name: Refuse an unparseable receipt (unverified state; nothing touched)
+          ansible.builtin.fail:
+            msg: >-
+              REFUSED RUN-BINDING-RENDER-CONFLICT: a receipt could not be parsed: {{ rb_out.receipt }}
+              (sha256 {{ rb_obs.r_sha | default('none', true) }}), {{ rb_out.kept_receipt | default('-', true) }}
+              (receipt sha256 {{ rb_obs.rr_sha | default('none', true) }}); every byte is preserved.
+
+    - name: Classify the destination pair into exactly ONE lifecycle state (before any write)
+      ansible.builtin.set_fact:
+        rb_state: |-
+          {%- set S = lme_run_binding_supersedes | default(none) -%}
+          {%- set H = rb_sha256 -%}
+          {%- set o = rb_obs -%}
+          {%- set keys = ['binding', 'binding_sha256', 'controller_inventory', 'data', 'data_sha256', 'deployment_identity', 'engine_revision', 'lab', 'lab_sha256', 'policy_sha256', 'transition'] -%}
+          {%- set cur = rb_rc.cur -%}
+          {%- set old = rb_rc.old -%}
+          {%- set r_ver = (o.b == 'ok' and o.r == 'ok' and cur is mapping and (cur.keys() | list | sort) == keys and cur['binding'] == rb_out.binding and cur['binding_sha256'] == o.b_sha) -%}
+          {%- set same = (r_ver and ((cur | dict2items | rejectattr('key', 'in', ['binding_sha256', 'transition']) | items2dict) == rb_in)) -%}
+          {%- set unchanged = (r_ver and o.b_sha == H and same) -%}
+          {#- S names a RECEIPT (its file sha256, the full revision identity); B_old is that receipt's binding_sha256 -#}
+          {%- set rr_ver = (S is not none and o.rr == 'ok' and o.rr_sha == S and old is mapping and (old.keys() | list | sort) == keys and old['binding'] == rb_out.binding and old['binding_sha256'] is string) -%}
+          {%- set rb_ver = (rr_ver and o.rb == 'ok' and o.rb_sha == old['binding_sha256']) -%}
+          {%- set ns = namespace(st='conflict') -%}
+          {%- if 'bad' in [o.b, o.r, o.root, o.rd, o.rb, o.rr] -%}
+          {%- set ns.st = 'conflict' -%}
+          {%- elif S is none -%}
+          {#- lineage (coordinator review): with a superseded root present, an absent pair or a receipt-less binding can
+              be an interrupted TRANSITION; without the transition input it is unverified (conflict), never a
+              transition-free publish / resume that would drop the recorded lineage -#}
+          {%- if o.b == 'absent' and o.r == 'absent' and o.root == 'absent' -%}{%- set ns.st = 'publish' -%}
+          {%- elif o.b == 'ok' and o.r == 'absent' and o.b_sha == H and o.root == 'absent' -%}{%- set ns.st = 'resume_receipt' -%}
+          {%- elif unchanged -%}{%- set ns.st = 'reuse' -%}
+          {%- elif r_ver -%}{%- set ns.st = 'revision' -%}
+          {%- endif -%}
+          {%- elif unchanged -%}
+          {%- set ns.st = 'reuse' if (cur['transition'] is mapping and cur['transition']['from'] | default(none) == S) else 'supersedes_mismatch' -%}
+          {%- elif o.rd == 'absent' -%}
+          {%- if o.b == 'absent' and o.r == 'absent' -%}{%- set ns.st = 'supersedes_nothing' -%}
+          {%- elif r_ver and o.r_sha == S -%}{%- set ns.st = 'transition' -%}
+          {%- elif r_ver -%}{%- set ns.st = 'supersedes_mismatch' -%}
+          {%- endif -%}
+          {%- elif o.rb == 'absent' and o.rr == 'absent' and r_ver and o.r_sha == S -%}{%- set ns.st = 'transition' -%}
+          {%- elif rr_ver and o.rb == 'absent' and o.r == 'absent' and o.b == 'ok' and o.b_sha == old['binding_sha256'] -%}{%- set ns.st = 'transition' -%}
+          {%- elif rr_ver and rb_ver and o.r == 'absent' and o.b == 'absent' -%}{%- set ns.st = 'transition' -%}
+          {%- elif rr_ver and rb_ver and o.r == 'absent' and o.b == 'ok' and o.b_sha == H -%}{%- set ns.st = 'transition' -%}
+          {%- endif -%}
+          {{- ns.st -}}
+
+    - name: Refuse a revision without a valid explicit transition input (preserve every byte)
+      ansible.builtin.assert:
+        that:
+          - rb_state not in ['revision', 'supersedes_mismatch', 'supersedes_nothing']
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-REVISION ({{ rb_state }}): the binding {{ rb_out.binding }} (sha256
+          {{ rb_obs.b_sha | default('none', true) }}) with its verified receipt {{ rb_out.receipt }} (sha256
+          {{ rb_obs.r_sha | default('none', true) }}) differs from this render (sha256 {{ rb_sha256 }}) or from its
+          recorded inputs, and
+          {{ ('lme_run_binding_supersedes=' ~ lme_run_binding_supersedes ~ ' does not name that receipt or its recorded transition, or there is no pair to supersede')
+             if lme_run_binding_supersedes is defined else 'no transition input was given' }}.
+          A configuration-revision transition needs -e lme_run_binding_supersedes=<the observed RECEIPT sha256>; the
+          superseded pair is then retained under {{ rb_out.root }}/<that sha256>/{binding.yml, receipt.yml}. Nothing touched.
+        quiet: true
+
+    - name: Refuse an unverified or conflicting state (preserve every byte; report paths and observed sha256)
+      ansible.builtin.assert:
+        that:
+          - rb_state in ['publish', 'reuse', 'resume_receipt', 'transition']
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-CONFLICT ({{ rb_state }}): unverified destination state, nothing touched --
+          binding {{ rb_out.binding }} [{{ rb_obs.b }}] sha256={{ rb_obs.b_sha | default('none', true) }};
+          receipt {{ rb_out.receipt }} [{{ rb_obs.r }}] sha256={{ rb_obs.r_sha | default('none', true) }};
+          superseded root {{ rb_out.root }} [{{ rb_obs.root }}];
+          retained {{ rb_out.retained | default('-', true) }} [{{ rb_obs.rd }}] binding [{{ rb_obs.rb }}]
+          sha256={{ rb_obs.rb_sha | default('none', true) }} receipt [{{ rb_obs.rr }}]
+          sha256={{ rb_obs.rr_sha | default('none', true) }}; rendered sha256={{ rb_sha256 }}. Files must be owned
+          regular 0600 files, dirs owned real 0700 dirs, and every receipt must vouch for the binding it names.
+        quiet: true
+
+    - name: Plan the writes of the classified state (reuse writes nothing)
+      ansible.builtin.set_fact:
+        rb_plan:
+          mkroot: "{{ rb_state == 'transition' and rb_obs.root == 'absent' }}"
+          mkdir: "{{ rb_state == 'transition' and rb_obs.rd == 'absent' }}"
+          mv_receipt: "{{ rb_state == 'transition' and rb_obs.r == 'ok' }}"
+          # B_old: the superseded receipt's binding_sha256 (the current receipt before its move, else the retained one)
+          old_binding_sha256: >-
+            {{ ((rb_rc.cur if rb_obs.r == 'ok' else rb_rc.old)['binding_sha256']) if rb_state == 'transition' else '' }}
+          mv_binding: >-
+            {{ rb_state == 'transition' and rb_obs.b == 'ok' and rb_obs.rb == 'absent'
+               and rb_obs.b_sha == (rb_rc.cur if rb_obs.r == 'ok' else rb_rc.old)['binding_sha256'] }}
+          write_binding: >-
+            {{ rb_state == 'publish' or (rb_state == 'transition' and (rb_obs.b == 'absent'
+               or (rb_obs.rb == 'absent' and rb_obs.b_sha == (rb_rc.cur if rb_obs.r == 'ok' else rb_rc.old)['binding_sha256']))) }}
+          write_receipt: "{{ rb_state in ['publish', 'resume_receipt', 'transition'] }}"
+          transition: >-
+            {{ {'from': lme_run_binding_supersedes,
+                'from_binding_sha256': (rb_rc.cur if rb_obs.r == 'ok' else rb_rc.old)['binding_sha256'],
+                'to': rb_sha256, 'retained': rb_out.retained,
+                'from_policy_sha256': (rb_rc.cur if rb_obs.r == 'ok' else rb_rc.old)['policy_sha256'],
+                'from_engine_revision': (rb_rc.cur if rb_obs.r == 'ok' else rb_rc.old)['engine_revision']}
+               if rb_state == 'transition' else none }}
+
+    - name: Create the superseded root if absent (declared mkdir, 0700; never chmod of an existing dir)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.mkdir.path }}", -m, '0700', --, "{{ rb_out.root }}"]
+      when: rb_plan.mkroot | bool
+
+    - name: Create the retained dir EXCLUSIVELY (no -p; an existing one fails)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.mkdir.path }}", -m, '0700', --, "{{ rb_out.retained }}"]
+      when: rb_plan.mkdir | bool
+
+    - name: Read back the superseded root and the retained dir (no link followed)
+      ansible.builtin.stat:
+        path: "{{ rb_st_i }}"
+        follow: false
+        get_checksum: false
+      loop: ["{{ rb_out.root }}", "{{ rb_out.retained }}"]
+      loop_control:
+        loop_var: rb_st_i
+      register: rb_st_mk
+      when: rb_state == 'transition'
+
+    - name: Refuse retained dirs that are not owned private real directories on the binding's device
+      ansible.builtin.assert:
+        that:
+          - rb_st_mk.results | map(attribute='stat') | rejectattr('exists') | list | length == 0
+          - rb_st_mk.results | map(attribute='stat') | selectattr('islnk') | list | length == 0
+          - rb_st_mk.results | map(attribute='stat') | rejectattr('isdir') | list | length == 0
+          - rb_st_mk.results | map(attribute='stat') | map(attribute='uid') | reject('equalto', rb_uid.stdout | int) | list | length == 0
+          - rb_st_mk.results | map(attribute='stat') | map(attribute='mode') | reject('equalto', '0700') | list | length == 0
+          - rb_st_mk.results | map(attribute='stat') | map(attribute='dev') | reject('equalto', rb_st_in.results[2].stat.dev) | list | length == 0
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-CONFLICT: {{ rb_out.root }} / {{ rb_out.retained }} must be owned 0700 real
+          directories on the same device as {{ rb_out.dir }} (a move must be a rename); nothing moved.
+        quiet: true
+      when: rb_state == 'transition'
+
+    # NO-OVERWRITE MOVES (codex-tick370 RUN-BINDING-RETAINED-PATH-COLLISION): `mv -n -T` never replaces an existing
+    # destination; its exit status is NOT trusted (coreutils 9.x changed -n exit semantics), so the task never fails on
+    # rc and the read-back decides: the source must be gone and the destination must hold exactly the recorded digest.
+    # A skipped (no-clobber) move therefore leaves BOTH byte sets in place and refuses CONFLICT before the next step.
+    - name: Retain the superseded receipt (declared mv, no-clobber; a rename on the same device)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.mv.path }}", -n, -T, --, "{{ rb_out.receipt }}", "{{ rb_out.kept_receipt }}"]
+      register: rb_mv_rcpt
+      failed_when: false
+      when: rb_plan.mv_receipt | bool
+
+    - name: Read back the receipt move (source and destination; no link followed)
+      ansible.builtin.stat:
+        path: "{{ rb_st_i }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: ["{{ rb_out.receipt }}", "{{ rb_out.kept_receipt }}"]
+      loop_control:
+        loop_var: rb_st_i
+      register: rb_st_mv_rcpt
+      when: rb_state == 'transition'
+
+    - name: Refuse a receipt move that did not land exactly (source gone; destination == S, owned 0600 regular)
+      ansible.builtin.assert:
+        that:
+          - not rb_st_mv_rcpt.results[0].stat.exists
+          - rb_st_mv_rcpt.results[1].stat.exists and rb_st_mv_rcpt.results[1].stat.isreg and not rb_st_mv_rcpt.results[1].stat.islnk
+          - rb_st_mv_rcpt.results[1].stat.uid == (rb_uid.stdout | int) and rb_st_mv_rcpt.results[1].stat.mode == '0600'
+          - rb_st_mv_rcpt.results[1].stat.checksum == lme_run_binding_supersedes
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-CONFLICT: retaining {{ rb_out.receipt }} (source
+          {{ 'present sha256=' ~ rb_st_mv_rcpt.results[0].stat.checksum | default('?') if rb_st_mv_rcpt.results[0].stat.exists else 'gone' }})
+          at {{ rb_out.kept_receipt }} (sha256 {{ rb_st_mv_rcpt.results[1].stat.checksum | default('none') }}) did not
+          yield the superseded receipt (sha256 {{ lme_run_binding_supersedes | default('none') }}); mv rc
+          {{ rb_mv_rcpt.rc | default('skipped') }}. Nothing overwritten, every byte preserved, binding not moved.
+        quiet: true
+      when: rb_state == 'transition'
+
+    - name: Retain the superseded binding (declared mv, no-clobber; a rename on the same device)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.mv.path }}", -n, -T, --, "{{ rb_out.binding }}", "{{ rb_out.kept_binding }}"]
+      register: rb_mv_bind
+      failed_when: false
+      when: rb_plan.mv_binding | bool
+
+    - name: Read back the binding move (source and destination; no link followed)
+      ansible.builtin.stat:
+        path: "{{ rb_st_i }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: ["{{ rb_out.binding }}", "{{ rb_out.kept_binding }}"]
+      loop_control:
+        loop_var: rb_st_i
+      register: rb_st_mv_bind
+      when: rb_state == 'transition'
+
+    # after the move the destination binding path is absent (moved) or already the new render (resume state P4)
+    - name: Refuse a binding move that did not land exactly (destination == B_old, owned 0600 regular; source moved)
+      ansible.builtin.assert:
+        that:
+          - rb_st_mv_bind.results[1].stat.exists and rb_st_mv_bind.results[1].stat.isreg and not rb_st_mv_bind.results[1].stat.islnk
+          - rb_st_mv_bind.results[1].stat.uid == (rb_uid.stdout | int) and rb_st_mv_bind.results[1].stat.mode == '0600'
+          - rb_st_mv_bind.results[1].stat.checksum == rb_plan.old_binding_sha256
+          - >-
+            (not rb_st_mv_bind.results[0].stat.exists)
+            or (not (rb_plan.write_binding | bool) and rb_st_mv_bind.results[0].stat.checksum | default('') == rb_sha256)
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-CONFLICT: retaining {{ rb_out.binding }} (now
+          {{ 'present sha256=' ~ rb_st_mv_bind.results[0].stat.checksum | default('?') if rb_st_mv_bind.results[0].stat.exists else 'gone' }})
+          at {{ rb_out.kept_binding }} (sha256 {{ rb_st_mv_bind.results[1].stat.checksum | default('none') }}) did not
+          yield the superseded binding (sha256 {{ rb_plan.old_binding_sha256 }}); mv rc
+          {{ rb_mv_bind.rc | default('skipped') }}. Nothing overwritten, every byte preserved, no new binding written.
+        quiet: true
+      when: rb_state == 'transition'
+
+    - name: Publish the rendered binding (exact in-memory bytes; 0600; only when absent)
+      ansible.builtin.copy:
+        dest: "{{ rb_out.binding }}"
+        content: "{{ rb_text }}"
+        mode: '0600'
+        force: false
+      when: rb_plan.write_binding | bool
+
+    - name: Read back the binding (no link followed)
+      ansible.builtin.stat:
+        path: "{{ rb_out.binding }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: rb_st_bound
+
+    - name: Refuse a binding that is not the rendered bytes in owned 0600 custody (before any receipt)
+      ansible.builtin.assert:
+        that:
+          - rb_st_bound.stat.exists and rb_st_bound.stat.isreg and not rb_st_bound.stat.islnk
+          - rb_st_bound.stat.uid == (rb_uid.stdout | int) and rb_st_bound.stat.mode == '0600'
+          - rb_st_bound.stat.checksum == rb_sha256
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-CONFLICT: {{ rb_out.binding }} (sha256
+          {{ rb_st_bound.stat.checksum | default('none') }}) is not the rendered binding (sha256 {{ rb_sha256 }}) in an
+          owned 0600 regular file; no receipt is written, every byte preserved.
+        quiet: true
+
+    - name: Record the binding receipt LAST (0600, only when absent; outside the inventory paths)
+      ansible.builtin.copy:
+        dest: "{{ rb_out.receipt }}"
+        mode: '0600'
+        force: false
+        content: "{{ rb_in | combine({'binding_sha256': rb_sha256, 'transition': rb_plan.transition}) | to_nice_yaml }}"
+      when: rb_plan.write_receipt | bool
+
+    - name: Read back the receipt (no link followed)
+      ansible.builtin.stat:
+        path: "{{ rb_out.receipt }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: rb_st_rcpt
+
+    - name: Refuse a receipt that is not the recorded document in owned 0600 custody
+      ansible.builtin.assert:
+        that:
+          - rb_st_rcpt.stat.exists and rb_st_rcpt.stat.isreg and not rb_st_rcpt.stat.islnk
+          - rb_st_rcpt.stat.uid == (rb_uid.stdout | int) and rb_st_rcpt.stat.mode == '0600'
+          - >-
+            rb_st_rcpt.stat.checksum == (rb_obs.r_sha if rb_state == 'reuse' else
+            (rb_in | combine({'binding_sha256': rb_sha256, 'transition': rb_plan.transition}) | to_nice_yaml | hash('sha256')))
+        fail_msg: >-
+          REFUSED RUN-BINDING-RENDER-CONFLICT: {{ rb_out.receipt }} (sha256 {{ rb_st_rcpt.stat.checksum | default('none') }})
+          is not the recorded receipt in an owned 0600 regular file; every byte preserved.
+        quiet: true
+
+    - name: Report the run binding
+      ansible.builtin.debug:
+        msg: >-
+          RUN-BINDING-{{ 'REUSED' if rb_state == 'reuse' else 'RENDERED' }} state={{ rb_state }}
+          binding={{ rb_out.binding }} sha256={{ rb_sha256 }} receipt={{ rb_out.receipt }}
+          receipt_sha256={{ rb_st_rcpt.stat.checksum }} deployment_identity={{ rb_derived.deployment_identity }}
+          policy_sha256={{ rh_config_revision }} engine_revision={{ rh_engine_revision }}
+          transition={{ rb_plan.transition | to_json }}
