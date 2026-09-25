@@ -99,6 +99,8 @@
         loop_var: rhc_o
       when: _rhc_fail | length == 0
 
+    # the stop at the first failed step is enforced INSIDE step.yml / act.yml (read live as each step starts): this loop's
+    # `when` is evaluated for every item before any step runs, so it never stops a later step (G-STEP-LIVE-FAIL-GUARD)
     - name: Steps (stop at the first failed step; undo and cleanup still run)
       ansible.builtin.include_tasks: step.yml
       loop: "{{ _rhc_compiled.steps }}"
@@ -106,6 +108,27 @@
         loop_var: rhc_s
         label: "{{ rhc_s.id }}"
       when: _rhc_fail | length == 0
+
+    # G-STEP-LIVE-FAIL-GUARD sequencing control (codex tick313): a variant that DECLARES its stop (expect_stop_at) passes
+    # only when it stopped exactly there and nothing after it ran (controls.j2 judge_stop over the log), and then its
+    # after_stop predicates hold (e.g. a pre-existing artifact byte-identical, a launch marker absent). The recorded stop
+    # failures stay in the evidence log. A runner error (rescue) is never converted.
+    - name: Judge the declared stop of {{ rhc_c.id }}/{{ rhc_v.id }}
+      vars:
+        _r: >-
+          {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_stop',
+               'args': [rhc_v.expect_stop_at, _rhc_fail, _rhc_log, _rhc_compiled.steps | map(attribute='id') | list]}}) | from_json }}
+      ansible.builtin.set_fact:
+        _rhc_log: "{{ _rhc_log + [{'stop_at': rhc_v.expect_stop_at, 'stop_failures': _rhc_fail, 'judgement': _r}] }}"
+        _rhc_fail: "{{ _r | map('regex_replace', '^', 'expect_stop_at: ') | list }}"
+      when: rhc_v.expect_stop_at is defined
+
+    - name: The predicates that must hold after the declared stop
+      ansible.builtin.include_tasks: state.yml
+      vars:
+        rhc_preds: "{{ rhc_v.after_stop }}"
+        rhc_preds_label: after_stop
+      when: rhc_v.expect_stop_at is defined and _rhc_fail | length == 0
 
   rescue:
     - name: A runner error is a FAIL of this variant, never a PASS
