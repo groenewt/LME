@@ -20,6 +20,15 @@
     _rhc_compiled: {}
     _rhc_modes: {}
     _rhc_sc_out: []
+    _rhc_trees: {}
+    _rhc_staged: []
+    # G-UNDO-PROTECTION-PROPAGATION (codex tick330): paths a refused / failed undo left in place, this variant's undo
+    # findings (routed after the undo), and the scratch entries / fixture control dir kept because they overlap a protected path
+    _rhc_protected: []
+    _rhc_undo_found: []
+    _rhc_scratch_keep: []
+    _rhc_vctl_prot: []
+    _rhc_root_prot: []
     _rhc_static_only: "{{ rhc_c.static_checks is defined and rhc_c.steps is not defined }}"
 
 - name: "Static checks of {{ rhc_c.id }}/{{ rhc_v.id }} (independent: no entrypoint, no release input, nothing written)"
@@ -51,25 +60,45 @@
 - name: "Run {{ rhc_c.id }}/{{ rhc_v.id }}"
   when: _rhc_status.status == 'READY' and _rhc_blockers | length == 0 and not (_rhc_static_only | bool)
   block:
+    # fixture_ctl (increment 2, codex 231744 option (a)): a DEDICATED fixture control dir {vctl} = {ctl}/<fixture_ctl> that
+    # holds this variant's Route 3 clone ({vclone} = {vctl}/vclone) so a fixture_ops step can relocate / link it without
+    # touching {ctl} itself; default {vctl} = {ctl} (every other variant: unchanged tokens)
+    - name: Refuse a fixture control dir name that is not a plain, unreserved name
+      ansible.builtin.assert:
+        that:
+          - rhc_v.fixture_ctl is not defined or (rhc_v.fixture_ctl is string and rhc_v.fixture_ctl is match('^[A-Za-z0-9][A-Za-z0-9_-]*$'))
+          - rhc_v.fixture_ctl is not defined or rhc_v.fixture_ctl not in (['p', 'cwd', 'stash', 'playbooks', 'fifo'] + rhc_decl.state.variant_scratch)
+          - rhc_v.fixture_ctl is not defined or (rhc_c.variant_checkout | default('')) == 'clone'
+        fail_msg: "RHC-FIXTURE-STAGING: variant {{ rhc_v.id }} fixture_ctl {{ rhc_v.fixture_ctl | default('') }} must be a plain unreserved name on a variant_checkout: clone control"
+        quiet: true
+
     - name: Derive this variant's tokens (declared tokens first, then the variant's own, expanded against them)
       vars:
         _ctl: "{{ rhc_base_tokens.run }}/controls/{{ rhc_c.id }}/{{ rhc_v.id }}"
+        _vctl: "{{ _ctl ~ (('/' ~ rhc_v.fixture_ctl) if rhc_v.fixture_ctl is defined else '') }}"
+        # {outside} (codex tick330 item 3): a path OUTSIDE {ctl} and inside the run dir, DERIVED from {ctl} by the one macro
+        # outside_of (never a control or variant name spelled in a declaration); it follows any relocation of the run dir or
+        # rename of the control / variant. An inadmissible {ctl} yields '' (a residual-free empty token no op can write).
+        _outside: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'outside_of', 'args': [_ctl]}}) | from_json }}"
         _t0: >-
-          {{ rhc_base_tokens | combine({'ctl': _ctl, 'parent': _ctl ~ '/p', 'root': _ctl ~ '/p/root', 'rootname': 'root', 'fifo': _ctl ~ '/fifo',
+          {{ rhc_base_tokens | combine({'ctl': _ctl, 'outside': _outside, 'parent': _ctl ~ '/p', 'root': _ctl ~ '/p/root', 'rootname': 'root', 'fifo': _ctl ~ '/fifo',
                'gen': _ctl ~ '/p/root/generations/' ~ rhc_base_tokens.gen_id,
                'sgen': rhc_base_tokens.shared ~ '/generations/' ~ rhc_base_tokens.gen_id, 'vowner': rhc_base_tokens.user,
-               'vclone': _ctl ~ '/vclone', 'vwork': _ctl ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel,
-               'vparent': _ctl ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p',
-               'vroot': _ctl ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p/root'}) }}
+               'vctl': _vctl,
+               'vclone': _vctl ~ '/vclone', 'vwork': _vctl ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel,
+               'vparent': _vctl ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p',
+               'vroot': _vctl ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p/root'}) }}
       ansible.builtin.set_fact:
         _rhc_t: "{{ _t0 | combine(lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [rhc_v.tokens | default({}), _t0]}}) | from_json) }}"
 
-    - name: Create the variant's private dirs (0700; the fresh root's parent stays empty)
+    - name: Create the variant's private dirs (0700; the fresh root's parent stays empty; {vctl} when it is a dedicated fixture ctl)
       ansible.builtin.file:
         path: "{{ item }}"
         state: directory
         mode: '0700'
-      loop: ["{{ _rhc_t.ctl }}", "{{ _rhc_t.parent }}", "{{ _rhc_t.ctl }}/cwd", "{{ _rhc_t.ctl }}/stash", "{{ _rhc_t.ctl }}/playbooks"]
+      loop: >-
+        {{ [_rhc_t.ctl] + ([_rhc_t.vctl] if _rhc_t.vctl != _rhc_t.ctl else [])
+           + [_rhc_t.parent, _rhc_t.ctl ~ '/cwd', _rhc_t.ctl ~ '/stash', _rhc_t.ctl ~ '/playbooks'] }}
 
     - name: Render the control playbooks
       ansible.builtin.template:
@@ -136,7 +165,18 @@
         _rhc_fail: "{{ _rhc_fail + ['runner error at task ' ~ (ansible_failed_task.name | default('?')) ~ ': ' ~ (ansible_failed_result.msg | default('') | string)[:400]] }}"
 
   always:
-    - name: Undo (restores the shared root; failures are cleanup findings and taint it)
+    # G-UNDO-PROTECTION-PROPAGATION (codex tick330): the staging reversal runs FIRST, so every path a refused or failed
+    # reversal leaves in place (_rhc_protected) is known before the declared undo ops (op.yml refuses one that would reach
+    # a protected path) and before every cleanup removal below (finish_variant.yml; the fixture control dir). The current
+    # declared undo ops of staging controls touch only paths the staging never recorded (order-independent).
+    - name: Reverse the recorded fixture staging (tasks/fixture_ops.yml records; reverse order; never follows a link)
+      ansible.builtin.include_tasks: fixture_undo.yml
+      loop: "{{ _rhc_staged | default([]) | reverse | list }}"
+      loop_control:
+        loop_var: rhc_fu
+        label: "{{ rhc_fu.op }} {{ rhc_fu.path or rhc_fu.to }}"
+
+    - name: Undo (restores the shared root; failures are cleanup findings and taint it; a protected path is never touched)
       ansible.builtin.include_tasks: op.yml
       loop: "{{ _rhc_compiled.undo | default([]) }}"
       loop_control:
@@ -144,8 +184,92 @@
       vars:
         rhc_op_is_undo: true
 
+    # an undo finding the variant declares EXACTLY (expect_undo_findings: exact path + reason regex) is expected evidence
+    # (logged; its paths stay protected and are reported as preserved); any other FAILs the variant and is a cleanup
+    # finding; a declaration no finding met FAILs it (controls.j2 judge_undo_findings; selftests)
+    - name: Route this variant's undo findings (declared -> preserved evidence; undeclared -> FAIL + cleanup finding)
+      vars:
+        _exp: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [rhc_v.expect_undo_findings | default([]), _rhc_t]}}) | from_json }}"
+        _r: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_undo_findings', 'args': [_exp, _rhc_undo_found]}}) | from_json }}"
+      ansible.builtin.set_fact:
+        _rhc_log: "{{ _rhc_log + [{'undo_findings': _r, 'protected': _rhc_protected}] }}"
+        _rhc_fail: >-
+          {{ _rhc_fail + (_r.unexpected | map('to_json') | map('regex_replace', '^', 'undo finding ') | list)
+             + (_r.missing | map('to_json') | map('regex_replace', '^', 'expect_undo_findings not met: ') | list) }}
+        rhc_cleanup_findings: >-
+          {{ rhc_cleanup_findings + (_r.unexpected | map('to_json') | map('regex_replace', '^', rhc_c.id ~ '/' ~ rhc_v.id ~ ': undo finding ') | list) }}
+      when: (_rhc_undo_found | length > 0) or (rhc_v.expect_undo_findings is defined)
+
+    # 003441 (G-STAGING-*): a variant's after_undo predicates hold once its undo ops and the staging reversal ran (e.g. an
+    # outside tree a variant planted is gone, a partial replica is removed); a failure is a FAIL of the variant
+    - name: The predicates that must hold after the undo and the staging reversal (after_undo)
+      ansible.builtin.include_tasks: state.yml
+      vars:
+        rhc_preds: "{{ rhc_v.after_undo }}"
+        rhc_preds_label: after_undo
+      when: rhc_v.after_undo is defined
+
     - name: Cleanup (purge a fresh root; re-verify the shared root)
       ansible.builtin.include_tasks: finish_variant.yml
+
+    # the dedicated fixture control dir (fixture_ctl) holds the clone below {ctl}, out of the top-level variant_scratch:
+    # removed here, after finish_variant decided retention, only while it is a REAL directory (never through a link;
+    # a link or other object left there is a cleanup finding) and never when the scratch is retained
+    - name: Stat the dedicated fixture control dir (never followed)
+      ansible.builtin.stat:
+        path: "{{ _rhc_t.vctl }}"
+        follow: false
+        get_checksum: false
+      register: _rhc_vctl_st
+      when: (_rhc_t.vctl | default('')) | length > 0 and _rhc_t.vctl != _rhc_t.ctl
+
+    - name: A fixture control dir that is not a real directory after the undo is a cleanup finding (left in place)
+      ansible.builtin.set_fact:
+        _rhc_fail: "{{ _rhc_fail + ['fixture control dir ' ~ _rhc_t.vctl ~ ' is not a real directory after the staging undo; left in place'] }}"
+        rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': fixture control dir ' ~ _rhc_t.vctl ~ ' not a real directory; left in place'] }}"
+      when: >-
+        _rhc_vctl_st.stat is defined and _rhc_vctl_st.stat.exists
+        and ((_rhc_vctl_st.stat.islnk | default(false)) or not (_rhc_vctl_st.stat.isdir | default(false)))
+
+    # G-UNDO-PROTECTION-PROPAGATION (codex tick330): a fixture control dir that is, contains or lies inside a path a refused
+    # undo left in place is neither chmod'ed nor removed (kept whole; logged; the originating undo finding was routed above)
+    - name: Is the fixture control dir protected by a refused undo?
+      ansible.builtin.set_fact:
+        _rhc_vctl_prot: >-
+          {{ [] if (_rhc_protected | length == 0 or _rhc_vctl_st.stat is not defined)
+             else (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'protected_overlap', 'args': [[_rhc_t.vctl], _rhc_protected]}}) | from_json) }}
+
+    - name: A protected fixture control dir is kept whole (logged)
+      ansible.builtin.set_fact:
+        _rhc_log: "{{ _rhc_log + [{'kept_fixture_ctl': _rhc_t.vctl, 'protected': _rhc_vctl_prot}] }}"
+      when: _rhc_vctl_prot | length > 0
+
+    - name: Owner write on the fixture control dir (chmod -R does not follow links below it)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.chmod }}", -R, u+w, --, "{{ _rhc_t.vctl }}"]
+      changed_when: true
+      when: >-
+        _rhc_vctl_st.stat is defined and _rhc_vctl_st.stat.exists and (_rhc_vctl_st.stat.isdir | default(false))
+        and not (_rhc_vctl_st.stat.islnk | default(false)) and not (_rhc_retain | default(false) | bool)
+        and _rhc_vctl_prot | length == 0
+
+    - name: Remove the fixture control dir (a real directory; never when the scratch is retained or it is protected)
+      ansible.builtin.file:
+        path: "{{ _rhc_t.vctl }}"
+        state: absent
+      when: >-
+        _rhc_vctl_st.stat is defined and _rhc_vctl_st.stat.exists and (_rhc_vctl_st.stat.isdir | default(false))
+        and not (_rhc_vctl_st.stat.islnk | default(false)) and not (_rhc_retain | default(false) | bool)
+        and _rhc_vctl_prot | length == 0
+
+    # G-UNDO-PROTECTION-PROPAGATION: the readback after the WHOLE undo and cleanup sequence (finish_variant + the fixture
+    # control dir), e.g. a replacement a refused undo protected is still byte-identical, an unprotected sibling is gone
+    - name: The predicates that must hold after the whole undo and cleanup sequence (after_cleanup)
+      ansible.builtin.include_tasks: state.yml
+      vars:
+        rhc_preds: "{{ rhc_v.after_cleanup }}"
+        rhc_preds_label: after_cleanup
+      when: rhc_v.after_cleanup is defined
 
     - name: "Record {{ rhc_c.id }}/{{ rhc_v.id }}"
       ansible.builtin.set_fact:
@@ -153,6 +277,7 @@
           {{ rhc_results + [{'control': rhc_c.id, 'variant': rhc_v.id, 'status': 'PASS' if _rhc_fail | length == 0 else 'FAIL',
               'why': _rhc_fail, 'cases': rhc_c.cases | default([]), 'findings': rhc_c.findings | default([]),
               'case_components': rhc_v.case_components | default(rhc_c.case_components | default({})),
+              'preserved': _rhc_protected | default([]),
               'evidence': _rhc_t.ctl ~ '/evidence.json'}] }}
 
     - name: Write the variant evidence (every step's argv, exit status, output files and judgement)

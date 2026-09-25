@@ -89,6 +89,10 @@
       shared: "{{ _run }}/shared/p/root"
       sparent: "{{ _run }}/shared/p"
       bundle_a: "{{ _run }}/bundles/a"
+      # the canonical run checkout (READ-ONLY source of a fixture_ops copy_tree, e.g. the managed replica MR of manifests/)
+      repo_root: "{{ rh_repo_root }}"
+      # the bound profile's sha256 (RHC-PROFILE-BINDING above): a fresh-evidence field of seed.runlocal.exec-reached
+      profile_sha256: "{{ rh_profile_sha256 }}"
       src: "{{ rhc_artifact_source | default('/PLAN/artifacts') }}"
       head: "{{ rhc_head | default('PLAN-HEAD') }}"
       uid: "{{ rhc_uid | default('PLAN-UID') }}"
@@ -126,6 +130,42 @@
       staging_max: "{{ _bs.bundle.staging_retention.max_reserved_per_run | int }}"
       staging_repeat: "{{ (_bs.bundle.staging_retention.max_reserved_per_run | int) + (_bs.bundle.staging_retention.keep | int) + 2 }}"
       artifact_count: "{{ _bs.artifacts | length }}"
+      # runner.seed.uv-added-files (codex 235616): relative names read from the bound profile's python declaration only
+      # (installed_rel, gen_dirs.verify, archive_top, archive_interpreter_rel, uv_added_files, uv_patched_rel) -- never a
+      # literal in the controls; an absent declaration yields a PLAN marker no path can hold
+      py_rel: "{{ _bs.python.installed_rel }}"
+      pbs_rel: "{{ _bs.layout.gen_dirs.verify }}/pbs/{{ _bs.python.archive_top }}"
+      pbs_hold_rel: "{{ _bs.layout.gen_dirs.verify }}/pbs/{{ _bs.python.archive_interpreter_rel }}"
+      uv_added_rel: "{{ (_bs.python.uv_added_files | default([{'rel': 'PLAN-NO-UV-ADDED-FILES'}]) | first).rel }}"
+      # G-UV-ELSEWHERE-FIXTURE-LOCATION (codex tick338): the alternate directory is DECLARATION-derived, never a literal --
+      # the first of the admitted interpreter's directory (python.archive_interpreter_rel below archive_top) and each
+      # declared uv-patched file's directory (python.uv_patched_rel; the seed diffs both, so each is present on both sides)
+      # that is not the first addition's own directory; none -> a PLAN marker no path can hold. The control ADMITS it before
+      # its mutation (a real, owned, not group/other-writable directory on the installed side, a directory on the unpack
+      # side, the destination absent on BOTH sides: no archive member is ever overwritten).
+      uv_added_elsewhere_dir: >-
+        {{ (([((_bs.python.archive_interpreter_rel | default(''))[((_bs.python.archive_top | default('')) | length) + 1:] | dirname)
+               if (_bs.python.archive_interpreter_rel | default('')).startswith((_bs.python.archive_top | default('PLAN-NO-ARCHIVE-TOP')) ~ '/') else '']
+             + (_bs.python.uv_patched_rel | default([]) | map('dirname') | list))
+            | reject('equalto', '')
+            | reject('equalto', ((_bs.python.uv_added_files | default([{'rel': 'PLAN-NO-UV-ADDED-FILES'}]) | first).rel | dirname))
+            | list | first | default('PLAN-NO-ALTERNATE-UV-DIR')) }}
+      uv_added_elsewhere_name: "{{ (_bs.python.uv_added_files | default([{'rel': 'PLAN-NO-UV-ADDED-FILES'}]) | first).rel | basename }}"
+      uv_added_elsewhere_rel: >-
+        {{ (([((_bs.python.archive_interpreter_rel | default(''))[((_bs.python.archive_top | default('')) | length) + 1:] | dirname)
+               if (_bs.python.archive_interpreter_rel | default('')).startswith((_bs.python.archive_top | default('PLAN-NO-ARCHIVE-TOP')) ~ '/') else '']
+             + (_bs.python.uv_patched_rel | default([]) | map('dirname') | list))
+            | reject('equalto', '')
+            | reject('equalto', ((_bs.python.uv_added_files | default([{'rel': 'PLAN-NO-UV-ADDED-FILES'}]) | first).rel | dirname))
+            | list | first | default('PLAN-NO-ALTERNATE-UV-DIR'))
+           ~ '/' ~ ((_bs.python.uv_added_files | default([{'rel': 'PLAN-NO-UV-ADDED-FILES'}]) | first).rel | basename) }}
+      uv_added_nested_parent_rel: >-
+        {{ ((_bs.python.uv_added_files | default([]) | map(attribute='rel') | select('search', '/') | list)
+            | first | default('PLAN-NO-NESTED-UV-ADDED-FILE/x')) | dirname }}
+      uv_added_nested_parent_name: >-
+        {{ ((_bs.python.uv_added_files | default([]) | map(attribute='rel') | select('search', '/') | list)
+            | first | default('PLAN-NO-NESTED-UV-ADDED-FILE/x')) | dirname | basename }}
+      uv_patched_first_rel: "{{ _bs.python.uv_patched_rel | default(['PLAN-NO-UV-PATCHED-FILES']) | first }}"
     rhc_ctx_static:
       rh: "{{ rh }}"
       refusals: "{{ _bs.refusals }}"
@@ -308,6 +348,28 @@
                   ~ ', runner_tools.git ' ~ (rhc_decl.runner_tools.git | default('ABSENT')) ~ ', ' ~ rh_repo_root ~ '/.git '
                   ~ ('present' if (_rhc_src_git.stat.exists | default(false)) else 'ABSENT')}) }) }}
 
+# bundle_a_class (increment 2, codex 230249 (b)): a produce step of task bundle / admit binds bundle A's class exactly as
+# scope_classes.yml / pack_class.yml do -- key = C1's published lme_resolved.remote_harness.scopes.controller[per_class.key_field]
+# (never read from bundle.json), policy = that scope's resolved policy (policy_sha256 == rh_config_revision), lock = the
+# policy's lock_file_rel. Met only when this runner's resolve carries that controller scope; otherwise every control that
+# requires it is visibly QUEUED (never a smaller matrix, never a PASS).
+- name: bundle_a_class is met only when the runner's resolve carries the controller class scope (key, policy, lock)
+  vars:
+    _s: "{{ lme_resolved.remote_harness.scopes | default(none) }}"
+    _pc: "{{ rh.controller.bootstrap.bundle.per_class | default({}) }}"
+    _ok: >-
+      {{ _s is mapping and (_s.controller | default(none)) is mapping and (_pc.key_field | default('')) | length > 0
+         and ((_s.controller[_pc.key_field] | default('')) is match(_pc.key_regex | default('^$')))
+         and (_s.controller.policy_sha256 | default('')) == rh_config_revision
+         and (_s.controller.policy | default(none)) is mapping
+         and ((_s.controller.policy.controller | default({})).lock_file_rel | default('')) | length > 0 }}
+  ansible.builtin.set_fact:
+    rhc_deps: >-
+      {{ rhc_deps | combine({'bundle_a_class': rhc_deps.bundle_a_class | combine({'met': _ok | bool,
+          'why': 'the runner resolve does not carry lme_resolved.remote_harness.scopes.controller with a well-formed '
+                 ~ (_pc.key_field | default('?')) ~ ', policy_sha256 == rh_config_revision, a policy mapping and its lock_file_rel'
+                 ~ ' (scopes ' ~ ('present' if _s is mapping else 'ABSENT') ~ ')'}) }) }}
+
 - name: Case binding -- every named case id exists in its owner's file
   ansible.builtin.set_fact:
     rhc_coverage: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'coverage', 'args': [rhc_decl.controls, rhc_sources]}}) | from_json }}"
@@ -334,18 +396,22 @@
     _c: "{{ rhc_decl.controls | selectattr('id', 'equalto', item.0.control) | first }}"
     _v: "{{ (_c.variants | default([{'id': 'base'}])) | selectattr('id', 'equalto', item.1) | first }}"
     _cv: "{{ item.0.compiled | selectattr('variant', 'equalto', item.1) | list }}"
+    # the SAME derivation as variant.yml (fixture_ctl -> {vctl} = {ctl}/<fixture_ctl>; default {vctl} = {ctl})
+    _pctl: "{{ rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 }}"
+    _pvctl: "{{ _pctl ~ (('/' ~ _v.fixture_ctl) if _v.fixture_ctl is defined else '') }}"
     _vt: >-
-      {{ rhc_base_tokens | combine({'ctl': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1,
-                                    'parent': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/p',
-                                    'root': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/p/root',
-                                    'rootname': 'root', 'fifo': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/fifo',
-                                    'gen': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/p/root/generations/' ~ rhc_base_tokens.gen_id,
+      {{ rhc_base_tokens | combine({'ctl': _pctl,
+                                    'parent': _pctl ~ '/p',
+                                    'root': _pctl ~ '/p/root',
+                                    'rootname': 'root', 'fifo': _pctl ~ '/fifo',
+                                    'gen': _pctl ~ '/p/root/generations/' ~ rhc_base_tokens.gen_id,
                                     'sgen': rhc_base_tokens.run ~ '/shared/p/root/generations/' ~ rhc_base_tokens.gen_id,
                                     'staging': 'BOUND-AT-RUN', 'reaping': 'BOUND-AT-RUN', 'sibling': 'BOUND-AT-RUN', 'vowner': rhc_base_tokens.user,
-                                    'vclone': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/vclone',
-                                    'vwork': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel,
-                                    'vparent': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p',
-                                    'vroot': rhc_base_tokens.run ~ '/controls/' ~ item.0.control ~ '/' ~ item.1 ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p/root'}) }}
+                                    'vctl': _pvctl,
+                                    'vclone': _pvctl ~ '/vclone',
+                                    'vwork': _pvctl ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel,
+                                    'vparent': _pvctl ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p',
+                                    'vroot': _pvctl ~ '/vclone/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/p/root'}) }}
     _vt2: "{{ _vt | combine(lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [_v.tokens | default({}), _vt]}}) | from_json) }}"
     _expanded: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [_cv, _vt2]}}) }}"
     _status: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_status', 'args': [_c, _v, rhc_deps, item.0.unimplemented[item.1] | default([])]}}) | from_json }}"

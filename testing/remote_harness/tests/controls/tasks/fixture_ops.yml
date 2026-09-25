@@ -1,0 +1,309 @@
+---
+# one CONFINED DECLARED STAGING action of a producer negative (step `fixture_ops`; increment 2, codex 231744 option (a)).
+# step.yml loops this file over the step's (already token-expanded) list: rhc_fo = the action, rhc_foi = its index.
+# Closed set (declared in controls.yml, nothing else):
+#   {mkdir: <path>}                  a new owner-private (0700) directory
+#   {copy_tree: {from, to}}          cp -a --no-dereference -T of a REAL directory `from` (inside this run, or read-only
+#                                    under rh_repo_root) into an ABSENT `to`
+#   {move: {from, to}}               mv -T of a REAL directory `from` to an ABSENT `to`
+#   {symlink: {path, target}}        a link at an ABSENT `path` naming an existing REAL directory `target`
+# Confinement: every path it WRITES (mkdir path, copy_tree to, move from and to, symlink path) and every symlink target is
+# strictly under {ctl}/ (this variant's own control dir); no `..`. Ownership and ancestry are admitted BEFORE the first
+# mutation: {ctl}'s full ancestry by the route's ONE rule (admit_ancestry.yml, refusal RHC-FIXTURE-STAGING) on the first
+# action, and every action's pre-state by stat (never followed) right before it.
+# G-STAGING-ANCESTRY (codex tick297 003441): a lexical {ctl}/ prefix plus leaf / parent stats misses a LINKED INTERMEDIATE
+# ({ctl}/copied/link/deep/new with link -> outside {ctl}; copy_tree preserves links, so a staged copy can import one).
+# Every path the action MUTATES or LINKS is admitted component by component through the same ONE rule before it runs:
+# mkdir [path], copy_tree [to], move [from, to], symlink [dirname(path), target] -- a link being created is the leaf and is
+# never dereferenced; its real parent chain is admitted. An intentional staged link stays; a later write THROUGH it is
+# refused. A copy_tree `from` is only READ (never admitted here: the canonical {repo_root} source is read-only and outside
+# this rule's scope). The refusal is recorded, never raised.
+# G-STAGING-PARTIAL: the action's INTENT (op, paths, index; its pre-state admitted absent under an admitted parent) is
+# recorded in _rhc_staged BEFORE it mutates; its outcome is reconciled at once -- the identity observed right after it
+# (exists, kind, dev, inode, link target), state done, or state failed when the action (or its post-state check) failed
+# after the mutation began, so partial output is tracked. tasks/fixture_undo.yml reverses exactly those records by
+# identity (controls.j2 fixture_undo_decide), never following a link and never deleting an unproven resource.
+# G-UNDO-PARTIAL-BINDING (codex tick330 item 4): the intent record also holds the observed pre-state (the written object's
+# immediate parent: dev, inode, uid, kind, group / other write) and failed_in (action | post-check, set by the rescue from
+# _rhc_fo_stage). A failed action's post identity is evidence only; its partial output is removed only when all of those
+# bind (fixture_undo_decide), and anything ambiguous is refused and left in place.
+# Outcome (controls.j2 judge_staging): a staging refusal or failure FAILS the variant (recorded as '<step>[<i>]: ...';
+# the actions after it are not run; step.yml's live guard stops every later step) -- it is never a producer refusal --
+# UNLESS the step declares exactly that outcome for that index (expect staging_refused CODE | staging_failed true,
+# staging_index, staging_task = the exact leaf, staging_msg_has): then it is the step's expected result, logged, the
+# remaining actions of the list are not run, and the variant continues.
+# G-STAGING per-item guard (003441 step 3; compatible with step.yml's G-STEP-LIVE-FAIL-GUARD, whose lines are unchanged):
+# step.yml's looped include evaluates its `when` for every action BEFORE any runs, so the per-action stop is HERE, read
+# live as each action starts: after any recorded failure, or after this list's declared staging outcome, the action runs
+# nothing and is logged as staging_skipped (never `skipped`, which judge_stop reserves for whole steps).
+
+- name: "Read the live state as staging action {{ rhc_foi }} of {{ rhc_s.id }} starts (an earlier failure or the declared outcome stops it)"
+  ansible.builtin.set_fact:
+    _rhc_fo_live: "{{ _rhc_fail | length == 0 and ((rhc_foi | int) == 0 or not (_rhc_fo_stop | default(false) | bool)) }}"
+    _rhc_fo_stop: "{{ false if (rhc_foi | int) == 0 else (_rhc_fo_stop | default(false) | bool) }}"
+
+- name: "Staging action {{ rhc_foi }} of {{ rhc_s.id }} is not run (logged; never evidence of the action)"
+  ansible.builtin.set_fact:
+    _rhc_log: >-
+      {{ _rhc_log + [{'step': rhc_s.id, 'fixture_op_index': rhc_foi | int, 'fixture_op': rhc_fo,
+                      'staging_skipped': 'not run: ' ~ ('an earlier failure was recorded' if _rhc_fail | length > 0 else 'the declared staging outcome ended this list')}] }}
+  when: not (_rhc_fo_live | bool)
+
+- name: "Staging action {{ rhc_foi }} of {{ rhc_s.id }}"
+  when: _rhc_fo_live | bool
+  block:
+    - name: Nothing is mutated yet (admission phase)
+      ansible.builtin.set_fact:
+        _rhc_fo_phase: admit
+
+    - name: "Admit the staging action {{ rhc_foi }} of {{ rhc_s.id }} (closed set; confined to {ctl}/)"
+      vars:
+        _k: "{{ (rhc_fo | list | first) if rhc_fo is mapping else '' }}"
+        _v: "{{ rhc_fo[_k] if _k else none }}"
+        _ctlp: "{{ (_rhc_t.ctl | regex_escape) ~ '/' }}"
+        _writes: >-
+          {{ ([_v] if _k == 'mkdir' else [])
+             + ([_v.to] if _k == 'copy_tree' else [])
+             + ([_v.from, _v.to] if _k == 'move' else [])
+             + ([_v.path, _v.target] if _k == 'symlink' else []) }}
+      ansible.builtin.assert:
+        that:
+          - rhc_fo is mapping and rhc_fo | length == 1
+          - _k in ['mkdir', 'copy_tree', 'move', 'symlink']
+          - >-
+            (_k == 'mkdir' and _v is string) or (_k in ['copy_tree', 'move'] and _v is mapping and (_v | list | sort) == ['from', 'to'])
+            or (_k == 'symlink' and _v is mapping and (_v | list | sort) == ['path', 'target'])
+          - _writes | reject('string') | list | length == 0
+          - _writes | reject('match', _ctlp) | list | length == 0
+          - (_writes + ([_v.from] if _k == 'copy_tree' else [])) | select('search', '(^|/)\.\.(/|$)') | list | length == 0
+          - >-
+            _k != 'copy_tree' or (_v.from is string and (_v.from is match((rhc_run_dir | regex_escape) ~ '/')
+            or _v.from is match((rh_repo_root | regex_escape) ~ '/')))
+        fail_msg: >-
+          REFUSED RHC-FIXTURE-STAGING: step {{ rhc_s.id }} action {{ rhc_fo | to_json }} is outside the closed staging set
+          (mkdir | copy_tree | move | symlink) or writes / links outside {{ _rhc_t.ctl }}/ (a copy_tree source only inside
+          {{ rhc_run_dir }} or read-only under {{ rh_repo_root }})
+        quiet: true
+
+    - name: "Admit {ctl}'s full ancestry before the first staging mutation (the route's ONE rule; RHC-FIXTURE-STAGING)"
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+      vars:
+        rh_anc_bs: "{{ rh.controller.bootstrap }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ _rhc_t.ctl }}"
+        rh_anc_refusal: RHC-FIXTURE-STAGING
+      when: rhc_foi | int == 0
+
+    - name: Name the action
+      ansible.builtin.set_fact:
+        _rhc_fok: "{{ rhc_fo | list | first }}"
+        _rhc_fov: "{{ rhc_fo[rhc_fo | list | first] }}"
+
+    # G-STAGING-ANCESTRY: every EXISTING component of each mutated / linked path is a real, owned, private directory (an
+    # absent leaf is skipped by the rule); a component that is a link -- e.g. a link a copy_tree imported -- refuses here
+    - name: "Admit every component of each path the action mutates or links (the route's ONE rule; RHC-FIXTURE-STAGING)"
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+      vars:
+        rh_anc_bs: "{{ rh.controller.bootstrap }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ _rhc_fo_anc }}"
+        rh_anc_refusal: RHC-FIXTURE-STAGING
+      loop: >-
+        {{ ([_rhc_fov] if _rhc_fok == 'mkdir' else [])
+           + ([_rhc_fov.to] if _rhc_fok == 'copy_tree' else [])
+           + ([_rhc_fov.from, _rhc_fov.to] if _rhc_fok == 'move' else [])
+           + ([_rhc_fov.path | dirname, _rhc_fov.target] if _rhc_fok == 'symlink' else []) }}
+      loop_control:
+        loop_var: _rhc_fo_anc
+
+    - name: "Stat the action's pre-state (never followed): the written path(s), their parents, the source / target"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: >-
+        {{ ([_rhc_fov, _rhc_fov | dirname] if _rhc_fok == 'mkdir' else [])
+           + ([_rhc_fov.from, _rhc_fov.to, _rhc_fov.to | dirname] if _rhc_fok in ['copy_tree', 'move'] else [])
+           + ([_rhc_fov.target, _rhc_fov.path, _rhc_fov.path | dirname] if _rhc_fok == 'symlink' else []) }}
+      register: _rhc_fo_st
+
+    - name: "Refuse a pre-state that is not the declared one (nothing is mutated)"
+      vars:
+        _s: "{{ _rhc_fo_st.results | map(attribute='stat') | list }}"
+      ansible.builtin.assert:
+        that:
+          # mkdir: path absent, parent a real directory
+          - _rhc_fok != 'mkdir' or (not _s[0].exists and _s[1].exists and _s[1].isdir and not _s[1].islnk)
+          # copy_tree / move: from a real directory, to absent, to's parent a real directory
+          - >-
+            _rhc_fok not in ['copy_tree', 'move'] or (_s[0].exists and _s[0].isdir and not _s[0].islnk and not _s[1].exists
+            and _s[2].exists and _s[2].isdir and not _s[2].islnk)
+          # symlink: target an existing real directory, path absent (not even a dangling link), path's parent a real directory
+          - >-
+            _rhc_fok != 'symlink' or (_s[0].exists and _s[0].isdir and not _s[0].islnk and not _s[1].exists
+            and _s[2].exists and _s[2].isdir and not _s[2].islnk)
+        fail_msg: >-
+          REFUSED RHC-FIXTURE-STAGING: step {{ rhc_s.id }} action {{ rhc_fo | to_json }}: the pre-state is not the declared one
+          (stats {{ _rhc_fo_st.results | map(attribute='item') | zip(_s | map(attribute='exists'), _s | map(attribute='islnk', default=false), _s | map(attribute='isdir', default=false)) | list }})
+        quiet: true
+
+    # G-STAGING-PARTIAL: the intent is on record before anything is mutated (a failure below is reconciled against it).
+    # G-UNDO-PARTIAL-BINDING (codex tick330 item 4): the record also carries the PRE-STATE actually observed -- the written
+    # object's immediate parent (the stat above, never followed: path, dev, inode, uid, kind, group / other write), i.e. the
+    # exclusive destination's container -- and failed_in, set only by the rescue ('' on a record that completes). The
+    # asserts above admitted the written object absent and that parent a real directory; pre_absent / parents_admitted
+    # state that admission, the parent identity is its evidence.
+    - name: Record the admitted intent of the staging action and its observed pre-state (before it mutates)
+      vars:
+        _pi: "{{ 1 if _rhc_fok == 'mkdir' else 2 }}"
+        _pp: "{{ _rhc_fo_st.results[_pi | int].stat }}"
+      ansible.builtin.set_fact:
+        _rhc_staged: >-
+          {{ _rhc_staged + [{'op': _rhc_fok, 'step': rhc_s.id, 'index': rhc_foi | int, 'state': 'intent',
+                             'path': _rhc_fov if _rhc_fok == 'mkdir' else (_rhc_fov.path | default('')),
+                             'from': _rhc_fov.from | default('') if _rhc_fov is mapping else '',
+                             'to': _rhc_fov.to | default('') if _rhc_fov is mapping else '',
+                             'target': _rhc_fov.target | default('') if _rhc_fov is mapping else '',
+                             'pre_absent': true, 'parents_admitted': true,
+                             'pre': {'parent': _rhc_fo_st.results[_pi | int].item, 'exists': _pp.exists,
+                                     'isdir': _pp.isdir | default(false), 'islnk': _pp.islnk | default(false),
+                                     'dev': _pp.dev | default(none), 'inode': _pp.inode | default(none),
+                                     'uid': _pp.uid | default(none), 'wgrp': _pp.wgrp | default(none),
+                                     'woth': _pp.woth | default(none)},
+                             'failed_in': '', 'post': {}}] }}
+        _rhc_fo_phase: mutate
+        _rhc_fo_stage: action
+
+    - name: mkdir (owner-private at creation; the declared mkdir, never -p)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.mkdir.path }}", -m, '0700', --, "{{ _rhc_fov }}"]
+      changed_when: true
+      when: _rhc_fok == 'mkdir'
+
+    - name: copy_tree (cp -a --no-dereference -T into the absent destination; the source is only read)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.cp }}", -a, --no-dereference, -T, --, "{{ _rhc_fov.from }}", "{{ _rhc_fov.to }}"]
+      changed_when: true
+      when: _rhc_fok == 'copy_tree'
+
+    - name: move (mv -T of the real directory to the absent name)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.mv }}", -T, --, "{{ _rhc_fov.from }}", "{{ _rhc_fov.to }}"]
+      changed_when: true
+      when: _rhc_fok == 'move'
+
+    - name: symlink (the absent path names the real target directory; never forced)
+      ansible.builtin.file:
+        path: "{{ _rhc_fov.path }}"
+        src: "{{ _rhc_fov.target }}"
+        state: link
+        follow: false
+        force: false
+      when: _rhc_fok == 'symlink'
+
+    # the action's own command / module returned; a failure from here on is the post-state check, not the action
+    # (judge_staging still reads phase mutate; failed_in on the record separates the two for fixture_undo_decide)
+    - name: The action returned (a failure from here on is its post-state check)
+      ansible.builtin.set_fact:
+        _rhc_fo_stage: post-check
+
+    - name: Stat what the action wrote (never followed; the identity undo verifies)
+      ansible.builtin.stat:
+        path: "{{ _rhc_fov if _rhc_fok == 'mkdir' else (_rhc_fov.path if _rhc_fok == 'symlink' else _rhc_fov.to) }}"
+        follow: false
+        get_checksum: false
+      register: _rhc_fo_post
+
+    - name: Refuse a post-state that is not the declared kind (a real directory; the link naming the declared target)
+      ansible.builtin.assert:
+        that:
+          - _rhc_fo_post.stat.exists
+          - >-
+            (_rhc_fok != 'symlink' and _rhc_fo_post.stat.isdir and not _rhc_fo_post.stat.islnk)
+            or (_rhc_fok == 'symlink' and _rhc_fo_post.stat.islnk and (_rhc_fo_post.stat.lnk_target | default('')) == _rhc_fov.target)
+        fail_msg: >-
+          RHC-FIXTURE-STAGING: step {{ rhc_s.id }} action {{ rhc_fo | to_json }} left
+          {{ _rhc_fo_post.stat | dict2items | selectattr('key', 'in', ['exists', 'isdir', 'islnk', 'lnk_target']) | items2dict }}
+        quiet: true
+
+    - name: Reconcile the completed staging action (state done, the identity observed right after it)
+      vars:
+        _st: "{{ _rhc_fo_post.stat }}"
+        _id: >-
+          {{ {'exists': _st.exists, 'isdir': _st.isdir | default(false), 'islnk': _st.islnk | default(false),
+              'dev': _st.dev | default(none), 'inode': _st.inode | default(none), 'lnk_target': _st.lnk_target | default(none)} }}
+        _r: >-
+          {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_staging',
+               'args': [_rhc_step.expect | default({}), rhc_foi | int, {'phase': 'done', 'task': '', 'msg': ''}]}}) | from_json }}
+      ansible.builtin.set_fact:
+        _rhc_staged: "{{ _rhc_staged[:-1] + [_rhc_staged[-1] | combine({'state': 'done', 'post': _id})] }}"
+        _rhc_fo_phase: done
+        _rhc_fail: "{{ _rhc_fail + (_r | map('regex_replace', '^', rhc_s.id ~ '[' ~ rhc_foi ~ ']: ') | list) }}"
+        _rhc_log: "{{ _rhc_log + [{'step': rhc_s.id, 'fixture_op': rhc_fo, 'fixture_op_index': rhc_foi | int, 'outcome': 'done', 'post': _id, 'judgement': _r}] }}"
+
+  rescue:
+    - name: Keep the failed task and its message (the leaf; stderr of a failed command included)
+      ansible.builtin.set_fact:
+        _rhc_fo_out:
+          phase: "{{ _rhc_fo_phase | default('admit') }}"
+          task: "{{ ansible_failed_task.name | default('?') }}"
+          msg: >-
+            {{ (ansible_failed_result.msg | default('') | string)
+               ~ ((' stderr: ' ~ (ansible_failed_result.stderr | string)) if (ansible_failed_result.stderr | default('') | length > 0) else '') }}
+
+    - name: Observe what the failed action left (only once its mutation began; never followed)
+      ansible.builtin.stat:
+        path: "{{ _rhc_fov if _rhc_fok == 'mkdir' else (_rhc_fov.path if _rhc_fok == 'symlink' else _rhc_fov.to) }}"
+        follow: false
+        get_checksum: false
+      register: _rhc_fo_left
+      when: _rhc_fo_out.phase == 'mutate'
+
+    # the post-failure identity is EVIDENCE of what is there now, never proof this action made it (fixture_undo_decide
+    # binds removal to the pre-state, the intent, the exclusive destination, failed_in and the current identity / ancestry)
+    - name: Reconcile the failed staging action (state failed; the partial output's identity is tracked, nothing deleted here)
+      vars:
+        _st: "{{ _rhc_fo_left.stat | default({'exists': false}) }}"
+        _id: >-
+          {{ {'exists': _st.exists | default(false), 'isdir': _st.isdir | default(false), 'islnk': _st.islnk | default(false),
+              'dev': _st.dev | default(none), 'inode': _st.inode | default(none), 'lnk_target': _st.lnk_target | default(none)} }}
+      ansible.builtin.set_fact:
+        _rhc_staged: >-
+          {{ _rhc_staged[:-1] + [_rhc_staged[-1] | combine({'state': 'failed', 'post': _id,
+                                                           'failed_in': _rhc_fo_stage | default('unknown')})] }}
+      when: _rhc_fo_out.phase == 'mutate'
+
+    - name: Judge the staging outcome (a declared one is the step's expected result; anything else FAILS the variant)
+      vars:
+        _r: >-
+          {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_staging',
+               'args': [_rhc_step.expect | default({}), rhc_foi | int, _rhc_fo_out]}}) | from_json }}
+      ansible.builtin.set_fact:
+        _rhc_fail: "{{ _rhc_fail + (_r | map('regex_replace', '^', rhc_s.id ~ '[' ~ rhc_foi ~ ']: ') | list) }}"
+        _rhc_fo_stop: true
+        _rhc_log: >-
+          {{ _rhc_log + [{'step': rhc_s.id, 'fixture_op': rhc_fo, 'fixture_op_index': rhc_foi | int, 'outcome': _rhc_fo_out,
+                          'left': (_rhc_staged[-1].post if _rhc_fo_out.phase == 'mutate' else 'nothing mutated'),
+                          'judgement': _r, 'declared': _r | length == 0}] }}
+
+# G-FIXTURE-ITEM-STOP-CONTROL (codex tick330): the per-item stop is itself judged, distinct from op.yml's ordinary-op
+# guard. At the list's LAST action (after it ran, was rescued or was skipped) the step's declared staging_skipped
+# [indexes] -- the later actions (a marker mutation) that must not run after the declared outcome -- is compared with the
+# staging_skipped records this step logged (controls.j2 judge_staging_skipped): a declared index without its skip record
+# ran and FAILS the variant; an undeclared skip FAILS it. The marker's absence is a separate state predicate in controls.yml.
+- name: "Judge which staging actions of {{ rhc_s.id }} were not run after its declared outcome (the per-item skip records)"
+  vars:
+    _x: "{{ _rhc_step.expect | default({}) }}"
+    _sk: >-
+      {{ _rhc_log | selectattr('step', 'defined') | selectattr('step', 'equalto', rhc_s.id)
+         | selectattr('staging_skipped', 'defined') | map(attribute='fixture_op_index') | map('int') | list }}
+    _r: >-
+      {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_staging_skipped',
+           'args': [_x, _sk]}}) | from_json }}
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + (_r | map('regex_replace', '^', rhc_s.id ~ ': ') | list) }}"
+    _rhc_log: "{{ _rhc_log + [{'step': rhc_s.id, 'staging_skipped_judged': _sk, 'declared': _x.staging_skipped | default([]), 'judgement': _r}] }}"
+  when:
+    - (rhc_foi | int) == ((_rhc_step.fixture_ops | default([]) | length) - 1)
+    - (_rhc_step.expect | default({})) is mapping
+    - (_rhc_step.expect | default({})).staging_skipped is defined or (_rhc_step.expect | default({})).staging_index is defined

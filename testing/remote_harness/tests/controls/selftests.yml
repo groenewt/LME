@@ -10,9 +10,12 @@
 schema_version: 1
 kind: lme-remote-harness-control-selftests
 gates: [judge, judge_pair, failed_task, outcome, refusal, residual, xjson, network_lines, plan_status, coverage, diff_paths, neutrality, dig, plan_act, judge_state, unimplemented, variant_dep,
+        isg_listing, isg_lock_pins,
         writer_cmd, writer_admitted, record_readback, launcher_consumers, export_availability, export_shape,
         judge_stop,
-        profile_case_patch, fixture_status_lines, clone_status, input_map]
+        judge_staging, judge_staging_skipped, fixture_undo_decide, protected_overlap, judge_undo_findings, op_writes,
+        judge_op_outcome, judge_op_skipped, outside_of,
+        profile_case_patch, fixture_status_lines, clone_status, input_map, judge_produce, tree_lines]
 ctx:
   rh: {controller: {bootstrap: {lock: {busy: RH-SEED-BUSY}, bundle: {staging_retention: {lease: {busy_refusal: RH-STAGING-BUSY}}}}}}
   record_refusal: {code: RHC-ACT-RECORD, rc: 86, barrier_rc: 87}
@@ -42,6 +45,21 @@ fixtures:
     expect: [rc]
     predicates: []
     ops: []
+    op_options: []
+    waits: []
+    kill_options: []
+    target_address_regex: '^192\.0\.2\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$'
+  # minimal vocabulary for the `unimplemented` gate's static staging_skipped / op_* validation (controls.j2 _steps_unimpl)
+  vocab_steps: &vocab_steps
+    control_keys: [id, steps, variants]
+    variant_keys: [id]
+    step_common: [id, expect]
+    steps: [ops, fixture_ops]
+    acts: []
+    act_keys: []
+    expect: [staging_refused, staging_failed, staging_index, staging_task, staging_msg_has, staging_skipped, op_failed, op_index, op_msg_has, op_skipped]
+    predicates: []
+    ops: [move, mkdir]
     op_options: []
     waits: []
     kill_options: []
@@ -213,6 +231,9 @@ cases:
   - {id: judge-stdout-not-regex-preserved-ok, gate: judge, fn: judge, with_ctx: true, negative: false,
      args: [{rc: 0, stdout_regex: '^PRESERVED-UNKNOWN-STAGING .*/h/c/\.bundle\.staging\.Labc\.x1', stdout_not_regex: ['^REAPED-STAGING .*/h/c/\.bundle\.staging\.Labc\.x1']}, *pkg_preserved],
      expect: {equals: []}}
+  # a bare-string stdout_not_regex was iterated character by character (socket-carry's 'probe_env FAILED'): now refused
+  - {id: judge-stdout-not-regex-string-refused, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc: 0, stdout_not_regex: 'probe_env FAILED'}, *pkg_preserved], expect: {search: 'stdout_not_regex must be a list of regexes'}}
   # ---- judge_pair ----
   - {id: pair-one-published-other-unchanged, gate: judge_pair, fn: judge_pair, with_ctx: true, negative: false,
      args: [{steps: [a, b], one_of: {rc: 0, outcome: INSTALLED}, other_any: [{refusal: RH-SEED-BUSY}]}, {a: *installed, b: *busy}], expect: {equals: []}}
@@ -243,6 +264,343 @@ cases:
      expect: {equals: ['step plant before the stop was skipped']}}
   - {id: stop-unknown-step, gate: judge_stop, fn: judge_stop, negative: true,
      args: [boundry, ['boundary[0]: x'], [], [boundary, overwrite]], expect: {search: 'declared stop step boundry is not a step'}}
+  # ---- judge_staging (codex tick297 003441 G-STAGING-*; tasks/fixture_ops.yml): only the declared index may end otherwise
+  # than done, only as declared (refused before mutation / failed after it began), at the exact leaf, with every string ----
+  - {id: staging-undeclared-done, gate: judge_staging, fn: judge_staging, negative: false,
+     args: [{}, 0, {phase: done, task: '', msg: ''}], expect: {equals: []}}
+  - {id: staging-undeclared-refusal-fails, gate: judge_staging, fn: judge_staging, negative: true,
+     args: [{}, 1, {phase: admit, task: Refuse L, msg: 'REFUSED RHC-FIXTURE-STAGING: /c/copied/link/deep/new has a component that is a link'}],
+     expect: {search: 'staging action 1 failed \(admit\) at Refuse L'}}
+  - {id: staging-declared-refusal-met, gate: judge_staging, fn: judge_staging, negative: false,
+     args: [{staging_refused: RHC-FIXTURE-STAGING, staging_index: 1, staging_task: Refuse L, staging_msg_has: [/c/copied/link/deep/new has a component that is a link]},
+            1, {phase: admit, task: Refuse L, msg: 'REFUSED RHC-FIXTURE-STAGING: /c/copied/link/deep/new has a component that is a link: [x]'}],
+     expect: {equals: []}}
+  - {id: staging-declared-refusal-but-completed, gate: judge_staging, fn: judge_staging, negative: true,
+     args: [{staging_refused: RHC-FIXTURE-STAGING, staging_index: 1, staging_task: Refuse L}, 1, {phase: done, task: '', msg: ''}],
+     expect: {equals: ['staging action 1 was declared refused RHC-FIXTURE-STAGING but completed']}}
+  - {id: staging-declared-refusal-after-mutation, gate: judge_staging, fn: judge_staging, negative: true,
+     args: [{staging_refused: RHC-FIXTURE-STAGING, staging_index: 0, staging_task: Refuse L}, 0, {phase: mutate, task: Refuse L, msg: 'REFUSED RHC-FIXTURE-STAGING: x'}],
+     expect: {search: 'but failed after its mutation began'}}
+  - {id: staging-declared-refusal-wrong-task, gate: judge_staging, fn: judge_staging, negative: true,
+     args: [{staging_refused: RHC-FIXTURE-STAGING, staging_index: 0, staging_task: Refuse L}, 0, {phase: admit, task: Refuse a pre-state, msg: 'REFUSED RHC-FIXTURE-STAGING: x'}],
+     expect: {search: 'ended at task \\"Refuse a pre-state\\", declared \\"Refuse L\\"'}}
+  - {id: staging-declared-refusal-other-code, gate: judge_staging, fn: judge_staging, negative: true,
+     args: [{staging_refused: RHC-FIXTURE-STAGING, staging_index: 0, staging_task: Refuse L}, 0, {phase: admit, task: Refuse L, msg: 'REFUSED RH-OTHER: x'}],
+     expect: {search: 'does not start with REFUSED RHC-FIXTURE-STAGING'}}
+  - {id: staging-declared-refusal-missing-string, gate: judge_staging, fn: judge_staging, negative: true,
+     args: [{staging_refused: RHC-FIXTURE-STAGING, staging_index: 0, staging_task: Refuse L, staging_msg_has: [/c/copied/link]}, 0,
+            {phase: admit, task: Refuse L, msg: 'REFUSED RHC-FIXTURE-STAGING: /c/other has a component that is a link'}],
+     expect: {equals: ['staging action 0 message lacks /c/copied/link']}}
+  - {id: staging-refusal-at-other-index, gate: judge_staging, fn: judge_staging, negative: true,
+     args: [{staging_refused: RHC-FIXTURE-STAGING, staging_index: 1, staging_task: Refuse L}, 0, {phase: admit, task: Refuse L, msg: 'REFUSED RHC-FIXTURE-STAGING: x'}],
+     expect: {search: 'staging action 0 failed \(admit\)'}}
+  - {id: staging-declared-failure-met, gate: judge_staging, fn: judge_staging, negative: false,
+     args: [{staging_failed: true, staging_index: 0, staging_task: copy_tree C, staging_msg_has: [non-zero return code, /c/mr-src/unreadable]}, 0,
+            {phase: mutate, task: copy_tree C, msg: "non-zero return code stderr: cp: cannot open '/c/mr-src/unreadable' for reading"}],
+     expect: {equals: []}}
+  - {id: staging-declared-failure-but-refused, gate: judge_staging, fn: judge_staging, negative: true,
+     args: [{staging_failed: true, staging_index: 0, staging_task: copy_tree C}, 0, {phase: admit, task: copy_tree C, msg: 'REFUSED RHC-FIXTURE-STAGING: x'}],
+     expect: {search: 'was declared failed after its mutation began, but was refused before it'}}
+  # ---- op_writes (codex tick334 G-UNDO-STASH-PATH-UNBOUND; tasks/op.yml): the full mutation set, derived stash entry included ----
+  - {id: op-writes-stash-derived, gate: op_writes, fn: op_writes, negative: false,
+     args: [{stash: /c/src}, /c], expect: {search: '"/c/src", "/c/stash/[0-9a-f]{40}"'}}
+  - {id: op-writes-unstash-derived, gate: op_writes, fn: op_writes, negative: false,
+     args: [{unstash: /c/src}, /c], expect: {search: '"/c/src", "/c/stash/[0-9a-f]{40}"'}}
+  - {id: op-writes-stash-copy-derived, gate: op_writes, fn: op_writes, negative: false,
+     args: [{stash_copy: /c/src}, /c], expect: {search: '"/c/stash/[0-9a-f]{40}"'}}
+  - {id: op-writes-move-both-names, gate: op_writes, fn: op_writes, negative: false,
+     args: [{move: {from: /c/a, to: /c/b}}, /c], expect: {equals: [/c/b, /c/a]}}
+  - {id: op-writes-remove-no-stash-entry, gate: op_writes, fn: op_writes, negative: true,
+     args: [{remove: /c/src}, /c], expect: {equals: [/c/src]}}
+  - {id: op-writes-copy-source-only-read, gate: op_writes, fn: op_writes, negative: true,
+     args: [{copy: {from: /c/stash/x, to: /c/y}}, /c], expect: {equals: [/c/y]}}
+  # ---- outside_of (codex tick330 item 3; tasks/variant.yml token {outside}): derived from {ctl} only -- follows a relocated
+  # run dir and a renamed control / variant, never lexically under {ctl}/, and '' for an inadmissible ctl ----
+  - {id: outside-of-sibling, gate: outside_of, fn: outside_of, negative: false,
+     args: [/r/controls/c/v], expect: {equals: /r/controls/c/v.outside}}
+  - {id: outside-of-relocated-run, gate: outside_of, fn: outside_of, negative: false,
+     args: [/w/other-run/controls/c/v], expect: {equals: /w/other-run/controls/c/v.outside}}
+  - {id: outside-of-renamed-control-and-variant, gate: outside_of, fn: outside_of, negative: false,
+     args: [/r/controls/c-renamed/v-renamed], expect: {equals: /r/controls/c-renamed/v-renamed.outside}}
+  - {id: outside-of-never-under-ctl, gate: outside_of, fn: outside_of, negative: true,
+     args: [/r/controls/c/v], expect: {not_search: '"/r/controls/c/v/'}}
+  - {id: outside-of-relative-refused, gate: outside_of, fn: outside_of, negative: true,
+     args: [r/controls/c/v], expect: {equals: ''}}
+  - {id: outside-of-dotdot-refused, gate: outside_of, fn: outside_of, negative: true,
+     args: [/r/controls/../v], expect: {equals: ''}}
+  - {id: outside-of-trailing-slash-refused, gate: outside_of, fn: outside_of, negative: true,
+     args: [/r/controls/c/v/], expect: {equals: ''}}
+  # ---- judge_staging_skipped (codex tick330 G-FIXTURE-ITEM-STOP-CONTROL; tasks/fixture_ops.yml at the list's last action):
+  # every declared later action carries its per-item staging_skipped record, and nothing undeclared was skipped ----
+  - {id: staging-skipped-marker-recorded, gate: judge_staging_skipped, fn: judge_staging_skipped, negative: false,
+     args: [{staging_refused: RHC-FIXTURE-STAGING, staging_index: 1, staging_skipped: [2]}, [2]],
+     expect: {equals: []}}
+  - {id: staging-skipped-last-index-nothing-after, gate: judge_staging_skipped, fn: judge_staging_skipped, negative: false,
+     args: [{staging_failed: true, staging_index: 1}, []],
+     expect: {equals: []}}
+  - {id: staging-skipped-marker-ran, gate: judge_staging_skipped, fn: judge_staging_skipped, negative: true,
+     args: [{staging_refused: RHC-FIXTURE-STAGING, staging_index: 1, staging_skipped: [2]}, []],
+     expect: {equals: ['staging action 2 was declared skipped after the declared outcome but has no staging_skipped record (it ran)']}}
+  - {id: staging-skipped-undeclared, gate: judge_staging_skipped, fn: judge_staging_skipped, negative: true,
+     args: [{staging_failed: true, staging_index: 0}, [1]],
+     expect: {equals: ['staging action 1 was skipped but not declared in staging_skipped']}}
+  - {id: staging-skipped-string-is-not-a-list, gate: judge_staging_skipped, fn: judge_staging_skipped, negative: true,
+     args: [{staging_failed: true, staging_index: 0, staging_skipped: '1'}, [1]],
+     expect: {equals: ['staging action 1 was skipped but not declared in staging_skipped']}}
+  # ---- judge_op_outcome (codex tick330 item 2 G-OP-PER-ITEM-GUARD; tasks/op.yml, a step's ops list): only the declared index
+  # may fail, only after admission (a refused op is a declaration error), with every op_msg_has string ----
+  - {id: op-outcome-undeclared-done, gate: judge_op_outcome, fn: judge_op_outcome, negative: false,
+     args: [{}, 0, {phase: done, task: '', msg: ''}], expect: {equals: []}}
+  - {id: op-outcome-declared-failure-met, gate: judge_op_outcome, fn: judge_op_outcome, negative: false,
+     args: [{op_failed: true, op_index: 0, op_msg_has: [non-zero return code, /c/absent-source]}, 0,
+            {phase: failed, task: move, msg: "non-zero return code stderr: mv: cannot stat '/c/absent-source': No such file or directory"}],
+     expect: {equals: []}}
+  - {id: op-outcome-undeclared-failure-fails, gate: judge_op_outcome, fn: judge_op_outcome, negative: true,
+     args: [{}, 0, {phase: failed, task: move, msg: non-zero return code}], expect: {search: 'op 0 failed \(failed\) at move: non-zero return code'}}
+  - {id: op-outcome-declared-but-completed, gate: judge_op_outcome, fn: judge_op_outcome, negative: true,
+     args: [{op_failed: true, op_index: 0, op_msg_has: [x]}, 0, {phase: done, task: '', msg: ''}],
+     expect: {equals: ['op 0 was declared failed but completed']}}
+  - {id: op-outcome-failure-at-other-index, gate: judge_op_outcome, fn: judge_op_outcome, negative: true,
+     args: [{op_failed: true, op_index: 1, op_msg_has: [non-zero return code]}, 0, {phase: failed, task: move, msg: non-zero return code}],
+     expect: {search: 'op 0 failed \(failed\) at move'}}
+  - {id: op-outcome-declared-but-refused, gate: judge_op_outcome, fn: judge_op_outcome, negative: true,
+     args: [{op_failed: true, op_index: 0, op_msg_has: [outside]}, 0, {phase: refused, task: Refuse a residual token, msg: 'op x: writes outside /r'}],
+     expect: {search: 'op 0 was declared failed but was refused before it ran \(refused, a declaration error\)'}}
+  - {id: op-outcome-missing-string, gate: judge_op_outcome, fn: judge_op_outcome, negative: true,
+     args: [{op_failed: true, op_index: 0, op_msg_has: [non-zero return code, /c/absent-source]}, 0, {phase: failed, task: move, msg: 'non-zero return code stderr: mv: /c/other'}],
+     expect: {equals: ['op 0 message lacks /c/absent-source']}}
+  - {id: op-outcome-failed-not-sameas-true, gate: judge_op_outcome, fn: judge_op_outcome, negative: true,
+     args: [{op_failed: 'true', op_index: 0, op_msg_has: [x]}, 0, {phase: failed, task: move, msg: x}],
+     expect: {search: 'op 0 failed \(failed\) at move'}}
+  # ---- judge_op_skipped (codex tick330 item 2; tasks/op.yml at the ops list's last op; separate from judge_staging_skipped):
+  # every declared later op carries its op_skipped record, and nothing undeclared was skipped ----
+  - {id: op-skipped-marker-recorded, gate: judge_op_skipped, fn: judge_op_skipped, negative: false,
+     args: [{op_failed: true, op_index: 0, op_skipped: [1]}, [1]], expect: {equals: []}}
+  - {id: op-skipped-last-index-nothing-after, gate: judge_op_skipped, fn: judge_op_skipped, negative: false,
+     args: [{op_failed: true, op_index: 1}, []], expect: {equals: []}}
+  - {id: op-skipped-marker-ran, gate: judge_op_skipped, fn: judge_op_skipped, negative: true,
+     args: [{op_failed: true, op_index: 0, op_skipped: [1]}, []],
+     expect: {equals: ['op 1 was declared skipped after the declared op outcome but has no op_skipped record (it ran)']}}
+  - {id: op-skipped-undeclared, gate: judge_op_skipped, fn: judge_op_skipped, negative: true,
+     args: [{op_failed: true, op_index: 0}, [1]], expect: {equals: ['op 1 was skipped but not declared in op_skipped']}}
+  - {id: op-skipped-staging-key-not-read, gate: judge_op_skipped, fn: judge_op_skipped, negative: true,
+     args: [{op_failed: true, op_index: 0, staging_skipped: [1]}, [1]], expect: {equals: ['op 1 was skipped but not declared in op_skipped']}}
+  # ---- fixture_undo_decide (codex tick297 003441 G-UNDO-IDENTITY / G-STAGING-PARTIAL; tasks/fixture_undo.yml): a recorded
+  # resource is reversed only while it keeps its recorded identity; replaced / re-targeted / unverifiable / unrecorded = finding ----
+  - {id: undo-link-recorded, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: false,
+     args: [{op: symlink, state: done, path: /c/A, target: /c/R, from: '', to: '', post: {exists: true, islnk: true, isdir: false, dev: 1, inode: 7, lnk_target: /c/R}},
+            {exists: true, islnk: true, isdir: false, dev: 1, inode: 7, lnk_target: /c/R}, {}],
+     expect: {equals: {do: unlink, why: 'the recorded link, recorded target'}}}
+  - {id: undo-link-retargeted, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: symlink, state: done, path: /c/A, target: /c/R, from: '', to: '', post: {exists: true, islnk: true, isdir: false, dev: 1, inode: 7, lnk_target: /c/R}},
+            {exists: true, islnk: true, isdir: false, dev: 1, inode: 7, lnk_target: /elsewhere}, {}],
+     expect: {search: '"do": "finding".*re-targeted \(/elsewhere, recorded /c/R\)'}}
+  - {id: undo-link-replaced, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: symlink, state: done, path: /c/A, target: /c/R, from: '', to: '', post: {exists: true, islnk: true, isdir: false, dev: 1, inode: 7, lnk_target: /c/R}},
+            {exists: true, islnk: true, isdir: false, dev: 1, inode: 9, lnk_target: /c/R}, {}],
+     expect: {search: '"do": "finding".*no longer the recorded link'}}
+  - {id: undo-dir-recorded, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: false,
+     args: [{op: copy_tree, state: done, path: '', from: /c/src, to: /c/copied, target: '', post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 5, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 5}, {}],
+     expect: {equals: {do: remove-dir, why: 'the recorded directory, recorded identity'}}}
+  - {id: undo-dir-replaced, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: mkdir, state: done, path: /c/R, from: '', to: '', target: '', post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 5, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 6}, {}],
+     expect: {search: '"do": "finding".*not the recorded directory \(replaced'}}
+  - {id: undo-dir-replaced-by-link, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: mkdir, state: done, path: /c/R, from: '', to: '', target: '', post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 5, lnk_target: null}},
+            {exists: true, isdir: false, islnk: true, dev: 1, inode: 5, lnk_target: /outside}, {}],
+     expect: {search: '"do": "finding"'}}
+  # ---- G-UNDO-PARTIAL-BINDING (codex tick330 item 4): a FAILED record's partial output is removed only when the outcome
+  # (failed_in action), the intent, the recorded pre-state parent, its exclusivity, the current ancestry (5th argument, the
+  # parent's stat now) and the current identity / owner ALL bind; the post-failure identity alone is evidence only; every
+  # other failed record that left something is a finding (refused, left in place) ----
+  - {id: undo-partial-copy-recorded, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: false,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: remove-dir, why: 'the partial output of the failed copy_tree: absent before under the recorded owner-private parent; post-failure identity, owner and ancestry unchanged'}}}
+  - {id: undo-partial-copy-replaced, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 3, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: finding, why: '/c/manifests-replica: partial output of a failed copy_tree not bound (current identity: not the real directory observed right after the failure); left in place'}}}
+  - {id: undo-partial-copy-now-link, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: false, islnk: true, dev: 1, inode: 8, uid: 1000, lnk_target: /outside}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {search: '"do": "finding".*current identity: not the real directory'}}
+  - {id: undo-partial-copy-reowned, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1001}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: finding, why: '/c/manifests-replica: partial output of a failed copy_tree not bound (owner: not owned by the recorded parent owner); left in place'}}}
+  - {id: undo-partial-copy-post-check-failed, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: post-check, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: finding, why: '/c/manifests-replica: partial output of a failed copy_tree not bound (outcome: failed in post-check, not in the copy); left in place'}}}
+  - {id: undo-partial-copy-outcome-unrecorded, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {search: '"do": "finding".*outcome: failed in \?, not in the copy'}}
+  - {id: undo-partial-copy-intent-unadmitted, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: false, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: finding, why: '/c/manifests-replica: partial output of a failed copy_tree not bound (intent: no admitted absent pre-state of a declared copy); left in place'}}}
+  - {id: undo-partial-copy-no-pre-state, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: finding, why: '/c/manifests-replica: partial output of a failed copy_tree not bound (pre-state: no recorded identity of the destination parent /c; current ancestry: the parent is no longer the recorded owner-private directory; owner: not owned by the recorded parent owner); left in place'}}}
+  - {id: undo-partial-copy-pre-parent-other-dir, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /elsewhere, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {search: '"do": "finding".*pre-state: no recorded identity of the destination parent /c;'}}
+  - {id: undo-partial-copy-pre-parent-not-exclusive, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: true, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: finding, why: '/c/manifests-replica: partial output of a failed copy_tree not bound (exclusive destination: the recorded parent was not a real owner-private directory); left in place'}}}
+  - {id: undo-partial-copy-parent-replaced, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 9, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: finding, why: '/c/manifests-replica: partial output of a failed copy_tree not bound (current ancestry: the parent is no longer the recorded owner-private directory); left in place'}}}
+  - {id: undo-partial-copy-parent-now-writable, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: true}],
+     expect: {search: '"do": "finding".*current ancestry: the parent is no longer the recorded owner-private directory'}}
+  - {id: undo-partial-copy-parent-unobserved, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, []],
+     expect: {search: '"do": "finding".*current ancestry: the parent is no longer the recorded owner-private directory'}}
+  - {id: undo-partial-copy-protected, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, uid: 1000}, {}, [/c/manifests-replica/kept],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {search: '"do": "finding".*remove-dir refused: the protected /c/manifests-replica/kept'}}
+  - {id: undo-partial-copy-gone, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: false,
+     args: [{op: copy_tree, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 8, lnk_target: null}},
+            {exists: false}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: none, why: 'the partial output of the failed copy_tree at /c/manifests-replica is already gone'}}}
+  - {id: undo-failed-mkdir-left-dir, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: mkdir, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: /c/R, from: '', to: '', target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 5, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 5, uid: 1000}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {equals: {do: finding, why: '/c/R: a failed mkdir left something whose origin is ambiguous (the post-failure identity is evidence only); left in place'}}}
+  - {id: undo-failed-symlink-left-link, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: symlink, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: /c/A, target: /c/R, from: '', to: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: false, islnk: true, dev: 1, inode: 7, lnk_target: /c/R}},
+            {exists: true, isdir: false, islnk: true, dev: 1, inode: 7, uid: 1000, lnk_target: /c/R}, {}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {search: '"do": "finding".*a failed symlink left something whose origin is ambiguous'}}
+  - {id: undo-failed-move-left-dir, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: move, state: failed, failed_in: action, pre_absent: true, parents_admitted: true, path: '', from: /c/fx, to: /c/fx.real, target: '',
+             pre: {parent: /c, exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false},
+             post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 4, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 4, uid: 1000}, {exists: false}, [],
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 2, uid: 1000, wgrp: false, woth: false}],
+     expect: {search: '"do": "finding".*a failed move left something whose origin is ambiguous'}}
+  - {id: undo-intent-left-something, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: copy_tree, state: intent, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '', post: {}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 8}, {}],
+     expect: {search: '"do": "finding".*ownership unproven'}}
+  - {id: undo-failed-nothing-created, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: false,
+     args: [{op: copy_tree, state: failed, path: '', from: /c/mr-src, to: /c/manifests-replica, target: '', post: {exists: false}},
+            {exists: false}, {}],
+     expect: {search: '"do": "none"'}}
+  - {id: undo-no-identity, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: mkdir, state: done, path: /c/R, from: '', to: '', target: '', post: {exists: true, isdir: true, islnk: false, dev: null, inode: null, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 5}, {}],
+     expect: {search: '"do": "finding".*unverifiable'}}
+  - {id: undo-move-recorded, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: false,
+     args: [{op: move, state: done, path: '', from: /c/fx, to: /c/fx.real, target: '', post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 4, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 4}, {exists: false}],
+     expect: {equals: {do: move-back, why: 'the recorded directory, recorded identity, source name free'}}}
+  - {id: undo-move-source-occupied, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: move, state: done, path: '', from: /c/fx, to: /c/fx.real, target: '', post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 4, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 4}, {exists: true, isdir: false, islnk: true, dev: 1, inode: 11}],
+     expect: {search: '"do": "finding".*source name is occupied'}}
+  # ---- G-UNDO-PROTECTION-PROPAGATION (codex tick330): a recorded parent whose own identity holds is NEVER removed, moved
+  # back or unlinked over a path an earlier (child) record's refused undo left in place; component-wise (/c/AB is not under /c/A) ----
+  - {id: undo-parent-over-protected-child, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: mkdir, state: done, path: /c/A, from: '', to: '', target: '', post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 5, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 5}, {}, [/c/A/B]],
+     expect: {equals: {do: finding, why: '/c/A: remove-dir refused: the protected /c/A/B is at, below or above it (left in place by a refused undo); left in place'}}}
+  - {id: undo-parent-prefix-sibling-not-protected, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: false,
+     args: [{op: mkdir, state: done, path: /c/A, from: '', to: '', target: '', post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 5, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 5}, {}, [/c/AB]],
+     expect: {equals: {do: remove-dir, why: 'the recorded directory, recorded identity'}}}
+  - {id: undo-move-back-over-protected, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: move, state: done, path: '', from: /c/fx, to: /c/fx.real, target: '', post: {exists: true, isdir: true, islnk: false, dev: 1, inode: 4, lnk_target: null}},
+            {exists: true, isdir: true, islnk: false, dev: 1, inode: 4}, {exists: false}, [/c/fx.real/child]],
+     expect: {search: '"do": "finding".*move-back refused: the protected /c/fx\.real/child'}}
+  - {id: undo-link-protected, gate: fixture_undo_decide, fn: fixture_undo_decide, negative: true,
+     args: [{op: symlink, state: done, path: /c/A, target: /c/R, from: '', to: '', post: {exists: true, islnk: true, isdir: false, dev: 1, inode: 7, lnk_target: /c/R}},
+            {exists: true, islnk: true, isdir: false, dev: 1, inode: 7, lnk_target: /c/R}, {}, [/c/A]],
+     expect: {search: '"do": "finding".*unlink refused'}}
+  - {id: protected-overlap-at-below-above, gate: protected_overlap, fn: protected_overlap, negative: false,
+     args: [[/c/A, /c/Q/x/y], [/c/A, /c/A/B, /c/Q, /c/Z]], expect: {equals: [/c/A, /c/A/B, /c/Q]}}
+  - {id: protected-overlap-prefix-is-not-a-component, gate: protected_overlap, fn: protected_overlap, negative: true,
+     args: [[/c/A], [/c/AB, /c/AB/c, /c]], expect: {equals: [/c]}}
+  - {id: protected-overlap-none, gate: protected_overlap, fn: protected_overlap, negative: true,
+     args: [[/c/A], []], expect: {equals: []}}
+  - {id: undo-findings-declared-exactly, gate: judge_undo_findings, fn: judge_undo_findings, negative: false,
+     args: [[{path: /c/src/child, why: 'not the recorded directory \(replaced'}, {path: /c/src, why: 'remove-dir refused: the protected'}],
+            [{path: /c/src/child, why: '/c/src/child is not the recorded directory (replaced: identity or kind differs); left in place'},
+             {path: /c/src, why: '/c/src: remove-dir refused: the protected /c/src/child is at, below or above it (left in place by a refused undo); left in place'}]],
+     expect: {equals: {expected: [{path: /c/src/child, why: '/c/src/child is not the recorded directory (replaced: identity or kind differs); left in place'},
+                                  {path: /c/src, why: '/c/src: remove-dir refused: the protected /c/src/child is at, below or above it (left in place by a refused undo); left in place'}],
+                       unexpected: [], missing: []}}}
+  - {id: undo-findings-reason-mismatch, gate: judge_undo_findings, fn: judge_undo_findings, negative: true,
+     args: [[{path: /c/src, why: 'remove-dir refused'}], [{path: /c/src, why: '/c/src is not the recorded directory (replaced: identity or kind differs); left in place'}]],
+     expect: {equals: {expected: [], unexpected: [{path: /c/src, why: '/c/src is not the recorded directory (replaced: identity or kind differs); left in place'}],
+                       missing: [{path: /c/src, why: 'remove-dir refused'}]}}}
+  - {id: undo-findings-path-is-exact, gate: judge_undo_findings, fn: judge_undo_findings, negative: true,
+     args: [[{path: /c/src, why: 'replaced'}], [{path: /c/src/child, why: '/c/src/child is not the recorded directory (replaced: identity or kind differs); left in place'}]],
+     expect: {search: '"missing": \[\{'}}
+  - {id: undo-findings-undeclared, gate: judge_undo_findings, fn: judge_undo_findings, negative: true,
+     args: [[], [{path: /c/src, why: 'x'}]], expect: {equals: {expected: [], unexpected: [{path: /c/src, why: 'x'}], missing: []}}}
+  - {id: undo-findings-malformed-declaration, gate: judge_undo_findings, fn: judge_undo_findings, negative: true,
+     args: [[x], []], expect: {equals: {expected: [], unexpected: [], missing: [x]}}}
   # ---- parsers ----
   - {id: failed-task-last-header-before-fatal, gate: failed_task, fn: failed_task, negative: false,
      args: ["TASK [A] ***\nok: [localhost]\nTASK [Refuse B (x)] ****\nfatal: [localhost]: FAILED!\n"], expect: {equals: 'Refuse B (x)'}}
@@ -430,6 +788,41 @@ cases:
   - {id: unimpl-extra-var-repoint-refused, gate: unimplemented, fn: unimplemented, negative: true,
      args: [{id: A, steps: [{id: s, act: {kind: playbook, playbook: target_bootstrap, extra_vars: {ansible_host: 100.64.0.1}, inventory_targets: {t1: {ansible_host: 192.0.2.10}}}}]}, *vocab_min],
      expect: {search: 'extra var ansible_host is not a TEST-NET-1 address'}}
+  # ---- unimplemented: the STATIC staging_skipped validation (codex tick330 G-FIXTURE-ITEM-STOP-CONTROL; controls.j2
+  # _steps_unimpl) and the static op_* validation (codex tick330 item 2 G-OP-PER-ITEM-GUARD): exactly the later indexes ----
+  - {id: unimpl-staging-skipped-exact-admitted, gate: unimplemented, fn: unimplemented, negative: false,
+     args: [{id: A, steps: [{id: s, fixture_ops: [{mkdir: /c/a}, {mkdir: /c/b}, {mkdir: /c/m}],
+                             expect: {staging_failed: true, staging_index: 0, staging_task: T, staging_skipped: [1, 2]}}]}, *vocab_steps],
+     expect: {equals: {base: []}}}
+  - {id: unimpl-staging-skipped-last-index-empty-admitted, gate: unimplemented, fn: unimplemented, negative: false,
+     args: [{id: A, steps: [{id: s, fixture_ops: [{mkdir: /c/a}, {mkdir: /c/b}], expect: {staging_failed: true, staging_index: 1, staging_task: T}}]}, *vocab_steps],
+     expect: {equals: {base: []}}}
+  - {id: unimpl-staging-skipped-missing-refused, gate: unimplemented, fn: unimplemented, negative: true,
+     args: [{id: A, steps: [{id: s, fixture_ops: [{mkdir: /c/a}, {mkdir: /c/b}, {mkdir: /c/m}], expect: {staging_failed: true, staging_index: 0, staging_task: T}}]}, *vocab_steps],
+     expect: {search: 'fixture_ops s staging_skipped must list exactly the actions after staging_index 0 \(\[1, 2\]\); got \[\]'}}
+  - {id: unimpl-staging-skipped-partial-refused, gate: unimplemented, fn: unimplemented, negative: true,
+     args: [{id: A, steps: [{id: s, fixture_ops: [{mkdir: /c/a}, {mkdir: /c/b}, {mkdir: /c/m}],
+                             expect: {staging_failed: true, staging_index: 0, staging_task: T, staging_skipped: [2]}}]}, *vocab_steps],
+     expect: {search: 'staging_skipped must list exactly the actions after staging_index 0 \(\[1, 2\]\); got \[2\]'}}
+  - {id: unimpl-staging-skipped-string-refused, gate: unimplemented, fn: unimplemented, negative: true,
+     args: [{id: A, steps: [{id: s, fixture_ops: [{mkdir: /c/a}, {mkdir: /c/b}], expect: {staging_failed: true, staging_index: 0, staging_task: T, staging_skipped: '1'}}]}, *vocab_steps],
+     expect: {search: 'staging_skipped must list exactly the actions after staging_index 0'}}
+  - {id: unimpl-op-outcome-exact-admitted, gate: unimplemented, fn: unimplemented, negative: false,
+     args: [{id: A, steps: [{id: s, ops: [{move: {from: /c/x, to: /c/y}}, {mkdir: /c/m}],
+                             expect: {op_failed: true, op_index: 0, op_msg_has: [non-zero return code], op_skipped: [1]}}]}, *vocab_steps],
+     expect: {equals: {base: []}}}
+  - {id: unimpl-op-skipped-missing-refused, gate: unimplemented, fn: unimplemented, negative: true,
+     args: [{id: A, steps: [{id: s, ops: [{move: {from: /c/x, to: /c/y}}, {mkdir: /c/m}], expect: {op_failed: true, op_index: 0, op_msg_has: [x]}}]}, *vocab_steps],
+     expect: {search: 'ops s op_skipped must list exactly the ops after op_index 0 \(\[1\]\); got \[\]'}}
+  - {id: unimpl-op-outcome-on-fixture-step-refused, gate: unimplemented, fn: unimplemented, negative: true,
+     args: [{id: A, steps: [{id: s, fixture_ops: [{mkdir: /c/a}], expect: {op_failed: true, op_index: 0, op_msg_has: [x]}}]}, *vocab_steps],
+     expect: {search: 'ops s op outcome needs an ops step'}}
+  - {id: unimpl-op-index-outside-refused, gate: unimplemented, fn: unimplemented, negative: true,
+     args: [{id: A, steps: [{id: s, ops: [{mkdir: /c/m}], expect: {op_failed: true, op_index: 1, op_msg_has: [x]}}]}, *vocab_steps],
+     expect: {search: 'ops s op outcome needs an ops step, op_failed true, an op_index inside its list'}}
+  - {id: unimpl-op-no-message-refused, gate: unimplemented, fn: unimplemented, negative: true,
+     args: [{id: A, steps: [{id: s, ops: [{move: {from: /c/x, to: /c/y}}, {mkdir: /c/m}], expect: {op_failed: true, op_index: 0, op_skipped: [1]}}]}, *vocab_steps],
+     expect: {search: 'at least one op_msg_has string'}}
   - {id: plan-binding-absent-queues, gate: plan_status, fn: plan_status, negative: true,
      args: [{id: S}, {id: base}, {retired_dep: {met: true, kind: source, why: landed}}, []],
      expect: {equals: {status: QUEUED, why: ['stale-binding: binding not evaluated (no bound_bytes_current dependency; no older-harness fallback)']}}}
@@ -482,6 +875,25 @@ cases:
             [{prefix: '', ids: [E25], variants: {E25: [a, b]}}],
             [{id: W, cases: [E25], variants: [{id: g}, {id: m}]}]],
      expect: {equals: {whole: [E25], partial: {}}}}
+  # G-COMPONENT-MULTI-LEG (increment 2): a component two catalog copies credit (E77 consumer-copies = seven cf-* legs) is
+  # NOT credited by one passing leg; it is credited once every leg crediting it has passed
+  - {id: coverage-of-component-needs-every-leg, gate: coverage, fn: coverage_of, negative: true,
+     args: [[{control: C, variant: cf-reorder, cases: [E77], case_components: {E77: [consumer-copies]}}],
+            [{prefix: '', ids: [E77], variants: {E77: [positive, consumer-copies]}}],
+            [{id: C, cases: [E77], variants: [{id: cf-reorder, case_components: {E77: [consumer-copies]}},
+                                               {id: cf-unterminated, case_components: {E77: [consumer-copies]}},
+                                               {id: e82-mode, case_components: {E77: []}}]}]],
+     expect: {equals: {whole: [], partial: {E77: {covered: [], missing: [positive, consumer-copies],
+                                                  pending_components: {consumer-copies: {C: [cf-unterminated]}}}}}}}
+  - {id: coverage-of-component-every-leg-passed, gate: coverage, fn: coverage_of, negative: false,
+     args: [[{control: C, variant: cf-reorder, cases: [E77], case_components: {E77: [consumer-copies]}},
+             {control: C, variant: cf-unterminated, cases: [E77], case_components: {E77: [consumer-copies]}},
+             {control: P, variant: base, cases: [E77], case_components: {E77: [positive]}}],
+            [{prefix: '', ids: [E77], variants: {E77: [positive, consumer-copies]}}],
+            [{id: C, cases: [E77], variants: [{id: cf-reorder, case_components: {E77: [consumer-copies]}},
+                                               {id: cf-unterminated, case_components: {E77: [consumer-copies]}}]},
+             {id: P, cases: [E77], case_components: {E77: [positive]}}]],
+     expect: {equals: {whole: [E77], partial: {}}}}
   # declaration: an omitted entry beside component-crediting siblings is refused; the explicit [] form is admitted
   - {id: coverage-mixed-credit-refused, gate: coverage, fn: coverage, negative: true,
      args: [[{id: S, cases: [E84], variants: [{id: k, case_components: {E84: [explicit-key-set]}}, {id: r}]}],
@@ -590,9 +1002,116 @@ cases:
   - {id: state-path-mode-group-readable, gate: judge_state, fn: judge_state, negative: true,
      args: [[{path: /r/run/probe-env/env.json, kind: regular, mode: '0600'}], [{exists: true, kind: regular, mode: '0640'}], {}],
      expect: {search: 'env\.json mode 0640 != 0600'}}
+  # ---- judge_state custody (codex tick338 G-UV-ELSEWHERE-FIXTURE-LOCATION): owner uid and group / other write ----
+  - {id: state-path-owned-private, gate: judge_state, fn: judge_state, negative: false,
+     args: [[{path: /g/py/bin, kind: dir, uid: '1000', private_write: true}], [{exists: true, kind: dir, uid: '1000', wgrp: false, woth: false}], {}],
+     expect: {equals: []}}
+  - {id: state-path-foreign-owner, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{path: /g/py/bin, kind: dir, uid: '1000'}], [{exists: true, kind: dir, uid: '0', wgrp: false, woth: false}], {}],
+     expect: {equals: ['/g/py/bin owner uid 0 != 1000']}}
+  - {id: state-path-group-writable, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{path: /g/py/bin, kind: dir, private_write: true}], [{exists: true, kind: dir, uid: '1000', wgrp: true, woth: false}], {}],
+     expect: {equals: ['/g/py/bin is absent or group / other-writable']}}
+  - {id: state-path-private-write-absent, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{path: /g/py/bin, private_write: true, uid: '1000'}], [{exists: false, kind: absent, uid: absent}], {}],
+     expect: {search: 'owner uid absent != 1000.*is absent or group / other-writable'}}
   - {id: state-path-mode-absent, gate: judge_state, fn: judge_state, negative: true,
      args: [[{path: /r/run/probe-env/env.json, mode: '0600'}], [{exists: false, kind: absent, mode: absent}], {}],
      expect: {search: 'mode absent != 0600'}}
+  # ---- judge_state same_bytes: two present, equal digests only; ABSENT is a typed obstruction, never ABSENT == ABSENT ----
+  - {id: state-same-bytes-equal, gate: judge_state, fn: judge_state, negative: false,
+     args: [[{same_bytes: [/r/a, /r/b]}], [{checksums: [aa11, aa11]}], {}], expect: {equals: []}}
+  - {id: state-same-bytes-both-absent, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{same_bytes: [/r/a, /r/b]}], [{checksums: [ABSENT, ABSENT]}], {}], expect: {search: 'same_bytes ABSENT: /r/a, /r/b ', not_search: 'bytes differ'}}
+  - {id: state-same-bytes-one-absent, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{same_bytes: [/r/a, /r/b]}], [{checksums: [aa11, ABSENT]}], {}], expect: {search: 'same_bytes ABSENT: /r/b '}}
+  - {id: state-same-bytes-differ, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{same_bytes: [/r/a, /r/b]}], [{checksums: [aa11, bb22]}], {}], expect: {search: 'bytes differ: /r/a vs /r/b'}}
+  # ---- judge_state trees (codex 234857 content readback): DIGEST-bearing tree records; metadata equality is never bytes ----
+  - {id: state-trees-equal-bytes, gate: judge_state, fn: judge_state, negative: false,
+     args: [[{trees: [pre, post]}], [{trees: [['a f 0644 aa11', 'd d 0755 -'], ['a f 0644 aa11', 'd d 0755 -']]}], {}], expect: {equals: []}}
+  - {id: state-trees-digest-differs, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{trees: [pre, post]}], [{trees: [['a f 0644 aa11', 'd d 0755 -'], ['a f 0644 bb22', 'd d 0755 -']]}], {}],
+     expect: {search: 'trees pre / post differ: .*a f 0644 (aa11|bb22)'}}
+  - {id: state-trees-absent-is-vacuous, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{trees: [pre, post]}], [{trees: [['ABSENT'], ['ABSENT']]}], {}], expect: {search: 'equality would be vacuous'}}
+  - {id: state-trees-link-root-is-vacuous, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{trees: [pre, post]}], [{trees: [['NOT-A-REAL-DIR'], ['NOT-A-REAL-DIR']]}], {}], expect: {search: 'equality would be vacuous'}}
+  - {id: state-trees-no-record, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{trees: [pre, post]}], [{}], {}], expect: {search: 'no tree record pre / post'}}
+  - {id: state-trees-must-differ, gate: judge_state, fn: judge_state, negative: false,
+     args: [[{trees: [pre, post], equal: false}], [{trees: [['a f 0644 aa11'], ['a f 0644 bb22']]}], {}], expect: {equals: []}}
+  # ---- tree_lines (tasks/tree.yml): relpath, type, mode, sha256 -- sorted; a link or absent root never lists ----
+  - {id: tree-lines-real-dir, gate: tree_lines, fn: tree_lines, negative: false,
+     args: [{path: /r/t, exists: true, isdir: true, islnk: false},
+            [{path: /r/t/l, islnk: true, mode: '0777'}, {path: /r/t/a, isreg: true, mode: '0644'}, {path: /r/t/d, isdir: true, mode: '0755'}],
+            [{path: /r/t/a, checksum: aa11}]],
+     expect: {equals: ['a f 0644 aa11', 'd d 0755 -', 'l l 0777 -']}}
+  - {id: tree-lines-link-root, gate: tree_lines, fn: tree_lines, negative: true,
+     args: [{path: /r/t, exists: true, isdir: false, islnk: true}, [{path: /r/t/a, isreg: true, mode: '0644'}], [{path: /r/t/a, checksum: aa11}]],
+     expect: {equals: ['NOT-A-REAL-DIR']}}
+  - {id: tree-lines-absent-root, gate: tree_lines, fn: tree_lines, negative: true,
+     args: [{exists: false}, [], []], expect: {equals: ['ABSENT']}}
+  - {id: tree-lines-unread-digest, gate: tree_lines, fn: tree_lines, negative: true,
+     args: [{path: /r/t, exists: true, isdir: true, islnk: false}, [{path: /r/t/a, isreg: true, mode: '0644'}], []],
+     expect: {equals: ['a f 0644 UNREAD']}}
+  # ---- judge_produce (tasks/produce.yml; codex 230249 (a), 231744 option (a)): one in-process route producer call ----
+  # G-ADMIT-FRESHNESS (codex tick297 003441): every call carries the runner sentinel produce.yml planted (&prod_snt);
+  # published = after != sentinel
+  - {id: produce-bundle-produced, gate: judge_produce, fn: judge_produce, negative: false,
+     args: [{produced: true}, {ok: true, before: null, sentinel: &prod_snt {schema: rhc-produce-sentinel/1, step: s, nonce: n1},
+                                after: {schema: fixture-bundle-result/1, case: e82-mode, dest: /h/c/bundle}},
+            {kind: bundle, case: e82-mode, dest: /h/c/bundle}], expect: {equals: []}}
+  - {id: produce-checkout-produced, gate: judge_produce, fn: judge_produce, negative: false,
+     args: [{produced: true}, {ok: true, before: {schema: fixture-checkout-result/1, case: old, clone: /h/c/vclone, head: h0}, sentinel: *prod_snt,
+                                after: {schema: fixture-checkout-result/1, case: usage-text, clone: /h/c/vclone, head: h1}},
+            {kind: checkout, case: usage-text, clone: /h/c/vclone, head: h1}], expect: {equals: []}}
+  - {id: produce-admit-produced, gate: judge_produce, fn: judge_produce, negative: false,
+     args: [{produced: true}, {ok: true, before: null, sentinel: *prod_snt, after: {dir: /h/c/R/bundle}}, {kind: admit, dir: /h/c/R/bundle}], expect: {equals: []}}
+  - {id: produce-admit-identical-readmission, gate: judge_produce, fn: judge_produce, negative: false,
+     args: [{produced: true}, {ok: true, before: {dir: /h/c/R/bundle, seed_sha256: s1}, sentinel: *prod_snt, after: {dir: /h/c/R/bundle, seed_sha256: s1}},
+            {kind: admit, dir: /h/c/R/bundle}], expect: {equals: []}}
+  - {id: produce-admit-stale-same-dir, gate: judge_produce, fn: judge_produce, negative: true,
+     args: [{produced: true}, {ok: true, before: {dir: /h/c/R/bundle, seed_sha256: s1}, sentinel: *prod_snt, after: *prod_snt},
+            {kind: admit, dir: /h/c/R/bundle}], expect: {search: 'returned without publishing a result during this call'}}
+  - {id: produce-no-sentinel, gate: judge_produce, fn: judge_produce, negative: true,
+     args: [{produced: true}, {ok: true, before: {dir: /h/c/R/bundle}, after: {dir: /h/c/R/bundle}}, {kind: admit, dir: /h/c/R/bundle}],
+     expect: {equals: ['no runner sentinel was planted in the result fact before the call (freshness unprovable)']}}
+  - {id: produce-refusal-matched, gate: judge_produce, fn: judge_produce, negative: false,
+     args: [{produce_refused: RH-FIXTURE-UNSUPPORTED, produce_task: 'Refuse linked, non-directory, foreign-owned, other-writable or foreign group-writable components',
+             produce_msg_has: ['/h/c/fxctl/vclone has a component that is a link'], produce_only_component: /h/c/fxctl},
+            {ok: false, task: 'Refuse linked, non-directory, foreign-owned, other-writable or foreign group-writable components',
+             msg: "REFUSED RH-FIXTURE-UNSUPPORTED: /h/c/fxctl/vclone has a component that is a link, not a directory, owned by a uid other than 0/1000, other-writable (sticky directories are not excepted), or group-writable without being owned by uid 1000: ['/h/c/fxctl', '/h/c/fxctl', '/h/c/fxctl'] (path_admission.ancestry).",
+             before: null, sentinel: *prod_snt, after: *prod_snt},
+            {kind: checkout, case: usage-text, clone: /h/c/fxctl/vclone, head: h1}], expect: {equals: []}}
+  - {id: produce-ok-when-refusal-expected, gate: judge_produce, fn: judge_produce, negative: true,
+     args: [{produce_refused: RH-FIXTURE-UNSUPPORTED, produce_task: 'Refuse linked, non-directory, foreign-owned, other-writable or foreign group-writable components'},
+            {ok: true, before: null, sentinel: *prod_snt, after: {schema: fixture-checkout-result/1, case: usage-text, clone: /h/c/fxctl/vclone, head: h1}},
+            {kind: checkout, case: usage-text, clone: /h/c/fxctl/vclone, head: h1}], expect: {search: 'the producer succeeded; expected REFUSED RH-FIXTURE-UNSUPPORTED'}}
+  - {id: produce-right-code-wrong-leaf, gate: judge_produce, fn: judge_produce, negative: true,
+     args: [{produce_refused: RH-FIXTURE-UNSUPPORTED, produce_task: 'Refuse linked, non-directory, foreign-owned, other-writable or foreign group-writable components'},
+            {ok: false, task: 'Admit the ancestry inputs (the ONE path-admission rule; no default)',
+             msg: 'REFUSED RH-FIXTURE-UNSUPPORTED: admit_ancestry.yml needs rh_anc_bs', before: null, sentinel: *prod_snt, after: *prod_snt},
+            {kind: checkout, case: usage-text, clone: /h/c/fxctl/vclone, head: h1}], expect: {search: 'failed task "Admit the ancestry inputs'}}
+  - {id: produce-refusal-names-another-component, gate: judge_produce, fn: judge_produce, negative: true,
+     args: [{produce_refused: RH-FIXTURE-UNSUPPORTED, produce_task: 'Refuse linked, non-directory, foreign-owned, other-writable or foreign group-writable components',
+             produce_only_component: /h/c/A},
+            {ok: false, task: 'Refuse linked, non-directory, foreign-owned, other-writable or foreign group-writable components',
+             msg: "REFUSED RH-FIXTURE-UNSUPPORTED: /h/c/A/bundle has a component that is a link, not a directory, owned by a uid other than 0/1000, other-writable (sticky directories are not excepted), or group-writable without being owned by uid 1000: ['/h/c/A', '/h/c/A', '/h/c/R'] (path_admission.ancestry).",
+             before: null, sentinel: *prod_snt, after: *prod_snt},
+            {kind: bundle, case: e82-mode, dest: /h/c/R/bundle/fixture}], expect: {search: 'offending components .* are not exactly \[/h/c/A\]'}}
+  - {id: produce-refused-but-published, gate: judge_produce, fn: judge_produce, negative: true,
+     args: [{produce_refused: RH-FIXTURE-UNSUPPORTED, produce_task: t1},
+            {ok: false, task: t1, msg: 'REFUSED RH-FIXTURE-UNSUPPORTED: x', before: null, sentinel: *prod_snt, after: {schema: fixture-bundle-result/1, case: e82-mode, dest: /h/c/x}},
+            {kind: bundle, case: e82-mode, dest: /h/c/x}], expect: {search: 'the result fact changed'}}
+  - {id: produce-wrong-case, gate: judge_produce, fn: judge_produce, negative: true,
+     args: [{produced: true}, {ok: true, before: null, sentinel: *prod_snt, after: {schema: fixture-bundle-result/1, case: e82-missing, dest: /h/c/bundle}},
+            {kind: bundle, case: e82-mode, dest: /h/c/bundle}], expect: {search: 'is not case e82-mode'}}
+  - {id: produce-stale-result, gate: judge_produce, fn: judge_produce, negative: true,
+     args: [{produced: true}, {ok: true, before: {schema: fixture-bundle-result/1, case: e82-mode, dest: /h/c/bundle}, sentinel: *prod_snt, after: *prod_snt},
+            {kind: bundle, case: e82-mode, dest: /h/c/bundle}], expect: {search: 'returned without publishing a result during this call'}}
+  - {id: produce-expectation-names-neither, gate: judge_produce, fn: judge_produce, negative: true,
+     args: [{}, {ok: true, before: null, sentinel: *prod_snt, after: *prod_snt}, {kind: bundle, case: e82-mode, dest: /h/c/bundle}], expect: {search: 'names neither'}}
   # ---- REPAIR 5 (codex 223100): Route 3 clone fixtures -- the declared mutation set (clone_status: G's profile line + every
   # applied fixture's expected_status, SORTED EXACT set against the porcelain) and the old-to-new input map (input_map) ----
   - {id: fx-status-lines-rename-is-delete-plus-untracked, gate: fixture_status_lines, fn: fixture_status_lines, negative: false,
@@ -663,3 +1182,69 @@ cases:
      args: [{id: pc, patch: {path: controller.lock_file_rel, value: x}}], expect: {search: 'has neither patch_bootstrap nor patch'}}
   - {id: profile-case-patch-both-forms-refused, gate: profile_case_patch, fn: profile_case_patch, negative: true,
      args: [{id: pc, patch_bootstrap: {template_rel: x}, patch: {path: controller.bootstrap.template_rel, value: x}}], expect: {search: 'declares both'}}
+  # ---- G-RUNLOCAL-STALE-PROBE (codex tick308-309): seed.runlocal.exec-reached's OWN predicate / expectation shapes against a
+  # stale but valid env.json and a run-local that returns 0 without exec (G cannot run a regressed run-local) ----
+  - {id: runlocal-fresh-boundary-absent, gate: judge_state, fn: judge_state, negative: false,
+     args: [[{path: /w/run/probe-env/env.json, exists: false}], [{exists: false, kind: absent}], {}], expect: {equals: []}}
+  - {id: runlocal-stale-artifact-refused, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{path: /w/run/probe-env/env.json, exists: false}], [{exists: true, kind: regular, mode: '0600'}], {}],
+     expect: {equals: ['/w/run/probe-env/env.json exists']}}
+  - {id: runlocal-runner-completed, gate: judge, fn: judge, with_ctx: true, negative: false,
+     args: [{rc: 0, stdout_regex: '^TASK \[Accept only when SSH_AUTH_SOCK is absent from the playbook environment\] \**\nok: \[localhost\][\s\S]*^localhost\s+: ok=[0-9]+\s+changed=[0-9]+\s+unreachable=0\s+failed=0\s'},
+            {rc: 0, stderr: '', stdout: "PLAY [Run-local playbook environment probe (names only; route-owned)] ***\nTASK [Accept only when SSH_AUTH_SOCK is absent from the playbook environment] ***\nok: [localhost]\n\nPLAY RECAP ***\nlocalhost                  : ok=7    changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0\n"}],
+     expect: {equals: []}}
+  - {id: runlocal-returned-before-exec-refused, gate: judge, fn: judge, with_ctx: true, negative: true,
+     args: [{rc: 0, stdout_regex: '^TASK \[Accept only when SSH_AUTH_SOCK is absent from the playbook environment\] \**\nok: \[localhost\][\s\S]*^localhost\s+: ok=[0-9]+\s+changed=[0-9]+\s+unreachable=0\s+failed=0\s'},
+            {rc: 0, stderr: '', stdout: "lme-controller-seed: run-local probe_env\n"}],
+     expect: {search: 'stdout does not match'}}
+  - {id: runlocal-stale-other-profile-refused, gate: judge_state, fn: judge_state, negative: true,
+     args: [[{file: /w/run/probe-env/env.json, json_equal: {path: profile_sha256, value: p1}}, {file: /w/run/probe-env/env.json, json_equal: {path: ssh_auth_sock_present, value: false}}],
+            [{text: '{"schema": "probe-env/1", "runner": "probe_env", "work_root": "/w/run/probe-env", "profile_sha256": "p0", "ssh_auth_sock_present": false}'},
+             {text: '{"schema": "probe-env/1", "runner": "probe_env", "work_root": "/w/run/probe-env", "profile_sha256": "p0", "ssh_auth_sock_present": false}'}], {}],
+     expect: {equals: ['/w/run/probe-env/env.json profile_sha256 = p0 != p1']}}
+  # ---- isg_listing / isg_lock_pins (codex tick313 G1): the installed-set gate fixture macros; fixture lock values only ----
+  - {id: isg-listing-locked, gate: isg_listing, fn: isg_listing, negative: false,
+     args: [&isg_lock [{name: ansible-core, version: '2.19.11'}, {name: jinja2, version: '3.1.6'}, {name: markupsafe, version: '3.0.2'}], {id: a}],
+     expect: {equals: {text: "ansible-core==2.19.11\njinja2==3.1.6\nmarkupsafe==3.0.2", errors: []}}}
+  - {id: isg-listing-mixed, gate: isg_listing, fn: isg_listing, negative: false,
+     args: [*isg_lock, {id: a, spell: mixed}], expect: {equals: {text: "ANSIBLE_CORE==2.19.11\nJinja2==3.1.6\nmarkupsafe==3.0.2", errors: []}}}
+  - {id: isg-listing-dots, gate: isg_listing, fn: isg_listing, negative: false,
+     args: [*isg_lock, {id: a, spell: dots}], expect: {equals: {text: "ansible.core==2.19.11\njinja2==3.1.6\nmarkupsafe==3.0.2", errors: []}}}
+  - {id: isg-listing-suffix, gate: isg_listing, fn: isg_listing, negative: false,
+     args: [*isg_lock, {id: a, version: {at: 0, suffix: '.1'}}], expect: {equals: {text: "ansible-core==2.19.11.1\njinja2==3.1.6\nmarkupsafe==3.0.2", errors: []}}}
+  - {id: isg-listing-mangled, gate: isg_listing, fn: isg_listing, negative: false,
+     args: [*isg_lock, {id: a, version: {at: 0, form: mangled}}], expect: {equals: {text: "ansible-core==2-19-11\njinja2==3.1.6\nmarkupsafe==3.0.2", errors: []}}}
+  - {id: isg-listing-replace, gate: isg_listing, fn: isg_listing, negative: false,
+     args: [*isg_lock, {id: a, spell: mixed, replace: {at: 0, form: '%N @ https://example.invalid/%N-%V.whl'}}],
+     expect: {equals: {text: "ANSIBLE_CORE @ https://example.invalid/ANSIBLE_CORE-2.19.11.whl\nJinja2==3.1.6\nmarkupsafe==3.0.2", errors: []}}}
+  - {id: isg-listing-insert-blank, gate: isg_listing, fn: isg_listing, negative: false,
+     args: [*isg_lock, {id: a, insert: [{at: 1, line: ''}]}], expect: {equals: {text: "ansible-core==2.19.11\n\njinja2==3.1.6\nmarkupsafe==3.0.2", errors: []}}}
+  - {id: isg-listing-drop-last, gate: isg_listing, fn: isg_listing, negative: false,
+     args: [*isg_lock, {id: a, drop: -1}], expect: {equals: {text: "ansible-core==2.19.11\njinja2==3.1.6", errors: []}}}
+  - {id: isg-listing-empty, gate: isg_listing, fn: isg_listing, negative: false,
+     args: [*isg_lock, {id: a, empty: true, grep_exit: 2}], expect: {equals: {text: '', errors: []}}}
+  - {id: isg-listing-unknown-key-refused, gate: isg_listing, fn: isg_listing, negative: true,
+     args: [*isg_lock, {id: a, spel: mixed}], expect: {equals: {text: '', errors: ['a: unknown case key spel']}}}
+  - {id: isg-listing-version-out-of-range-refused, gate: isg_listing, fn: isg_listing, negative: true,
+     args: [*isg_lock, {id: a, version: {at: 3, suffix: '.1'}}], expect: {search: 'a: version .* is not \{at: 0\.\.2, suffix', not_search: '"text": "[^"]'}}
+  - {id: isg-listing-version-both-forms-refused, gate: isg_listing, fn: isg_listing, negative: true,
+     args: [*isg_lock, {id: a, version: {at: 0, suffix: '.1', form: mangled}}], expect: {search: 'a: version '}}
+  - {id: isg-listing-vacuous-mangle-refused, gate: isg_listing, fn: isg_listing, negative: true,
+     args: [[{name: ansible-core, version: '2'}], {id: a, version: {at: 0, form: mangled}}], expect: {search: 'mangled on row 0 \(2\) changes nothing'}}
+  - {id: isg-listing-spell-refused, gate: isg_listing, fn: isg_listing, negative: true,
+     args: [*isg_lock, {id: a, spell: upper}], expect: {search: 'spell upper is not locked'}}
+  - {id: isg-listing-drop-out-of-range-refused, gate: isg_listing, fn: isg_listing, negative: true,
+     args: [*isg_lock, {id: a, drop: 3}], expect: {search: 'drop 3 is not in -3\.\.2'}}
+  - {id: isg-listing-empty-with-listing-key-refused, gate: isg_listing, fn: isg_listing, negative: true,
+     args: [*isg_lock, {id: a, empty: true, spell: mixed}], expect: {search: 'empty with a listing key'}}
+  - {id: isg-listing-bad-id-refused, gate: isg_listing, fn: isg_listing, negative: true,
+     args: [*isg_lock, {id: 'A b'}], expect: {search: 'id is not'}}
+  - {id: isg-lock-pins-normalized-sorted, gate: isg_lock_pins, fn: isg_lock_pins, negative: false,
+     args: [[{name: MarkupSafe, version: '3.0.2'}, {name: ansible_core, version: '2.19.11'}, {name: jinja2, version: '3.1.6'}, {name: zope.x-y, version: '1.0'}]],
+     expect: {equals: {pins: 'ansible-core==2.19.11 jinja2==3.1.6 markupsafe==3.0.2 zope-x-y==1.0', errors: []}}}
+  - {id: isg-lock-pins-empty-refused, gate: isg_lock_pins, fn: isg_lock_pins, negative: true,
+     args: [[]], expect: {equals: {pins: '', errors: [empty lock]}}}
+  - {id: isg-lock-pins-no-dotted-version-refused, gate: isg_lock_pins, fn: isg_lock_pins, negative: true,
+     args: [[{name: ansible-core, version: '2'}]], expect: {search: 'no dotted version', not_search: '"pins": "[^"]'}}
+  - {id: isg-lock-pins-no-dash-name-refused, gate: isg_lock_pins, fn: isg_lock_pins, negative: true,
+     args: [[{name: jinja2, version: '3.1.6'}]], expect: {search: 'no - name'}}

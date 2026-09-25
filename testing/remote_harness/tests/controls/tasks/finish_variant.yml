@@ -35,6 +35,22 @@
 # cleanup_purge (variant key; the cleanup race control runner.record.cleanup-barrier): {record_barrier, timeout_s} are
 # declared deviations of the purge act (the writer plants the barrier after its precheck, before its create), expect
 # judges the purge like a step (collect.yml; failures fail the variant), post_state is checked after it.
+# G-UNDO-PROTECTION-PROPAGATION (codex tick330): every removal below first asks controls.j2 protected_overlap against the
+# paths a refused or failed undo of this variant left in place (_rhc_protected; fixture_undo.yml / op.yml). A fresh root
+# (or its parent) overlapping one is neither purged nor fallback-removed; a clone root {vroot} overlapping one is not
+# purged (the variant is then RETAINED and FAILS by G-VARIANT-PURGE-READBACK below); a scratch entry overlapping one is
+# neither chmod'ed nor removed. Each keep is logged; the originating undo finding was already routed (variant.yml).
+- name: Is the fresh root (or its parent) protected by a refused undo?
+  ansible.builtin.set_fact:
+    _rhc_root_prot: >-
+      {{ [] if (_rhc_protected | default([]) | length == 0)
+         else (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'protected_overlap', 'args': [[_rhc_t.root, _rhc_t.parent], _rhc_protected]}}) | from_json) }}
+
+- name: A protected fresh root is neither purged nor fallback-removed (logged)
+  ansible.builtin.set_fact:
+    _rhc_log: "{{ _rhc_log + [{'kept_root': _rhc_t.root, 'protected': _rhc_root_prot}] }}"
+  when: _rhc_root_prot | length > 0 and (rhc_c.root | default('')) == 'fresh'
+
 - name: Plan the purge of the fresh root through bundle A (the declared seed launch)
   ansible.builtin.set_fact:
     _rhc_purge_plan: >-
@@ -59,7 +75,9 @@
   changed_when: true
   failed_when: false
   timeout: "{{ _rhc_purge_plan.timeout_s + 60 }}"
-  when: (rhc_c.root | default('')) == 'fresh' and rhc_deps.bundle_a.met and (_rhc_purge_plan.seed_launch.unresolved | length == 0)
+  when: >-
+    (rhc_c.root | default('')) == 'fresh' and rhc_deps.bundle_a.met and (_rhc_purge_plan.seed_launch.unresolved | length == 0)
+    and _rhc_root_prot | length == 0
 
 - name: What the purge writer admitted or refused (its own stderr; nothing read)
   vars:
@@ -115,8 +133,8 @@
     _rhc_left: "{{ {'files': _rhc_left.files | default([]) | rejectattr('path', 'in', _wsub | map('regex_replace', '^', _rhc_t.parent ~ '/') | list) | list}
                    | combine({'matched': (_rhc_left.files | default([]) | rejectattr('path', 'in', _wsub | map('regex_replace', '^', _rhc_t.parent ~ '/') | list) | list | length)}) }}"
 
-- name: Fallback removal inside this marked run dir (a cleanup finding; the seed's purge left or refused it)
-  when: _rhc_left.matched | default(0) > 0
+- name: Fallback removal inside this marked run dir (a cleanup finding; the seed's purge left or refused it; never a protected root)
+  when: _rhc_left.matched | default(0) > 0 and _rhc_root_prot | length == 0
   block:
     - name: The run marker must be present (never remove outside a marked run dir)
       ansible.builtin.stat:
@@ -203,6 +221,12 @@
   register: _rhc_vr
   when: (rhc_c.variant_checkout | default('')) == 'clone' and (_rhc_t.vroot | default('')) | length > 0
 
+- name: Is the variant clone root protected by a refused undo? (then never purged; retained and FAILED below)
+  ansible.builtin.set_fact:
+    _rhc_vroot_prot: >-
+      {{ [] if (_rhc_protected | default([]) | length == 0 or (_rhc_t.vroot | default('')) | length == 0)
+         else (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'protected_overlap', 'args': [[_rhc_t.vroot], _rhc_protected]}}) | from_json) }}
+
 - name: Plan the purge of the variant clone root through bundle A (the declared seed launch)
   ansible.builtin.set_fact:
     _rhc_vpurge_plan: >-
@@ -223,7 +247,9 @@
   changed_when: true
   failed_when: false
   timeout: "{{ _rhc_vpurge_plan.timeout_s + 60 }}"
-  when: ((_rhc_vr.stat | default({})).exists | default(false)) and rhc_deps.bundle_a.met and (_rhc_vpurge_plan.seed_launch.unresolved | length == 0)
+  when: >-
+    ((_rhc_vr.stat | default({})).exists | default(false)) and rhc_deps.bundle_a.met and (_rhc_vpurge_plan.seed_launch.unresolved | length == 0)
+    and _rhc_vroot_prot | length == 0
 
 - name: What the variant clone purge writer admitted (its own stderr; nothing read)
   ansible.builtin.set_fact:
@@ -266,10 +292,25 @@
     recurse: false
   register: _rhc_scratch
 
+- name: Scratch entries at, above or below a protected path stay whole (neither chmod'ed nor removed)
+  ansible.builtin.set_fact:
+    _rhc_scratch_keep: "{{ _rhc_scratch_keep | default([]) + [item.path] }}"
+  loop: >-
+    {{ [] if ((_rhc_retain | default(false) | bool) or (_rhc_protected | default([]) | length == 0)) else (_rhc_scratch.files | default([])) }}
+  loop_control:
+    label: "{{ item.path }}"
+  when: >-
+    (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'protected_overlap', 'args': [[item.path], _rhc_protected]}}) | from_json) | length > 0
+
+- name: The kept scratch entries (logged)
+  ansible.builtin.set_fact:
+    _rhc_log: "{{ _rhc_log + [{'kept_scratch': _rhc_scratch_keep, 'protected': _rhc_protected}] }}"
+  when: _rhc_scratch_keep | default([]) | length > 0
+
 - name: Owner write on the scratch
   ansible.builtin.command:
     argv: ["{{ rhc_decl.runner_tools.chmod }}", -R, u+w, --, "{{ item.path }}"]
-  loop: "{{ [] if (_rhc_retain | default(false) | bool) else (_rhc_scratch.files | rejectattr('islnk') | selectattr('isdir') | list) }}"
+  loop: "{{ [] if (_rhc_retain | default(false) | bool) else (_rhc_scratch.files | rejectattr('islnk') | selectattr('isdir') | rejectattr('path', 'in', _rhc_scratch_keep | default([])) | list) }}"
   loop_control:
     label: "{{ item.path }}"
   changed_when: true
@@ -279,6 +320,6 @@
   ansible.builtin.file:
     path: "{{ item.path }}"
     state: absent
-  loop: "{{ [] if (_rhc_retain | default(false) | bool) else _rhc_scratch.files }}"
+  loop: "{{ [] if (_rhc_retain | default(false) | bool) else (_rhc_scratch.files | rejectattr('path', 'in', _rhc_scratch_keep | default([])) | list) }}"
   loop_control:
     label: "{{ item.path }}"
