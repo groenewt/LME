@@ -420,7 +420,10 @@ vocabulary:
   # G-STEP-LIVE-FAIL-GUARD (codex tick313): expect_stop_at <step id> + after_stop [predicates] -- the variant must stop at
   # exactly that step with nothing after it run (controls.j2 judge_stop), then after_stop must hold (tasks/variant.yml)
   variant_keys: [id, declaration, requires, ops, undo, tokens, expect, note, case_components, cleanup_purge, expect_stop_at, after_stop, fixture_ctl, after_undo,
-                 expect_undo_findings, after_cleanup]
+                 expect_undo_findings, after_cleanup, expect_stop_failure_has]
+  # expect_stop_failure_has [strings] (with expect_stop_at; the retained undeclared-failure negative): each LITERAL string
+  # (not token-expanded) must occur in a recorded failure of the stop step (controls.j2 judge_stop `has`), so a stop
+  # caused by some other failure of that step does not meet the declaration
   # after_undo [predicates] (codex tick297 003441 G-STAGING-*): checked after the undo ops and the staging reversal
   # (tasks/variant.yml always section), e.g. an outside tree the variant planted is gone and a partial replica removed
   # G-UNDO-PROTECTION-PROPAGATION (codex tick330): expect_undo_findings [{path, why}] -- the undo findings this variant
@@ -740,6 +743,21 @@ declarations:
                  note: 'uv_installer tool: base PATH /usr/bin:/bin resolves /usr/bin/cut'}
   mv_owner:     {patch: {os_tools: {mv: {path: '{fixtures}/tools/mv', identity: {kind: file_sha256, sha256: 7db4661c6397fe5fd5ba6837692aa5adb7dce1efc656369d7b08dfd6ece525a0}}}}}
   git_absent:   {patch: {os_tools: {git: {path: /usr/bin/lme-rhc-absent-git, identity: {kind: file_sha256, sha256: 356db14e102d68a1a37d8a1ac577dfd678d45d46e92f468bef8b7154e7bfdc60}}}}}
+  # OS-TOOL CONSUMER PARTITION (item 6; codex-tick328-329; route package.yml 8a24bd81, no re-pin; profile os_tools values as
+  # declared). Route 1 (tunable path / identity only): a CONTROLLER-only tool absent, and a TARGET-only tool absent or with
+  # a wrong identity. The wrong digest is sort's (another file's).
+  keygen_absent:   {patch: {os_tools: {ssh-keygen: {path: /usr/bin/lme-rhc-absent-ssh-keygen, identity: {kind: file_sha256, sha256: 4a16f170f7c80d6643d3ffada36d396c9d7b1d63238a218628e37af38d6107c0}}}},
+                    note: 'controller-only (required_by [owner_key_generation]) absent: package refuses RH-OS-TOOL-MISSING'}
+  timeout_absent:  {patch: {os_tools: {timeout: {path: /usr/bin/lme-rhc-absent-timeout, identity: {kind: file_sha256, sha256: 6ca1891dfc0b05d7680770c2884c0391b92467c7bb6500a5c84677e6481739f1}}}},
+                    note: 'target-only (required_by [observation]) absent on the controller: controller packaging skips it and publishes'}
+  timeout_wrong_id: {patch: {os_tools: {timeout: {path: /usr/bin/timeout, identity: {kind: file_sha256, sha256: 4bf4f14424fa481b1f40d28534b0c5c7a7d07affcb82c805b07255cc4c2034be}}}},
+                     note: 'target-only with a wrong identity: never hashed on the controller, publishes (target admission is TR02 / MAIN)'}
+  # The same tool made MIXED (required_by [seed, observation] -- the shape C1's loader case oc-mixed-tool-stays-controller-admitted
+  # admits): required_by is not tunable, so clone route only
+  timeout_mixed_absent:   {patch: {os_tools: {timeout: {path: /usr/bin/lme-rhc-absent-timeout, required_by: [seed, observation], identity: {kind: file_sha256, sha256: 6ca1891dfc0b05d7680770c2884c0391b92467c7bb6500a5c84677e6481739f1}}}},
+                           profile_bytes_differ: true, note: 'mixed tool absent: a controller precondition, package refuses RH-OS-TOOL-MISSING'}
+  timeout_mixed_wrong_id: {patch: {os_tools: {timeout: {required_by: [seed, observation], identity: {kind: file_sha256, sha256: 4bf4f14424fa481b1f40d28534b0c5c7a7d07affcb82c805b07255cc4c2034be}}}},
+                           profile_bytes_differ: true, note: 'mixed tool with a wrong identity: hashed on the controller, package refuses RH-OS-TOOL-IDENTITY'}
   # copy or clone route only (profile_bytes_differ never takes the override): C1 refuses both as overrides (not tunable)
   owner_mismatch: {patch: {inventory: {owner: {var: lme_toolchain_other}}}, profile_bytes_differ: true,
                    note: 'owner rule hostile negative: inventory.owner.var != inventory.owner_var; admit_transport.yml task 3 must refuse'}
@@ -1807,6 +1825,81 @@ controls:
       same path + identity read from the target''s own lme_resolved.remote_harness.adapter.tools[''target.tools''], adapter-only xargs
       absent, adapter package gap) contact a host: MAIN (TR02). The adapter-override leg expects C1''s own message ("is not a tunable
       path") from the engine resolve, which is not a route refusal code: it is judged by rc, the message and no later task header'
+
+  # ---- OS-TOOL CONSUMER PARTITION (item 6; codex-tick328-329; route package.yml 8a24bd81, NO re-pin) ----
+  # package.yml hashes and admits only os_tools entries whose required_by is NOT a subset of os_tool_consumers.target
+  # (any controller consumer -> controller precondition); a target-only entry is skipped by controller packaging. One tool
+  # (timeout) is run through both sides of the partition: target-only here (Route 1), mixed in the clone control below --
+  # the pair differs only in required_by.
+  - id: package.os-tools.consumer-partition
+    cases: []
+    findings: [codex-tick328-329 os_tool_partition, RH-OS-TOOL-MISSING]
+    requires: [bundle_a]
+    rows:
+      controller-only-absent: 'a controller-only tool (ssh-keygen, required_by [owner_key_generation]) absent: package REFUSED RH-OS-TOOL-MISSING, nothing written -- the controller selection is unchanged by the partition'
+      target-only-absent: 'a target-only tool (timeout, required_by [observation]) absent on the controller: packaging PUBLISHES (not a controller precondition)'
+      target-only-wrong-identity: 'the same target-only tool with another file''s digest: packaging PUBLISHES (never hashed on the controller; target admission is TR02 / MAIN)'
+    refute: 'the pre-partition selection (m1-1g package.yml 9728531a: only an entry whose required_by == [target_adapter] is skipped)
+      hashes timeout [observation]: target-only-absent refuses RH-OS-TOOL-MISSING and target-only-wrong-identity RH-OS-TOOL-IDENTITY
+      -> rc 0 / PUBLISHED FAIL; a selection dropping owner_key_generation from the controller side publishes controller-only-absent -> FAIL'
+    hostile: 'a controller-consumed tool mislabelled target-only to escape the controller hash (mixed leg: package.os-tools.consumer-partition-mixed)'
+    variants:
+      - {id: controller-only-absent, declaration: keygen_absent,
+         expect: {package: {rc_nonzero: true, playbook_refusal: RH-OS-TOOL-MISSING, refused_at: 'Refuse missing or non-executable controller tools, named with their packages',
+                            stdout_regex: 'RH-OS-TOOL-MISSING: .*ssh-keygen.*lme-rhc-absent-ssh-keygen', failed_before_task: Bind the source edition}}}
+      - {id: target-only-absent, declaration: timeout_absent, expect: {package: {rc: 0, stdout_has: [PUBLISHED]}}}
+      - {id: target-only-wrong-identity, declaration: timeout_wrong_id, expect: {package: {rc: 0, stdout_has: [PUBLISHED]}}}
+    steps:
+      - {id: snap-ctl, snapshot: {name: ctl, of: '{ctl}', exclude_regex: ['^[a-z0-9-]+\.(stdout|stderr|strace|inventory\.yml|rc|json) ']}}
+      - {id: package, act: {kind: package, repo: variant, dest: '{ctl}/bundle'}}
+      - {id: nothing-packaged, only_variants: [controller-only-absent], state: [{snapshot: ctl, equal: true}]}
+      - {id: published, only_variants: [target-only-absent, target-only-wrong-identity], state: [{path: '{ctl}/bundle', exists: true}]}
+      - {id: drop, ops: [{remove: '{ctl}/bundle'}], only_variants: [target-only-absent, target-only-wrong-identity]}
+    note: 'BUILT-UNRUN: every leg OPEN until run, never PASS. No case id is credited (cases: []; the lifecycle pin is being rebound,
+      f37edb29 -> 3be74d14, and a target-only PUBLISHED leg is not C21''s refusal). Route 1 (lme_global_override, C1 projection; each
+      path override carries its identity, C1 path_requires). Existing controller-only absent legs this complements: X01 absent-tool (flock_absent), X04
+      missing-dependency (mv_absent), git_absent (source binding). NOT BUILT here: (a) the RH-OS-TOOL-CONSUMER runtime refusal
+      (package.yml "Refuse an os_tools consumer outside the declared controller/target partition (before any hash)") -- unreachable
+      from a C1-admitted profile, since C1''s engine resolve (contract_admission.os_tool_consumers) refuses every such shape first and G
+      cannot bypass the resolve; it stays defence in depth, unexercised at runtime. (b) The SCHEMA half (unknown consumer, empty or
+      scalar or duplicate required_by, missing required_by, overlapping / scalar / extra-key / empty / relabelled / absent
+      partition) is C1''s loader coverage, testing/loader-tests-r4/cases-c1-graph-shared-contract.yml section (7): oc-canonical-partition-admitted,
+      oc-mixed-tool-stays-controller-admitted, oc-unknown-consumer-refused, oc-empty-consumer-list-refused, oc-consumer-list-scalar-refused,
+      oc-consumer-list-duplicate-refused, oc-new-entry-without-consumer-refused, oc-overlapping-partition-refused, oc-partition-scalar-refused,
+      oc-partition-extra-key-refused, oc-partition-set-scalar-refused, oc-partition-empty-controller-refused, oc-partition-label-dropped-refused,
+      oc-partition-unregistered-label-refused, oc-partition-label-moved-refused, oc-partition-absent-refused,
+      oc-partition-target-set-absent-refused, oc-required-by-absent-refused (cited by name only; G runs none of them). (c) Target-side
+      admission of a target-only tool (its own namespace; no target identity check is waived): TR02 / MAIN. OPEN until run: whether
+      any other package-time consumer reads the target-only timeout path (then target-only-absent refuses there, and that refusal is
+      the finding)'
+
+  - id: package.os-tools.consumer-partition-mixed
+    cases: []
+    findings: [codex-tick328-329 os_tool_partition, RH-OS-TOOL-MISSING, RH-OS-TOOL-IDENTITY]
+    requires: [bundle_a]
+    variant_checkout: clone
+    rows:
+      mixed-absent: 'a MIXED tool (timeout, required_by [seed, observation]) absent: a controller precondition, package REFUSED RH-OS-TOOL-MISSING'
+      mixed-wrong-identity: 'the same mixed tool with another file''s digest: hashed on the controller, package REFUSED RH-OS-TOOL-IDENTITY'
+    refute: 'a selection that treats ANY target label as target-only (subset replaced by intersect) skips the mixed timeout -> both variants PUBLISH -> FAIL;
+      packaging from the candidate (timeout target-only) publishes -> FAIL (package.os-tools.consumer-partition target-only legs are that input)'
+    hostile: 'a controller-consumed tool that also carries a target label, absent or forged on the controller'
+    variants:
+      - {id: mixed-absent, declaration: timeout_mixed_absent,
+         expect: {package: {rc_nonzero: true, playbook_refusal: RH-OS-TOOL-MISSING, refused_at: 'Refuse missing or non-executable controller tools, named with their packages',
+                            stdout_regex: 'RH-OS-TOOL-MISSING: .*timeout.*lme-rhc-absent-timeout', failed_before_task: Bind the source edition}}}
+      - {id: mixed-wrong-identity, declaration: timeout_mixed_wrong_id,
+         expect: {package: {rc_nonzero: true, playbook_refusal: RH-OS-TOOL-IDENTITY, refused_at: Refuse any declared executable whose content is not its declared identity,
+                            stdout_regex: 'timeout=/usr/bin/timeout\(6ca1891d', failed_before_task: Bind the source edition}}}
+    steps:
+      - {id: package, act: {kind: package, repo: variant, dest: '{ctl}/bundle'}}
+      - {id: nothing-published, state: [{path: '{ctl}/bundle', exists: false}]}
+    note: 'BUILT-UNRUN: OPEN until run, never PASS. Route 3 (G''s declared clone; required_by is not tunable, so profile_bytes_differ and
+      variant_clone_fixture). The mixed label set [seed, observation] is exactly the one C1''s loader case
+      oc-mixed-tool-stays-controller-admitted admits. No case id is credited (cases: []): the lifecycle pin is being rebound
+      (coordinator: f37edb29 -> 3be74d14, ROUTE-X may move it again). OPEN until run: whether the C1 loader or seed06 projection reads a seed-labelled path earlier (then that
+      earlier refusal is the expected outcome). The schema half and the RH-OS-TOOL-CONSUMER runtime leg: see
+      package.os-tools.consumer-partition (NOT BUILT, C1 loader coverage)'
 
   # ---- SEED-06 projection, budget ----
   - id: Y01-budget-envelope
@@ -4546,7 +4639,9 @@ controls:
   # made to fail (read-only); a failure of THAT copy inside bundle.fixture.checkout-negatives is NOT BUILT.
   # Undo identity (G-UNDO-IDENTITY): directory replacement and link re-target before the undo are cleanup FINDINGS by
   # construction (a finding FAILs its variant), so they are judged by the ONE decision macro fixture_undo_decide in the
-  # selftests (undo-dir-replaced, undo-link-retargeted, ...); runtime replacement / re-target variants are NOT BUILT.
+  # selftests (undo-dir-replaced, undo-link-retargeted, ...). Runtime replacement variants (a failed copy's parent, a
+  # failed copy's output, a staged link) are runner.fixture-undo.runtime-identity (item 5; BUILT-UNRUN, OPEN until run); a
+  # same-inode re-target is impossible at runtime and stays selftest-only.
   - id: runner.fixture-staging.confinement
     cases: []
     findings: [G-STAGING-ANCESTRY, G-STAGING-PARTIAL, G-UNDO-IDENTITY, G-STAGING-PER-ITEM-GUARD, G-FIXTURE-ITEM-STOP-CONTROL,
@@ -4628,8 +4723,9 @@ controls:
       still the real directory with the post-failure dev / inode, owned by that uid; {ctl} unchanged and still
       owner-private) -- the post-failure identity alone is evidence only, and anything else is left in place as a cleanup
       finding. "Exclusive" is owner-private: a process of the same uid is not excluded (residual). Only the bound positive
-      path has a runtime variant here; each refusal is proven by the fixture_undo_decide selftests only, and runtime
-      parent-replacement / re-owned-output / failed-post-check variants are OPEN (item 5), never PASS.'
+      path has a runtime variant here; the refusals are proven by the fixture_undo_decide selftests, and at runtime by
+      runner.fixture-undo.runtime-identity (item 5: parent replaced, output replaced; BUILT-UNRUN, OPEN until run, never
+      PASS); re-owned output is MAIN-ONLY and a failed post-check is NOT BUILT (see that control''s note).'
 
   # ---- G-UNDO-PROTECTION-PROPAGATION (codex tick330 preservation findings; BUILT-UNRUN, controller-local, G-owned) ----
   # A recorded staged CHILD replaced before the undo, under a recorded staged PARENT whose own identity still holds, run
@@ -4752,6 +4848,141 @@ controls:
       fixture_ops.yml needed no change: its admitted write set is already the full set (mkdir path; copy_tree to; move from
       and to; symlink path + target), no staging action derives a name.'
 
+  # ---- G-UNDO-RUNTIME-IDENTITY (codex tick330 item 5; BUILT-UNRUN, controller-local, G-owned; OPEN until run, never PASS) ----
+  # The runtime counterparts of the fixture_undo_decide refusals the selftests prove: a staged resource is REPLACED by
+  # ordinary ops between the staging and the undo, while the recorded inode is kept ALIVE (moved aside with mv -T, which
+  # keeps the inode), so the replacement can never reuse the recorded dev / inode. Three legs:
+  #   partial-parent-replaced  a FAILED copy_tree's partial replica keeps its post-failure identity and owner, but its
+  #                            recorded parent {fxparent} (the variant's declared fixture parent, never the runner's {parent})
+  #                            is replaced (item 4 current-ancestry leg; the replica is moved into the new parent) -> finding
+  #                            "current ancestry", and the replaced mkdir {fxparent} -> finding
+  #   partial-copy-replaced    a FAILED copy_tree's partial replica is replaced by a new empty directory (item 4
+  #                            current-identity leg) -> finding "current identity"
+  #   link-replaced            a completed staged link is replaced by a link to another directory (a re-target at runtime
+  #                            is necessarily a replacement: a symlink's target text is immutable) -> finding "replaced";
+  #                            the staged target dir {ctl}/R keeps its identity and IS removed
+  # Each refused resource is preserved (expect_undo_findings, then after_cleanup reads it back); nothing else is left.
+  - id: runner.fixture-undo.runtime-identity
+    cases: []
+    findings: [G-UNDO-RUNTIME-IDENTITY, G-UNDO-PARTIAL-BINDING, G-UNDO-IDENTITY, G-UNDO-PROTECTION-PROPAGATION]
+    purpose: 'a staged resource replaced before the undo -- a failed copy''s parent, a failed copy''s partial output, a
+      completed link -- is never removed or unlinked by the staging reversal; it is a declared finding and reads back after
+      the whole cleanup, while every staged resource that kept its identity is still reversed'
+    refute: 'a runner that reverses a failed record by its post-failure identity alone removes {fxparent}/replica although
+      its parent was replaced -> after_cleanup {fxparent}/replica kind dir and its same_bytes FAIL and the declared "current
+      ancestry" finding is missing; a runner that removes by name deletes the replacement {ctl}/replica or unlinks the
+      replacement link {ctl}/A -> after_cleanup kind dir / kind link FAIL; a runner that retains everything after a finding
+      leaves {ctl}/R -> exists: false FAILS'
+    hostile: 'a staged parent replaced with the partial output moved into the new parent; a partial output replaced by an
+      empty directory; a staged link replaced by a link naming another directory -- each with the recorded inode alive'
+    variants:
+      - id: partial-parent-replaced
+        # G-RUNTIME-IDENTITY-FIXTURE-PARENT-COLLISION (codex tick358-359): the staged parent is this variant's OWN declared
+        # fixture parent {fxparent}, never the runner-owned {parent} = {ctl}/p (variant.yml creates that private dir before
+        # any op, so a staging mkdir of it would refuse at index 0 and the failed copy would never be reached)
+        tokens: {fxparent: '{ctl}/rhc-fixture-parent'}
+        ops:
+          - {mkdir: '{ctl}/mr-src', mode: '0700'}
+          - {write: '{ctl}/mr-src/readable', mode: '0600', content: "copied before the failure\n"}
+          - {write: '{ctl}/mr-src/unreadable', mode: '0600', content: "never copied\n"}
+          - {chmod: '{ctl}/mr-src/unreadable', mode: '0000'}
+          - {write: '{ctl}/readable-ref', mode: '0600', content: "copied before the failure\n"}
+        undo:
+          - {remove: '{fxparent}-old'}
+          - {remove: '{ctl}/mr-src'}
+        expect_undo_findings:
+          - {path: '{fxparent}/replica', why: 'not bound \(current ancestry: the parent is no longer the recorded owner-private directory\)'}
+          - {path: '{fxparent}', why: 'is not the recorded directory \(replaced'}
+        after_cleanup:
+          - {path: '{fxparent}', kind: dir}
+          - {path: '{fxparent}/replica', kind: dir}
+          - {same_bytes: ['{fxparent}/replica/readable', '{ctl}/readable-ref']}
+          - {path: '{fxparent}/replica/unreadable', exists: false}
+          - {path: '{fxparent}-old', exists: false}
+          - {path: '{ctl}/mr-src', exists: false}
+      - id: partial-copy-replaced
+        ops:
+          - {mkdir: '{ctl}/mr-src', mode: '0700'}
+          - {write: '{ctl}/mr-src/readable', mode: '0600', content: "copied before the failure\n"}
+          - {write: '{ctl}/mr-src/unreadable', mode: '0600', content: "never copied\n"}
+          - {chmod: '{ctl}/mr-src/unreadable', mode: '0000'}
+          - {write: '{ctl}/readable-ref', mode: '0600', content: "copied before the failure\n"}
+        undo:
+          - {remove: '{ctl}/replica-old'}
+          - {remove: '{ctl}/mr-src'}
+        expect_undo_findings:
+          - {path: '{ctl}/replica', why: 'not bound \(current identity: not the real directory observed right after the failure\)'}
+        after_cleanup:
+          - {path: '{ctl}/replica', kind: dir}
+          - {glob: {dir: '{ctl}/replica', pattern: '*', count: 0}}
+          - {path: '{ctl}/replica-old', exists: false}
+          - {path: '{ctl}/mr-src', exists: false}
+      - id: link-replaced
+        ops:
+          - {mkdir: '{ctl}/R2', mode: '0700'}
+        undo:
+          - {remove: '{ctl}/A-old'}
+          - {remove: '{ctl}/R2'}
+        expect_undo_findings:
+          - {path: '{ctl}/A', why: 'is no longer the recorded link \(replaced\)'}
+        after_cleanup:
+          - {path: '{ctl}/A', kind: link}
+          - {path: '{ctl}/R', exists: false}
+          - {path: '{ctl}/A-old', exists: false}
+          - {path: '{ctl}/R2', exists: false}
+    steps:
+      - {id: stage-parent, only_variants: [partial-parent-replaced],
+         fixture_ops: [{mkdir: '{fxparent}'}, {copy_tree: {from: '{ctl}/mr-src', to: '{fxparent}/replica'}}],
+         expect: {staging_failed: true, staging_index: 1,
+                  staging_task: 'copy_tree (cp -a --no-dereference -T into the absent destination; the source is only read)',
+                  staging_msg_has: ['non-zero return code', '{ctl}/mr-src/unreadable']}}
+      - {id: replace-parent, only_variants: [partial-parent-replaced],
+         ops: [{move: {from: '{fxparent}', to: '{fxparent}-old'}}, {mkdir: '{fxparent}', mode: '0700'},
+               {move: {from: '{fxparent}-old/replica', to: '{fxparent}/replica'}}]}
+      - {id: parent-replaced, only_variants: [partial-parent-replaced],
+         state: [{path: '{fxparent}/replica', kind: dir}, {same_bytes: ['{fxparent}/replica/readable', '{ctl}/readable-ref']},
+                 {path: '{fxparent}-old', kind: dir}, {path: '{fxparent}-old/replica', exists: false},
+                 {path: '{parent}', kind: dir}]}
+      - {id: stage-copy, only_variants: [partial-copy-replaced],
+         fixture_ops: [{copy_tree: {from: '{ctl}/mr-src', to: '{ctl}/replica'}}],
+         expect: {staging_failed: true, staging_index: 0,
+                  staging_task: 'copy_tree (cp -a --no-dereference -T into the absent destination; the source is only read)',
+                  staging_msg_has: ['non-zero return code', '{ctl}/mr-src/unreadable']}}
+      - {id: replace-copy, only_variants: [partial-copy-replaced],
+         ops: [{move: {from: '{ctl}/replica', to: '{ctl}/replica-old'}}, {mkdir: '{ctl}/replica', mode: '0700'}]}
+      - {id: copy-replaced, only_variants: [partial-copy-replaced],
+         state: [{path: '{ctl}/replica', kind: dir}, {same_bytes: ['{ctl}/replica-old/readable', '{ctl}/readable-ref']}]}
+      - {id: stage-link, only_variants: [link-replaced],
+         fixture_ops: [{mkdir: '{ctl}/R'}, {symlink: {path: '{ctl}/A', target: '{ctl}/R'}}]}
+      - {id: replace-link, only_variants: [link-replaced],
+         ops: [{move: {from: '{ctl}/A', to: '{ctl}/A-old'}}, {symlink: '{ctl}/A', target: '{ctl}/R2'}]}
+      - {id: link-replaced-state, only_variants: [link-replaced],
+         state: [{path: '{ctl}/A', kind: link}, {path: '{ctl}/A-old', kind: link}]}
+    note: 'BUILT-UNRUN, controller-local (no root, no target, no producer, no clone); OPEN until executed, never PASS by
+      declaration. Expected sequence (declared, not observed): partial-parent-replaced -- the fixture parent is the variant
+      token {fxparent} = {ctl}/rhc-fixture-parent (absent before staging; the runner-owned {parent} = {ctl}/p exists from the
+      private-dir setup and is never staged, replaced or undone -- parent-replaced reads it still a dir); stage-parent: mkdir
+      {fxparent} done, copy_tree fails on the 0000 member (the declared staging outcome, failed_in action, pre = {fxparent}''s
+      identity); replace-parent moves {fxparent} aside (inode alive at {fxparent}-old), makes a new 0700 {fxparent} and moves
+      the replica into it (rename: same dev / inode / owner). Reversal: the copy_tree record binds outcome, intent, pre-state,
+      exclusivity, identity and owner but NOT current ancestry ({fxparent}''s inode differs) -> finding, {fxparent}/replica
+      protected; the mkdir {fxparent} record -> finding (replaced), {fxparent} protected; the declared undo removes
+      {fxparent}-old and mr-src (no overlap: component-wise). partial-copy-
+      replaced -- the replica (post-failure identity at replica-old) is replaced by an empty 0700 directory -> finding
+      "current identity" only (parent {ctl}, owner unchanged), {ctl}/replica protected, the empty replacement reads back.
+      link-replaced -- the recorded link (inode alive at A-old) is replaced by a link to {ctl}/R2 -> finding "replaced",
+      {ctl}/A protected; the mkdir R record keeps its identity and is removed (/R never overlaps /A). DECLARED NOT BUILT:
+      (1) re-owned output -- the partial replica owned by another uid needs a chown by root: MAIN-ONLY (main_only), no G
+      variant; its refusal is selftest undo-partial-copy-reowned only; (2) failed post-check -- a staging action whose own
+      command succeeds and whose post-state check then fails needs a pause between the action task and its post-stat; the
+      staging actions are in-process tasks and the stracep hold applies only to acts, so no mechanism exists (selftest
+      undo-partial-copy-post-check-failed only); (3) a same-inode re-target -- impossible (a symlink''s target text is
+      immutable; the `retarget` op stays in not_implemented), so the "re-targeted" branch of fixture_undo_decide is
+      selftest-only (undo-link-retargeted). Tree custody: this control makes no tree claim (bytes by same_bytes, identity
+      by the undo decision''s own stats). On m1-1 the custody is WEAKER wherever trees are used: the m1-1 tree record is
+      tree_lines (bytes, structure and mode only -- no uid, gid, inode or dev), so no m1-1 tree comparison (e.g. the
+      confinement control''s outside-pre / outside-post) carries an identity or ownership claim; m1-1g''s tree record does.'
+
   # ---- G-OP-PER-ITEM-GUARD (codex tick330 item 2; BUILT-UNRUN, controller-local, G-owned) ----
   # op.yml's ORDINARY-op per-item stop, distinct from fixture_ops.yml's staging stop (runner.fixture-staging.confinement):
   # a step's ops list whose FIRST op fails after admission (a move of an absent source) and whose SECOND op is an admissible
@@ -4789,9 +5020,29 @@ controls:
           - {path: '{ctl}/before-op-failure', exists: false}
           - {path: '{ctl}/after-op-failure-marker', exists: false}
           - {path: '{ctl}/moved', exists: false}
+      # the retained UNDECLARED-failure negative (codex tick342/346): the same failing move in a step that declares NO op
+      # outcome -- the failure is the variant's failure (judge_op_outcome), the list and every later step stop, and the
+      # declared stop (expect_stop_at + expect_stop_failure_has) is the only thing that turns it into this variant's result
+      - id: undeclared-failure-stops
+        ops:
+          - {mkdir: '{ctl}/undo-target', mode: '0700'}
+        undo:
+          - {remove: '{ctl}/undo-target'}
+        expect_stop_at: undeclared-fail
+        expect_stop_failure_has: ['op 0 failed (failed) at move: ', 'absent-source']
+        after_stop:
+          - {path: '{ctl}/after-op-failure-marker', exists: false}
+          - {path: '{ctl}/moved', exists: false}
+          - {path: '{ctl}/undo-target', kind: dir}
+        after_undo:
+          - {path: '{ctl}/undo-target', exists: false}
+          - {path: '{ctl}/after-op-failure-marker', exists: false}
+          - {path: '{ctl}/moved', exists: false}
     steps:
       - {id: pre, state: [{path: '{ctl}/absent-source', exists: false}, {path: '{ctl}/undo-target', kind: dir},
                           {path: '{ctl}/after-op-failure-marker', exists: false}]}
+      - {id: undeclared-fail, only_variants: [undeclared-failure-stops],
+         ops: [{move: {from: '{ctl}/absent-source', to: '{ctl}/moved'}}, {mkdir: '{ctl}/after-op-failure-marker', mode: '0700'}]}
       - {id: fail-then-mark, only_variants: [failing-first-mutation-second],
          ops: [{move: {from: '{ctl}/absent-source', to: '{ctl}/moved'}}, {mkdir: '{ctl}/after-op-failure-marker', mode: '0700'}],
          expect: {op_failed: true, op_index: 0, op_skipped: [1], op_msg_has: ['non-zero return code', '{ctl}/absent-source']}}
@@ -4812,9 +5063,19 @@ controls:
       the marker and the move destination absent; the variant undo removes {ctl}/undo-target (undo is never behind the
       guard). completed-first-failing-second is the same with a completed op 0 before the failing op 1 (op_index 1,
       op_skipped [2]; earlier-op-ran reads op 0''s directory). An UNDECLARED op failure in any ops list still FAILS the
-      variant and stops the list and every later step. NOT BUILT here: an undeclared-failure negative control (its expected
-      result is a FAIL, which this runner has no expected-FAIL form for); the discriminating judge and static legs are the
-      selftests of judge_op_outcome / judge_op_skipped / unimplemented.'
+      variant and stops the list and every later step. undeclared-failure-stops (the retained negative, BUILT-UNRUN, OPEN
+      until run, never PASS) is that case: undeclared-fail declares no op outcome, so op 0''s failure is recorded as
+      "undeclared-fail op[0]: op 0 failed (failed) at move: ..." (judge_op_outcome), op 1 reads the recorded failure live and
+      is not run, ops-stopped is skipped by the step live guard; the expected-FAIL form is the declared stop
+      (expect_stop_at undeclared-fail, whose judge_stop accepts the ''<id> op['' prefix, plus expect_stop_failure_has naming the
+      move and the source, so a stop for any other reason does not meet it), then after_stop reads the marker and the move
+      destination absent and the undo target still present; the undo then removes it (after_undo). Its refute: a runner
+      that runs op 1 after an undeclared failure leaves the marker (after_stop FAILS); one that does not stop later steps runs
+      ops-stopped (judge_stop "ran after the stop"); one that swallows the failure records none (judge_stop "no step
+      failed"). The failure string keeps 300 characters of the message for DISPLAY only; judge_stop matches the has strings
+      against the stop step''s UNTRUNCATED structured cause as well (the op.yml rescue record, declared: false; codex
+      tick358-359 known limit, selftest stop-has-untruncated-cause), so a long run path cannot drop ''absent-source''. The discriminating judge
+      legs are the selftests of judge_stop (op-prefix / has) / judge_op_outcome / judge_op_skipped / unimplemented.'
 
   # ---- runner.seed.uv-added-files (codex-d649-runtime-refusal-repair-20260924-235616; BUILT-UNRUN, controller-local, G-owned) ----
   # The seed's python-verify admission of the declared python.uv_added_files (route's controller_seed.j2 install_python):

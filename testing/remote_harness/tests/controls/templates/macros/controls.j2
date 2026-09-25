@@ -159,6 +159,10 @@
 {#- G-STEP-LIVE-FAIL-GUARD: a declared stop names a string step id and carries its non-empty after_stop predicates -#}
 {%- if (v.expect_stop_at is defined or v.after_stop is defined) and not (v.expect_stop_at is string and v.after_stop is sequence and v.after_stop is not string and v.after_stop | length > 0) -%}{%- set ns.v = ns.v + ['expect_stop_at needs a step id and non-empty after_stop predicates'] -%}{%- endif -%}
 {%- set ns.v = ns.v + (_preds_unimpl(v.after_stop | default([]), vocab) | from_json) -%}
+{#- expect_stop_failure_has (the undeclared-failure negative): only with expect_stop_at, a non-empty list of strings -#}
+{%- if v.expect_stop_failure_has is defined and not (v.expect_stop_at is defined and v.expect_stop_failure_has is sequence and v.expect_stop_failure_has is not string
+      and v.expect_stop_failure_has is not mapping and v.expect_stop_failure_has | length > 0 and (v.expect_stop_failure_has | reject('string') | list | length == 0)) -%}
+{%- set ns.v = ns.v + ['expect_stop_failure_has needs expect_stop_at and a non-empty list of strings'] -%}{%- endif -%}
 {%- set ns.v = ns.v + (_ops_unimpl((v.ops | default([])) + (v.undo | default([])), vocab) | from_json) -%}
 {%- for sid in (v.expect | default({})) -%}{%- for k in v.expect[sid] if k not in vocab.expect -%}{%- set ns.v = ns.v + ['expect ' ~ k] -%}{%- endfor -%}{%- endfor -%}
 {#- cleanup_purge (the cleanup race control): only the declared keys, a barrier of a declared kind at out / err, known
@@ -1311,19 +1315,36 @@
 {%- endif -%}
 {%- endmacro -%}
 
-{#- judge_stop(stop_at, fails, log, ids) (G-STEP-LIVE-FAIL-GUARD, codex tick313): a variant that DECLARES the step it must stop
-    at (variant expect_stop_at; tasks/variant.yml) meets it only when: the step is one of this variant's compiled steps
-    (ids, in order); at least one failure was recorded and EVERY failure is that step's own (prefix '<id>:', '<id>[' or
-    '<id> post_state'); every later step has a log record and every one of its records is a skip (step.yml / act.yml
-    live guard) -- a later step that ran, or one without any record, fails; no earlier step was skipped. Returns
-    reasons (empty = met); the after_stop predicates are judged separately (variant.yml). -#}
-{%- macro judge_stop(stop_at, fails, log, ids) -%}
+{#- judge_stop(stop_at, fails, log, ids, has=[]) (G-STEP-LIVE-FAIL-GUARD, codex tick313): a variant that DECLARES the step it
+    must stop at (variant expect_stop_at; tasks/variant.yml) meets it only when: the step is one of this variant's compiled
+    steps (ids, in order); at least one failure was recorded and EVERY failure is that step's own (prefix '<id>:', '<id>[',
+    '<id> op[' -- an UNDECLARED op failure of that step's ops list, tasks/op.yml -- or '<id> post_state'); every string of
+    has (variant expect_stop_failure_has; the retained undeclared-failure negative) occurs in at least one recorded cause
+    of the stop: a failure string, or -- STRUCTURED and UNTRUNCATED (codex tick358-359 known limit: judge_op_outcome
+    truncates the failure string's message to 300 characters for DISPLAY only) -- the full cause of an undeclared op
+    outcome the stop step logged (tasks/op.yml rescue record {step, op_index, outcome {phase, task, msg}, declared: false}),
+    rendered as 'op <i> failed (<phase>) at <task>: <msg>' with the whole msg; every later step has a log record and every one of its records is a skip (step.yml / act.yml live guard) --
+    a later step that ran, or one without any record, fails; no earlier step was skipped. Returns reasons (empty = met);
+    the after_stop predicates are judged separately (variant.yml). -#}
+{%- macro judge_stop(stop_at, fails, log, ids, has=[]) -%}
 {%- set ns = namespace(r = [], seen = false) -%}
 {%- if stop_at not in ids -%}{%- set ns.r = ['declared stop step ' ~ stop_at ~ ' is not a step of this variant (' ~ (ids | join(', ')) ~ ')'] -%}
 {%- elif fails | length == 0 -%}{%- set ns.r = ['expected the variant to stop at ' ~ stop_at ~ ', but no step failed'] -%}
 {%- else -%}
-{%- for f in fails if not ((f | string).startswith(stop_at ~ ':') or (f | string).startswith(stop_at ~ '[') or (f | string).startswith(stop_at ~ ' post_state')) -%}
+{%- for f in fails if not ((f | string).startswith(stop_at ~ ':') or (f | string).startswith(stop_at ~ '[') or (f | string).startswith(stop_at ~ ' op[')
+                          or (f | string).startswith(stop_at ~ ' post_state')) -%}
 {%- set ns.r = ns.r + ['failure outside the declared stop step ' ~ stop_at ~ ': ' ~ (f | string)[:200]] -%}
+{%- endfor -%}
+{%- set cz = namespace(l = fails | map('string') | list) -%}
+{%- for r in log if r is mapping and r.step is defined and r.step == stop_at and r.op_index is defined and r.outcome is defined
+                    and r.outcome is mapping and r.declared is defined and r.declared is sameas false -%}
+{%- set cz.l = cz.l + ['op ' ~ r.op_index ~ ' failed (' ~ (r.outcome.phase | default('?') | string) ~ ') at ' ~ (r.outcome.task | default('?') | string)
+                       ~ ': ' ~ (r.outcome.msg | default('') | string)] -%}
+{%- endfor -%}
+{%- for h in ([has] if has is string else (has if (has is sequence and has is not mapping) else [])) -%}
+{%- set hit = namespace(v = false) -%}
+{%- for f in cz.l if (h | string) in f -%}{%- set hit.v = true -%}{%- endfor -%}
+{%- if not hit.v -%}{%- set ns.r = ns.r + ['no recorded failure of the declared stop step ' ~ stop_at ~ ' carries ' ~ (h | string)] -%}{%- endif -%}
 {%- endfor -%}
 {%- for sid in ids -%}
 {%- set recs = log | selectattr('step', 'defined') | selectattr('step', 'equalto', sid) | list -%}
