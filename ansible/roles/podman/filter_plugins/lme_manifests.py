@@ -2501,7 +2501,8 @@ def _rh_int(v):
 # DATA; this code names no contract, tool, env name or deployment value.
 _RH_CA_KINDS = frozenset(('keys', 'has_keys', 'enum', 'pattern', 'key_pattern', 'positive_int', 'strings', 'within',
                           'ere', 'ere_compose', 'umask_yields', 'not_in', 'rejects',
-                          'matches_ere', 'distinct_from', 'placeholder_words', 'equals_registry'))
+                          'matches_ere', 'distinct_from', 'placeholder_words', 'equals_registry',
+                          'records', 'rel_disjoint'))
 _RH_CA_EACH = frozenset(('enum', 'pattern', 'strings', 'positive_int', 'has_keys', 'placeholder_words'))
 _RH_CA_MODS = {'each': _RH_CA_EACH, 'where': _RH_CA_EACH,
                'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',)), 'subject': frozenset(('within',)),
@@ -2627,7 +2628,18 @@ def _rh_ca_registry(ca, schema):
                   and all(isinstance(arg[k], list) and all(isinstance(x, str) and x for x in arg[k]) for k in ('known', 'whole_word', 'refused') if k in arg)
                   and ('params' not in arg or (isinstance(arg['params'], str) and arg['params'] in pats)),
                   'equals_registry': isinstance(arg, dict) and 'path' in arg and not set(arg) - {'path', 'index'}
-                  and isinstance(arg['path'], str) and bool(arg['path']) and ('index' not in arg or (_rh_int(arg['index']) and arg['index'] >= 0))}[kind]
+                  and isinstance(arg['path'], str) and bool(arg['path']) and ('index' not in arg or (_rh_int(arg['index']) and arg['index'] >= 0)),
+                  'records': isinstance(arg, dict) and set(arg) == {'fields'} and isinstance(arg['fields'], dict) and bool(arg['fields'])
+                  and all(isinstance(k, str) and k and isinstance(p, str) and p in pats for k, p in arg['fields'].items()),
+                  'rel_disjoint': isinstance(arg, dict) and 'field' in arg and not set(arg) - {'field', 'from', 'from_under', 'ref_pattern'}
+                  and isinstance(arg['field'], str) and bool(arg['field']) and ('from' not in arg or strs(arg['from']))
+                  # UV-REFERENCE-NORMALIZATION (codex 001124): references are compared only after they fully match a
+                  # DECLARED pattern, so ref_pattern is required whenever the check has references
+                  and (('from' not in arg and 'from_under' not in arg and 'ref_pattern' not in arg)
+                       or (isinstance(arg.get('ref_pattern'), str) and arg['ref_pattern'] in pats))
+                  and ('from_under' not in arg or (isinstance(arg['from_under'], dict) and set(arg['from_under']) == {'base', 'paths'}
+                                                   and isinstance(arg['from_under']['base'], str) and bool(arg['from_under']['base'])
+                                                   and strs(arg['from_under']['paths'])))}[kind]
             for m in mods:
                 v = chk[m]
                 ok = ok and kind in _RH_CA_MODS[m] and {
@@ -2784,6 +2796,65 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
             return 'does not compile: %s' % (e,)
         hit = [p for p in arg if rx.fullmatch(p)]
         return 'admits the refused probe values %r (a configurable pattern may never admit them)' % (hit,) if hit else None
+    if kind == 'records':
+        # C1-UV-ADDED-FILES (codex-d649-runtime-refusal-repair-20260924-235616): a LIST (possibly empty -- the strictest
+        # declaration) of mappings, each with EXACTLY the declared field names, each field a string fully matching its
+        # declared pattern. A missing value never reaches here (_rh_admit_contracts: 'is not declared').
+        if not isinstance(s, list):
+            return 'must be a list of {%s} mappings; got a %s' % (', '.join(sorted(arg['fields'])), _rh_kind(s))
+        for i, e in enumerate(s):
+            if not isinstance(e, dict) or set(e) != set(arg['fields']):
+                return 'entry %d must be a mapping with exactly the keys %s; got %r' % (i, sorted(arg['fields']), e)
+            for f in sorted(arg['fields']):
+                p = pats[arg['fields'][f]]
+                if not isinstance(e[f], str) or not p.fullmatch(e[f]):
+                    return 'entry %d %s %r must fully match patterns.%s %r' % (i, f, e[f], arg['fields'][f], p.pattern)
+        return None
+    if kind == 'rel_disjoint':
+        # C1-UV-ADDED-FILES: the <field> relative paths of a record list are pairwise distinct and never nested, and
+        # overlap (equal / ancestor / descendant, compared BY COMPONENT: a == b or one is the other + '/' + more) no
+        # member of the `from` nodes (relative paths in the same base) and no `from_under` path rebased onto `base`
+        # (it must lie strictly under base + '/'). Every shape and reference is checked here (fail-closed, never
+        # vacuous): a malformed subject refuses, an absent or malformed reference is a missing dependency.
+        f = arg['field']
+        if not isinstance(s, list) or any(not isinstance(e, dict) or not isinstance(e.get(f), str) or not e[f] for e in s):
+            return 'must be a list of mappings each carrying a non-empty string %s' % (f,)
+        rels = [e[f] for e in s]
+        nested = lambda a, b: a == b or b.startswith(a + '/') or a.startswith(b + '/')
+        how = lambda a, b: 'equal to' if a == b else 'an ancestor of' if b.startswith(a + '/') else 'a descendant of'
+        for i in range(len(rels)):
+            for j in range(i + 1, len(rels)):
+                if nested(rels[i], rels[j]):
+                    return '%s %r is %s %s %r (entries must be distinct and never nested)' % (f, rels[i], how(rels[i], rels[j]), f, rels[j])
+        # UV-REFERENCE-NORMALIZATION (codex 001124): EVERY reference (the from_under base, each from_under path, each
+        # member of each from list) must fully match the declared ref_pattern BEFORE any rebasing or comparison --
+        # checked even when the subject list is empty; an unnormalized reference (x/../BUILD, bin/../bin/python3.13)
+        # REFUSES, it is never normalized away (a normalized copy could differ from what the consumer reads).
+        rn = arg.get('ref_pattern')
+        norm = lambda x: isinstance(x, str) and bool(pats[rn].fullmatch(x))
+        others = []   # from_under first, then from (the first overlap found is reported)
+        if 'from_under' in arg:
+            b = arg['from_under']['base']
+            fb, base = _rh_get(pol, root + '.' + b)
+            if not fb or not norm(base):
+                return 'requires %s declared as a normalized relative path (patterns.%s) (missing dependency); got %r' % (b, rn, base if fb else '<absent>')
+            for p in arg['from_under']['paths']:
+                fp, node = _rh_get(pol, root + '.' + p)
+                if not fp or not norm(node) or not node.startswith(base + '/'):
+                    return 'requires %s declared as a normalized relative path (patterns.%s) strictly under %s %r (missing dependency); got %r' % (
+                        p, rn, b, base, node if fp else '<absent>')
+                others.append((p + ' (under ' + b + ')', node[len(base) + 1:]))
+        for p in arg.get('from', []):
+            fo, node = _rh_get(pol, root + '.' + p)
+            if not fo or not isinstance(node, list) or not all(norm(x) for x in node):
+                return 'requires %s declared as a list of normalized relative paths (patterns.%s) (missing dependency); got %r' % (
+                    p, rn, node if fo else '<absent>')
+            others.extend((p, x) for x in node)
+        for r in rels:
+            for p, o in others:
+                if nested(r, o):
+                    return '%s %r is %s %s %r' % (f, r, how(r, o), p, o)
+        return None
     return 'unknown check kind'
 
 

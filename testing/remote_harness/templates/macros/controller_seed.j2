@@ -777,16 +777,42 @@ for _e in "$G/{{ py.install_dir }}"/* "$G/{{ py.install_dir }}"/.[!.]* "$G/{{ py
   esac
 done
 [ -d "$G/{{ py.installed_rel }}" ] && [ ! -L "$G/{{ py.installed_rel }}" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH 'uv did not install the declared key {{ py.download_key }}'
-# 2. independent unpack of the admitted archive; the ELF must be byte-equal, the trees may differ ONLY in declared uv-patched files
+# 2. independent unpack of the admitted archive; the ELF must be byte-equal, the trees may differ ONLY in declared uv-patched
+#    files (content) and declared uv-added files (install-only; each validated below BEFORE its diff line is accepted)
 {{ x(bs, 'tar') }} -xzf "$A/"{{ shq(pa.file) }} -C "$G/{{ bs.layout.gen_dirs.verify }}/pbs" --no-same-owner || lme_refuse RH-SEED-INSTALL-FAILED 'independent PBS unpack failed'
 {{ x(bs, 'cmp') }} -s -- "$G/{{ bs.layout.gen_dirs.verify }}/pbs/{{ py.archive_interpreter_rel }}" "$G/{{ py.interpreter_rel }}" || lme_refuse RH-SEED-IDENTITY-MISMATCH 'installed interpreter ELF differs from the admitted archive member'
-_dv=$({{ x(bs, 'diff') }} -r --no-dereference -q -- "$G/{{ bs.layout.gen_dirs.verify }}/pbs/{{ py.archive_top }}" "$G/{{ py.installed_rel }}" 2>&1)
+# per declared uv-added file, in order: absent from the unpack; a real (non-symlink) parent chain from $G; a regular,
+# non-symlink file owned by the generation owner; exact sha256 (python.uv_added_files drives every check)
+{% for a in py.uv_added_files %}
+{% set parts = a.rel.split('/') %}
+{% if ('' in parts) or ('.' in parts) or ('..' in parts) %}
+lme_refuse RH-SEED-IDENTITY-MISMATCH {{ shq('declared uv-added rel is not a normalized relative path: ' ~ a.rel) }}
+{% endif %}
+[ ! -e "$G/{{ bs.layout.gen_dirs.verify }}/pbs/{{ py.archive_top }}/"{{ shq(a.rel) }} ] && [ ! -L "$G/{{ bs.layout.gen_dirs.verify }}/pbs/{{ py.archive_top }}/"{{ shq(a.rel) }} ] \
+  || lme_refuse RH-SEED-IDENTITY-MISMATCH {{ shq('declared uv-added file is present in the admitted archive: ' ~ a.rel) }}
+_p="$G"
+for _c in{% for c in py.installed_rel.split('/') + parts[:-1] %} {{ shq(c) }}{% endfor %}; do
+  _p="$_p/$_c"
+  [ -d "$_p" ] && [ ! -L "$_p" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "declared uv-added file parent is not a real directory: $_p"
+done
+_f="$G/{{ py.installed_rel }}/"{{ shq(a.rel) }}
+[ -f "$_f" ] && [ ! -L "$_f" ] && [ "$({{ x(bs, 'stat') }} -c %u -- "$_f")" = "$_uid" ] \
+  || lme_refuse RH-SEED-IDENTITY-MISMATCH "declared uv-added file is not a regular, non-symlink, owned file: $_f"
+_d=$({{ x(bs, 'sha256sum') }} -- "$_f") || lme_refuse RH-SEED-IDENTITY-MISMATCH "cannot digest the declared uv-added file: $_f"
+[ "${_d%% *}" = {{ shq(a.sha256) }} ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "declared uv-added file digest differs from the declaration: $_f"
+{% endfor %}
+_dv=$({{ x(bs, 'diff') }} -r --no-dereference -q -- "$G/{{ bs.layout.gen_dirs.verify }}/pbs/{{ py.archive_top }}" "$G/{{ py.installed_rel }}" 2>&1); _drc=$?
+[ "$_drc" -le 1 ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "installed-tree diff against the admitted archive failed (exit $_drc): $_dv"
 _dx=$(printf '%s\n' "$_dv" | {{ x(bs, 'grep') }} -v -x -F -e '' \
 {% for f in py.uv_patched_rel %}
   -e "Files $G/{{ bs.layout.gen_dirs.verify }}/pbs/{{ py.archive_top }}/{{ f }} and $G/{{ py.installed_rel }}/{{ f }} differ" \
 {% endfor %}
+{% for a in py.uv_added_files %}
+{% set parts = a.rel.split('/') %}
+  -e "Only in $G/{{ py.installed_rel }}"{{ shq(((('/' ~ (parts[:-1] | join('/'))) if (parts | length > 1) else '') ~ ': ' ~ parts[-1])) }} \
+{% endfor %}
   || :)
-[ -z "$_dx" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "installed interpreter tree differs from the admitted archive beyond the declared uv-patched files: $_dx"
+[ -z "$_dx" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "installed interpreter tree differs from the admitted archive beyond the declared uv-patched and uv-added files: $_dx"
 # 3. runtime identity
 _v=$({{ env_i(bs) }} "$G/{{ py.interpreter_rel }}" -I -B -c 'import sys, platform; print(platform.python_implementation(), platform.python_version(), sys.base_prefix)' 2>&1) || lme_refuse RH-SEED-IDENTITY-MISMATCH "python identity probe failed: $_v"
 [ "$_v" = "CPython {{ py.version }} $G/{{ py.installed_rel }}" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "interpreter reports '$_v'"
