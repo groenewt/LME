@@ -2502,8 +2502,12 @@ def _rh_int(v):
 _RH_CA_KINDS = frozenset(('keys', 'has_keys', 'enum', 'pattern', 'key_pattern', 'positive_int', 'strings', 'within',
                           'ere', 'ere_compose', 'umask_yields', 'not_in', 'rejects',
                           'matches_ere', 'distinct_from', 'placeholder_words', 'equals_registry',
-                          'records', 'rel_disjoint'))
-_RH_CA_EACH = frozenset(('enum', 'pattern', 'strings', 'positive_int', 'has_keys', 'placeholder_words'))
+                          'records', 'rel_disjoint', 'int_range', 'key_set', 'int_gt_sum', 'disjoint_from',
+                          'mode_regex_domain', 'values_distinct', 'includes'))
+# GRAPH-SHARED-CONTRACT (codex-tick304): `within` joins each (a role -> executable-name mapping: every VALUE is one
+# scalar member, e.g. guest.tools.<role> names a controller.bootstrap.os_tools key the guest consumer requires).
+_RH_CA_EACH = frozenset(('enum', 'pattern', 'strings', 'positive_int', 'has_keys', 'placeholder_words', 'int_range',
+                         'within'))
 _RH_CA_MODS = {'each': _RH_CA_EACH, 'where': _RH_CA_EACH,
                'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',)), 'subject': frozenset(('within',)),
                'key_at': frozenset(('within',)), 'placeholders': frozenset(('within',))}
@@ -2624,6 +2628,18 @@ def _rh_ca_registry(ca, schema):
                   'rejects': isinstance(arg, list) and bool(arg) and all(isinstance(x, str) for x in arg),
                   'matches_ere': isinstance(arg, str) and bool(arg),
                   'distinct_from': strs(arg),
+                  # OS-TOOL CONSUMER PARTITION (codex-tick328-329): a list subject shares NO member with any referenced
+                  # (root-relative) list; shapes checked, an absent reference is a missing dependency
+                  'disjoint_from': strs(arg),
+                  # C1-PREREQ-MODE-DOMAIN (codex-tick328 schema findings, HIGH): a configurable MODE regex is admitted
+                  # by its whole permission domain -- forbidden_bits is one octal mask (e.g. '0022': group/other write)
+                  'mode_regex_domain': isinstance(arg, dict) and set(arg) == {'forbidden_bits'} and isinstance(arg['forbidden_bits'], str)
+                  and 3 <= len(arg['forbidden_bits']) <= 4 and all(c in '01234567' for c in arg['forbidden_bits'])
+                  and int(arg['forbidden_bits'], 8) != 0,
+                  # C1-GUEST-RUN-FILE-ALIASES / refusal codes (codex-tick328): every VALUE of a mapping is a non-empty
+                  # scalar and no two are equal (type-exact); `includes`: a list holds every declared member
+                  'values_distinct': arg is True,
+                  'includes': strs(arg),
                   'placeholder_words': isinstance(arg, dict) and 'known' in arg and not set(arg) - {'known', 'whole_word', 'params', 'refused'}
                   and all(isinstance(arg[k], list) and all(isinstance(x, str) and x for x in arg[k]) for k in ('known', 'whole_word', 'refused') if k in arg)
                   and ('params' not in arg or (isinstance(arg['params'], str) and arg['params'] in pats)),
@@ -2639,7 +2655,19 @@ def _rh_ca_registry(ca, schema):
                        or (isinstance(arg.get('ref_pattern'), str) and arg['ref_pattern'] in pats))
                   and ('from_under' not in arg or (isinstance(arg['from_under'], dict) and set(arg['from_under']) == {'base', 'paths'}
                                                    and isinstance(arg['from_under']['base'], str) and bool(arg['from_under']['base'])
-                                                   and strs(arg['from_under']['paths'])))}[kind]
+                                                   and strs(arg['from_under']['paths']))),
+                  # GRAPH-SHARED-CONTRACT (codex-tick304): a type-exact integer range; min REQUIRED, max optional
+                  'int_range': isinstance(arg, dict) and 'min' in arg and not set(arg) - {'min', 'max'}
+                  and all(_rh_int(arg[k]) for k in arg) and ('max' not in arg or arg['max'] >= arg['min']),
+                  # GRAPH-SHARED-CONTRACT (codex-tick304): an EXACT key set with declared optional members (a section
+                  # whose per-host member exists on target scopes only); required and optional are disjoint
+                  'key_set': isinstance(arg, dict) and set(arg) == {'required', 'optional'} and strs(arg['required'])
+                  and strs(arg['optional']) and not set(arg['required']) & set(arg['optional']),
+                  # GUEST-LEASE-BOUND (RS a51cc226 B1.lifecycle_leaves): a BOUNDED linear cross-leaf constraint: the
+                  # integer subject strictly exceeds sum(times * <root-relative integer leaf>); times a positive int
+                  'int_gt_sum': isinstance(arg, list) and bool(arg) and all(
+                      isinstance(t, dict) and set(t) == {'path', 'times'} and isinstance(t['path'], str) and bool(t['path'])
+                      and _rh_int(t['times']) and t['times'] >= 1 for t in arg)}[kind]
             for m in mods:
                 v = chk[m]
                 ok = ok and kind in _RH_CA_MODS[m] and {
@@ -2661,6 +2689,11 @@ def _rh_ca_registry(ca, schema):
                 or not isinstance(r['var_at'], str) or not r['var_at'] or not isinstance(r['pattern'], str) or r['pattern'] not in pats \
                 or ('when_present' in r and (not isinstance(r['when_present'], str) or not r['when_present'])):
             raise ValueError('lme: registry contract_admission.required_values.%s must be {var_at, pattern (a declared patterns name)[, when_present]}; got %r' % (rname, r))
+    # GRAPH-SHARED-CONTRACT (codex-tick304): reserved OUTPUT name FAMILIES (a consumer's prefixed task vars) are declared
+    # patterns; not_in [reserved_outputs] and the declared target inputs refuse a name matching one (fail-closed shape).
+    rop = schema.get('reserved_output_patterns', [])
+    if not isinstance(rop, list) or any(not isinstance(n, str) or n not in pats for n in rop):
+        raise ValueError('lme: registry remote_harness_schema.reserved_output_patterns must be a list of contract_admission.patterns names; got %r' % (rop,))
     return pats, ca['contracts'], ca['required_values']
 
 
@@ -2685,6 +2718,34 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
         return 'keys %s must fully match patterns.%s %r' % (bad, arg, pats[arg].pattern) if bad else None
     if kind == 'positive_int':
         return None if _rh_int(s) and s >= 1 else 'must be an integer >= 1'
+    if kind == 'int_range':
+        # type-exact: a bool, a float or a decimal string is never an integer here (no coercion)
+        lim = '[%d, %s]' % (arg['min'], arg['max'] if 'max' in arg else 'unbounded')
+        if not _rh_int(s):
+            return 'must be an integer in %s (type-exact; a %s is not)' % (lim, _rh_kind(s))
+        return None if s >= arg['min'] and ('max' not in arg or s <= arg['max']) else 'must be an integer in %s' % (lim,)
+    if kind == 'int_gt_sum':
+        # type-exact on the subject and every term (a bool / float / string never counts); an absent or non-integer
+        # term is a missing dependency, never vacuous
+        if not _rh_int(s):
+            return 'must be an integer (type-exact; a %s is not)' % (_rh_kind(s),)
+        total, parts = 0, []
+        for t in arg:
+            ft, v = _rh_get(pol, root + '.' + t['path'])
+            if not ft or not _rh_int(v):
+                return 'requires %s declared as an integer (missing dependency)' % (t['path'],)
+            total += t['times'] * v
+            parts.append('%d*%s' % (t['times'], t['path']))
+        return None if s > total else 'must exceed %s = %d' % (' + '.join(parts), total)
+    if kind == 'key_set':
+        if not isinstance(s, dict):
+            return 'must be a mapping'
+        miss = sorted(set(arg['required']) - set(s))
+        extra = sorted(str(k) for k in set(s) - set(arg['required']) - set(arg['optional']))
+        if miss or extra:
+            return 'key set must be exactly %s plus optionally %s (missing %s, undeclared %s)' % (
+                sorted(arg['required']), sorted(arg['optional']), miss, extra)
+        return None
     if kind == 'strings':
         if not isinstance(s, list) or any(not isinstance(x, str) for x in s):
             return 'must be a list of strings'
@@ -2749,6 +2810,58 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
             if _rh_ca_same(s, other):
                 return 'equals %s (%r); it must be distinct from %s' % (p, other, arg)
         return None
+    if kind == 'disjoint_from':
+        if not isinstance(s, list) or any(not isinstance(x, str) or not x for x in s):
+            return 'must be a list of non-empty strings'
+        for p in arg:
+            fd, other = _rh_get(pol, root + '.' + p)
+            if not fd or not isinstance(other, list) or any(not isinstance(x, str) or not x for x in other):
+                return 'requires %s declared as a list of non-empty strings (missing dependency); got %r' % (p, other if fd else '<absent>')
+            both = sorted(set(s) & set(other))
+            if both:
+                return 'shares %r with %s; the sets must be disjoint' % (both, p)
+        return None
+    if kind == 'mode_regex_domain':
+        # STRUCTURAL permission domain (C1-PREREQ-MODE-DOMAIN): every octal mode string of width 1..4 (the stat %a
+        # and the zero-padded forms, 4680 strings) that the regex ADMITS (re.search: a superset of an anchored full
+        # match, so an unanchored consumer is covered too) must carry none of forbidden_bits; and it must admit at
+        # least one mode. Never judged by examples: 0712 / 0752 refuse because their bits do, not because listed.
+        if not isinstance(s, str) or not s:
+            return 'must be a non-empty regex string'
+        try:
+            rx = re.compile(s)
+        except re.error as e:
+            return 'does not compile: %s' % (e,)
+        forbid, ok_n, bad = int(arg['forbidden_bits'], 8), 0, []
+        for width in (1, 2, 3, 4):
+            for v in range(8 ** width):
+                m = format(v, '0%do' % width)
+                if rx.search(m):
+                    if v & forbid:
+                        bad.append(m)
+                    else:
+                        ok_n += 1
+        if bad:
+            return 'admits %d mode string(s) carrying forbidden permission bits %s, e.g. %r' % (len(bad), arg['forbidden_bits'], bad[:12])
+        return None if ok_n else 'admits no mode at all (an empty permission domain)'
+    if kind == 'values_distinct':
+        if not isinstance(s, dict) or not s:
+            return 'must be a non-empty mapping'
+        seen = {}
+        for k in sorted(s, key=str):
+            v = s[k]
+            if isinstance(v, (dict, list)) or v is None or v == '':
+                return 'value of %s must be a non-empty scalar; got %r' % (k, v)
+            for k0, v0 in seen.items():
+                if _rh_ca_same(v, v0):
+                    return 'values of %s and %s are equal (%r); every value must be distinct' % (k0, k, v)
+            seen[k] = v
+        return None
+    if kind == 'includes':
+        if not isinstance(s, list):
+            return 'must be a list; got a %s' % (_rh_kind(s),)
+        miss = [m for m in arg if not any(_rh_ca_same(m, x) for x in s)]
+        return 'must include %s (missing %s)' % (arg, miss) if miss else None
     if kind == 'placeholder_words':
         return _rh_ca_words(s, arg, pats)
     if kind == 'equals_registry':
@@ -2786,6 +2899,8 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
         return None if (0o666 & ~int(s, 8)) == int(mode, 8) else '0666 & ~%s = %04o, not the declared %s %s' % (s, 0o666 & ~int(s, 8), arg, mode)
     if kind == 'not_in':
         hit = [n for n in arg if s in schema[n]]
+        if 'reserved_outputs' in arg and isinstance(s, str):
+            hit += ['reserved_output_patterns.%s' % (p,) for p in schema.get('reserved_output_patterns', []) if pats[p].fullmatch(s)]
         return 'is a registry %s name (a route/loader OUTPUT, never an external input)' % (hit,) if hit else None
     if kind == 'rejects':
         if not isinstance(s, str) or not s:
@@ -2960,6 +3075,14 @@ def _rh_validate(composed, declared, override, schema):
                 if ospec is None or set(oid) != {'kind', ospec['value_field']} or not isinstance(oval, str) \
                         or not re.match(ospec['value_pattern'], oval):
                     raise ValueError('lme: lme_global_override.%s.%s.%s.%s must be a COMPLETE identity {kind: <one of %s>, <value>} in the override itself; got %r (a partial identity would inherit the declared digest)' % (key, ei0['entries'], tool, ei0['field'], sorted(ei0['kinds']), oid))
+    # GRAPH-SHARED-CONTRACT (codex-tick304): per-host INSTANCE values (a guest allocation) come ONLY from that host's
+    # override; a global/profile declaration would be a default for every scope, so it refuses (registry override_only_paths).
+    oop = schema.get('override_only_paths', [])
+    if not isinstance(oop, list) or any(not isinstance(p, str) or not p for p in oop):
+        raise ValueError('lme: registry remote_harness_schema.override_only_paths must be a list of policy paths; got %r' % (oop,))
+    for p in oop:
+        if _rh_get(decl, p)[0]:
+            raise ValueError('lme: %s.%s is declared in global/profile; it is a per-host instance value that only that host\'s lme_global_override.%s.%s may supply (no default)' % (key, p, key, p))
     # -- composed-policy checks (declaration AND override) --
     for pattern in schema['path_leaves']:
         for path, v in _rh_expand(pol, pattern):
@@ -2981,6 +3104,8 @@ def _rh_validate(composed, declared, override, schema):
     # C1-BOOTSTRAP-CONTRACT-VALUE-ADMISSION (codex 191117): the registry-declared bootstrap contracts and their
     # references (executables, env names, sub_roots keys, ERE/format fields) on the composed policy, before any mutation.
     _rh_admit_contracts(pol, schema, key)
+    # GRAPH-SHARED-CONTRACT (codex-tick304): the declared target-input roles are admitted on every composition, scoped or not.
+    _rh_target_inputs(pol, schema, key)
     for dotted in schema['positive_int_paths']:
         f, v = _rh_get(pol, dotted)
         if not f or not _rh_int(v) or v < 1:
@@ -3002,6 +3127,17 @@ def _rh_validate(composed, declared, override, schema):
             if miss:
                 raise ValueError('lme: %s.%s names %s with no %s.%s.%s mapping' % (key, where, miss, key, pm['families'], fam))
     _pkg_check(req if fr else None, pm['required'])
+    # GRAPH-SHARED-CONTRACT (codex-tick304): further DECLARED logical package lists (e.g. the target prerequisite's
+    # hypervisor packages) need a mapping in EVERY os family, like packages.required; absent list = not declared.
+    rl = pm.get('required_lists', [])
+    if not isinstance(rl, list) or any(not isinstance(p, str) or not p for p in rl):
+        raise ValueError('lme: registry package_mapping.required_lists must be a list of policy paths; got %r' % (rl,))
+    for p in rl:
+        fl, names = _rh_get(pol, p)
+        if fl:
+            if not isinstance(names, list) or not names or any(not isinstance(n, str) or not n for n in names):
+                raise ValueError('lme: %s.%s must be a non-empty list of logical package names; got %r' % (key, p, names))
+            _pkg_check(names, p)
     ad = schema['adapter']
     (fs, sel), (fm, members) = _rh_get(pol, ad['selector']), _rh_get(pol, ad['members'])
     if not fs or not isinstance(sel, str) or not fm or not isinstance(members, dict) or sel not in members:
@@ -3064,6 +3200,15 @@ def _rh_validate(composed, declared, override, schema):
 
 
 _RH_ARTIFACT_KEYS = frozenset(('templates', 'inputs', 'checkout_inputs', 'consumers', 'not_embedded_fields'))
+# INSTALLED-SET-FRAGMENT (codex-tick313 R2 (a)): the ONE optional artifact key. when_present names a policy path; a
+# scope whose resolved policy does not declare it neither binds the artifact's inputs nor its declared-reference
+# import (an OPTIONAL fragment, composable per profile). The template proof itself stays policy-free and total.
+_RH_ARTIFACT_OPTIONAL = frozenset(('when_present',))
+
+
+def _rh_artifact_active(d, pol):
+    """True when the artifact applies to this scope policy (no when_present, or its path is declared there)."""
+    return 'when_present' not in d or _rh_get(pol, d['when_present'])[0]
 
 
 def _rh_artifact_decl(hs):
@@ -3073,8 +3218,12 @@ def _rh_artifact_decl(hs):
         raise ValueError('lme: registry host_scope.shared_artifacts must declare every shared rendered artifact; got %r' % (arts,))
     for a in sorted(arts):
         d = arts[a]
-        if not isinstance(d, dict) or set(d) != _RH_ARTIFACT_KEYS:
-            raise ValueError('lme: registry host_scope.shared_artifacts.%s must carry exactly %s' % (a, sorted(_RH_ARTIFACT_KEYS)))
+        if not isinstance(d, dict) or set(d) - _RH_ARTIFACT_OPTIONAL != _RH_ARTIFACT_KEYS:
+            raise ValueError('lme: registry host_scope.shared_artifacts.%s must carry exactly %s plus optionally %s' % (
+                a, sorted(_RH_ARTIFACT_KEYS), sorted(_RH_ARTIFACT_OPTIONAL)))
+        if 'when_present' in d and (not isinstance(d['when_present'], str) or not d['when_present']
+                                    or '' in d['when_present'].split('.')):
+            raise ValueError('lme: registry host_scope.shared_artifacts.%s.when_present must be a dotted policy path; got %r' % (a, d['when_present']))
         tpl, ins, cins, cons, ne = (d[k] for k in ('templates', 'inputs', 'checkout_inputs', 'consumers', 'not_embedded_fields'))
         if not isinstance(tpl, list) or not tpl or len(set(tpl)) != len(tpl) or any(
                 not isinstance(p, str) or not p or p.startswith('/') or '..' in p.split('/') for p in tpl):
@@ -3103,6 +3252,8 @@ def _rh_shared_inputs(pol, hs, scoped, key):
     _, entries = _rh_get(pol, tm)
     out = {}
     for a, d in sorted(_rh_artifact_decl(hs).items()):
+        if not _rh_artifact_active(d, pol):
+            continue
         stripped = _rh_without(pol, [p for p in scoped if p.rsplit('.', 1)[1] in d['not_embedded_fields']])
         vals = {}
         for var, path in sorted(d['inputs'].items()):
@@ -3465,6 +3616,113 @@ def _rh_endpoint(raw, rule, host, key):
     return [comp[c] for c in rule['endpoint_key']]
 
 
+_RH_INPUT_TYPES = ('string', 'bool', 'string_list')
+
+
+def _rh_target_inputs(pol, schema, key):
+    """GRAPH-SHARED-CONTRACT (codex-tick304) DECLARED TARGET INPUTS. The per-target INVENTORY values the deployment's
+    consumers read (owner account, toolchain root, bundle dir, the owner key REFERENCE, observation host inputs, ...)
+    are each named ONCE in the policy, at registry host_scope.target_inputs.decl_path, as
+    {<role>: {var, type, required[, pattern]}}. The loader SELECTS them (lme_rh_connection_values), types them against
+    the registry patterns and binds every target's values into binding.deployment.target_inputs (part of every
+    scope_sha256), so a consumer reads the bound value, never a raw host var. A key or credential is only ever a PATH
+    reference (a string; the loader never reads it). Presence is kept separate from the value (as for endpoints): an
+    absent var omits the role (a required role refuses); a supplied null is a value no type admits. Returns
+    {role: spec}; {} (inert) when the registry names no decl_path or the policy declares none."""
+    hs = schema['host_scope']
+    if 'target_inputs' not in hs:
+        return {}
+    ti = hs['target_inputs']
+    if not isinstance(ti, dict) or set(ti) != {'decl_path'} or not isinstance(ti['decl_path'], str) or not ti['decl_path']:
+        raise ValueError('lme: registry host_scope.target_inputs must be {decl_path: <policy path>}; got %r' % (ti,))
+    f, decl = _rh_get(pol, ti['decl_path'])
+    if not f:
+        return {}
+    pats = _rh_ca_registry(schema.get('contract_admission'), schema)[0]
+    if 'var_name' not in pats:
+        raise ValueError('lme: registry contract_admission.patterns.var_name is required to admit %s.%s' % (key, ti['decl_path']))
+    if not isinstance(decl, dict) or not decl:
+        raise ValueError('lme: %s.%s must be a non-empty mapping of input roles; got %r' % (key, ti['decl_path'], decl))
+    reserved = set(schema.get('reserved_outputs') or []) | set(schema.get('resolver_outputs') or [])
+    seen = {}
+    for role in sorted(decl, key=str):
+        spec, where = decl[role], '%s.%s.%s' % (key, ti['decl_path'], role)
+        if not isinstance(role, str) or not pats['var_name'].fullmatch(role):
+            raise ValueError('lme: %s: an input role must fully match patterns.var_name' % (where,))
+        ok = isinstance(spec, dict) and {'var', 'type', 'required'} <= set(spec) and not set(spec) - {'var', 'type', 'required', 'pattern'} \
+            and isinstance(spec['var'], str) and bool(pats['var_name'].fullmatch(spec['var'])) \
+            and isinstance(spec['type'], str) and spec['type'] in _RH_INPUT_TYPES and isinstance(spec['required'], bool) \
+            and ('pattern' in spec) == (spec['type'] != 'bool') \
+            and ('pattern' not in spec or (isinstance(spec['pattern'], str) and spec['pattern'] in pats))
+        if not ok:
+            raise ValueError('lme: %s must be {var: <patterns.var_name>, type: <one of %s>, required: <bool>, pattern: <a declared '
+                             'contract_admission.patterns name; string / string_list only>}; got %r' % (where, list(_RH_INPUT_TYPES), spec))
+        if spec['var'] in reserved or any(pats[p].fullmatch(spec['var']) for p in schema.get('reserved_output_patterns', [])):
+            raise ValueError('lme: %s.var %r is a reserved / resolver OUTPUT name, never an input' % (where, spec['var']))
+        if spec['var'] in seen:
+            raise ValueError('lme: %s.var %r is already read by role %s (one role per inventory variable)' % (where, spec['var'], seen[spec['var']]))
+        seen[spec['var']] = role
+    return decl
+
+
+def _rh_bind_target_inputs(decl, conn, targets, schema, key):
+    """The typed {target: {role: value}} of the declared target inputs (see _rh_target_inputs); refuses a connection
+    context that does not carry exactly the declared vars and every target's values, a missing required role, and a
+    value of another type (type-exact: 'true' is not a bool, 8 is not a string)."""
+    pats = _rh_ca_registry(schema.get('contract_admission'), schema)[0]
+    names = dict((r, decl[r]['var']) for r in sorted(decl))
+    inp = conn.get('inputs') if isinstance(conn, dict) else None
+    if not isinstance(inp, dict) or inp.get('vars') != names or not isinstance(inp.get('values'), dict) \
+            or any(not isinstance(inp['values'].get(t), dict) for t in targets):
+        raise ValueError('lme: remote-harness scope connections must carry the declared target inputs %r and every target\'s values' % (names,))
+    out = {}
+    for t in targets:
+        raw, row = inp['values'][t], {}
+        for role in sorted(decl):
+            spec = decl[role]
+            if role not in raw:
+                if spec['required']:
+                    raise ValueError('lme: %s target %r lacks the required input %s (inventory var %s); there is no default' % (key, t, role, spec['var']))
+                continue
+            v, p = raw[role], pats.get(spec.get('pattern'))
+            if spec['type'] == 'bool':
+                good, want = isinstance(v, bool), 'a bool (type-exact)'
+            elif spec['type'] == 'string':
+                good, want = isinstance(v, str) and bool(p.fullmatch(v)), 'a string fully matching patterns.%s' % (spec['pattern'],)
+            else:
+                good = isinstance(v, list) and bool(v) and all(isinstance(x, str) and p.fullmatch(x) for x in v) and len(set(v)) == len(v)
+                want = 'a non-empty list of distinct strings, each fully matching patterns.%s' % (spec['pattern'],)
+            if not good:
+                raise ValueError('lme: %s target %r input %s (inventory var %s) must be %s; got %r (%s)' % (key, t, role, spec['var'], want, v, _rh_kind(v)))
+            row[role] = v
+        out[t] = row
+    return out
+
+
+def _rh_distinct_across_targets(hs, scopes, targets, key):
+    """GRAPH-SHARED-CONTRACT (codex-tick304): registry host_scope.distinct_across_targets names policy paths whose
+    value, wherever a target scope declares it, must differ between the targets of one deployment (e.g. a guest's
+    run_id and hostname: two hypervisors declaring the same one would collide in the lifecycle record and the
+    inventory binding). Scalars only (str / int), compared type-exactly; absent on a scope = not declared there."""
+    dat = hs.get('distinct_across_targets')
+    if dat is None:
+        return
+    if not isinstance(dat, list) or any(not isinstance(p, str) or not p for p in dat):
+        raise ValueError('lme: registry host_scope.distinct_across_targets must be a list of policy paths; got %r' % (dat,))
+    for p in dat:
+        seen = {}
+        for t in targets:
+            f, v = _rh_get(scopes['targets'][t]['policy'], p)
+            if not f:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (str, int)):
+                raise ValueError('lme: %s.%s of target %r must be a string or integer to be compared across targets; got %r' % (key, p, t, v))
+            k = (_rh_kind(v), v)
+            if k in seen:
+                raise ValueError('lme: %s.%s %r is declared by targets %r and %r; it must be distinct across the targets of one deployment' % (key, p, v, seen[k], t))
+            seen[k] = t
+
+
 def lme_rh_connection_values(hostvars, ids, composed, schema):
     """C1-EFFECTIVE-ENDPOINT-BINDING: a SELECTION (no derivation) of the inventory values the declared endpoint rule
     names, for each host id: {vars: {role: var name}, values: {id: {role: value}}}; {} when no remote-harness
@@ -3481,7 +3739,15 @@ def lme_rh_connection_values(hostvars, ids, composed, schema):
     for h in ids:
         hv = hostvars[h]
         values[h] = dict((role, hv[v]) for role, v in sorted(names.items()) if v in hv)
-    return {'vars': names, 'values': values}
+    out = {'vars': names, 'values': values}
+    # GRAPH-SHARED-CONTRACT (codex-tick304): the DECLARED target inputs, selected the same way (presence kept apart
+    # from the value); carried only when the policy declares them, so an undeclared context is unchanged.
+    tin = _rh_target_inputs(pol, schema, key)
+    if tin:
+        ivars = dict((r, tin[r]['var']) for r in sorted(tin))
+        out['inputs'] = {'vars': ivars, 'values': dict(
+            (h, dict((r, hostvars[h][v]) for r, v in sorted(ivars.items()) if v in hostvars[h])) for h in ids)}
+    return out
 
 
 def _rh_without(tree, dotted_paths):
@@ -3551,6 +3817,13 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
                               'endpoints': endpoints},
                'source_edition': {'global_sha256': ed['global_sha256'], 'profile_sha256': ed['profile_sha256']},
                'operation': op}
+    # GRAPH-SHARED-CONTRACT (codex-tick304): every target's DECLARED inventory inputs, typed, join the deployment
+    # binding (so every scope_sha256), exactly when the policy declares them; a context carrying undeclared inputs refuses.
+    tin = _rh_target_inputs(pol, schema, key)
+    if tin:
+        binding['deployment']['target_inputs'] = _rh_bind_target_inputs(tin, conn, targets, schema, key)
+    elif 'inputs' in conn:
+        raise ValueError('lme: remote-harness scope connections carry target inputs the policy does not declare')
 
     def entry(i):
         sec = section if i == me else _rh_validate(comp[i], declared, ovs[i], schema)[0]
@@ -3561,6 +3834,7 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
         out['scope_sha256'] = _digest({'scope': ident, 'binding': binding, 'policy_sha256': sec['policy_sha256']})
         return out
     scopes = {'controller': entry(cid), 'targets': {t: entry(t) for t in targets}}
+    _rh_distinct_across_targets(hs, scopes, targets, key)
     # IMPORT-PER-SCOPE-BINDING (codex 214135): every declared-reference import binds against EVERY already-resolved
     # scope policy (the ONE composition per scope, derived above; nothing merged here), so a scope whose declared
     # target differs is proved on its own values, not on this host's.
@@ -3568,7 +3842,8 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
     for label, spol in [('controller ' + cid, scopes['controller']['policy'])] + [
             ('target ' + t, scopes['targets'][t]['policy']) for t in targets]:
         for rec in imports:
-            _rh_bind_declared_import(rec, arts[rec['artifact']], label, spol)
+            if _rh_artifact_active(arts[rec['artifact']], spol):
+                _rh_bind_declared_import(rec, arts[rec['artifact']], label, spol)
     mine =scopes['controller'] if me == cid else scopes['targets'][me]
     return dict(section, scope={'kind': mine['kind'], 'id': me}, binding=binding, scope_sha256=mine['scope_sha256'],
                 scopes=scopes, scopes_sha256=_digest(scopes))
@@ -3669,6 +3944,18 @@ def lme_verify_resolved(resolved, registry):
             raise ValueError('lme: published %s.scopes.%s.scope_sha256 is not bound to its scope/binding/policy' % (key, where))
     if sec['scopes_sha256'] != _digest(scopes):
         raise ValueError('lme: published %s.scopes_sha256 is not the digest of its actual scopes' % (key,))
+    # GRAPH-SHARED-CONTRACT (codex-tick304): the bound target inputs are present exactly when the controller scope's
+    # policy declares them, cover exactly the bound targets, and re-type to themselves (no undeclared role, no value
+    # of another type).
+    tdecl = _rh_target_inputs(scopes['controller']['policy'], schema, key)
+    if bool(tdecl) != ('target_inputs' in dep):
+        raise ValueError('lme: published %s.binding.deployment.target_inputs must be present exactly when the policy declares target inputs' % (key,))
+    if tdecl:
+        ti = dep['target_inputs']
+        tnames = dict((r, tdecl[r]['var']) for r in sorted(tdecl))
+        if not isinstance(ti, dict) or sorted(ti) != sorted(dep.get('targets') or []) or any(not isinstance(v, dict) for v in ti.values()) \
+                or not _leaf_equal(_rh_bind_target_inputs(tdecl, {'inputs': {'vars': tnames, 'values': ti}}, sorted(ti), schema, key), ti):
+            raise ValueError('lme: published %s.binding.deployment.target_inputs must map every bound target to its declared, typed inputs' % (key,))
     me = sec['scope']
     mine = scopes['controller'] if isinstance(me, dict) and me.get('kind') == 'controller' else \
         scopes['targets'].get(me.get('id')) if isinstance(me, dict) else None

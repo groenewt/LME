@@ -615,6 +615,20 @@
       register: _rh_tb_list
       changed_when: false
 
+    # PARSED-BYTE BINDING (codex-tick355 / tick361 RX-SCOPE row 11): sha256sum --check used to OPEN the check file by
+    # path while the digest compared with the admitted checksum_file_sha256 came from a LATER stat, so a list replaced
+    # between them could steer which members were verified and still pass the stat. The check file is now read ONCE; only
+    # when those read bytes hash to the admitted checksum_file_sha256 are EXACTLY they fed to sha256sum on stdin ('-');
+    # otherwise sha256sum does not run and the refusal below names the binding. Absent / unreadable: no read, refused
+    # below as before (failed_when: false keeps the one refusal).
+    - name: Read the check file that is read back ONCE (the bytes sha256sum verifies)
+      vars:
+        _src: "{{ (_rh_tb_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir) if not _rh_tb_bdir.stat.exists else lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
+      ansible.builtin.slurp:
+        src: "{{ _src }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
+      register: _rh_tb_sumraw
+      failed_when: false
+
     - name: Read back every digest with the declared sha256sum against the bundle's own check file
       vars:
         _src: "{{ (_rh_tb_stage.path ~ '/' ~ rh.controller.bootstrap.bundle.staging_retention.target_members.extract_dir) if not _rh_tb_bdir.stat.exists else lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var) }}"
@@ -624,11 +638,16 @@
           - --check
           - --strict
           - --quiet
-          - "{{ rh.controller.bootstrap.bundle.checksum_file }}"
+          - '-'
         chdir: "{{ _src }}"
+        stdin: "{{ _rh_tb_sumraw.content | b64decode }}"
+        stdin_add_newline: false
       register: _rh_tb_sum
       changed_when: false
       failed_when: false
+      when:
+        - _rh_tb_sumraw.content is defined
+        - (_rh_tb_sumraw.content | b64decode | hash('sha256')) == rh_tb_xfer.bundle.checksum_file_sha256
 
     - name: Digest the check file that is read back
       vars:
@@ -663,7 +682,9 @@
       ansible.builtin.assert:
         that:
           - _rh_tb_list.stdout_lines | sort == rh_tb_xfer.bundle.members
-          - _rh_tb_sum.rc == 0
+          # the bytes sha256sum verified ARE the admitted check file (read once, fed on stdin; RX-SCOPE row 11)
+          - (_rh_tb_sumraw.content | default('') | b64decode | hash('sha256')) == rh_tb_xfer.bundle.checksum_file_sha256
+          - (_rh_tb_sum.rc | default(1)) == 0
           - _rh_tb_sumfile.stat.exists and not _rh_tb_sumfile.stat.islnk
           - _rh_tb_sumfile.stat.checksum == rh_tb_xfer.bundle.checksum_file_sha256
           - _rh_tb_manfile.stat.exists and not _rh_tb_manfile.stat.islnk
@@ -672,7 +693,7 @@
           REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }}: the
           {{ 'staged extraction' if not _rh_tb_bdir.stat.exists else 'present bundle dir' }} differs from the admitted
           controller bundle (members/modes {{ _rh_tb_list.stdout_lines | sort | symmetric_difference(rh_tb_xfer.bundle.members) }},
-          sha256sum rc {{ _rh_tb_sum.rc }}{% if _rh_tb_present is not skipped %}; present class_key
+          sha256sum rc {{ _rh_tb_sum.rc | default('not run: the check file read back is not the admitted bytes') }}{% if _rh_tb_present is not skipped %}; present class_key
           {{ ((_rh_tb_present.content | default('') | b64decode | from_json) if (_rh_tb_present.content | default('') | length) > 0 else {}).class_key | default('unreadable') }}
           vs admitted {{ rh_tb_xfer.bundle.class_key }}{% endif %}). Nothing was published; a present bundle dir is preserved.
         quiet: true

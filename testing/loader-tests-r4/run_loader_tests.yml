@@ -16,6 +16,8 @@
 # unchanged with its 19/20/21-entry indexes):
 #   R3-CASE-SENSITIVE-KEYS  macros/diff.j2 compares keys case-sensitively; non-string keys fail closed (+controls)
 #   R3-MANAGED-IDENTITY     managed_only binds every executable to a pinned, instrument-ACCEPTED bootstrap receipt
+#                           (codex-tick332 F3 DETACHED-REVIEW: the review lives on the accepted catalog entry, never
+#                           inside the receipt; receipt schema 2 = managed-bootstrap-receipts.yml receipt_contract)
 #   R3-COPIED-MANIFEST-BYTES one_case.yml binds each copied tree to the run-level manifests_tree before overlay and
 #                           binds/records the post-overlay bytes (only declared overlay targets may change)
 #   R3-OVERLAY-ALIASES      overlay paths must be canonical relative paths; targets realpath-contained
@@ -49,6 +51,13 @@
 #     -e expected_probe_python_executable=<abs> -e expected_probe_python_version=<x.y.z> \
 #     -e run_mode=reproduction|integration -e source_commit=<40-hex> [-e baseline_commit=<40-hex>] \
 #     -e managed_interpreter_root=<abs> [-e interpreter_policy=managed_only|unmanaged_diagnostic]
+#     managed_only also: -e managed_bootstrap_receipt=<abs R> -e managed_bootstrap_receipt_sha256=<sha256(R), accepted>
+#                        -e managed_bootstrap_review=<A's locator rel = <runners[review_contract.locator.runner_key]>/<readback attempt>/<locator.leaf>>
+#                        -e managed_bootstrap_review_sha256=<sha256(A), accepted>   (codex-tick337 review artifact A;
+#                        location: codex-tick339-340 / codex-tick348 -- A sits beside readback.yml in the COMPLETED
+#                        bootstrap_receipt_readback attempt it reviews)
+#     managed_only resolves the harness policy (resolve_policy.yml) as a PREFLIGHT before any admission check; a preflight
+#     failure refuses RH-LOADER-POLICY-PREFLIGHT and is never an expected negative case (codex-tick348 RUN_1).
 #     -e work_root=<abs> -e '{"lme_resolved_run": {...}}'   (both from the declared seed run-local, passed LAST;
 #                                                            RH-RUNNER-RESOLVED-WORKROOT, see the play header)
 #
@@ -75,6 +84,16 @@
   #     per-case temp roots under the case dir (inside work_root).
   # Nonzero exit: every refusal below and the Overall gate fail the play.
   tasks:
+    # REVIEW-ARTIFACT-CALLER-SUBSTITUTION (codex-tick339-340, HIGH): extra-vars outrank register / set_fact / task vars,
+    # and the declared launcher admits flat JSON single-key extra-vars, so a caller could supply e.g. review_raw
+    # ({"content": <base64 YAML>}) or receipt_stat and override this runner's own measurement. The EXISTING harness
+    # guard (SEED-05; C1 registry reserved_outputs + resolver_outputs, read inline from playbook_dir) is therefore this
+    # play's FIRST task: every R / A admission register and effect-bearing intermediate below is a reserved output (C1
+    # proposal G2, mandatory). The public inputs (repo_root ... managed_bootstrap_review_sha256, work_root,
+    # lme_resolved_run) are NOT reserved and stay admissible.
+    - name: Refuse pre-supplied R / A admission registers and intermediates (harness guard, first task)
+      ansible.builtin.include_tasks: ../remote_harness/tasks/refuse_pinned_outputs.yml
+
     - name: "RH-RUNNER-RESOLVED-WORKROOT -- require the resolved run input (no raw-profile fallback, no default work root)"
       ansible.builtin.assert:
         that:
@@ -120,6 +139,31 @@
           {{ item.value }}; the runner must be started by the declared seed run-local with lme_resolved_run.env
       loop: "{{ lme_resolved_run.env | dict2items }}"
       loop_control: {label: "{{ item.key }}"}
+
+    # RUN-1 (C1 review-location-join 5f0a3d08; codex-tick348-location-lineage-decisions RUN_1 ACCEPTED): managed_only
+    # resolves the harness policy through the EXISTING route resolver (resolve_policy.yml: the engine resolve, the
+    # effective checkout/profile binding and the typed policy `rh`) -- the SAME include the sibling projection / readback
+    # runners use -- so A's declared location (work_roots.runners[catalog locator.runner_key], the attempt grammar) is
+    # read from the RESOLVED profile, never from a raw-profile read or a literal. It runs AFTER the first-task reserved-
+    # output guard (rh, rh_* and the resolver outputs are reserved, so a pre-supplied value refuses first) and after the
+    # resolved-run admission above. TRADE-OFF (flagged for codex, accepted tick348 with a qualification): the loader
+    # runner now resolves through the engine it tests, before any case, under managed_only only. QUALIFICATION: this is
+    # a POSITIVE runner-policy PREFLIGHT, not a verdict on the engine. Its failure is rescued into the distinct refusal
+    # RH-LOADER-POLICY-PREFLIGHT below and is NEVER counted as an expected negative case: every lifecycle / loader case
+    # still exercises its own declared isolated source with its own expected outcome (lifecycle E89-E91).
+    - name: "r4 PREFLIGHT -- resolve the harness policy (managed_only; the declared review location; no raw-profile read)"
+      when: interpreter_policy | default('') == 'managed_only'
+      block:
+        - name: "r4 PREFLIGHT -- include the route resolver (resolve_policy.yml)"
+          ansible.builtin.include_tasks: ../remote_harness/tasks/resolve_policy.yml
+      rescue:
+        - name: "r4 PREFLIGHT FAILED -- RH-LOADER-POLICY-PREFLIGHT (runner policy preflight; never an expected negative)"
+          ansible.builtin.fail:
+            msg: >-
+              REFUSED RH-LOADER-POLICY-PREFLIGHT: the managed_only runner-policy preflight (resolve_policy.yml) failed at
+              "{{ ansible_failed_task.name | default('?') }}": {{ ansible_failed_result.msg | default('?') }}. This is a
+              PREFLIGHT failure of the runner's own policy resolution, NOT a loader case verdict: no expected-negative
+              case may be satisfied by it (codex-tick348 RUN_1 qualification).
 
     - name: Refuse a run whose inputs are not all explicit (no private defaults)
       ansible.builtin.assert:
@@ -303,24 +347,194 @@
       loop: [probe_python, runner_python]
       when: interpreter_policy == 'managed_only'
 
+    # ---- RX-CATALOG-READ (codex-tick361: one early read bound to an INDEPENDENTLY admitted source digest) ----
+    # The catalog managed-bootstrap-receipts.yml was parsed by six separate lookup('file') re-reads (each re-opens the
+    # path and strips trailing whitespace), and its only digest (instrument_stat, below) was a LATER stat -- the bytes
+    # parsed were never the bytes measured. Now: the catalog is READ ONCE (slurp); the bytes of THAT read are bound,
+    # BEFORE any parse, to the blob object the declared source_commit records at the same path (declared git,
+    # identity-checked; `ls-tree` of source_commit -- never HEAD, never the worktree -- and `hash-object --no-filters
+    # --stdin` of exactly the read bytes, same repository so the same object format). The anchor is independent of the
+    # catalog: the catalog declares no digest of itself (no admission cycle); source_commit is the declared -e input
+    # the checkout was admitted against above. It proves the parsed bytes ARE the reviewed source revision's bytes; it
+    # does not make that revision's content correct. Every catalog use below parses THIS read. The shape gate takes no
+    # criterion from the catalog (hard-coded top-level keys). Negatives (UNRUN): lifecycle E93 (mismatch / absent /
+    # malformed on a disposable clone). The registers below (managed_bootstrap_catalog_{rel,raw,git,tree,oid}) are
+    # reserved: C1 landed them in global.yml a1fdf576 reserved_outputs, so a pre-supplied value refuses at the guard.
+    - name: "RX-CATALOG-READ -- derive the catalog's path relative to the admitted checkout (no search)"
+      ansible.builtin.set_fact:
+        managed_bootstrap_catalog_rel: "{{ (playbook_dir ~ '/managed-bootstrap-receipts.yml') | relpath(repo_root) }}"
+      when: interpreter_policy == 'managed_only'
+
+    - name: "RX-CATALOG-READ -- read the catalog ONCE (the bytes every catalog check below parses)"
+      ansible.builtin.slurp: {src: "{{ repo_root ~ '/' ~ managed_bootstrap_catalog_rel }}"}
+      register: managed_bootstrap_catalog_raw
+      failed_when: false
+      when: interpreter_policy == 'managed_only'
+
+    - name: "RX-CATALOG-READ -- measure the declared git tool before using it (identity)"
+      ansible.builtin.stat: {path: "{{ rh.controller.bootstrap.os_tools.git.path }}", follow: false, checksum_algorithm: sha256}
+      register: managed_bootstrap_catalog_git
+      when: interpreter_policy == 'managed_only'
+
+    - name: "RX-CATALOG-READ -- the object source_commit records at the catalog path (read-only; never HEAD / worktree)"
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.git.path }}", -C, "{{ repo_root }}", ls-tree, --full-tree,
+               "{{ source_commit }}", --, "{{ managed_bootstrap_catalog_rel }}"]
+      register: managed_bootstrap_catalog_tree
+      changed_when: false
+      failed_when: false
+      when:
+        - interpreter_policy == 'managed_only'
+        - managed_bootstrap_catalog_git.stat.checksum | default('') == rh.controller.bootstrap.os_tools.git.identity.sha256
+
+    - name: "RX-CATALOG-READ -- the git object id of exactly the bytes READ (stdin; no filters, no re-open by path)"
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.git.path }}", -C, "{{ repo_root }}", hash-object, --no-filters, --stdin]
+        stdin: "{{ managed_bootstrap_catalog_raw.content | b64decode }}"
+        stdin_add_newline: false
+      register: managed_bootstrap_catalog_oid
+      changed_when: false
+      failed_when: false
+      when:
+        - interpreter_policy == 'managed_only'
+        - managed_bootstrap_catalog_raw.content is defined
+        - managed_bootstrap_catalog_git.stat.checksum | default('') == rh.controller.bootstrap.os_tools.git.identity.sha256
+
+    - name: "RX-CATALOG-READ -- bind the catalog bytes READ to the blob source_commit records BEFORE parsing"
+      vars:
+        _l: "{{ managed_bootstrap_catalog_tree.stdout_lines | default([]) }}"
+        _m: "{{ ((_l[0] | default('')).split('\t')[0]).split(' ') }}"
+        _p: "{{ ((_l[0] | default('')).split('\t') + [''])[1] }}"
+      ansible.builtin.assert:
+        that:
+          # the read and the git lookup name the SAME file of the admitted checkout
+          - managed_bootstrap_catalog_rel is string and managed_bootstrap_catalog_rel is not match('^/')
+          - "'..' not in managed_bootstrap_catalog_rel.split('/')"
+          - (repo_root ~ '/' ~ managed_bootstrap_catalog_rel) == (playbook_dir ~ '/managed-bootstrap-receipts.yml')
+          # ABSENT CATALOG (worktree): nothing was read
+          - managed_bootstrap_catalog_raw.content is defined and managed_bootstrap_catalog_raw.content is string
+          # the declared git, not a PATH git
+          - managed_bootstrap_catalog_git.stat.exists and managed_bootstrap_catalog_git.stat.isreg and not managed_bootstrap_catalog_git.stat.islnk
+          - managed_bootstrap_catalog_git.stat.checksum == rh.controller.bootstrap.os_tools.git.identity.sha256
+          # ABSENT CATALOG (commit): source_commit records exactly one regular-file blob at this path (no link, no gitlink)
+          - managed_bootstrap_catalog_tree.rc | default(1) == 0
+          - (_l | length) == 1
+          - (_m | length) == 3
+          - _m[0] in ['100644', '100755'] and _m[1] == 'blob'
+          - _p == managed_bootstrap_catalog_rel
+          # CATALOG MISMATCH: the bytes READ are exactly that blob
+          - managed_bootstrap_catalog_oid.rc | default(1) == 0
+          - (managed_bootstrap_catalog_oid.stdout | default('')) is match('^([0-9a-f]{40}|[0-9a-f]{64})$')
+          - managed_bootstrap_catalog_oid.stdout == _m[2]
+        fail_msg: >-
+          REFUSED RX-CATALOG-READ: the catalog bytes read from {{ repo_root }}/{{ managed_bootstrap_catalog_rel | default('?') }}
+          (object {{ managed_bootstrap_catalog_oid.stdout | default('<not read>') }}) are not the regular-file blob the declared
+          source_commit {{ source_commit }} records there ({{ _l | to_json }}), or the git used is not the declared
+          os_tools.git (codex-tick361 RX-CATALOG-READ; no catalog content was parsed)
+      when: interpreter_policy == 'managed_only'
+
+    - name: "RX-CATALOG-READ -- the bound catalog is one mapping with every top-level section (criteria hard-coded, not read from it)"
+      vars:
+        # parsed ONLY from the read bound above; a YAML syntax error fails THIS task (MALFORMED CATALOG)
+        _catalog: "{{ managed_bootstrap_catalog_raw.content | b64decode | from_yaml }}"
+      ansible.builtin.assert:
+        that:
+          - _catalog is mapping
+          - (['entry_contract', 'accepted', 'review_contract', 'receipt_contract'] | reject('in', _catalog.keys() | map('string') | list) | list | length) == 0
+          - _catalog.entry_contract is mapping and _catalog.review_contract is mapping and _catalog.receipt_contract is mapping
+        fail_msg: >-
+          REFUSED RX-CATALOG-READ: the bound catalog is not one mapping carrying entry_contract, accepted, review_contract
+          and receipt_contract (MALFORMED CATALOG; codex-tick361)
+      when: interpreter_policy == 'managed_only'
+
     # r4 R3-MANAGED-IDENTITY (codex-213359): a caller-selected managed root is NOT installation identity (/usr
-    # could be declared). managed_only now binds every selected executable (resolved path + sha256) to a
-    # REVIEWED bootstrap receipt, itself pinned by sha256. The receipt is data produced by the reviewed
-    # bootstrap job (tick112 acquired archives only; no installed-executable receipt exists yet), so today
-    # managed_only fails closed. The receipt shape:
-    #   {kind: managed_interpreter_bootstrap_receipt, review: {message_id, sha256},
-    #    executables: {probe_ansible_playbook|probe_python|runner_python: {path, sha256}}}
-    - name: "r4 -- managed_only requires a pinned reviewed bootstrap receipt"
+    # could be declared). managed_only binds every selected executable (resolved path + sha256) to a bootstrap
+    # receipt R pinned by the sha256 of its bytes and ACCEPTED in the hashed instrument managed-bootstrap-receipts.yml.
+    # r4 DETACHED-REVIEW (codex-tick332 F3; no self-reference, acyclic): R no longer carries a review of itself (a
+    # review cannot hash bytes holding its own id). The review is validated on the matching ACCEPTED CATALOG ENTRY
+    # {sha256: sha256(R), review: {locator: <A's locator>, message_id: <review message A>, sha256: sha256(A)}}; neither
+    # R nor A contains the catalog digest. codex-tick337: the runner READS A (review_contract) and binds its bytes,
+    # message_id, accepted decision and receipt_sha256 == the MEASURED R digest before any case. R's shape is
+    # managed-bootstrap-receipts.yml receipt_contract (schema 2; producer
+    # project_bootstrap_receipt.yml from the SEALED generation receipt toolchain.json + actual measurements, re-measured
+    # by readback_bootstrap_receipt.yml). Still mandatory: the exact R bytes, the selected executable paths/sha256,
+    # the managed root, the resolved-run toolchain receipt, and catalog acceptance. Declared negatives: lifecycle E89, E90.
+    - name: "r4 -- managed_only requires a pinned bootstrap receipt ACCEPTED by exactly one catalog entry"
+      vars:
+        _catalog: "{{ managed_bootstrap_catalog_raw.content | b64decode | from_yaml }}"
       ansible.builtin.assert:
         that:
           - managed_bootstrap_receipt is defined and managed_bootstrap_receipt is string and managed_bootstrap_receipt is match('^/')
-          - managed_bootstrap_receipt_sha256 is defined and managed_bootstrap_receipt_sha256 is match('^[0-9a-f]{64}$')
-          - managed_bootstrap_receipt_sha256 in ((lookup('ansible.builtin.file', playbook_dir ~ '/managed-bootstrap-receipts.yml') | from_yaml).accepted | map(attribute='sha256') | list)
+          - managed_bootstrap_receipt_sha256 is defined and managed_bootstrap_receipt_sha256 is string
+          - managed_bootstrap_receipt_sha256 is match(_catalog.entry_contract.sha256_regex)
+          - _catalog.accepted is sequence and _catalog.accepted is not string and _catalog.accepted is not mapping
+          - (_catalog.accepted | reject('mapping') | list | length) == 0
+          # every accepted receipt digest appears once (an ambiguous duplicate refuses, never first-match)
+          - (_catalog.accepted | map(attribute='sha256', default='') | list | unique | length) == (_catalog.accepted | length)
+          # UNACCEPTED RECEIPT: a digest no entry names refuses here, before any receipt byte is read
+          - (_catalog.accepted | selectattr('sha256', 'defined') | selectattr('sha256', 'equalto', managed_bootstrap_receipt_sha256) | list | length) == 1
         fail_msg: >-
           interpreter_policy=managed_only requires -e managed_bootstrap_receipt=<abs path> and
-          -e managed_bootstrap_receipt_sha256=<hex> naming a receipt ACCEPTED in the hashed instrument
-          managed-bootstrap-receipts.yml: a directory-name claim (managed_interpreter_root) is not
-          approved installation identity (R3-MANAGED-IDENTITY)
+          -e managed_bootstrap_receipt_sha256=<hex> naming a receipt ACCEPTED by exactly one entry of the hashed
+          instrument managed-bootstrap-receipts.yml (accepted digests: {{ _catalog.accepted | default([]) | map(attribute='sha256', default='?') | list }}):
+          a directory-name claim (managed_interpreter_root) is not approved installation identity (R3-MANAGED-IDENTITY)
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- the matching catalog entry carries a well-formed DETACHED review of exactly this receipt (codex-tick332 F3)"
+      vars:
+        _catalog: "{{ managed_bootstrap_catalog_raw.content | b64decode | from_yaml }}"
+        _ec: "{{ _catalog.entry_contract }}"
+        _lc: "{{ _catalog.review_contract.locator }}"
+        _entry: "{{ _catalog.accepted | selectattr('sha256', 'defined') | selectattr('sha256', 'equalto', managed_bootstrap_receipt_sha256) | first }}"
+        # RUN-2 (C1 review-location-join): the declared location, read from the RESOLVED policy (preflight above)
+        _wr: "{{ rh.controller.bootstrap.work_roots }}"
+        _att: "{{ rh.controller.bootstrap.genesis.seed_step_record.attempt }}"
+        _segs: "{{ (_entry.review.locator.rel | string).split('/') }}"
+      ansible.builtin.assert:
+        that:
+          # MISSING CATALOG REVIEW: the entry must hold exactly {sha256, review}
+          - (_entry.keys() | map('string') | sort | list) == (_ec.entry_keys | sort | list)
+          # MALFORMED CATALOG REVIEW: review is exactly {locator, message_id, sha256}, a string id and a 64-hex digest
+          - _entry.review is mapping
+          - (_entry.review.keys() | map('string') | sort | list) == (_ec.review_keys | sort | list)
+          - _entry.review.message_id is string and _entry.review.message_id is match(_ec.message_id_regex)
+          - _entry.review.sha256 is string and _entry.review.sha256 is match(_ec.sha256_regex)
+          # A is a SEPARATE message: its digest can never be the receipt's own digest
+          - _entry.review.sha256 != _entry.sha256
+          # A's portable locator (codex-tick337): the declared anchor + a relative path at the declared location
+          - _entry.review.locator is mapping
+          - (_entry.review.locator.keys() | map('string') | sort | list) == (_lc.fields | sort | list)
+          - _entry.review.locator.anchor in _lc.anchors
+          - _entry.review.locator.rel is string
+          # the declared location (codex-tick339-340 / tick348): <runners[runner_key]>/<attempt>/<leaf>, read from the
+          # RESOLVED profile; the catalog names a declaration KEY (runner_key) and a leaf, never a directory name
+          - _lc.runner_key is string and _lc.runner_key in _wr.runners
+          # the key names a REAL run-local runner (no runner-less evidence key)
+          - _lc.runner_key in rh.controller.bootstrap.work_roots.run_local.runners
+          - _segs | length == 3
+          - _segs[0] == _wr.runners[_lc.runner_key]
+          - _att.match == 'fullmatch'
+          - _segs[1] is ansible.builtin.regex(_att.regex, match_type=_att.match)
+          - _segs[2] == _lc.leaf
+          # the declared review inputs name exactly this entry's A (no second source of truth)
+          - managed_bootstrap_review is defined and managed_bootstrap_review is string
+          - managed_bootstrap_review == _entry.review.locator.rel
+          - managed_bootstrap_review_sha256 is defined and managed_bootstrap_review_sha256 is string
+          - managed_bootstrap_review_sha256 == _entry.review.sha256
+        fail_msg: >-
+          the accepted entry for {{ managed_bootstrap_receipt_sha256 }} must be exactly {sha256, review: {locator:
+          {anchor in {{ _lc.anchors }}, rel == {{ _wr.runners[_lc.runner_key] | default('?') }}/<attempt {{ _att.regex | default('?') }}>/{{ _lc.leaf }}},
+          message_id (matching {{ _ec.message_id_regex }}),
+          sha256 (64 hex, A's own digest, distinct from the receipt digest)}}, and -e managed_bootstrap_review /
+          managed_bootstrap_review_sha256 must name exactly that locator rel and digest; got {{ _entry | to_json }}
+          (codex-tick332 F3 / codex-tick337 detached review)
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- record the matched catalog entry (detached review metadata; evidence only)"
+      ansible.builtin.set_fact:
+        managed_bootstrap_catalog_entry: >-
+          {{ (managed_bootstrap_catalog_raw.content | b64decode | from_yaml).accepted
+             | selectattr('sha256', 'defined') | selectattr('sha256', 'equalto', managed_bootstrap_receipt_sha256) | first }}
       when: interpreter_policy == 'managed_only'
 
     - name: "r4 -- measure the bootstrap receipt bytes"
@@ -328,28 +542,213 @@
       register: receipt_stat
       when: interpreter_policy == 'managed_only'
 
-    - name: "r4 -- bind the selected executables to the reviewed bootstrap receipt"
+    # PARSED-BYTE BINDING (codex-tick339-340, same class as A): R is READ ONCE (slurp); the decoded payload of that one
+    # read is hashed against the accepted digest BEFORE it is parsed, and every R field below comes from that same
+    # payload -- never from a second read (a lookup/file re-read could see a different inode behind the same path).
+    - name: "r4 -- read the bootstrap receipt R once (the bytes every R check below uses)"
+      ansible.builtin.slurp: {src: "{{ managed_bootstrap_receipt }}"}
+      register: receipt_raw
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- bind the exact receipt bytes, its shape, the managed root and the resolved-run toolchain receipt"
       vars:
-        receipt: "{{ lookup('ansible.builtin.file', managed_bootstrap_receipt) | from_yaml }}"
-        measured: >-
+        _rc: "{{ (managed_bootstrap_catalog_raw.content | b64decode | from_yaml).receipt_contract }}"
+        # parsed ONLY after the hash of these exact decoded bytes is asserted (assert evaluates `that` in order).
+        # Named managed_receipt_doc (C1 G2 rename, global.yml 69c4e736 reserved_outputs; the generic `receipt` is unreserved).
+        managed_receipt_doc: "{{ receipt_raw.content | b64decode | from_yaml }}"
+      ansible.builtin.assert:
+        that:
+          # WRONG RECEIPT DIGEST: the named file measures, AND the bytes actually read hash to, the accepted digest
+          - receipt_stat.stat.exists and receipt_stat.stat.isreg and not receipt_stat.stat.islnk
+          - receipt_stat.stat.checksum == managed_bootstrap_receipt_sha256
+          - (receipt_raw.content | b64decode | hash('sha256')) == managed_bootstrap_receipt_sha256
+          - managed_receipt_doc is mapping
+          # NO SELF-REVIEW: a receipt carrying a review of itself refuses (then the exact key set)
+          - (managed_receipt_doc.keys() | map('string') | select('in', _rc.forbidden_keys) | list | length) == 0
+          - (managed_receipt_doc.keys() | map('string') | sort | list) == (_rc.top_level_keys | sort | list)
+          - managed_receipt_doc.kind == _rc.kind and managed_receipt_doc.schema == _rc.schema
+          # MANAGED ROOT: the receipt's root is the declared one
+          - managed_receipt_doc.managed_root is string and managed_receipt_doc.managed_root == managed_interpreter_root
+          - managed_receipt_doc.executables is mapping and (managed_receipt_doc.executables.keys() | map('string') | sort | list) == (_rc.executable_keys | sort | list)
+          # the selections the receipt was projected for are exactly this run's selections
+          - managed_receipt_doc.selected is mapping and (managed_receipt_doc.selected.keys() | map('string') | sort | list) == (_rc.selected_keys | sort | list)
+          - managed_receipt_doc.selected.probe_ansible_playbook == probe_ansible_playbook
+          - managed_receipt_doc.selected.probe_python_executable == expected_probe_python_executable
+          - managed_receipt_doc.selected.runner_python == ansible_playbook_python
+          # the receipt was projected from the SAME sealed generation receipt this runner was launched with
+          - managed_receipt_doc.toolchain_receipt is mapping and (managed_receipt_doc.toolchain_receipt.keys() | map('string') | sort | list) == (_rc.toolchain_receipt_keys | sort | list)
+          - managed_receipt_doc.toolchain_receipt.path == lme_resolved_run.receipt.path
+          - managed_receipt_doc.toolchain_receipt.sha256 == lme_resolved_run.receipt.sha256
+          - managed_receipt_doc.toolchain_receipt.generation_dir == managed_receipt_doc.managed_root
+        fail_msg: >-
+          bootstrap receipt {{ managed_bootstrap_receipt }} (measured {{ receipt_stat.stat.checksum | default('<absent>') }},
+          accepted {{ managed_bootstrap_receipt_sha256 }}) is not a schema-{{ _rc.schema }} {{ _rc.kind }} with exactly the
+          keys {{ _rc.top_level_keys }} (no {{ _rc.forbidden_keys }}), managed_root == {{ managed_interpreter_root }},
+          selections == this run's (probe {{ probe_ansible_playbook }}, probe python {{ expected_probe_python_executable }},
+          runner python {{ ansible_playbook_python }}) and toolchain_receipt == the resolved run's
+          {{ lme_resolved_run.receipt }} (R3-MANAGED-IDENTITY, codex-tick332 F3)
+      when: interpreter_policy == 'managed_only'
+
+    # ---- REVIEW ARTIFACT A (codex-tick337-detached-review-binding-decision-20260925) ----
+    # A is resolved ONLY from the accepted entry's locator: anchor run_evidence_root = dirname(lme_resolved_run.work_root)
+    # (the seed-admitted <work root>/<sub_roots.run>), plus the relative path admitted above as exactly
+    # <runners[locator.runner_key]>/<attempt>/<locator.leaf> = the COMPLETED bootstrap_receipt_readback attempt A reviews
+    # (codex-tick339-340 / tick348 location). Every component below the anchor is stat'ed not-followed (no link can
+    # redirect the read); A itself must be an immutable regular file. The four checks -- full-byte digest, message_id,
+    # decision, receipt_sha256 == the MEASURED R digest -- and (RUN-4) the readback correspondence all run here, before
+    # any case executes.
+    # RUN-3: the anchor is the DECLARED run evidence root of this checkout, not merely dirname(work_root).
+    - name: "r4 -- the resolved run's evidence root IS the declared <work root>/<sub_roots.run>"
+      vars:
+        _wr: "{{ rh.controller.bootstrap.work_roots }}"
+      ansible.builtin.assert:
+        that:
+          - (lme_resolved_run.work_root | dirname) == rh_repo_root ~ '/' ~ _wr.root_rel ~ '/' ~ _wr.sub_roots.run
+        fail_msg: >-
+          the run evidence root {{ lme_resolved_run.work_root | dirname }} is not the declared
+          <checkout>/{{ _wr.root_rel }}/{{ _wr.sub_roots.run }} (codex-tick339-340 declared review location)
+        quiet: true
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- locate the review artifact A from the accepted entry (declared anchor + relative path; no search)"
+      vars:
+        _anchor: "{{ lme_resolved_run.work_root | dirname }}"
+        # rel was admitted above as exactly <runners[locator.runner_key]>/<attempt>/<locator.leaf> (three segments)
+        _segs: "{{ managed_bootstrap_catalog_entry.review.locator.rel.split('/') }}"
+      ansible.builtin.set_fact:
+        managed_bootstrap_review_path: "{{ _anchor ~ '/' ~ managed_bootstrap_catalog_entry.review.locator.rel }}"
+        # [anchor, anchor/seg0, anchor/seg0/seg1, A, the readback record A sits beside (RUN-4)]; A stays index 3
+        managed_bootstrap_review_components:
+          - "{{ _anchor }}"
+          - "{{ _anchor ~ '/' ~ _segs[0] }}"
+          - "{{ _anchor ~ '/' ~ _segs[0] ~ '/' ~ _segs[1] }}"
+          - "{{ _anchor ~ '/' ~ managed_bootstrap_catalog_entry.review.locator.rel }}"
+          - "{{ _anchor ~ '/' ~ _segs[0] ~ '/' ~ _segs[1] ~ '/readback.yml' }}"
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- measure the anchor, every component of A's path below it, A itself and its readback record (not followed)"
+      ansible.builtin.stat: {path: "{{ item }}", follow: false, checksum_algorithm: sha256}
+      # default([]): the loop is templated BEFORE the per-item `when`, and the list exists only under managed_only
+      loop: "{{ managed_bootstrap_review_components | default([]) }}"
+      register: review_path_stat
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- refuse a missing, redirected or mutable review artifact A (MISSING A; WRONG A DIGEST)"
+      vars:
+        _st: "{{ review_path_stat.results | map(attribute='stat') | list }}"
+      ansible.builtin.assert:
+        that:
+          # the anchor and both directories below it: real directories, never links
+          - _st[0].exists and _st[0].isdir and not _st[0].islnk
+          - _st[1].exists and _st[1].isdir and not _st[1].islnk
+          - _st[2].exists and _st[2].isdir and not _st[2].islnk
+          # MISSING A: A exists as an immutable regular file (review_contract.immutable)
+          - _st[3].exists and _st[3].isreg and not _st[3].islnk
+          - not (_st[3].wusr or _st[3].wgrp or _st[3].woth)
+          # WRONG A DIGEST: A's full bytes are exactly the accepted digest
+          - _st[3].checksum == managed_bootstrap_catalog_entry.review.sha256
+          # RUN-4: A sits in a COMPLETED readback attempt -- its readback record is an immutable regular file, never a link
+          - _st[4].exists and _st[4].isreg and not _st[4].islnk
+          - not (_st[4].wusr or _st[4].wgrp or _st[4].woth)
+        fail_msg: >-
+          review artifact A {{ managed_bootstrap_review_path }} (locator {{ managed_bootstrap_catalog_entry.review.locator | to_json }})
+          is missing, reached through a link or non-directory, writable, or its bytes measure
+          {{ _st[3].checksum | default('<absent>') }} instead of the accepted {{ managed_bootstrap_catalog_entry.review.sha256 }};
+          or the readback record beside it ({{ managed_bootstrap_review_components[4] | default('?') }}) is missing, a link or
+          writable (codex-tick337 / tick348; MAIN relocates A byte-identical, 0400, into the COMPLETED readback attempt)
+      when: interpreter_policy == 'managed_only'
+
+    # REVIEW-ARTIFACT-PARSED-BYTE-BINDING (codex-tick339-340, HIGH): the stat digest above proves the inode that was
+    # stat'ed; A is then READ ONCE, and the decoded payload of THAT read is hashed against the accepted sha(A) before
+    # anything is parsed or credited. The fields below are parsed from exactly those bytes (no re-read, no
+    # reserialization, no normalization), so a replacement of A through its parent between stat and read refuses here.
+    # RUN-4 (codex-tick348: actual byte binding, same discipline): the readback record beside A is read ONCE in the SAME
+    # task (results[1]); when A carries `readback`, those read bytes are hashed against A.readback.sha256 BEFORE they are
+    # parsed. One register (review_raw, reserved) holds both reads: results[0] = A, results[1] = readback.yml.
+    - name: "r4 -- read the review artifact A and its readback record once each (the bytes every A check below uses)"
+      ansible.builtin.slurp: {src: "{{ item }}"}
+      loop: "{{ [managed_bootstrap_review_path, managed_bootstrap_review_components[4]] if interpreter_policy == 'managed_only' else [] }}"
+      register: review_raw
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- bind the bytes actually READ of A to the accepted digest BEFORE parsing (REPLACED A)"
+      ansible.builtin.assert:
+        that:
+          - review_raw.results is defined and (review_raw.results | length) == 2
+          - review_raw.results[0].content is defined and review_raw.results[0].content is string
+          - (review_raw.results[0].content | b64decode | hash('sha256')) == managed_bootstrap_catalog_entry.review.sha256
+        fail_msg: >-
+          the bytes read from review artifact A {{ managed_bootstrap_review_path }} hash to
+          {{ review_raw.results[0].content | default('') | b64decode | hash('sha256') }}, not the accepted
+          {{ managed_bootstrap_catalog_entry.review.sha256 }} (A replaced after it was measured; codex-tick339-340)
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- A is a well-formed review of exactly the MEASURED receipt, by the accepted message, with an accepted decision"
+      vars:
+        _vc: "{{ (managed_bootstrap_catalog_raw.content | b64decode | from_yaml).review_contract }}"
+        # parsed from the SAME read bound above; a YAML syntax error fails this task (refusal before any case); a
+        # non-mapping document fails `is mapping`
+        _a: "{{ review_raw.results[0].content | b64decode | from_yaml }}"
+      ansible.builtin.assert:
+        that:
+          # MALFORMED A: one mapping with every required key and nothing outside required + optional keys
+          - _a is mapping
+          - (_vc.required_keys | reject('in', _a.keys() | map('string') | list) | list | length) == 0
+          - (_a.keys() | map('string') | reject('in', _vc.required_keys + _vc.optional_keys) | list | length) == 0
+          - _a.schema_version == _vc.schema_version and _a.kind == _vc.kind
+          - _a.message_id is string and _a.receipt_sha256 is string and _a.decision is string
+          - _a.decision in _vc.decision_values
+          # MISMATCHED MESSAGE ID: right bytes, but A names another message than the accepted entry
+          - _a.message_id == managed_bootstrap_catalog_entry.review.message_id
+          # ANOTHER R: A reviews exactly the digest of the R bytes this runner READ (bound above), not a claimed one
+          - _a.receipt_sha256 == (receipt_raw.content | b64decode | hash('sha256'))
+          # NOT ACCEPTED: an explicit accepted decision
+          - _a.decision == _vc.accepted_decision
+          # RUN-4 READBACK CORRESPONDENCE (codex-tick348), only when A carries `readback`: exactly {path, sha256}; the path is
+          # the readback record beside A; the bytes READ of it (results[1]) and its measured stat both hash to A.readback.sha256
+          # -- asserted BEFORE the record is parsed (the parse below is reached only through these, in order) -- and the
+          # parsed record is the PASS readback of exactly the R bytes this runner read
+          - ('readback' not in _a) or (_a.readback is mapping and (_a.readback.keys() | map('string') | sort | list) == ['path', 'sha256'])
+          - ('readback' not in _a) or (_a.readback.path == managed_bootstrap_review_components[4])
+          - ('readback' not in _a) or ((review_raw.results[1].content | b64decode | hash('sha256')) == _a.readback.sha256)
+          - ('readback' not in _a) or (review_path_stat.results[4].stat.checksum == _a.readback.sha256)
+          - ('readback' not in _a) or ((review_raw.results[1].content | b64decode | from_yaml) is mapping)
+          - ('readback' not in _a) or ((review_raw.results[1].content | b64decode | from_yaml).verdict | default('') == 'PASS')
+          - ('readback' not in _a) or ((review_raw.results[1].content | b64decode | from_yaml).receipt.sha256 | default('') == (receipt_raw.content | b64decode | hash('sha256')))
+        fail_msg: >-
+          review artifact A {{ managed_bootstrap_review_path }} is not a schema_version {{ _vc.schema_version }} {{ _vc.kind }}
+          with exactly {{ _vc.required_keys }} (+ optional {{ _vc.optional_keys }}), message_id ==
+          {{ managed_bootstrap_catalog_entry.review.message_id }}, receipt_sha256 == the measured R digest
+          {{ receipt_stat.stat.checksum | default('?') }} and decision == {{ _vc.accepted_decision }}; or its `readback`
+          is not {path: {{ managed_bootstrap_review_components[4] | default('?') }}, sha256: <the bytes read of that PASS
+          readback of this R>}; got {{ _a | to_json }} (codex-tick337 / tick348 RUN-4)
+      when: interpreter_policy == 'managed_only'
+
+    - name: "r4 -- bind every selected executable (path + sha256) to the accepted bootstrap receipt"
+      vars:
+        _rc: "{{ (managed_bootstrap_catalog_raw.content | b64decode | from_yaml).receipt_contract }}"
+        # the SAME single read whose decoded bytes were bound to the accepted digest above (C1 G2 rename: managed_receipt_doc,
+        # managed_measured, managed_measured_path are reserved_outputs; the generic receipt / measured / measured_path are not)
+        managed_receipt_doc: "{{ receipt_raw.content | b64decode | from_yaml }}"
+        managed_measured: >-
           {{ dict(['probe_ansible_playbook', 'probe_python', 'runner_python']
                   | zip(exec_stat.results | map(attribute='stat'))) }}
-        measured_path:
+        managed_measured_path:
           probe_ansible_playbook: "{{ probe_ansible_playbook }}"
           probe_python: "{{ interpreter_resolved.probe_python | default(interpreter_declared.probe_python, true) }}"
           runner_python: "{{ interpreter_resolved.runner_python | default(interpreter_declared.runner_python, true) }}"
       ansible.builtin.assert:
         that:
-          - receipt_stat.stat.exists and receipt_stat.stat.isreg and not receipt_stat.stat.islnk
-          - receipt_stat.stat.checksum == managed_bootstrap_receipt_sha256
-          - receipt is mapping and receipt.kind | default('') == 'managed_interpreter_bootstrap_receipt'
-          - receipt.review is mapping and receipt.review.message_id is string and receipt.review.sha256 is match('^[0-9a-f]{64}$')
-          - (receipt.executables.keys() | sort | list) == ['probe_ansible_playbook', 'probe_python', 'runner_python']
-          - receipt.executables[item].path == measured_path[item]
-          - receipt.executables[item].sha256 == measured[item].checksum
+          - managed_receipt_doc.executables[item] is mapping
+          - (managed_receipt_doc.executables[item].keys() | map('string') | sort | list) == (_rc.executable_fields | sort | list)
+          # CHANGED EXECUTABLE: the measured path and bytes must be exactly the receipt's
+          - managed_receipt_doc.executables[item].path == managed_measured_path[item]
+          - managed_receipt_doc.executables[item].sha256 == managed_measured[item].checksum
+          - managed_receipt_doc.executables[item].path is match('^' ~ (managed_receipt_doc.managed_root | regex_escape) ~ '/')
         fail_msg: >-
-          {{ item }} measured {{ measured_path[item] }} sha256 {{ measured[item].checksum | default('?') }} does not
-          match the reviewed bootstrap receipt {{ managed_bootstrap_receipt }} (R3-MANAGED-IDENTITY)
+          {{ item }} measured {{ managed_measured_path[item] }} sha256 {{ managed_measured[item].checksum | default('?') }} does not
+          match the accepted bootstrap receipt {{ managed_bootstrap_receipt }} ({{ managed_receipt_doc.executables[item] | default('absent') }},
+          managed root {{ managed_receipt_doc.managed_root | default('?') }}) (R3-MANAGED-IDENTITY)
       loop: [probe_ansible_playbook, probe_python, runner_python]
       when: interpreter_policy == 'managed_only'
 
@@ -363,13 +762,19 @@
         checksum_algorithm: sha256
       register: manifests_found
 
+    # Roster = every file under this directory the runner or one_case.yml reads. macros/key_remove.j2 is consumed by
+    # one_case.yml (key_remove present/remove lookups; codex-tick335-336 C1-KEY-REMOVE-INSTRUMENT-REPORT). NOT listed:
+    # macros/bootstrap_receipt.j2, project_bootstrap_receipt.yml and readback_bootstrap_receipt.yml -- never read by
+    # this runner (they are the bootstrap_receipt / _readback runners' own playbook and template; their output R is
+    # bound here by its exact bytes, and A by its locator + bytes, recorded in consumed_inputs below).
     - name: Hash every instrument file actually used by this run
       ansible.builtin.stat:
         path: "{{ playbook_dir }}/{{ item }}"
         checksum_algorithm: sha256
       register: instrument_stat
       loop: [run_loader_tests.yml, one_case.yml, macros/probe.j2, macros/manifest_digest.j2, macros/classify.j2,
-             macros/diff.j2, macros/dump_integrity.j2, fixture_config.yml, managed-bootstrap-receipts.yml, "{{ cases_file }}"]
+             macros/diff.j2, macros/dump_integrity.j2, macros/key_remove.j2, fixture_config.yml, managed-bootstrap-receipts.yml,
+             "{{ cases_file }}"]
 
     - name: sha256 of loader inputs BEFORE the run (source-unchanged baseline)
       ansible.builtin.stat: {path: "{{ repo_root }}/{{ item }}", checksum_algorithm: sha256}
@@ -386,6 +791,18 @@
         src_before_map: "{{ dict(isolated_source.files | zip(src_before.results | map(attribute='stat.checksum') | list)) }}"
         run_id: >-
           {{ head_rev.stdout[:12] }}-{{ run_mode }}-{{ run_label }}-core{{ toolchain.probe_ansible_core }}-{{ run_ts.stdout }}
+
+    # RX-CATALOG-READ roster cross-check: the published instrument digest of the catalog must be the sha256 of exactly the
+    # bytes the runner READ, bound and parsed above (a replacement after the bound read shows here, not in evidence).
+    - name: "RX-CATALOG-READ -- the instrument roster's catalog digest is the digest of the bytes read and parsed"
+      ansible.builtin.assert:
+        that:
+          - instruments['managed-bootstrap-receipts.yml'] == (managed_bootstrap_catalog_raw.content | b64decode | hash('sha256'))
+        fail_msg: >-
+          REFUSED RX-CATALOG-READ: the roster records managed-bootstrap-receipts.yml as
+          {{ instruments['managed-bootstrap-receipts.yml'] | default('<absent>') }} but the bytes read and parsed hash to
+          {{ managed_bootstrap_catalog_raw.content | default('') | b64decode | hash('sha256') }} (catalog replaced after the bound read)
+      when: interpreter_policy == 'managed_only'
 
     # r2 C1-AGGREGATE-MANIFEST-DIGEST: the v6.2 expression joined each dict2items RECORD, and joining a
     # dict joins its KEYS ('key', 'value'), so every same-size manifest set produced the same digest.
@@ -451,7 +868,27 @@
           managed_interpreter_root: "{{ managed_interpreter_root }}"
           interpreters_resolved: "{{ interpreter_resolved }}"
           managed_bootstrap_receipt: >-
-            {{ {'path': managed_bootstrap_receipt, 'sha256': managed_bootstrap_receipt_sha256}
+            {{ {'path': managed_bootstrap_receipt, 'sha256': managed_bootstrap_receipt_sha256,
+                'read_sha256': receipt_raw.content | b64decode | hash('sha256')}
+               if interpreter_policy == 'managed_only' else none }}
+          # codex-tick332 F3: the detached review metadata of the matched catalog entry (evidence; not a measured value)
+          managed_bootstrap_catalog_entry: "{{ managed_bootstrap_catalog_entry if interpreter_policy == 'managed_only' else none }}"
+          # codex-tick337: the review artifact A actually read (resolved path + its measured bytes digest), and (RUN-4) the
+          # readback record beside it as read
+          managed_bootstrap_review: >-
+            {{ {'locator': managed_bootstrap_catalog_entry.review.locator, 'path': managed_bootstrap_review_path,
+                'sha256': review_raw.results[0].content | b64decode | hash('sha256'),
+                'stat_sha256': review_path_stat.results[3].stat.checksum,
+                'readback': {'path': managed_bootstrap_review_components[4],
+                             'sha256': review_raw.results[1].content | b64decode | hash('sha256'),
+                             'stat_sha256': review_path_stat.results[4].stat.checksum}}
+               if interpreter_policy == 'managed_only' else none }}
+          # RUN-1 preflight binding (codex-tick348 RUN_1 "bind the actual resolver/global/profile inputs"): the policy the
+          # review location was read from -- its engine revisions and the profile bytes -- plus the include itself (its
+          # bytes are bound by the clean source_commit checkout checked above)
+          runner_policy_preflight: >-
+            {{ {'include': 'testing/remote_harness/tasks/resolve_policy.yml', 'policy_sha256': rh_config_revision,
+                'lme_resolved_revision': rh_engine_revision, 'profile_sha256': rh_profile_sha256}
                if interpreter_policy == 'managed_only' else none }}
           qualifies_leg: "{{ interpreter_policy == 'managed_only' }}"
           # RH-RUNNER-RESOLVED-WORKROOT: the resolved run input this run consumed (receipt measured above)

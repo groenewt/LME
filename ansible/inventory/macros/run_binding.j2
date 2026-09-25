@@ -1,0 +1,124 @@
+{#-
+  ansible/inventory/macros/run_binding.j2 -- GENERIC run-binding macros (codex-tick350 GRAPH-BINDING-TEMPLATE-TOPOLOGY).
+  Machines and placement are INVENTORY DATA: no host alias, group name, role var name or key path is written here.
+  Every name comes from the resolved contract (rh.controller.bootstrap); every value from the per-run data. Renaming,
+  adding or removing a target is a DATA change only (testing/e2e/inventory_binding/run_binding.cases.yml,
+  declared_unrun).
+  No manifest loader, no merge engine: the macros only project declared data into ONE inventory document; the loader
+  types and validates the result on every leg (target_inputs patterns, lme_validated_deployment_identity).
+
+  binding(bs, repo_root, run, derived) -> the YAML text of the frozen run binding (20-binding.yml).
+    bs         rh.controller.bootstrap from a resolve over the frozen lab copy (10-lab.yml): inventory.target_inputs
+               (role -> var), inventory.target_group, inventory.role_groups, inventory.root_var / owner_var,
+               owner_key (the J-KEY producer contract: location_rule_rel + storage).
+    repo_root  the controller checkout (rh_repo_root): the location rule's work-root anchor.
+    run        the per-run data (MAIN's, frozen with its sha256 in the run receipts) -- ONLY run-time values:
+      hosts                 {<alias>: {
+                               member_of:        [target | <role_groups key>, ...]   (optional; placement)
+                               address:          ansible_host override              (optional)
+                               roles:            {<target_inputs role>: value}      (optional; declared roles only)
+                               bundle:           {leaf}  -> role bundle_dir = <bound prereq_bundle_root>/leaf, 64 hex
+                               global_override:  lme_global_override candidate      (optional; MAIN-admitted)
+                               observed:         runtime observation -> lme_lab_observed (optional; never desired config)
+                             }}
+               Any other top-level key refuses RUN-BINDING-DERIVED-INPUT (deployment_identity, lab_sha256 and controller
+               are derived by the render entry, never supplied: ONE channel each).
+    derived    the render entry's DERIVED values (testing/e2e/inventory_binding/render_run_binding.yml; never MAIN data):
+      deployment_identity   lme_resolved | lme_validated_deployment_identity (declared ONCE in the lab file all.vars)
+      lab_sha256            sha256 of the 10-lab.yml copy (stat of the file the resolve read; written into the header)
+      controller            {toolchain_root, owner, bundle_dir, artifact_source, acquisition_receipt}
+      bound                 lme_resolved.remote_harness.binding.deployment.target_inputs (the loader's typed lab values)
+  DERIVED roles, refused when supplied (RUN-BINDING-DERIVED-ROLE):
+    owner_key / owner_pubkey = the J-KEY location rule (bs.owner_key.location_rule_rel) over
+                               (bs, repo_root, derived.deployment_identity, <alias>, <effective owner>): key / pub, where
+                               the effective owner is roles.owner, else the lab's bound owner. Rendered for every host
+                               of run.hosts with an effective owner. The producer (owner_key.yml) renders the SAME rule
+                               and refuses JKEY-LOCATION on any difference.
+    bundle_dir               = derived.bound[<alias>].prereq_bundle_root ~ '/' ~ bundle.leaf (bundle.root refuses).
+  The binding carries NO all.vars: lme_deployment_identity lives only in the lab file (one channel).
+  Refusals (render fails; a half-bound run inventory never exists): RUN-BINDING-UNDECLARED-ROLE,
+  RUN-BINDING-DERIVED-ROLE, RUN-BINDING-DERIVED-INPUT, RUN-BINDING-UNDECLARED-GROUP, RUN-BINDING-BUNDLE-LEAF,
+  RUN-BINDING-BUNDLE-ROOT, RUN-BINDING-HOST-KEY.
+  The preservation selection and its expectations are DESIRED configuration in the lab file (codex-tick360); observation
+  never feeds this binding (no observation -> binding cycle).
+-#}
+
+{%- macro refuse(code, detail) -%}
+{{- rb_refused | mandatory('REFUSED ' ~ code ~ ': ' ~ detail) -}}
+{%- endmacro -%}
+
+{#- the group name a member_of key declares: 'target' -> target_group, else role_groups[<key>] -#}
+{%- macro group_name(bs, key, alias) -%}
+{%- if key == 'target' -%}{{ bs.inventory.target_group | mandatory }}
+{%- elif key in (bs.inventory.role_groups | default({})) -%}{{ bs.inventory.role_groups[key] }}
+{%- else -%}{{ refuse('RUN-BINDING-UNDECLARED-GROUP', alias ~ ' member_of ' ~ key ~ ' is neither target nor a key of inventory.role_groups ' ~ (bs.inventory.role_groups | default({}) | list | to_json)) }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- one host's vars as JSON: declared roles through their registered var names + derived roles -#}
+{%- macro host_vars(bs, repo_root, derived, alias, h) -%}
+{%- set ti = bs.inventory.target_inputs -%}
+{%- set roles = h.roles | default({}) -%}
+{%- set ns = namespace(v={}) -%}
+{%- if h.keys() | reject('in', ['member_of', 'address', 'roles', 'bundle', 'global_override', 'observed']) | list | length > 0 -%}
+{{- refuse('RUN-BINDING-HOST-KEY', alias ~ ' has undeclared keys ' ~ (h.keys() | reject('in', ['member_of', 'address', 'roles', 'bundle', 'global_override', 'observed']) | list | to_json)) -}}
+{%- endif -%}
+{%- for role in roles -%}
+{%- if role in ['owner_key', 'owner_pubkey', 'bundle_dir'] -%}
+{{- refuse('RUN-BINDING-DERIVED-ROLE', alias ~ '.' ~ role ~ ' is derived (J-KEY location rule / bundle root+leaf), never supplied') -}}
+{%- elif role not in ti -%}
+{{- refuse('RUN-BINDING-UNDECLARED-ROLE', alias ~ '.' ~ role ~ ' is not a role of controller.bootstrap.inventory.target_inputs') -}}
+{%- else -%}
+{%- set ns.v = ns.v | combine({ti[role].var: roles[role]}) -%}
+{%- endif -%}
+{%- endfor -%}
+{%- set lab = (derived.bound | default({}))[alias] | default({}) -%}
+{%- set owner = roles.owner if ('owner' in roles) else (lab.owner | default(none)) -%}
+{%- if owner is not none -%}
+{%- set loc = lookup('ansible.builtin.template', (repo_root | mandatory) ~ '/' ~ (bs.owner_key.location_rule_rel | mandatory),
+      template_vars={'ok_bs': bs, 'ok_repo_root': repo_root, 'ok_deployment': derived.deployment_identity | mandatory,
+                     'ok_target': alias, 'ok_owner': owner}) | trim | from_json -%}
+{%- set ns.v = ns.v | combine({ti.owner_key.var: loc.key, ti.owner_pubkey.var: loc.pub}) -%}
+{%- endif -%}
+{%- if h.bundle is defined -%}
+{%- if h.bundle.keys() | reject('equalto', 'leaf') | list | length > 0 -%}
+{{- refuse('RUN-BINDING-DERIVED-ROLE', alias ~ ' bundle may carry only leaf; the root is the lab''s bound prereq_bundle_root') -}}
+{%- endif -%}
+{%- if (h.bundle.leaf | mandatory) is not match('^[0-9a-f]{64}$') -%}
+{{- refuse('RUN-BINDING-BUNDLE-LEAF', alias ~ ' bundle.leaf must be the 64-hex class key (a new identity is a new leaf)') -}}
+{%- endif -%}
+{%- set broot = roles.prereq_bundle_root if ('prereq_bundle_root' in roles) else (lab.prereq_bundle_root | default(none)) -%}
+{%- if broot is none -%}
+{{- refuse('RUN-BINDING-BUNDLE-ROOT', alias ~ ' has a bundle leaf but no bound prereq_bundle_root (lab file) -- a run-only host cannot derive its bundle dir') -}}
+{%- endif -%}
+{%- set ns.v = ns.v | combine({ti.bundle_dir.var: broot ~ '/' ~ h.bundle.leaf}) -%}
+{%- endif -%}
+{%- if h.address is defined -%}{%- set ns.v = ns.v | combine({'ansible_host': h.address}) -%}{%- endif -%}
+{%- if h.global_override is defined -%}{%- set ns.v = ns.v | combine({'lme_global_override': h.global_override}) -%}{%- endif -%}
+{%- if h.observed is defined -%}{%- set ns.v = ns.v | combine({'lme_lab_observed': h.observed}) -%}{%- endif -%}
+{{- ns.v | to_json -}}
+{%- endmacro -%}
+
+{#- the whole binding document -#}
+{%- macro binding(bs, repo_root, run, derived) -%}
+{%- set inv = bs.inventory -%}
+{%- if run.keys() | reject('equalto', 'hosts') | list | length > 0 -%}
+{{- refuse('RUN-BINDING-DERIVED-INPUT', 'per-run data carries only hosts; ' ~ (run.keys() | reject('equalto', 'hosts') | list | to_json) ~ ' are derived by the render entry (deployment identity from the lab file, lab sha256 and controller values from the run), never supplied') -}}
+{%- endif -%}
+{%- set c = derived.controller | mandatory -%}
+{%- set ns = namespace(hosts={'localhost': {'ansible_connection': 'local',
+      inv.root_var: c.toolchain_root | mandatory, inv.owner_var: c.owner | mandatory,
+      'rh_bundle_dir': c.bundle_dir | mandatory, 'rh_artifact_source': c.artifact_source | mandatory,
+      'rh_acquisition_receipt': c.acquisition_receipt | mandatory}}, groups={}) -%}
+{%- for alias, h in (run.hosts | default({})).items() -%}
+{%- set ns.hosts = ns.hosts | combine({alias: host_vars(bs, repo_root, derived, alias, h) | from_json}) -%}
+{%- for key in h.member_of | default([]) -%}
+{%- set g = group_name(bs, key, alias) -%}
+{%- set ns.groups = ns.groups | combine({g: {'hosts': {alias: {}}}}, recursive=true) -%}
+{%- endfor -%}
+{%- endfor -%}
+# RENDERED -- the frozen per-run binding (ansible/inventory/macros/run_binding.j2). Do not edit; re-render.
+# 10-lab.yml sha256: {{ derived.lab_sha256 | mandatory }}
+# deployment identity (lab all.vars, not repeated here): {{ derived.deployment_identity | mandatory }}
+{{ {'all': {'hosts': ns.hosts, 'children': ns.groups}} | to_nice_yaml(indent=2) }}
+{%- endmacro -%}
