@@ -1,0 +1,157 @@
+---
+# testing/remote_harness/tasks/prepare_package.yml -- ONE declared guest-tool package: fetched and bound to its signed
+# stanza, extracted into a fresh private dir, each declared member measured by native stat. AUTHORED, NEVER EXECUTED.
+# Included by tasks/prepare_tools.yml once per preparation.tool_packages.packages entry (loop_var rh_prep_pkg =
+# {key: <logical package>, value: {version?, members: {<os_tools key>: <absolute path>}}}); the stanza is
+# rh_prep_t_stanzas[rh_prep_pkg.key] (exactly one, admitted by the caller).
+# A member is the file the package installs at that path (dpkg installs member bytes verbatim): the candidate identity
+# is the member's sha256, a BASELINE of that package edition. It never proves graph's installed file: target_prereq.yml
+# measures graph and emits a per-host candidate override when it differs.
+
+- name: "PREPARE PACKAGE -- set the .deb fetch (the stanza's pool Filename, confined in every hop's path)"
+  vars:
+    _a: "{{ rh.controller.bootstrap.preparation.tool_packages }}"
+    _s: "{{ rh_prep_t_stanzas[rh_prep_pkg.key] }}"
+  ansible.builtin.set_fact:
+    rh_prep_f_url: "{{ _a.archive_url ~ '/' ~ _s.filename }}"
+    rh_prep_f_dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/' ~ (_s.filename | basename) }}"
+    rh_prep_f_hosts: "{{ _a.origin_hosts }}"
+    rh_prep_f_path: "{{ _a.archive_path_regex ~ (_s.filename | regex_escape) ~ '$' }}"
+    rh_prep_f_hop: 0
+    rh_prep_f_hops: []
+
+- name: "PREPARE PACKAGE -- stat an already bound copy in the debs dir (content-addressed by the signed stanza)"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.debs ~ '/' ~ (rh_prep_t_stanzas[rh_prep_pkg.key].filename | basename) }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rh_prep_deb0
+
+- name: "PREPARE PACKAGE -- refuse a conflicting kept .deb (same name, other bytes; preserved)"
+  when: _rh_prep_deb0.stat.exists
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_deb0.stat.isreg and not _rh_prep_deb0.stat.islnk
+      - _rh_prep_deb0.stat.checksum == rh_prep_t_stanzas[rh_prep_pkg.key].sha256
+    fail_msg: "REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ _rh_prep_deb0.stat.path }} exists and is not the signed stanza's bytes; preserved."
+    quiet: true
+
+- name: "PREPARE PACKAGE -- fetch, bind and keep the .deb (absent only)"
+  when: not _rh_prep_deb0.stat.exists
+  block:
+    - name: "PREPARE PACKAGE -- fetch the .deb (constrained)"
+      ansible.builtin.include_tasks: prepare_fetch.yml
+
+    - name: "PREPARE PACKAGE -- digest the fetched .deb"
+      ansible.builtin.stat: {path: "{{ rh_prep_f_dest }}", follow: false, checksum_algorithm: sha256}
+      register: _rh_prep_debp
+
+    - name: "PREPARE PACKAGE -- a .deb that is not the signed stanza: remove it, then refuse"
+      when: (_rh_prep_debp.stat.checksum | default('')) != rh_prep_t_stanzas[rh_prep_pkg.key].sha256 or (_rh_prep_debp.stat.islnk | default(true))
+      block:
+        - name: "PREPARE PACKAGE -- remove the unbound .deb"
+          ansible.builtin.file: {path: "{{ rh_prep_f_dest }}", state: absent}
+
+        - name: "PREPARE PACKAGE -- refuse the unbound .deb"
+          ansible.builtin.fail:
+            msg: >-
+              REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ rh_prep_f_final | default('?') }} sha256
+              {{ _rh_prep_debp.stat.checksum | default('?') }} is not the signed stanza's {{ rh_prep_t_stanzas[rh_prep_pkg.key].sha256 }};
+              removed, nothing admitted.
+
+    - name: "PREPARE PACKAGE -- keep the bound .deb (no-replace hard link), then release the partial name"
+      ansible.builtin.file:
+        src: "{{ rh_prep_f_dest }}"
+        dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.debs ~ '/' ~ (rh_prep_t_stanzas[rh_prep_pkg.key].filename | basename) }}"
+        state: hard
+        force: false
+
+    - name: "PREPARE PACKAGE -- release the partial name"
+      ansible.builtin.file: {path: "{{ rh_prep_f_dest }}", state: absent}
+
+- name: "PREPARE PACKAGE -- re-bind the kept .deb immediately before extraction"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.debs ~ '/' ~ (rh_prep_t_stanzas[rh_prep_pkg.key].filename | basename) }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rh_prep_deb1
+
+- name: "PREPARE PACKAGE -- refuse a kept .deb that is not the signed stanza's bytes"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_deb1.stat.isreg and not _rh_prep_deb1.stat.islnk
+      - _rh_prep_deb1.stat.checksum == rh_prep_t_stanzas[rh_prep_pkg.key].sha256
+    fail_msg: "REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ _rh_prep_deb1.stat.path | default('?') }} is not the signed stanza's bytes."
+    quiet: true
+
+- name: "PREPARE PACKAGE -- a FRESH private extraction dir (a leftover of an earlier attempt is removed, never reused)"
+  ansible.builtin.file:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.extract ~ '/' ~ rh_prep_pkg.key }}"
+    state: absent
+
+- name: "PREPARE PACKAGE -- create the extraction dir (0700)"
+  ansible.builtin.file:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.extract ~ '/' ~ rh_prep_pkg.key }}"
+    state: directory
+    mode: '0700'
+
+- name: "PREPARE PACKAGE -- extract the bound .deb with the admitted dpkg-deb (never installed; no maintainer script runs)"
+  ansible.builtin.command:
+    argv:
+      - "{{ rh.controller.bootstrap.os_tools['dpkg-deb'].path }}"
+      - --extract
+      - "{{ _rh_prep_deb1.stat.path }}"
+      - "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.extract ~ '/' ~ rh_prep_pkg.key }}"
+  register: _rh_prep_x
+  changed_when: true
+  failed_when: false
+
+- name: "PREPARE PACKAGE -- refuse a failed extraction"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_x.rc | default(-1) == 0
+    fail_msg: "REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: dpkg-deb --extract of {{ _rh_prep_deb1.stat.path }} exited {{ _rh_prep_x.rc | default('?') }} ({{ _rh_prep_x.stderr | default('') }})."
+    quiet: true
+
+- name: "PREPARE PACKAGE -- measure every declared member (native stat sha256; links NOT followed; no search)"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.extract ~ '/' ~ rh_prep_pkg.key ~ item.value }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ rh_prep_pkg.value.members | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} {{ item.value }}"
+  register: _rh_prep_mem
+
+- name: "PREPARE PACKAGE -- refuse a declared member that is absent, a link, or not a regular executable file"
+  ansible.builtin.assert:
+    that:
+      - rh_prep_pkg.value.members | dict2items | map(attribute='value') | reject('match', '^/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$') | list | length == 0
+      - rh_prep_pkg.value.members | dict2items | map(attribute='value') | select('search', '(^|/)\.\.?(/|$)') | list | length == 0
+      - >-
+        _rh_prep_mem.results | map(attribute='stat') | selectattr('exists') | selectattr('isreg') | rejectattr('islnk')
+        | selectattr('executable') | list | length == _rh_prep_mem.results | length
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: package {{ rh_prep_t_stanzas[rh_prep_pkg.key].name }}
+      {{ rh_prep_t_stanzas[rh_prep_pkg.key].version }} does not ship every declared member as a regular executable file
+      (absent / link / not executable: {{ _rh_prep_mem.results | rejectattr('stat.isreg', 'defined') | map(attribute='item.value') | list
+      + (_rh_prep_mem.results | selectattr('stat.isreg', 'defined') | rejectattr('stat.isreg') | map(attribute='item.value') | list) }});
+      a declared member path is never searched for. No candidate was produced.
+    quiet: true
+
+- name: "PREPARE PACKAGE -- the members' CANDIDATE identities (source-bound: package edition + signed archive)"
+  ansible.builtin.set_fact:
+    rh_prep_tools: >-
+      {%- set ns = namespace(o=rh_prep_tools) -%}
+      {%- set s = rh_prep_t_stanzas[rh_prep_pkg.key] -%}
+      {%- for r in _rh_prep_mem.results -%}
+      {%- set ns.o = ns.o | combine({r.item.key: {
+            'path': r.item.value,
+            'identity': {'kind': 'file_sha256', 'sha256': r.stat.checksum},
+            'measured': {'by': 'native stat, links not followed', 'of': 'the extracted package member',
+                         'uid_in_package_tree': r.stat.uid, 'mode': r.stat.mode, 'size': r.stat.size},
+            'package': {'logical': rh_prep_pkg.key, 'name': s.name, 'version': s.version, 'architecture': s.architecture,
+                        'filename': s.filename, 'deb_sha256': _rh_prep_deb1.stat.checksum, 'os_family': 'Debian'},
+            'baseline_only': true}}) -%}
+      {%- endfor -%}{{ ns.o }}

@@ -1,0 +1,80 @@
+---
+# testing/e2e/target_prereq/tasks/readback.yml -- TOOL-VERIFIED pair correspondence (codex-tick341): custody is checked
+# by the caller (observe_key.yml / after generation); this proves the pair. The admitted ssh-keygen reads the private
+# key INTERNALLY (-y derives its public line; the declared passphrase_argv[encryption].pair_check, -P '' for the
+# unencrypted mode, so it never prompts); only that derived PUBLIC line reaches this play, under no_log, and is
+# compared with the .pub line (type + base64). Then the .pub fingerprint is read with the same tool. Ansible never
+# reads a private byte; nothing private is registered, printed or recorded.
+# UNVALIDATED CANDIDATE (codex-tick350 JKEY-UNVALIDATED-PUBLIC-FILE-EXPOSURE): the .pub file is NOT public material
+# until admitted -- it may hold anything (e.g. a misplaced private key). Its read, the pattern match over it and every
+# fact derived from it run under no_log; the rejection names the PATH only and touches only a boolean. Only an admitted
+# line is bound to _jk_rb_line and may appear in any later output. (Case J16: synthetic private-looking candidate.)
+# Inputs (include vars, no defaults): _jk_rb_key (private path), _jk_rb_pub (public path), _jk_rb_what (label).
+# Output: jk_rb {line, fingerprint_sha256, pub_sha256}.
+
+- name: Read the unvalidated public candidate (the .pub file only; no_log until admitted)
+  ansible.builtin.set_fact:
+    _jk_rb_cand: "{{ lookup('ansible.builtin.file', _jk_rb_pub) | trim }}"
+  no_log: true
+
+- name: Match the candidate against the declared public-key form (no_log; only a boolean leaves this task)
+  ansible.builtin.set_fact:
+    _jk_rb_admit: >-
+      {{ (_jk_rb_cand is match(jk.pubkey_regex)) and ('\n' not in _jk_rb_cand)
+         and ('PRIVATE KEY' not in _jk_rb_cand) }}
+  no_log: true
+
+- name: Refuse anything but one public-key line of the declared type (path only; the content is withheld)
+  ansible.builtin.assert:
+    that:
+      - _jk_rb_admit | bool
+    fail_msg: >-
+      REFUSED JKEY-PAIR: {{ _jk_rb_pub }} ({{ _jk_rb_what }}) is not one {{ jk.key_type }} public-key line; its content
+      was never admitted and is not shown. The file is preserved.
+    quiet: true
+
+- name: Admit the public line (from here on it is public material) and drop the candidate
+  ansible.builtin.set_fact:
+    _jk_rb_line: "{{ _jk_rb_cand }}"
+    _jk_rb_cand: ''
+  no_log: true
+
+- name: Derive the public line FROM the private key with the admitted tool (the tool reads it; the play never does)
+  ansible.builtin.command:
+    argv: >-
+      {{ [jk_tool.path, '-y'] + jk.passphrase_argv[jk.encryption].pair_check + ['-f', _jk_rb_key] }}
+  register: _jk_rb_y
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Refuse a pair that does not correspond (tool-verified; the derived line is never printed)
+  ansible.builtin.assert:
+    that:
+      - _jk_rb_y.rc == 0
+      - (_jk_rb_y.stdout | trim).split()[:jk.readback.compare_fields] == _jk_rb_line.split()[:jk.readback.compare_fields]
+    fail_msg: >-
+      REFUSED JKEY-PAIR: {{ _jk_rb_what }}: the public half derived by {{ jk_tool.path }} from {{ _jk_rb_key }} does not
+      equal {{ _jk_rb_pub }} (or the tool refused the key: rc {{ _jk_rb_y.rc }}). The files are preserved.
+    quiet: true
+
+- name: Read the public fingerprint with the admitted tool (the .pub only)
+  ansible.builtin.command:
+    argv: ["{{ jk_tool.path }}", -l, -E, "{{ jk.readback.fingerprint_hash }}", -f, "{{ _jk_rb_pub }}"]
+  register: _jk_rb_l
+  changed_when: false
+
+- name: Refuse a fingerprint of another form
+  ansible.builtin.assert:
+    that:
+      - (_jk_rb_l.stdout | trim).split() | length >= 2
+      - (_jk_rb_l.stdout | trim).split()[1] is match('^SHA256:[A-Za-z0-9+/]{43}$')
+    fail_msg: "REFUSED JKEY-PAIR: {{ _jk_rb_what }}: {{ jk_tool.path }} -l gave no SHA256 fingerprint for {{ _jk_rb_pub }}."
+    quiet: true
+
+- name: Publish the readback (public material only; pub_sha256 == target_prereq tp_ctl.pubkey_sha256 over the same line)
+  ansible.builtin.set_fact:
+    jk_rb:
+      line: "{{ _jk_rb_line }}"
+      fingerprint_sha256: "{{ (_jk_rb_l.stdout | trim).split()[1] }}"
+      pub_sha256: "{{ _jk_rb_line | hash('sha256') }}"

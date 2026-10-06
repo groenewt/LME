@@ -1,0 +1,474 @@
+---
+# testing/loader-tests-r4/readback_bootstrap_receipt.yml -- APPLY ADAPTER, readback half (codex-tick332 apply_adapter
+# custody: independently re-measured values are kept SEPARATE from the producer's claims and from R's values, and only
+# then compared). It reads a projected receipt R (project_bootstrap_receipt.yml output, managed-bootstrap-receipts.yml
+# receipt_contract schema 2) by exact bytes and MEASURES AGAIN FROM SCRATCH -- its own stat / slurp / setup / git tasks,
+# never the projection's facts (a different ansible-playbook process) and never run_loader_tests.yml's checks:
+#   the sealed generation receipt (bytes + parse), every selected executable as the loader will select it (unresolved
+#   ansible-playbook; venv python link resolution + followed bytes; the runner's own interpreter), the interpreter
+#   file, FULL-LINE membership of the ansible-playbook and interpreter digests in the sealed tree.sha256, the tree /
+#   config / seed / bundle-manifest digests, the source checkout (HEAD, tree, clean) and the profile bytes.
+# It writes ONE record (write-once, 0400) with three separate blocks -- receipt_values (read from R), remeasured
+# (measured here), producer_claims_now (the sealed toolchain.json read now) -- and the list of mismatches, THEN fails
+# unless that list is empty. The record is the evidence the reviewer reads with R (review message A cites sha256(R));
+# it is not a review and grants nothing.
+# Launched ONLY by the declared seed, started by the bundle's generated launcher:
+#   <bundle>/lme-seed-launch.sh run-local <checkout>/.work/toolchain bootstrap_receipt_readback \
+#     -e brr_label=<attempt> -e brr_receipt=<abs R> -e brr_receipt_sha256=<sha256 of R>
+#   (seed_launcher.caller_argv [launcher, mode, root, mode_params, args]: the mode_args' `--` is the LAUNCHER's word)
+# The completed <brr_label> dir is also where MAIN relocates review artifact A (catalog review_contract.locator
+# runner_key + leaf; the success message prints that destination).
+#   (work_roots.run_local.runners.bootstrap_receipt_readback), which supplies brr_work_root and, LAST, lme_resolved_run.
+# Refusal: RH-BOOTSTRAP-RECEIPT-READBACK.
+- name: Read back a projected bootstrap receipt by independent re-measurement (route-owned)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: ../remote_harness/tasks/refuse_pinned_outputs.yml
+
+    - name: Resolve the harness policy through the engine
+      ansible.builtin.include_tasks: ../remote_harness/tasks/resolve_policy.yml
+
+    - name: Admit the resolved run and the readback inputs (declared seed run-local --runner bootstrap_receipt_readback)
+      vars:
+        _rs: "{{ rh.controller.bootstrap.work_roots.run_local.resolved_run }}"
+        _att: "{{ rh.controller.bootstrap.genesis.seed_step_record.attempt }}"
+        _wr: "{{ rh.controller.bootstrap.work_roots }}"
+      ansible.builtin.assert:
+        that:
+          - lme_resolved_run is defined and lme_resolved_run is mapping
+          - (lme_resolved_run.keys() | map('string') | sort | list) == (_rs.fields | sort | list)
+          - lme_resolved_run.runner == 'bootstrap_receipt_readback'
+          - brr_work_root is defined and brr_work_root is string and brr_work_root == lme_resolved_run.work_root
+          - brr_work_root is match(rh.controller.bootstrap.path_admission.regex)
+          - "'TMPDIR' in lme_resolved_run.env"
+          - lme_resolved_run.receipt is mapping
+          - (lme_resolved_run.receipt.keys() | map('string') | sort | list) == (_rs.receipt_fields | sort | list)
+          - ansible_playbook_python == lme_resolved_run.python
+          - _att.match == 'fullmatch'
+          - brr_label is defined and brr_label is string and brr_label is ansible.builtin.regex(_att.regex, match_type=_att.match)
+          - brr_receipt is defined and brr_receipt is string and brr_receipt is match(rh.controller.bootstrap.path_admission.regex)
+          # R is read only from the PROJECTION runner's own evidence dir: <work root>/<run>/<runners.bootstrap_receipt>/<label>/
+          - (brr_receipt | dirname | dirname) == rh_repo_root ~ '/' ~ _wr.root_rel ~ '/' ~ _wr.sub_roots.run ~ '/' ~ _wr.runners.bootstrap_receipt
+          - (brr_receipt | basename) == 'managed-bootstrap-receipt.yml'
+          - brr_receipt_sha256 is defined and brr_receipt_sha256 is string and brr_receipt_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: >-
+          REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: readback_bootstrap_receipt.yml runs only under the declared seed run-local
+          (--runner bootstrap_receipt_readback), which passes brr_work_root and {{ _rs.var }}, with -e brr_label=<attempt>
+          ({{ _att.regex }}, {{ _att.match }}), -e brr_receipt=<the projection's managed-bootstrap-receipt.yml under
+          {{ _wr.sub_roots.run }}/{{ _wr.runners.bootstrap_receipt | default('?') }}/<label>/> and -e brr_receipt_sha256=<its sha256>.
+        quiet: true
+
+    - name: Refuse an existing readback record (write-once; a label is never reused)
+      ansible.builtin.stat: {path: "{{ brr_work_root ~ '/' ~ brr_label }}", follow: false, get_checksum: false}
+      register: _rh_brr_pre
+
+    - name: Refuse a reused readback label
+      ansible.builtin.assert:
+        that: not _rh_brr_pre.stat.exists
+        fail_msg: "REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: {{ brr_work_root }}/{{ brr_label }} exists (new brr_label)."
+        quiet: true
+
+    # ---- R, by exact bytes ----
+    - name: Measure R (not followed)
+      ansible.builtin.stat: {path: "{{ brr_receipt }}", follow: false, checksum_algorithm: sha256}
+      register: _rh_brr_rst
+
+    - name: Read R
+      ansible.builtin.slurp: {src: "{{ brr_receipt }}"}
+      register: _rh_brr_rraw
+
+    # BOOTSTRAP-READBACK-PARSED-BYTE-BINDING (codex-tick355, HIGH): the stat above proves only the inode it measured
+    # (R1); a rename-replacement between it and the read would hand the read another file (R2). The decoded payload of
+    # the ONE read above is hashed against the NAMED digest brr_receipt_sha256 BEFORE anything parses it (own task; every
+    # later parse of R -- `_r` below and `_rh_brr_r` -- is of this same content), and the digest recorded / printed is
+    # this verified read digest, never the stat's. Declared check: managed-bootstrap-receipts.yml payload_binding_contract.
+    - name: Bind the bytes READ of R to the named digest BEFORE parsing (REPLACED R)
+      vars:
+        _b: >-
+          {{ lookup('ansible.builtin.template', playbook_dir ~ '/macros/bootstrap_receipt.j2',
+                    template_vars={'op': 'payload_binding', 'content': _rh_brr_rraw.content | default(none),
+                                   'expected': brr_receipt_sha256, 'stat': _rh_brr_rst.stat | default(none),
+                                   'sealed': true}) | from_json }}
+      ansible.builtin.assert:
+        that:
+          - _b is mapping and _b.op | default('') == 'payload_binding'
+          - _b.bound is sameas true
+        fail_msg: >-
+          REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: the bytes read from {{ brr_receipt }} are not the named
+          {{ brr_receipt_sha256 }} (payload_binding {{ _b | to_json }}; R replaced after it was measured?). Nothing was
+          parsed or written.
+        quiet: true
+
+    # ---- RX-CATALOG-READ (codex-tick368): the catalog, read ONCE and bound to an independently admitted revision ----
+    # ANCHOR: R's recorded source.commit. It is admitted, not measured here: R's bytes are admitted by the NAMED digest
+    # brr_receipt_sha256 (shape-admitted in "Admit the resolved run and the readback inputs", and the bytes READ are bound
+    # to it BEFORE any parse in "Bind the bytes READ of R to the named digest BEFORE parsing (REPLACED R)" above), and the
+    # projection writes source.commit only after asserting its checkout is clean at the admitted br_source_commit
+    # (project_bootstrap_receipt.yml RX-CATALOG-READ). The current HEAD of this checkout is NOT the anchor (it is only
+    # re-measured and compared later, pair `source`). The catalog declares no digest of itself (no admission cycle):
+    # its bytes READ (hash-object --no-filters --stdin) must be the regular-file blob that ls-tree of R's source.commit
+    # records at the same path (declared git, identity-checked here). Every catalog parse below uses THIS read.
+    - name: "RX-CATALOG-READ -- read the catalog ONCE (the bytes every catalog check below parses)"
+      ansible.builtin.slurp: {src: "{{ rh_repo_root ~ '/' ~ ((playbook_dir ~ '/managed-bootstrap-receipts.yml') | relpath(rh_repo_root)) }}"}
+      register: _rh_brr_catraw
+      failed_when: false
+
+    - name: "RX-CATALOG-READ -- measure the declared git tool before using it (identity)"
+      ansible.builtin.stat: {path: "{{ rh.controller.bootstrap.os_tools.git.path }}", follow: false, checksum_algorithm: sha256}
+      register: _rh_brr_git
+
+    - name: "RX-CATALOG-READ -- the object R's admitted source.commit records at the catalog path (read-only; never HEAD)"
+      vars:
+        # R parsed from the SAME read bound to brr_receipt_sha256 above (no re-read)
+        _r: "{{ _rh_brr_rraw.content | b64decode | from_yaml }}"
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.git.path }}", -C, "{{ rh_repo_root }}", ls-tree, --full-tree,
+               "{{ _r.source.commit }}", --, "{{ (playbook_dir ~ '/managed-bootstrap-receipts.yml') | relpath(rh_repo_root) }}"]
+      register: _rh_brr_cattree
+      changed_when: false
+      failed_when: false
+      when:
+        - _rh_brr_git.stat.checksum | default('') == rh.controller.bootstrap.os_tools.git.identity.sha256
+        - _r is mapping and _r.source is defined and _r.source is mapping
+        # native string only (READBACK-SOURCE-ANCHOR-NATIVE-TYPES): an all-digit commit parsed as an int is never coerced
+        - _r.source.commit is defined and _r.source.commit is string
+        - _r.source.commit is match('^[0-9a-f]{40}$')
+
+    - name: "RX-CATALOG-READ -- the git object id of exactly the catalog bytes READ (stdin; no filters, no re-open by path)"
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.git.path }}", -C, "{{ rh_repo_root }}", hash-object, --no-filters, --stdin]
+        stdin: "{{ _rh_brr_catraw.content | b64decode }}"
+        stdin_add_newline: false
+      register: _rh_brr_catoid
+      changed_when: false
+      failed_when: false
+      when:
+        - _rh_brr_catraw.content is defined
+        - _rh_brr_git.stat.checksum | default('') == rh.controller.bootstrap.os_tools.git.identity.sha256
+
+    - name: "RX-CATALOG-READ -- bind the catalog bytes READ to the blob R's admitted source.commit records BEFORE parsing"
+      vars:
+        _r: "{{ _rh_brr_rraw.content | b64decode | from_yaml }}"
+        _l: "{{ _rh_brr_cattree.stdout_lines | default([]) }}"
+        _m: "{{ ((_l[0] | default('')).split('\t')[0]).split(' ') }}"
+        _p: "{{ ((_l[0] | default('')).split('\t') + [''])[1] }}"
+      ansible.builtin.assert:
+        that:
+          # the read and the git lookup name the SAME file of this checkout
+          - "'..' not in ((playbook_dir ~ '/managed-bootstrap-receipts.yml') | relpath(rh_repo_root)).split('/')"
+          - (rh_repo_root ~ '/' ~ ((playbook_dir ~ '/managed-bootstrap-receipts.yml') | relpath(rh_repo_root))) == (playbook_dir ~ '/managed-bootstrap-receipts.yml')
+          # ABSENT CATALOG (worktree)
+          - _rh_brr_catraw.content is defined and _rh_brr_catraw.content is string
+          # the declared git
+          - _rh_brr_git.stat.exists and _rh_brr_git.stat.isreg and not _rh_brr_git.stat.islnk
+          - _rh_brr_git.stat.checksum == rh.controller.bootstrap.os_tools.git.identity.sha256
+          # the ADMITTED anchor: R (bound bytes) records a clean 40-hex source commit
+          - _r is mapping and _r.source is mapping
+          # NATIVE TYPES (codex-tick371 READBACK-SOURCE-ANCHOR-NATIVE-TYPES): the commit is a native YAML string (no
+          # string coercion of an int/float scalar) and worktree_clean is the native boolean true (no bool conversion:
+          # 1, "true", "yes" refuse)
+          - _r.source.commit is defined and _r.source.commit is string
+          - _r.source.commit is match('^[0-9a-f]{40}$')
+          - _r.source.worktree_clean is defined and _r.source.worktree_clean is sameas true
+          # ABSENT CATALOG (commit): exactly one regular-file blob at this path (no link, no gitlink)
+          - _rh_brr_cattree.rc | default(1) == 0
+          - (_l | length) == 1
+          - (_m | length) == 3
+          - _m[0] in ['100644', '100755'] and _m[1] == 'blob'
+          - _p == ((playbook_dir ~ '/managed-bootstrap-receipts.yml') | relpath(rh_repo_root))
+          # CATALOG MISMATCH: the bytes READ are exactly that blob
+          - _rh_brr_catoid.rc | default(1) == 0
+          - (_rh_brr_catoid.stdout | default('')) is match('^([0-9a-f]{40}|[0-9a-f]{64})$')
+          - _rh_brr_catoid.stdout == _m[2]
+        fail_msg: >-
+          REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: the catalog bytes read (object {{ _rh_brr_catoid.stdout | default('<not read>') }})
+          are not the regular-file blob R's admitted source.commit {{ _r.source.commit | default('?') }} records at
+          {{ (playbook_dir ~ '/managed-bootstrap-receipts.yml') | relpath(rh_repo_root) }} ({{ _l | to_json }}), or the git
+          used is not the declared os_tools.git (codex-tick368 RX-CATALOG-READ). Nothing was parsed or written.
+        quiet: true
+
+    - name: "RX-CATALOG-READ -- the bound catalog is one mapping with every top-level section (criteria hard-coded, not read from it)"
+      vars:
+        # parsed ONLY from the read bound above; a YAML syntax error fails THIS task (MALFORMED CATALOG)
+        _catalog: "{{ _rh_brr_catraw.content | b64decode | from_yaml }}"
+      ansible.builtin.assert:
+        that:
+          - _catalog is mapping
+          - (['entry_contract', 'accepted', 'review_contract', 'receipt_contract'] | reject('in', _catalog.keys() | map('string') | list) | list | length) == 0
+          - _catalog.entry_contract is mapping and _catalog.review_contract is mapping and _catalog.receipt_contract is mapping
+        fail_msg: >-
+          REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: the bound catalog is not one mapping carrying entry_contract, accepted,
+          review_contract and receipt_contract (MALFORMED CATALOG; codex-tick368 RX-CATALOG-READ). Nothing was written.
+        quiet: true
+
+    - name: Refuse R unless it is exactly the named bytes, sealed, in the receipt contract, with no self-review
+      vars:
+        _rc: "{{ (_rh_brr_catraw.content | b64decode | from_yaml).receipt_contract }}"
+        _r: "{{ _rh_brr_rraw.content | b64decode | from_yaml }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_brr_rst.stat.exists and _rh_brr_rst.stat.isreg and not _rh_brr_rst.stat.islnk
+          - _rh_brr_rst.stat.checksum == brr_receipt_sha256
+          - not (_rh_brr_rst.stat.wusr or _rh_brr_rst.stat.wgrp or _rh_brr_rst.stat.woth)
+          - _r is mapping
+          - (_r.keys() | map('string') | select('in', _rc.forbidden_keys) | list | length) == 0
+          - (_r.keys() | map('string') | sort | list) == (_rc.top_level_keys | sort | list)
+          - _r.kind == _rc.kind and _r.schema == _rc.schema
+          - (_r.executables.keys() | map('string') | sort | list) == (_rc.executable_keys | sort | list)
+          - _r.executables.values() | map('dict2items') | map('map', attribute='key') | map('sort') | map('list') | unique | list == [_rc.executable_fields | sort | list]
+          - (_r.selected.keys() | map('string') | sort | list) == (_rc.selected_keys | sort | list)
+          - (_r.toolchain_receipt.keys() | map('string') | sort | list) == (_rc.toolchain_receipt_keys | sort | list)
+        fail_msg: >-
+          REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: {{ brr_receipt }} (measured {{ _rh_brr_rst.stat.checksum | default('<absent>') }},
+          named {{ brr_receipt_sha256 }}) is not a sealed schema-{{ _rc.schema }} {{ _rc.kind }} with exactly
+          {{ _rc.top_level_keys }} and no {{ _rc.forbidden_keys }}.
+        quiet: true
+
+    - name: Keep R's values apart (read from R; not measurements)
+      ansible.builtin.set_fact:
+        _rh_brr_r: "{{ _rh_brr_rraw.content | b64decode | from_yaml }}"
+
+    # ---- re-measurement from scratch ----
+    - name: Re-measure the sealed generation receipt this runner was launched with (not followed)
+      ansible.builtin.stat: {path: "{{ lme_resolved_run.receipt.path }}", follow: false, checksum_algorithm: sha256}
+      register: _rh_brr_tcst
+
+    - name: Re-read the sealed generation receipt (the producer claims, now)
+      ansible.builtin.slurp: {src: "{{ lme_resolved_run.receipt.path }}"}
+      register: _rh_brr_tcraw
+
+    # PARSED-BYTE BINDING (codex-tick355): the claims read now are parsed only from bytes whose hash is the resolved-run
+    # receipt digest (and its not-followed, sealed stat). A mismatch now REFUSES before any record is written (claims
+    # parsed from unbound bytes are never recorded as producer_claims_now); previously it surfaced only as a FAIL pair.
+    - name: Bind the bytes READ of the sealed generation receipt to the resolved-run digest BEFORE parsing
+      vars:
+        _b: >-
+          {{ lookup('ansible.builtin.template', playbook_dir ~ '/macros/bootstrap_receipt.j2',
+                    template_vars={'op': 'payload_binding', 'content': _rh_brr_tcraw.content | default(none),
+                                   'expected': lme_resolved_run.receipt.sha256, 'stat': _rh_brr_tcst.stat | default(none),
+                                   'sealed': true}) | from_json }}
+      ansible.builtin.assert:
+        that:
+          - _b is mapping and _b.op | default('') == 'payload_binding'
+          - _b.bound is sameas true
+        fail_msg: >-
+          REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: the bytes read from {{ lme_resolved_run.receipt.path }} are not the
+          resolved-run receipt {{ lme_resolved_run.receipt.sha256 }} (payload_binding {{ _b | to_json }}). No record was written.
+        quiet: true
+
+    - name: Keep the producer claims read now apart
+      ansible.builtin.set_fact:
+        _rh_brr_claims: "{{ _rh_brr_tcraw.content | b64decode | from_json }}"
+
+    - name: Re-measure each executable as the loader selects it (not followed; link targets resolved)
+      ansible.builtin.stat: {path: "{{ item }}", follow: false, checksum_algorithm: sha256}
+      loop:
+        - "{{ _rh_brr_r.selected.probe_ansible_playbook }}"
+        - "{{ _rh_brr_r.selected.probe_python_executable }}"
+        - "{{ ansible_playbook_python }}"
+        - "{{ _rh_brr_claims.interpreter }}"
+      register: _rh_brr_nf
+
+    - name: Re-measure the bytes each selection executes (links followed, as run_loader_tests.yml measures)
+      ansible.builtin.stat: {path: "{{ item }}", follow: true, checksum_algorithm: sha256}
+      loop:
+        - "{{ _rh_brr_r.selected.probe_ansible_playbook }}"
+        - "{{ _rh_brr_r.selected.probe_python_executable }}"
+        - "{{ ansible_playbook_python }}"
+      register: _rh_brr_fo
+
+    - name: Re-measure the seals, config, seed and bundle manifest (not followed)
+      ansible.builtin.stat: {path: "{{ item }}", follow: false, checksum_algorithm: sha256}
+      loop:
+        - "{{ _rh_brr_claims.generation_dir ~ '/' ~ rh.controller.bootstrap.layout.receipts_dir ~ '/tree.sha256' }}"
+        - "{{ _rh_brr_claims.generation_dir ~ '/' ~ rh.controller.bootstrap.layout.receipts_dir ~ '/tree.list' }}"
+        - "{{ _rh_brr_claims.generation_dir ~ '/' ~ rh.controller.bootstrap.layout.config_file }}"
+        - "{{ _rh_brr_claims.seed_path }}"
+        - "{{ (_rh_brr_claims.seed_path | dirname) ~ '/' ~ rh.controller.bootstrap.bundle.manifest_file }}"
+      register: _rh_brr_seal
+
+    # PARSED-BYTE BINDING (codex-tick355): FULL-LINE membership is tested against the sealed tree.sha256 read ONCE here
+    # (registered under the reserved name _tree; it replaces the former task-var lookup('file'), which re-read the path
+    # per reference and stripped trailing whitespace) from the SAME path _rh_brr_seal item 0 measured, and those read
+    # bytes must hash to that measured digest (the one compared with the claims and R) before membership is tested.
+    - name: Read the sealed tree.sha256 once (the bytes membership is tested against)
+      ansible.builtin.slurp: {src: "{{ _rh_brr_claims.generation_dir ~ '/' ~ rh.controller.bootstrap.layout.receipts_dir ~ '/tree.sha256' }}"}
+      register: _tree
+
+    - name: Bind the bytes READ of tree.sha256 to its measured digest BEFORE testing membership
+      vars:
+        _b: >-
+          {{ lookup('ansible.builtin.template', playbook_dir ~ '/macros/bootstrap_receipt.j2',
+                    template_vars={'op': 'payload_binding', 'content': _tree.content | default(none),
+                                   'expected': _rh_brr_seal.results[0].stat.checksum | default(''),
+                                   'stat': _rh_brr_seal.results[0].stat | default(none), 'sealed': false}) | from_json }}
+      ansible.builtin.assert:
+        that:
+          - _b is mapping and _b.op | default('') == 'payload_binding'
+          - _b.bound is sameas true
+        fail_msg: >-
+          REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: the bytes read from {{ _rh_brr_claims.generation_dir }}/{{
+          rh.controller.bootstrap.layout.receipts_dir }}/tree.sha256 are not the bytes measured (payload_binding
+          {{ _b | to_json }}). No record was written.
+        quiet: true
+
+    - name: Re-measure the running interpreter (read-only)
+      ansible.builtin.setup:
+        gather_subset: ['!all', '!min', 'python']
+
+    - name: Re-measure the declared git tool (identity)
+      ansible.builtin.stat: {path: "{{ rh.controller.bootstrap.os_tools.git.path }}", follow: false, checksum_algorithm: sha256}
+      register: _rh_brr_git
+
+    - name: Refuse an undeclared git tool
+      ansible.builtin.assert:
+        that:
+          - _rh_brr_git.stat.exists and _rh_brr_git.stat.isreg and not _rh_brr_git.stat.islnk
+          - _rh_brr_git.stat.checksum == rh.controller.bootstrap.os_tools.git.identity.sha256
+        fail_msg: "REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: {{ rh.controller.bootstrap.os_tools.git.path }} is not the declared git (os_tools.git.identity)"
+        quiet: true
+
+    - name: Re-measure the source checkout commit and tree (read-only)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.git.path }}", -C, "{{ rh_repo_root }}", rev-parse, HEAD, 'HEAD^{tree}']
+      register: _rh_brr_head
+      changed_when: false
+
+    - name: Re-measure the source checkout status
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.git.path }}", -C, "{{ rh_repo_root }}", status, --porcelain]
+      register: _rh_brr_status
+      changed_when: false
+
+    - name: Re-measure the profile bytes
+      ansible.builtin.stat: {path: "{{ rh_repo_root }}/manifests/profiles/remote-harness.yml", follow: false, checksum_algorithm: sha256}
+      register: _rh_brr_prof
+
+    - name: Assemble the re-measured values (separate from R and from the claims)
+      vars:
+        _nf: "{{ _rh_brr_nf.results | map(attribute='stat') | list }}"
+        _fo: "{{ _rh_brr_fo.results | map(attribute='stat') | list }}"
+        _se: "{{ _rh_brr_seal.results | map(attribute='stat') | list }}"
+        _gen: "{{ lme_resolved_run.receipt.path | dirname | dirname }}"
+        # the sealed content manifest is the registered _tree (read once and bound above); membership is tested as a
+        # FULL line "<sha256>  <path relative to G>" against its decoded bytes (no task var shadows the register)
+        _ap_rel: "{{ (_rh_brr_r.selected.probe_ansible_playbook | regex_replace('^' ~ (_gen | regex_escape) ~ '/', '')) }}"
+        _in_rel: "{{ (_nf[3].path | default('') | regex_replace('^' ~ (_gen | regex_escape) ~ '/', '')) }}"
+      ansible.builtin.set_fact:
+        _rh_brr_now:
+          toolchain_receipt:
+            path: "{{ lme_resolved_run.receipt.path }}"
+            # the VERIFIED read digest (bound above to the resolved-run digest and the stat), not the stat's claim
+            sha256: "{{ _rh_brr_tcraw.content | b64decode | hash('sha256') }}"
+            sealed: "{{ (_rh_brr_tcst.stat.isreg | default(false)) and not (_rh_brr_tcst.stat.islnk | default(true)) and not ((_rh_brr_tcst.stat.wusr | default(true)) or (_rh_brr_tcst.stat.wgrp | default(true)) or (_rh_brr_tcst.stat.woth | default(true))) }}"
+            generation_dir: "{{ _gen }}"
+          managed_root: "{{ _gen }}"
+          executables:
+            probe_ansible_playbook: {path: "{{ _rh_brr_r.selected.probe_ansible_playbook }}", sha256: "{{ _fo[0].checksum | default('') }}"}
+            probe_python: {path: "{{ _nf[1].lnk_source | default('') }}", sha256: "{{ _fo[1].checksum | default('') }}"}
+            runner_python: {path: "{{ _nf[2].lnk_source | default('') }}", sha256: "{{ _fo[2].checksum | default('') }}"}
+          shapes:
+            probe_ansible_playbook_regular: "{{ (_nf[0].isreg | default(false)) and not (_nf[0].islnk | default(true)) }}"
+            probe_python_is_link: "{{ _nf[1].islnk | default(false) }}"
+            runner_python_is_link: "{{ _nf[2].islnk | default(false) }}"
+            interpreter_regular: "{{ (_nf[3].isreg | default(false)) and not (_nf[3].islnk | default(true)) }}"
+          interpreter: {path: "{{ _nf[3].path | default('') }}", sha256: "{{ _nf[3].checksum | default('') }}"}
+          tree_membership:
+            probe_ansible_playbook: "{{ (_tree.content | b64decode) is ansible.builtin.regex('^' ~ (_fo[0].checksum | default('x')) ~ '  ' ~ (_ap_rel | regex_escape) ~ '$', multiline=True, match_type='search') }}"
+            interpreter: "{{ (_tree.content | b64decode) is ansible.builtin.regex('^' ~ (_nf[3].checksum | default('x')) ~ '  ' ~ (_in_rel | regex_escape) ~ '$', multiline=True, match_type='search') }}"
+          tree_manifest_sha256: "{{ _se[0].checksum | default('') }}"
+          tree_list_sha256: "{{ _se[1].checksum | default('') }}"
+          ansible_config_sha256: "{{ _se[2].checksum | default('') }}"
+          seed_sha256: "{{ _se[3].checksum | default('') }}"
+          bundle_manifest_sha256: "{{ _se[4].checksum | default('') }}"
+          running: {ansible_core: "{{ ansible_version.full }}", python_executable: "{{ ansible_facts.python.executable }}",
+                    python_version: "{{ ansible_facts.python.version.major }}.{{ ansible_facts.python.version.minor }}.{{ ansible_facts.python.version.micro }}"}
+          source:
+            checkout: "{{ rh_repo_root }}"
+            commit: "{{ _rh_brr_head.stdout_lines[0] | default('') }}"
+            tree: "{{ _rh_brr_head.stdout_lines[1] | default('') }}"
+            worktree_clean: "{{ _rh_brr_status.stdout_lines | length == 0 }}"
+          profile_sha256: "{{ _rh_brr_prof.stat.checksum | default('') }}"
+
+    - name: Compare -- R vs re-measurement, R's recorded claims vs the claims read now, claims vs re-measurement
+      vars:
+        _r: "{{ _rh_brr_r }}"
+        _n: "{{ _rh_brr_now }}"
+        _c: "{{ _rh_brr_claims }}"
+        _pairs:
+          - {field: executables, receipt: "{{ _r.executables }}", remeasured: "{{ _n.executables }}"}
+          - {field: managed_root, receipt: "{{ _r.managed_root }}", remeasured: "{{ _n.managed_root }}"}
+          - {field: toolchain_receipt.path, receipt: "{{ _r.toolchain_receipt.path }}", remeasured: "{{ _n.toolchain_receipt.path }}"}
+          - {field: toolchain_receipt.sha256, receipt: "{{ _r.toolchain_receipt.sha256 }}", remeasured: "{{ _n.toolchain_receipt.sha256 }}"}
+          - {field: toolchain_receipt.generation_dir, receipt: "{{ _r.toolchain_receipt.generation_dir }}", remeasured: "{{ _n.toolchain_receipt.generation_dir }}"}
+          - {field: toolchain_receipt.sealed, receipt: true, remeasured: "{{ _n.toolchain_receipt.sealed }}"}
+          # the seals / tree.sha256 are read from the claims' generation_dir: it must BE the launched generation
+          - {field: producer_claims_now.generation_dir vs launched generation, receipt: "{{ _c.generation_dir }}", remeasured: "{{ _n.toolchain_receipt.generation_dir }}"}
+          - {field: selected.runner_python, receipt: "{{ _r.selected.runner_python }}", remeasured: "{{ ansible_playbook_python }}"}
+          - {field: shapes, receipt: {probe_ansible_playbook_regular: true, probe_python_is_link: true, runner_python_is_link: true, interpreter_regular: true}, remeasured: "{{ _n.shapes }}"}
+          - {field: tree_membership, receipt: {probe_ansible_playbook: true, interpreter: true}, remeasured: "{{ _n.tree_membership }}"}
+          - {field: producer_claims (R) vs toolchain.json now, receipt: "{{ _r.producer_claims }}", remeasured: "{{ dict(_r.producer_claims.keys() | zip(_r.producer_claims.keys() | map('extract', _c))) }}"}
+          - {field: claim interpreter vs re-measured interpreter, receipt: {path: "{{ _c.interpreter }}", sha256: "{{ _c.interpreter_sha256 }}"}, remeasured: "{{ _n.interpreter }}"}
+          - {field: claim interpreter vs re-measured probe python, receipt: {path: "{{ _c.interpreter }}", sha256: "{{ _c.interpreter_sha256 }}"}, remeasured: "{{ _n.executables.probe_python }}"}
+          - {field: claim ansible_playbook vs re-measured, receipt: {path: "{{ _c.ansible_playbook }}", sha256: "{{ _c.ansible_playbook_sha256 }}"}, remeasured: "{{ _n.executables.probe_ansible_playbook }}"}
+          - {field: claim seals vs re-measured, receipt: {tree: "{{ _c.tree_manifest_sha256 }}", list: "{{ _c.tree_list_sha256 }}", config: "{{ _c.ansible_config_sha256 }}", seed: "{{ _c.seed_sha256 }}"}, remeasured: {tree: "{{ _n.tree_manifest_sha256 }}", list: "{{ _n.tree_list_sha256 }}", config: "{{ _n.ansible_config_sha256 }}", seed: "{{ _n.seed_sha256 }}"}}
+          - {field: measured.seals (R) vs re-measured, receipt: {tree: "{{ _r.measured.tree_manifest_sha256 }}", list: "{{ _r.measured.tree_list_sha256 }}", config: "{{ _r.measured.ansible_config.sha256 }}", seed: "{{ _r.measured.seed.sha256 }}"}, remeasured: {tree: "{{ _n.tree_manifest_sha256 }}", list: "{{ _n.tree_list_sha256 }}", config: "{{ _n.ansible_config_sha256 }}", seed: "{{ _n.seed_sha256 }}"}}
+          - {field: bootstrap.bundle_manifest.sha256, receipt: "{{ _r.bootstrap.bundle_manifest.sha256 }}", remeasured: "{{ _n.bundle_manifest_sha256 }}"}
+          - {field: measured.running (R) vs re-measured, receipt: "{{ _r.measured.running }}", remeasured: "{{ _n.running }}"}
+          - {field: source, receipt: "{{ _r.source }}", remeasured: "{{ _n.source }}"}
+          - {field: config.profile_sha256, receipt: "{{ _r.config.profile_sha256 }}", remeasured: "{{ _n.profile_sha256 }}"}
+      ansible.builtin.set_fact:
+        _rh_brr_cmp: "{{ _pairs }}"
+        _rh_brr_bad: []
+
+    - name: Determine the mismatches (exact equality of each pair; accumulated, never inferred)
+      ansible.builtin.set_fact:
+        _rh_brr_bad: "{{ (_rh_brr_bad + [item.field]) if (item.receipt != item.remeasured) else _rh_brr_bad }}"
+      loop: "{{ _rh_brr_cmp }}"
+      loop_control: {label: "{{ item.field }}"}
+
+    - name: Create the readback attempt directory (owned, 0700; absent before, checked above)
+      ansible.builtin.file: {path: "{{ brr_work_root ~ '/' ~ brr_label }}", state: directory, mode: '0700'}
+
+    - name: Write the readback record once (0400; written for PASS and FAIL alike -- evidence precedes the verdict)
+      ansible.builtin.copy:
+        dest: "{{ brr_work_root ~ '/' ~ brr_label ~ '/readback.yml' }}"
+        mode: '0400'
+        force: false
+        content: >-
+          {{ {'schema': 'bootstrap-receipt-readback/1',
+              'receipt': {'path': brr_receipt, 'sha256': _rh_brr_rraw.content | b64decode | hash('sha256')},
+              'toolchain_receipt': {'path': lme_resolved_run.receipt.path, 'sha256': _rh_brr_now.toolchain_receipt.sha256},
+              'receipt_values': {'executables': _rh_brr_r.executables, 'managed_root': _rh_brr_r.managed_root,
+                                 'toolchain_receipt': _rh_brr_r.toolchain_receipt, 'source': _rh_brr_r.source,
+                                 'config': _rh_brr_r.config},
+              'producer_claims_now': _rh_brr_claims,
+              'remeasured': _rh_brr_now,
+              'comparisons': _rh_brr_cmp,
+              'mismatches': _rh_brr_bad,
+              'verdict': ('PASS' if (_rh_brr_bad | length) == 0 else 'FAIL'),
+              'readback': {'runner': lme_resolved_run.runner, 'playbook_rel': 'testing/loader-tests-r4/readback_bootstrap_receipt.yml'}}
+             | to_nice_yaml(indent=2, sort_keys=True, width=4096) }}
+
+    - name: Refuse unless every re-measured value equals R and the claims (the record above is the evidence)
+      ansible.builtin.assert:
+        that: _rh_brr_bad | length == 0
+        fail_msg: >-
+          REFUSED RH-BOOTSTRAP-RECEIPT-READBACK: {{ brr_receipt }} does not survive independent re-measurement:
+          {{ _rh_brr_bad }} (record {{ brr_work_root }}/{{ brr_label }}/readback.yml)
+        # the A destination is derived from the SAME declaration run_loader_tests.yml admits (C1 review-location-join;
+        # codex-tick348): <work root>/<sub_roots.run>/<runners[catalog locator.runner_key]>/<this label>/<catalog locator.leaf>
+        success_msg: >-
+          BOOTSTRAP-RECEIPT-READBACK PASS {{ brr_receipt }} read sha256={{ _rh_brr_rraw.content | b64decode | hash('sha256') }}; record
+          {{ brr_work_root }}/{{ brr_label }}/readback.yml -- next: the detached review (message A cites sha256(R));
+          MAIN relocates A's published bytes unchanged (0400, regular, no link; never creating this label dir) to
+          {{ rh_repo_root ~ '/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/' ~ rh.controller.bootstrap.work_roots.sub_roots.run
+             ~ '/' ~ rh.controller.bootstrap.work_roots.runners[(_rh_brr_catraw.content | b64decode | from_yaml).review_contract.locator.runner_key]
+             ~ '/' ~ brr_label ~ '/' ~ (_rh_brr_catraw.content | b64decode | from_yaml).review_contract.locator.leaf }}
+          (catalog locator rel = {{ rh.controller.bootstrap.work_roots.runners[(_rh_brr_catraw.content | b64decode | from_yaml).review_contract.locator.runner_key]
+          ~ '/' ~ brr_label ~ '/' ~ (_rh_brr_catraw.content | b64decode | from_yaml).review_contract.locator.leaf }})
+        quiet: false

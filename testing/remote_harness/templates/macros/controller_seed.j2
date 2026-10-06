@@ -818,6 +818,25 @@ _v=$({{ env_i(bs) }} "$G/{{ py.interpreter_rel }}" -I -B -c 'import sys, platfor
 [ "$_v" = "CPython {{ py.version }} $G/{{ py.installed_rel }}" ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "interpreter reports '$_v'"
 {%- endmacro -%}
 
+{#- INSTALLED-SET GATE (codex-tick313 transfer-pass-macro-join): the ONE implementation of the wheel installed-set
+    admission, called by install_venv and exported for G's fixtures by templates/lme-seed-installed-set-gate.sh.j2 (never
+    copied). Reads the shell variable _inv (uv pip list --format freeze output); sets _bad, _brc and, on admission,
+    _norm (the normalized, sorted set, which then equals the lock's pins); refuses through lme_refuse
+    RH-SEED-IDENTITY-MISMATCH. Emits no trailing newline (the caller's line structure is unchanged). -#}
+{%- macro installed_set_gate(bs, lock) -%}
+# every freeze line must be exactly <name>==<version> (no editable, URL, @, empty-version or blank line); none is dropped
+_bad=$(printf '%s\n' "$_inv" | {{ x(bs, 'grep') }} -v -x -E '[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9][A-Za-z0-9.+!_-]*'); _brc=$?
+[ "$_brc" -eq 1 ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "uv pip list freeze output has a line that is not exactly <name>==<version> (grep exit $_brc): $_bad"
+# normalize ONLY the name (before ==) as the lock side does: lower-case, '_' and '.' -> '-'; the version stays verbatim
+_norm=$(printf '%s\n' "$_inv" | {{ x(bs, 'sed') }} 'h;s/==.*//;y/ABCDEFGHIJKLMNOPQRSTUVWXYZ_./abcdefghijklmnopqrstuvwxyz--/;G;s/\n[^=]*==/==/' | {{ joinsorted(bs) }})
+{% set ns = namespace(pins=[]) %}
+{% for p in lock.packages %}
+{% set ns.pins = ns.pins + [(p.name | lower | replace('_', '-') | replace('.', '-')) ~ '==' ~ p.version] %}
+{% endfor %}
+[ "$_norm" = {{ shq(ns.pins | sort(case_sensitive=true) | join(' ')) }} ] \
+  || lme_refuse RH-SEED-IDENTITY-MISMATCH "installed set != lock: $_norm"
+{%- endmacro -%}
+
 {%- macro install_venv(bs, lock) -%}
 lme_phase venv
 {{ env_i(bs) }} "$G/{{ bs.python.interpreter_rel }}" -I -B -m venv --without-pip "$G/{{ bs.layout.gen_dirs.venv }}" || lme_refuse RH-SEED-INSTALL-FAILED 'venv creation failed'
@@ -830,17 +849,7 @@ lme_phase wheels
   || lme_refuse RH-SEED-INSTALL-FAILED 'wheel install failed'
 _inv=$({{ env_i(bs, {'UV_NO_CONFIG': '1', 'UV_OFFLINE': '1', 'UV_PYTHON_DOWNLOADS': 'never'}, ['TMPDIR="$G/' ~ bs.layout.gen_dirs.tmp ~ '"']) }} "$G/{{ bs.layout.gen_dirs.uv }}/uv" pip list --python "$G/{{ bs.layout.gen_dirs.venv }}/bin/python" --format freeze --no-cache) || lme_refuse RH-SEED-IDENTITY-MISMATCH 'uv pip list failed'
 printf '%s\n' "$_inv" > "$G/{{ bs.layout.receipts_dir }}/installed-inventory.txt"
-# every freeze line must be exactly <name>==<version> (no editable, URL, @, empty-version or blank line); none is dropped
-_bad=$(printf '%s\n' "$_inv" | {{ x(bs, 'grep') }} -v -x -E '[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9][A-Za-z0-9.+!_-]*'); _brc=$?
-[ "$_brc" -eq 1 ] || lme_refuse RH-SEED-IDENTITY-MISMATCH "uv pip list freeze output has a line that is not exactly <name>==<version> (grep exit $_brc): $_bad"
-# normalize ONLY the name (before ==) as the lock side does: lower-case, '_' and '.' -> '-'; the version stays verbatim
-_norm=$(printf '%s\n' "$_inv" | {{ x(bs, 'sed') }} 'h;s/==.*//;y/ABCDEFGHIJKLMNOPQRSTUVWXYZ_./abcdefghijklmnopqrstuvwxyz--/;G;s/\n[^=]*==/==/' | {{ joinsorted(bs) }})
-{% set ns = namespace(pins=[]) %}
-{% for p in lock.packages %}
-{% set ns.pins = ns.pins + [(p.name | lower | replace('_', '-') | replace('.', '-')) ~ '==' ~ p.version] %}
-{% endfor %}
-[ "$_norm" = {{ shq(ns.pins | sort(case_sensitive=true) | join(' ')) }} ] \
-  || lme_refuse RH-SEED-IDENTITY-MISMATCH "installed set != lock: $_norm"
+{{ installed_set_gate(bs, lock) }}
 {%- endmacro -%}
 
 {%- macro install_collections(bs, lock) -%}

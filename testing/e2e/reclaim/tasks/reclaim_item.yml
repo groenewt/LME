@@ -1,0 +1,57 @@
+---
+# testing/e2e/reclaim/tasks/reclaim_item.yml -- ONE admitted ledger item: revalidate, then exactly one exact-name /
+# exact-id effect (target, privileged). Never a wildcard, never `-a`, never a prune, never a recursive delete; a
+# directory is removed only when EMPTY (anything inside it is not in the ledger and is preserved by refusing).
+# Inputs: rcl, rcl_dir, tr_bs, rcl_item ({kind, key_value, service, admitted, in_scope, state}).
+
+- name: Revalidate immediately before the effect (stale ownership refuses)
+  ansible.builtin.include_tasks: "{{ rcl_dir }}/tasks/revalidate.yml"
+
+- name: Unit -- stop and disable exactly this unit
+  when: rcl_item.kind == 'unit'
+  ansible.builtin.command:
+    argv: ["{{ tr_bs.os_tools[rcl.native.tools.systemctl].path }}", disable, --now, --, "{{ rcl_item.key_value }}"]
+
+- name: Unit -- remove exactly its recorded fragment (digest revalidated above)
+  when: rcl_item.kind == 'unit' and (rcl_item.admitted.FragmentPath | default('')) is match('^/etc/systemd/system/lme[A-Za-z0-9@_.-]*$')
+  ansible.builtin.file:
+    path: "{{ rcl_item.admitted.FragmentPath }}"
+    state: absent
+
+- name: Unit -- reload the manager after a fragment removal
+  when: rcl_item.kind == 'unit'
+  ansible.builtin.command:
+    argv: ["{{ tr_bs.os_tools[rcl.native.tools.systemctl].path }}", daemon-reload]
+
+- name: Container / volume / secret -- remove exactly this id or name
+  when: rcl_item.kind in ['container', 'volume', 'secret']
+  ansible.builtin.command:
+    argv: >-
+      {{ [tr_bs.os_tools[rcl.native.tools.podman].path, rcl_item.kind, 'rm']
+         + (['--force', '--time', '30'] if rcl_item.kind == 'container' else [])
+         + ['--', rcl_item.key_value] }}
+
+- name: Path -- list a directory's entries (an owned directory is removed only when empty)
+  when: rcl_item.kind == 'path' and rcl_item.admitted.sha256_if_file is none
+  ansible.builtin.find:
+    paths: "{{ rcl_item.key_value }}"
+    file_type: any
+    hidden: true
+    recurse: false
+  register: _rcl_dir_entries
+
+- name: Path -- refuse a non-empty owned directory (its content is not in the ledger, so it is preserved)
+  when: rcl_item.kind == 'path' and rcl_item.admitted.sha256_if_file is none
+  ansible.builtin.assert:
+    that:
+      - _rcl_dir_entries.matched == 0
+    fail_msg: >-
+      {{ rcl.refusals.foreign }} on {{ inventory_hostname }}: owned directory {{ rcl_item.key_value }} holds
+      {{ _rcl_dir_entries.matched }} entries the ledger does not name; preserved (ledger children are reclaimed first).
+    quiet: true
+
+- name: Path -- remove exactly this owned file or empty directory
+  when: rcl_item.kind == 'path'
+  ansible.builtin.file:
+    path: "{{ rcl_item.key_value }}"
+    state: absent

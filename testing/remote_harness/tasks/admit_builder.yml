@@ -6,20 +6,114 @@
 # declared executable (exact shebang line), declared python (path + major.minor), declared core, the ansible
 # package imported from the declared directory, NO ansible config file discovered, and no ANSIBLE_* variable
 # outside env_allow. No search, no fallback. Nothing is written before this passes. Non-root only.
-# Requires refuse_pinned_outputs.yml and resolve_policy.yml earlier in the play (localhost, connection local).
-#
+# Requires refuse_pinned_outputs.yml and resolve_policy.yml earlier in the play (localhost, connection local; both are
+# controller-side action plugins only -- assert / set_fact / include_vars -- so no module has staged anything yet).
+# Input (no default): rh_gen_stage, the genesis.launch.stages key of the including playbook (acquire | package), and
+# the launch's act identity (genesis.launch.stage_root.act.var, an extra var from the launch argv; its own stage root).
+# RH-GENESIS-TEMP-BINDING (codex-tick184): the process environment and every temp are genesis.launch. The FIRST task
+# below uses controller-side lookups only (env, config, path tests), so a mis-bound environment refuses before the
+# first module stages anything; the builder's own start-up local temp (created before any task) is reported by its
+# effective location. The first module (setup, read-only) then yields the full environment (undeclared ANSIBLE_*) and
+# the custody facts, refused right after, before any write.
+# CONNECTED-LINEAGE PORT (codex-tick332 F1; ROUTE-X): the genesis launch admission below is the qualified mechanism of
+# the genesis lineage, adapted onto this file's m1-1 interpreter binding (9c0c9b9) -- source closures 2e8ff44
+# (RH-GENESIS-TEMP-BINDING: launch assert, custody stat + assert, mounts subset), e0c0aa5 (env['clear'] by subscript),
+# 0fde998 (per-act stage root only), 55ec7aa (act as a declared fullmatch) and the genesis-only act-required portion
+# of 929f5b3 (C1-ACT-REQUIRED-COMPONENT, codex 193337 / 194825; the registry side contract_admission.required_values
+# .genesis_act is already on this lineage). Requires the profile's controller.bootstrap.genesis.launch (C1 hunk):
+# without it the first task fails on an undefined policy node, never on a silent default.
+
+- name: Refuse an undeclared or mis-bound genesis process environment before any module (RH-GENESIS-TEMP-BINDING; lookups only)
+  vars:
+    _l: "{{ rh.controller.bootstrap.genesis.launch }}"
+    _wr: "{{ rh.controller.bootstrap.work_roots }}"
+    _w: "{{ rh_repo_root ~ '/' ~ rh.controller.bootstrap.work_roots.root_rel }}"
+    # PER-ACT ISOLATION (launch.stage_root.act): the stage root is this launch's own act dir
+    # REQUIRED (C1-ACT-REQUIRED-COMPONENT, codex 193337): an absent act is none (refused below), never defaulted to ''.
+    # Absence is bound EXPLICITLY: the 2.19 vars lookup treats default=none as NO default (plugins/lookup/vars.py:
+    # `if default is None` -> an undefined marker), which would raise at the first use instead of the declared refusal.
+    # act.var is admitted as var_name (no regex metacharacter), so the varnames pattern is exact.
+    _act: >-
+      {{ lookup('ansible.builtin.vars', _l.stage_root.act.var)
+         if (q('ansible.builtin.varnames', '^' ~ _l.stage_root.act.var ~ '$') | length) > 0 else none }}
+    # the registry's act component rule (contract_admission.required_values.genesis_act -> patterns); raw registry read
+    # under the SEED-06 raw_readers precedent of refuse_pinned_outputs.yml (the registry is not part of lme_global: no
+    # override reaches it; global.yml is byte-bound by the engine); rh_repo_root is guarded inline at play entry
+    _act_req: "{{ (lookup('ansible.builtin.file', rh_repo_root ~ '/manifests/global.yml') | from_yaml).lme_config_registry.remote_harness_schema.contract_admission }}"
+    # display gate for the refusal message only: when the act is refused, no stage-root path is derived or stat'ed for
+    # the message either (codex 194825: nothing derived from a refused act); the asserts below are the decision
+    _act_ok: >-
+      {{ (q('ansible.builtin.varnames', '^' ~ _l.stage_root.act.var ~ '$') | length) > 0 and _act is not none and _act is string
+         and (_act | length) > 0
+         and _act is ansible.builtin.regex(_act_req.patterns[_act_req.required_values.genesis_act.pattern], match_type='fullmatch')
+         and _act is ansible.builtin.regex(_l.stage_root.act.regex, match_type=_l.stage_root.act.match) }}
+    _sr: "{{ _w ~ '/' ~ _wr.sub_roots[_l.stage_root.sub] ~ '/' ~ _l.stage_root.rel ~ '/' ~ (rh_gen_stage | default('')) ~ '/' ~ _act }}"
+    _paths: >-
+      {% set ns = namespace(d={}) %}{% for k, v in _l.env.stage_paths.items() %}{% set ns.d = ns.d | combine({k: _sr ~ '/' ~ v}) %}{% endfor %}{{ ns.d }}
+    _want: "{{ rh.controller.bootstrap.base_env | combine(_l.env.literal) | combine(_paths) }}"
+    _bad: >-
+      {% set ns = namespace(b=[]) %}{% for k, v in _want.items() %}{% set a = lookup('ansible.builtin.env', k, default='<unset>') %}{% if a != v %}{% set ns.b = ns.b + [k ~ '=' ~ a ~ ' (declared ' ~ v ~ ')'] %}{% endif %}{% endfor %}{{ ns.b }}
+    _chain: >-
+      {% set ns = namespace(p=[]) %}{% for full in _paths.values() %}{% for i in range(1, (full.split('/') | length) + 1) %}{% set ns.p = ns.p + ['/' ~ (full.split('/')[1:i] | join('/'))] %}{% endfor %}{% endfor %}{{ ns.p | unique | sort | list }}
+    _ltmp: "{{ lookup('ansible.builtin.config', 'DEFAULT_LOCAL_TMP') }}"
+    _home: "{{ lookup('ansible.builtin.config', 'ANSIBLE_HOME') }}"
+    _rtmp: "{{ lookup('ansible.builtin.config', 'remote_tmp', plugin_type='shell', plugin_name='sh') }}"
+  ansible.builtin.assert:
+    that:
+      - rh_gen_stage is defined and rh_gen_stage in _l.stages
+      # FULL match of the whole value (declared act.match = fullmatch): a trailing newline is refused (RH-GENESIS-ACT-STRICT-END)
+      - _l.stage_root.act.match == 'fullmatch'
+      # RH-GENESIS-ACT-REQUIRED (C1-ACT-REQUIRED-COMPONENT, codex 193337 / 194825): the RAW looked-up value (never
+      # converted to a string) must be present, not null, a string, non-empty and a FULL match of the REGISTRY component
+      # pattern (contract_admission.required_values.genesis_act -> patterns.rel_segment: no '/', no newline), all
+      # BEFORE the profile pattern and before any use of the stage root derived from it (a profile act.regex such as
+      # '^$' or '^x/y$' can never admit a missing, empty or slash-bearing act). Asserts stop at the first false, and the
+      # result's `assertion` names which one: one distinguishable refusal per case.
+      - (q('ansible.builtin.varnames', '^' ~ _l.stage_root.act.var ~ '$') | length) > 0
+      - _act is not none
+      - _act is string
+      - (_act | length) > 0
+      - _act is ansible.builtin.regex(_act_req.patterns[_act_req.required_values.genesis_act.pattern], match_type='fullmatch')
+      - _act is ansible.builtin.regex(_l.stage_root.act.regex, match_type=_l.stage_root.act.match)
+      # env['clear'] by SUBSCRIPT: `.clear` resolves to the dict METHOD (attribute access prefers it), never the key
+      - _l.env['clear'] is sameas true and (_l.env.order | sort) == ((_want.keys() | list) + (_l.env.inherited.keys() | list)) | sort
+      - (rh.controller.bootstrap.genesis.builder.env_allow | sort) == (_want.keys() | select('match', '^ANSIBLE_') | sort | list)
+      - _bad | length == 0
+      - lookup('ansible.builtin.env', 'HOME', default='') is match('^/')
+      - (_ltmp | dirname) == _paths.ANSIBLE_LOCAL_TEMP and (_ltmp | basename) is match('^ansible-local-')
+      - _home == _paths.ANSIBLE_HOME
+      - _rtmp == _paths.ANSIBLE_REMOTE_TMP
+      - (ansible_remote_tmp | default(_paths.ANSIBLE_REMOTE_TMP)) == _paths.ANSIBLE_REMOTE_TMP
+      - (_sr ~ '/') is not match('(' ~ (_wr.admission.refused_prefixes | map('regex_escape') | join('|')) ~ ')')
+      - _chain | select('link') | list | length == 0
+      - _l.env.must_exist | map('extract', _paths) | reject('directory') | list | length == 0
+    fail_msg: >-
+      REFUSED {{ _l.refusal }} (RH-GENESIS-TEMP-BINDING): the genesis stage '{{ rh_gen_stage | default('') }}' runs only
+      under env -i with exactly the declared pairs (controller.bootstrap.genesis.launch.env), every temp under the stage
+      root {{ _sr if _act_ok else '(not derived: the act was refused)' }} of its own act (RH-GENESIS-ACT-ISOLATION: -e {{ _l.stage_root.act.var }}=<act> matching
+      {{ _l.stage_root.act.regex }} as a {{ _l.stage_root.act.match }} of the whole value, got {{ _act | to_json }}; RH-GENESIS-ACT-REQUIRED:
+      the act is required (present, not null, a string, non-empty) and must fully match the registry component pattern
+      {{ _act_req.patterns[_act_req.required_values.genesis_act.pattern] }} before the profile pattern applies; the failed
+      `assertion` names which check refused); mismatched or unset: {{ _bad if _act_ok else '(not compared: the act was refused)' }}; effective local temp {{ _ltmp }} (declared inside
+      {{ _paths.ANSIBLE_LOCAL_TEMP | default('') if _act_ok else '(not derived)' }}), ANSIBLE_HOME {{ _home }}, remote_tmp {{ _rtmp }} / ansible_remote_tmp
+      {{ ansible_remote_tmp | default('unset') }}; env_allow {{ rh.controller.bootstrap.genesis.builder.env_allow }} must
+      equal the declared ANSIBLE_* names; the stage root must not be under {{ _wr.admission.refused_prefixes }}; linked
+      components {{ (_chain | select('link') | list) if _act_ok else '(not checked)' }}; missing {{ (_l.env.must_exist | map('extract', _paths) | reject('directory') | list) if _act_ok else '(not checked)' }}.
+      Nothing was staged; re-launch with the declared argv/env (genesis.launch), never an ad hoc export.
+    quiet: true
+
 # INTERPRETER BINDING (RH-BUILDER-UNSUPPORTED; e0c0aa51 genesis acquire refusal): the module interpreter is BOUND to the
 # declared builder.python, never discovered. Without a binding, 2.19 interpreter discovery runs at the first module
 # (setup below) and picks the first INTERPRETER_PYTHON_FALLBACK hit (/usr/bin/python3.13), not the declared
 # /usr/bin/python3. Everything before this point in both genesis plays (refuse_pinned_outputs, admit_controller,
-# resolve_policy incl. the engine resolve role) is assert / set_fact / include_* / debug -- action plugins on the
-# controller, no module, no discovery. This file is the single point both genesis plays (acquire.yml, package.yml)
-# include before their first module, and set_fact is host-persistent, so the binding covers every later module of the
-# play. A pre-supplied binding (inventory, extra-var) is admitted only when EQUAL to the declared one (an extra-var
-# would outrank set_fact; an inventory value would be silently masked by it): it refuses here, still before any
-# module. Under genesis the set_fact also outranks the task-var pins of reap_staging.yml / decide_private_group.yml
-# (ansible_playbook_python): equal values, since the builder assert below requires ansible_playbook_python ==
-# builder.python. set_fact does not outlive this process.
+# resolve_policy incl. the engine resolve role, the assert above) is assert / set_fact / include_* / debug -- action
+# plugins on the controller, no module, no discovery. This file is the single point both genesis plays (acquire.yml,
+# package.yml) include before their first module, and set_fact is host-persistent, so the binding covers every later
+# module of the play. A pre-supplied binding (inventory, extra-var) is admitted only when EQUAL to the declared one
+# (an extra-var would outrank set_fact; an inventory value would be silently masked by it): it refuses here, still
+# before any module. Under genesis the set_fact also outranks the task-var pins of reap_staging.yml /
+# decide_private_group.yml (ansible_playbook_python): equal values, since the builder assert below requires
+# ansible_playbook_python == builder.python. set_fact does not outlive this process.
 
 - name: Refuse a pre-supplied module interpreter other than the declared builder python (before any module)
   ansible.builtin.assert:
@@ -38,7 +132,67 @@
 
 - name: Refuse a privileged builder and read the builder's environment and interpreter facts (no writes)
   ansible.builtin.setup:
-    gather_subset: ['!all', '!min', 'env', 'python', 'user']
+    gather_subset: ['!all', '!min', 'env', 'python', 'user', 'mounts']
+
+- name: Stat every component from / down to each genesis stage path (no link followed; read-only)
+  vars:
+    _l: "{{ rh.controller.bootstrap.genesis.launch }}"
+    _wr: "{{ rh.controller.bootstrap.work_roots }}"
+    _sr: "{{ rh_repo_root ~ '/' ~ _wr.root_rel ~ '/' ~ _wr.sub_roots[_l.stage_root.sub] ~ '/' ~ _l.stage_root.rel ~ '/' ~ rh_gen_stage ~ '/' ~ lookup('ansible.builtin.vars', _l.stage_root.act.var) }}"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: >-
+    {% set ns = namespace(p=[]) %}{% for v in _l.env.stage_paths.values() %}{% set full = _sr ~ '/' ~ v %}{% for i in range(1, (full.split('/') | length) + 1) %}{% set ns.p = ns.p + ['/' ~ (full.split('/')[1:i] | join('/'))] %}{% endfor %}{% endfor %}{{ ns.p | unique | sort | list }}
+  register: _rh_bld_gen_stat
+
+- name: Refuse genesis temp custody that is not the invoker's, on the admitted disk-backed work root (RH-GENESIS-TEMP-BINDING)
+  vars:
+    _l: "{{ rh.controller.bootstrap.genesis.launch }}"
+    _wr: "{{ rh.controller.bootstrap.work_roots }}"
+    _w: "{{ rh_repo_root ~ '/' ~ rh.controller.bootstrap.work_roots.root_rel }}"
+    _u: "{{ ansible_facts.user_uid | int }}"
+    # stat of an absent path carries only `exists`: the looped path is attached from the loop item
+    _st: >-
+      {% set ns = namespace(l=[]) %}{% for r in _rh_bld_gen_stat.results %}{% set ns.l = ns.l + [r.stat | combine({'path': r.item})] %}{% endfor %}{{ ns.l }}
+    _above: "{{ _st | selectattr('exists') | rejectattr('path', 'equalto', _w) | rejectattr('path', 'match', '^' ~ (_w | regex_escape) ~ '/') | list }}"
+    _within: "{{ _st | selectattr('exists') | selectattr('path', 'match', '^' ~ (_w | regex_escape) ~ '(/|$)') | list }}"
+    _wdev: "{{ (_st | selectattr('path', 'equalto', _w) | first | default({})).dev | default(-1) }}"
+    # the mount holding the work root: the longest mount point that is a path prefix of it
+    _wm: >-
+      {% set ns = namespace(m={}, n=-1) %}{% for m in ansible_facts.mounts | default([]) %}{% if (m.mount == '/' or (_w ~ '/').startswith(m.mount ~ '/')) and (m.mount | length) > ns.n %}{% set ns.m = m %}{% set ns.n = m.mount | length %}{% endif %}{% endfor %}{{ ns.m }}
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'HOME', default='') == ansible_facts.user_dir
+      # the full environment (first read-only module): no ANSIBLE_* outside env_allow (re-asserted in the builder assert)
+      - >-
+        ansible_facts.env | dict2items | map(attribute='key') | select('match', '^ANSIBLE_')
+        | reject('in', rh.controller.bootstrap.genesis.builder.env_allow) | list | length == 0
+      - _st | selectattr('path', 'equalto', _w) | selectattr('exists') | list | length == 1
+      - _st | selectattr('exists') | selectattr('islnk') | list | length == 0
+      - _st | selectattr('exists') | rejectattr('isdir') | list | length == 0
+      - _above | map(attribute='uid') | reject('in', [0, _u | int]) | list | length == 0
+      - _above | selectattr('wgrp') | list | length == 0 and _above | selectattr('woth') | list | length == 0
+      - _within | map(attribute='uid') | reject('equalto', _u | int) | list | length == 0
+      - _within | selectattr('wgrp') | list | length == 0 and _within | selectattr('woth') | list | length == 0
+      - _within | map(attribute='dev') | reject('equalto', _wdev) | list | length == 0
+      - _wm.fstype is defined and _wm.fstype not in _wr.admission.refused_fs_types
+      - (_wm.size_available | default(0) | int) >= (_wr.admission.free_bytes_min | int)
+      - (_wm.inode_available | default(0) | int) >= (_wr.admission.free_inodes_min | int)
+    fail_msg: >-
+      REFUSED {{ _l.refusal }} (RH-GENESIS-TEMP-BINDING): HOME must be the invoker's passwd home ({{ ansible_facts.user_dir }};
+      got '{{ lookup('ansible.builtin.env', 'HOME', default='') }}', never redirected); no ANSIBLE_* besides
+      {{ rh.controller.bootstrap.genesis.builder.env_allow }} (found {{ ansible_facts.env | dict2items | map(attribute='key')
+      | select('match', '^ANSIBLE_') | list }}); the work root {{ _w }} must exist;
+      every component above it a real directory owned by 0 or uid {{ _u }}, not group/other-writable (no private-group
+      exception at genesis); it and every component below it to the stage paths a real directory owned by uid {{ _u }},
+      not group/other-writable, on the work root's device (no nested mount); the work root's filesystem
+      ({{ _wm.mount | default('?') }} {{ _wm.fstype | default('?') }}) not in {{ _wr.admission.refused_fs_types }} with
+      >= {{ _wr.admission.free_bytes_min }} bytes ({{ _wm.size_available | default('?') }}) and
+      >= {{ _wr.admission.free_inodes_min }} inodes ({{ _wm.inode_available | default('?') }}) free. Components:
+      {{ _st | map(attribute='path', default='?') | zip(_st | map(attribute='uid', default='-'), _st | map(attribute='mode', default='absent')) | list }}.
+    quiet: true
 
 # results[0] the executable (not followed), results[1] the declared python path itself (not followed: a Debian
 # /usr/bin/python3 is a symlink -> lnk_source, and stat gives NO checksum for a link), results[2] the same path

@@ -1,0 +1,58 @@
+---
+# testing/e2e/reclaim/tasks/revalidate.yml -- STALE OWNERSHIP (codex-tick333 negative case): re-observe, IMMEDIATELY
+# before one effect, everything admission bound -- machine id, host public keys, the ledger digest, and this item's
+# observation -- and refuse RECLAIM-STALE-OWNERSHIP on any difference (the item and everything after it preserved).
+# Target host, observe-only. Inputs: rcl, rcl_dir, tr_bs, rcl_item, hostvars['localhost'].rcl_plan.
+
+- name: Re-read the machine id
+  ansible.builtin.slurp:
+    src: /etc/machine-id
+  register: _rcl_rv_mid
+
+- name: Re-find the host public keys
+  ansible.builtin.find:
+    paths: /etc/ssh
+    patterns: 'ssh_host_*_key.pub'
+    file_type: file
+    follow: false
+  register: _rcl_rv_hkf
+
+- name: Re-read the host public keys
+  ansible.builtin.slurp:
+    src: "{{ rcl_hk.path }}"
+  loop: "{{ _rcl_rv_hkf.files | sort(attribute='path') }}"
+  loop_control:
+    loop_var: rcl_hk
+    label: "{{ rcl_hk.path }}"
+  register: _rcl_rv_hk
+
+- name: Re-stat the ownership ledger
+  ansible.builtin.stat:
+    path: "{{ rcl.native.ledger_path }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rcl_rv_led
+
+- name: Re-observe this item (the same observation admission used)
+  ansible.builtin.include_tasks: "{{ rcl_dir }}/tasks/observe_item.yml"
+  vars:
+    rcl_res: "{{ rcl_item }}"
+    rcl_collect: false
+
+- name: Refuse stale ownership (anything admission bound has changed since)
+  vars:
+    _rcl_p: "{{ hostvars['localhost'].rcl_plan }}"
+  ansible.builtin.assert:
+    that:
+      - (_rcl_rv_mid.content | b64decode | trim) == _rcl_p.machine_id
+      - >-
+        (_rcl_rv_hk.results | map(attribute='content') | map('b64decode') | map('trim')
+         | map('regex_replace', '^(\S+)\s+(\S+).*$', '\1 \2') | list | sort) == _rcl_p.host_public_keys
+      - _rcl_rv_led.stat.exists and not _rcl_rv_led.stat.islnk and _rcl_rv_led.stat.checksum == _rcl_p.ledger_sha256
+      - rcl_seen.present | bool
+      - rcl_seen.observed == rcl_item.admitted
+    fail_msg: >-
+      {{ rcl.refusals.stale }} on {{ inventory_hostname }}: before reclaiming {{ rcl_item.kind }} {{ rcl_item.key_value }}
+      the machine id, host public keys, ledger digest or the item's observation differ from admission. This item and
+      every later one are preserved.
+    quiet: true

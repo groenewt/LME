@@ -1,0 +1,86 @@
+---
+# testing/e2e/reclaim/tasks/observe_target.yml -- everything admission compares, observed on the target AFTER the
+# privileged contact (bind_target.yml) and the recorded-endpoint check (observe-only; no effect).
+# Inputs: rcl, tr_bs, tr_target (machine id, from B). Outputs (this host): rcl_host_keys, rcl_ledger (mapping or
+# none), rcl_ledger_sha256, rcl_ledger_meta, rcl_seen_all.
+# The host PUBLIC keys are public material (never a private key file); the ledger holds names / ids only.
+
+- name: Find the host public keys the endpoint serves
+  ansible.builtin.find:
+    paths: /etc/ssh
+    patterns: 'ssh_host_*_key.pub'
+    file_type: file
+    follow: false
+  register: _rcl_hk_files
+
+- name: Read the host public keys
+  ansible.builtin.slurp:
+    src: "{{ rcl_hk.path }}"
+  loop: "{{ _rcl_hk_files.files | sort(attribute='path') }}"
+  loop_control:
+    loop_var: rcl_hk
+    label: "{{ rcl_hk.path }}"
+  register: _rcl_hk_raw
+
+- name: Bind the observed host public keys ('<type> <base64>', comment dropped)
+  ansible.builtin.set_fact:
+    rcl_host_keys: >-
+      {{ _rcl_hk_raw.results | map(attribute='content') | map('b64decode') | map('trim')
+         | map('regex_replace', '^(\S+)\s+(\S+).*$', '\1 \2') | list | sort }}
+
+- name: Stat the ownership ledger (no link following)
+  ansible.builtin.stat:
+    path: "{{ rcl.native.ledger_path }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rcl_led_st
+
+- name: Refuse a ledger that is linked, not a regular file, or not root 0600 (present ledgers only)
+  when: _rcl_led_st.stat.exists
+  ansible.builtin.assert:
+    that:
+      - _rcl_led_st.stat.isreg and not _rcl_led_st.stat.islnk
+      - _rcl_led_st.stat.uid == rcl.native.ledger_owner.uid and _rcl_led_st.stat.gid == rcl.native.ledger_owner.gid
+      - _rcl_led_st.stat.mode == rcl.native.ledger_owner.mode
+    fail_msg: "{{ rcl.refusals.ledger }} on {{ inventory_hostname }}: {{ rcl.native.ledger_path }} is not a root 0600 regular file"
+    quiet: true
+
+- name: Read the ownership ledger
+  when: _rcl_led_st.stat.exists
+  ansible.builtin.slurp:
+    src: "{{ rcl.native.ledger_path }}"
+  register: _rcl_led_raw
+
+- name: Refuse a ledger of another schema, a missing field, or a malformed resource entry
+  when: _rcl_led_st.stat.exists
+  vars:
+    _rcl_l: "{{ _rcl_led_raw.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _rcl_l is mapping and (_rcl_l.schema | default('')) == rcl.native.schema
+      - rcl.native.required_fields | difference(_rcl_l.keys() | list) | length == 0
+      - _rcl_l.resources is sequence and _rcl_l.resources is not string
+      - _rcl_l.pending_obligations is sequence and _rcl_l.pending_obligations is not string
+      - _rcl_l.resources | reject('mapping') | list | length == 0
+      - _rcl_l.resources | rejectattr('kind', 'in', rcl.native.resource_kinds.keys() | list) | list | length == 0
+      - (_rcl_l.resources | map('list') | map('sort') | unique | list) in [[], [rcl.native.per_resource_fields | sort]]
+    fail_msg: >-
+      {{ rcl.refusals.ledger }} on {{ inventory_hostname }}: {{ rcl.native.ledger_path }} is not a well-formed
+      {{ rcl.native.schema }} (fields {{ rcl.native.required_fields }}; per resource {{ rcl.native.per_resource_fields }}).
+    quiet: true
+
+- name: Bind the ledger (digest re-read before every effect)
+  ansible.builtin.set_fact:
+    rcl_ledger: "{{ (_rcl_led_raw.content | b64decode | from_json) if _rcl_led_st.stat.exists else none }}"
+    rcl_ledger_sha256: "{{ _rcl_led_st.stat.checksum if _rcl_led_st.stat.exists else none }}"
+    rcl_seen_all: []
+
+- name: Observe every ledger resource (the same observation revalidate.yml repeats before each effect)
+  when: rcl_ledger is not none
+  ansible.builtin.include_tasks: "{{ rcl_dir }}/tasks/observe_item.yml"
+  vars:
+    rcl_collect: true
+  loop: "{{ rcl_ledger.resources if rcl_ledger is not none else [] }}"
+  loop_control:
+    loop_var: rcl_res
+    label: "{{ rcl_res.kind }} {{ rcl_res.key_value }}"

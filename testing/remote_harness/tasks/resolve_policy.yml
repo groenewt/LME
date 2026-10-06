@@ -69,6 +69,44 @@
     rh_seed_lock: >-
       {{ lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ lme_resolved.remote_harness.policy.controller.lock_file_rel) | from_yaml }}
 
+# ROUTE-INTERFACE-BYTES-BEFORE-CONSUMPTION (codex-tick372 interface-binding verdict): the FIRST point at which the
+# resolved declaration exists, and before ANY consumer includes another pinned member (resolve_harness.yml:14 includes
+# verify_toolchain_receipt.yml only after this file returns; guest.yml:79 reaches it through resolve_harness.yml;
+# initial_contact / admit_ancestry / decide_private_group are included later still). Every member of the resolved
+# controller.bootstrap.consumer_interface is re-hashed from the CONTROLLER checkout (lookup runs on the controller
+# even inside a target play; rstrip=false: the exact bytes) and compared with its declared digest, and the aggregate
+# is recomputed with the EXISTING recipe (profile consumer_interface comment: sha256 of the lines "<sha256>  <path>\n",
+# paths relative to testing/remote_harness, sorted by path; == transfer.j2:439-443) and compared with the declared
+# interface_sha256. No new digest format and no loader. LIMIT (stated, not claimed away): refuse_pinned_outputs.yml and
+# THIS file are consumed before any resolved declaration exists, so for those two members this check DETECTS drift
+# (the run refuses before any further member is consumed) but cannot PREVENT their own consumption; their pre-execution
+# custody stays B's check.yml (transfer.j2:418-443) and G's controls pins.
+- name: Refuse a consumer interface whose member bytes are not the resolved declaration (before any other member is consumed)
+  vars:
+    _ci: "{{ lme_resolved.remote_harness.policy.controller.bootstrap.consumer_interface | default(none) }}"
+    _l: >-
+      {%- set ns = namespace(o=[]) -%}
+      {%- for rel in (_ci.files | default({})) | list | sort -%}
+      {%- set ns.o = ns.o + [[rel, lookup('ansible.builtin.file', rh_repo_root ~ '/testing/remote_harness/' ~ rel, rstrip=false) | hash('sha256')]] -%}
+      {%- endfor -%}{{ ns.o }}
+    # the recipe's listing, from the ACTUAL digests: "<sha256>  <rel>\n" per member, sorted by rel
+    _txt: "{{ _l | map('reverse') | map('join', '  ') | map('regex_replace', '$', '\n') | join('') }}"
+  ansible.builtin.assert:
+    that:
+      - _ci is mapping
+      - _ci.revision | default('') is integer
+      - _ci.files | default(none) is mapping and _ci.files | length > 0
+      - _ci.interface_sha256 | default('') is match('^[0-9a-f]{64}$')
+      - _l | map('last') | list == _l | map('first') | map('extract', _ci.files) | list
+      - (_txt | hash('sha256')) == _ci.interface_sha256
+    fail_msg: >-
+      REFUSED RH-ROUTE-INTERFACE: the resolved consumer interface (revision {{ _ci.revision | default('?') }},
+      {{ _ci.interface_sha256 | default('?') }}) does not describe the checkout's bytes. Drifted members:
+      {% for p in _l if p[1] != (_ci.files[p[0]] | default('')) %}{{ p[0] }}={{ p[1] }} (declared {{ _ci.files[p[0]] | default('?') }}) {% endfor %}.
+      Republish the interface (revision, members, aggregate) through C1 before any consumer runs; nothing further was
+      included.
+    quiet: true
+
 - name: Report the resolved harness policy (audit of admitted overrides; not revision-bound)
   ansible.builtin.debug:
     msg: >-

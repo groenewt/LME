@@ -312,12 +312,17 @@ cases:
   # Bound roles: prereq_preserved_units (-> inactive_not_enabled), prereq_retired_units (-> retired_absent),
   # prereq_verified_no_prior_deployment (bool), obs_unit_patterns (discovery selectors). <u> = a synthetic unit
   # lme-tpcase-<n>.service installed by MAIN on the disposable VM; never a real LME unit, never graph.
-# COVERAGE LIMITS (codex-tick370; no case here can prove more): service_facts lists SYSTEM .service units only -- no
-# .timer / .socket / .path units and no user-manager units; status `generated` is ADMITTED despite possible autostart
-# until ownership/lifecycle evidence is joined; ABSENT = not listed, or status in absent_status [not-found] AND state
-# in absent_states [inactive] -- a listed not-found unit is reported `running` or `stopped` (sub-state only), so it is
-# never proven inactive and refuses loaded_without_unit_file (PV10-PV14; join TP4-ACTIVESTATE-PROBE).
-# "not listed" = no unit file AND not loaded (never started, or stopped then removed + daemon-reload, no reference).
+# COVERAGE LIMITS (codex-tick370, codex-tick375-377; no case here can prove more): DISCOVERY is service_facts, which
+# lists SYSTEM .service units only -- no .timer / .socket / .path units and no user-manager units. Every declared
+# expectation and every absence is decided by the exact-unit PROBE (decl r4 preservation.probe: systemctl show
+# LoadState/ActiveState/SubState/UnitFileState); UnitFileState `generated` is ADMITTED despite possible autostart until
+# ownership/lifecycle evidence is joined. ABSENT = probe LoadState not-found AND ActiveState inactive (and service_facts
+# does not list it running). Retirement authority stays obstructed (JOIN-NATIVE-LEDGER-PRODUCER).
+# PROBE GATE: every case whose member set or verified_none matches are non-empty needs route join TP4-PROBE-TOOL
+# (systemctl admitted as a privileged-contact tool); until then each such unit is probe_unknown (PV20) -- the positive
+# known_set cases (PV09, PV14, PV16, PV17) are red until the join. verified_none cases with NO match probe nothing.
+# PROBE INJECTION (PV19): a missing field / an out-of-enum value cannot be produced by a stock systemd; those cases need
+# the declared-missing injection harness (no runner exists) and stay declarations.
   - id: PV01-known-member-absent-refused-never-shrunk
     finding: codex-tick360 rule 3 (absence must not silently shrink a known set)
     pre_state: {inputs: 'known_set members [<u1>, <u2>] (inactive_not_enabled)', target: '<u1> present inactive disabled; <u2> has no unit file and is not loaded (not listed)'}
@@ -406,7 +411,98 @@ cases:
     finding: PREREQ-RUNNING-NOTFOUND-ABSENCE (neighbour; absence proven by not listed)
     pre_state: {inputs: 'known_set: prereq_retired_units [<u5>]', target: '<u5> stopped, unit file removed + daemon-reload, no remaining reference (not listed by service_facts)'}
     expect: {rc: 0, record: 'members.<u5> {observed: null, outcome: as_expected}; refusals []'}
-    note: a retirement that leaves a drop-in (e.g. graph's 90-lme-preserved-*.conf) keeps the unit loaded not-found and refuses until MAIN reconciles (TP4-ACTIVESTATE-PROBE)
+    note: >-
+      adjusted (codex-tick375-377): absence is now PROBED (LoadState not-found, ActiveState inactive), so a retirement
+      that leaves a drop-in keeps the unit LISTED not-found yet evaluates as_expected (PV17) instead of refusing; the
+      earlier note (refuses until TP4-ACTIVESTATE-PROBE) described the service_facts-only source.
+  # ---------------- codex-tick375-377 SERVICE-FACTS-BAD-STATES-MASKING: the exact-unit probe decides ----------------
+  - id: PV15-known-member-failed-enabled-refused
+    finding: SERVICE-FACTS-BAD-STATES-MASKING (the confirmed counterexample)
+    pre_state:
+      inputs: 'known_set [<u1>] inactive_not_enabled'
+      target: '<u1> unit file present, `systemctl enable <u1>`, started with ExecStart=/bin/false so it ends failed'
+      observed_by: 'service_facts {state: stopped, status: failed} (failed kept over UnitFileState); probe {LoadState: loaded, ActiveState: failed, SubState: failed, UnitFileState: enabled}'
+    expect:
+      rc: fail
+      out: [RH-TARGET-PREREQ-PREFLIGHT, RH-TARGET-PREREQ-PRESERVATION, 'declared inactive_not_enabled but observed failed', native_service_remove]
+      record: 'members.<u1> {outcome: failed, probe.fields.UnitFileState: enabled, probe.ok: true}'
+    unchanged: ['<u1> ActiveState (still failed) and UnitFileState (still enabled)']
+    discriminates: 'the service_facts-only evaluation (status failed not in [enabled, enabled-runtime], state stopped not running) yields as_expected and rc 0'
+  - id: PV16-known-member-inactive-disabled-admitted
+    finding: SERVICE-FACTS-BAD-STATES-MASKING (positive neighbour)
+    pre_state: {inputs: 'known_set [<u1>] inactive_not_enabled', target: '<u1> unit file present, disabled, never started (probe {loaded, inactive, dead, disabled})'}
+    expect: {rc: 0, record: 'members.<u1> {outcome: as_expected, probe: {ok: true, rc: 0, fields: {LoadState: loaded, ActiveState: inactive, SubState: dead, UnitFileState: disabled}}}; refusals []'}
+    unchanged: [<u1>]
+  - id: PV17-retired-member-loaded-not-found-inactive-admitted
+    finding: probed absence (a retirement that left a drop-in)
+    pre_state: {inputs: 'known_set: prereq_retired_units [<u5>]', target: '<u5> stopped, unit file removed, a drop-in <u5>.d/90-x.conf kept, daemon-reload (listed; probe {not-found, inactive, dead, ""})'}
+    expect: {rc: 0, record: 'members.<u5> {observed: {status: not-found}, probe.fields.LoadState: not-found, outcome: as_expected}'}
+    unchanged: [<u5>.d]
+  - id: PV18-probe-rc-nonzero-refused-in-target-prereq
+    finding: probe_unknown (rc != 0)
+    pre_state: {inputs: 'known_set [<u1>] inactive_not_enabled', target: 'disposable target where systemctl show fails (systemd not PID 1: "System has not been booted with systemd", rc 1)'}
+    expect:
+      rc: fail
+      out: [RH-TARGET-PREREQ-PRESERVATION, 'observed probe_unknown', 'rc 1']
+      record: 'members.<u1> {outcome: probe_unknown, probe: {ok: false, rc: 1, stderr: <first stderr_max chars>}}; no effect ran (prereq.json absent)'
+    unchanged: ['/etc/passwd', <work root>]
+  - id: PV19-probe-missing-field-or-unknown-enum-refused
+    finding: probe_unknown (incomplete / untyped probe)
+    pre_state:
+      inputs: 'known_set [<u1>] inactive_not_enabled'
+      injection: '(a) the probe stdout lacks UnitFileState; (b) ActiveState=hibernating (outside the declared enum); (c) a repeated LoadState line -- via the declared-missing injection harness only'
+    expect:
+      rc: fail
+      out: [RH-TARGET-PREREQ-PRESERVATION, probe_unknown]
+      record: "members.<u1>.probe.error names (a) 'missing field UnitFileState' / (b) 'ActiveState=\"hibernating\" outside its declared enum' / (c) 'unexpected or repeated line'"
+    status: declared; needs the injection harness (missing)
+  - id: PV20-probe-tool-not-admitted-refused
+    finding: probe_unknown (route join TP4-PROBE-TOOL absent)
+    pre_state: {inputs: 'known_set [<u1>]', policy: 'systemctl NOT in target_bootstrap.initial_contact.privileged.executed_after_custody (current profile)'}
+    expect:
+      rc: fail
+      out: [RH-TARGET-PREREQ-PRESERVATION, probe_unknown, 'is not an admitted privileged-contact tool']
+      record: 'preservation.probe {tool: systemctl, tool_admitted: false}; members.<u1>.outcome probe_unknown; no systemctl executed'
+  - id: PV21-verified-none-loaded-not-found-inactive-admitted
+    finding: probed absence on verified_none (neighbour of PV12)
+    pre_state: {inputs: 'verified_none true, obs_unit_patterns [lme-tpcase-*]', target: '<u6> listed not-found inactive (file removed, drop-in kept, daemon-reload)'}
+    expect: {rc: 0, record: 'outside_known.<u6> {status: not-found, probe.fields: {LoadState: not-found, ActiveState: inactive}}; refusals []'}
+  # codex-tick389 R1 (verified_none outside-known: ONE classification decides both the reason and the route; the
+  # pre-fix route was chosen by probe.ok alone, so a valid but contradictory or present probe got the absent-file
+  # removal route). PV02 never discriminated this: its `out` names no route.
+  - id: PV22-verified-none-contradictory-valid-probe-routes-probe-unknown
+    finding: codex-tick389 R1 (contradictory observation keeps probe_unknown refusal AND its null-mechanism route)
+    pre_state:
+      inputs: 'prereq_verified_no_prior_deployment true, obs_unit_patterns [lme-tpcase-*]'
+      injection: >-
+        service_facts lists <u1> {state: running} while the exact-unit probe of <u1> is valid (rc 0, every field once,
+        in enum) with ActiveState inactive -- the two observations are separate tasks, so stock systemd yields this
+        only by a race; via the declared-missing injection harness only
+    expect:
+      rc: fail
+      out: [RH-TARGET-PREREQ-PRESERVATION, 'declared verified_none', 'probe_unknown (service_facts lists it running, probe ActiveState inactive',
+            'outcome probe_unknown', 'MAIN resolves the probe obstruction']
+      out_absent: [native_service_remove, testing/e2e/reclaim/reclaim.yml, LOADED WITHOUT ITS UNIT FILE]
+      record: 'preservation.outside_known.<u1> {state: running, probe: {ok: true, fields.ActiveState: inactive}}; refusals name route {mechanism: null}'
+    unchanged: [<u1>]
+    discriminates: 'the pre-fix route (probe_unknown only if not probe.ok) gives this valid probe route loaded_without_unit_file (native_service_remove) and fails out_absent'
+    status: declared; needs the injection harness (missing)
+  - id: PV23-verified-none-valid-present-match-classified-present-not-removal
+    finding: codex-tick389 R1 (a valid PRESENT outside-known unit is classified separately, never given the absent-file route)
+    pre_state: {inputs: 'prereq_verified_no_prior_deployment true, obs_unit_patterns [lme-tpcase-*]', target: '<u1> unit file present, disabled, inactive (probe {loaded, inactive, dead, disabled})'}
+    expect:
+      rc: fail
+      out: [RH-TARGET-PREREQ-PRESERVATION, 'declared verified_none', 'unclassified_present: present (LoadState loaded, ActiveState inactive)',
+            'outcome unclassified_present', 'ROUTE UNDECLARED: routes.unclassified_present']
+      out_absent: [native_service_remove, testing/e2e/reclaim/reclaim.yml, LOADED WITHOUT ITS UNIT FILE, 'outcome loaded_without_unit_file']
+      record: 'preservation.outside_known.<u1> {probe: {ok: true, fields: {LoadState: loaded, ActiveState: inactive}}}; refusals non-empty'
+    unchanged: [<u1>]
+    discriminates: 'the pre-fix route gives a valid present unit route loaded_without_unit_file (native_service_remove) and fails out_absent'
+    note: >-
+      GATED on the C1 route join (routes.unclassified_present: {mechanism: null, action} in the profile data, the
+      global.yml contract_admission.target_prereq exact-key pin and the decl r4 mirror). Until then the refusal carries
+      the fail-closed marker asserted above; once joined, 'ROUTE UNDECLARED' becomes the declared action text and
+      out_absent is unchanged. Needs TP4-PROBE-TOOL like every probed case (else probe_unknown, PV20).
   # ---------------- prereq_observe.yml (testing/e2e/target_prereq; MAIN-only, read-only, no owner key) ----------------
   - id: OB01-observe-no-owner-key-dependency
     finding: codex-tick360 rule 6 (no generated owner key; nothing an effect creates)
@@ -436,6 +532,14 @@ cases:
       rc_meaning: 'rc 0 is NOT a clean observation: it includes observation errors (obs_paths_error, a rescued preflight stop in preflight.refusals) and findings; consumers read the record, never the rc alone'
     unchanged: [/mnt/lme-tpcase-fuse]
     discriminates: 'a consumer that treats rc 0 as "observed clean" misses the error and fails this case'
+  - id: OB09-observe-probe-unknown-recorded-not-enforced
+    finding: codex-tick375-377 (prereq_observe may run and RETAIN probe errors; never enforced)
+    pre_state: {inputs: 'known_set [<u1>]', target: 'each PV18 / PV19 / PV20 pre-state in turn'}
+    expect:
+      rc: 0
+      record: 'preservation.probe.results.<u1> {ok: false, rc, stderr, error} retained; findings include RH-TARGET-PREREQ-PRESERVATION <u1> ... probe_unknown'
+      rc_meaning: 'rc 0 with probe_unknown findings; the record, not the rc, is the result'
+    unchanged: [<u1>]
   - id: OB05-observe-contact-not-admitted-recorded-then-refused
     finding: observe record even on a failed contact
     pre_state: {target: 'the privileged system interpreter is not the declared version'}

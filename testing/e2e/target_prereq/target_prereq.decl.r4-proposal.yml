@@ -50,26 +50,56 @@ target_prereq_r4_delta:
           means: verified no prior deployment on this member
           role: prereq_verified_no_prior_deployment    # bool target input; must be true when present (false refuses)
           requires: [the discovery selector role is bound (non-empty), no member role is bound]
-          check: any LISTED unit matching the discovery selectors REFUSES unless its status is in absent_status AND its state is in absent_states
+          check: any LISTED unit matching the discovery selectors is PROBED and REFUSES unless its probe LoadState is in absent_status AND its probe ActiveState is in absent_states (probe_unknown refuses)
       # EXPECTED-STATE vocabulary (per member; rule 1). One string_list target-input role per state (no new pattern:
       # both roles use the registered service_name pattern). A unit named in two roles refuses (conflicting basis).
       expected_states:
         inactive_not_enabled:
           role: prereq_preserved_units                 # existing role (var lme_lab_preserved_units)
           present: required
-          refused_states: [running]                    # moved from r3 hypervisor.preserved_refused_states
-          refused_status: [enabled, enabled-runtime]   # moved from r3 hypervisor.preserved_refused_status
+          # codex-tick375-377 SERVICE-FACTS-BAD-STATES-MASKING: decided from the PROBE fields, never from service_facts
+          # state/status (these three REPLACE refused_states [running] / refused_status [enabled, enabled-runtime]).
+          load_states: [loaded]                        # a preserved unit keeps its unit file (masked/error/... -> load_refused)
+          active_states: [inactive]                    # failed -> outcome failed; probe.running_states -> outcome running
+          # UnitFileState admitted; every other enum value -> outcome enabled (enabled, enabled-runtime, linked,
+          # linked-runtime, alias, indirect, transient, masked, masked-runtime, bad, ''). TIGHTENED over r3 (linked /
+          # indirect / alias / transient now refuse); `generated` (podman quadlet) stays ADMITTED despite possible
+          # autostart through generator wants links -- the existing limit, until ownership/lifecycle evidence is joined;
+          # `static` stays admitted (no [Install]; started only as a dependency).
+          unit_file_states: [disabled, static, generated]
         retired_absent:
           role: prereq_retired_units                   # NEW role (C1 join TP4-ROLE-RETIRED)
           present: refused                             # present again = an interrupted / reverted retirement
-      absent_status: [not-found]                       # service_facts status of a LOADED unit whose unit file is gone
-      # ABSENT (codex-tick370 PREREQ-RUNNING-NOTFOUND-ABSENCE) == NOT LISTED by service_facts, OR status in absent_status
-      # AND state in absent_states. Any other state with an absent_status is outcome loaded_without_unit_file (refuses,
-      # route recorded) for every basis. service_facts reports a not-found unit (list-units only) as `running` or
-      # `stopped`, where `stopped` means only sub-state != running (exited / activating / auto-restart / failed are all
-      # `stopped`), so `stopped` is NOT runtime inactivity and is not admitted: with service_facts as the source a
-      # listed not-found unit is never proven inactive and absence today means NOT LISTED (join TP4-ACTIVESTATE-PROBE).
-      absent_states: [inactive]
+      absent_status: [not-found]                       # PROBE LoadState of a unit without a unit file (value unchanged)
+      # ABSENT (codex-tick370 PREREQ-RUNNING-NOTFOUND-ABSENCE; codex-tick375-377 TP4-ACTIVESTATE-PROBE) == probe LoadState in
+      # absent_status AND probe ActiveState in absent_states, and service_facts does not list the unit in
+      # probe.service_facts_running_states. Any other ActiveState with an absent_status LoadState is outcome
+      # loaded_without_unit_file (refuses, route recorded) for every basis. service_facts alone never proves absence
+      # (it reports a not-found unit only as running / stopped, and keeps failed / masked / not-found over the real
+      # UnitFileState).
+      absent_states: [inactive]                        # probe ActiveState (value unchanged)
+      # the declared read-only EXACT-UNIT PROBE (TP4-ACTIVESTATE-PROBE, approved codex-tick375-377). Scope: every declared
+      # member (inactive_not_enabled AND retired_absent, listed or not) and, on a verified_none member, every discovery
+      # match; nothing on basis undeclared. ok == rc 0 AND every field exactly once AND no other line AND every value in
+      # its enum; anything else (incl. a tool not admitted, a name outside unit_regex, a skipped item, service_facts
+      # listing it running while ActiveState is not in running_states) is outcome probe_unknown -- REFUSED by
+      # target_prereq.yml before any effect, RECORDED (findings, never enforced) by prereq_observe.yml.
+      probe:
+        tool: systemctl                                # os_tools ROLE (path + identity from os_tools; admission = join TP4-PROBE-TOOL)
+        argv: ['{tool}', show, '--property={properties}', --no-pager, '--', '{unit}']   # {tool} admitted path; {properties} fields joined by ','; {unit} ONE exact name
+        fields: [LoadState, ActiveState, SubState, UnitFileState]
+        enums:                                         # closed typed domains (systemd unit / service vocabulary); outside -> probe_unknown
+          LoadState: [stub, loaded, not-found, bad-setting, error, merged, masked]
+          ActiveState: [active, reloading, inactive, failed, activating, deactivating, maintenance, refreshing]
+          SubState: [dead, condition, start-pre, start, start-post, running, exited, reload, reload-signal, reload-notify,
+                     stop, stop-watchdog, stop-sigterm, stop-sigkill, stop-post, final-watchdog, final-sigterm,
+                     final-sigkill, failed, dead-before-auto-restart, failed-before-auto-restart, dead-resources-pinned,
+                     auto-restart, auto-restart-queued, cleaning]
+          UnitFileState: [enabled, enabled-runtime, linked, linked-runtime, alias, masked, masked-runtime, static, indirect,
+                          disabled, generated, transient, bad, '']   # '' == no unit file (a not-found unit)
+        running_states: [active, reloading, activating, deactivating, maintenance, refreshing]   # ActiveState -> outcome running
+        service_facts_running_states: [running]        # discovery state that contradicts a non-running probe -> probe_unknown
+        stderr_max: 500                                # retained stderr characters per probe
       # outcome -> route (rule 5). The preflight RECORDS the outcome and the route and refuses; it never starts, stops,
       # enables, disables or masks a unit, and never touches a unit outside the declared selection.
       routes:
@@ -93,7 +123,16 @@ target_prereq_r4_delta:
             never a route.
         enabled: *retire
         present_after_retirement: *retire
-        loaded_without_unit_file: *retire              # listed, absent_status, state not in absent_states (every basis)
+        loaded_without_unit_file: *retire              # probe LoadState absent_status, ActiveState not in absent_states (every basis)
+        failed: *retire                                # inactive_not_enabled member with probe ActiveState failed (codex-tick375-377)
+        load_refused:                                  # inactive_not_enabled member with LoadState outside load_states (masked, error, ...)
+          mechanism: null
+          action: MAIN reconciles the declaration against the probe record (a masked / broken unit is never adopted or repaired here).
+        probe_unknown:                                 # probe not ok / disagreeing (codex-tick375-377)
+          mechanism: null
+          action: >-
+            MAIN resolves the probe obstruction recorded per unit (tool admission TP4-PROBE-TOOL, rc, missing field,
+            enum value) through the declared observation; never an ad hoc systemctl run, never adoption or absence by default.
       # DISCOVERY (rule 2): a declared bounded selector where names are not recorded. Matches outside the member set
       # are RECORDED (unclassified). Observation alone grants no ownership or retirement authority.
       discovery:
@@ -106,14 +145,15 @@ target_prereq_r4_delta:
           units (e.g. lme-llama-model.path) and user-manager units are NOT seen; the route's observe.yml O-PRIOR-STATE
           job (system-units / user-units) covers those as recorded evidence. A clean RERUN (cases DR07 / PF14) stays
           positive only because the new stack's units are owner (user-manager) units: a SYSTEM unit named by a
-          selector (lme-*) that runs refuses as an unclassified running match. inactive_not_enabled refuses only
-          UnitFileState enabled / enabled-runtime (r3 values): a podman-quadlet unit reports `generated` and can still
-          autostart through generator wants links, yet evaluates as_expected -- MAIN checks the observed status of
-          each member in the observe record before trusting the expectation (UNRESOLVED; a `generated` refusal would
-          be a further changed node). `generated` stays ADMITTED despite possible autostart until exact ownership /
-          lifecycle evidence is joined. Absence is proven only by NOT LISTED (absent_states: a listed not-found unit
-          is never proven inactive by service_facts). The observation stages ordinary admitted Ansible module
-          payloads under the root module temp; no deployment-state mutation is intended.
+          selector (lme-*) that runs refuses as an unclassified running match. service_facts only DISCOVERS; every
+          declared expectation and every absence is decided from the exact-unit probe (preservation.probe).
+          inactive_not_enabled admits UnitFileState disabled / static / generated: a podman-quadlet unit reports
+          `generated` and can still autostart through generator wants links, yet evaluates as_expected -- MAIN checks
+          the probe record of each member before trusting the expectation (UNRESOLVED; a `generated` refusal would be
+          a further changed node). `generated` stays ADMITTED despite possible autostart until exact ownership /
+          lifecycle evidence is joined. Retirement authority stays obstructed (native ownership ledger producer
+          JOIN-NATIVE-LEDGER-PRODUCER open). The observation stages ordinary admitted Ansible module payloads under the
+          root module temp; no deployment-state mutation is intended.
         outside_known:
           refused_states: [running]                    # known_set: an unclassified RUNNING match refuses (recorded)
       # the read-only OBSERVATION leg that seeds the declaration (rules 2, 6; testing/e2e/target_prereq/prereq_observe.yml)
@@ -139,7 +179,7 @@ target_prereq_r4_delta:
         scope: '{id, scope_sha256}'
         declared: '{preservation: {basis, members: {<unit>: <expected state>}, selectors}, obs_paths}'
         preflight: 'the lme-target-prereq-preflight/v2 body (contact, principal, endpoint, paths incl. the work parent chain, account, os_family, packages, preservation, capacity, linger_tool, refusals)'
-        preservation: 'preflight.preservation: {basis, selectors, selector_regex, evaluated, members: {<unit>: {expected, observed: {state, status, source, selected_by}, outcome, route}}, outside_known: {<unit>: {state, status, source, selected_by}}, limit, refusals}'
+        preservation: 'preflight.preservation: {basis, selectors, selector_regex, evaluated, members: {<unit>: {expected, observed: {state, status, source, selected_by}, probe: {ok, rc, fields, stderr, error}, outcome, route}}, outside_known: {<unit>: {state, status, source, selected_by, probe}}, limit, probe: {tool, tool_admitted, fields, units, results}, refusals}'
         obs_paths: '{<entry>: {chain: {<ancestor or entry>: {exists, type, uid, gid, owner, group, mode}}, listing: {<child path>: {type, uid, gid, owner, group, mode}} | null, listing_skipped: [...]}}'
         findings: preflight refusals + preservation refusals (collected; not enforced by this leg)
         contact: admitted | not_admitted
@@ -152,9 +192,10 @@ consumed_by_source:
   - preservation.refusal
   - preservation.unit_regex
   - preservation.bases              # key set (known_set, verified_none) + bases.verified_none.role
-  - preservation.expected_states    # key set + each .role, .present, .refused_states, .refused_status
+  - preservation.expected_states    # key set + each .role, .present; inactive_not_enabled .load_states, .active_states, .unit_file_states (codex-tick375-377; .refused_states / .refused_status no longer read)
   - preservation.absent_status
   - preservation.absent_states      # codex-tick370
+  - preservation.probe              # codex-tick375-377: .tool, .argv, .fields, .enums.<field>, .running_states, .service_facts_running_states, .stderr_max
   - preservation.routes             # the whole mapping, recorded verbatim per outcome
   - preservation.discovery.selector_role
   - preservation.discovery.selector_regex
@@ -194,13 +235,28 @@ joins:
       reserved_prereq_vars and the bare-name guard); no new family. If the route's observation registry
       (controller.bootstrap.observation) must list prereq_observe.yml as a declared observation playbook, route adds it.
   - id: TP4-ACTIVESTATE-PROBE
-    owner: route + C1 (privileged tool admission)
+    owner: C1
+    status: approved (codex-tick375-377); B source implements it (prereq_preflight.yml probe + evaluation)
+    what: register the preservation.probe leaves and the inactive_not_enabled load_states / active_states /
+      unit_file_states leaves and the routes failed / load_refused / probe_unknown; drop the unread
+      inactive_not_enabled refused_states / refused_status.
+  - id: TP4-PROBE-TOOL
+    owner: route
     what: >-
-      codex-tick370: an ADMITTED read-only probe of systemd ActiveState/SubState for listed absent_status units (e.g.
-      systemctl show --property=Id,LoadState,ActiveState,SubState) -- systemctl is not among the privileged-contact
-      tools and ansible.builtin.systemd_service requires a mutating parameter, so B adds none. Until joined, a listed
-      not-found unit refuses loaded_without_unit_file (e.g. a retirement that removes the unit file but leaves a
-      drop-in keeps the unit loaded and refuses until MAIN reconciles).
+      privileged READ-ONLY use of os_tools ROLE `systemctl` (profile os_tools.systemctl: path /usr/bin/systemctl,
+      identity file_sha256 848c70d7...; currently required_by [observation]) by the target_prereq preflight
+      (target_prereq.yml and prereq_observe.yml, root, argv only, subcommand `show` only). Needed admission fields:
+      (1) systemctl in target_bootstrap.initial_contact.privileged.tools AND privileged.executed_after_custody (so
+      privileged INITIAL CONTACT 1 digests it against os_tools.systemctl.identity and the custody walk admits its chain;
+      _rh_tb_ic_tools.systemctl.path is then the only path the probe executes); (2) os_tools.systemctl.required_by
+      gains target_prereq (a declared target consumer) -- or route names the admitted label; (3) the per-host identity
+      of systemctl on graph through the admitted os_tools.*.identity override (controller-fixture digest proves nothing
+      about graph). Until joined every probe item is skipped and every probed unit is probe_unknown (target_prereq.yml
+      refuses before any effect; prereq_observe.yml records it).
+  - id: TP4-PROBE-NAMES
+    owner: C1 (reserved outputs)
+    what: new derived names in prereq_preflight.yml -- set_fact _tp_pv_sel, register _tp_pv_probe (both in the _tp_
+      family already refused by the family guard; add to the exact reserved list if C1 enumerates registers).
   - id: TP4-LAB-DECLARATION
     owner: coordinator (graph_lab_example.yml)
     what: the graph host vars snippet in the B hand-back (preservation basis + members + selectors + obs_paths).

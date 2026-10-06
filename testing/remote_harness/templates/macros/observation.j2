@@ -1,0 +1,334 @@
+{#- testing/remote_harness/templates/macros/observation.j2 -- GENUINE, PARAMETERIZED Jinja macros of the generic
+    read-only observation runner (testing/remote_harness/observe.yml; profile controller.bootstrap.observation). They
+    turn the DATA of jobs/observations.yml (schema lme-observation-jobs/1) into commands and records; they execute
+    nothing. Every macro prints ONE JSON value (to_json), which the playbook reads back with from_json.
+      jobs = the bound job file (observation.jobs_rel, sha256 == observation.jobs_sha256)
+      ot   = the host's resolved os_tools (rh.controller.bootstrap.os_tools of THAT host's resolve)
+      loc  = the host's resolved base_env.LC_ALL (jobs.semantics.locale_from)
+      oti  = the host's resolved os_tool_identity (owner_uid, known_answers)
+      pv   = the resolved packages.provides (a missing tool is named with its logical package)
+    Only the vocabulary declared in jobs.semantics is implemented; anything else is reported as a validation error
+    (validate) and the runner refuses before any contact. No value reaches a command unless it matched its declared
+    parameter type (admit); no declared type admits `{`, `}`, whitespace, a quote or a backslash.
+    EXACT DISTINCTNESS (codex-tick315 OBS-CASE-SENSITIVE-COVERAGE): every `unique` / `sort` here is case_sensitive=true.
+    Ansible's `unique` without it is Jinja's do_unique(case_sensitive=False) (ansible filter/mathstuff.py passes
+    bool(None)), which would collapse /data/A and /data/a, LME-* and lme-*, or two case-distinct extracted values into
+    ONE instance. -#}
+
+{#- the job's tool names: semantics.runner_tools + argv[0] of every step (the {tool:<name>} token) -#}
+{%- macro job_tools(jobs, job) -%}
+{%- set ns = namespace(t=[]) -%}
+{%- for s in job.steps -%}{%- set ns.t = ns.t + [s.argv[0][6:-1]] -%}{%- endfor -%}
+{{ (jobs.semantics.runner_tools + ns.t) | unique(case_sensitive=true) | list | to_json }}
+{%- endmacro -%}
+
+{#- '' when value val of parameter n is admitted, else the reason. within: the value must lie strictly under
+    <prefix><an accepted value of yield>/ taken from THIS host's earlier records -#}
+{%- macro admit(pr, n, val, records) -%}
+{%- set t = pr[n] if n in pr else none -%}
+{%- if t is none -%}undeclared parameter {{ n }}
+{%- elif val is not string or val is not match(t.regex) -%}{{ n }}: value fails its declared type
+{%- elif t.forbidden_regex is defined and val is search(t.forbidden_regex) -%}{{ n }}: value has a forbidden form
+{%- elif t.within is defined -%}
+{%- set w = namespace(ok=false) -%}
+{%- for r in records -%}{%- for p in (r.yields | default({}))[t.within.yield] | default([]) -%}{%- if val.startswith(t.within.prefix ~ p ~ '/') -%}{%- set w.ok = true -%}{%- endif -%}{%- endfor -%}{%- endfor -%}
+{%- if not w.ok -%}{{ n }}: value is not under {{ t.within.prefix }}<{{ t.within.yield }}>/{%- endif -%}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- the placeholder names of one argv word ({name}); an unterminated one is reported as '<unterminated>' -#}
+{%- macro word_names(w) -%}
+{%- set ns = namespace(n=[]) -%}
+{%- for p in w.split('{')[1:] -%}{%- set kv = p.split('}', 1) -%}{%- set ns.n = ns.n + [kv[0] if kv | length == 2 else '<unterminated>'] -%}{%- endfor -%}
+{{ ns.n | to_json }}
+{%- endmacro -%}
+
+{#- validate(jobs, ot): every job of the file against the closed vocabulary; prints the list of errors ([] = valid) -#}
+{%- macro validate(jobs, ot) -%}
+{%- set sem = jobs.semantics | default({}) -%}
+{%- set pr = jobs.parameters | default({}) -%}
+{%- set hin = jobs.target_inputs | default({}) -%}
+{%- set e = namespace(l=[]) -%}
+{%- if jobs.schema | default('') != 'lme-observation-jobs/1' -%}{%- set e.l = e.l + ['schema is not lme-observation-jobs/1'] -%}{%- endif -%}
+{%- if sem.channel | default('') != 'raw' or sem.tty | default(true) != false or sem.write | default('') != 'none' -%}{%- set e.l = e.l + ['semantics.channel/tty/write must be raw/false/none'] -%}{%- endif -%}
+{%- if sem.locale_from | default('') != 'base_env.LC_ALL' -%}{%- set e.l = e.l + ['semantics.locale_from must be base_env.LC_ALL'] -%}{%- endif -%}
+{%- if sem.kill_after_sec | default(0) is not number or sem.kill_after_sec < 1 or sem.kill_after_sec > 60 -%}{%- set e.l = e.l + ['semantics.kill_after_sec must be 1..60'] -%}{%- endif -%}
+{%- if sem.max_output_chars | default(0) is not number or sem.max_output_chars < 1 -%}{%- set e.l = e.l + ['semantics.max_output_chars must be a positive number'] -%}{%- endif -%}
+{%- for t in sem.runner_tools | default([]) if t not in ot -%}{%- set e.l = e.l + ['runner tool ' ~ t ~ ' is not a declared os_tools entry'] -%}{%- endfor -%}
+{#- codex-tick315 OBS-CONNECTED-PRINCIPAL: the principal read-back tool is a declared runner tool (identity-checked) -#}
+{%- if sem.principal_tool | default('') not in sem.runner_tools | default([]) -%}{%- set e.l = e.l + ['semantics.principal_tool must name one of semantics.runner_tools'] -%}{%- endif -%}
+{%- for n, t in pr.items() if t.regex is not defined or t.regex is not string or '\\' in t.regex -%}{%- set e.l = e.l + ['parameter ' ~ n ~ ' has no plain regex'] -%}{%- endfor -%}
+{%- for hv, d in hin.items() if d.param not in pr -%}{%- set e.l = e.l + ['target input ' ~ hv ~ ' names undeclared parameter ' ~ d.param] -%}{%- endfor -%}
+{#- codex-tick315 OBS-EMPTY-JOB: jobs is a non-empty mapping; every job a mapping whose steps are a NON-EMPTY list of
+    step mappings, each with a non-empty argv list (an identity-only run can never report COMPLETE) -#}
+{%- set jm = jobs.jobs | default(none) -%}
+{%- if jm is not mapping or (jm | length) == 0 -%}{%- set e.l = e.l + ['jobs must be a non-empty mapping of job id to job'] -%}{%- set jm = {} -%}{%- endif -%}
+{%- for jid, job in jm.items() -%}
+{%- if job is not mapping -%}{%- set e.l = e.l + [jid ~ ': a job must be a mapping'] -%}
+{%- else -%}
+{%- if jid is not match('^[A-Z][A-Z0-9-]*$') or job.gate | default('') not in ['READY', 'READY_ON_PRECONDITION'] or job.label | default('') not in ['PORTED', 'NEW'] -%}{%- set e.l = e.l + [jid ~ ': id, gate (READY | READY_ON_PRECONDITION) or label (PORTED | NEW) unsupported'] -%}{%- endif -%}
+{%- for cn, cv in (job.constants | default({})).items() if (admit(pr, cn, cv, []) | string) | length > 0 -%}{%- set e.l = e.l + [jid ~ ': constant ' ~ cn ~ ' not admitted'] -%}{%- endfor -%}
+{%- set st = job.steps | default(none) -%}
+{%- if st is none or st is string or st is mapping or st is not iterable or (st | length) == 0 or (st | reject('mapping') | list | length) > 0 -%}{%- set e.l = e.l + [jid ~ ': steps must be a non-empty list of step mappings'] -%}{%- set st = [] -%}{%- endif -%}
+{%- set seen = namespace(ids=[], yields={}) -%}
+{%- for s in st -%}
+{%- set sid = jid ~ '/' ~ (s.id | default('?')) -%}
+{%- if s.id | default('') is not match('^[a-z0-9][a-z0-9-]*$') or s.id in seen.ids -%}{%- set e.l = e.l + [sid ~ ': step id missing, malformed or repeated'] -%}{%- endif -%}
+{%- set av = s.argv | default(none) -%}
+{%- if av is none or av is string or av is mapping or av is not iterable or (av | length) == 0 -%}{%- set e.l = e.l + [sid ~ ': argv must be a non-empty list'] -%}{%- set av = [''] -%}{%- endif -%}
+{%- set inp = s.input | default({}) -%}
+{%- set allowed = namespace(n=(job.constants | default({})) | list) -%}
+{%- if inp.kind | default('') not in sem.input_kinds -%}{%- set e.l = e.l + [sid ~ ': input kind unsupported'] -%}
+{%- elif inp.kind == 'host_list' -%}
+{%- if inp.target_input | default('') not in hin or hin[inp.target_input].param != inp.param | default('') -%}{%- set e.l = e.l + [sid ~ ': host_list must name a declared target input and its parameter'] -%}{%- endif -%}
+{%- set allowed.n = allowed.n + [inp.param | default('')] -%}
+{%- elif inp.kind == 'from_step' -%}
+{%- if inp.step | default('') not in seen.yields or inp.yield | default('') not in seen.yields[inp.step] or seen.yields[inp.step][inp.yield] != inp.param | default('') or inp.on_empty | default('') not in sem.on_empty -%}{%- set e.l = e.l + [sid ~ ': from_step must name an EARLIER step, one of its yields, that yield''s parameter and a declared on_empty'] -%}{%- endif -%}
+{%- set allowed.n = allowed.n + [inp.param | default('')] -%}
+{%- endif -%}
+{%- set a0 = av[0] | string -%}
+{%- if not (a0.startswith('{tool:') and a0.endswith('}')) or a0[6:-1] not in ot -%}{%- set e.l = e.l + [sid ~ ': argv[0] must be {tool:<declared os_tools name>}'] -%}{%- endif -%}
+{%- for w in (av | list)[1:] -%}
+{%- if w is not string -%}{%- set e.l = e.l + [sid ~ ': argv words must be strings'] -%}
+{%- else -%}
+{%- for n in word_names(w) | from_json if n not in allowed.n -%}{%- set e.l = e.l + [sid ~ ': placeholder {' ~ n ~ '} is not this step''s input parameter or a job constant'] -%}{%- endfor -%}
+{%- if '}' in w.split('{') | last and (w.split('{') | length) == 1 -%}{%- set e.l = e.l + [sid ~ ': stray }'] -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if s.timeout_sec | default(0) is not number or s.timeout_sec < 1 or s.timeout_sec > 600 -%}{%- set e.l = e.l + [sid ~ ': timeout_sec must be 1..600'] -%}{%- endif -%}
+{%- if s.on_failure | default('') not in sem.on_failure -%}{%- set e.l = e.l + [sid ~ ': on_failure unsupported'] -%}{%- endif -%}
+{%- if (s.allowed_rc | default([])) | select('in', [0] + sem.rc_classes.timeout + sem.rc_classes.tool_missing + [125]) | list | length > 0 -%}{%- set e.l = e.l + [sid ~ ': allowed_rc may not re-classify 0, timeout, tool_missing or 125'] -%}{%- endif -%}
+{%- if s.precondition_false is defined and (s.precondition_false.rc is not defined or s.precondition_false.stderr_regex is not defined or '\\' in s.precondition_false.stderr_regex) -%}{%- set e.l = e.l + [sid ~ ': precondition_false needs rc and a plain stderr_regex'] -%}{%- endif -%}
+{%- set ys = namespace(m={}) -%}
+{%- for yn, y in (s.yields | default({})).items() -%}
+{%- if y.kind | default('') not in sem.extract_kinds or y.param | default('') not in pr or (y.kind in ['json', 'json_line'] and y.path is not defined) or (y.kind == 'json_line' and y.line is not number) -%}{%- set e.l = e.l + [sid ~ ': yield ' ~ yn ~ ' unsupported'] -%}{%- endif -%}
+{%- set ys.m = ys.m | combine({yn: y.param | default('')}) -%}
+{%- endfor -%}
+{%- set seen.ids = seen.ids + [s.id | default('?')] -%}
+{%- set seen.yields = seen.yields | combine({s.id | default('?'): ys.m}) -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+{{ e.l | to_json }}
+{%- endmacro -%}
+
+{#- instances(jobs, job, step, ot, hin, records, loc): the command instances of ONE step on ONE host. hin = this host's
+    BOUND target inputs (binding.deployment.target_inputs.<host>, roles named by jobs.target_inputs only); records =
+    this host's earlier records of this attempt.
+    Prints {"errors": [...], "instances": [{key, subst, argv, command}]}. An empty list with no errors is the
+    step's on_empty case (the caller records it). -#}
+{%- macro instances(jobs, job, step, ot, hin, records, loc) -%}
+{%- set sem = jobs.semantics -%}
+{%- set pr = jobs.parameters -%}
+{%- set inp = step.input -%}
+{%- set consts = job.constants | default({}) -%}
+{%- set ns = namespace(vals=[], err=[], out=[]) -%}
+{%- if inp.kind == 'once' -%}{%- set ns.vals = [none] -%}
+{%- elif inp.kind == 'host_list' -%}
+{%- set hv = hin[inp.target_input] if inp.target_input in hin else none -%}
+{%- if hv is none or hv is string or hv is mapping or hv is not iterable or (hv | length) == 0 -%}{%- set ns.err = ns.err + ['target input ' ~ inp.target_input ~ ' is not bound to a non-empty list'] -%}
+{%- else -%}{%- set ns.vals = hv | list -%}{%- endif -%}
+{%- elif inp.kind == 'from_step' -%}
+{%- for r in records if r.step == inp.step -%}{%- set ns.vals = ns.vals + ((r.yields | default({}))[inp.yield] | default([])) -%}{%- endfor -%}
+{%- else -%}{%- set ns.err = ns.err + ['input kind ' ~ inp.kind ~ ' unsupported'] -%}{%- endif -%}
+{%- for v in ns.vals | unique(case_sensitive=true) -%}
+{%- set subst = consts if v is none else (consts | combine({inp.param: v})) -%}
+{%- for n, val in subst.items() -%}{%- set why = admit(pr, n, val, records) | string -%}{%- if why | length > 0 -%}{%- set ns.err = ns.err + [step.id ~ ': ' ~ why] -%}{%- endif -%}{%- endfor -%}
+{%- set a = namespace(w=[ot[step.argv[0][6:-1]].path]) -%}
+{%- for w in step.argv[1:] -%}
+{%- set parts = w.split('{') -%}
+{%- set t = namespace(o=parts[0]) -%}
+{%- for p in parts[1:] -%}{%- set kv = p.split('}', 1) -%}
+{%- if kv | length == 2 and kv[0] in subst -%}{%- set t.o = t.o ~ subst[kv[0]] ~ kv[1] -%}{%- else -%}{%- set ns.err = ns.err + [step.id ~ ': unbound placeholder in ' ~ w] -%}{%- endif -%}
+{%- endfor -%}
+{%- set a.w = a.w + [t.o] -%}
+{%- endfor -%}
+{%- set cmd = 'export LC_ALL=' ~ (loc | quote) ~ '; exec ' ~ (([ot.timeout.path, '-k', (sem.kill_after_sec | string) ~ 's', (step.timeout_sec | string) ~ 's'] + a.w) | map('quote') | join(' ')) -%}
+{%- set ns.out = ns.out + [{'key': step.id ~ ('' if v is none else '[' ~ v ~ ']'), 'subst': subst, 'argv': a.w,
+                            'command': (ot.sh.path | quote) ~ ' -c ' ~ (cmd | quote)}] -%}
+{%- endfor -%}
+{{ {'errors': ns.err, 'instances': (ns.out if ns.err | length == 0 else [])} | to_json }}
+{%- endmacro -%}
+
+{#- the value at path of a parsed JSON value (mapping keys, list indices); none when absent -#}
+{%- macro walk(v, path) -%}
+{%- set w = namespace(v=v) -%}
+{%- for k in path -%}
+{%- if w.v is mapping and k in w.v -%}{%- set w.v = w.v[k] -%}
+{%- elif w.v is iterable and w.v is not string and w.v is not mapping and k is number and k < (w.v | length) -%}{%- set w.v = w.v[k] -%}
+{%- else -%}{%- set w.v = none -%}{%- endif -%}
+{%- endfor -%}
+{{ [w.v] | to_json }}
+{%- endmacro -%}
+
+{#- classify(jobs, step, insts, results, records, extract): one record per instance (results = the raw loop's results,
+    same order); with no instance, ONE record of the step's on_empty class (NO_INPUT / PRECONDITION_FALSE).
+    extract=true: a JSON extraction of malformed output fails the render (Jinja has no try). The caller then renders
+    AGAIN with extract=false, which records every OK instance of a step that declares yields as EXTRACT_INVALID
+    (no yield; rejected {'*': [reason]}) -- the malformed output is kept in the record, never dropped. -#}
+{%- macro classify(jobs, step, insts, results, records, extract) -%}
+{%- set sem = jobs.semantics -%}
+{%- set pr = jobs.parameters -%}
+{%- set mx = sem.max_output_chars | int -%}
+{%- set ns = namespace(out=[]) -%}
+{%- if insts | length == 0 -%}
+{%- set ns.out = [{'step': step.id, 'instance': step.id, 'argv': [], 'rc': none, 'stdout': '', 'stderr': '', 'truncated': false, 'yields': {}, 'rejected': {},
+                   'diagnostic': '', 'diagnostic_chars': 0,
+                   'class': ('PRECONDITION_FALSE' if (step.input.on_empty | default('skip')) == 'precondition_false' else 'NO_INPUT')}] -%}
+{%- endif -%}
+{%- for i in insts -%}
+{%- set r = results[loop.index0] -%}
+{%- set rc = r.rc if (r.rc is defined and r.rc is number) else none -%}
+{%- set out = r.stdout | default('') | string -%}
+{%- set err = r.stderr | default('') | string -%}
+{#- codex-tick315 OBS-FAILURE-DIAGNOSTIC: a result with NO exit status (unreachable, or a connection failure raised
+    before the command ran) carries its cause only in result.msg (no stdout / stderr); it is kept, bounded by
+    max_output_chars (diagnostic_chars = its full length). A result WITH an exit status keeps stdout / stderr and no
+    diagnostic (its msg is Ansible's generic status text, not the cause). -#}
+{%- set dg = (r.msg | default('') | string) if (rc is none or r.unreachable | default(false)) else '' -%}
+{%- if r.unreachable | default(false) -%}{%- set c = 'UNREACHABLE' -%}
+{%- elif rc is none -%}{%- set c = 'FAILED' -%}
+{%- elif rc == 0 -%}{%- set c = 'OK' -%}
+{%- elif step.precondition_false is defined and rc in step.precondition_false.rc and err is search(step.precondition_false.stderr_regex) -%}{%- set c = 'PRECONDITION_FALSE' -%}
+{%- elif rc in step.allowed_rc | default([]) -%}{%- set c = 'ALLOWED_RC' -%}
+{%- elif rc in sem.rc_classes.timeout -%}{%- set c = 'TIMEOUT' -%}
+{%- elif rc in sem.rc_classes.tool_missing -%}{%- set c = 'TOOL_MISSING' -%}
+{%- else -%}{%- set c = 'FAILED' -%}{%- endif -%}
+{%- set tr = (out | length) > mx or (err | length) > mx -%}
+{%- set k = namespace(c=('TRUNCATED' if tr and c in ['OK', 'ALLOWED_RC'] else c), y={}, rj={}) -%}
+{%- if k.c == 'OK' and not extract and (step.yields | default({})) | length > 0 -%}
+{%- set k.c = 'EXTRACT_INVALID' -%}{%- set k.rj = {'*': ['<output is not the declared JSON; extraction failed>']} -%}
+{%- elif k.c == 'OK' -%}
+{%- for yn, y in (step.yields | default({})).items() -%}
+{%- set lines = (out | replace('\r', '')).split('\n') | map('trim') | select | list -%}
+{%- if y.kind == 'json' -%}{%- set raw = walk(out | from_json, y.path) | from_json -%}
+{%- elif y.kind == 'json_line' -%}{%- set raw = (walk(lines[y.line] | from_json, y.path) | from_json) if (lines | length) > y.line else [none] -%}
+{%- elif y.kind == 'lines' -%}{%- set raw = lines -%}
+{%- else -%}{%- set raw = [out | trim | basename] if (out | trim) | length > 0 else [] -%}{%- endif -%}
+{%- set acc = namespace(a=[], rj=[]) -%}
+{%- for v in raw -%}
+{%- if v is none -%}{%- set acc.rj = acc.rj + ['<absent at declared path>'] -%}
+{%- elif v is string and v | length == 0 -%}
+{%- elif (admit(pr, y.param, v, records) | string) | length == 0 -%}{%- set acc.a = acc.a + [v] -%}
+{%- else -%}{%- set acc.rj = acc.rj + [(v | string)[:256]] -%}{%- endif -%}
+{%- endfor -%}
+{%- set k.y = k.y | combine({yn: acc.a | unique(case_sensitive=true) | list}) -%}
+{%- if acc.rj | length > 0 -%}{%- set k.rj = k.rj | combine({yn: acc.rj}) -%}{%- set k.c = 'EXTRACT_INVALID' -%}{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- set ns.out = ns.out + [{'step': step.id, 'instance': i.key, 'argv': i.argv, 'timeout_sec': step.timeout_sec, 'rc': rc, 'class': k.c,
+                            'stdout': out[:mx], 'stderr': err[:mx], 'stdout_chars': out | length, 'stderr_chars': err | length,
+                            'truncated': tr, 'yields': k.y, 'rejected': k.rj, 'diagnostic': dg[:mx], 'diagnostic_chars': dg | length}] -%}
+{%- endfor -%}
+{{ ns.out | to_json }}
+{%- endmacro -%}
+
+{#- stop(jobs, step, recs): true when no later step of the job may run on this host (a precondition is false, the host
+    is unreachable, or a bad class under on_failure: stop) -#}
+{%- macro stop(jobs, step, recs) -%}
+{%- set cls = recs | map(attribute='class') | list -%}
+{{ ('PRECONDITION_FALSE' in cls or 'UNREACHABLE' in cls
+    or (step.on_failure == 'stop' and cls | select('in', jobs.semantics.bad_classes) | list | length > 0)) | to_json }}
+{%- endmacro -%}
+
+{#- coverage(job, records, hin): codex-tick315 OBS-CASE-SENSITIVE-COVERAGE -- every step's RECORDED instance keys must
+    be exactly (same multiset, compared case-sensitively) the keys of its SELECTED values, derived independently of
+    instances(): once -> <step>; host_list -> <step>[<v>] for every exact distinct value of this host's bound target
+    input; from_step -> <step>[<v>] for every exact distinct value the named earlier step's records yielded; no
+    selected value -> the one on_empty record <step>. A job without steps is a gap too. Prints the list of gaps. -#}
+{%- macro coverage(job, records, hin) -%}
+{%- set e = namespace(l=[]) -%}
+{%- if (job.steps | default([])) | length == 0 -%}{%- set e.l = e.l + ['the job has no steps'] -%}{%- endif -%}
+{%- for s in job.steps | default([]) -%}
+{%- set inp = s.input -%}
+{%- set v = namespace(l=[]) -%}
+{%- if inp.kind == 'once' -%}{%- set v.l = [none] -%}
+{%- elif inp.kind == 'host_list' -%}{%- set v.l = (hin[inp.target_input] | default([])) | list if inp.target_input in hin else [] -%}
+{%- else -%}{%- for r in records if r.step == inp.step -%}{%- set v.l = v.l + ((r.yields | default({}))[inp.yield] | default([])) -%}{%- endfor -%}
+{%- endif -%}
+{%- set w = namespace(k=[]) -%}
+{%- for x in v.l | unique(case_sensitive=true) -%}{%- set w.k = w.k + [s.id if x is none else s.id ~ '[' ~ x ~ ']'] -%}{%- endfor -%}
+{%- if w.k | length == 0 -%}{%- set w.k = [s.id] -%}{%- endif -%}
+{%- set got = records | selectattr('step', 'equalto', s.id) | map(attribute='instance') | list -%}
+{%- if (got | sort(case_sensitive=true)) != (w.k | sort(case_sensitive=true)) -%}{%- set e.l = e.l + [s.id ~ ': recorded instances ' ~ (got | to_json) ~ ' are not the selected ' ~ (w.k | to_json)] -%}{%- endif -%}
+{%- endfor -%}
+{{ e.l | to_json }}
+{%- endmacro -%}
+
+{#- host_result(jobs, job, records, refusal, hin): the declared per-host result (semantics.host_results). COMPLETE
+    needs every step's recorded instances to be exactly its selected ones (coverage), not merely every step id. -#}
+{%- macro host_result(jobs, job, records, refusal, hin) -%}
+{%- set cls = records | map(attribute='class') | list -%}
+{%- set ran = records | map(attribute='step') | unique(case_sensitive=true) | list -%}
+{%- if 'UNREACHABLE' in cls -%}{%- set r = 'UNREACHABLE' -%}
+{%- elif refusal | length > 0 -%}{%- set r = 'REFUSED' -%}
+{%- elif cls | select('in', jobs.semantics.bad_classes) | list | length > 0 -%}{%- set r = 'INCOMPLETE' -%}
+{%- elif 'PRECONDITION_FALSE' in cls -%}{%- set r = 'PRECONDITION_FALSE' -%}
+{%- elif (job.steps | default([])) | map(attribute='id') | reject('in', ran) | list | length > 0 -%}{%- set r = 'INCOMPLETE' -%}
+{%- elif (coverage(job, records, hin) | from_json) | length > 0 -%}{%- set r = 'INCOMPLETE' -%}
+{%- else -%}{%- set r = 'COMPLETE' -%}{%- endif -%}
+{{ r | to_json }}
+{%- endmacro -%}
+
+{#- identity_command(jobs, tools, ot, oti, loc): the ONE raw identity command of a host, BEFORE any job step
+    (read-only): the declared sha256sum's known answer (os_tool_identity.known_answers), then `sha256sum --` and
+    `stat -L -c 'st|%n|%F|%u|%a' --` of every tool the job uses (tools = job_tools), then the CONNECTED PRINCIPAL read
+    back with the declared semantics.principal_tool in initial_contact.yml's line convention (`uid|<id -u>`,
+    `uname|<id -un>`; codex-tick315 OBS-CONNECTED-PRINCIPAL). Prints {"command": ...}.
+    TRUST BASIS / CUSTODY LIMIT (stated exactly; no parity with the privileged contact's tool_custody): this one command
+    EXECUTES sh, sha256sum, stat and the principal tool (id) before any of them is admitted; every other tool is only
+    read. Their outputs are admitted only afterwards, on the controller, and only together: sha256sum's known answer,
+    each tool's digest (sha256sum's and stat's included, i.e. reported by the tools under test), and each tool's stat
+    line. That stat line is FOLLOWED file metadata of the declared path (stat -L: the resolved file's type, owner uid
+    and mode) -- NOT the executable path's ancestry: the directories on the path, link hops and the resolved file's
+    parent chain are not observed or admitted here. The principal lines are used only after that admission. -#}
+{%- macro identity_command(jobs, tools, ot, oti, loc) -%}
+{%- set kat = oti.known_answers | selectattr('tool', 'equalto', 'sha256sum') | first -%}
+{%- set paths = tools | map('extract', ot) | map(attribute='path') | unique(case_sensitive=true) | list -%}
+{%- set ps = paths | map('quote') | join(' ') -%}
+{%- set pt = ot[jobs.semantics.principal_tool].path | quote -%}
+{%- set script = 'export LC_ALL=' ~ (loc | quote) ~ '; printf %s ' ~ (kat.stdin | quote) ~ ' | ' ~ (ot.sha256sum.path | quote)
+                 ~ '; ' ~ (ot.sha256sum.path | quote) ~ ' -- ' ~ ps
+                 ~ '; ' ~ (ot.stat.path | quote) ~ ' -L -c ' ~ ('st|%n|%F|%u|%a' | quote) ~ ' -- ' ~ ps
+                 ~ '; printf ' ~ ("'uid|%s\\n'") ~ ' "$(' ~ pt ~ ' -u)"'
+                 ~ '; printf ' ~ ("'uname|%s\\n'") ~ ' "$(' ~ pt ~ ' -un)"' -%}
+{{ {'command': (ot.sh.path | quote) ~ ' -c ' ~ (script | quote)} | to_json }}
+{%- endmacro -%}
+
+{#- principal_check(owner, out): codex-tick315 OBS-CONNECTED-PRINCIPAL -- the problems of the connected principal read
+    back by identity_command ([] = admitted): exactly one `uid|` line whose value is a NON-ZERO decimal uid, exactly one
+    `uname|` line whose value is the declared owner (a non-root account name). A uid-0 account under any name refuses. -#}
+{%- macro principal_check(owner, out) -%}
+{%- set lines = (out | replace('\r', '')).split('\n') | map('trim') | select | list -%}
+{%- set ul = lines | select('match', '^uid[|]') | list -%}
+{%- set nl = lines | select('match', '^uname[|]') | list -%}
+{%- set e = namespace(l=[]) -%}
+{%- if ul | length != 1 or ul[0][4:] is not match('^[1-9][0-9]*$') -%}{%- set e.l = e.l + ['connected uid is not exactly one non-zero uid: ' ~ (ul | to_json)] -%}{%- endif -%}
+{%- if owner is not string or owner is not match('^[a-z_][a-z0-9_-]*$') or owner == 'root' or nl | length != 1 or nl[0][6:] != owner -%}{%- set e.l = e.l + ['connected account ' ~ (nl | to_json) ~ ' is not exactly the declared owner ' ~ (owner | string)] -%}{%- endif -%}
+{{ e.l | to_json }}
+{%- endmacro -%}
+
+{#- identity_check(tools, ot, oti, pv, out): the problems of the identity command's stdout ([] = admitted). Per tool:
+    exactly one `<digest>  <path>` line equal to os_tools.<tool>.identity (kind file_sha256), exactly one stat line of
+    a regular file (stat -L: links followed; followed file metadata only, not path ancestry -- see identity_command)
+    owned by os_tool_identity.owner_uid and not group/other-writable. A missing tool is named with its logical package
+    (packages.provides) -- remedied by the declared MAIN prerequisite tasks, never here. -#}
+{%- macro identity_check(tools, ot, oti, pv, out) -%}
+{%- set kat = oti.known_answers | selectattr('tool', 'equalto', 'sha256sum') | first -%}
+{%- set lines = (out | replace('\r', '')).split('\n') | map('trim') | select | list -%}
+{%- set e = namespace(l=[]) -%}
+{%- if (lines | first | default('')) != kat.stdout -%}{%- set e.l = e.l + ['sha256sum ' ~ ot.sha256sum.path ~ ' fails its known answer'] -%}{%- endif -%}
+{%- for t in tools -%}
+{%- set p = ot[t].path -%}
+{%- set pkg = pv | dict2items | selectattr('value', 'contains', t) | map(attribute='key') | list -%}
+{%- set dl = lines | select('match', '^[0-9a-f]{64}  ' ~ (p | regex_escape) ~ '$') | list -%}
+{%- set sl = lines | select('match', '^st[|]' ~ (p | regex_escape) ~ '[|]') | list -%}
+{%- if dl | length != 1 or sl | length != 1 -%}{%- set e.l = e.l + [t ~ ' (' ~ p ~ ') absent or unreadable; package ' ~ (pkg | join(',') or 'UNDECLARED')] -%}
+{%- else -%}
+{%- set f = sl[0].split('|') -%}
+{%- if ot[t].identity.kind | default('') != 'file_sha256' or dl[0][:64] != ot[t].identity.sha256 | default('') -%}{%- set e.l = e.l + [t ~ ' (' ~ p ~ ') digest ' ~ dl[0][:64] ~ ' is not its declared identity'] -%}{%- endif -%}
+{%- if f | length != 5 or f[2] != 'regular file' or f[3] != (oti.owner_uid | string) or f[4] is not match('^[0-7]{3,4}$') or f[4][-1] in '2367' or f[4][-2] in '2367' -%}{%- set e.l = e.l + [t ~ ' (' ~ p ~ ') is not a regular file owned by uid ' ~ oti.owner_uid ~ ' free of group/other write: ' ~ sl[0]] -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ e.l | to_json }}
+{%- endmacro -%}

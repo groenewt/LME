@@ -1,0 +1,504 @@
+---
+# testing/e2e/guest/tasks/lease_recover.yml -- OWNERSHIP-PROVEN recovery of ONE blocking lease entry (codex
+# tick339-340 review-format-and-recovery-scope; tick342-346 GUEST-RECOVERY-RECORD-AMBIGUITY +
+# GUEST-RECOVERY-RETRY-BINDING). Included ONLY by tasks/lease.yml acquire, and only when the declared operator input
+# gd.lease.recover_var is given. It never runs on age alone and never deletes anything.
+#   TOKEN   -e <gd.lease.recover_var>=<entry basename>:<dev>:<inode> -- names EXACTLY the entry the refusal observed
+#           (tasks/lease.yml prints it); a replaced or different entry refuses.
+#   TARGETS (a) epoch        the HIGHEST epoch <epoch_prefix><N> when it carries NO admitted holder (unparsable holder,
+#                            a /2-shaped or otherwise foreign-shaped holder, a hand-made dir); an ADMITTED holder is never
+#                            recovered here (its recorded term + break_var is the path).
+#           (b) stage        a lost staging <stage_prefix><uuid> (inert: never adopted).
+#           (c) epoch-done / stage-done  RESUME of a recovery that already took effect (retry with the SAME token): bound
+#                            to the RETAINED evidence, never re-executed (see RESUME below).
+#   RECORDS (codex GUEST-RECOVERY-RECORD-AMBIGUITY): the two candidates of THIS run_id (runs/<run_id>/record,
+#           preserved/<run_id>/record) are each observed SEPARATELY -- existence, type/custody (owned regular non-link),
+#           read, parse, and the ONE shared owner/shape admission tasks/record_admit.yml (the same binding provision S2
+#           applies). A candidate that exists but is not admitted (foreign, linked, unreadable, unparsable, wrong
+#           shape/owner/version) is INVALID. ANY invalid candidate, or TWO admitted ones, is AMBIGUOUS and refuses
+#           BEFORE any evidence or effect, whatever the holder says.
+#   PROOF   ALL of: owned, non-link directory directly under the storage root; the token's dev/inode; ONLY declared
+#           entries inside; records not ambiguous; and ONE consistent basis binding it to THIS storage root and run_id:
+#             holder_identity  the entry's holder parses as a mapping naming epoch/nonce, this run_id, this hypervisor
+#                              and this owner (for a staging: nonce == its name suffix, epoch already published)
+#             record_chain     (epoch only) the ONE admitted record was published under THIS epoch (lease_epoch == N)
+#           Anything else refuses gd.refusals.lease_recovery and preserves everything as found.
+#   EVIDENCE BEFORE ANY CHANGE: the observation (entry identity, listing, holder sha256, basis, per-candidate record
+#           outcomes) is written ONCE to <storage_root>/<evidence_prefix><own nonce>.json (never overwritten), read back,
+#           and the entry is re-observed unchanged. Then:
+#             epoch   NOT renamed (a renamed epoch would let a new epoch reuse its number and live-token path, defeating
+#                     the fence): it stays in place; tasks/lease.yml revokes its live token (if any) under the lock and
+#                     publishes N+1 whose holder records broke + recovered (the observation name + sha256).
+#             staging moved aside by ONE locked no-replace rename to <storage_root>/<evidence_prefix><own nonce>-stage.
+#   RESUME (codex GUEST-RECOVERY-RETRY-BINDING): the SAME token after the effect landed
+#             epoch-done  the token's epoch is no longer the highest; the highest epoch's ADMITTED holder names it in
+#                         `recovered`, and that observation file (owned regular non-link, sha256 == recovered.
+#                         observation_sha256) records the token's entry and dev/inode, and the entry is still in place
+#                         with that identity -> no recovery effect; tasks/lease.yml judges the successor epoch normally
+#                         (GUEST-LEASE-HELD until its recorded term ends + break_var, or released).
+#             stage-done  the token's staging is gone; EXACTLY ONE retained observation names it (entry + dev/inode) AND
+#                         its moved-aside dir <evidence_prefix><nonce>-stage exists as the owner's dir with the observed
+#                         inode, and nothing was recreated at the staging name -> no effect; acquisition continues.
+#           An interrupt BEFORE the effect leaves the entry in place: the retry re-proves it from scratch under a NEW
+#           nonce (earlier observations stay as evidence). Anything else refuses; no ad hoc cleanup, no exemption.
+# Output: _g_lrec {epoch_ok, recovered, resumed}.
+
+- name: LEASE recover -- bind the token (derived)
+  vars:
+    _g_lrt0: "{{ lookup('ansible.builtin.vars', gd.lease.recover_var, default='') | string }}"
+    _g_lrm: "{{ _g_lrt0 | regex_search('^([A-Za-z0-9._-]+):([0-9]+):([0-9]+)$', '\\1', '\\2', '\\3') | default([], true) }}"
+  ansible.builtin.set_fact:
+    _g_lrt: "{{ _g_lrt0 }}"
+    _g_lr_name: "{{ _g_lrm[0] | default('') }}"
+    _g_lr_dev: "{{ _g_lrm[1] | default('-1') | int }}"
+    _g_lr_ino: "{{ _g_lrm[2] | default('-1') | int }}"
+
+- name: LEASE recover -- list the stagings and the retained observations of this storage root (read-only)
+  ansible.builtin.find:
+    paths: ["{{ gg.storage_root }}"]
+    patterns: ["{{ item }}"]
+    use_regex: true
+    hidden: true
+    file_type: any
+    recurse: false
+  loop:
+    - "^{{ gd.lease.stage_prefix | regex_escape }}[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    - "^{{ gd.lease.evidence_prefix | regex_escape }}[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.json$"
+  register: _g_lr_ls
+
+- name: LEASE recover -- classify the named target (derived)
+  vars:
+    _g_stages: "{{ _g_lr_ls.results[0].files | map(attribute='path') | map('basename') | list }}"
+    _g_uuid_re: '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    _g_rec: "{{ _g_lold.holder.recovered | default(none) if (_g_lold.holder_ok | bool) else none }}"
+  ansible.builtin.set_fact:
+    _g_lr_kind: >-
+      {{ 'epoch' if (_g_lr_name == gd.lease.epoch_prefix ~ _g_lold_n and (_g_lold_n | int) > 0 and not (_g_lold.holder_ok | bool))
+         else ('stage' if (_g_lr_name in _g_stages and _g_lr_name != gd.lease.stage_prefix ~ _g_lnonce_v)
+         else ('epoch-done' if (_g_lr_name is match('^' ~ (gd.lease.epoch_prefix | regex_escape) ~ '[0-9]+$')
+                                and (_g_lr_name[(gd.lease.epoch_prefix | length):] | int) + 1 == _g_lold_n | int
+                                and _g_rec is mapping and (_g_rec.kind | default('')) == 'epoch'
+                                and (_g_rec.entry | default('')) == _g_lr_name
+                                and (_g_rec.observation | default('') | string) is match('^' ~ (gd.lease.evidence_prefix | regex_escape) ~ _g_uuid_re ~ '\.json$')
+                                and (_g_rec.observation_sha256 | default('') | string) is match('^[0-9a-f]{64}$'))
+         else ('stage-done' if (_g_lr_name is match('^' ~ (gd.lease.stage_prefix | regex_escape) ~ _g_uuid_re ~ '$')
+                                and _g_lr_name not in _g_stages)
+         else 'none'))) }}
+
+- name: LEASE recover -- refuse a malformed token or one that names no recoverable or recovered entry (nothing changed)
+  ansible.builtin.assert:
+    that:
+      - _g_lr_name | length > 0
+      - _g_lr_kind in ['epoch', 'stage', 'epoch-done', 'stage-done']
+    fail_msg: >-
+      REFUSED {{ gd.refusals.lease_recovery }} on {{ inventory_hostname }}: {{ gd.lease.recover_var }}={{ _g_lrt }} must be
+      <entry>:<dev>:<inode> of the HIGHEST epoch ({{ gd.lease.epoch_prefix }}{{ _g_lold_n }}) when it has NO admitted holder,
+      of a lost {{ gd.lease.stage_prefix }}<uuid> staging (not this invocation's), or of an entry whose recovery the
+      current evidence records. An epoch WITH an admitted holder is never recovered here (recorded term +
+      {{ gd.lease.break_var }}). Nothing changed.
+    quiet: true
+
+# ======================================================================================= RESUME (bound to evidence)
+- name: LEASE recover RESUME -- stat the named entry (still in place for an epoch; absent for a moved staging)
+  when: _g_lr_kind in ['epoch-done', 'stage-done']
+  ansible.builtin.stat:
+    path: "{{ gg.storage_root }}/{{ _g_lr_name }}"
+    follow: false
+    get_checksum: false
+  register: _g_lr_rs_ent
+
+- name: LEASE recover RESUME -- bind the candidate observations (derived)
+  when: _g_lr_kind in ['epoch-done', 'stage-done']
+  vars:
+    _g_obs_all: "{{ _g_lr_ls.results[1].files | map(attribute='path') | map('basename') | list }}"
+  ansible.builtin.set_fact:
+    _g_lr_rs_obs: >-
+      {{ [_g_lold.holder.recovered.observation] if _g_lr_kind == 'epoch-done' else _g_obs_all }}
+
+- name: LEASE recover RESUME -- stat each candidate observation (no link followed; read-only)
+  when: _g_lr_kind in ['epoch-done', 'stage-done']
+  ansible.builtin.stat:
+    path: "{{ gg.storage_root }}/{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ _g_lr_rs_obs }}"
+  register: _g_lr_rs_st_raw
+
+- name: LEASE recover RESUME -- stat each candidate's moved-aside staging dir (read-only)
+  when: _g_lr_kind in ['epoch-done', 'stage-done']
+  ansible.builtin.stat:
+    path: "{{ gg.storage_root }}/{{ item | regex_replace('\\.json$', '') }}-stage"
+    follow: false
+    get_checksum: false
+  loop: "{{ _g_lr_rs_obs }}"
+  register: _g_lr_rs_mv
+
+- name: LEASE recover RESUME -- read the owned regular candidate observations (read-only)
+  when:
+    - _g_lr_kind in ['epoch-done', 'stage-done']
+    - item.stat.exists and item.stat.isreg and not item.stat.islnk and item.stat.uid == g_owner_uid | int
+  ansible.builtin.slurp:
+    src: "{{ gg.storage_root }}/{{ item.item }}"
+  loop: "{{ _g_lr_rs_st_raw.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  failed_when: false
+  register: _g_lr_rs_raw
+
+- name: LEASE recover RESUME -- parse the candidate observations (a parse failure binds nothing)
+  when: _g_lr_kind in ['epoch-done', 'stage-done']
+  block:
+    - name: LEASE recover RESUME -- parse (derived)
+      ansible.builtin.set_fact:
+        _g_lr_rs_parsed: >-
+          {{ _g_lr_rs_raw.results | selectattr('content', 'defined')
+             | map(attribute='content') | map('b64decode') | map('from_json') | list }}
+        _g_lr_rs_names: >-
+          {{ _g_lr_rs_raw.results | selectattr('content', 'defined') | map(attribute='item') | map(attribute='item')
+             | list }}
+        _g_lr_rs_sha: >-
+          {{ _g_lr_rs_raw.results | selectattr('content', 'defined') | map(attribute='content') | map('b64decode')
+             | map('hash', 'sha256') | list }}
+  rescue:
+    - name: LEASE recover RESUME -- an unparsable observation binds nothing (derived)
+      ansible.builtin.set_fact:
+        _g_lr_rs_parsed: []
+        _g_lr_rs_names: []
+        _g_lr_rs_sha: []
+
+- name: LEASE recover RESUME -- bind the matching evidence (derived)
+  when: _g_lr_kind in ['epoch-done', 'stage-done']
+  vars:
+    _g_kind0: "{{ 'epoch' if _g_lr_kind == 'epoch-done' else 'stage' }}"
+    _g_moved: >-
+      {{ dict(_g_lr_rs_mv.results | map(attribute='item')
+              | zip(_g_lr_rs_mv.results | map(attribute='stat'))) }}
+  ansible.builtin.set_fact:
+    _g_lr_rs_match: >-
+      {% set ns = namespace(m=[]) %}{% for o in _g_lr_rs_parsed %}{% set n = _g_lr_rs_names[loop.index0] %}{%
+      set mv = _g_moved[n] | default({}) %}{%
+      if o is mapping and (o.kind | default('')) == _g_kind0 and (o.entry | default('')) == _g_lr_name
+         and (o.identity | default({})) is mapping and (o.identity.dev | default(-1)) == _g_lr_dev | int
+         and (o.identity.inode | default(-1)) == _g_lr_ino | int
+         and (o.basis | default('')) in ['holder_identity', 'record_chain']
+         and (o.by_nonce | default('')) ~ '.json' == n[(gd.lease.evidence_prefix | length):]
+         and (_g_kind0 == 'epoch'
+              or ((mv.exists | default(false)) and (mv.isdir | default(false)) and not (mv.islnk | default(true))
+                  and (mv.uid | default(-1)) == g_owner_uid | int and (mv.inode | default(-1)) == o.identity.inode)) %}{%
+      set ns.m = ns.m + [{'observation': n, 'sha256': _g_lr_rs_sha[loop.index0]}] %}{% endif %}{% endfor %}{{ ns.m }}
+
+- name: LEASE recover RESUME -- refuse unless the retained evidence binds the token exactly (nothing changed)
+  when: _g_lr_kind in ['epoch-done', 'stage-done']
+  ansible.builtin.assert:
+    that:
+      - _g_lr_rs_match | length == 1
+      - >-
+        _g_lr_kind != 'epoch-done'
+        or (_g_lr_rs_match[0].observation == _g_lold.holder.recovered.observation
+            and _g_lr_rs_match[0].sha256 == _g_lold.holder.recovered.observation_sha256
+            and _g_lr_rs_ent.stat.exists and _g_lr_rs_ent.stat.isdir and not _g_lr_rs_ent.stat.islnk
+            and _g_lr_rs_ent.stat.dev == _g_lr_dev | int and _g_lr_rs_ent.stat.inode == _g_lr_ino | int)
+      - _g_lr_kind != 'stage-done' or not _g_lr_rs_ent.stat.exists
+    fail_msg: >-
+      REFUSED {{ gd.refusals.lease_recovery }} on {{ inventory_hostname }}: {{ _g_lr_name }} is not bound to exactly ONE
+      retained recovery observation (matches {{ _g_lr_rs_match }}), the successor's recorded observation / sha256 differs,
+      the epoch is no longer in place with the token's identity, or something was recreated at the staging name. Every
+      entry and observation is preserved as found; nothing changed.
+    quiet: true
+
+- name: LEASE recover RESUME -- report the recovery already in effect (read-only; no further effect)
+  when: _g_lr_kind in ['epoch-done', 'stage-done']
+  ansible.builtin.debug:
+    msg: >-
+      RECOVERED-ALREADY {{ _g_lr_name }} on {{ inventory_hostname }} (evidence {{ _g_lr_rs_match[0].observation }});
+      {{ 'the successor epoch is judged normally (recorded term + break_var, or released)' if _g_lr_kind == 'epoch-done'
+         else 'the staging stays moved aside; acquisition continues' }}.
+
+# ======================================================================================= FIRST RECOVERY (epoch / stage)
+# ---- the staging (the epoch was observed by tasks/lease_epoch.yml as _g_lold)
+- name: LEASE recover -- stat the named staging (no link followed; read-only)
+  when: _g_lr_kind == 'stage'
+  ansible.builtin.stat:
+    path: "{{ gg.storage_root }}/{{ _g_lr_name }}"
+    follow: false
+    get_checksum: false
+  register: _g_lr_sdir
+
+- name: LEASE recover -- list the named staging (read-only)
+  when: _g_lr_kind == 'stage' and _g_lr_sdir.stat.isdir | default(false) and not (_g_lr_sdir.stat.islnk | default(true))
+  ansible.builtin.find:
+    paths: ["{{ gg.storage_root }}/{{ _g_lr_name }}"]
+    patterns: ['*']
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _g_lr_sls
+
+- name: LEASE recover -- stat the staging's holder (no link followed; read-only)
+  when: _g_lr_kind == 'stage'
+  ansible.builtin.stat:
+    path: "{{ gg.storage_root }}/{{ _g_lr_name }}/{{ gd.lease.holder_file }}"
+    follow: false
+    get_checksum: false
+  register: _g_lr_sh
+
+- name: LEASE recover -- read the staging's holder (owned regular file only; read-only)
+  when:
+    - _g_lr_kind == 'stage'
+    - _g_lr_sh.stat.exists and _g_lr_sh.stat.isreg and not _g_lr_sh.stat.islnk and _g_lr_sh.stat.uid == g_owner_uid | int
+  ansible.builtin.slurp:
+    src: "{{ gg.storage_root }}/{{ _g_lr_name }}/{{ gd.lease.holder_file }}"
+  failed_when: false
+  register: _g_lr_shraw
+
+- name: LEASE recover -- parse the staging's holder (a parse failure is no basis)
+  when: _g_lr_kind in ['epoch', 'stage']
+  block:
+    - name: LEASE recover -- parse (derived)
+      ansible.builtin.set_fact:
+        _g_lr_shp: "{{ (_g_lr_shraw.content | b64decode | from_json) if (_g_lr_shraw.content is defined) else {} }}"
+  rescue:
+    - name: LEASE recover -- an unparsable staging holder is no basis (derived)
+      ansible.builtin.set_fact:
+        _g_lr_shp: {}
+
+# ---- the record candidates of THIS run_id, each observed SEPARATELY (codex GUEST-RECOVERY-RECORD-AMBIGUITY)
+- name: LEASE recover -- stat both record candidates (no link followed; read-only)
+  when: _g_lr_kind in ['epoch', 'stage']
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ gp.files.record }}", "{{ gp.preserved_run }}/{{ gd.layout.run_files.record }}"]
+  register: _g_lr_rst
+
+- name: LEASE recover -- read each candidate that is an owned regular non-link file (read-only; failure recorded)
+  when:
+    - _g_lr_kind in ['epoch', 'stage']
+    - item.stat.exists and item.stat.isreg and not item.stat.islnk and item.stat.uid == g_owner_uid | int
+  ansible.builtin.slurp:
+    src: "{{ item.stat.path }}"
+  loop: "{{ _g_lr_rst.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  failed_when: false
+  register: _g_lr_rraw
+
+- name: LEASE recover -- parse the runs/ candidate (a parse failure is recorded, never dropped)
+  when: _g_lr_kind in ['epoch', 'stage']
+  block:
+    - name: LEASE recover -- parse runs/ (derived)
+      ansible.builtin.set_fact:
+        _g_lr_p0: "{{ {'parsed': true, 'value': (_g_lr_rraw.results[0].content | b64decode | from_json)} if (_g_lr_rraw.results[0].content is defined) else {'parsed': false, 'value': none} }}"
+  rescue:
+    - name: LEASE recover -- runs/ candidate unparsable (derived)
+      ansible.builtin.set_fact:
+        _g_lr_p0: {parsed: false, value: null}
+
+- name: LEASE recover -- parse the preserved/ candidate (a parse failure is recorded, never dropped)
+  when: _g_lr_kind in ['epoch', 'stage']
+  block:
+    - name: LEASE recover -- parse preserved/ (derived)
+      ansible.builtin.set_fact:
+        _g_lr_p1: "{{ {'parsed': true, 'value': (_g_lr_rraw.results[1].content | b64decode | from_json)} if (_g_lr_rraw.results[1].content is defined) else {'parsed': false, 'value': none} }}"
+  rescue:
+    - name: LEASE recover -- preserved/ candidate unparsable (derived)
+      ansible.builtin.set_fact:
+        _g_lr_p1: {parsed: false, value: null}
+
+- name: LEASE recover -- admit the runs/ candidate through the ONE shared record admission (derived)
+  when: _g_lr_kind in ['epoch', 'stage']
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/record_admit.yml"
+  vars:
+    _g_ra_rec: "{{ _g_lr_p0.value }}"
+    # retire.yml publishes state=retired in runs/ BEFORE the move, so an interrupted retire leaves a retired record there
+    _g_ra_states: [claimed, starting, started, retired]
+
+- name: LEASE recover -- bind the runs/ candidate outcome (derived)
+  when: _g_lr_kind in ['epoch', 'stage']
+  vars:
+    _s: "{{ _g_lr_rst.results[0].stat }}"
+  ansible.builtin.set_fact:
+    _g_lr_c0:
+      path: "{{ gp.files.record }}"
+      exists: "{{ _s.exists }}"
+      custody: "{{ _s.exists and _s.isreg | default(false) and not (_s.islnk | default(true)) and (_s.uid | default(-1)) == g_owner_uid | int }}"
+      read: "{{ _g_lr_rraw.results[0].content is defined }}"
+      parsed: "{{ _g_lr_p0.parsed }}"
+      admitted: "{{ (_g_lr_rraw.results[0].content is defined) and (_g_lr_p0.parsed | bool) and (_g_ra_ok | bool) }}"
+      lease_epoch: "{{ (_g_lr_p0.value.lease_epoch | default(none)) if (_g_ra_ok | bool) else none }}"
+      lease_nonce: "{{ (_g_lr_p0.value.lease_nonce | default(none)) if (_g_ra_ok | bool) else none }}"
+
+- name: LEASE recover -- admit the preserved/ candidate through the ONE shared record admission (derived)
+  when: _g_lr_kind in ['epoch', 'stage']
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/record_admit.yml"
+  vars:
+    _g_ra_rec: "{{ _g_lr_p1.value }}"
+    _g_ra_states: [retired]
+
+- name: LEASE recover -- bind the preserved/ candidate outcome (derived)
+  when: _g_lr_kind in ['epoch', 'stage']
+  vars:
+    _s: "{{ _g_lr_rst.results[1].stat }}"
+  ansible.builtin.set_fact:
+    _g_lr_c1:
+      path: "{{ gp.preserved_run }}/{{ gd.layout.run_files.record }}"
+      exists: "{{ _s.exists }}"
+      custody: "{{ _s.exists and _s.isreg | default(false) and not (_s.islnk | default(true)) and (_s.uid | default(-1)) == g_owner_uid | int }}"
+      read: "{{ _g_lr_rraw.results[1].content is defined }}"
+      parsed: "{{ _g_lr_p1.parsed }}"
+      admitted: "{{ (_g_lr_rraw.results[1].content is defined) and (_g_lr_p1.parsed | bool) and (_g_ra_ok | bool) }}"
+      lease_epoch: "{{ (_g_lr_p1.value.lease_epoch | default(none)) if (_g_ra_ok | bool) else none }}"
+      lease_nonce: "{{ (_g_lr_p1.value.lease_nonce | default(none)) if (_g_ra_ok | bool) else none }}"
+
+# ---- judge (derived): ownership proven by exactly one consistent basis, or refused
+- name: LEASE recover -- bind the observation and the ownership decision (derived)
+  when: _g_lr_kind in ['epoch', 'stage']
+  vars:
+    _g_ent: >-
+      {{ _g_lold.dir if _g_lr_kind == 'epoch' else
+         {'exists': _g_lr_sdir.stat.exists | default(false), 'isdir': _g_lr_sdir.stat.isdir | default(false),
+          'islnk': _g_lr_sdir.stat.islnk | default(false), 'uid': _g_lr_sdir.stat.uid | default(none),
+          'dev': _g_lr_sdir.stat.dev | default(none), 'inode': _g_lr_sdir.stat.inode | default(none)} }}
+    _g_lst: >-
+      {{ _g_lold.listing if _g_lr_kind == 'epoch'
+         else ((_g_lr_sls.files | default([])) | map(attribute='path') | map('basename') | sort | list) }}
+    _g_hs: "{{ _g_lold.holder_seen if _g_lr_kind == 'epoch' else (_g_lr_shp if _g_lr_shp is mapping else {}) }}"
+    _g_allowed: >-
+      {{ [gd.lease.holder_file, gd.lease.released_file, gd.lease.live_dir] if _g_lr_kind == 'epoch'
+         else [gd.lease.holder_file, gd.lease.live_dir] }}
+    _g_undeclared: >-
+      {{ _g_lst | reject('in', _g_allowed)
+         | reject('match', '^' ~ (gd.lease.revoked_prefix | regex_escape) ~ '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+         | list if _g_lr_kind == 'epoch' else _g_lst | reject('in', _g_allowed) | list }}
+    _g_cands: "{{ [_g_lr_c0, _g_lr_c1] }}"
+    _g_invalid: "{{ _g_cands | selectattr('exists') | rejectattr('admitted') | list }}"
+    _g_admitted: "{{ _g_cands | selectattr('admitted') | list }}"
+    _g_rec_ambiguous: "{{ _g_invalid | length > 0 or _g_admitted | length > 1 }}"
+    _g_hid: >-
+      {{ _g_hs is mapping and (_g_hs.run_id | default(none)) == gg.run_id
+         and (_g_hs.hypervisor | default(none)) == inventory_hostname
+         and (_g_hs.owner_uid | default(none)) == g_owner_uid | int
+         and (_g_hs.nonce | default('') | string) is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+         and (_g_hs.epoch | default(none)) is integer
+         and ((_g_hs.epoch == _g_lold_n | int) if _g_lr_kind == 'epoch'
+              else (_g_hs.nonce == _g_lr_name[(gd.lease.stage_prefix | length):] and _g_hs.epoch <= _g_lold_n | int)) }}
+    _g_hforeign: "{{ _g_hs is mapping and _g_hs | length > 0 and not (_g_hid | bool) }}"
+    _g_chain: >-
+      {{ _g_lr_kind == 'epoch' and _g_admitted | length == 1 and (_g_admitted[0].lease_epoch | int) == _g_lold_n | int }}
+    _g_chain_conflict: >-
+      {{ _g_lr_kind == 'epoch' and (_g_hid | bool) and (_g_chain | bool)
+         and (_g_admitted[0].lease_nonce | default(none)) != _g_hs.nonce }}
+  ansible.builtin.set_fact:
+    _g_lr_obs:
+      schema: "{{ gd.lease.schema }}"
+      kind: "{{ _g_lr_kind }}"
+      entry: "{{ _g_lr_name }}"
+      identity: "{{ _g_ent }}"
+      listing: "{{ _g_lst }}"
+      undeclared: "{{ _g_undeclared }}"
+      holder_parsed: "{{ _g_lold.holder_parsed if _g_lr_kind == 'epoch' else (_g_hs | length > 0) }}"
+      holder_sha256: "{{ _g_lold.holder_sha256 if _g_lr_kind == 'epoch' else ((_g_lr_shraw.content | b64decode | hash('sha256')) if (_g_lr_shraw.content is defined) else none) }}"
+      holder_seen_keys: "{{ _g_hs.keys() | list | sort if _g_hs is mapping else [] }}"
+      record_candidates: "{{ _g_cands }}"
+      basis: >-
+        {{ 'ambiguous' if ((_g_rec_ambiguous | bool) or (_g_hforeign | bool) or (_g_chain_conflict | bool))
+           else ('holder_identity' if (_g_hid | bool) else ('record_chain' if (_g_chain | bool) else 'none')) }}
+      highest_epoch: "{{ _g_lold_n | int }}"
+      run_id: "{{ gg.run_id }}"
+      hypervisor: "{{ inventory_hostname }}"
+      by_nonce: "{{ _g_lnonce_v }}"
+      observed_epoch: "{{ _g_now | int }}"
+
+- name: LEASE recover -- refuse unless ownership is PROVEN by one consistent basis (BEFORE any evidence or effect)
+  when: _g_lr_kind in ['epoch', 'stage']
+  ansible.builtin.assert:
+    that:
+      - _g_lr_obs.identity.exists and _g_lr_obs.identity.isdir and not _g_lr_obs.identity.islnk
+      - _g_lr_obs.identity.uid == g_owner_uid | int
+      - _g_lr_obs.identity.dev == _g_lr_dev | int and _g_lr_obs.identity.inode == _g_lr_ino | int
+      - _g_lr_obs.undeclared | length == 0
+      - _g_lr_obs.basis in ['holder_identity', 'record_chain']
+      - _g_lr_kind != 'epoch' or not (_g_lold.released_ok | bool)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.lease_recovery }} on {{ inventory_hostname }}: ownership of {{ gg.storage_root }}/{{ _g_lr_name }}
+      by run {{ gg.run_id }} is not proven (basis {{ _g_lr_obs.basis }}; record candidates {{ _g_lr_obs.record_candidates }};
+      identity {{ _g_lr_obs.identity }}; undeclared {{ _g_lr_obs.undeclared }}; token dev/inode {{ _g_lr_dev }}/{{ _g_lr_ino }}).
+      Required: an owned non-link directory with exactly the token's identity, only declared entries, NO invalid or
+      duplicate record candidate, and ONE consistent basis. The entry, its contents and every record are preserved as
+      found; nothing was written.
+    quiet: true
+
+# ---- evidence BEFORE any change (own nonce-named file; never overwritten)
+- name: LEASE recover -- record the immutable observation (own nonce-named evidence file; never overwrites)
+  when: _g_lr_kind in ['epoch', 'stage']
+  ansible.builtin.copy:
+    content: "{{ _g_lr_obs | to_nice_json(sort_keys=True) }}\n"
+    dest: "{{ gg.storage_root }}/{{ gd.lease.evidence_prefix }}{{ _g_lnonce_v }}.json"
+    mode: "{{ gd.layout.file_mode }}"
+    force: false
+  timeout: "{{ gd.lease.step_s }}"
+
+- name: LEASE recover -- read the observation back (read-only)
+  when: _g_lr_kind in ['epoch', 'stage']
+  ansible.builtin.slurp:
+    src: "{{ gg.storage_root }}/{{ gd.lease.evidence_prefix }}{{ _g_lnonce_v }}.json"
+  register: _g_lr_obs_rb
+
+- name: LEASE recover -- re-observe the entry right before the change (no link followed; read-only)
+  when: _g_lr_kind in ['epoch', 'stage']
+  ansible.builtin.stat:
+    path: "{{ gg.storage_root }}/{{ _g_lr_name }}"
+    follow: false
+    get_checksum: false
+  register: _g_lr_again
+
+- name: LEASE recover -- refuse an observation that did not persist, or an entry that changed meanwhile (nothing changed)
+  when: _g_lr_kind in ['epoch', 'stage']
+  ansible.builtin.assert:
+    that:
+      - (_g_lr_obs_rb.content | b64decode) == (_g_lr_obs | to_nice_json(sort_keys=True)) ~ '\n'
+      - _g_lr_again.stat.exists and _g_lr_again.stat.isdir and not _g_lr_again.stat.islnk
+      - _g_lr_again.stat.dev == _g_lr_obs.identity.dev and _g_lr_again.stat.inode == _g_lr_obs.identity.inode
+    fail_msg: >-
+      REFUSED {{ gd.refusals.lease_recovery }} on {{ inventory_hostname }}: the observation
+      {{ gd.lease.evidence_prefix }}{{ _g_lnonce_v }}.json does not read back as written, or {{ _g_lr_name }} changed
+      after it was observed. Both are preserved; nothing else changed.
+    quiet: true
+
+# ---- the change: a staging is moved aside (never deleted); an epoch is left in place for tasks/lease.yml
+- name: LEASE recover -- move the lost staging aside under the storage-root lock (ONE no-replace rename; never deleted)
+  when: _g_lr_kind == 'stage'
+  ansible.builtin.command:
+    argv: "{{ g_lock_argv + [gt.mv, '-T', '-n', '--', gg.storage_root ~ '/' ~ _g_lr_name, gg.storage_root ~ '/' ~ gd.lease.evidence_prefix ~ _g_lnonce_v ~ '-stage'] }}"
+
+- name: LEASE recover -- read the move aside back (no link followed; read-only)
+  when: _g_lr_kind == 'stage'
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ gg.storage_root }}/{{ _g_lr_name }}", "{{ gg.storage_root }}/{{ gd.lease.evidence_prefix }}{{ _g_lnonce_v }}-stage"]
+  register: _g_lr_mv
+
+- name: LEASE recover -- refuse a staging move that did not land as observed (mv -n does not fail on a refused rename)
+  when: _g_lr_kind == 'stage'
+  ansible.builtin.assert:
+    that:
+      - not _g_lr_mv.results[0].stat.exists
+      - _g_lr_mv.results[1].stat.exists and _g_lr_mv.results[1].stat.inode == _g_lr_obs.identity.inode
+    fail_msg: >-
+      REFUSED {{ gd.refusals.lease_recovery }} on {{ inventory_hostname }}: {{ _g_lr_name }} was not moved aside to
+      {{ gd.lease.evidence_prefix }}{{ _g_lnonce_v }}-stage as observed; both names are preserved as found.
+    quiet: true
+
+- name: LEASE recover -- bind the outcome (derived output for tasks/lease.yml)
+  ansible.builtin.set_fact:
+    _g_lrec:
+      epoch_ok: "{{ _g_lr_kind == 'epoch' }}"
+      resumed: "{{ _g_lr_kind in ['epoch-done', 'stage-done'] }}"
+      recovered: >-
+        {{ {'kind': _g_lr_kind, 'entry': _g_lr_name, 'basis': _g_lr_obs.basis,
+            'observation': gd.lease.evidence_prefix ~ _g_lnonce_v ~ '.json',
+            'observation_sha256': _g_lr_obs_rb.content | b64decode | hash('sha256')}
+           if _g_lr_kind in ['epoch', 'stage'] else none }}

@@ -1,0 +1,247 @@
+---
+# testing/e2e/guest/tasks/retire.yml -- retire ONE recorded guest generation (lme_guest_mode=retire). Strictly scoped:
+# stops only a process BOUND to the owned record (tasks/unit_bind.yml), then moves only the recorded run dir to
+# preserved/<run_id>. Never deletes a disk, the base, or anything outside <storage_root>; never touches the physical
+# host's preserved development stack (its units, containers, /etc/lme).
+# COMPLETED RETIREMENT (codex GUEST-RETIRED-UNIT-REUSE): when admit.yml found preserved/<run_id> (and no runs/<run_id>),
+# the preserved record is read back and reported -- no lease, no systemctl query, no stop, no write. A unit NAME reused
+# after the retirement is never looked at.
+# PENDING RETIREMENT: under the ONE lifecycle lease (tasks/lease.yml), re-decided under it; a running unit of the
+# recorded name that does not bind to this generation refuses GUEST-UNIT-REUSED and everything is preserved.
+# codex tick331: stop and move are FENCED commands (g_step_argv: storage-root lock + this epoch's live token); the
+# retired record is written to this epoch's partial and published by a fenced rename; the rescue re-raises typed.
+
+- name: Bind the path admission decided (stable for this file; _g_run is re-registered under the lease below)
+  ansible.builtin.set_fact:
+    _g_retire_pending: "{{ _g_run.results[0].stat.exists }}"
+
+# ---- completed retirement: read back only
+- name: COMPLETED -- read the preserved record (owned regular file, admitted by admit.yml / observe_run.yml)
+  when: not _g_retire_pending | bool
+  ansible.builtin.slurp:
+    src: "{{ gp.preserved_run }}/{{ gd.layout.run_files.record }}"
+  register: _g_prec_raw
+
+# codex tick331 RECORD VERSION: a preserved record of any other version is refused as its version and left
+# byte-identical (this path takes no lease and writes nothing).
+- name: COMPLETED -- refuse a preserved record of any version other than the one this lifecycle produces
+  when: not _g_retire_pending | bool
+  vars:
+    _g_prec: "{{ _g_prec_raw.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _g_prec is mapping
+      - (_g_prec.schema | default(none)) == gd.record.schema
+    fail_msg: >-
+      REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.preserved_run }}/{{
+      gd.layout.run_files.record }} is version {{ (_g_prec.schema | default('undeclared')) if _g_prec is mapping else
+      'not-a-mapping' }}; this lifecycle reads only {{ gd.record.schema }}. Nothing is queried, rewritten or moved; the
+      preserved record stays byte-identical.
+    quiet: true
+
+- name: COMPLETED -- refuse a preserved run that is not THIS generation's completed retirement (nothing is touched)
+  when: not _g_retire_pending | bool
+  vars:
+    _g_prec: "{{ _g_prec_raw.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _g_prec.state == 'retired'
+      - _g_prec.run_id == gg.run_id and _g_prec.hypervisor == inventory_hostname
+      - _g_prec.owner_uid == g_owner_uid | int and _g_prec.run_dir == gp.run
+      - _g_prec.unit.name == gp.unit and _g_prec.unit.scope == 'user'
+    fail_msg: >-
+      REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: {{ gp.preserved_run }} is not a completed retirement
+      of run {{ gg.run_id }} here; nothing is queried, stopped or moved.
+    quiet: true
+
+- name: COMPLETED -- report (effect-free read-back)
+  when: not _g_retire_pending | bool
+  ansible.builtin.debug:
+    msg: "RETIRED {{ gg.run_id }} generation {{ (_g_prec_raw.content | b64decode | from_json).generation }} at {{ gp.preserved_run }} (read back; no effect)"
+
+# ---- pending retirement: under the lease
+- name: PENDING -- retire under the lifecycle lease
+  when: _g_retire_pending | bool
+  block:
+    - name: Acquire the lifecycle lease of this storage root (exclusive; typed refusal when held)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+      vars:
+        _g_lease_op: acquire
+
+    - name: USE BOUNDARY -- re-admit the ancestry of the run dir and its preserved destination (route rule)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+      vars:
+        rh_anc_bs: "{{ rh.controller.bootstrap }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ _g_anc_path }}"
+        rh_anc_refusal: "{{ gd.refusals.storage }}"
+      loop: ["{{ gp.run }}", "{{ gp.preserved_run }}"]
+      loop_control:
+        loop_var: _g_anc_path
+
+    - name: Re-observe this run_id's owned state under the lease (read-only)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/observe_run.yml"
+
+    - name: Refuse a state that changed since admission (a concurrent retire/provision finished first; nothing done)
+      ansible.builtin.assert:
+        that:
+          - _g_run.results[0].stat.exists and _g_run.results[1].stat.exists
+          - not _g_run.results[2].stat.exists
+        fail_msg: >-
+          REFUSED {{ gd.refusals.ambiguous }} on {{ inventory_hostname }}: {{ gp.run }} with its record and no
+          {{ gp.preserved_run }} is no longer the observed state; re-run retire (a completed retirement reads back).
+        quiet: true
+
+    - name: Read the record
+      ansible.builtin.slurp:
+        src: "{{ gp.files.record }}"
+      register: _g_rec_raw
+
+    - name: Bind the record (derived)
+      ansible.builtin.set_fact:
+        g_record: "{{ _g_rec_raw.content | b64decode | from_json }}"
+
+    # codex tick331 RECORD VERSION: before any stop, write or move (the first effect of this block is the stop below),
+    # so a record of another version is refused as its version and left byte-identical in place, never moved.
+    - name: Refuse a record of any version other than the one this lifecycle produces (nothing stopped, written or moved)
+      ansible.builtin.assert:
+        that:
+          - g_record is mapping
+          - (g_record.schema | default(none)) == gd.record.schema
+        fail_msg: >-
+          REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.files.record }} is version
+          {{ (g_record.schema | default('undeclared')) if g_record is mapping else 'not-a-mapping' }}; this lifecycle
+          retires only {{ gd.record.schema }} records. Nothing is stopped, rewritten or moved; the record and run dir are
+          preserved byte-identical (a migration is an explicit, separately reviewed step).
+        quiet: true
+
+    - name: Refuse to retire anything the record does not name as this allocated guest
+      ansible.builtin.assert:
+        that:
+          - g_record.state in ['claimed', 'starting', 'started', 'retired']
+          - g_record.run_id == gg.run_id and g_record.hypervisor == inventory_hostname
+          - g_record.owner_uid == g_owner_uid | int
+          - g_record.run_dir == gp.run
+          - g_record.unit.name == gp.unit and g_record.unit.scope == 'user'
+        fail_msg: >-
+          REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: the record does not name run {{ gg.run_id }} / unit
+          {{ gp.unit }} of uid {{ g_owner_uid }} here; nothing is stopped or moved.
+        quiet: true
+
+    - name: Bind the unit of the recorded name to THIS generation (argv, cgroup, invocation; read-only)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/unit_bind.yml"
+
+    - name: Refuse a running unit of the recorded name that is not this generation's guest (reuse; everything preserved)
+      ansible.builtin.assert:
+        that:
+          - not (g_unit_obs.running | bool) or (g_unit_obs.bound | bool)
+        fail_msg: >-
+          REFUSED {{ gd.refusals.unit_reused }} on {{ inventory_hostname }}: {{ gp.unit }} runs pid {{ g_unit_obs.main_pid }}
+          (invocation {{ g_unit_obs.invocation_id }}) that does not bind to generation {{ g_record.generation }}'s recorded
+          argv/invocation. Nothing is stopped or moved.
+        quiet: true
+
+    - name: LEASE boundary (stop)
+      when: g_unit_obs.running | bool
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+      vars:
+        _g_lease_op: check
+
+    - name: Stop ONLY the bound unit (user scope; re-bound immediately above -- name-addressed stop is the residual window)
+      when: g_unit_obs.running | bool and g_unit_obs.bound | bool
+      environment:
+        XDG_RUNTIME_DIR: "{{ gp.runtime_dir }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path={{ gp.bus }}"
+      ansible.builtin.command:
+        argv: "{{ g_step_argv + [gt.systemctl, '--user', 'stop', '--', gp.unit] }}"
+
+    - name: Bind the unit again after the stop (read-only)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/unit_bind.yml"
+
+    - name: Refuse to move disks while a process of the recorded name still runs
+      ansible.builtin.assert:
+        that:
+          - not (g_unit_obs.running | bool)
+        fail_msg: >-
+          REFUSED {{ gd.refusals.unit }} on {{ inventory_hostname }}: {{ gp.unit }} still runs
+          ({{ g_unit_obs.active_state }}, bound {{ g_unit_obs.bound }}); nothing moved.
+        quiet: true
+
+    - name: LEASE boundary (retired record)
+      when: g_record.state != 'retired'
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+      vars:
+        _g_lease_op: check
+        _g_lease_ops: 2
+
+    # codex tick331 GUEST-DELAYED-HOLDER-FENCE: the module writes ONLY this epoch's partial; the FENCED rename publishes it
+    - name: Write record(state=retired) to this epoch's partial (the record travels with the preserved run)
+      when: g_record.state != 'retired'
+      ansible.builtin.copy:
+        content: >-
+          {{ g_record | combine({'state': 'retired', 'lease_nonce': g_lease_nonce, 'lease_epoch': g_lease_epoch | int,
+             'observed_at_utc': now(utc=True).strftime('%Y-%m-%dT%H:%M:%SZ')}) | to_nice_json(sort_keys=True) }}
+        dest: "{{ gp.files.record }}{{ gd.layout.epoch_partial_infix }}{{ g_lease_epoch }}"
+        mode: "{{ gd.layout.file_mode }}"
+      timeout: "{{ gd.lease.step_s }}"
+
+    - name: Publish record(state=retired) -- FENCED rename of this epoch's partial onto the record (atomic replace)
+      when: g_record.state != 'retired'
+      ansible.builtin.command:
+        argv: "{{ g_step_argv + [gt.mv, '-T', '--', gp.files.record ~ gd.layout.epoch_partial_infix ~ g_lease_epoch, gp.files.record] }}"
+
+    - name: LEASE boundary (move)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+      vars:
+        _g_lease_op: check
+
+    - name: Move ONLY the recorded run dir to preserved/<run_id> (atomic rename; -n never replaces; never deleted)
+      ansible.builtin.command:
+        argv: "{{ g_step_argv + [gt.mv, '-T', '-n', '--', gp.run, gp.preserved_run] }}"
+
+    - name: Read the move back (no link followed; read-only)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: ["{{ gp.run }}", "{{ gp.preserved_run }}/{{ gd.layout.run_files.record }}"]
+      register: _g_mv
+
+    - name: Read the preserved record back (only when the move landed)
+      when: _g_mv.results[1].stat.exists and _g_mv.results[1].stat.isreg
+      ansible.builtin.slurp:
+        src: "{{ gp.preserved_run }}/{{ gd.layout.run_files.record }}"
+      register: _g_mvrec
+
+    - name: Refuse a preserved record of any other version after the move (preserved as found)
+      when: _g_mvrec.content is defined
+      ansible.builtin.assert:
+        that:
+          - ((_g_mvrec.content | b64decode | from_json).schema | default(none)) == gd.record.schema
+        fail_msg: "REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.preserved_run }}/{{ gd.layout.run_files.record }} read back as another record version; preserved as found."
+        quiet: true
+
+    - name: Refuse a retire whose run dir is not THIS generation's preserved run (mv -n does not fail on a refused overwrite)
+      ansible.builtin.assert:
+        that:
+          - not _g_mv.results[0].stat.exists
+          - _g_mv.results[1].stat.exists and _g_mv.results[1].stat.isreg and not _g_mv.results[1].stat.islnk
+          - (_g_mvrec.content | b64decode | from_json).generation == g_record.generation
+          - (_g_mvrec.content | b64decode | from_json).state == 'retired'
+        fail_msg: >-
+          REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: {{ gp.run }} is not at {{ gp.preserved_run }} as
+          generation {{ g_record.generation }} (an existing destination is never overwritten); both are left as found.
+        quiet: true
+  rescue:
+    - name: Classify the failure, decide lease preservation and RE-RAISE it (tasks/lease.yml op=failed)
+      when: _g_retire_pending | bool
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+      vars:
+        _g_lease_op: failed
+  always:
+    - name: Release the lease only when quiescent and no module write failed (tasks/lease.yml; else PRESERVED-HELD)
+      when: _g_retire_pending | bool
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+      vars:
+        _g_lease_op: release
+        _g_lease_preserve: "{{ g_lease_preserve | default(false) }}"

@@ -1,0 +1,165 @@
+---
+# testing/e2e/target_prereq/controls/CASES.yml -- the declared controls of J-KEY (owner_key.yml). STATUS:
+# declared_unrun. NOTHING HERE HAS RUN: no runner exists for this leg yet and none is authored (the transfer controls
+# runner, testing/e2e/transfer/controls/run_controls.yml, is B's; binding J-KEY cases into it is a later, reviewed
+# join). Every case needs C1's joins (c1-jkey-proposal.yml: owner_key node, reserved_owner_key_vars, work_roots
+# credentials sub-root, os_tools owner_key_generation entry, lme_deployment_identity) and MAIN's managed generation
+# (seed `run`, non-root). Until then every case refuses at the entry (RESERVED-FAMILY-REGISTRY / JKEY-UNREGISTERED),
+# which is the intended ordering, never a pass.
+#
+# Fixture rule (all cases): a throwaway work root <checkout>/<root_rel>/<sub_roots.run>/<runner key>/<case> is NOT
+# used for keys; the leg's location is always the resolved owned location, so a case runs against a THROWAWAY
+# CHECKOUT (its own .work) with a synthetic deployment identity 'jkeyctl' and synthetic target alias 'jk-fixture'
+# (inventory member of the target group; never contacted). No real key material is inspected by the runner: expects
+# name files, modes, the record's PUBLIC fields and refusal codes only.
+# expect vocabulary: rc (0 | fail), out / out_absent (substrings), present / absent (paths, relative to the key dir
+# <W>/credentials/owner-keys/jkeyctl/jk-fixture/<owner>), record ({field: value} of owner_key.record.json),
+# unchanged (paths whose stat mtime/ino/mode must be identical before and after).
+owner_key_cases:
+  status: declared_unrun
+  entry: testing/e2e/target_prereq/owner_key.yml
+  common_extra_vars: {lme_transfer_target: jk-fixture}
+  cases:
+    - id: J01
+      name: fresh
+      setup: empty key dir chain (no credentials sub-root yet)
+      extra_vars: {lme_owner_key_op: ensure}
+      expect:
+        rc: 0
+        out: ['JKEY CHANGED']
+        present: [id_ed25519, id_ed25519.pub, owner_key.record.json]
+        absent: [id_ed25519.next, id_ed25519.next.pub]
+        modes: {'.': '0700', id_ed25519: '0600', id_ed25519.pub: '0644', owner_key.record.json: '0600'}
+        record: {state: done, origin: generated, generation: 1, obligations: []}
+        out_absent: ['PRIVATE KEY', 'BEGIN OPENSSH']
+
+    - id: J02
+      name: reapply-unchanged
+      setup: J01 result
+      extra_vars: {lme_owner_key_op: ensure}
+      expect:
+        rc: 0
+        out: ['JKEY NOOP']
+        unchanged: [id_ed25519, id_ed25519.pub, owner_key.record.json, '.']
+        record: {state: done}
+        note: the pair is re-proven by ssh-keygen -y (pair correspondence) AND the fingerprint equals the record's
+
+    - id: J03
+      name: rotation-pending
+      setup: J01 result
+      extra_vars: {lme_owner_key_op: rotate}
+      expect:
+        rc: 0
+        out: ['JKEY CHANGED', 'rotation']
+        unchanged: [id_ed25519, id_ed25519.pub]
+        present: [id_ed25519.next, id_ed25519.next.pub]
+        record: {state: done, 'obligations[0].kind': rotation, 'obligations[0].state': pending,
+                 'obligations[0].steps': {admit_replacement: open, prove_access: open, retire_prior: open}}
+      follow_up:
+        - {id: J03b, name: rotation-reapply-holds, extra_vars: {lme_owner_key_op: ensure},
+           expect: {rc: 0, out: ['JKEY NOOP', 'rotation'], unchanged: [id_ed25519, id_ed25519.pub, id_ed25519.next, id_ed25519.next.pub, owner_key.record.json]}}
+        - {id: J03c, name: rotation-not-stacked, extra_vars: {lme_owner_key_op: rotate},
+           expect: {rc: 0, out: ['JKEY NOOP'], record: {'obligations|length': 1}}}
+
+    - id: J04
+      name: foreign-owned
+      setup: J01 result, then the owner key dir's id_ed25519 replaced by a file of mode 0644 (a mode the leg refuses;
+             a foreign uid needs a privileged fixture and is declared as J04b)
+      extra_vars: {lme_owner_key_op: ensure}
+      expect: {rc: fail, out: ['JKEY-FOREIGN'], unchanged: [id_ed25519, id_ed25519.pub, owner_key.record.json]}
+      variants:
+        - {id: J04b, setup: 'id_ed25519 owned by another uid (MAIN privileged fixture; declared, not run by B)', expect: {rc: fail, out: ['JKEY-FOREIGN']}}
+        - {id: J04c, setup: 'the <owner> chain level at mode 0755', expect: {rc: fail, out: ['JKEY-FOREIGN'], unchanged: ['.']}}
+
+    - id: J05
+      name: symlink
+      setup: J01 result, then id_ed25519.pub replaced by a symlink to a public-key file outside the key dir
+      extra_vars: {lme_owner_key_op: ensure}
+      expect: {rc: fail, out: ['JKEY-SYMLINK'], unchanged: [id_ed25519.pub, owner_key.record.json]}
+      variants:
+        - {id: J05b, setup: 'the <deployment> chain level a symlink to an owned 0700 directory', expect: {rc: fail, out: ['JKEY-SYMLINK']}}
+
+    - id: J06
+      name: tool-not-admitted
+      setup: >-
+        empty key dir; the resolved os_tools owner_key_generation entry's identity.sha256 overridden (admitted
+        lme_global_override of os_tools.<ssh-keygen>.identity) to a digest that is not the file's
+      extra_vars: {lme_owner_key_op: ensure}
+      expect: {rc: fail, out: ['JKEY-TOOL-NOT-ADMITTED'], absent: [id_ed25519, id_ed25519.pub, owner_key.record.json]}
+      variants:
+        - {id: J06b, setup: 'REMOVAL FIXTURE (JK-1 has landed, so absence must be made explicit): the throwaway checkout''s profile copy with the os_tools ssh-keygen entry deleted (or its required_by emptied), resolved as that fixture; the real registry is never edited', expect: {rc: fail, out: ['JKEY-TOOL-NOT-ADMITTED']}}
+        - {id: J06c, setup: 'os_tools.<ssh-keygen>.path overridden to a symlink', expect: {rc: fail, out: ['JKEY-TOOL-NOT-ADMITTED']}}
+
+    # additional declared refusals (not in the codex minimum set)
+    - {id: J07, name: location-mismatch, setup: 'inventory owner_key a path other than the owned location',
+       extra_vars: {lme_owner_key_op: ensure}, expect: {rc: fail, out: ['JKEY-LOCATION'], absent: [owner_key.record.json]}}
+    - {id: J08, name: generation-change, setup: 'J01 result, then owner_key.generation overridden to 2',
+       extra_vars: {lme_owner_key_op: ensure},
+       expect: {rc: 0, record: {'obligations[0].kind': generation_change, 'obligations[0].to_generation': 2, generation: 1},
+                unchanged: [id_ed25519, id_ed25519.pub]}}
+    - {id: J09, name: resume-after-crash, setup: 'record state started + both halves present (a crashed J01)',
+       extra_vars: {lme_owner_key_op: ensure}, expect: {rc: 0, record: {state: done}, unchanged: [id_ed25519, id_ed25519.pub]}}
+    - {id: J10, name: half-pair, setup: 'record state started + only id_ed25519 present',
+       extra_vars: {lme_owner_key_op: ensure}, expect: {rc: fail, out: ['JKEY-RESUME'], unchanged: [id_ed25519]}}
+    - {id: J11, name: pair-mismatch, setup: 'J01 result, then id_ed25519.pub replaced (same custody) by another ed25519 public line',
+       extra_vars: {lme_owner_key_op: ensure}, expect: {rc: fail, out: ['JKEY-PAIR']}}
+    - {id: J12, name: rotate-without-current, setup: 'empty key dir',
+       extra_vars: {lme_owner_key_op: rotate}, expect: {rc: fail, out: ['JKEY-ROTATE-NO-CURRENT'], absent: [id_ed25519]}}
+    - {id: J13, name: root-refused, setup: 'run as uid 0 (MAIN fixture; declared, not run by B)',
+       extra_vars: {lme_owner_key_op: ensure}, expect: {rc: fail, out: ['JKEY-ROOT-REFUSED']}}
+    - {id: J14, name: pinned-derived-output, setup: 'extra-var -e jk_ctl={}  and separately -e jk={}',
+       extra_vars: {lme_owner_key_op: ensure}, expect: {rc: fail, out: ['RESERVED-FAMILY-DERIVED-OUTPUT-PINNED', 'JKEY-DERIVED-OUTPUT-PINNED']}}
+
+    # codex-tick350-jkey-verdict C1 (JKEY-LOCATE-MISSING-INPUT-DIAGNOSTIC): locate never requires the key it locates.
+    # The target's bound inputs carry ONLY owner (no owner_key, no owner_pubkey role); Ansible 2.19 templates assert
+    # arguments before the condition, so every diagnostic defaults an absent input. Nothing is created or read.
+    - id: J15
+      name: locate-owner-only
+      setup: >-
+        empty checkout (no credentials sub-root); the fixture inventory declares for jk-fixture ONLY the owner role
+        (owner_key and owner_pubkey absent from target_inputs)
+      extra_vars: {lme_owner_key_op: locate}
+      expect:
+        rc: 0
+        out: ['JKEY-LOCATION', 'owner_key=', 'owner_pubkey=']
+        out_absent: ['JKEY-INPUT', 'is undefined', "has no attribute 'owner_key'", "has no attribute 'owner_pubkey'"]
+        absent: ['.', owner_key.record.json]
+      variants:
+        - id: J15b
+          name: ensure-owner-only
+          setup: the same inventory, op ensure
+          extra_vars: {lme_owner_key_op: ensure}
+          expect: {rc: fail, out: ['JKEY-INPUT'], out_absent: ['is undefined'], absent: ['.']}
+
+    # codex-tick350-jkey-verdict C2 (JKEY-UNVALIDATED-PUBLIC-FILE-EXPOSURE). SYNTHETIC DATA ONLY: the candidate below is
+    # a fake private-key-looking header plus fixed junk; it is NOT a key, is never produced by a tool and no real key is
+    # used or read to make it. The runner writes it verbatim (same custody as the leg's .pub: owned regular file, mode
+    # in pub_modes) and asserts that the whole callback output (stdout + stderr, default and -vvv) contains NONE of its
+    # bytes: the leg reads, matches and rejects the candidate under no_log and names only the path.
+    - id: J16
+      name: unvalidated-pub-not-exposed
+      setup: J01 result, then id_ed25519.pub replaced (same custody) by synthetic_candidate
+      synthetic_candidate: |
+        -----BEGIN OPENSSH PRIVATE KEY-----
+        JKEYSYNTHETICJUNKNOTAKEYaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        JKEYSYNTHETICJUNKLINETWObbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        -----END OPENSSH PRIVATE KEY-----
+      extra_vars: {lme_owner_key_op: ensure}
+      verbosity: [0, 3]
+      expect:
+        rc: fail
+        out: ['JKEY-PAIR', 'content was never admitted']
+        out_absent: ['BEGIN OPENSSH', 'END OPENSSH', 'PRIVATE KEY', 'JKEYSYNTHETICJUNK', 'aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbb']
+        unchanged: [id_ed25519, id_ed25519.pub, owner_key.record.json]
+      variants:
+        - id: J16b
+          name: unvalidated-pub-junk-single-line
+          setup: J01 result, then id_ed25519.pub replaced (same custody) by the single line 'ssh-ed25519 JKEYSYNTHETIC!!notbase64'
+          extra_vars: {lme_owner_key_op: ensure}
+          expect: {rc: fail, out: ['JKEY-PAIR'], out_absent: ['JKEYSYNTHETIC!!notbase64'], unchanged: [id_ed25519.pub]}
+
+    # codex-tick350-jkey-verdict C3 (declaration join): naming and passphrase argv come from the resolved node.
+    - {id: J17, name: naming-follows-declaration, setup: 'empty checkout; FIXTURE registry whose owner_key node declares storage.pub_suffix .pubkey (C1 pins enum [.pub] in the real contract, JK-6; the fixture widens it to prove no leg literal remains; never an override)',
+       extra_vars: {lme_owner_key_op: locate}, expect: {rc: 0, out: ['id_ed25519.pubkey'], out_absent: ['id_ed25519.pub ']}}
+    - {id: J18, name: passphrase-mode-unregistered, setup: 'fixture registry whose owner_key node declares an encryption mode with no passphrase_argv entry (encryption is not tunable; a C1 fixture node, never an override)',
+       extra_vars: {lme_owner_key_op: locate}, expect: {rc: fail, out: ['JKEY-UNREGISTERED'], absent: ['.']}}

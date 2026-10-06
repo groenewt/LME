@@ -13,14 +13,18 @@
 #            group, mode}, hypervisor, linger_tool{name, path, sha256}, preservation{basis, members, selectors}.
 #            NOTHING key-related (no pubkey, no owner_key / owner_pubkey role), nothing an effect creates.
 #   rh, lme_resolved, lme_transfer_label (this host's resolve)
+#   _rh_tb_ic_tools (initial_contact.yml output): the ADMITTED path of the preservation probe tool
+#            (tp.preservation.probe.tool, when listed in initial_contact.privileged.executed_after_custody)
 # Output: tp_pre (the preflight record body; every refusal COLLECTED into tp_pre.refusals, never asserted here; a
 # contact or observation failure is rescued into it). The caller writes it and decides.
 # Never: a unit start/stop/enable/disable/mask, a deployment-state write of any kind, a read of any private key. (No
 # deployment-state mutation is intended; ordinary ADMITTED Ansible module staging still occurs -- each module task
 # stages and removes its payload under the admitted root module temp, ansible_remote_tmp, set by initial_contact.)
-# Coverage (codex-tick370): service_facts lists SYSTEM .service units only (no .timer / .socket / .path / user-manager
-# units); status `generated` is admitted despite possible autostart until ownership/lifecycle evidence is joined; a
-# listed absent_status unit is ABSENT only in a state in tp.preservation.absent_states (see the evaluation below).
+# Coverage (codex-tick370, codex-tick375-377): DISCOVERY (selector matches) comes from service_facts, which lists
+# SYSTEM .service units only (no .timer / .socket / .path / user-manager units). DECISIONS come from the exact-unit
+# probe (LoadState / ActiveState / SubState / UnitFileState): UnitFileState `generated` stays ADMITTED for
+# inactive_not_enabled despite possible autostart until ownership/lifecycle evidence is joined; ABSENT = probe LoadState
+# in absent_status AND ActiveState in absent_states (and service_facts does not list it running).
 
 - name: Start the preflight record (contact-free; written by the caller's record play even if everything below fails)
   ansible.builtin.set_fact:
@@ -139,16 +143,19 @@
     # discovery-selector matches outside the member set are recorded (unclassified: observation grants no ownership
     # or retirement authority). An outcome other than as_expected is a COLLECTED refusal naming the declared route;
     # no unit is ever started, stopped, enabled, disabled or masked here. basis `undeclared` (prereq_observe.yml only;
-    # target_prereq.yml refuses it before contact) records the matches and evaluates nothing.
-    - name: Evaluate the declared preservation selection against the observed units (derived output)
+    # target_prereq.yml refuses it before contact) records the matches and evaluates nothing (and probes nothing).
+    # SERVICE-FACTS-BAD-STATES-MASKING (codex-tick375-377; TP4-ACTIVESTATE-PROBE approved): service_facts keeps a
+    # failed / masked / not-found status over the real UnitFileState, so it DISCOVERS (selector matches, outside_known)
+    # but never decides a declared expectation or an absence. Those are decided ONLY from the declared exact-unit PROBE
+    # (tp.preservation.probe): four separate typed fields, rc 0, every field present once, every value in its declared
+    # enum -- anything else is outcome probe_unknown (refused before any effect).
+    - name: Select the declared preservation units and the probe set (derived output)
       vars:
         _pvd: "{{ tp.preservation }}"
         _pv: "{{ tp_ctl.preservation }}"
       ansible.builtin.set_fact:
-        _tp_pv_eval: >-
+        _tp_pv_sel: >-
           {%- set svc = ansible_facts.services | default({}) -%}
-          {%- set gone = _pvd.absent_status -%}
-          {%- set idle = _pvd.absent_states -%}
           {%- set sel = namespace(rx=[]) -%}
           {%- for g in _pv.selectors -%}
           {%- set sel.rx = sel.rx + ['^' ~ (g | regex_escape | replace('\\*', '.*')) ~ '$'] -%}
@@ -163,40 +170,141 @@
                 'selected_by': (['member'] if n in _pv.members else []) + (['selector'] if hit.sel else [])}}) -%}
           {%- endif -%}
           {%- endfor -%}
+          {#- probe set: every declared member (known_set: inactive_not_enabled AND retired_absent, listed or not) and, on
+              a verified_none member, every discovery match; nothing on an undeclared basis -#}
+          {%- set pr = namespace(u=[]) -%}
+          {%- if _pv.basis in (_pvd.bases | list) -%}
+          {%- set pr.u = _pv.members | list | sort -%}
+          {%- if _pv.basis == 'verified_none' -%}{%- set pr.u = pr.u + (seen.d.keys() | list | sort) -%}{%- endif -%}
+          {%- endif -%}
+          {{ {'rx': sel.rx, 'seen': seen.d, 'probe': pr.u | unique | list} }}
+
+    # The ONE declared read-only probe (tp.preservation.probe): argv = the declared template with the ADMITTED tool
+    # path (the privileged initial contact digests the tool against os_tools.<tool>.identity and admits its custody
+    # when the tool is in initial_contact.privileged.executed_after_custody -- route join TP4-PROBE-TOOL), the exact
+    # property list and ONE exact unit after `--`. No shell, no glob, no state change. A skipped item (tool not
+    # admitted, name outside unit_regex) and any failure are recorded and evaluate probe_unknown.
+    - name: PROBE each selected unit by exact name (declared read-only systemctl show; admitted privileged tool)
+      vars:
+        _pb: "{{ tp.preservation.probe }}"
+        _adm: >-
+          {{ _pb.tool in rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.executed_after_custody
+             and _pb.tool in (_rh_tb_ic_tools | default({})) }}
+      ansible.builtin.command:
+        argv: >-
+          {{ _pb.argv | map('replace', '{tool}', _rh_tb_ic_tools[_pb.tool].path)
+                      | map('replace', '{properties}', _pb.fields | join(','))
+                      | map('replace', '{unit}', item) | list }}
+      loop: "{{ _tp_pv_sel.probe }}"
+      when: _adm | bool and item is match(tp.preservation.unit_regex)
+      register: _tp_pv_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Evaluate the declared preservation selection against the probed units (derived output)
+      vars:
+        _pvd: "{{ tp.preservation }}"
+        _pv: "{{ tp_ctl.preservation }}"
+      ansible.builtin.set_fact:
+        _tp_pv_eval: >-
+          {%- set P = _pvd.probe -%}
+          {%- set gone = _pvd.absent_status -%}
+          {%- set idle = _pvd.absent_states -%}
+          {%- set seen = namespace(d=_tp_pv_sel.seen) -%}
+          {%- set sel = namespace(rx=_tp_pv_sel.rx) -%}
+          {%- set tadm = P.tool in rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.executed_after_custody
+                         and P.tool in (_rh_tb_ic_tools | default({})) -%}
+          {#- probe results: {unit: {ok, rc, fields: {<field>: value}, stderr, error}} -- typed and complete, or not ok -#}
+          {%- set pb = namespace(m={}) -%}
+          {%- for r in _tp_pv_probe.results | default([]) -%}
+          {%- if r.skipped | default(false) -%}
+          {%- set pb.m = pb.m | combine({r.item: {'ok': false, 'rc': none, 'fields': {}, 'stderr': '',
+                'error': ('tool ' ~ P.tool ~ ' is not an admitted privileged-contact tool (initial_contact.privileged.executed_after_custody)'
+                          if not tadm else 'unit name outside unit_regex; not probed')}}) -%}
+          {%- else -%}
+          {%- set kv = namespace(d={}, bad=[]) -%}
+          {%- for l in r.stdout_lines | default([]) -%}
+          {%- set k = l.split('=', 1)[0] if '=' in l else '' -%}
+          {%- if k not in P.fields or k in kv.d -%}
+          {%- set kv.bad = kv.bad + ['unexpected or repeated line ' ~ (l | to_json)] -%}
+          {%- else -%}
+          {%- set kv.d = kv.d | combine({k: l.split('=', 1)[1]}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if r.rc | default(-1) != 0 -%}{%- set kv.bad = ['rc ' ~ (r.rc | default('none'))] + kv.bad -%}{%- endif -%}
+          {%- for f in P.fields -%}
+          {%- if f not in kv.d -%}{%- set kv.bad = kv.bad + ['missing field ' ~ f] -%}
+          {%- elif kv.d[f] not in P.enums[f] -%}{%- set kv.bad = kv.bad + [f ~ '=' ~ (kv.d[f] | to_json) ~ ' outside its declared enum'] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set pb.m = pb.m | combine({r.item: {'ok': kv.bad | length == 0, 'rc': r.rc | default(none), 'fields': kv.d,
+                'stderr': (r.stderr | default('') | string)[:P.stderr_max | int], 'error': (kv.bad | join('; ')) if kv.bad else none}}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {#- one decision per probed unit: absent (LoadState in absent_status AND ActiveState in absent_states, and
+              service_facts does not list it running), loaded_without_unit_file (absent_status, any other ActiveState),
+              or present; probe_unknown when the probe is not ok or disagrees with service_facts -#}
           {%- set ev = namespace(m={}, ref=[]) -%}
           {%- for u in _pv.members | list | sort -%}
           {%- set want = _pv.members[u] -%}
           {%- set spec = _pvd.expected_states[want] -%}
           {%- set o = seen.d[u] if u in seen.d else none -%}
-          {#- PREREQ-RUNNING-NOTFOUND-ABSENCE (codex-tick370): ABSENT only when NOT LISTED, or listed with an absent_status
-              AND a state in absent_states (runtime inactivity). A listed absent_status unit in any other state (running,
-              or service_facts `stopped` = sub-state not running: exited / activating / auto-restart / failed) is a
-              loaded unit whose file is gone -- an ACTIVE outcome, never absence. -#}
-          {%- set nofile = o is not none and o.status in gone -%}
-          {%- set loaded_nofile = nofile and o.state not in idle -%}
-          {%- set absent = o is none or (nofile and o.state in idle) -%}
-          {%- if loaded_nofile -%}
-          {%- set out = 'loaded_without_unit_file' -%}
-          {%- elif spec.present == 'required' -%}
-          {%- set out = 'absent' if absent else ('running' if o.state in spec.refused_states
-                          else ('enabled' if o.status in spec.refused_status else 'as_expected')) -%}
+          {%- set p = pb.m[u] if u in pb.m else {'ok': false, 'rc': none, 'fields': {}, 'stderr': '', 'error': 'no probe result'} -%}
+          {%- set f = p.fields -%}
+          {%- if not p.ok or (o is not none and o.state in P.service_facts_running_states and f.ActiveState not in P.running_states) -%}
+          {%- set out = 'probe_unknown' -%}
+          {%- elif f.LoadState in gone -%}
+          {%- set out = ('absent' if spec.present == 'required' else 'as_expected') if f.ActiveState in idle else 'loaded_without_unit_file' -%}
+          {%- elif spec.present != 'required' -%}
+          {%- set out = 'present_after_retirement' -%}
+          {%- elif f.ActiveState in P.running_states -%}
+          {%- set out = 'running' -%}
+          {%- elif f.ActiveState not in spec.active_states -%}
+          {%- set out = 'failed' -%}
+          {%- elif f.LoadState not in spec.load_states -%}
+          {%- set out = 'load_refused' -%}
+          {%- elif f.UnitFileState not in spec.unit_file_states -%}
+          {%- set out = 'enabled' -%}
           {%- else -%}
-          {%- set out = 'as_expected' if absent else 'present_after_retirement' -%}
+          {%- set out = 'as_expected' -%}
           {%- endif -%}
-          {%- set ev.m = ev.m | combine({u: {'expected': want, 'observed': o, 'outcome': out, 'route': _pvd.routes[out]}}) -%}
+          {%- set ev.m = ev.m | combine({u: {'expected': want, 'observed': o, 'probe': p, 'outcome': out, 'route': _pvd.routes[out]}}) -%}
           {%- if out != 'as_expected' -%}
           {%- set ev.ref = ev.ref + [_pvd.refusal ~ ': ' ~ u ~ ' is declared ' ~ want ~ ' but observed ' ~ out ~ ' '
-                ~ (o | to_json) ~ '; route ' ~ (_pvd.routes[out] | to_json) ~ '; the unit was not touched'] -%}
+                ~ (o | to_json) ~ ' probe ' ~ (p | to_json) ~ '; route ' ~ (_pvd.routes[out] | to_json) ~ '; the unit was not touched'] -%}
           {%- endif -%}
           {%- endfor -%}
           {%- set ext = namespace(m={}) -%}
           {%- for n, o in seen.d.items() if n not in _pv.members -%}
-          {%- set ext.m = ext.m | combine({n: o}) -%}
-          {%- if _pv.basis == 'verified_none' and not (o.status in gone and o.state in idle) -%}
-          {%- set ev.ref = ev.ref + [_pvd.refusal ~ ': ' ~ n ~ ' ' ~ (o | to_json) ~ ' matches the discovery selectors '
-                ~ (_pv.selectors | to_json) ~ ' on a target declared verified_none (no prior deployment)'
-                ~ (' and is LOADED WITHOUT ITS UNIT FILE (state not in ' ~ (idle | to_json) ~ ')' if o.status in gone else '')
+          {%- set p = pb.m[n] if n in pb.m else none -%}
+          {%- set ext.m = ext.m | combine({n: o | combine({'probe': p})}) -%}
+          {%- if _pv.basis == 'verified_none' -%}
+          {%- set p = p if p is not none else {'ok': false, 'rc': none, 'fields': {}, 'stderr': '', 'error': 'no probe result'} -%}
+          {%- set f = p.fields -%}
+          {#- ONE classification (codex-tick389 R1) decides both the reason and the route: probe not ok, or service_facts
+              running while the probe ActiveState is not running -> probe_unknown (null mechanism); absent_status +
+              absent_states -> none (absent; no refusal); absent_status + any other ActiveState ->
+              loaded_without_unit_file; any other valid probe -> unclassified_present (a present unit; never the
+              absent-file removal route). Its route key is not yet declared (pending C1 join; fail-closed marker). -#}
+          {%- set kout = 'probe_unknown' if not p.ok
+                else ('probe_unknown' if (o.state in P.service_facts_running_states and f.ActiveState not in P.running_states)
+                else (none if (f.LoadState in gone and f.ActiveState in idle)
+                else ('loaded_without_unit_file' if f.LoadState in gone else 'unclassified_present'))) -%}
+          {%- if kout is not none -%}
+          {%- set why = ('probe_unknown (' ~ p.error ~ ')') if not p.ok
+                else ('probe_unknown (service_facts lists it ' ~ o.state ~ ', probe ActiveState ' ~ f.ActiveState ~ ')'
+                      if kout == 'probe_unknown'
+                else ('loaded_without_unit_file: LOADED WITHOUT ITS UNIT FILE (ActiveState ' ~ f.ActiveState ~ ' not in ' ~ (idle | to_json) ~ ')'
+                      if kout == 'loaded_without_unit_file'
+                else 'unclassified_present: present (LoadState ' ~ f.LoadState ~ ', ActiveState ' ~ f.ActiveState ~ ')')) -%}
+          {%- set kroute = _pvd.routes[kout] if (kout != 'unclassified_present' or kout in _pvd.routes)
+                else 'ROUTE UNDECLARED: routes.unclassified_present is pending its C1 contract join (no mechanism; MAIN reconciles the basis against the probe record; never removal)' -%}
+          {%- set ev.ref = ev.ref + [_pvd.refusal ~ ': ' ~ n ~ ' ' ~ (o | to_json) ~ ' probe ' ~ (p | to_json)
+                ~ ' matches the discovery selectors ' ~ (_pv.selectors | to_json)
+                ~ ' on a target declared verified_none (no prior deployment) and is ' ~ why
+                ~ '; outcome ' ~ kout ~ '; route ' ~ (kroute | to_json)
                 ~ '; declare it or correct the basis'] -%}
+          {%- endif -%}
           {%- elif _pv.basis == 'known_set' and o.state in _pvd.discovery.outside_known.refused_states -%}
           {%- set ev.ref = ev.ref + [_pvd.refusal ~ ': ' ~ n ~ ' ' ~ (o | to_json) ~ ' matches the discovery selectors, is '
                 ~ o.state ~ ' and is not a declared member (unclassified; observation grants no ownership or retirement authority)'] -%}
@@ -205,6 +313,7 @@
           {{ {'basis': _pv.basis, 'selectors': _pv.selectors, 'selector_regex': sel.rx,
               'evaluated': _pv.basis in (_pvd.bases | list),
               'members': ev.m, 'outside_known': ext.m, 'limit': _pvd.discovery.limit,
+              'probe': {'tool': P.tool, 'tool_admitted': tadm, 'fields': P.fields, 'units': _tp_pv_sel.probe, 'results': pb.m},
               'refusals': ev.ref if (_pv.basis in (_pvd.bases | list)) else []} }}
 
     - name: Decide the preflight (collected refusals; derived output)

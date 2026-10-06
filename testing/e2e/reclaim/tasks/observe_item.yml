@@ -1,0 +1,87 @@
+---
+# testing/e2e/reclaim/tasks/observe_item.yml -- the ONE observation of one ledger resource (target, observe-only,
+# read-only argv, changed_when false). Used at admission (observe_target.yml) AND immediately before the item's effect
+# (revalidate.yml), so both compare the same fields. Never reads secret or credential CONTENT (names / ids only).
+# Inputs: rcl, tr_bs, rcl_res ({kind, key_value, ...}). Output: rcl_seen ({kind, key_value, present, observed}).
+
+- name: Refuse a resource kind or key the ledger schema does not declare (before any argv carries it)
+  ansible.builtin.assert:
+    that:
+      - rcl_res.kind in rcl.native.resource_kinds
+      - rcl_res.key_value is string
+      - >-
+        rcl_res.key_value is match(rcl.native.resource_kinds[rcl_res.kind].name_regex
+        | default(rcl.native.resource_kinds[rcl_res.kind].id_regex
+        | default(rcl.native.resource_kinds[rcl_res.kind].path_regex)))
+      - rcl.native.tools.podman in tr_bs.os_tools and rcl.native.tools.systemctl in tr_bs.os_tools
+    fail_msg: >-
+      {{ rcl.refusals.ledger }} on {{ inventory_hostname }}: ledger resource {{ rcl_res.kind | default('?') }}
+      {{ rcl_res.key_value | default('?') }} is not a declared kind/key, or os_tools lacks
+      {{ rcl.native.tools.values() | list }} ({{ rcl.refusals.join }} JOIN-OS-TOOLS).
+    quiet: true
+
+- name: Observe a unit (exact name)
+  when: rcl_res.kind == 'unit'
+  ansible.builtin.command:
+    argv: ["{{ tr_bs.os_tools[rcl.native.tools.systemctl].path }}", show, --property=Id,FragmentPath,LoadState, --, "{{ rcl_res.key_value }}"]
+  register: _rcl_o_rcl_u
+  changed_when: false
+
+- name: Stat the unit's fragment (content digest)
+  when: rcl_res.kind == 'unit'
+  ansible.builtin.stat:
+    path: "{{ (_rcl_o_rcl_u.stdout_lines | select('match', '^FragmentPath=') | first | default('FragmentPath='))[13:] or '/nonexistent' }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rcl_o_frag
+
+- name: Observe a container / volume / secret (exact id or name; JSON, no format templates)
+  when: rcl_res.kind in ['container', 'volume', 'secret']
+  ansible.builtin.command:
+    argv: ["{{ tr_bs.os_tools[rcl.native.tools.podman].path }}", "{{ rcl_res.kind }}", inspect, --, "{{ rcl_res.key_value }}"]
+  register: _rcl_o_rcl_pd
+  changed_when: false
+  failed_when: false
+
+- name: Stat an owned path (no link following)
+  when: rcl_res.kind == 'path'
+  ansible.builtin.stat:
+    path: "{{ rcl_res.key_value }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rcl_o_path
+
+- name: Publish the observation
+  vars:
+    _rcl_ul: "{{ _rcl_o_rcl_u.stdout_lines | default([]) }}"
+    _rcl_u:
+      Id: "{{ (_rcl_ul | select('match', '^Id=') | first | default('Id='))[3:] }}"
+      FragmentPath: "{{ (_rcl_ul | select('match', '^FragmentPath=') | first | default('FragmentPath='))[13:] }}"
+      LoadState: "{{ (_rcl_ul | select('match', '^LoadState=') | first | default('LoadState='))[10:] }}"
+    _rcl_pd: "{{ ((_rcl_o_rcl_pd.stdout | from_json) | first) if (rcl_res.kind in ['container', 'volume', 'secret'] and _rcl_o_rcl_pd.rc == 0) else {} }}"
+  ansible.builtin.set_fact:
+    rcl_seen:
+      kind: "{{ rcl_res.kind }}"
+      key_value: "{{ rcl_res.key_value }}"
+      present: >-
+        {{ (rcl_res.kind == 'unit' and _rcl_u.LoadState | default('') == 'loaded')
+           or (rcl_res.kind in ['container', 'volume', 'secret'] and _rcl_o_rcl_pd.rc | default(1) == 0)
+           or (rcl_res.kind == 'path' and _rcl_o_path.stat.exists | default(false)) }}
+      observed: >-
+        {{ {'Id': _rcl_u.Id | default(none), 'FragmentPath': _rcl_u.FragmentPath | default(none),
+            'FragmentPath_sha256': _rcl_o_frag.stat.checksum | default(none)} if rcl_res.kind == 'unit' else
+           {'Id': _rcl_pd.Id | default(none), 'label_lme_owner_run': ((_rcl_pd.Config | default({})).Labels | default({}))['lme.owner.run'] | default(none)}
+             if rcl_res.kind == 'container' else
+           {'Name': _rcl_pd.Name | default(none), 'label_lme_owner_run': (_rcl_pd.Labels | default({}))['lme.owner.run'] | default(none)}
+             if rcl_res.kind == 'volume' else
+           {'ID': _rcl_pd.ID | default(none), 'Spec_Name': (_rcl_pd.Spec | default({})).Name | default(none)}
+             if rcl_res.kind == 'secret' else
+           {'dev': _rcl_o_path.stat.dev | default(none), 'inode': _rcl_o_path.stat.inode | default(none),
+            'uid': _rcl_o_path.stat.uid | default(none), 'gid': _rcl_o_path.stat.gid | default(none),
+            'mode': _rcl_o_path.stat.mode | default(none),
+            'sha256_if_file': _rcl_o_path.stat.checksum | default(none)} }}
+
+- name: Collect the observation (admission pass only; rcl_collect is this include's parameter)
+  when: rcl_collect | default(false) | bool
+  ansible.builtin.set_fact:
+    rcl_seen_all: "{{ (rcl_seen_all | default([])) + [rcl_seen] }}"

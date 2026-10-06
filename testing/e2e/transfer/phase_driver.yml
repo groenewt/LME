@@ -17,21 +17,43 @@
 # (drv_clone_dirs), else CONTROLS-SOURCE-LOAD-PATH; the controller play writes drv_load_paths_out for the verdict.
 # "The source" excludes <source>/<rh.controller.bootstrap.work_roots.root_rel>/ (the git-ignored run scratch, where
 # the clones live). This driver defaults and asserts no work root of its own: every path it writes is an extra-var.
-# Extra-vars come from controls/run_one_case.yml: transfer_dir, drv_ctl_root, drv_stand_in, the four *_steps lists,
-# decl_overrides, tamper, and the lme_transfer_* operational inputs. It needs C1's registry
+# Extra-vars come from controls/run_one_case.yml: transfer_dir, drv_ctl_root, drv_stand_in, drv_repo_root, the four
+# *_steps lists, decl_overrides, tamper, and the lme_transfer_* operational inputs. It needs C1's registry
 # (manifests/global.yml reserved_outputs) and the engine's lme_resolved.remote_harness projection: without them it
 # refuses at the route's guard (RH-DERIVED-OUTPUT-PINNED / RH-POLICY-UNRESOLVED), never falls back.
+# ENTRY GUARD (codex tick318-321 item 2): tr / tr_dir / tr_repo_root are DERIVED outputs, never play vars or driver
+# inputs. The declared override SEAMS stay inputs: transfer_dir, decl_overrides (and every drv_* / lme_transfer_*).
+# On each host's first play: the route guard, B's family guard (tasks/refuse_reserved_families.yml: every registered
+# name family, e.g. tr_* / _tr_*; codex-tick333), then the set_fact deriving tr_dir / tr from the seams, then the equality
+# assert (an extra-var would outrank the set_fact; the assert reads the effective value). tr_repo_root is derived from
+# the driver input drv_repo_root only AFTER load_paths.yml admitted it as a verified clone.
 - name: driver observe-controller
   hosts: localhost
   connection: local
   gather_facts: false
   any_errors_fatal: true
-  vars: &drv
-    tr_dir: "{{ transfer_dir }}"
-    tr: "{{ (lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true) }}"
   tasks:
     - name: Refuse pre-supplied harness outputs and derive the repository root (route author; first task)
       ansible.builtin.include_tasks: "{{ playbook_dir | dirname | dirname | dirname }}/testing/remote_harness/tasks/refuse_pinned_outputs.yml"
+
+    - name: Refuse pre-supplied names of a reserved family (B family guard; second task, first entry)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/refuse_reserved_families.yml"
+
+    - name: Derive the transfer declaration and its directory from the declared seams (entry guard)
+      ansible.builtin.set_fact:
+        tr_dir: "{{ transfer_dir }}"
+        tr: "{{ (lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true) }}"
+
+    - name: Refuse a pinned transfer declaration or directory (entry guard; before any use)
+      ansible.builtin.assert:
+        that:
+          - tr_dir == transfer_dir
+          - tr == ((lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true))
+        fail_msg: >-
+          TRANSFER-DERIVED-OUTPUT-PINNED: {{ (['tr_dir'] if tr_dir != transfer_dir else [])
+          + (['tr'] if tr != ((lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true)) else []) }}
+          were supplied from outside the driver (extra-var); they are derived from transfer_dir / decl_overrides, never inputs.
+        quiet: true
 
     - name: Resolve the harness policy (route author; the resolved `rh`, never the raw profile)
       ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_policy.yml"
@@ -50,8 +72,18 @@
       ansible.builtin.set_fact:
         tr_bs: "{{ rh.controller.bootstrap }}"
         tr_adapter: "{{ rh.transfer.adapters[rh.transfer.adapter] }}"
-        tr_repo_root: "{{ rh_repo_root }}"
+        tr_repo_root: "{{ drv_repo_root }}"
         tr_ctl_token: "{{ ((_drv_id.content | b64decode | trim) ~ ':' ~ drv_ctl_root) | hash('sha256') }}"
+
+    # drv_repo_root was admitted above (load_paths.yml: a verified clone of the admitted commit); tr_repo_root is
+    # derived from it (the caller no longer passes tr_repo_root; C1 reserves it). An extra-var tr_repo_root would
+    # outrank the set_fact: the effective value is compared with its derivation before any step uses it.
+    - name: Refuse a pinned repository root (derived output)
+      ansible.builtin.assert:
+        that:
+          - tr_repo_root == drv_repo_root
+        fail_msg: "TRANSFER-DERIVED-OUTPUT-PINNED: ['tr_repo_root'] was supplied from outside the driver (extra-var); it is derived from the admitted drv_repo_root, never an input."
+        quiet: true
 
     - name: Expect the observed stand-in target's controller-resolved scope (B-PER-HOST-POLICY-BINDING)
       ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/scope_expect.yml"
@@ -76,10 +108,28 @@
   hosts: "{{ drv_stand_in }}"
   gather_facts: false
   any_errors_fatal: true
-  vars: *drv
   tasks:
     - name: Refuse pre-supplied harness outputs (route author; first task on this host too)
       ansible.builtin.include_tasks: "{{ playbook_dir | dirname | dirname | dirname }}/testing/remote_harness/tasks/refuse_pinned_outputs.yml"
+
+    - name: Refuse pre-supplied names of a reserved family (B family guard; second task, first entry)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/refuse_reserved_families.yml"
+
+    - name: Derive the transfer declaration and its directory from the declared seams (entry guard)
+      ansible.builtin.set_fact:
+        tr_dir: "{{ transfer_dir }}"
+        tr: "{{ (lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true) }}"
+
+    - name: Refuse a pinned transfer declaration or directory (entry guard; before any use)
+      ansible.builtin.assert:
+        that:
+          - tr_dir == transfer_dir
+          - tr == ((lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true))
+        fail_msg: >-
+          TRANSFER-DERIVED-OUTPUT-PINNED: {{ (['tr_dir'] if tr_dir != transfer_dir else [])
+          + (['tr'] if tr != ((lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true)) else []) }}
+          were supplied from outside the driver (extra-var); they are derived from transfer_dir / decl_overrides, never inputs.
+        quiet: true
 
     - name: Resolve the harness policy on this host (route author)
       ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_policy.yml"
@@ -118,7 +168,6 @@
   connection: local
   gather_facts: false
   any_errors_fatal: true
-  vars: *drv
   tasks:
     # B-COMMIT-INDEX-RACE controls (cases use src: clone, so only the case's own clone moves): the index moves AFTER
     # source_admit observed the source and BEFORE source_stage binds the archive -- a concurrent `git add`.
@@ -161,7 +210,6 @@
   hosts: "{{ drv_stand_in }}"
   gather_facts: false
   any_errors_fatal: true
-  vars: *drv
   tasks:
     - name: Run the steps
       ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/{{ _step }}.yml"

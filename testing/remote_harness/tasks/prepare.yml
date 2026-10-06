@@ -1,0 +1,196 @@
+---
+# testing/remote_harness/tasks/prepare.yml -- the declared PREPARATION phase of the acquisition stage (codex-tick369
+# GUEST-ACQUISITION-ADMISSION-CYCLE; codex-tick372 Debian cloud trust correction; RS descriptors r2 03f07f63).
+# AUTHORED, NEVER EXECUTED. Included ONLY by acquire.yml, after its artifact rows are acquired and receipted, and only
+# when the resolved policy declares controller.bootstrap.preparation (C1 proposal; absent -> acquire.yml is unchanged).
+#
+# STAGE BOUNDARY: this runs inside the genesis acquire stage (genesis.launch.stages.acquire; inventory
+# genesis.launch.inventory = operator_controller_inventory: a controller-only inventory, so the engine's scope
+# derivation has NO target -- the lab allocation is never composed), over the SAME resolve as every route stage
+# (tasks/resolve_policy.yml; no raw manifest read, no second merge). It resolves the narrower declaration that exists
+# BEFORE the guest tool identities and graph's base_image are known, and it reads neither a target scope nor
+# guest.allocation: every input below is rh.controller.bootstrap.preparation, rh.controller.bootstrap.os_tools,
+# rh.packages or the localhost host var rh_preparation_root. It is not target_prereq, contacts no target and graph
+# stays a hypervisor.
+#
+# OUTPUT: ONE immutable, content-addressed CANDIDATE record <root>/<layout.records>/<sha256>.json (mode 0400, never
+# overwritten) with
+#   images[]  per declared base image: trust mode + its boundary statement, edition (and how it was selected), the
+#             exact file, sha512 / sha256 / size, metadata bytes (stored content-addressed beside the record) and
+#             digests, the one selected checksum line, source / final URL and every hop, disposition fetched|reused
+#   tools{}   per declared guest tool: path + {kind: file_sha256, sha256} MEASURED (native stat) on the member
+#             extracted from the declared Debian package, whose bytes are bound to the OpenPGP-verified archive
+#             metadata (InRelease -> Packages -> .deb), with the package edition and the archive provenance
+# The record is a REQUEST for admission, never self-authorizing: C1 lands the identities + the record's sha256 in the
+# profile, B lands graph's {file, sha512}, and package.yml (tasks/admit_preparation.yml) re-reads the record by that
+# digest and refuses any declaration that is not the candidate. A graph measurement (target_prereq.yml) stays a
+# SEPARATE per-host override check, never the initial identity. The base image is admitted into <root>/<layout.bases>
+# only (never into the acquisition store, whose rows are pre-declared).
+
+# Every name this phase derives (rh_prep_* facts, _rh_prep_* registers, the loop vars rh_prep_img / rh_prep_pkg) is
+# refused as an INPUT here, inline (the observe.yml ^_?rh_obs_ idiom): refuse_pinned_outputs.yml reads only the exact
+# reserved_outputs list, and an extra-var would outrank every set_fact below (e.g. a widened rh_prep_f_hosts or a
+# pinned rh_prep_i_entry). C1 proposal: reserved_output_patterns reserved_prep_vars '^_?rh_prep_[A-Za-z0-9_]+$'.
+- name: "PREPARE -- refuse pre-supplied preparation names (^_?rh_prep_)"
+  ansible.builtin.assert:
+    that:
+      - (vars | list) | select('match', '^_?rh_prep_') | list | length == 0
+    fail_msg: >-
+      REFUSED RH-DERIVED-OUTPUT-PINNED: preparation names supplied from outside:
+      {{ (vars | list) | select('match', '^_?rh_prep_') | list }}
+    quiet: true
+
+# PREPARATION SCOPE = CONTROLLER ONLY (codex-tick375-377 BASE-IMAGE-SLOT-RESOLVE-ORDER option (i)): the resolve this
+# phase runs under must carry NO target scope (the engine composes the controller plus every target-group member,
+# lme_manifests.py _rh_scoped), so an inventory holding the incomplete lab -- or any target -- is refused here, before
+# any fetch, even though every play is hosts: localhost.
+- name: "PREPARE -- refuse a resolve that composed any target scope (controller-only preparation scope)"
+  ansible.builtin.assert:
+    that:
+      - lme_resolved.remote_harness.scopes is defined
+      - lme_resolved.remote_harness.scopes.targets | default(none) is mapping
+      - lme_resolved.remote_harness.scopes.targets | length == 0
+      - groups[rh.controller.bootstrap.inventory.target_group] | default([]) | length == 0
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal | default('RH-PREPARE') }}: preparation runs only under a
+      controller-only inventory (genesis.launch.inventory); this resolve composed targets
+      {{ lme_resolved.remote_harness.scopes.targets | default({}) | list }} / group
+      {{ rh.controller.bootstrap.inventory.target_group }} = {{ groups[rh.controller.bootstrap.inventory.target_group] | default([]) }}.
+      Nothing was fetched.
+    quiet: true
+
+- name: "PREPARE -- admit the preparation declaration shape and the root input (no defaults)"
+  vars:
+    _p: "{{ rh.controller.bootstrap.preparation }}"
+    _root: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.preparation.root_var, default='') }}"
+  ansible.builtin.assert:
+    that:
+      - _p is mapping
+      - _p.revision | default(none) == 1
+      - _root is string and _root != ''
+      - _root is match(rh.controller.bootstrap.path_admission.regex)
+      - _root is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+      - not (_root ~ '/').startswith(rh_artifact_source ~ '/')
+      - not (rh_artifact_source ~ '/').startswith(_root ~ '/')
+      - not (rh_acquisition_receipt ~ '/').startswith(_root ~ '/')
+    fail_msg: >-
+      REFUSED {{ _p.refusal | default('RH-PREPARE') }}: controller.bootstrap.preparation must be revision 1 and the
+      localhost host var {{ _p.root_var | default('?') }} a normalized absolute path, disjoint from the acquisition store
+      {{ rh_artifact_source }} and not holding the acquisition receipt. Nothing was fetched.
+    quiet: true
+
+- name: "PREPARE -- publish the admitted preparation root (derived output)"
+  ansible.builtin.set_fact:
+    rh_prep_root: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.preparation.root_var) }}"
+    rh_prep_images: []
+    rh_prep_tools: {}
+    rh_prep_archive: {}
+
+- name: "PREPARE -- stat the preparation root (read-only)"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root }}"
+    follow: false
+    get_checksum: false
+  register: _rh_prep_rootst
+
+- name: "PREPARE -- refuse a preparation root that is not an existing owned private directory"
+  vars:
+    _d: "{{ _rh_prep_rootst.stat }}"
+  ansible.builtin.assert:
+    that:
+      - _d.exists and _d.isdir and not _d.islnk and _d.uid == rh_builder.uid | int and not (_d.wgrp or _d.woth)
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ rh_prep_root }} must be an existing real directory
+      owned by uid {{ rh_builder.uid }} and not group/other-writable. Nothing was fetched.
+    quiet: true
+
+- name: "PREPARE -- the declared sub-directories (created only if absent, 0700; never chmod of an existing one)"
+  ansible.builtin.file:
+    path: "{{ rh_prep_root ~ '/' ~ item }}"
+    state: directory
+    mode: '0700'
+  loop: "{{ rh.controller.bootstrap.preparation.layout | dict2items | map(attribute='value') | list }}"
+
+- name: "PREPARE -- re-stat the sub-directories (owned, private, real)"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root ~ '/' ~ item }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ rh.controller.bootstrap.preparation.layout | dict2items | map(attribute='value') | list }}"
+  register: _rh_prep_dirs
+
+- name: "PREPARE -- refuse a sub-directory that is not an owned private real directory (preserved, never repaired)"
+  ansible.builtin.assert:
+    that:
+      - >-
+        _rh_prep_dirs.results | map(attribute='stat') | selectattr('isdir', 'defined') | selectattr('isdir')
+        | rejectattr('islnk') | selectattr('uid', 'equalto', rh_builder.uid | int) | selectattr('mode', 'equalto', '0700')
+        | list | length == _rh_prep_dirs.results | length
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: every {{ rh_prep_root }}/<layout> directory must be a
+      real directory owned by uid {{ rh_builder.uid }} with mode 0700: {{ _rh_prep_dirs.results | map(attribute='item') | list }}.
+    quiet: true
+
+- name: "PREPARE -- admit every preparation tool by identity BEFORE its first use (tasks/admit_prep_tools.yml)"
+  ansible.builtin.include_tasks: admit_prep_tools.yml
+
+- name: "PREPARE -- each declared base image (debian_official_tls_sha512; tasks/prepare_image.yml)"
+  ansible.builtin.include_tasks: prepare_image.yml
+  loop: "{{ rh.controller.bootstrap.preparation.base_images | dict2items }}"
+  loop_control:
+    loop_var: rh_prep_img
+    label: "{{ rh_prep_img.key }}"
+
+- name: "PREPARE -- the declared guest tool packages (debian_archive_inrelease; tasks/prepare_tools.yml)"
+  ansible.builtin.include_tasks: prepare_tools.yml
+  when: rh.controller.bootstrap.preparation.tool_packages is defined
+
+- name: "PREPARE -- render the candidate record (one value, digested before it is written)"
+  ansible.builtin.set_fact:
+    rh_prep_record_text: >-
+      {{ {'schema': rh.controller.bootstrap.preparation.record_schema,
+          'candidate': true,
+          'self_authorizing': false,
+          'prepared_at_utc': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+          'profile_sha256': rh_profile_sha256,
+          'config_revision': rh_config_revision,
+          'engine_revision': rh_engine_revision,
+          'lock_sha256': lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ rh.controller.lock_file_rel) | hash('sha256'),
+          'preparation': rh.controller.bootstrap.preparation | dict2items | rejectattr('key', 'equalto', 'admitted_record') | items2dict,
+          'builder_uid': rh_builder.uid,
+          'images': rh_prep_images,
+          'tools': rh_prep_tools,
+          'archive': rh_prep_archive} | to_nice_json }}
+
+- name: "PREPARE -- write the candidate record content-addressed (no overwrite: an existing name IS these bytes)"
+  ansible.builtin.copy:
+    dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.records ~ '/' ~ (rh_prep_record_text | hash('sha256')) ~ '.json' }}"
+    content: "{{ rh_prep_record_text }}"
+    mode: '0400'
+    force: false
+
+- name: "PREPARE -- re-read the written record (links not followed)"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.records ~ '/' ~ (rh_prep_record_text | hash('sha256')) ~ '.json' }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rh_prep_recst
+
+- name: "PREPARE -- refuse unless the record on disk is exactly the rendered bytes"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_recst.stat.exists and _rh_prep_recst.stat.isreg and not _rh_prep_recst.stat.islnk
+      - _rh_prep_recst.stat.checksum == (rh_prep_record_text | hash('sha256'))
+      - _rh_prep_recst.stat.mode == '0400'
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: the candidate record at {{ _rh_prep_recst.stat.path | default('?') }}
+      is not the rendered record (a pre-existing file of that name is preserved).
+    quiet: true
+
+- name: "PREPARE -- report the candidate (a request for admission; C1 / B land it, package.yml admits it)"
+  ansible.builtin.debug:
+    msg: >-
+      PREPARED record={{ _rh_prep_recst.stat.path }} record_sha256={{ _rh_prep_recst.stat.checksum }}
+      images={{ rh_prep_images | map(attribute='file') | list }} tools={{ rh_prep_tools | list }}
+      trust_modes={{ (rh_prep_images | map(attribute='trust_mode') | list) + ([rh_prep_archive.trust_mode] if rh_prep_archive else []) }}
+      candidate=true self_authorizing=false

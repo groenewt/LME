@@ -55,6 +55,7 @@
     outcome: {}
     dump_sha256: {}
     overlay_sha256: {}
+    key_removal: {}
     host_outcomes: null
     outcome_host: null
     inv_children: {}
@@ -118,6 +119,37 @@
       - case.inventory_proof_auto is not defined or case.extra_vars is not defined or 'lme_inventory_proof' not in case.extra_vars
       - case.inventory_proof_tamper is not defined or (case.inventory_proof_auto is defined and case.inventory_proof_tamper in ['digest', 'sources'])
     fail_msg: "case {{ case.name }} declares an invalid inventory_hosts / inventory_groups / limit / probe_hosts / no_inventory / expected_outcome_hosts / inventory_proof_auto / inventory_proof_tamper shape"
+
+# KEY-REMOVAL FIXTURE OPERATION (C1; codex-tick328-329 missing_keys). OPTIONAL declared case field
+#   key_remove: [{path: <an admitted copied file, canonical relative path>, key_paths: [[<seg>, ...], ...]}]
+# (field `key_paths`, never `keys`: a Jinja attribute lookup of a missing `keys` would reach dict.keys)
+# the one declared way a case DELETES keys (overlay_merge is a recursive combine and cannot). Applied AFTER the
+# overlays, to the isolated copy only (source tree immutable), through macros/key_remove.j2; confined to an admitted
+# copied file (isolated_source.files or a member of the bound manifests tree) and to canonical key paths (lists of
+# non-empty string segments from the document root; every path must EXIST before removal). The exact pre/post bytes
+# are retained (<casedir>/key_remove/<n>.pre + the target itself) and their sha256 recorded in the result; each key
+# is proved ABSENT from the written copy before the probe runs. A case declaring no key_remove is unchanged.
+- name: "[{{ case.name }}] refuse an invalid key_remove declaration BEFORE running (canonical file + key paths)"
+  ansible.builtin.assert:
+    that:
+      - case.key_remove is not defined or (case.key_remove is sequence and case.key_remove is not string and case.key_remove is not mapping and (case.key_remove | length) > 0)
+      - (case.key_remove | default([]) | reject('mapping') | list | length) == 0
+      - (case.key_remove | default([]) | map('dict2items') | map('map', attribute='key') | map('sort') | map('list') | reject('eq', ['key_paths', 'path']) | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='path') | reject('string') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='path') | list | length) == (case.key_remove | default([]) | map(attribute='path') | unique(case_sensitive=true) | list | length)
+      - (case.key_remove | default([]) | map(attribute='path') | select('match', '/') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='path') | select('search', '[\\x00-\\x1f\\x7f\\\\]') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='path') | map('split', '/') | flatten | select('in', ['', '.', '..']) | list | length) == 0
+      # every keys value: a non-empty list of key paths; every key path a non-empty list of non-empty strings
+      - (case.key_remove | default([]) | map(attribute='key_paths') | reject('sequence') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | select('string') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | map('length') | select('eq', 0) | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=1) | reject('sequence') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=1) | select('string') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=1) | map('length') | select('eq', 0) | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=2) | reject('string') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=2) | map('length') | select('eq', 0) | list | length) == 0
+    fail_msg: "case {{ case.name }} declares an invalid key_remove (a non-empty list of {path, key_paths}; unique canonical relative paths; key_paths = non-empty lists of non-empty string segment lists)"
 
 - name: "[{{ case.name }}] fresh casedir"
   ansible.builtin.file: {path: "{{ work }}/{{ case.name }}", state: "{{ item }}"}
@@ -221,6 +253,101 @@
   loop: "{{ overlay_src.results }}"
   loop_control: {label: "{{ item.item.path }}"}
 
+# ---- KEY-REMOVAL FIXTURE OPERATION (declared key_remove only; after the overlays; isolated copy only) ----
+- name: "[{{ case.name }}] key_remove: confined to an admitted copied file (isolated_source.files or a bound manifests-tree member), no alias"
+  ansible.builtin.assert:
+    that:
+      - item.path in (isolated_source.files + (copied_tree_before.keys() | list))
+      - ((casedir ~ '/' ~ item.path) | realpath) == ((casedir | realpath) ~ '/' ~ item.path)
+    fail_msg: "key_remove target {{ item.path }} is not an admitted copied file of this case (or resolves elsewhere: {{ (casedir ~ '/' ~ item.path) | realpath }})"
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: evidence dir for the exact PRE bytes"
+  ansible.builtin.file: {path: "{{ casedir }}/key_remove", state: directory}
+  when: case.key_remove is defined
+
+- name: "[{{ case.name }}] key_remove: retain the exact PRE bytes of each target (post-overlay copy, byte-for-byte)"
+  ansible.builtin.copy:
+    src: "{{ casedir }}/{{ item.path }}"
+    dest: "{{ casedir }}/key_remove/{{ kr_i }}.pre"
+    remote_src: true
+    mode: preserve
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}", index_var: kr_i}
+
+- name: "[{{ case.name }}] key_remove: sha256 of the PRE bytes"
+  ansible.builtin.stat: {path: "{{ casedir }}/key_remove/{{ kr_i }}.pre", checksum_algorithm: sha256}
+  register: kr_pre_stat
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}", index_var: kr_i}
+
+- name: "[{{ case.name }}] key_remove: read each target"
+  ansible.builtin.slurp:
+    src: "{{ casedir }}/{{ item.path }}"
+  register: kr_src
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: every declared key path EXISTS before removal and the document round-trips losslessly"
+  vars:
+    _kr_doc: "{{ item.content | b64decode | from_yaml }}"
+    _kr_present: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/key_remove.j2', template_vars={'op': 'present', 'doc': _kr_doc, 'paths': item.item.key_paths}) | from_json).present }}"
+  ansible.builtin.assert:
+    that:
+      - _kr_doc is mapping
+      - (_kr_doc | to_json | from_json) == _kr_doc
+      - _kr_present | length == item.item.key_paths | length
+      - _kr_present | reject('eq', true) | list | length == 0
+    fail_msg: "key_remove {{ item.item.path }}: declared key paths {{ item.item.key_paths }} present={{ _kr_present }} (every one must exist; the document must be a mapping with a lossless JSON round trip)"
+  loop: "{{ kr_src.results }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: write the isolated copy WITHOUT exactly the declared keys (macros/key_remove.j2)"
+  ansible.builtin.copy:
+    dest: "{{ casedir }}/{{ item.item.path }}"
+    content: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/key_remove.j2', template_vars={'op': 'remove', 'doc': (item.content | b64decode | from_yaml), 'paths': item.item.key_paths}) | from_json).doc | to_nice_yaml(indent=2, sort_keys=True) }}"
+  loop: "{{ kr_src.results }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: re-read each written target"
+  ansible.builtin.slurp:
+    src: "{{ casedir }}/{{ item.path }}"
+  register: kr_post
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: every declared key is ABSENT from the written copy BEFORE the probe; nothing else removed"
+  vars:
+    _kr_after: "{{ item.content | b64decode | from_yaml }}"
+    _kr_absent: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/key_remove.j2', template_vars={'op': 'present', 'doc': _kr_after, 'paths': item.item.key_paths}) | from_json).present }}"
+    _kr_before: "{{ kr_src.results[kr_i].content | b64decode | from_yaml }}"
+    _kr_expect: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/key_remove.j2', template_vars={'op': 'remove', 'doc': _kr_before, 'paths': item.item.key_paths}) | from_json).doc }}"
+  ansible.builtin.assert:
+    that:
+      - _kr_absent | length == item.item.key_paths | length
+      - _kr_absent | select('eq', true) | list | length == 0
+      - _kr_after == _kr_expect
+    fail_msg: "key_remove {{ item.item.path }}: after the write present={{ _kr_absent }} (every declared key must be absent, the rest unchanged)"
+  loop: "{{ kr_post.results }}"
+  loop_control: {label: "{{ item.item.path }}", index_var: kr_i}
+
+- name: "[{{ case.name }}] key_remove: sha256 of the POST bytes"
+  ansible.builtin.stat: {path: "{{ casedir }}/{{ item.path }}", checksum_algorithm: sha256}
+  register: kr_post_stat
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: record the operation (path -> removed key paths, exact pre/post sha256, retained pre file)"
+  ansible.builtin.set_fact:
+    key_removal: >-
+      {{ key_removal | combine({item.path: {'key_paths': item.key_paths, 'pre_file': 'key_remove/' ~ kr_i ~ '.pre',
+                                            'pre_sha256': kr_pre_stat.results[kr_i].stat.checksum,
+                                            'post_sha256': kr_post_stat.results[kr_i].stat.checksum,
+                                            'generator': {'path': 'macros/key_remove.j2', 'sha256': instruments['macros/key_remove.j2']}}}) }}
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}", index_var: kr_i}
+
 - name: "[{{ case.name }}] sha256 of each overlaid file"
   ansible.builtin.stat: {path: "{{ casedir }}/{{ item.path }}", checksum_algorithm: sha256}
   register: overlay_stat
@@ -248,14 +375,18 @@
               | map('regex_replace', '^' ~ (casedir | regex_escape) ~ '/', '')
               | zip(tree_after.results | map(attribute='files') | flatten(levels=1) | map(attribute='checksum'))) }}
 
-- name: "[{{ case.name }}] post-overlay tree = pre-overlay tree except exactly the declared overlay targets"
+- name: "[{{ case.name }}] post-overlay tree = pre-overlay tree except exactly the declared overlay / key_remove targets"
+  vars:
+    _declared_targets: "{{ (overlay_sha256.keys() | list) + (key_removal.keys() | list) }}"
   ansible.builtin.assert:
     that:
       - tree_links_after.results | map(attribute='files') | flatten(levels=1) | length == 0
       - (copied_tree_after.keys() | sort | list) == (copied_tree_before.keys() | sort | list)
-      - (copied_tree_after | dict2items | rejectattr('key', 'in', overlay_sha256.keys() | list) | items2dict) == (copied_tree_before | dict2items | rejectattr('key', 'in', overlay_sha256.keys() | list) | items2dict)
+      - (copied_tree_after | dict2items | rejectattr('key', 'in', _declared_targets) | items2dict) == (copied_tree_before | dict2items | rejectattr('key', 'in', _declared_targets) | items2dict)
       - (overlay_sha256 | dict2items | selectattr('key', 'in', copied_tree_after.keys() | list) | items2dict) == (copied_tree_after | dict2items | selectattr('key', 'in', overlay_sha256.keys() | list) | items2dict)
-    fail_msg: "the overlay changed tree membership or bytes outside its declared targets"
+      # a key_remove target's bytes in the tree are exactly its recorded POST bytes (the probe reads those)
+      - (key_removal | dict2items | selectattr('key', 'in', copied_tree_after.keys() | list) | map(attribute='value.post_sha256') | list) == (key_removal | dict2items | selectattr('key', 'in', copied_tree_after.keys() | list) | map(attribute='key') | map('extract', copied_tree_after) | list)
+    fail_msg: "the overlay / key_remove changed tree membership or bytes outside its declared targets"
 
 - name: "[{{ case.name }}] canonical digests of the copied tree before/after overlay (macros/manifest_digest.j2)"
   ansible.builtin.set_fact:
@@ -572,7 +703,7 @@
           'probe_sha256': probe_stat.stat.checksum, 'argv_sha256': (probe_argv | to_json | hash('sha256')),
           'probe_env': probe_env,
           'stdout_sha256': (probe_run.stdout | hash('sha256')), 'stderr_sha256': (probe_run.stderr | hash('sha256')),
-          'overlay_sha256': overlay_sha256, 'dump_sha256': dump_sha256,
+          'overlay_sha256': overlay_sha256, 'key_removal': key_removal, 'dump_sha256': dump_sha256,
           'copied_tree_sha256': copied_tree_digests,
           'host_outcomes': host_outcomes, 'outcome_host': outcome_host, 'system_inventory': system_inventory,
           'inventory_proof': inventory_proof,

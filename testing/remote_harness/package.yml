@@ -70,6 +70,31 @@
 
     - name: Admit exactly the declared builder before any write (GENESIS)
       ansible.builtin.include_tasks: tasks/admit_builder.yml
+      vars:
+        rh_gen_stage: package     # genesis.launch.stages key: env and temps under <work root>/tmp/genesis/package/<act>
+
+    # OS-TOOL CONSUMER PARTITION (codex-tick328-329; controller.bootstrap.os_tool_consumers, registry-owned, not tunable):
+    # every required_by name is EXACTLY one controller or one target consumer. An entry with ANY controller consumer stays
+    # a controller precondition (hashed and admitted below); only entries used exclusively by target consumers are
+    # skipped here -- target execution admits those in its own namespace. An undeclared name refuses (never silently
+    # skipped or hashed). The identity, missing-tool and source-binding guards below are unchanged.
+    - name: Refuse an os_tools consumer outside the declared controller/target partition (before any hash)
+      vars:
+        _rh_pkg_oc: "{{ rh.controller.bootstrap.os_tool_consumers | default({}) }}"
+        _rh_pkg_used: "{{ rh.controller.bootstrap.os_tools | dict2items | map(attribute='value.required_by', default=[]) | flatten | unique | list }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_oc.controller | default([]) | length > 0
+          - _rh_pkg_oc.target is defined
+          - _rh_pkg_oc.controller | intersect(_rh_pkg_oc.target) | length == 0
+          - rh.controller.bootstrap.os_tools | dict2items | rejectattr('value.required_by', 'defined') | list | length == 0
+          - rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'equalto', []) | list | length == 0
+          - _rh_pkg_used | reject('in', _rh_pkg_oc.controller + _rh_pkg_oc.target) | list | length == 0
+        fail_msg: >-
+          REFUSED RH-OS-TOOL-CONSUMER: every os_tools required_by name must be exactly one declared consumer of
+          controller.bootstrap.os_tool_consumers (controller {{ _rh_pkg_oc.controller | default([]) }}, target
+          {{ _rh_pkg_oc.target | default([]) }}); undeclared: {{ _rh_pkg_used | reject('in', (_rh_pkg_oc.controller | default([])) + (_rh_pkg_oc.target | default([]))) | list }}.
+        quiet: true
 
     - name: Hash every declared executable this controller runs, independently of the tools (stat sha256, links followed)
       ansible.builtin.stat:
@@ -77,8 +102,17 @@
         follow: true
         get_checksum: true
         checksum_algorithm: sha256
-      # target-only entries (adapter tools; the privileged contact's system interpreter, codex 155203) are not controller preconditions
-      loop: "{{ rh.controller.bootstrap.os_tools | dict2items | rejectattr('value.required_by', 'subset', ['target_adapter', 'privileged_contact']) | list }}"
+      # target-only entries (required_by names only target consumers: adapter tools, the privileged contact's interpreter,
+      # target_prereq / guest / observation tools) are not controller preconditions; with the partition admitted above,
+      # "not a subset of target" == "names at least one controller consumer". PREPARATION-only entries (required_by a
+      # subset of target + [preparation.tool_label]: gpgv, dpkg-deb, xz) are likewise skipped: they are admitted at their
+      # own use boundary (tasks/admit_prep_tools.yml, acquire stage) and are no precondition of packaging (a controller
+      # without dpkg-deb -- e.g. RedHat -- still packages); an entry that ALSO serves seed/uv_installer (tar) stays hashed
+      loop: >-
+        {{ rh.controller.bootstrap.os_tools | dict2items
+           | rejectattr('value.required_by', 'subset', rh.controller.bootstrap.os_tool_consumers.target
+                        + ([rh.controller.bootstrap.preparation.tool_label] if rh.controller.bootstrap.preparation is defined else []))
+           | list }}
       loop_control:
         label: "{{ item.key }}"
       register: _rh_pkg_ident
@@ -133,6 +167,13 @@
           {{ _pkgs | map('extract', rh.packages.by_os_family.RedHat) | list }} (MAIN installs them; never ad hoc; an
           admitted os_tools path override names its own location). Nothing was written.
         quiet: true
+
+    # PREPARATION ADMISSION (codex-tick369; C1 proposal controller.bootstrap.preparation): the guest tool identities and
+    # a hypervisor's base image are admitted only as the candidate of the preparation record whose digest the profile
+    # declares (tasks/admit_preparation.yml; before any write). Absent section -> skipped (the pre-guest profile).
+    - name: Admit the preparation candidates the declarations carry (tasks/admit_preparation.yml; declared only)
+      ansible.builtin.include_tasks: tasks/admit_preparation.yml
+      when: rh.controller.bootstrap.preparation is defined
 
     - name: Bind the source edition (read-only git)
       ansible.builtin.command:

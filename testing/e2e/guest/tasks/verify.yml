@@ -1,0 +1,134 @@
+---
+# testing/e2e/guest/tasks/verify.yml -- READ-ONLY: the observed guest equals its lifecycle record (lme_guest_mode=verify,
+# and the last step of provision). Nothing is written, started or stopped. Inputs: gd, gg, gp, gt, g_owner_uid.
+# Output: g_record (the admitted record: the observed guest identity + endpoint + console fingerprint OBSERVATIONS).
+# NOT AUTHENTICATION (codex review): the SSH banner check is liveness of the forwarded port only, and the console
+# comparison is record/console CONSISTENCY only. Neither authenticates the endpoint. Binding the host key the endpoint
+# presents to g_record.host_key_fingerprints, before any privileged SSH, is B's privileged leg; the record fields are
+# observations for that binding, not a known_hosts file.
+
+- name: Read this run's lifecycle record (owned regular file, admitted by admit.yml)
+  ansible.builtin.slurp:
+    src: "{{ gp.files.record }}"
+  register: _g_rec_raw
+
+- name: Bind the record (derived)
+  ansible.builtin.set_fact:
+    g_record: "{{ _g_rec_raw.content | b64decode | from_json }}"
+
+# codex tick331 RECORD VERSION: first, before the shape check; verify is read-only, so the record stays byte-identical.
+- name: Refuse a record of any version other than the one this lifecycle produces (read-only; preserved byte-identical)
+  ansible.builtin.assert:
+    that:
+      - g_record is mapping
+      - (g_record.schema | default(none)) == gd.record.schema
+    fail_msg: >-
+      REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.files.record }} is version
+      {{ (g_record.schema | default('undeclared')) if g_record is mapping else 'not-a-mapping' }}; this lifecycle reads
+      only {{ gd.record.schema }}. Nothing is reinterpreted or written; the record is preserved byte-identical.
+    quiet: true
+
+- name: Refuse a record that is not THIS allocated guest on THIS hypervisor
+  ansible.builtin.assert:
+    that:
+      - g_record.keys() | list | sort == gd.record.fields | sort
+      - g_record.state == 'started'
+      - g_record.run_id == gg.run_id and g_record.name == gg.name
+      - g_record.hypervisor == inventory_hostname
+      - g_record.owner_uid == g_owner_uid | int
+      - g_record.run_dir == gp.run and g_record.storage_root == gg.storage_root
+      - g_record.base == gp.base and g_record.base_sha512 == gg.base_image.sha512
+      - g_record.unit.name == gp.unit and g_record.unit.scope == 'user'
+      - g_record.endpoint.address == gd.qemu.net.bind and g_record.endpoint.port == gg.forward_port
+      - g_record.endpoint.via == inventory_hostname
+      - g_record.allocation.vcpus == gg.vcpus and g_record.allocation.memory_mib == gg.memory_mib
+      - g_record.allocation.os_disk_gib == gg.os_disk_gib and g_record.allocation.data_disk_gib == gg.data_disk_gib
+      - g_record.disks.os.file == gp.files.os_disk and g_record.disks.data.file == gp.files.data_disk
+      - g_record.disks.os.identity is mapping and g_record.disks.data.identity is mapping
+      - g_record.recoveries is sequence and g_record.recoveries is not string
+      - >-
+        g_record.recoveries | length == 0
+        or g_record.recoveries[-1].invocation_id == g_record.unit.invocation_id
+      - g_record.uuid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+      # host-key presence/count/type is refused as GUEST-HOST-KEYS by the HOST KEYS task below (codex decision)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: {{ gp.files.record }} does not describe the allocated
+      started guest {{ gg.run_id }} of this hypervisor (a changed allocation is a NEW run_id, never an in-place edit).
+    quiet: true
+
+# codex GUEST-INITIALIZED-DISK: the pathnames must still be the RECORDED inodes (a vanished or recreated disk refuses
+# GUEST-DISK-IDENTITY), and unit_bind below requires the process to hold exactly those inodes open.
+- name: Refuse disks whose chain or inode differs from the record (overlay on the immutable base; standalone data disk)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/check_disks.yml"
+  vars:
+    _g_disks: [os, data]
+    _g_disk_ids_expect: "{{ {'os': g_record.disks.os.identity, 'data': g_record.disks.data.identity} }}"
+
+# codex GUEST-RETIRED-UNIT-REUSE: ActiveState + a positive MainPID do not bind the process to this guest.
+- name: Bind the unit named in the record to THIS generation (argv, cgroup, invocation; read-only)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/unit_bind.yml"
+
+- name: Refuse a guest whose unit is not this generation's running process with the recorded invocation
+  ansible.builtin.assert:
+    that:
+      - g_unit_obs.load == 'loaded' and g_unit_obs.active_state == 'active'
+      - g_unit_obs.bound | bool
+      - g_record.unit.invocation_id is string and g_record.unit.invocation_id == g_unit_obs.invocation_id
+    fail_msg: >-
+      REFUSED {{ gd.refusals.unit_reused if (g_unit_obs.running | bool) else gd.refusals.unit }} on {{ inventory_hostname }}:
+      {{ gp.unit }} is {{ g_unit_obs.load }}/{{ g_unit_obs.active_state }} (pid {{ g_unit_obs.main_pid }}, invocation
+      {{ g_unit_obs.invocation_id }}); bound to generation {{ g_record.generation }}: {{ g_unit_obs.bound }}.
+    quiet: true
+
+- name: LIVENESS ONLY -- the recorded forwarded port answers with an SSH protocol banner (not authentication; read-only)
+  ansible.builtin.wait_for:
+    host: "{{ g_record.endpoint.address }}"
+    port: "{{ g_record.endpoint.port }}"
+    search_regex: '^SSH-2\.0-'
+    timeout: "{{ gd.endpoint_timeout_s }}"
+
+- name: Read the console for the fingerprints the guest printed (owned file; read-only)
+  ansible.builtin.slurp:
+    src: "{{ gp.files.console }}"
+  register: _g_console_v
+
+# codex decision: GUEST-ENDPOINT only for endpoint failures; any failure of host-key material, count, type or binding
+# refuses GUEST-HOST-KEYS (next task).
+- name: ENDPOINT -- the guest did not report an identity mismatch on its console
+  vars:
+    _g_vtxt: "{{ _g_console_v.content | b64decode }}"
+  ansible.builtin.assert:
+    that:
+      - gd.cloud_init.identity_check.marker not in _g_vtxt
+    fail_msg: >-
+      REFUSED {{ gd.refusals.endpoint }} on {{ inventory_hostname }}: {{ gp.files.console }} reports an identity mismatch
+      ({{ gd.cloud_init.identity_check.marker }}); the guest is not the recorded one.
+    quiet: true
+
+# CONSISTENCY ONLY: the recorded fingerprint and PUBLIC host-key observations are still on the console, one public key
+# per fingerprint, of the declared types (declared short<->long type_map). These remain OBSERVATIONS: this never
+# authenticates the endpoint; B re-derives each fingerprint from public_key and binds the presented key before
+# privileged SSH.
+- name: HOST KEYS -- the recorded host-key observations are still on the console, complete and of the declared types
+  vars:
+    _g_vtxt: "{{ _g_console_v.content | b64decode }}"
+  ansible.builtin.assert:
+    that:
+      - g_record.host_key_fingerprints | length > 0
+      - g_record.host_key_fingerprints | map(attribute='fingerprint_sha256') | reject('in', _g_vtxt) | list | length == 0
+      - g_record.host_key_fingerprints | map(attribute='key_type') | unique | sort | list == gd.cloud_init.ssh.genkeytypes | map('lower') | unique | sort | list
+      - g_record.host_key_fingerprints | map(attribute='source') | unique | list == ['serial_console']
+      - g_record.host_public_keys | length > 0
+      - g_record.host_public_keys | length == g_record.host_key_fingerprints | length
+      - gd.cloud_init.ssh.genkeytypes | map('lower') | reject('in', gd.cloud_init.console_host_keys.type_map) | list | length == 0
+      - >-
+        g_record.host_public_keys | map(attribute='key_type') | unique | sort | list
+        == gd.cloud_init.ssh.genkeytypes | map('lower') | map('extract', gd.cloud_init.console_host_keys.type_map) | unique | sort | list
+      - g_record.host_public_keys | map(attribute='public_key') | reject('in', _g_vtxt) | list | length == 0
+      - g_record.host_public_keys | map(attribute='source') | unique | list == ['serial_console']
+    fail_msg: >-
+      REFUSED {{ gd.refusals.host_keys }} on {{ inventory_hostname }}: the recorded host-key observations
+      ({{ g_record.host_key_fingerprints | length }} fingerprints, {{ g_record.host_public_keys | length }} public keys)
+      are missing, miscounted, not the declared {{ gd.cloud_init.ssh.genkeytypes }} or no longer on {{ gp.files.console }}.
+      (Observations only; B binds the presented host key.)
+    quiet: true

@@ -1,0 +1,152 @@
+---
+# testing/e2e/reclaim/tasks/admit_plan.yml -- CLASSIFY by observation only, build the exact plan, write the admission
+# record (localhost). Contract (a)-(e) of reclaim.decl.yml. Nothing here reads an inventory name, alias, address or
+# group to decide: the target's class comes from the OBSERVED machine id + host public keys + endpoint against the
+# approved run record (guest) or the ownership ledger bound to that machine id (native).
+# Inputs: rcl, rcl_op, rcl_approval, rcl_approval_sha256, tr_contract, tr_out, tr_state,
+#         hostvars[lme_transfer_target].{tr_target, rcl_host_keys, rcl_ledger, rcl_ledger_sha256, rcl_seen_all}.
+# Outputs: rcl_plan; the admission record gate.<label>.reclaim.<op>.admission.json (0600).
+
+- name: Bind the observations of the target (observed, never named)
+  ansible.builtin.set_fact:
+    rcl_obs:
+      machine_id: "{{ hostvars[lme_transfer_target].tr_target.identity }}"
+      host_public_keys: "{{ hostvars[lme_transfer_target].rcl_host_keys }}"
+      endpoint: {host: "{{ tr_contract.address }}", port: "{{ (tr_contract.port if tr_contract.port is not none else 22) | int }}"}
+      ledger: "{{ hostvars[lme_transfer_target].rcl_ledger }}"
+      ledger_sha256: "{{ hostvars[lme_transfer_target].rcl_ledger_sha256 }}"
+      seen: "{{ hostvars[lme_transfer_target].rcl_seen_all }}"
+
+# (c) + (d): an approval whose HYPERVISOR is the machine we reached is a physical host reached under a guest's name
+# (alias / IP / renamed host). Refused before anything else is compared.
+- name: Refuse a physical hypervisor reached under a guest approval (no blanket op exists)
+  when: rcl_approval is not none
+  ansible.builtin.assert:
+    that:
+      - rcl_obs.machine_id != rcl_approval.hypervisor_machine_id
+    fail_msg: >-
+      {{ rcl.refusals.physical }}: {{ lme_transfer_target }} observes machine id {{ rcl_obs.machine_id }}, the HYPERVISOR
+      of approved run {{ rcl_approval.run_id }}. A physical machine is never wiped; nothing is touched.
+    quiet: true
+
+# (a) + (d): every binding of the approved run record equals the observation; one mismatch refuses.
+- name: Refuse a guest approval that does not bind the observed machine id, host public keys and endpoint
+  when: rcl_approval is not none
+  ansible.builtin.assert:
+    that:
+      - rcl_obs.machine_id == rcl_approval.machine_id
+      - rcl_obs.host_public_keys | length > 0
+      - (rcl_obs.host_public_keys | sort) == (rcl_approval.host_public_keys | sort)
+      - rcl_obs.endpoint.host == rcl_approval.endpoint.host
+      - (rcl_obs.endpoint.port | int) == (rcl_approval.endpoint.port | int)
+    fail_msg: >-
+      {{ rcl.refusals.identity }}: {{ lme_transfer_target }} (observed machine id {{ rcl_obs.machine_id }}, endpoint
+      {{ rcl_obs.endpoint.host }}:{{ rcl_obs.endpoint.port }}, {{ rcl_obs.host_public_keys | length }} host keys) is not
+      the guest approved as run {{ rcl_approval.run_id }} generation {{ rcl_approval.generation }}; an alias, address,
+      renamed host or identity receipt alone is not proof. Nothing is touched.
+    quiet: true
+
+- name: Decide the class (guest only when bound above; native only with a ledger bound to this machine id)
+  ansible.builtin.set_fact:
+    rcl_class: "{{ 'guest' if rcl_approval is not none else ('native' if rcl_obs.ledger is not none else 'unowned') }}"
+    rcl_action: >-
+      {{ (rcl_op.guest if rcl_approval is not none else rcl_op.native)
+         if (rcl_approval is not none or rcl_obs.ledger is not none) else 'absent' }}
+
+- name: Refuse a ledger bound to another machine (a copied disk or a moved file is not ownership)
+  when: rcl_obs.ledger is not none
+  ansible.builtin.assert:
+    that:
+      - rcl_obs.ledger.machine_id == rcl_obs.machine_id
+    fail_msg: >-
+      {{ rcl.refusals.identity }}: {{ rcl.native.ledger_path }} on {{ lme_transfer_target }} is bound to machine id
+      {{ rcl_obs.ledger.machine_id }}, observed {{ rcl_obs.machine_id }}. Nothing is touched.
+    quiet: true
+
+- name: Refuse an unowned target where the op needs ownership (never a blanket guess)
+  when: rcl_obs.ledger is none and rcl_action != 'retire_handoff'
+  ansible.builtin.assert:
+    that:
+      - rcl_op.absent_ledger[rcl_class if rcl_class == 'guest' else 'native'] == 'no_owned_state'
+    fail_msg: >-
+      {{ rcl.refusals.unowned }}: {{ lme_transfer_target }} has no approved run record and no ownership ledger at
+      {{ rcl.native.ledger_path }} bound to machine id {{ rcl_obs.machine_id }}; op {{ rcl_op.name }} reconciles only
+      declared ownership ({{ rcl.refusals.join }} JOIN-NATIVE-LEDGER-PRODUCER). A blanket wipe is never performed
+      ({{ rcl.refusals.physical }}).
+    quiet: true
+
+- name: Refuse a ledger with a pending obligation (preserved whole; contract (e))
+  when: rcl_obs.ledger is not none and rcl_action != 'retire_handoff'
+  ansible.builtin.assert:
+    that:
+      - rcl_obs.ledger.pending_obligations | length == 0
+    fail_msg: >-
+      {{ rcl.refusals.obligation }}: {{ rcl.native.ledger_path }} holds pending obligations
+      {{ rcl_obs.ledger.pending_obligations }}; nothing is reconciled until they are discharged.
+    quiet: true
+
+- name: Start the per-resource decision
+  ansible.builtin.set_fact:
+    rcl_decided: []
+
+# per entry: evidence / obligation -> preserved; absent -> gone (recorded, no effect); observation differs -> foreign;
+# otherwise owned. in_scope: every entry for ledger_reconcile, only the named service's entries for ledger_service.
+- name: Decide each ledger entry against its observation
+  when: rcl_obs.ledger is not none and rcl_action in ['ledger_reconcile', 'ledger_service']
+  ansible.builtin.set_fact:
+    rcl_decided: >-
+      {{ rcl_decided + [{'kind': rcl_pair.0.kind, 'key_value': rcl_pair.0.key_value, 'service': rcl_pair.0.service,
+          'admitted': rcl_pair.1.observed,
+          'in_scope': (rcl_action == 'ledger_reconcile') or (rcl_pair.0.service == lme_reclaim_service | default('')),
+          'state': ('evidence' if rcl_pair.0.evidence | bool else
+                    ('obligation' if rcl_pair.0.obligations | length > 0 else
+                     ('gone' if not rcl_pair.1.present | bool else
+                      ('foreign' if rcl_pair.0.observed != rcl_pair.1.observed else 'owned'))))}] }}
+  loop: "{{ rcl_obs.ledger.resources | zip(rcl_obs.seen) | list if rcl_obs.ledger is not none else [] }}"
+  loop_control:
+    loop_var: rcl_pair
+    label: "{{ rcl_pair.0.kind }} {{ rcl_pair.0.key_value }}"
+
+- name: Refuse a ledger whose observations do not line up, a foreign entry in scope, or an empty service scope
+  when: rcl_obs.ledger is not none and rcl_action in ['ledger_reconcile', 'ledger_service']
+  ansible.builtin.assert:
+    that:
+      - rcl_obs.seen | length == rcl_obs.ledger.resources | length
+      - rcl_decided | selectattr('in_scope') | selectattr('state', 'equalto', 'foreign') | list | length == 0
+      - rcl_action != 'ledger_service' or (rcl_decided | selectattr('in_scope') | list | length > 0)
+    fail_msg: >-
+      {{ rcl.refusals.foreign }}: on {{ lme_transfer_target }} the entries
+      {{ rcl_decided | selectattr('in_scope') | selectattr('state', 'equalto', 'foreign') | map(attribute='key_value') | list }}
+      are not what the ledger recorded (foreign or replaced), or service {{ lme_reclaim_service | default('') }} owns no
+      entry. Everything is preserved; nothing is reconciled.
+    quiet: true
+
+- name: Bind the plan (exact items; everything else preserved and listed)
+  ansible.builtin.set_fact:
+    rcl_plan:
+      schema: "{{ rcl.schema }}"
+      op: "{{ rcl_op.name }}"
+      nonce: "{{ lme_reclaim_nonce }}"
+      class: "{{ rcl_class }}"
+      action: "{{ rcl_action }}"
+      status: >-
+        {{ 'retire_handoff_admitted' if rcl_action == 'retire_handoff' else
+           ('no_owned_state' if rcl_obs.ledger is none else 'reconciled') }}
+      machine_id: "{{ rcl_obs.machine_id }}"
+      host_public_keys: "{{ rcl_obs.host_public_keys }}"
+      endpoint: "{{ rcl_obs.endpoint }}"
+      ledger_sha256: "{{ rcl_obs.ledger_sha256 }}"
+      approval_sha256: "{{ rcl_approval_sha256 }}"
+      run: >-
+        {{ none if rcl_approval is none else
+           {'run_id': rcl_approval.run_id, 'generation': rcl_approval.generation, 'uuid': rcl_approval.uuid,
+            'name': rcl_approval.name, 'hypervisor': rcl_approval.hypervisor, 'disks': rcl_approval.disks,
+            'record_schema': rcl_approval.record_schema, 'record_sha256': rcl_approval.record_sha256} }}
+      items: "{{ rcl_decided | selectattr('in_scope') | selectattr('state', 'equalto', 'owned') | list if rcl_class != 'guest' or rcl_action != 'retire_handoff' else [] }}"
+      preserved: "{{ rcl_decided | rejectattr('state', 'equalto', 'owned') | list + (rcl_decided | rejectattr('in_scope') | list) }}"
+
+- name: Write the admission record (the RS retire handoff reads it; JOIN-RS-RETIRE-ADMISSION)
+  ansible.builtin.copy:
+    dest: "{{ tr_state.dir }}/gate.{{ lme_transfer_label }}.reclaim.{{ rcl_op.name }}.admission.json"
+    content: "{{ rcl_plan | to_nice_json }}\n"
+    mode: '0600'

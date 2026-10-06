@@ -218,6 +218,10 @@ exit $_fail
               'delay', 'ignore_errors', 'check_mode', 'notify', 'any_errors_fatal', 'listen', 'throttle', 'timeout',
               'diff', 'module_defaults', 'collections', 'connection', 'block', 'rescue', 'always', 'with_items'] -%}
 {%- set bprefix = '{' ~ '{ tr_dir }' ~ '}/' ~ tr.tasks_dir ~ '/' -%}
+{#- the entry-guard family include (codex-tick333 (2)) runs BEFORE tr_dir is derived, so it names the same directory by
+    the magic playbook_dir (== tr_dir in every walked entry; the entry_guard assert proves it). ONLY that exact include
+    is admitted in this form (entry_guard.family_include); any other playbook_dir-rooted include stays UNRESOLVED. -#}
+{%- set pprefix = '{' ~ '{ playbook_dir }' ~ '}/' ~ tr.tasks_dir ~ '/' -%}
 {%- set rprefix = '^\\{\\{ (rh_repo_root|playbook_dir \\| dirname \\| dirname \\| dirname) \\}\\}/' -%}
 {%- for t in (tasks or []) -%}
 {#- teff: this task/block's own effective settings (keywords + vars overlay the inherited ones) -#}
@@ -251,6 +255,9 @@ exit $_fail
 {%- if f.startswith(bprefix) and depth < 6 -%}
 {{ (row | combine({'include': 'b', 'file': f[bprefix | length:]}) | to_json) ~ '\n' }}
 {{- walk(lookup('ansible.builtin.file', tr_dir ~ '/' ~ tr.tasks_dir ~ '/' ~ f[bprefix | length:]) | from_yaml, via ~ '>' ~ f[bprefix | length:], tr, tr_dir, depth + 1, ceff) -}}
+{%- elif f == pprefix ~ 'refuse_reserved_families.yml' and depth < 6 -%}
+{{ (row | combine({'include': 'b', 'file': f[pprefix | length:]}) | to_json) ~ '\n' }}
+{{- walk(lookup('ansible.builtin.file', tr_dir ~ '/' ~ tr.tasks_dir ~ '/' ~ f[pprefix | length:]) | from_yaml, via ~ '>' ~ f[pprefix | length:], tr, tr_dir, depth + 1, ceff) -}}
 {%- elif f is match(rprefix) -%}
 {{ (row | combine({'include': 'route', 'file': f | regex_replace(rprefix, '')}) | to_json) ~ '\n' }}
 {%- else -%}
@@ -276,6 +283,12 @@ exit $_fail
 {%- if (plays | map(attribute='name') | list) != (decl | map(attribute='id') | list) -%}
 {{ v.append(ename ~ ': plays ' ~ (plays | map(attribute='name') | list | to_json) ~ ' != declared ' ~ (decl | map(attribute='id') | list | to_json)) or '' }}
 {%- endif -%}
+{#- ENTRY GUARD (codex tick318-321 item 2; decl entry_guard): the derived names are never play vars; the FIRST play of
+    each host class (localhost / target) starts with exactly [the route guard include, the entry_guard set_fact (exact
+    declared expressions), its assert (exact declared `that`)]; a later play of that host class never includes the
+    guard again. Structural string equality only; nothing is evaluated. -#}
+{%- set eg = namespace(seen=[]) -%}
+{%- set egr = '^\\{\\{ (rh_repo_root|playbook_dir \\| dirname \\| dirname \\| dirname) \\}\\}/' -%}
 {%- for p in plays -%}
 {%- set d = decl | selectattr('id', 'equalto', p.name | default('')) | first | default({'hosts': 'UNDECLARED', 'kind': 'UNDECLARED'}) -%}
 {%- set placed = 'localhost' if (p.hosts == 'localhost' and p.connection | default('') == 'local')
@@ -284,6 +297,72 @@ exit $_fail
 {%- if placed != d.hosts -%}{{ v.append(pa ~ ': placed on ' ~ placed ~ ', declared ' ~ d.hosts) or '' }}{%- endif -%}
 {%- if p.any_errors_fatal | default(false) is not sameas true -%}{{ v.append(pa ~ ': not any_errors_fatal') or '' }}{%- endif -%}
 {%- if p.gather_facts | default(true) is not sameas false -%}{{ v.append(pa ~ ': gathers facts') or '' }}{%- endif -%}
+{%- set g = tr.entry_guard -%}
+{#- TRANSFER-FIRST-GUARD-CHECKER (codex-tick333) (b): pre_tasks / roles run BEFORE tasks and play-level keywords
+    (ignore_errors, check_mode, tags, ...) reach the guard tasks, so a walked play carries only the declared keys -#}
+{%- for pk in (p.keys() | list | sort) if pk not in g.play_keys -%}
+{{ v.append(pa ~ ': play keyword ' ~ pk ~ ' (a walked play carries only ' ~ (g.play_keys | join('/')) ~ '; pre_tasks / roles run before the entry guard, play keywords reach it)') or '' }}
+{%- endfor -%}
+{%- for dv in g.derived if dv in (p.vars | default({})) -%}
+{{ v.append(pa ~ ': play var ' ~ dv ~ ' (a derived output of the entry guard, never a play var)') or '' }}
+{%- endfor -%}
+{%- set ts = p.tasks | default([]) -%}
+{%- set gin = [] -%}
+{%- set fin = [] -%}
+{#- unfiltered loop: a filtered for-loop renumbers loop.index0, and the position is what is checked -#}
+{%- for t in ts -%}
+{%- if t is mapping and (t['ansible.builtin.include_tasks'] | default('')) is string
+      and (t['ansible.builtin.include_tasks'] | default('')) is match(egr)
+      and (t['ansible.builtin.include_tasks'] | regex_replace(egr, '')) == g.guard_route_rel -%}{{ gin.append(loop.index0) or '' }}{%- endif -%}
+{%- if t is mapping and (t['ansible.builtin.include_tasks'] | default('')) is string
+      and (t['ansible.builtin.include_tasks'] | default('')).endswith('/' ~ g.family_rel) -%}{{ fin.append(loop.index0) or '' }}{%- endif -%}
+{%- endfor -%}
+{%- if placed not in eg.seen -%}
+{%- set eg.seen = eg.seen + [placed] -%}
+{#- positions (codex-tick333 (2)): [0] route guard, [1] B family guard, [2] bind set_fact, [3] assert -#}
+{%- set ok0 = (gin | length == 1) and (gin[0] == 0) -%}
+{%- set okf = (fin | length == 1) and (fin[0] == 1) and (ts[1]['ansible.builtin.include_tasks'] | default(none)) == g.family_include -%}
+{%- if not okf -%}
+{{ v.append(pa ~ ': second task of the first entry must be exactly ' ~ g.family_include ~ ' (the reserved-family guard, once, before the set_fact)') or '' }}
+{%- endif -%}
+{%- set ok1 = ts | length > 3 and ts[2] is mapping and (ts[2]['ansible.builtin.set_fact'] | default(none)) == g.bind -%}
+{%- set ok2 = ts | length > 3 and ts[3] is mapping and ((ts[3]['ansible.builtin.assert'] | default({})).that | default(none)) == g.that -%}
+{#- TRANSFER-FIRST-GUARD-CHECKER (codex-tick333) (c): the first include is exactly guard_include (magic-rooted); (a): each
+    guard task carries exactly its declared keys and the assert exactly assert_args -- no when / ignore_errors /
+    failed_when / tags / loop / delegate_to / any other keyword that can skip, suppress or redirect it -#}
+{%- set ok3 = ts | length > 0 and ts[0] is mapping and (ts[0]['ansible.builtin.include_tasks'] | default(none)) == g.guard_include -%}
+{%- if gin | length > 0 and gin[0] == 0 and not ok3 -%}
+{{ v.append(pa ~ ': first guard include is not exactly ' ~ g.guard_include ~ ' (rh_repo_root is derived inside the guard; any other root could select another file)') or '' }}
+{%- endif -%}
+{%- set kn = namespace(ok=true) -%}
+{%- for role in ['include', 'family', 'bind', 'assert'] -%}
+{%- set t = ts[loop.index0] if ts | length > loop.index0 else none -%}
+{%- if t is mapping -%}
+{%- for k in (t.keys() | list | sort) if k not in g.task_keys[role] -%}{%- set kn.ok = false -%}
+{{ v.append(pa ~ ': entry guard ' ~ role ~ ' task carries keyword ' ~ k ~ ' (exactly ' ~ (g.task_keys[role] | join('/')) ~ '; nothing may skip, suppress or redirect it)') or '' }}
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if ts | length > 3 and ts[3] is mapping and ts[3]['ansible.builtin.assert'] is defined -%}
+{%- if ts[3]['ansible.builtin.assert'] is not mapping -%}{%- set kn.ok = false -%}
+{{ v.append(pa ~ ': entry guard assert arguments are not a mapping') or '' }}
+{%- else -%}
+{%- for k in (ts[3]['ansible.builtin.assert'].keys() | list | sort) if k not in g.assert_args -%}{%- set kn.ok = false -%}
+{{ v.append(pa ~ ': entry guard assert carries argument ' ~ k ~ ' (exactly ' ~ (g.assert_args | join('/')) ~ ')') or '' }}
+{%- endfor -%}
+{%- endif -%}
+{%- endif -%}
+{%- if not (ok0 and okf and ok1 and ok2 and ok3 and kn.ok) -%}
+{{ v.append(pa ~ ': first entry of this host must be ' ~ g.guard_route_rel ~ ', then ' ~ g.family_rel ~ ', then the entry_guard set_fact ' ~ (g.derived | join('/')) ~ ', then its assert, before any other task') or '' }}
+{%- endif -%}
+{%- else -%}
+{%- if gin | length > 0 -%}
+{{ v.append(pa ~ ': re-includes ' ~ g.guard_route_rel ~ ' in a later play of this host (the guard runs on first entry only)') or '' }}
+{%- endif -%}
+{%- if fin | length > 0 -%}
+{{ v.append(pa ~ ': re-includes ' ~ g.family_rel ~ ' in a later play of this host (the family guard runs on first entry only)') or '' }}
+{%- endif -%}
+{%- endif -%}
 {%- if placed == 'target' -%}
 {%- for cv in tr.contract.conn_vars + tr.contract.credential_selectors.bind_key + tr.contract.credential_selectors['clear'] -%}
 {%- if (p.vars | default({}))[cv] | default('') != ('{' ~ "{ hostvars['localhost'].tr_conn." ~ cv ~ ' }' ~ '}') -%}
@@ -293,6 +372,22 @@ exit $_fail
 {%- endif -%}
 {%- set rows = walk(p.tasks | default([]), pa, tr, tr_dir, 0) | trim | split('\n') | select | map('from_json') | list -%}
 {%- set n.rows = n.rows + (rows | length) -%}
+{#- TRANSFER-RECURSIVE-GUARD-REENTRY-COVERAGE (codex-tick341-347): the top-level collectors above (gin / fin) see only
+    the play's DIRECT tasks. Re-entry is also possible through anything walk() reaches: a B tasks include (recursive,
+    any depth it walks), a block / rescue / always, or a differently-rooted include. Every walked row whose included
+    file is either guard (by basename: route, B, pprefix or UNRESOLVED form alike) is counted; the ONLY admitted ones
+    are the direct top-level includes already counted in gin / fin (and position-checked above on first entry, refused
+    above on a later play). Any surplus is a re-entry, refused with its walk path. -#}
+{%- set grd = [g.guard_route_rel | basename, g.family_rel | basename] -%}
+{%- set grows = rows | selectattr('include', 'defined') | selectattr('file', 'defined')
+                     | selectattr('file', 'string') | list -%}
+{%- set grows = grows | selectattr('file', 'match', '^(.*/)?(' ~ (grd | map('regex_escape') | join('|')) ~ ')$') | list -%}
+{%- if (grows | length) > (gin | length) + (fin | length) -%}
+{{ v.append(pa ~ ': re-enters an entry guard (' ~ (grd | join(' / ')) ~ ') through a nested include or block: '
+            ~ (grows | rejectattr('via', 'equalto', pa) | map(attribute='via') | list
+               + (grows | selectattr('via', 'equalto', pa) | map(attribute='task') | list)) | to_json
+            ~ ' (a guard runs once, as a direct task of the first entry of its host; never reachable from another include)') or '' }}
+{%- endif -%}
 {%- if placed == 'target' -%}
 {%- set ic = tr.initial_contact -%}
 {%- for pv in ic.refused_play_vars -%}

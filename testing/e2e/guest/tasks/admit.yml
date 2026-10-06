@@ -1,0 +1,359 @@
+---
+# testing/e2e/guest/tasks/admit.yml -- READ-ONLY admission of this host's guest allocation and of the hypervisor
+# (included by guest.yml after INITIAL CONTACT and the toolchain receipt). Every refusal here precedes the first guest
+# effect; nothing is created, started, stopped or moved. Inputs: gd (= rh.guest), gg (= rh.guest.allocation), rh,
+# _rh_tb_ic_uid (initial contact). Outputs (derived per run, guarded by guest.yml's entry guard): gt, gp, g_owner_uid.
+# Types and bounds of the allocation are C1's (global.yml contract_admission.guest_allocation, registered 32d26c0d:
+# EXACT keys, typed; the authorized keys are a controller-side PATH reference, never key material in policy); the
+# checks below are the consumer's own defence in depth (they read only the keys this lifecycle uses) and the admission
+# of what only the host / controller can show (tools, kvm, user manager, storage, base, the key file's content).
+# Capacity and memory are charged under the lifecycle lease by provision_stages.yml S3 (resume-aware), not here.
+
+- name: Refuse an allocation whose fields are absent, mistyped or malformed (consumer defence in depth)
+  ansible.builtin.assert:
+    that:
+      - >-
+        ['run_id', 'name', 'vcpus', 'memory_mib', 'os_disk_gib', 'data_disk_gib', 'storage_root', 'storage_mount',
+         'physical_reserve_gib', 'host_headroom_mib', 'forward_port', 'base_image', 'privileged_authorized_keys_file']
+        | reject('in', gg) | list | length == 0
+      - gg.run_id is string and gg.run_id is match('^[a-z0-9][a-z0-9-]{2,39}$')
+      - gg.name is string and gg.name is match('^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+      - gg.vcpus is integer and gg.vcpus >= 1
+      - gg.memory_mib is integer and gg.memory_mib >= 1024
+      - gg.os_disk_gib is integer and gg.os_disk_gib >= 8
+      - gg.data_disk_gib is integer and gg.data_disk_gib >= 1
+      - gg.storage_root is string and gg.storage_root is match('^/[A-Za-z0-9._/-]+[^/]$')
+      - "'/../' not in (gg.storage_root ~ '/') and '/./' not in (gg.storage_root ~ '/') and '//' not in gg.storage_root"
+      - gg.storage_mount is string and gg.storage_mount is match('^/([A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*)?$')
+      - gg.storage_root.startswith((gg.storage_mount | regex_replace('/$', '')) ~ '/')
+      - (gg.storage_root ~ '/') is not match('(' ~ (gd.preserved_physical_prefixes | map('regex_escape') | join('|')) ~ ')')
+      - gg.physical_reserve_gib is integer and gg.physical_reserve_gib >= 0
+      - gg.host_headroom_mib is integer and gg.host_headroom_mib >= 2048
+      - gg.forward_port is integer and gg.forward_port >= 1024 and gg.forward_port <= 65535
+      - gg.base_image is mapping and gg.base_image.keys() | list | sort == ['file', 'sha512']
+      - gg.base_image.file is string and gg.base_image.file is match('^[A-Za-z0-9._+-]+[.]qcow2$')
+      - gg.base_image.sha512 is string and gg.base_image.sha512 is match('^[0-9a-f]{128}$')
+      - gg.privileged_authorized_keys_file is string
+      - gg.privileged_authorized_keys_file is match('^/(?!\.\.?(?:/|$))[A-Za-z0-9._+-]+(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._+-]+)*$')
+    fail_msg: >-
+      REFUSED {{ gd.refusals.decl_invalid }} on {{ inventory_hostname }}: rh.guest.allocation (C1 contract
+      guest_allocation) must carry its typed keys, a storage_root under storage_mount and never under the preserved
+      physical stack's paths {{ gd.preserved_physical_prefixes }}, and privileged_authorized_keys_file as an absolute
+      controller-side path. Got keys {{ gg.keys() | list | sort }}.
+    quiet: true
+
+# The privileged guest account's authorized keys: a CONTROLLER-side file named by the allocation (never key material in
+# policy). PROVISION ONLY (its one consumer is the S5 user-data render; verify / retire never depend on it, so a
+# rotated key file never blocks them). Admitted by controller-evaluated tests only (no module runs on the controller
+# from this hypervisor play): a regular, non-link file holding only PUBLIC ed25519 / ecdsa key lines (C1 key_algorithm
+# policy; no rsa, no dss) and no private-key material. RESIDUAL (declared): its mode bits (group/other-writable) are
+# not observable this way; the file's custody is B's prerequisite.
+- name: Refuse an authorized-keys reference that is not a regular, non-link controller file (controller-side tests)
+  when: lookup('ansible.builtin.vars', gd.modes.var) == 'provision'
+  ansible.builtin.assert:
+    that:
+      - gg.privileged_authorized_keys_file is file
+      - gg.privileged_authorized_keys_file is not link
+    fail_msg: >-
+      REFUSED {{ gd.refusals.decl_invalid }} on {{ inventory_hostname }}: {{ gg.privileged_authorized_keys_file }} must be
+      an existing regular (non-link) controller file.
+    quiet: true
+
+- name: Bind the PUBLIC authorized-key lines (derived; controller-side lookup, never logged)
+  when: lookup('ansible.builtin.vars', gd.modes.var) == 'provision'
+  no_log: true
+  ansible.builtin.set_fact:
+    g_authorized_keys: >-
+      {{ lookup('ansible.builtin.file', gg.privileged_authorized_keys_file, rstrip=false).split('\n')
+         | map('trim') | reject('equalto', '') | list }}
+
+- name: Refuse authorized-key content that is not PUBLIC ed25519 / ecdsa key lines only (content never printed)
+  when: lookup('ansible.builtin.vars', gd.modes.var) == 'provision'
+  ansible.builtin.assert:
+    that:
+      - g_authorized_keys | length > 0
+      - g_authorized_keys | select('search', 'PRIVATE KEY') | list | length == 0
+      - >-
+        g_authorized_keys
+        | reject('match', '^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,3}( [ -~]*)?$') | list | length == 0
+    fail_msg: >-
+      REFUSED {{ gd.refusals.decl_invalid }} on {{ inventory_hostname }}: {{ gg.privileged_authorized_keys_file }} must
+      hold only PUBLIC ssh-ed25519 / ecdsa-sha2-nistp* key lines (content not shown).
+    quiet: true
+
+- name: Refuse a guest tool role that names no declared executable (os_tools; a clean refusal, never an undefined error)
+  ansible.builtin.assert:
+    that:
+      - gd.tools is mapping and gd.tools | length > 0
+      - gd.tools.values() | list | reject('in', rh.controller.bootstrap.os_tools) | list | length == 0
+      - gd.tools.keys() | list | sort == ['cloud_localds', 'df', 'env', 'flock', 'mkdir', 'mv', 'qemu_img', 'qemu_system', 'systemctl', 'systemd_run', 'timeout']
+    fail_msg: >-
+      REFUSED {{ gd.refusals.tool }} on {{ inventory_hostname }}: guest tools
+      {{ gd.tools.values() | list | reject('in', rh.controller.bootstrap.os_tools) | list }} are not declared in
+      controller.bootstrap.os_tools (route proposal A2).
+    quiet: true
+
+- name: Derive the tool paths from the ONE executable declaration (os_tools; identity checked below)
+  ansible.builtin.set_fact:
+    gt: "{{ dict(gd.tools | dict2items | map(attribute='key') | zip(gd.tools | dict2items | map(attribute='value') | map('extract', rh.controller.bootstrap.os_tools) | map(attribute='path'))) }}"
+    g_owner_uid: "{{ _rh_tb_ic_uid | int }}"
+
+# GUEST-LEASE-SUCCESSOR + tick331 GUEST-DELAYED-HOLDER-FENCE: every command runs under the hypervisor's coreutils
+# timeout (TERM at step_s, KILL kill_after_s later). g_lock_argv adds the storage-root lock (flock on the admitted
+# storage-root DIRECTORY; nothing is created for it) for the lease's own publish / revocation renames. The FENCED
+# mutation prefix g_step_argv (lock + this epoch's live token + timeout) exists only once tasks/lease.yml acquired an
+# epoch, so no target mutation can run without one. g_op_budget_s = one declared operation's worst case.
+- name: Derive the enforced step budget and the lock prefix (derived; argv only)
+  ansible.builtin.set_fact:
+    g_timeout_argv: "{{ [gt.timeout, '--kill-after=' ~ gd.lease.kill_after_s ~ 's', gd.lease.step_s ~ 's'] }}"
+    g_lock_argv: >-
+      {{ [gt.flock, '--exclusive', '--wait', gd.lease.lock_wait_s | string, '--conflict-exit-code',
+          gd.lease.busy_rc | string, gg.storage_root, gt.timeout, '--kill-after=' ~ gd.lease.kill_after_s ~ 's',
+          gd.lease.step_s ~ 's'] }}
+    g_op_budget_s: "{{ gd.lease.lock_wait_s + gd.lease.step_s + gd.lease.kill_after_s }}"
+
+- name: Derive the owned paths (derived output; every later task writes only under gp.runs / gp.preserved)
+  vars:
+    _g_rundir: "{{ gg.storage_root }}/{{ gd.layout.runs_dir }}/{{ gg.run_id }}"
+  ansible.builtin.set_fact:
+    gp:
+      bases: "{{ gg.storage_root }}/{{ gd.layout.bases_dir }}"
+      base: "{{ gg.storage_root }}/{{ gd.layout.bases_dir }}/{{ gg.base_image.file }}"
+      runs: "{{ gg.storage_root }}/{{ gd.layout.runs_dir }}"
+      run: "{{ _g_rundir }}"
+      preserved: "{{ gg.storage_root }}/{{ gd.layout.preserved_dir }}"
+      preserved_run: "{{ gg.storage_root }}/{{ gd.layout.preserved_dir }}/{{ gg.run_id }}"
+      # the ONE lifecycle lease of this storage root as numbered epochs (tasks/lease.yml: <lease_prefix><N>), the
+      # console evidence prefix of same-generation recovery, and this run_id's claim staging prefix
+      lease_prefix: "{{ gg.storage_root }}/{{ gd.lease.epoch_prefix }}"
+      console_evidence_prefix: "{{ _g_rundir }}/{{ gd.layout.run_files.console }}.{{ gd.recovery.console_evidence_infix }}"
+      claim_prefix: "{{ gg.storage_root }}/{{ gd.layout.runs_dir }}/{{ gd.layout.claim_prefix }}{{ gg.run_id }}-"
+      files: "{{ dict(gd.layout.run_files | dict2items | map(attribute='key') | zip(gd.layout.run_files | dict2items | map(attribute='value') | map('regex_replace', '^', _g_rundir ~ '/'))) }}"
+      unit: "{{ gd.unit.name | replace('{run_id}', gg.run_id) }}"
+      runtime_dir: "{{ rh.controller.bootstrap.target_bootstrap.user_manager.runtime_dir | replace('{uid}', g_owner_uid | string) }}"
+      bus: "{{ rh.controller.bootstrap.target_bootstrap.user_manager.runtime_dir | replace('{uid}', g_owner_uid | string) }}/{{ rh.controller.bootstrap.target_bootstrap.user_manager.bus }}"
+      linger: "{{ gd.linger_dir }}/{{ ansible_user }}"
+
+# ---- hypervisor tools: present AND the declared identity (sha256), like target_bootstrap.yml's executable hashing
+- name: Hash every guest tool on the hypervisor (stat sha256, links followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ item.value }}"
+    follow: true
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ gt | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} {{ item.value }}"
+  register: _g_tools
+
+# Explicit precondition of the identity comparison below: every guest tool's declared identity must be a MEASURED
+# file_sha256 (global.yml identity kinds; an `unmeasured` entry is admitted by the loader and refused at use). An
+# unmeasured tool refuses here naming its cause, never only through a checksum inequality against 'UNMEASURED'.
+- name: Refuse a guest tool whose declared identity is not a measured file_sha256 (unmeasured identity refuses at use)
+  vars:
+    _g_tool_decl: "{{ gd.tools.values() | list | map('extract', rh.controller.bootstrap.os_tools) | list }}"
+  ansible.builtin.assert:
+    that:
+      - _g_tool_decl | map(attribute='identity.kind') | unique | list == ['file_sha256']
+    fail_msg: >-
+      REFUSED {{ gd.refusals.tool }} on {{ inventory_hostname }}: guest tools
+      {{ gd.tools.values() | list | zip(_g_tool_decl | map(attribute='identity.kind')) | rejectattr('1', 'equalto', 'file_sha256') | map('join', ':') | list }}
+      carry no measured identity (os_tools.<tool>.identity.kind must be file_sha256; the route preparation stage is
+      the identity owner, codex-tick369). Never measured or installed here.
+    quiet: true
+
+- name: Refuse a missing or unadmitted guest tool (MAIN's declared package step is the remedy; never installed here)
+  ansible.builtin.assert:
+    that:
+      - _g_tools.results | rejectattr('stat.exists') | list | length == 0
+      - _g_tools.results | rejectattr('stat.isreg') | list | length == 0
+      - _g_tools.results | rejectattr('stat.executable') | list | length == 0
+      - _g_tools.results | rejectattr('stat.uid', 'equalto', 0) | list | length == 0
+      - _g_tools.results | selectattr('stat.writeable') | list | length == 0
+      - >-
+        _g_tools.results | map(attribute='stat.checksum') | list
+        == (_g_tools.results | map(attribute='item.key') | map('extract', gd.tools) | map('extract', rh.controller.bootstrap.os_tools)
+            | map(attribute='identity.sha256') | list)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.tool }} on {{ inventory_hostname }}: guest tools must be present, root-owned, regular,
+      not owner-writable and the declared identity (os_tools.<tool>.identity; packages named in the route's packages
+      mapping). Missing: {{ _g_tools.results | rejectattr('stat.exists') | map(attribute='item.value') | list }}.
+    quiet: true
+
+# ---- /dev/kvm (owner read-write; group membership is a MAIN prerequisite, B-graph's prerequisite play)
+- name: Stat the kvm device (read-only)
+  ansible.builtin.stat:
+    path: "{{ gd.kvm_device }}"
+    get_checksum: false
+  register: _g_kvm
+
+- name: Refuse a hypervisor where the owner cannot open the kvm device read-write
+  ansible.builtin.assert:
+    that:
+      - _g_kvm.stat.exists and _g_kvm.stat.ischr
+      - _g_kvm.stat.readable and _g_kvm.stat.writeable
+    fail_msg: >-
+      REFUSED {{ gd.refusals.kvm }} on {{ inventory_hostname }}: {{ gd.kvm_device }} is absent or not read-write for
+      {{ ansible_user }} (MAIN prerequisite: owner in the device's group).
+    quiet: true
+
+# ---- the owner's user manager (the guest is a transient USER unit) and linger (it must outlive the SSH session)
+- name: Stat the user manager runtime dir, its bus and the owner's linger flag (read-only)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop: ["{{ gp.runtime_dir }}", "{{ gp.bus }}", "{{ gp.linger }}"]
+  register: _g_um
+
+- name: Refuse a missing user manager, bus or linger (linger = MAIN prerequisite, remote-harness user_manager.linger)
+  ansible.builtin.assert:
+    that:
+      - _g_um.results[0].stat.exists and _g_um.results[0].stat.isdir and _g_um.results[0].stat.uid == g_owner_uid | int
+      - _g_um.results[0].stat.mode[-3:] == rh.controller.bootstrap.target_bootstrap.user_manager.runtime_dir_mode
+      - _g_um.results[1].stat.exists and _g_um.results[1].stat.issock
+      - _g_um.results[2].stat.exists and _g_um.results[2].stat.isreg
+    fail_msg: >-
+      REFUSED {{ gd.refusals.user_manager }} on {{ inventory_hostname }}: the guest is a transient user unit of
+      {{ ansible_user }} and must survive the SSH session: {{ gp.runtime_dir }}, its bus and {{ gp.linger }} are required
+      (got {{ _g_um.results | map(attribute='stat.exists') | list }}).
+    quiet: true
+
+# ---- the storage root (MAIN-created; owned, private, on the declared mount)
+- name: Stat the storage root and its mount point (read-only)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ gg.storage_root }}", "{{ gg.storage_mount }}"]
+  register: _g_sr
+
+- name: Refuse a storage root that is absent, a link, not owner-private or not on the declared mount
+  ansible.builtin.assert:
+    that:
+      - _g_sr.results[0].stat.exists and _g_sr.results[0].stat.isdir and not _g_sr.results[0].stat.islnk
+      - _g_sr.results[0].stat.uid == g_owner_uid | int
+      - not (_g_sr.results[0].stat.wgrp or _g_sr.results[0].stat.woth)
+      - _g_sr.results[1].stat.exists and _g_sr.results[1].stat.isdir
+      - _g_sr.results[0].stat.dev == _g_sr.results[1].stat.dev
+    fail_msg: >-
+      REFUSED {{ gd.refusals.storage }} on {{ inventory_hostname }}: {{ gg.storage_root }} must be a real directory owned
+      by uid {{ g_owner_uid }}, not group/other-writable, on the same device as {{ gg.storage_mount }} (MAIN prerequisite).
+    quiet: true
+
+# GUEST-STORAGE-ANCESTRY (codex review): the leaf checks above cannot see a symlinked INTERMEDIATE or an existing
+# runs/ / preserved/ / bases/ link. The route's ONE ancestry rule (tasks/admit_ancestry.yml, consumer interface file;
+# pinned in guest.yml) admits EVERY existing component from / down to each path the lifecycle reads or writes: real
+# directories only (a link refuses), owned by uid 0 or the owner, never other-writable, group-writable only through
+# owner_private_group. No private path policy here. provision.yml and retire.yml include it AGAIN at their use
+# boundaries (right before the first write / the move).
+- name: Admit the ancestry of every guest path (route rule; storage root, runs/<run_id>, preserved/<run_id>, bases/)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ _g_anc_path }}"
+    rh_anc_refusal: "{{ gd.refusals.storage }}"
+  loop: ["{{ gp.run }}", "{{ gp.preserved_run }}", "{{ gp.bases }}"]
+  loop_control:
+    loop_var: _g_anc_path
+
+# Existing run / preserved entries: dir/link/owner of every already-existing entry (the preserved checks included),
+# via the shared read-only observation that provision/retire repeat UNDER the lease.
+- name: Observe this run_id's owned state (read-only; refuses links / foreign owners)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/observe_run.yml"
+
+# Lease epochs (<storage_root>/<gd.lease.epoch_prefix><N>) that are links / foreign are refused by tasks/lease.yml at
+# acquisition, before any lifecycle effect; read-only modes never read the lease.
+
+# ---- PROVISION-ONLY base image admission. Capacity and memory are charged UNDER the lease, resume-aware
+# (tasks/provision_stages.yml S3): charging here, before the exclusion and blind to what the generation already
+# holds, let two run_ids overcommit and made a legitimate resume double-charge itself.
+- name: Stat and hash the base image (sha512; read-only)
+  when: lookup('ansible.builtin.vars', gd.modes.var) == 'provision'
+  ansible.builtin.stat:
+    path: "{{ gp.base }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha512
+  register: _g_base
+
+- name: Read the base image's format and backing (argv; read-only, shared lock)
+  when: lookup('ansible.builtin.vars', gd.modes.var) == 'provision'
+  ansible.builtin.command:
+    argv: ["{{ gt.qemu_img }}", "info", "--force-share", "--output=json", "{{ gp.base }}"]
+  changed_when: false
+  failed_when: false
+  register: _g_base_info
+
+- name: Refuse a base image that is absent, a link, writable, mis-hashed, not qcow2 or itself an overlay
+  when: lookup('ansible.builtin.vars', gd.modes.var) == 'provision'
+  vars:
+    _g_binfo: "{{ (_g_base_info.stdout | default('{}') | from_json) if (_g_base_info.rc | default(1)) == 0 else {} }}"
+  ansible.builtin.assert:
+    that:
+      - _g_base.stat.exists and _g_base.stat.isreg and not _g_base.stat.islnk
+      - not (_g_base.stat.wusr or _g_base.stat.wgrp or _g_base.stat.woth)
+      - _g_base.stat.checksum == gg.base_image.sha512
+      - _g_binfo.format | default('') == 'qcow2'
+      - _g_binfo['backing-filename'] is not defined
+    fail_msg: >-
+      REFUSED {{ gd.refusals.base }} on {{ inventory_hostname }}: {{ gp.base }} must be a read-only regular qcow2 file
+      with no backing file and sha512 {{ gg.base_image.sha512 }} (acquired by MAIN; never fetched or rewritten here).
+    quiet: true
+
+# ---- the owned run dir / record (mode-dependent presence; read-only here; _g_run from observe_run.yml:
+# [0] runs/<run_id>, [1] its record, [2] preserved/<run_id>, [3] its record). Provision and retire re-decide under the lease.
+# provision: a preserved run_id is never reused; an existing runs/<run_id> is RESUMED only when its record attributes it
+# (codex GUEST-INTERRUPTED-PROVISION: no refusal merely because the run exists); one without a record is preserved.
+- name: Refuse provision of a retired run_id, or over a run dir no record attributes to this lifecycle
+  when: lookup('ansible.builtin.vars', gd.modes.var) == 'provision'
+  ansible.builtin.assert:
+    that:
+      - not _g_run.results[2].stat.exists
+      - (not _g_run.results[0].stat.exists) or _g_run.results[1].stat.exists
+    fail_msg: >-
+      REFUSED {{ gd.refusals.present if _g_run.results[2].stat.exists else gd.refusals.ambiguous }} on
+      {{ inventory_hostname }}: {{ gp.preserved_run }} exists (a run_id names ONE generation; declare a new run_id), or
+      {{ gp.run }} exists without its record (unattributable; preserved, never adopted).
+    quiet: true
+
+# codex GUEST-SAME-GENERATION-RECOVERY: the recovery token is an explicit PROVISION input naming a generation (never a
+# run_id); provision_stages.yml S7 honours it only for THIS started generation whose own guest is gone.
+- name: Refuse a malformed recovery token, or one given outside provision (nothing examined further)
+  when: lookup('ansible.builtin.vars', gd.recovery.var, default='') | string | length > 0
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', gd.modes.var) == 'provision'
+      - lookup('ansible.builtin.vars', gd.recovery.var) | string is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+    fail_msg: >-
+      REFUSED {{ gd.refusals.recovery }} on {{ inventory_hostname }}: {{ gd.recovery.var }} names a generation id and is
+      accepted only with {{ gd.modes.var }}=provision; nothing changed.
+    quiet: true
+
+- name: Refuse verify without this run's owned record in runs/ (nothing but the recorded resource is examined)
+  when: lookup('ansible.builtin.vars', gd.modes.var) == 'verify'
+  ansible.builtin.assert:
+    that:
+      - _g_run.results[0].stat.exists and _g_run.results[0].stat.isdir and not _g_run.results[0].stat.islnk
+      - _g_run.results[0].stat.uid == g_owner_uid | int
+      - _g_run.results[1].stat.exists and _g_run.results[1].stat.isreg and not _g_run.results[1].stat.islnk
+      - not _g_run.results[2].stat.exists
+    fail_msg: >-
+      REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: {{ gp.run }} with an owned regular
+      {{ gd.layout.run_files.record }} is required (and {{ gp.preserved_run }} must be absent).
+    quiet: true
+
+# retire: EXACTLY ONE of runs/<run_id> (to retire) or preserved/<run_id> (already retired -> tasks/retire.yml reads it
+# back and reports success without an effect); both or neither refuses.
+- name: Refuse retire unless exactly one of the run dir and its preserved destination exists
+  when: lookup('ansible.builtin.vars', gd.modes.var) == 'retire'
+  ansible.builtin.assert:
+    that:
+      - _g_run.results[0].stat.exists != _g_run.results[2].stat.exists
+      - (not _g_run.results[0].stat.exists) or (_g_run.results[0].stat.isdir and not _g_run.results[0].stat.islnk and _g_run.results[0].stat.uid == g_owner_uid | int)
+      - (not _g_run.results[0].stat.exists) or (_g_run.results[1].stat.exists and _g_run.results[1].stat.isreg and not _g_run.results[1].stat.islnk)
+      - _g_run.results[0].stat.exists or (_g_run.results[3].stat.exists and _g_run.results[3].stat.isreg and not _g_run.results[3].stat.islnk)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: exactly one of {{ gp.run }} (with its owned record)
+      and {{ gp.preserved_run }} must exist; nothing is stopped or moved.
+    quiet: true

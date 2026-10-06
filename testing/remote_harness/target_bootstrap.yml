@@ -339,27 +339,34 @@
            | map(attribute='value.path') | unique | list }}
       register: _rh_tb_ident
 
+    # TB-IDENTITY-KIND-SELECTED (MAIN tick383 option (a)): kind / identity / one-path-one-identity judged over the SELECTED
+    # set only (_sel = the seed + uv_installer os_tools entries the stat loop above hashes, plus the adapter tools _ad).
+    # Non-selected os_tools entries (preparation / guest tools, measured or unmeasured) are neither admitted nor refused
+    # here; they stay refused at their own boundaries (tasks/admit_prep_tools.yml, the guest admission).
     - name: Refuse any selected executable whose content is not its declared identity, or an adapter tool set the engine did not derive (SEED-06 file_sha256; stat sha256, never a declared tool)
       vars:
         # present files only: an absent tool is refused (named with its package) by the next check, still before any tool runs
         _tst: "{{ _rh_tb_ident.results | selectattr('stat.exists') | list }}"
-        _ot: "{{ rh.controller.bootstrap.os_tools }}"
+        _sel: >-
+          {{ ((rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'seed') | list)
+              + (rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'contains', 'uv_installer') | list))
+             | unique(attribute='key') | list | items2dict }}
         _at: "{{ rh.transfer.adapters.managed_archive.target.tools }}"
         _ad: "{{ lme_resolved.remote_harness.adapter.tools['target.tools'] | default({}) }}"
         # declared identity per selected path: seed/uv_installer from os_tools, adapter tools from C1's derivation
         _want: >-
-          {% set ns = namespace(m={}) %}{% for n, t in _ot.items() %}{% set ns.m = ns.m | combine({t.path: t.identity.sha256}) %}{% endfor %}{% for n, t in _ad.items() %}{% set ns.m = ns.m | combine({t.path: t.identity.sha256}) %}{% endfor %}{{ ns.m }}
+          {% set ns = namespace(m={}) %}{% for n, t in _sel.items() %}{% set ns.m = ns.m | combine({t.path: t.identity.sha256}) %}{% endfor %}{% for n, t in _ad.items() %}{% set ns.m = ns.m | combine({t.path: t.identity.sha256}) %}{% endfor %}{{ ns.m }}
       ansible.builtin.assert:
         that:
           # the engine derived exactly the declared adapter names (C1 refuses declared copies and names outside os_tools)
           - (_ad | list | sort) == (_at | list | sort)
           # every adapter tool is provided by a package the ONE target bootstrap owns (adapter target.packages)
           - _at | list | reject('in', rh.transfer.adapters.managed_archive.target.packages | map('extract', rh.packages.provides) | flatten) | list | length == 0
-          - (_ot.values() | list + _ad.values() | list) | map(attribute='identity.kind') | unique | list == ['file_sha256']
+          - (_sel.values() | list + _ad.values() | list) | map(attribute='identity.kind') | unique | list == ['file_sha256']
           # one path, one identity (seed/uv and adapter views agree; a path can never carry two identities)
           - >-
-            (_ot.values() | list + _ad.values() | list) | map(attribute='path') | unique | list | length
-            == (_ot.values() | list + _ad.values() | list) | map(attribute='path') | zip((_ot.values() | list + _ad.values() | list) | map(attribute='identity.sha256')) | map('join', ' ') | unique | list | length
+            (_sel.values() | list + _ad.values() | list) | map(attribute='path') | unique | list | length
+            == (_sel.values() | list + _ad.values() | list) | map(attribute='path') | zip((_sel.values() | list + _ad.values() | list) | map(attribute='identity.sha256')) | map('join', ' ') | unique | list | length
           - _tst | map(attribute='stat') | map(attribute='checksum', default='') | list == _tst | map(attribute='item') | map('extract', _want) | list
         fail_msg: >-
           REFUSED RH-OS-TOOL-IDENTITY on {{ inventory_hostname }} (nothing was changed): every selected executable's stat

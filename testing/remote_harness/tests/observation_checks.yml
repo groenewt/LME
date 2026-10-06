@@ -1,0 +1,524 @@
+---
+# testing/remote_harness/tests/observation_checks.yml -- DECLARED required checks of the generic observation runner
+# (testing/remote_harness/observe.yml; codex-tick307 observation-job-binding). DATA ONLY: nothing here executes.
+# Two kinds:
+#   render_cases  pure macro cases of templates/observation_step.j2 (no host, no command), run by the executor
+#                 contract below. Executor: a G runner of the private_group_fixtures kind (proposal; G owns
+#                 tests/run_controls.yml and tests/tasks/*).
+#   run_cases     controller runs of observe.yml under `seed run` against a declared fixture inventory; `expect`
+#                 names the refusal code, the task that raises it, what must NOT have happened and the evidence state.
+#                 Executor: MAIN / G through the declared seed launcher (never a subagent; never root).
+# Every expectation is stated on what the runner records (task names, REFUSED codes, evidence files and fields);
+# none is claimed as passed -- nothing here has been rendered or run.
+schema: lme-observation-checks/1
+subject:
+  playbook: testing/remote_harness/observe.yml
+  step_template: testing/remote_harness/templates/observation_step.j2
+  macros: testing/remote_harness/templates/macros/observation.j2
+  jobs: testing/remote_harness/jobs/observations.yml
+
+# ---- render executor contract (what a render case MEANS; the executor implements exactly this, nothing else)
+render_executor:
+  jobs: >-
+    rh_obs_jobs = the bytes of subject.jobs parsed with from_yaml; when the case has jobs_patch {path, value}, the
+    value is set at that key/index path of a COPY (the file itself is never edited). A case that needs the file's
+    digest does not exist here: the digest binding is a run case (X-JOB-*).
+  selectors: >-
+    `job` and `step` are case SELECTORS, not template vars: rh_obs_job = rh_obs_jobs.jobs[job];
+    rh_obs_step = rh_obs_job.steps[step] (0-based index).
+  template_vars: >-
+    {rh_obs_part: part, rh_obs_jobs, rh_obs_job (when job is given), rh_obs_step (when step is given)} combined with
+    the case's `vars` (only the names observation_step.j2 declares for that part). The template is rendered with
+    ansible.builtin.template (template_vars) from subject.step_template and the result is parsed with from_json,
+    exactly as observe.yml / tasks/observe_step.yml do.
+  expect_keys:
+    equals: the parsed result equals this value
+    contains: the parsed result (a list of strings) has an element equal to this string
+    contains_prefix: the parsed result (a list of strings) has an element that starts with this string
+    errors: result.errors equals this list
+    errors_contain: result.errors has an element equal to this string
+    instances: >-
+      result.instances has exactly this many entries and, entry by entry, every key given here equals the entry's key
+      (keys not given -- e.g. subst -- are not compared)
+    classes: the list of `class` of the parsed records, in order, equals this list
+    yields: the FIRST record's yields equals this mapping
+    stdout_kept: the FIRST record's stdout equals this string
+    diagnostic_kept: the FIRST record's diagnostic equals this string (codex-tick315 OBS-FAILURE-DIAGNOSTIC)
+    command_contains: result.command contains every string of this list as a substring
+    render_fails: true = the render raises (the caller's fallback path); nothing is parsed
+    stop: >-
+      part `stop` rendered with {rh_obs_jobs, rh_obs_step (same step), rh_obs_recs: the parsed records} equals this
+    host_result_after: >-
+      part `host_result` rendered with {rh_obs_jobs, rh_obs_job, rh_obs_prior: vars.rh_obs_prior + the parsed records,
+      rh_obs_why: '', rh_obs_hin: vars.rh_obs_hin, or {} when the case gives none} equals this
+
+# ---- synthetic os_tools for render cases (paths only matter; identities are not read by these parts)
+fixture_os_tools: &ot
+  sh: {path: /bin/sh}
+  timeout: {path: /usr/bin/timeout}
+  sha256sum: {path: /usr/bin/sha256sum}
+  stat: {path: /usr/bin/stat}
+  cat: {path: /usr/bin/cat}
+  grep: {path: /usr/bin/grep}
+  find: {path: /usr/bin/find}
+  df: {path: /usr/bin/df}
+  readlink: {path: /usr/bin/readlink}
+  findmnt: {path: /usr/bin/findmnt}
+  lsblk: {path: /usr/bin/lsblk}
+  systemctl: {path: /usr/bin/systemctl}
+  systemd-analyze: {path: /usr/bin/systemd-analyze}
+  busctl: {path: /usr/bin/busctl}
+  id: {path: /usr/bin/id}          # semantics.runner_tools / principal_tool (codex-tick315)
+
+render_cases:
+  - id: R-VALIDATE-BOUND-FILE
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    expect: {equals: []}
+  - id: R-VALIDATE-UNDECLARED-TOOL
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs, O-CAPACITY, steps, 2, argv, 0], value: '{tool:undeclared}'}
+    expect: {contains: 'O-CAPACITY/meminfo: argv[0] must be {tool:<declared os_tools name>}'}
+  - id: R-VALIDATE-UNBOUND-PLACEHOLDER
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs, O-CAPACITY, steps, 2, argv, 1], value: '/proc/{pid}/status'}
+    expect: {contains: 'O-CAPACITY/meminfo: placeholder {pid} is not this step''s input parameter or a job constant'}
+  - id: R-VALIDATE-FROM-LATER-STEP
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs, Q-TOOLS, steps, 5, input, step], value: backing}
+    expect: {contains: 'Q-TOOLS/sysfs-link: from_step must name an EARLIER step, one of its yields, that yield''s parameter and a declared on_empty'}
+  - id: R-VALIDATE-ALLOWED-RC-MASKS-TIMEOUT
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs, O-PRIOR-STATE, steps, 1, allowed_rc], value: [1, 124]}
+    expect: {contains: 'O-PRIOR-STATE/system-unit-files: allowed_rc may not re-classify 0, timeout, tool_missing or 125'}
+  - id: R-INSTANCES-TRAVERSAL-REFUSED
+    part: instances
+    job: O-CAPACITY
+    step: 0
+    vars: {rh_obs_ot: *ot, rh_obs_hin: {obs_paths:[/data/../etc]}, rh_obs_prior: [], rh_obs_loc: C.UTF-8}
+    expect: {errors_contain: 'df-bytes: path: value has a forbidden form', instances: []}
+  - id: R-INSTANCES-SHELL-WORD-REFUSED
+    part: instances
+    job: O-CAPACITY
+    step: 0
+    vars: {rh_obs_ot: *ot, rh_obs_hin: {obs_paths:['/data;id']}, rh_obs_prior: [], rh_obs_loc: C.UTF-8}
+    expect: {errors_contain: 'df-bytes: path: value fails its declared type', instances: []}
+  - id: R-INSTANCES-HOST-INPUT-ABSENT
+    part: instances
+    job: O-CAPACITY
+    step: 0
+    vars: {rh_obs_ot: *ot, rh_obs_hin: {}, rh_obs_prior: [], rh_obs_loc: C.UTF-8}
+    expect: {errors_contain: 'target input obs_paths is not bound to a non-empty list', instances: []}
+  - id: R-INSTANCES-COMMAND-FORM
+    part: instances
+    job: O-CAPACITY
+    step: 0
+    vars: {rh_obs_ot: *ot, rh_obs_hin: {obs_paths:[/data]}, rh_obs_prior: [], rh_obs_loc: C.UTF-8}
+    expect:
+      errors: []
+      instances:
+        - key: 'df-bytes[/data]'
+          argv: [/usr/bin/df, -B1, '--output=source,fstype,size,used,avail,target', --, /data]
+          # shell-quoted by the ansible `quote` filter (shlex.quote): plain words stay bare
+          command: >-
+            /bin/sh -c 'export LC_ALL=C.UTF-8; exec /usr/bin/timeout -k 2s 10s /usr/bin/df -B1 --output=source,fstype,size,used,avail,target -- /data'
+  # Q-NOFILE gate, instance side: an EMPTY ControlGroup yields nothing, so cgroup-procs-files has NO instance (no find
+  # of /sys/fs/cgroup) and the classify case below records PRECONDITION_FALSE
+  - id: R-NOFILE-EMPTY-CONTROLGROUP-NO-INSTANCE
+    part: instances
+    job: Q-NOFILE
+    step: 3
+    vars: {rh_obs_ot: *ot, rh_obs_hin: {}, rh_obs_loc: C.UTF-8,
+           rh_obs_prior: [{step: service-props, class: OK, yields: {control_group: []}}]}
+    expect: {errors: [], instances: []}
+  - id: R-NOFILE-NO-UNIT-IS-PRECONDITION-FALSE
+    part: classify
+    job: Q-NOFILE
+    step: 0
+    vars: {rh_obs_prior: [], rh_obs_extract: true,
+           rh_obs_insts: [{key: get-unit, argv: []}],
+           rh_obs_results: [{rc: 1, stdout: '', stderr: 'Call failed: Unit lme-elasticsearch.service not loaded.'}]}
+    expect: {classes: [PRECONDITION_FALSE], stop: true, host_result_after: PRECONDITION_FALSE}
+  - id: R-NOFILE-EMPTY-CONTROLGROUP-IS-PRECONDITION-FALSE
+    part: classify
+    job: Q-NOFILE
+    step: 3
+    vars: {rh_obs_prior: [{step: service-props, class: OK, yields: {control_group: []}}],
+           rh_obs_extract: true, rh_obs_insts: [], rh_obs_results: []}
+    expect: {classes: [PRECONDITION_FALSE], stop: true}
+  - id: R-CGROUP-PROCS-OUTSIDE-UNIT-REJECTED
+    part: classify
+    job: Q-NOFILE
+    step: 3
+    vars: {rh_obs_extract: true,
+           rh_obs_prior: [{step: service-props, class: OK, yields: {control_group: [/system.slice/lme-elasticsearch.service]}}],
+           rh_obs_insts: [{key: 'cgroup-procs-files[/system.slice/lme-elasticsearch.service]', argv: []}],
+           rh_obs_results: [{rc: 0, stdout: "/sys/fs/cgroup/system.slice/other.service/cgroup.procs\n", stderr: ''}]}
+    expect: {classes: [EXTRACT_INVALID], yields: {cgroup_procs_file: []}}
+  - id: R-MALFORMED-JSON-EXTRACT-FAILS-RENDER
+    part: classify
+    note: extract=true on malformed JSON raises (Jinja has no try); tasks/observe_step.yml then renders with extract=false
+    job: Q-TOOLS
+    step: 3
+    vars: {rh_obs_prior: [], rh_obs_extract: true,
+           rh_obs_insts: [{key: 'containment[/data]', argv: []}], rh_obs_results: [{rc: 0, stdout: 'not json', stderr: ''}]}
+    expect: {render_fails: true}
+  - id: R-MALFORMED-JSON-IS-EXTRACT-INVALID
+    part: classify
+    note: the fallback render records EXTRACT_INVALID with the output kept
+    job: Q-TOOLS
+    step: 3
+    vars: {rh_obs_prior: [], rh_obs_extract: false,
+           rh_obs_insts: [{key: 'containment[/data]', argv: []}], rh_obs_results: [{rc: 0, stdout: 'not json', stderr: ''}]}
+    expect: {classes: [EXTRACT_INVALID], stdout_kept: 'not json'}
+  - id: R-TIMEOUT-CLASS
+    part: classify
+    job: O-CAPACITY
+    step: 2
+    vars: {rh_obs_prior: [], rh_obs_extract: true,
+           rh_obs_insts: [{key: meminfo, argv: []}], rh_obs_results: [{rc: 124, stdout: '', stderr: ''}]}
+    expect: {classes: [TIMEOUT], stop: false, host_result_after: INCOMPLETE}
+  - id: R-UNREACHABLE-CLASS
+    part: classify
+    job: O-CAPACITY
+    step: 2
+    vars: {rh_obs_prior: [], rh_obs_extract: true,
+           rh_obs_insts: [{key: meminfo, argv: []}], rh_obs_results: [{unreachable: true, msg: 'ssh: connect timed out'}]}
+    expect: {classes: [UNREACHABLE], stop: true, host_result_after: UNREACHABLE, diagnostic_kept: 'ssh: connect timed out'}
+  # codex-tick315 OBS-FAILURE-DIAGNOSTIC: a result with an exit status keeps its streams, not Ansible's generic msg
+  - id: R-TIMEOUT-MSG-NOT-DIAGNOSTIC
+    part: classify
+    job: O-CAPACITY
+    step: 2
+    vars: {rh_obs_prior: [], rh_obs_extract: true,
+           rh_obs_insts: [{key: meminfo, argv: []}], rh_obs_results: [{rc: 124, stdout: '', stderr: '', msg: 'non-zero return code'}]}
+    expect: {classes: [TIMEOUT], diagnostic_kept: ''}
+  # ... and a result with NO exit status that is not flagged unreachable (a connection failure) keeps its msg
+  - id: R-NO-RC-FAILED-KEEPS-DIAGNOSTIC
+    part: classify
+    job: O-CAPACITY
+    step: 2
+    vars: {rh_obs_prior: [], rh_obs_extract: true,
+           rh_obs_insts: [{key: meminfo, argv: []}], rh_obs_results: [{failed: true, msg: 'Failed to connect to the host via ssh: Connection reset by peer'}]}
+    expect: {classes: [FAILED], diagnostic_kept: 'Failed to connect to the host via ssh: Connection reset by peer', host_result_after: INCOMPLETE}
+  - id: R-IDENTITY-DIGEST-MISMATCH
+    part: identity_check
+    vars:
+      rh_obs_tools: [cat]
+      rh_obs_ot: {cat: {path: /usr/bin/cat, identity: {kind: file_sha256, sha256: 8a5c20c3400a4058a487cd806111cc5138ef4d0fbc6714ff67c9432e38c2705a}}, sha256sum: {path: /usr/bin/sha256sum}}
+      rh_obs_oti: {owner_uid: 0, known_answers: [{tool: sha256sum, stdin: abc, stdout: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -'}]}
+      rh_obs_pv: {coreutils: [cat, sha256sum]}
+      rh_obs_out: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\n0000000000000000000000000000000000000000000000000000000000000000  /usr/bin/cat\nst|/usr/bin/cat|regular file|0|755\n"
+    expect: {contains: 'cat (/usr/bin/cat) digest 0000000000000000000000000000000000000000000000000000000000000000 is not its declared identity'}
+  - id: R-IDENTITY-MISSING-NAMES-PACKAGE
+    part: identity_check
+    vars:
+      rh_obs_tools: [findmnt]
+      rh_obs_ot: {findmnt: {path: /usr/bin/findmnt, identity: {kind: file_sha256, sha256: 598a23e36910f5cf7a99dfe83b6b29b54dae26ec73faa82fb097c0d5ddc36334}}, sha256sum: {path: /usr/bin/sha256sum}}
+      rh_obs_oti: {owner_uid: 0, known_answers: [{tool: sha256sum, stdin: abc, stdout: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -'}]}
+      rh_obs_pv: {util_linux: [flock, findmnt, lsblk]}
+      rh_obs_out: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\n"
+    expect: {contains: 'findmnt (/usr/bin/findmnt) absent or unreadable; package util_linux'}
+  - id: R-IDENTITY-GROUP-WRITABLE
+    part: identity_check
+    vars:
+      rh_obs_tools: [cat]
+      rh_obs_ot: {cat: {path: /usr/bin/cat, identity: {kind: file_sha256, sha256: 8a5c20c3400a4058a487cd806111cc5138ef4d0fbc6714ff67c9432e38c2705a}}, sha256sum: {path: /usr/bin/sha256sum}}
+      rh_obs_oti: {owner_uid: 0, known_answers: [{tool: sha256sum, stdin: abc, stdout: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -'}]}
+      rh_obs_pv: {coreutils: [cat]}
+      rh_obs_out: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\n8a5c20c3400a4058a487cd806111cc5138ef4d0fbc6714ff67c9432e38c2705a  /usr/bin/cat\nst|/usr/bin/cat|regular file|0|775\n"
+    expect: {contains_prefix: 'cat (/usr/bin/cat) is not a regular file owned by uid 0 free of group/other write'}
+
+  # ---- codex-tick315 OBS-EMPTY-JOB: a job must carry a non-empty, correctly typed step list (validate; before contact)
+  - id: R-VALIDATE-EMPTY-STEPS
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs, O-CAPACITY, steps], value: []}
+    expect: {contains: 'O-CAPACITY: steps must be a non-empty list of step mappings'}
+  - id: R-VALIDATE-STEPS-MAPPING
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs, O-CAPACITY, steps], value: {meminfo: {input: {kind: once}, argv: ['{tool:cat}', /proc/meminfo]}}}
+    expect: {contains: 'O-CAPACITY: steps must be a non-empty list of step mappings'}
+  - id: R-VALIDATE-STEP-NOT-MAPPING
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs, O-CAPACITY, steps, 2], value: meminfo}
+    expect: {contains: 'O-CAPACITY: steps must be a non-empty list of step mappings'}
+  - id: R-VALIDATE-JOB-NOT-MAPPING
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs, O-CAPACITY], value: [meminfo]}
+    expect: {contains: 'O-CAPACITY: a job must be a mapping'}
+  - id: R-VALIDATE-ARGV-NOT-LIST
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs, O-CAPACITY, steps, 2, argv], value: '{tool:cat} /proc/meminfo'}
+    expect: {contains: 'O-CAPACITY/meminfo: argv must be a non-empty list'}
+  - id: R-VALIDATE-NO-JOBS
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [jobs], value: {}}
+    expect: {contains: 'jobs must be a non-empty mapping of job id to job'}
+  - id: R-VALIDATE-PRINCIPAL-TOOL-UNDECLARED
+    part: validate
+    vars: {rh_obs_ot: *ot}
+    jobs_patch: {path: [semantics, principal_tool], value: whoami}
+    expect: {contains: 'semantics.principal_tool must name one of semantics.runner_tools'}
+
+  # ---- codex-tick315 OBS-CASE-SENSITIVE-COVERAGE: case-distinct selections stay DISTINCT instances
+  - id: R-INSTANCES-CASE-DISTINCT-PATHS
+    part: instances
+    job: O-CAPACITY
+    step: 0
+    vars: {rh_obs_ot: *ot, rh_obs_hin: {obs_paths: [/data/A, /data/a]}, rh_obs_prior: [], rh_obs_loc: C.UTF-8}
+    expect:
+      errors: []
+      instances: [{key: 'df-bytes[/data/A]'}, {key: 'df-bytes[/data/a]'}]
+  - id: R-INSTANCES-CASE-DISTINCT-UNIT-PATTERNS
+    part: instances
+    job: O-PRIOR-STATE
+    step: 0
+    vars: {rh_obs_ot: *ot, rh_obs_hin: {obs_unit_patterns: ['LME-*', 'lme-*']}, rh_obs_prior: [], rh_obs_loc: C.UTF-8}
+    expect:
+      errors: []
+      instances: [{key: 'system-units[LME-*]'}, {key: 'system-units[lme-*]'}]
+  - id: R-INSTANCES-EXACT-DUPLICATE-COLLAPSES
+    part: instances
+    job: O-CAPACITY
+    step: 0
+    note: only an EXACT duplicate is one selection
+    vars: {rh_obs_ot: *ot, rh_obs_hin: {obs_paths: [/data/A, /data/A]}, rh_obs_prior: [], rh_obs_loc: C.UTF-8}
+    expect: {errors: [], instances: [{key: 'df-bytes[/data/A]'}]}
+  - id: R-CLASSIFY-CASE-DISTINCT-YIELDS
+    part: classify
+    job: Q-NOFILE
+    step: 3
+    vars: {rh_obs_extract: true,
+           rh_obs_prior: [{step: service-props, class: OK, yields: {control_group: [/system.slice/lme-elasticsearch.service]}}],
+           rh_obs_insts: [{key: 'cgroup-procs-files[/system.slice/lme-elasticsearch.service]', argv: []}],
+           rh_obs_results: [{rc: 0, stderr: '',
+                             stdout: "/sys/fs/cgroup/system.slice/lme-elasticsearch.service/A/cgroup.procs\n/sys/fs/cgroup/system.slice/lme-elasticsearch.service/a/cgroup.procs\n"}]}
+    expect:
+      classes: [OK]
+      yields: {cgroup_procs_file: [/sys/fs/cgroup/system.slice/lme-elasticsearch.service/A/cgroup.procs, /sys/fs/cgroup/system.slice/lme-elasticsearch.service/a/cgroup.procs]}
+  - id: R-INSTANCES-FROM-STEP-CASE-DISTINCT-YIELDS
+    part: instances
+    job: Q-NOFILE
+    step: 4
+    vars: {rh_obs_ot: *ot, rh_obs_hin: {}, rh_obs_loc: C.UTF-8,
+           rh_obs_prior: [{step: service-props, class: OK, yields: {control_group: [/system.slice/lme-elasticsearch.service]}},
+                          {step: cgroup-procs-files, class: OK,
+                           yields: {cgroup_procs_file: [/sys/fs/cgroup/system.slice/lme-elasticsearch.service/A/cgroup.procs, /sys/fs/cgroup/system.slice/lme-elasticsearch.service/a/cgroup.procs]}}]}
+    expect:
+      errors: []
+      instances: [{key: 'cgroup-pids[/sys/fs/cgroup/system.slice/lme-elasticsearch.service/A/cgroup.procs]'},
+                  {key: 'cgroup-pids[/sys/fs/cgroup/system.slice/lme-elasticsearch.service/a/cgroup.procs]'}]
+
+  # ---- coverage: COMPLETE needs every SELECTED instance recorded exactly once (not merely every step id)
+  - id: R-COVERAGE-FULL-IS-COMPLETE
+    part: host_result
+    job: O-CAPACITY
+    vars:
+      rh_obs_why: ''
+      rh_obs_hin: {obs_paths: [/data/A, /data/a]}
+      rh_obs_prior: &cov_full
+        - {step: df-bytes, instance: 'df-bytes[/data/A]', class: OK}
+        - {step: df-bytes, instance: 'df-bytes[/data/a]', class: OK}
+        - {step: df-inodes, instance: 'df-inodes[/data/A]', class: OK}
+        - {step: df-inodes, instance: 'df-inodes[/data/a]', class: OK}
+        - {step: meminfo, instance: meminfo, class: OK}
+        - {step: loadavg, instance: loadavg, class: OK}
+        - {step: cpu-online, instance: cpu-online, class: OK}
+    expect: {equals: COMPLETE}
+  - id: R-COVERAGE-FULL-NO-GAPS
+    part: coverage
+    job: O-CAPACITY
+    vars: {rh_obs_hin: {obs_paths: [/data/A, /data/a]}, rh_obs_prior: *cov_full}
+    expect: {equals: []}
+  - id: R-COVERAGE-MISSING-CASE-INSTANCE-IS-INCOMPLETE
+    part: host_result
+    job: O-CAPACITY
+    note: every step id ran; df-inodes[/data/a] (a case-distinct selection) has no record
+    vars:
+      rh_obs_why: ''
+      rh_obs_hin: {obs_paths: [/data/A, /data/a]}
+      rh_obs_prior:
+        - {step: df-bytes, instance: 'df-bytes[/data/A]', class: OK}
+        - {step: df-bytes, instance: 'df-bytes[/data/a]', class: OK}
+        - {step: df-inodes, instance: 'df-inodes[/data/A]', class: OK}
+        - {step: meminfo, instance: meminfo, class: OK}
+        - {step: loadavg, instance: loadavg, class: OK}
+        - {step: cpu-online, instance: cpu-online, class: OK}
+    expect: {equals: INCOMPLETE}
+  - id: R-COVERAGE-MISSING-CASE-INSTANCE-GAP
+    part: coverage
+    job: O-CAPACITY
+    vars:
+      rh_obs_hin: {obs_paths: [/data/A, /data/a]}
+      rh_obs_prior:
+        - {step: df-bytes, instance: 'df-bytes[/data/A]', class: OK}
+        - {step: df-bytes, instance: 'df-bytes[/data/a]', class: OK}
+        - {step: df-inodes, instance: 'df-inodes[/data/A]', class: OK}
+        - {step: meminfo, instance: meminfo, class: OK}
+        - {step: loadavg, instance: loadavg, class: OK}
+        - {step: cpu-online, instance: cpu-online, class: OK}
+    expect: {contains_prefix: 'df-inodes: recorded instances '}
+  - id: R-COVERAGE-DUPLICATE-IS-INCOMPLETE
+    part: host_result
+    job: O-CAPACITY
+    note: df-bytes[/data/A] recorded twice and df-bytes[/data/a] never (a case-folded collapse) -- same count of df-bytes records
+    vars:
+      rh_obs_why: ''
+      rh_obs_hin: {obs_paths: [/data/A, /data/a]}
+      rh_obs_prior:
+        - {step: df-bytes, instance: 'df-bytes[/data/A]', class: OK}
+        - {step: df-bytes, instance: 'df-bytes[/data/A]', class: OK}
+        - {step: df-inodes, instance: 'df-inodes[/data/A]', class: OK}
+        - {step: df-inodes, instance: 'df-inodes[/data/a]', class: OK}
+        - {step: meminfo, instance: meminfo, class: OK}
+        - {step: loadavg, instance: loadavg, class: OK}
+        - {step: cpu-online, instance: cpu-online, class: OK}
+    expect: {equals: INCOMPLETE}
+  - id: R-COVERAGE-NO-STEPS-IS-INCOMPLETE
+    part: host_result
+    job: O-CAPACITY
+    jobs_patch: {path: [jobs, O-CAPACITY, steps], value: []}
+    vars: {rh_obs_why: '', rh_obs_hin: {}, rh_obs_prior: []}
+    expect: {equals: INCOMPLETE}
+
+  # ---- codex-tick315 OBS-CONNECTED-PRINCIPAL: the identity command reads the principal back; principal_check admits
+  - id: R-IDENTITY-COMMAND-READS-PRINCIPAL
+    part: identity_command
+    vars:
+      rh_obs_tools: [sh, timeout, sha256sum, stat, id, cat]
+      rh_obs_ot: *ot
+      rh_obs_oti: {owner_uid: 0, known_answers: [{tool: sha256sum, stdin: abc, stdout: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -'}]}
+      rh_obs_loc: C.UTF-8
+    expect: {command_contains: ['"$(/usr/bin/id -u)"', '"$(/usr/bin/id -un)"']}
+  - id: R-PRINCIPAL-VALID
+    part: principal_check
+    vars: {rh_obs_owner: lmeowner, rh_obs_out: "ba7816bf  -\nuid|1000\nuname|lmeowner\n"}
+    expect: {equals: []}
+  - id: R-PRINCIPAL-UID0-NON-ROOT-NAME
+    part: principal_check
+    vars: {rh_obs_owner: lmeowner, rh_obs_out: "uid|0\nuname|lmeowner\n"}
+    expect: {contains_prefix: 'connected uid is not exactly one non-zero uid'}
+  - id: R-PRINCIPAL-NAME-MISMATCH
+    part: principal_check
+    vars: {rh_obs_owner: lmeowner, rh_obs_out: "uid|1000\nuname|other\n"}
+    expect: {contains_prefix: 'connected account '}
+  - id: R-PRINCIPAL-LINE-MISSING
+    part: principal_check
+    vars: {rh_obs_owner: lmeowner, rh_obs_out: "uname|lmeowner\n"}
+    expect: {contains_prefix: 'connected uid is not exactly one non-zero uid'}
+  - id: R-PRINCIPAL-DUPLICATE-LINES
+    part: principal_check
+    vars: {rh_obs_owner: lmeowner, rh_obs_out: "uid|1000\nuid|0\nuname|lmeowner\n"}
+    expect: {contains_prefix: 'connected uid is not exactly one non-zero uid'}
+  - id: R-PRINCIPAL-OWNER-ROOT
+    part: principal_check
+    vars: {rh_obs_owner: root, rh_obs_out: "uid|1000\nuname|root\n"}
+    expect: {contains_prefix: 'connected account '}
+
+run_cases:
+  # codex-tick307 (2): a missing or mismatched job digest refuses before any target contact or mutation
+  - id: X-JOB-DIGEST-MISMATCH
+    setup: observation.jobs_sha256 declares a digest that is not the job file's (e.g. one byte of the job file edited)
+    expect:
+      refusal: RH-OBSERVATION
+      task: Refuse a job file that is not the declared bytes (observation.jobs_sha256; before any contact)
+      not_run: [FIRST CONTACT -- the job's tool identities (raw; known answer, digests, file custody; read-only), Create the attempt dir EXCLUSIVELY (an existing attempt refuses; never reused) and its host dir]
+      evidence: none (no attempt dir created)
+  - id: X-JOB-FILE-ABSENT
+    setup: observation.jobs_rel names an absent file
+    expect: {refusal: RH-OBSERVATION, task: Refuse a job file that is absent or not a regular file (before any read or contact), evidence: none}
+  # codex-tick307 (3): both digests recorded
+  - id: X-DIGESTS-RECORDED
+    setup: a COMPLETE or INCOMPLETE attempt
+    expect: {evidence_fields: {'attempt.json jobs.expected_sha256': observation.jobs_sha256, 'attempt.json jobs.observed_sha256': the sha256 of the ONE text read that was parsed, 'attempt.json jobs.observed_stat_sha256': the job file's stat sha256, 'hosts/<h>.json jobs': the same three}}
+  # codex-tick307 (4): no reuse of an attempt identity or admission
+  - id: X-ATTEMPT-REUSE
+    setup: rerun with the same lme_obs_job and lme_obs_attempt (job file changed and re-declared, or unchanged)
+    expect: {failure: mkdir of the existing attempt dir fails, task: Create the attempt dir EXCLUSIVELY (an existing attempt refuses; never reused) and its host dir, not_run: [FIRST CONTACT -- the job's tool identities (raw; known answer, digests, file custody; read-only)], evidence: the prior attempt dir untouched}
+  # codex-tick307 (5): adding a host edits the inventory only
+  - id: X-ADD-HOST-INVENTORY-ONLY
+    setup: add a host (e.g. graph) to group lme_toolchain_targets with its target-input vars (lme_obs_paths, ...); job file and profile unchanged
+    expect: {jobs_file_unchanged: true, observation_jobs_sha256_unchanged: true, scopes_sha256: 'changes (the deployment binding now holds the new target and its bound target inputs)', evidence: 'hosts/<new host>.json written; host_inputs (the bound values) + host_inputs_sha256 recorded'}
+  - id: X-TARGET-INPUT-CHANGE-MOVES-REVISION
+    setup: change one value of lme_obs_paths on one host; nothing else
+    expect: {jobs_file_unchanged: true, scopes_sha256: changes, every_target_scope_sha256: changes, note: 'binding.deployment (target_inputs of every target) is shared by every scope, so one host''s selection moves every scope identity; the selection is part of the resolved run revision, not of the job file'}
+  - id: X-RAW-HOSTVAR-NOT-READ
+    setup: a host whose inventory sets lme_obs_paths while the policy declares no target input role for it (inventory.target_inputs lacks obs_paths)
+    expect: {refusal: RH-OBSERVATION, task: Refuse a job file that is not valid in the closed vocabulary, or lacks the selected job, evidence: none}
+  - id: X-EMPTY-TARGET-GROUP
+    setup: inventory whose lme_toolchain_targets is empty or absent
+    expect: {refusal: RH-OBSERVATION, task: Refuse an empty target set (no target-deployment or observation credit without a target), evidence: none}
+  - id: X-LIMIT-REFUSED
+    setup: any --limit (including one that keeps localhost)
+    expect: {refusal: RH-OBSERVATION, task: Refuse an undeclared runner, run scratch dir, selection or invocation form (RH-OBSERVATION), note: 'a --limit that drops localhost skips play 1; every target then fails its un-rescued admitted-run check (nonzero exit, no evidence)'}
+  # advisor item 1: extra-vars outrank task vars, registers and loop vars -- every runner name is refused as input
+  - id: X-PINNED-RUNNER-OUTPUT
+    setup: -e rh_obs_records=[] (or any rh_obs_* name)
+    expect: {refusal: RH-DERIVED-OUTPUT-PINNED, task: 'Refuse pre-supplied observation runner names (^_?rh_obs_)', evidence: none}
+  - id: X-FORGED-GUARD-INPUT
+    setup: >-
+      -e '{"_rh_obs_jobs_st": {"stat": {"exists": true, "isreg": true, "checksum": "<the declared jobs_sha256>"}}}'
+      (or any _rh_obs_* task var, register or loop var)
+    expect: {refusal: RH-DERIVED-OUTPUT-PINNED, task: 'Refuse pre-supplied observation runner names (^_?rh_obs_)', not_run: ['Stat the job file (controller; regular file, no link followed; sha256; read-only)'], evidence: none}
+  - id: X-TTY-FORCED
+    setup: -e ansible_ssh_use_tty=true
+    expect: {refusal: RH-OBSERVATION, task: 'Refuse a tty-forcing connection (RH-OBSERVATION; before any contact)', not_run: [FIRST CONTACT -- the job's tool identities (raw; known answer, digests, file custody; read-only)], evidence: 'hosts/<h>.json REFUSED (recorded inside the block) for every host; attempt.json INCOMPLETE; nonzero exit after evidence'}
+  # ansible breaks the playbook when EVERY host of a play batch fails (executor/playbook_executor.py: len(batch) ==
+  # failed_hosts_count -> break_play); an outside-block refusal on every target therefore leaves an ABORTED attempt
+  - id: X-ALL-TARGETS-FAIL-OUTSIDE-BLOCK
+    setup: every target of the group fails an un-rescued entry refusal (e.g. an inventory host var named rh_obs_* on a one-host group)
+    expect: {exit: nonzero, evidence: 'attempt dir exists (exclusively created), no attempt.json, no host records = ABORTED attempt; its id is burned'}
+  - id: X-HOST-INPUT-INVALID-NO-CONTACT
+    setup: 'O-CAPACITY with one host that sets no lme_obs_paths (optional role, so nothing is bound for it); a malformed value is refused earlier, by the loader (abs_path), before this runner starts'
+    expect: {host_result: REFUSED, task: Refuse absent or invalid target inputs before any contact (typed substitution), not_run_on_that_host: [FIRST CONTACT -- the job's tool identities (raw; known answer, digests, file custody; read-only)], attempt: INCOMPLETE, exit: nonzero after evidence}
+  - id: X-TOOL-IDENTITY-MISMATCH
+    setup: a host whose findmnt differs from os_tools.findmnt.identity (per-host identity not declared)
+    expect: {host_result: REFUSED, task: Refuse tools that are absent, not their declared identity or not uid-0 custody (named with their package), job_steps_run: 0}
+  - id: X-NOFILE-ABSENT-UNIT
+    setup: Q-NOFILE on a host without lme-elasticsearch.service loaded
+    expect: {host_result: PRECONDITION_FALSE, records: [get-unit PRECONDITION_FALSE], no_instance_of: [cgroup-procs-files, cgroup-pids, pid-limits], attempt: 'COMPLETE if every other host is COMPLETE or PRECONDITION_FALSE'}
+  - id: X-UNREACHABLE-HOST
+    setup: one host of the group unreachable
+    expect: {host_result: UNREACHABLE, evidence: hosts/<h>.json written, attempt: INCOMPLETE, exit: nonzero after attempt.json}
+  - id: X-READ-ONLY
+    setup: any job on any host
+    expect: {target_writes: none, module_tasks_on_target: 0, channel: raw only, become: never, evidence_modes: {dirs: '0700', files: '0600'}}
+  # ---- codex-tick315 OBS-EMPTY-JOB (the job file edited AND its digest re-declared, so the digest check passes)
+  - id: X-EMPTY-JOB
+    setup: the selected job's steps is [] (or absent); observation.jobs_sha256 re-declared to the edited file
+    expect: {refusal: RH-OBSERVATION, task: Refuse a job file that is not valid in the closed vocabulary, or lacks the selected job, not_run: [Create the attempt dir EXCLUSIVELY (an existing attempt refuses; never reused) and its host dir, FIRST CONTACT -- the job's tool identities (raw; known answer, digests, file custody; read-only)], evidence: none (no attempt dir created)}
+  - id: X-MALFORMED-JOB
+    setup: the selected job is not a mapping, or its steps is a mapping, or a step's argv is a string; observation.jobs_sha256 re-declared
+    expect: {refusal: RH-OBSERVATION, task: Refuse a job file that is not valid in the closed vocabulary, or lacks the selected job, not_run: [FIRST CONTACT -- the job's tool identities (raw; known answer, digests, file custody; read-only)], evidence: none (no attempt dir created)}
+  # ---- codex-tick315 OBS-CASE-SENSITIVE-COVERAGE
+  - id: X-CASE-DISTINCT-PATHS
+    setup: O-CAPACITY on a host whose bound obs_paths are two case-distinct existing dirs (e.g. /data/A and /data/a)
+    expect: {records_of: {df-bytes: ['df-bytes[/data/A]', 'df-bytes[/data/a]'], df-inodes: ['df-inodes[/data/A]', 'df-inodes[/data/a]']}, coverage_gaps: [], host_result: COMPLETE}
+  # ---- codex-tick315 OBS-CONNECTED-PRINCIPAL
+  - id: X-PRINCIPAL-UID0
+    setup: 'fixture target whose declared owner account (a non-root name) has uid 0 (e.g. a second uid-0 account); MAIN-built fixture, never a real host'
+    expect: {host_result: REFUSED, task: Refuse a connected principal that is uid 0 or not the declared owner (RH-OBSERVATION; before any job step), job_steps_run: 0, evidence: 'hosts/<h>.json REFUSED with identity.stdout carrying the uid| / uname| lines'}
+  # ---- codex-tick315 OBS-EFFECTIVE-CREDENTIAL-BINDING (tasks/admit_transport.yml; before any contact)
+  - id: X-KEY-DIFFERING-VALID
+    setup: explicit_key run with -e ansible_ssh_private_key_file=<another admitted, existing key path> (the inventory's lme_toolchain_owner_key unchanged)
+    expect: {host_result: REFUSED, refusal: RH-TRANSPORT-AUTH, task: Refuse an undeclared, mismatched or overridden SSH authentication mode (RH-TRANSPORT-AUTH), not_run: [FIRST CONTACT -- the job's tool identities (raw; known answer, digests, file custody; read-only)], evidence: hosts/<h>.json REFUSED}
+  # RESIDUAL (stated, not a case): an extra-var of the DECLARED input lme_toolchain_owner_key itself is read by the
+  # loader like any inventory input, so it is the bound owner_key and is recorded in the scope binding -- the check
+  # above refuses a selector that differs from the owner contract, not a re-declared owner key.
+  - id: X-AGENT-KEY-CONFLICT
+    setup: '`seed run --ssh-auth agent` with lme_ssh_auth_mode=agent while the host also sets lme_toolchain_owner_key (or -e ansible_ssh_private_key_file=<path>)'
+    expect: {host_result: REFUSED, refusal: RH-TRANSPORT-AUTH, task: Refuse an undeclared, mismatched or overridden SSH authentication mode (RH-TRANSPORT-AUTH), not_run: [FIRST CONTACT -- the job's tool identities (raw; known answer, digests, file custody; read-only)]}
+  # ---- codex-tick315 OBS-FAILURE-DIAGNOSTIC (the existing connect-timeout input of X-UNREACHABLE-HOST)
+  - id: X-UNREACHABLE-DIAGNOSTIC
+    setup: as X-UNREACHABLE-HOST (connect timeout)
+    expect: {evidence_fields: {'hosts/<h>.json records[0].class': UNREACHABLE, 'hosts/<h>.json records[0].diagnostic': 'the bounded ssh connect-timeout message (non-empty)', 'hosts/<h>.json records[0].diagnostic_chars': the full message length}}

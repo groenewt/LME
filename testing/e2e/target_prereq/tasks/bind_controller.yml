@@ -1,0 +1,243 @@
+---
+# testing/e2e/target_prereq/tasks/bind_controller.yml -- J-KEY controller binding (localhost; observe-only).
+# Outputs: jk (the resolved owner_key node), jk_tool, jk_ti, jk_ctl. Every value from the resolved rh / lme_resolved.
+
+- name: Resolve the harness policy, verify the controller receipt and bind the managed executor (route author)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_harness.yml"
+
+- name: Refuse an unregistered J-KEY node or an unregistered consumer label (C1 joins; nothing touched)
+  vars:
+    _jk_n: "{{ rh.controller.bootstrap.owner_key | default({}) }}"
+  ansible.builtin.assert:
+    that:
+      - _jk_n is mapping and _jk_n.revision | default(0) == 1
+      - _jk_n.runner | default('') == 'controller_non_root'
+      - _jk_n.tool_consumer | default('') in (rh.controller.bootstrap.os_tool_consumers.controller | default([]))
+      - _jk_n.key_type | default('') == 'ed25519'
+      - _jk_n.storage.sub_root | default('') in rh.controller.bootstrap.work_roots.sub_roots
+      - rh.controller.bootstrap.work_roots.anchor == 'repository_checkout'
+    fail_msg: >-
+      REFUSED JKEY-UNREGISTERED: rh.controller.bootstrap.owner_key is not registered at revision 1 (runner
+      controller_non_root, key_type ed25519, tool_consumer in os_tool_consumers.controller, storage.sub_root a key of
+      work_roots.sub_roots, work_roots.anchor repository_checkout). C1 registers testing/e2e/target_prereq/owner_key.decl.yml.
+    quiet: true
+
+- name: Bind the leg policy (resolved rh only)
+  ansible.builtin.set_fact:
+    jk: "{{ rh.controller.bootstrap.owner_key }}"
+
+- name: Refuse a pinned leg policy or malformed storage names (an extra var would outrank the set_fact above)
+  ansible.builtin.assert:
+    that:
+      - jk == rh.controller.bootstrap.owner_key
+      - >-
+        [rh.controller.bootstrap.work_roots.sub_roots[jk.storage.sub_root], jk.storage.keys_rel, jk.storage.key_name,
+         jk.storage.record_name] | reject('match', jk.name_regex) | list | length == 0
+      - jk.storage.next_suffix is match('^[.][A-Za-z0-9_-]+$')
+      - jk.storage.pub_suffix | default('') is match('^[.][A-Za-z0-9_-]+$')
+      - jk.storage.pub_suffix | default('') != jk.storage.next_suffix
+      # the ONE location rule: repo-relative, no parent segment, a .j2 under this leg's directory
+      - jk.location_rule_rel | default('') is match('^testing/e2e/target_prereq/templates/[A-Za-z0-9_.-]+[.]j2$')
+      - jk.location_rule_rel is not search('[.][.]')
+      - jk.storage.dir_mode == '0700' and jk.storage.file_mode == '0600'
+      # the declared encryption mode drives the ssh-keygen passphrase argv (generate -N, pair check -P); a mode
+      # without both argv pairs is unregistered, never defaulted
+      - (jk.passphrase_argv | default({}))[jk.encryption | default('')] | default({}) is mapping
+      - (jk.passphrase_argv | default({}))[jk.encryption | default('')].generate | default([]) | length == 2
+      - (jk.passphrase_argv | default({}))[jk.encryption | default('')].pair_check | default([]) | length == 2
+    fail_msg: >-
+      REFUSED JKEY-UNREGISTERED: jk is not the resolved node, or its storage names / suffixes / modes are malformed,
+      or passphrase_argv has no generate / pair_check argv for the declared encryption mode.
+    quiet: true
+
+- name: Read the running uid with the declared tool (the route's rule; admit_ancestry.yml reads it the same way)
+  ansible.builtin.command:
+    argv: ["{{ rh.controller.bootstrap.os_tools.id.path }}", -u]
+  register: _jk_uid
+  changed_when: false
+
+- name: Stat the managed controller root (the executor's own root; no link followed)
+  ansible.builtin.stat:
+    path: "{{ rh_owned_root }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: _jk_own
+
+- name: Refuse root (J-KEY runs ONLY as the non-root controller owner; never become)
+  ansible.builtin.assert:
+    that:
+      - _jk_uid.stdout is match('^[0-9]+$')
+      - (_jk_uid.stdout | int) != 0
+      - _jk_own.stat.exists and _jk_own.stat.isdir and not _jk_own.stat.islnk
+      - _jk_own.stat.uid == (_jk_uid.stdout | int)
+    fail_msg: >-
+      REFUSED JKEY-ROOT-REFUSED: the leg runs as uid {{ _jk_uid.stdout }}; it runs only as the non-root owner of the
+      managed controller root {{ rh_owned_root }} (uid {{ _jk_own.stat.uid | default('?') }}).
+    quiet: true
+
+- name: Select the ONE admitted generator (os_tools entry whose required_by names the consumer label)
+  ansible.builtin.set_fact:
+    _jk_tools: >-
+      {{ rh.controller.bootstrap.os_tools | dict2items
+         | selectattr('value.required_by', 'defined')
+         | selectattr('value.required_by', 'contains', jk.tool_consumer) | list }}
+
+- name: Refuse a missing, ambiguous or conditional generator declaration (no install, no fallback)
+  ansible.builtin.assert:
+    that:
+      - _jk_tools | length == 1
+      - not (_jk_tools[0].value.conditional | default(false))
+      - _jk_tools[0].value.path is match(rh.controller.bootstrap.path_admission.regex)
+      - _jk_tools[0].value.identity.kind | default('') == 'file_sha256'
+      - (_jk_tools[0].value.identity.sha256 | default('')) is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      REFUSED JKEY-TOOL-NOT-ADMITTED: os_tools must declare EXACTLY one unconditional entry required_by
+      {{ jk.tool_consumer }} with an admitted path and a file_sha256 identity; found
+      {{ _jk_tools | map(attribute='key') | list }}. Nothing is installed and no other tool is tried.
+    quiet: true
+
+- name: Stat the generator (no link followed; content digest of the TOOL only)
+  ansible.builtin.stat:
+    path: "{{ _jk_tools[0].value.path }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+    get_mime: false
+    get_attributes: false
+  register: _jk_tst
+
+- name: Refuse a generator that is not the admitted identity
+  ansible.builtin.assert:
+    that:
+      - _jk_tst.stat.exists and _jk_tst.stat.isreg and not _jk_tst.stat.islnk
+      - _jk_tst.stat.uid == rh.controller.bootstrap.os_tool_identity.owner_uid
+      - not _jk_tst.stat.wgrp and not _jk_tst.stat.woth
+      - _jk_tst.stat.executable
+      - _jk_tst.stat.checksum == _jk_tools[0].value.identity.sha256
+    fail_msg: >-
+      REFUSED JKEY-TOOL-NOT-ADMITTED: {{ _jk_tools[0].value.path }} (os_tools.{{ _jk_tools[0].key }}) is absent, a link,
+      not a regular executable owned by uid {{ rh.controller.bootstrap.os_tool_identity.owner_uid }}, group/other-writable,
+      or its sha256 differs from the declared identity. Nothing is installed and no other tool is tried.
+    quiet: true
+
+- name: Bind the admitted generator (derived output)
+  ansible.builtin.set_fact:
+    jk_tool: {name: "{{ _jk_tools[0].key }}", path: "{{ _jk_tools[0].value.path }}", sha256: "{{ _jk_tools[0].value.identity.sha256 }}"}
+
+# DEPLOYMENT IDENTITY (codex-tick350 JKEY-DEPLOYMENT-IDENTITY-JOIN): the resolve-only path (resolve_harness ->
+# resolve_policy -> podman resolve) publishes lme_resolved = _lme_resolution.resolved | combine({<policy_key>: ...})
+# (resolve.yml:278; its read-back guard at :334 refuses a pinned lme_resolved), but NOT the lme_resolved.deployment_identity
+# ALIAS, which only the full loader adds (load_manifests.yml:568-569). This leg therefore derives ONE reserved value,
+# jk_deployment_identity, through the SAME canonical filter over the SAME resolved input the loader uses:
+#   loader : _lme_resolution.resolved | lme_validated_deployment_identity   (load_manifests.yml:568-569)
+#   J-KEY  : lme_resolved             | lme_validated_deployment_identity
+# lme_resolved differs from _lme_resolution.resolved only by the policy_key entry, so lme_deployment_identity (and the
+# filter's validation: shape [A-Za-z0-9_-]+, raise on ill-shaped, None when unset) is identical; nothing is re-validated,
+# minted, raw-read from inventory or loaded beyond the resolve. STABILITY: lme_deployment_identity is registered
+# exclude_from_revision (global.yml:615), so a config revision change never moves it and it never moves the revision;
+# the key location follows the identity only. The later full-loader projection lme_resolved.deployment_identity is the
+# same filter over the same input, so both agree by construction. jk_ is a reserved family (refused pre-supplied at
+# entry); the assert below re-derives it inline so a pinned value refuses.
+- name: Derive the deployment identity through the canonical filter (the loader's projection input)
+  ansible.builtin.set_fact:
+    jk_deployment_identity: "{{ lme_resolved | lme_validated_deployment_identity }}"
+
+- name: Refuse an undeclared op, a non-member or path-unsafe target, or an absent / pinned deployment identity
+  ansible.builtin.assert:
+    that:
+      - lme_owner_key_op is defined and lme_owner_key_op in jk.ops
+      - lme_transfer_target is defined and lme_transfer_target is string
+      - lme_transfer_target is match(jk.storage.target_regex)
+      - lme_transfer_target in (groups[rh.controller.bootstrap.inventory.target_group] | default([]))
+      - jk_deployment_identity is string and jk_deployment_identity | length > 0
+      - jk_deployment_identity == (lme_resolved | lme_validated_deployment_identity)
+    fail_msg: >-
+      REFUSED JKEY-INPUT: lme_owner_key_op must be one of {{ jk.ops }}; lme_transfer_target must be a member of
+      {{ rh.controller.bootstrap.inventory.target_group }} matching {{ jk.storage.target_regex }}; and the resolved
+      lme_deployment_identity (the declared operator input, validated by lme_validated_deployment_identity) must be set
+      -- it is never minted here. Nothing touched.
+    quiet: true
+
+- name: Bind this target's typed target inputs (ONLY the loader binding; the host vars are never read raw)
+  ansible.builtin.set_fact:
+    jk_ti: "{{ ((lme_resolved.remote_harness.binding.deployment.target_inputs | default({}))[lme_transfer_target] | default({})) }}"
+
+- name: Refuse an absent or malformed owner input (every role is optional; no default)
+  ansible.builtin.assert:
+    that:
+      - "'owner' in jk_ti"
+      - jk_ti.owner is string and jk_ti.owner is match(jk.storage.owner_regex)
+    fail_msg: "REFUSED JKEY-INPUT: {{ lme_transfer_target }} needs the bound target input owner (account name); got roles {{ jk_ti | list }}."
+    quiet: true
+
+- name: Refuse an absent or malformed owner_key / owner_pubkey input (not needed by the read-only locate op)
+  when: lme_owner_key_op != 'locate'
+  ansible.builtin.assert:
+    that:
+      - "['owner_key', 'owner_pubkey'] | reject('in', jk_ti) | list | length == 0"
+      - jk_ti.owner_key is match(rh.controller.bootstrap.path_admission.regex)
+      - jk_ti.owner_pubkey == jk_ti.owner_key ~ jk.storage.pub_suffix
+      - "'privileged_key' not in jk_ti or jk_ti.privileged_key != jk_ti.owner_key"
+    fail_msg: >-
+      REFUSED JKEY-INPUT: {{ lme_transfer_target }} needs the bound target inputs owner, owner_key and owner_pubkey
+      (== owner_key ~ '{{ jk.storage.pub_suffix }}'), an owner_key distinct from privileged_key; got roles {{ jk_ti | list }}.
+    quiet: true
+
+- name: Derive the controller work root TWO ways (repository anchor; the seed's last-'/<root_rel>/' rule)
+  vars:
+    _jk_rr: "{{ rh.controller.bootstrap.work_roots.root_rel }}"
+  ansible.builtin.set_fact:
+    _jk_w_repo: "{{ rh_repo_root ~ '/' ~ _jk_rr }}"
+    # greedy '^.*' + lookahead: the prefix through the LAST '/<root_rel>' that is followed by '/' (the seed's
+    # W=${R%/<root_rel>/*}/<root_rel>); no backreference literal
+    _jk_w_seed: "{{ rh_owned_root | regex_search('^.*/' ~ (_jk_rr | regex_escape) ~ '(?=/)') | default('', true) }}"
+
+# The ONE location rule (codex-tick350): jk.location_rule_rel (templates/owner_key_location.j2), rendered by lookup here AND by the generic
+# run-binding macros (ansible/inventory/macros/run_binding.j2) for the owner_key / owner_pubkey role values. The leg
+# never re-encodes the naming (key name, pub suffix, next suffix, record name all come from jk.storage).
+- name: Derive the owned key location through the declared location rule (work_roots + resolved storage)
+  ansible.builtin.set_fact:
+    _jk_loc: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ jk.location_rule_rel,
+                template_vars={'ok_bs': rh.controller.bootstrap, 'ok_repo_root': rh_repo_root,
+                               'ok_deployment': jk_deployment_identity, 'ok_target': lme_transfer_target,
+                               'ok_owner': jk_ti.owner}) | trim | from_json }}
+
+- name: Bind the controller location facts (derived output)
+  ansible.builtin.set_fact:
+    jk_ctl:
+      uid: "{{ _jk_uid.stdout | int }}"
+      work_root: "{{ _jk_loc.work_root }}"
+      deployment: "{{ jk_deployment_identity }}"
+      target: "{{ lme_transfer_target }}"
+      owner: "{{ jk_ti.owner }}"
+      chain: "{{ _jk_loc.chain }}"
+      keydir: "{{ _jk_loc.keydir }}"
+      key: "{{ _jk_loc.key }}"
+      pub: "{{ _jk_loc.pub }}"
+      next: "{{ _jk_loc.next }}"
+      next_pub: "{{ _jk_loc.next_pub }}"
+      record: "{{ _jk_loc.record }}"
+      comment_base: >-
+        {{ jk.comment_template | replace('{deployment}', jk_deployment_identity)
+           | replace('{target}', lme_transfer_target) | replace('{owner}', jk_ti.owner) }}
+
+# Diagnostics are safe for legitimately absent inputs (codex-tick350 JKEY-LOCATE-MISSING-INPUT-DIAGNOSTIC): Ansible
+# 2.19 templates the assert arguments before evaluating `that`, so every value an op may lack is defaulted in the
+# message. Locate never requires the key it locates.
+- name: Refuse a work root the two derivations disagree on, or bound inputs that are not the owned location
+  ansible.builtin.assert:
+    that:
+      - _jk_w_seed | length > 0 and _jk_w_seed == _jk_w_repo and _jk_loc.work_root == _jk_w_repo
+      - jk_ctl.key is match(rh.controller.bootstrap.path_admission.regex)
+      - jk_ctl.key is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+      - lme_owner_key_op == 'locate' or jk_ti.owner_key == jk_ctl.key
+      - lme_owner_key_op == 'locate' or jk_ti.owner_pubkey == jk_ctl.pub
+    fail_msg: >-
+      REFUSED JKEY-LOCATION: work root (repository anchor) {{ _jk_w_repo }} vs (seed rule over {{ rh_owned_root }})
+      {{ _jk_w_seed }} vs (location rule) {{ _jk_loc.work_root }}; the bound owner_key / owner_pubkey
+      ({{ jk_ti.owner_key | default('<absent>') }}, {{ jk_ti.owner_pubkey | default('<absent>') }}) must be the owned
+      location {{ jk_ctl.key }} / {{ jk_ctl.pub }} (declare the inventory values from it; never the reverse).
+    quiet: true

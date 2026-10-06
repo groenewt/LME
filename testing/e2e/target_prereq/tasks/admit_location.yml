@@ -1,0 +1,94 @@
+---
+# testing/e2e/target_prereq/tasks/admit_location.yml -- the owned key directory chain (localhost; non-root).
+# jk_ctl.chain = [<W>/<credentials sub-root>, .../<keys_rel>, .../<deployment>, .../<target>, .../<owner>].
+# The work root W itself is admitted by the seed (storage admission) and by the route ancestry rule here. Every
+# EXISTING chain level must be a real directory (JKEY-SYMLINK on a link), owned by the running uid with mode 0700
+# (JKEY-FOREIGN otherwise); nothing existing is chmod'ed, chown'ed or replaced. ABSENT levels are created in order,
+# each with mode 0700, then every level is read back. The route ancestry rule is re-checked at the use boundary (the
+# key directory) before any key file is written.
+
+- name: Admit the work root through the ONE ancestry rule (route; read-only)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ jk_ctl.work_root }}"
+    rh_anc_refusal: JKEY-FOREIGN
+
+- name: Stat every chain level (no link followed; metadata only)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: "{{ jk_ctl.chain }}"
+  register: _jk_chain0
+
+- name: Refuse a linked chain level (never followed, never replaced)
+  ansible.builtin.assert:
+    that:
+      - _jk_chain0.results | selectattr('stat.exists') | selectattr('stat.islnk') | list | length == 0
+    fail_msg: >-
+      REFUSED JKEY-SYMLINK: {{ _jk_chain0.results | selectattr('stat.exists') | selectattr('stat.islnk') | map(attribute='item') | list }}
+      is a link; the key directory chain is never followed or replaced.
+    quiet: true
+
+- name: Refuse a foreign, non-directory or wrongly-moded existing chain level (never repaired)
+  ansible.builtin.assert:
+    that:
+      - item.stat.isdir
+      - item.stat.uid == jk_ctl.uid | int
+      - item.stat.mode == jk.storage.dir_mode
+    fail_msg: >-
+      REFUSED JKEY-FOREIGN: {{ item.item }} exists but is not a directory owned by uid {{ jk_ctl.uid }} with mode
+      {{ jk.storage.dir_mode }} (uid {{ item.stat.uid }}, mode {{ item.stat.mode }}); it is preserved and never chmod'ed.
+    quiet: true
+  loop: "{{ _jk_chain0.results | selectattr('stat.exists') | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create ONLY the absent chain levels, in order, each 0700 (levels are ordered, so each parent exists)
+  ansible.builtin.file:
+    path: "{{ item.item }}"
+    state: directory
+    mode: "{{ jk.storage.dir_mode }}"
+  loop: "{{ _jk_chain0.results | rejectattr('stat.exists') | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: _jk_chain_made
+
+- name: Read the chain back (no link followed)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: "{{ jk_ctl.chain }}"
+  register: _jk_chain1
+
+- name: Refuse a chain that did not read back as owned 0700 real directories
+  ansible.builtin.assert:
+    that:
+      - >-
+        ((_jk_chain1.results | rejectattr('stat.exists') | list)
+         + (_jk_chain1.results | selectattr('stat.exists') | selectattr('stat.islnk') | list)
+         + (_jk_chain1.results | selectattr('stat.exists') | rejectattr('stat.isdir') | list))
+        | length == 0
+      - _jk_chain1.results | map(attribute='stat.uid') | unique | list == [jk_ctl.uid | int]
+      - _jk_chain1.results | map(attribute='stat.mode') | unique | list == [jk.storage.dir_mode]
+    fail_msg: "REFUSED JKEY-FOREIGN: the key directory chain {{ jk_ctl.chain }} did not read back as owned {{ jk.storage.dir_mode }} directories."
+    quiet: true
+
+- name: Re-check the ONE ancestry rule at the use boundary (the key directory; before any key file write)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ jk_ctl.keydir }}"
+    rh_anc_refusal: JKEY-FOREIGN
+
+- name: Record whether this run created any chain level
+  ansible.builtin.set_fact:
+    jk_changed: "{{ (_jk_chain_made.results | default([]) | length) > 0 }}"

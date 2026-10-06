@@ -1,0 +1,120 @@
+---
+# testing/e2e/target_prereq/tasks/observe_key.yml -- custody observation + classification (localhost; read-only).
+# Private files (<key>, <key><next_suffix>) are stat'ed for METADATA ONLY (get_checksum / get_mime / get_attributes
+# false): Ansible never reads a private byte. The record (public digests + journal) is read; it holds no secret.
+# Output: jk_obs (per-file presence), jk_prior (the record read, or none), jk_plan.current in
+#   fresh  -- no key pair (and no record, or a record journaled 'started' with no file yet): generate
+#   resume -- a record journaled 'started' and BOTH halves present: read back, then mark done
+#   adopt  -- no record and BOTH halves present in the owned location with declared custody: read back, record
+#   check  -- a record 'done' and BOTH halves present: read back only (the unchanged reapply is a no-op)
+
+- name: Stat the key files and the record (no link followed; metadata only -- no content digest of any file)
+  ansible.builtin.stat:
+    path: "{{ item.value }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: "{{ {'key': jk_ctl.key, 'pub': jk_ctl.pub, 'next': jk_ctl.next, 'next_pub': jk_ctl.next_pub, 'record': jk_ctl.record} | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: _jk_st
+
+- name: Index the observation
+  ansible.builtin.set_fact:
+    _jk_s: "{{ dict(_jk_st.results | map(attribute='item.key') | zip(_jk_st.results | map(attribute='stat'))) }}"
+
+- name: Refuse a linked key file or record (never followed, never replaced)
+  ansible.builtin.assert:
+    that:
+      - _jk_s | dict2items | selectattr('value.exists') | selectattr('value.islnk') | list | length == 0
+    fail_msg: >-
+      REFUSED JKEY-SYMLINK: {{ _jk_s | dict2items | selectattr('value.exists') | selectattr('value.islnk') | map(attribute='key') | list }}
+      under {{ jk_ctl.keydir }} is a link; it is preserved and never followed or replaced.
+    quiet: true
+
+- name: Refuse a foreign, non-regular or wrongly-moded existing key file or record (never repaired)
+  vars:
+    _jk_modes: "{{ {'key': [jk.storage.file_mode], 'next': [jk.storage.file_mode], 'record': [jk.storage.file_mode],
+                   'pub': jk.storage.pub_modes, 'next_pub': jk.storage.pub_modes} }}"
+  ansible.builtin.assert:
+    that:
+      - item.value.isreg
+      - item.value.uid == jk_ctl.uid | int
+      - item.value.mode in _jk_modes[item.key]
+    fail_msg: >-
+      REFUSED JKEY-FOREIGN: {{ item.key }} under {{ jk_ctl.keydir }} is not a regular file owned by uid {{ jk_ctl.uid }}
+      with mode in {{ _jk_modes[item.key] }} (uid {{ item.value.uid }}, mode {{ item.value.mode }}); preserved, never chmod'ed.
+    quiet: true
+  loop: "{{ _jk_s | dict2items | selectattr('value.exists') | list }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Read the record (public digests and journal only; never a key byte)
+  ansible.builtin.slurp:
+    src: "{{ jk_ctl.record }}"
+  register: _jk_rec_raw
+  when: _jk_s.record.exists
+
+- name: Bind the prior record (or none) and the per-file presence (derived output)
+  ansible.builtin.set_fact:
+    jk_prior: "{{ (_jk_rec_raw.content | b64decode | from_json) if _jk_s.record.exists else none }}"
+    jk_obs: "{{ dict(_jk_s | dict2items | map(attribute='key') | zip(_jk_s | dict2items | map(attribute='value.exists'))) }}"
+
+- name: Refuse a record that is not THIS producer's record for THIS location
+  ansible.builtin.assert:
+    that:
+      - jk_prior is mapping
+      - jk_prior.schema | default('') == jk.record_schema
+      - jk_prior.deployment | default('') == jk_ctl.deployment
+      - jk_prior.target | default('') == jk_ctl.target
+      - jk_prior.owner | default('') == jk_ctl.owner
+      - jk_prior.key_path | default('') == jk_ctl.key and jk_prior.pub_path | default('') == jk_ctl.pub
+      - jk_prior.key_type | default('') == jk.key_type
+      - jk_prior.state | default('') in jk.record_states
+      - jk_prior.generation | default(none) is integer
+      - jk_prior.obligations | default(none) is sequence and jk_prior.obligations is not string
+      - jk_prior.obligations | rejectattr('state', 'equalto', 'closed') | list | length <= 1
+      - jk_prior.obligations | map(attribute='kind') | reject('in', jk.obligations.kinds) | list | length == 0
+    fail_msg: >-
+      REFUSED JKEY-FOREIGN: {{ jk_ctl.record }} is not a {{ jk.record_schema }} record of deployment
+      {{ jk_ctl.deployment }} / target {{ jk_ctl.target }} / owner {{ jk_ctl.owner }} at {{ jk_ctl.key }} (or it carries
+      more than one open obligation or an undeclared kind); preserved, never rewritten.
+    quiet: true
+  when: jk_prior is not none
+
+- name: Classify the CURRENT pair (observation only)
+  vars:
+    _jk_k: "{{ jk_obs.key }}"
+    _jk_p: "{{ jk_obs.pub }}"
+    _jk_st0: "{{ jk_prior.state if jk_prior is not none else 'absent' }}"
+  ansible.builtin.set_fact:
+    jk_plan:
+      current: >-
+        {{ 'fresh' if (not _jk_k and not _jk_p and _jk_st0 in ['absent', 'started'] and not jk_obs.next and not jk_obs.next_pub)
+           else 'resume' if (_jk_k and _jk_p and _jk_st0 == 'started')
+           else 'adopt' if (_jk_k and _jk_p and _jk_st0 == 'absent' and not jk_obs.next and not jk_obs.next_pub)
+           else 'check' if (_jk_k and _jk_p and _jk_st0 == 'done')
+           else 'drift' if (_jk_st0 == 'done')
+           else 'partial' }}
+      prior_state: "{{ _jk_st0 }}"
+
+- name: Refuse a recorded pair that is gone, or a partial / unrecorded pair (the obligation and the files are kept)
+  ansible.builtin.assert:
+    that:
+      - jk_plan.current in ['fresh', 'resume', 'adopt', 'check']
+    fail_msg: >-
+      REFUSED {{ 'JKEY-DRIFT' if jk_plan.current == 'drift' else 'JKEY-RESUME' }}: {{ jk_ctl.keydir }} holds
+      key={{ jk_obs.key }} pub={{ jk_obs.pub }} next={{ jk_obs.next }} next_pub={{ jk_obs.next_pub }} with record state
+      {{ jk_plan.prior_state }}; a recorded pair that is gone, one half of a pair, or a replacement without a record is
+      never regenerated, adopted or removed here (MAIN decides; everything is preserved).
+    quiet: true
+
+- name: Refuse a rotation without a recorded current pair (rotate replaces only an admitted, recorded key)
+  ansible.builtin.assert:
+    that:
+      - lme_owner_key_op != 'rotate' or jk_plan.current == 'check'
+    fail_msg: >-
+      REFUSED JKEY-ROTATE-NO-CURRENT: lme_owner_key_op=rotate needs a recorded current pair at {{ jk_ctl.key }}
+      (found plan {{ jk_plan.current }}); run lme_owner_key_op=ensure first.
+    quiet: true
