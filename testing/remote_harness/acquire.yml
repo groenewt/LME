@@ -3,9 +3,14 @@
 # route + missing-dependency handling). MAIN runs it; it is the ONLY network-permitted stage of the bootstrap.
 #
 #   ansible-playbook -i <operator inventory> testing/remote_harness/acquire.yml
-# localhost host vars (inputs, no defaults): rh_artifact_source = an EXISTING directory owned by the invoking account;
-# rh_acquisition_receipt (genesis.acquisition.receipt_var) = the receipt file path, OUTSIDE the store, in an existing
-# owned directory.
+# localhost host vars (inputs, no defaults), both NAMED by the declaration, never by a literal here (brr-follow-s2
+# OPEN-C; codex-tick542 OD-GEN-09; codex-tick556 settled_join_precision OPEN_C): the host var named by
+# genesis.acquisition.source_var = an EXISTING directory owned by the invoking account (the artifact store); the host var
+# named by genesis.acquisition.receipt_var = the receipt file path, OUTSIDE the store, in an existing owned directory.
+# Their VALUES are read INLINE in every use by a lookup of the declared name (brr-follow-s2 successor-06
+# ACQ-PLAY-VAR-PRECEDENCE, codex-572): no play-level alias exists, so no extra-var or host var can outrank or stand in
+# for the declared inputs; every lookup is evaluated only after the admission task below has checked the declared names
+# and the vars' presence (the measurement-only branch above it reads no acquisition input).
 #
 # Runs on the declared builder only (tasks/admit_builder.yml). For every declared artifact row
 # (controller.bootstrap.artifacts + the lock's packages and collections):
@@ -35,10 +40,14 @@
 # through tasks/prepare_fetch.yml, and neither reads a target scope nor guest.allocation (this stage's inventory is
 # operator_controller_inventory). The candidate is admitted by C1 / B declarations and package.yml
 # (tasks/admit_preparation.yml), never by itself. Without the section this playbook is unchanged.
-# MEASUREMENT-ONLY (codex R4, C1 proposal controller.bootstrap.preparation_measurement): selected by the declared
-# localhost host var preparation_measurement.mode_var; right after builder admission, tasks/measure_controller_tools.yml
-# writes ONE candidate measurement record under preparation_measurement.root_var and ENDS the play (no fetch, no
-# preparation). Without the node or the mode var this playbook is unchanged.
+# MEASUREMENT-ONLY (codex R4, route-r4b; C1 proposal controller.bootstrap.preparation_measurement revision 2 and
+# genesis.launch.stages.acquire selectors / operations): selected by a declared stage selector (localhost host var);
+# right after builder admission a selector gate refuses any requested operation that is undeclared, unsupported or
+# ambiguous, whether or not acquisition inputs are present; the admitted one (tasks/measure_controller_tools.yml)
+# checks the controller-only scope, writes ONE candidate measurement record under preparation_measurement.root_var and
+# ENDS the play (no fetch, no preparation). With no selector supplied this playbook is unchanged. route-r4c: the
+# selector gate's refusals use the common grammar controller.bootstrap.refusal_grammar (REFUSED <code>: <detail>,
+# through its entry template) and its path join uses path_admission.separator (C1 proposal r4c-c1-hunks.yml).
 - name: Acquire the declared bootstrap artifacts (sha256-pinned, declared sources only)
   hosts: localhost
   connection: local
@@ -59,35 +68,107 @@
       vars:
         rh_gen_stage: acquire     # genesis.launch.stages key: env and temps under <work root>/tmp/genesis/acquire/<act>
 
-    # MEASUREMENT-ONLY (codex-r2-r4-r5-bootstrap-decisions-20261006 R4; C1 proposal controller.bootstrap.
-    # preparation_measurement): with the node declared AND its localhost host var mode_var supplied, the controller,
-    # policy and builder admissions above are the whole admission; tasks/measure_controller_tools.yml records the
-    # selected preparation tools / keyrings by native stat into ONE candidate record and ENDS the play here -- before
-    # the artifact-source admission below, any fetch and preparation. Otherwise this include is skipped and the stage is
-    # unchanged. A measurement inventory carries no rh_artifact_source / rh_acquisition_receipt (refused_inputs), so a
-    # mode var supplied without the declaration still refuses RH-ACQUIRE at the next task, before any fetch.
-    - name: "MEASUREMENT-ONLY -- the declared controller measurement, then END (tasks/measure_controller_tools.yml; declared only)"
-      ansible.builtin.include_tasks: tasks/measure_controller_tools.yml
+    # STAGE OPERATION SELECTORS (route-r4b R4-MODE-WITHOUT-DECLARATION; C1 proposal genesis.launch.stages.acquire
+    # selectors / operations). The selector NAMES are declared at the stage, apart from the operation nodes, so an
+    # explicitly requested operation is recognised even when its node is undeclared. ANY supplied selector (extra-var or
+    # inventory; presence, whatever its value -- an empty value is a request too) requires: exactly ONE requested
+    # operation, its node declared at the revision the stage declares, its mode selector supplied with the declared mode
+    # value. Otherwise REFUSED here -- after builder admission, before the artifact-source admission and any fetch --
+    # whether or not acquisition inputs are present. With NO selector supplied every expression below is vacuous and the
+    # stage is unchanged. The selector declaration itself is required (no default): the contract
+    # (contract_admission.genesis_stage_operations) makes it mandatory, so every admissible resolve carries it.
+    # Inline in every use (no task var: an extra-var would outrank it).
+    - name: "SELECTORS -- refuse a resolve without the stage selector declaration (required; no default)"
+      ansible.builtin.assert:
+        that:
+          - rh.controller.bootstrap.genesis.launch.stages.acquire.selectors is mapping
+          - rh.controller.bootstrap.genesis.launch.stages.acquire.operations is mapping
+          - rh.controller.bootstrap.genesis.launch.stages.acquire.refusal is string
+          - rh.controller.bootstrap.genesis.launch.stages.acquire.diagnostics is mapping
+        # absent-node diagnostics from the ADMITTED parent (genesis.launch.refusal, the stage's playbook_rel and its key
+        # set), formatted by the common refusal grammar (route-r4c; C1 controller.bootstrap.refusal_grammar)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.genesis.launch.refusal,
+                                   'rh_rf_detail': [rh.controller.bootstrap.genesis.launch.stages.acquire.playbook_rel,
+                                                    rh.controller.bootstrap.genesis.launch.stages.acquire | list | to_json]}) }}
+        quiet: true
+
+    - name: "SELECTORS -- refuse an explicitly requested acquire-stage operation that is undeclared, unsupported or ambiguous"
+      ansible.builtin.assert:
+        that:
+          - >-
+            rh.controller.bootstrap.genesis.launch.stages.acquire.selectors.values()
+            | reject('in', rh.controller.bootstrap.genesis.launch.stages.acquire.operations) | list | length == 0
+          - >-
+            rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+            | map(attribute='value') | unique | list | length <= 1
+          - >-
+            rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+            | map(attribute='value') | unique | reject('in', rh.controller.bootstrap) | list | length == 0
+          - >-
+            (rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+             | map(attribute='value') | unique | map('extract', rh.controller.bootstrap) | map(attribute='revision') | list)
+            == (rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+                | map(attribute='value') | unique | map('extract', rh.controller.bootstrap.genesis.launch.stages.acquire.operations)
+                | map(attribute='revision') | list)
+          - >-
+            rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+            | map(attribute='value') | unique | map('extract', rh.controller.bootstrap.genesis.launch.stages.acquire.operations)
+            | map(attribute='mode_selector') | reject('in', vars) | list | length == 0
+          - >-
+            query('ansible.builtin.vars', *(rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items
+                  | selectattr('key', 'in', vars) | map(attribute='value') | unique
+                  | map('extract', rh.controller.bootstrap.genesis.launch.stages.acquire.operations)
+                  | map(attribute='mode_selector') | list))
+            == (rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+                | map(attribute='value') | unique | map('extract', rh.controller.bootstrap.genesis.launch.stages.acquire.operations)
+                | map(attribute='mode_value') | list)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.genesis.launch.stages.acquire.refusal,
+                                   'rh_rf_detail': [rh.controller.bootstrap.genesis.launch.stages.acquire.diagnostics.selectors,
+                                                    rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | list | select('in', vars) | list | to_json,
+                                                    rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+                                                    | map(attribute='value') | unique | list | to_json,
+                                                    rh.controller.bootstrap.genesis.launch.stages.acquire.diagnostics.stop]}) }}
+        quiet: true
+
+    # THE REQUESTED OPERATION (codex-r2-r4-r5-bootstrap-decisions-20261006 R4; route-r4b): the ONE operation the gate
+    # above admitted runs from its declared tasks_rel (preparation_measurement -> tasks/measure_controller_tools.yml,
+    # which ENDS the play) -- before the artifact-source admission below, any fetch and preparation. No selector
+    # supplied -> skipped (the when is evaluated before the file name is templated) and the stage is unchanged.
+    - name: "STAGE OPERATION -- the requested declared operation, then END (its declared tasks_rel)"
+      ansible.builtin.include_tasks: >-
+        {{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.genesis.launch.stages.acquire.operations[
+             rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+             | map(attribute='value') | first].tasks_rel }}
       vars:
         rh_gen_stage: acquire     # the same genesis.launch.stages key as the builder admission above
-      # ONE expression (no reliance on short-circuit across when items); default='' because the vars lookup treats
-      # default=None as "no default" and yields an undefined value for an absent variable (2.19.11 lookup/vars.py)
       when: >-
-        rh.controller.bootstrap.preparation_measurement is defined
-        and lookup('ansible.builtin.vars', rh.controller.bootstrap.preparation_measurement.mode_var, default='') != ''
+        rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+        | list | length > 0
 
     - name: Admit the artifact source path (the ONE path-admission rule; no default)
       ansible.builtin.assert:
         that:
-          - rh_artifact_source is defined and rh_artifact_source is string
-          - rh_artifact_source is match(rh.controller.bootstrap.path_admission.regex)
-          - rh_artifact_source is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
-          - rh_acquisition_receipt is defined and rh_acquisition_receipt is string
-          - rh_acquisition_receipt is match(rh.controller.bootstrap.path_admission.regex)
-          - rh_acquisition_receipt is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
-          - not (rh_acquisition_receipt ~ '/').startswith(rh_artifact_source ~ '/')
+          - rh.controller.bootstrap.genesis.acquisition.source_var is string and rh.controller.bootstrap.genesis.acquisition.source_var in vars
+          - lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) is string
+          - lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) is match(rh.controller.bootstrap.path_admission.regex)
+          - lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+          - rh.controller.bootstrap.genesis.acquisition.receipt_var is string and rh.controller.bootstrap.genesis.acquisition.receipt_var in vars
+          - lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) is string
+          - lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) is match(rh.controller.bootstrap.path_admission.regex)
+          - lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+          - not (lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) ~ '/').startswith(lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) ~ '/')
         fail_msg: >-
-          REFUSED RH-ACQUIRE rh_artifact_source and rh_acquisition_receipt must be normalized absolute paths (host vars
+          REFUSED RH-ACQUIRE the host vars named by genesis.acquisition.source_var
+          ({{ rh.controller.bootstrap.genesis.acquisition.source_var }}) and receipt_var
+          ({{ rh.controller.bootstrap.genesis.acquisition.receipt_var }}) must be normalized absolute paths (host vars
           of localhost; no defaults), and the receipt must lie OUTSIDE the store.
         quiet: true
 
@@ -96,7 +177,9 @@
         path: "{{ item }}"
         follow: false
         get_checksum: false
-      loop: ["{{ rh_acquisition_receipt | dirname }}", "{{ rh_acquisition_receipt }}"]
+      loop:
+        - "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) | dirname }}"
+        - "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }}"
       register: _rh_acq_rcpt
 
     - name: Refuse an unowned receipt directory or a receipt path that is not an owned regular file
@@ -108,13 +191,14 @@
           - _d.exists and _d.isdir and not _d.islnk and _d.uid == rh_builder.uid | int and not (_d.wgrp or _d.woth)
           - not _f.exists or (_f.isreg and not _f.islnk and _f.uid == rh_builder.uid | int)
         fail_msg: >-
-          REFUSED RH-ACQUIRE: {{ rh_acquisition_receipt | dirname }} must be an existing real directory owned by uid
-          {{ rh_builder.uid }} and not group/other-writable, and {{ rh_acquisition_receipt }} absent or an owned regular file.
+          REFUSED RH-ACQUIRE: {{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) | dirname }}
+          must be an existing real directory owned by uid {{ rh_builder.uid }} and not group/other-writable, and
+          {{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }} absent or an owned regular file.
         quiet: true
 
     - name: List every entry of the artifact store BEFORE any fetch (the cold-qualification observation; read-only)
       ansible.builtin.find:
-        paths: "{{ rh_artifact_source }}"
+        paths: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) }}"
         file_type: any
         hidden: true
         recurse: false
@@ -128,8 +212,10 @@
         get_checksum: true
         checksum_algorithm: sha256
       loop: >-
-        {{ [rh_artifact_source] + ((rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections)
-           | map(attribute='file') | map('regex_replace', '^', rh_artifact_source ~ '/') | list) }}
+        {{ [lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var)]
+           + ((rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections) | map(attribute='file')
+              | map('regex_replace', '^', lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) ~ '/')
+              | list) }}
       register: _rh_acq_have
 
     - name: Refuse before any fetch -- unowned source dir, wrong digests, or absent rows without a declared source
@@ -166,7 +252,7 @@
         _rows: "{{ rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections }}"
       ansible.builtin.get_url:
         url: "{{ item.0.url }}"
-        dest: "{{ rh_artifact_source }}/{{ item.0.file }}"
+        dest: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) }}/{{ item.0.file }}"
         checksum: "sha256:{{ item.0.sha256 }}"
         mode: '0400'
         force: false
@@ -177,7 +263,7 @@
 
     - name: Re-verify every declared row in the store after the fetch (links not followed)
       ansible.builtin.stat:
-        path: "{{ rh_artifact_source }}/{{ item.file }}"
+        path: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) }}/{{ item.file }}"
         follow: false
         get_checksum: true
         checksum_algorithm: sha256
@@ -213,12 +299,12 @@
           {%- endfor -%}{{ ns.r }}
         _decl: "{{ _rows | map(attribute='file') | list }}"
       ansible.builtin.copy:
-        dest: "{{ rh_acquisition_receipt }}"
+        dest: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }}"
         mode: '0400'
         content: >-
           {{ {'schema': _acq.receipt_schema,
               'observed_at_utc': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
-              'store': rh_artifact_source,
+              'store': lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var),
               'store_empty_before': _empty,
               'store_entries_before': _rh_acq_before.files | map(attribute='path') | map('basename') | sort,
               'store_foreign_entries': _rh_acq_before.files | map(attribute='path') | map('basename') | reject('in', _decl) | sort,
@@ -237,7 +323,7 @@
           {{ _acq.report }} store_empty_before={{ _rh_acq_before.files | length == 0 }}
           fetched={{ _pre | rejectattr('exists') | list | length }} reused={{ _pre | selectattr('exists') | list | length }}
           cold_qualified={{ (_rh_acq_before.files | length == 0) and (_pre | selectattr('exists') | list | length == 0) }}
-          receipt={{ rh_acquisition_receipt }}
+          receipt={{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }}
 
     - name: "PREPARATION -- the declared candidates (guest tool identities, base images) (tasks/prepare.yml; declared only)"
       ansible.builtin.include_tasks: tasks/prepare.yml

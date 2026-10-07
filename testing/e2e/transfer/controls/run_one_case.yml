@@ -17,6 +17,14 @@
     _xc: {}
     _case_src: {commit: null, tree: null}
     _case_lp: null
+    _gm: null                                      # r5p generation kind: the mirror output (reset per case)
+    _gen: null                                     # r5p generation kind: the launch record (reset per case)
+    _gref: false                                   # r5u-rf2 generation kind: a pre-launch refusal was recorded (reset per case)
+    _gsetup: []                                    # r5u-rf3 generation kind: the admitted setup links (reset per case)
+    _gstage: null                                  # r5u-rf4 generation kind: the declared verdict stage reached (harness.generation.verdict_stage; null = not a generation case)
+    _hreasons: []                                  # r5u-rf4 the identities (harness.inner_failure.reasons values) of the declared inner failures recorded
+    _inner: null                                   # r5u-rf4 the raw inner verdict (failed / failures / reasons), kept apart from the outer expectation result
+    _gx: []                                        # brr-follow-s2 genesis kinds: the per-variant evidence (reset per case)
 
 - name: "{{ case.id }} -- expand placeholders in the case"
   ansible.builtin.set_fact:
@@ -38,25 +46,271 @@
     path: "{{ cd }}"
     state: directory
     mode: '0755'
-  when: case.kind != 'integration'
+  when: case.kind not in _k_unrun
 
 # ============================ check ============================
 - name: "{{ case.id }} -- check: copy the declared paths to their real relative paths"
   when: case.kind == 'check'
   block:
-    - name: Parent directories of the copied paths
+    # r5p X-R1-S9-4 (R1 s9; codex-tick446 option c): check.yml play 1 includes the R2 early-view producer
+    # (transfer.structural_check.early_view.producer_rel = admit_loader_source.yml), which refuses unless (1) the launcher
+    # record rh_source_bootstrap arrives as the LAST -e word, (2) the bound declaration's bytes are the record's digest and
+    # (3) every source_admission member is a tracked blob of the record's edition == HEAD whose worktree bytes are that
+    # blob (admit_git_paths.yml). So the copied fixture carries the producer closure -- every path SOURCED from its
+    # declaration by C.harness.check_copy_sourced (no restated literal) -- and is committed as its own one-commit
+    # repository; the record is built from the resolved bootstrap's source_admission.bootstrap_input. JOIN-ATOMIC with
+    # R2 r2k (producer), C1-S9-EARLY-VIEW-SHAPE and R1 s9 check.yml: before that join every check case fails closed.
+    - name: Refuse an undeclared check-fixture closure or launcher-record source (presence and type first)
+      ansible.builtin.assert:
+        that:
+          - C.harness.check_copy is sequence and C.harness.check_copy is not string
+          - C.harness.check_copy_sourced is mapping
+          - (C.harness.check_copy_sourced.keys() | list | sort) == ['bootstrap_lists', 'bootstrap_paths', 'transfer']
+          - C.harness.check_launch is mapping
+          - C.harness.check_launch.record_var is string
+          - C.harness.check_launch.record_from is sequence and C.harness.check_launch.record_from is not string
+          - C.harness.check_launch.fields is mapping
+          # r5r: the field key set is the declaration's bootstrap_input.record_keys (asserted below and in
+          # launch_record.yml; r5s: r2l C1-R2L-TOOL-BINDING's seven keys incl. tools) -- r5p's restated five-key literal list is RETIRED. The tokens
+          # are the builder's implemented token vocabulary (launch_record.yml), asserted as that set.
+          - C.harness.check_launch.tokens is sequence and C.harness.check_launch.tokens is not string
+          - (C.harness.check_launch.tokens | sort) == ['declaration_digest', 'early_context', 'fixture_head', 'packaged_tools', 'record_parent', 'record_src']
+          - _wrp.bootstrap is mapping
+          - T is mapping
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.check_input,
+                                   'rh_rf_detail': [C.harness.texts.check_shape, case.id]}) | trim }}
+        quiet: true
+
+    - name: Resolve the sourced closure paths and the launcher-record source node (key paths into their declarations)
+      ansible.builtin.set_fact:
+        _ccs: >-
+          {%- set ns = namespace(p=[], miss=[], node=none) -%}
+          {%- for root_name, root, kps, many in [('transfer', T, C.harness.check_copy_sourced.transfer, false),
+                                                 ('bootstrap', _wrp.bootstrap, C.harness.check_copy_sourced.bootstrap_paths, false),
+                                                 ('bootstrap', _wrp.bootstrap, C.harness.check_copy_sourced.bootstrap_lists, true)] -%}
+          {%- for kp in kps -%}
+          {%- set ns.node = root -%}
+          {%- for k in kp -%}
+          {%- set ns.node = ns.node[k] if (ns.node is mapping and k in ns.node) else none -%}
+          {%- endfor -%}
+          {%- if ns.node is none -%}{%- set ns.miss = ns.miss + [[root_name] + kp] -%}
+          {%- elif many and ns.node is sequence and ns.node is not string -%}{%- set ns.p = ns.p + (ns.node | list) -%}
+          {%- elif (not many) and ns.node is string -%}{%- set ns.p = ns.p + [ns.node] -%}
+          {%- else -%}{%- set ns.miss = ns.miss + [[root_name] + kp] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {%- set ns.node = _wrp.bootstrap -%}
+          {%- for k in C.harness.check_launch.record_from[:-1] -%}
+          {%- set ns.node = ns.node[k] if (ns.node is mapping and k in ns.node) else none -%}
+          {%- endfor -%}
+          {%- set par = ns.node -%}
+          {%- set ns.node = par[C.harness.check_launch.record_from | last] if (par is mapping and (C.harness.check_launch.record_from | last) in par) else none -%}
+          {{ {'paths': ns.p, 'missing': ns.miss, 'record_parent': par, 'record_src': ns.node} }}
+
+    - name: Refuse a sourced closure node that is absent or mistyped, or an undeclared launcher-record source
+      ansible.builtin.assert:
+        that:
+          - _ccs.missing | length == 0
+          - _ccs.paths | select('string') | list | length == _ccs.paths | length
+          # r5r: path_admission.regex is the ABSOLUTE-form grammar; a relative path is admitted as its separator-prefixed
+          # form (r5p matched the bare relative path, which refused every sourced closure path -- r5p slip, corrected)
+          - >-
+            _ccs.paths | map('regex_replace', '^', _wrp.bootstrap.path_admission.separator)
+            | select('match', _wrp.bootstrap.path_admission.regex) | list | length == _ccs.paths | length
+          - _ccs.paths | select('search', _wrp.bootstrap.path_admission.forbidden_segment_regex) | list | length == 0
+          - _ccs.record_parent is mapping
+          - _ccs.record_parent.digest_algorithm is string
+          - _ccs.record_parent.controller_delegate is defined
+          - _ccs.record_src is mapping
+          - _ccs.record_src.record_keys is sequence
+          - >-
+            C.harness.check_launch.fields.values()
+            | reject('in', C.harness.check_launch.tokens) | list | length == 0
+          - (_ccs.record_src.record_keys | sort) == (C.harness.check_launch.fields.keys() | list | sort)
+          - _ccs.record_src.declaration_rel is string
+          - _ccs.record_src.declaration_path is sequence and _ccs.record_src.declaration_path is not string
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.check_input,
+                                   'rh_rf_detail': [C.harness.texts.check_closure, case.id, _ccs.missing | to_json,
+                                                    C.harness.check_launch.record_from | to_json]}) | trim }}
+        quiet: true
+
+    - name: The check fixture's copy set (declared literals plus sourced closure; each path once, exact identity)
+      ansible.builtin.set_fact:
+        _ccopy: "{{ (C.harness.check_copy + _ccs.paths) | unique(case_sensitive=_wrp.bootstrap.path_admission.case_sensitive) }}"
+
+    # r5t (codex-tick486 R5S-COMPLETE-COPY-SET-ADMISSION): r5s grammar-checked _ccs.paths only; the declared literals
+    # (check_copy) and the merged set reached mkdir / copy behind a .git-segment guard alone, so `../outside/file`
+    # escaped the fixture root and `.` recursively copied the source root (incl. .git) after init. Now the ENTIRE
+    # merged copy set, and every actual descendant of each declared directory, is admitted under the ONE shared path /
+    # identity policy (admit_case_paths.yml: path_admission grammar incl. the absolute-form regex, forbidden_segment_regex
+    # (`.` / `..` segments), normpath identity (an empty rel or an absolute rel does not survive `<root>/<rel>`
+    # normalisation), containment under the source root, ancestry with links refused, leaf class `tree` = an existing
+    # regular file or directory, never a link) BEFORE the fixture destination is admitted, created, initialised or
+    # written. The directory-copy contract is kept (testing/e2e/transfer stays a declared directory source): it is
+    # EXPANDED (find, no link followed, hidden entries included) and the copy writes exactly the admitted expansion --
+    # never a recursive copy of an unexpanded tree. Metadata import (.git anywhere in a member or a descendant) refuses
+    # at the guard below. Refusal loci: CONTROLS-CASE-PATH at "CASE-PATH -- refuse a path outside the declared grammar
+    # or the admitted root" (shape / traversal / root alias / escape), at admit_ancestry (linked parent) or at
+    # "CASE-PATH -- refuse a leaf of the wrong presence class or a link"; CONTROLS-GIT-LOCATION at "Refuse a copy-set
+    # member, descendant or mutate file with a .git segment". The case dir <cd> (created for every kind above) is the
+    # only directory that exists at this point; nothing under <cd>/repo and nothing outside is written.
+    - name: Admit EVERY member of the merged copy set at the source root (shared policy; before any fixture effect)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ repo_root }}"
+        ap_items: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for p in _ccopy -%}{%- set ns.o = ns.o + [{'rel': p, 'need': C.harness.case_path_classes.tree}] -%}{%- endfor -%}
+          {{ ns.o }}
+        ap_case: "{{ case.id }}"
+
+    - name: Observe each admitted member's kind (no link followed)
+      ansible.builtin.stat:
+        path: "{{ repo_root }}/{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: "{{ _ccopy }}"
+      register: _ccst
+
+    - name: Expand every declared directory member to its actual descendants (no link followed; hidden entries included)
+      ansible.builtin.find:
+        paths: "{{ repo_root }}/{{ item }}"
+        recurse: true
+        hidden: true
+        follow: false
+        file_type: any
+      loop: "{{ _ccst.results | selectattr('stat.isdir') | map(attribute='item') | list }}"
+      register: _ccfd
+
+    - name: The admitted expansion (relative descendants; files and directories to write)
+      ansible.builtin.set_fact:
+        _ccx: >-
+          {%- set pre = repo_root ~ _wrp.bootstrap.path_admission.separator -%}
+          {%- set ns = namespace(d=[], files=[], dirs=[], bad=[]) -%}
+          {%- for r in _ccst.results -%}
+          {%- if r.stat.isdir -%}{%- set ns.dirs = ns.dirs + [r.item] -%}{%- else -%}{%- set ns.files = ns.files + [r.item] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- for fr in _ccfd.results -%}
+          {#- an unreadable / skipped subtree is never silently left out of the closure: it refuses with the rest -#}
+          {%- if fr.skipped_paths is defined and fr.skipped_paths | length > 0 -%}{%- set ns.bad = ns.bad + (fr.skipped_paths | list) -%}{%- endif -%}
+          {%- for f in fr.files -%}
+          {%- if f.path.startswith(pre) -%}
+          {%- set rel = f.path[(pre | length):] -%}
+          {%- set ns.d = ns.d + [rel] -%}
+          {%- if f.isdir -%}{%- set ns.dirs = ns.dirs + [rel] -%}{%- else -%}{%- set ns.files = ns.files + [rel] -%}{%- endif -%}
+          {%- else -%}{%- set ns.bad = ns.bad + [f.path] -%}{%- endif -%}
+          {%- endfor -%}{%- endfor -%}
+          {{ {'desc': ns.d, 'files': ns.files, 'dirs': ns.dirs, 'outside': ns.bad} }}
+
+    - name: Refuse a descendant reported outside the source root or a skipped subtree (before its admission)
+      ansible.builtin.assert:
+        that:
+          - _ccx.outside | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.case_path,
+                                   'rh_rf_detail': [C.harness.texts.case_path, case.id, repo_root, _ccx.outside | to_json]}) | trim }}
+        quiet: true
+
+    # r5s (R2 r2l C1-R2L-GIT-FRESH-INIT, consumed; replaces r5r's PROVISIONAL copy-then-init order): the declared FRESH
+    # order is destination admission -> init -> location -> config listing -> mutation -> location -> readback, and the
+    # destination must be absent / empty with no dest/.git BEFORE init. r5r copied the tree into <cd>/repo first and
+    # initialised a populated directory. Now: (a) no copy-set member may carry a .git segment (a copied .git would
+    # replace the fixture's own git dir after init); (b) <cd>/repo is admitted ABSENT (fixture_fresh_dest.yml);
+    # (c) it is created with fresh_init.dir_mode and initialised under the mutation prefix + fence (mutation.init);
+    # (d) post_init = fixture_git_admit.yml (location == [realpath/.git, realpath], then the config listing); only then
+    # are the members copied and mutated (worktree writes), and every git mutation follows the r2k existing order.
+    # r5s (codex-tick482 R2L-B-FRESH-INIT-ORDER): init is MOVED before the copies and mutations (installing the
+    # destination guard at r5r's old init site would refuse a valid C00, whose <cd>/repo was already populated). The
+    # copies and mutations are GUARDED to protect .git: no copy-set member and no mutate file may carry a .git segment
+    # -- refused under r5r's existing negative code CONTROLS-GIT-LOCATION (GIT-ISO-04 kept), before init. The existing
+    # parent-repository negative is kept by the post-init location equality (fixture_git_admit.yml: location must be
+    # [realpath(<cd>/repo)/.git, realpath(<cd>/repo)], so an enclosing repository is never adopted; GIT-ISO-07).
+    # r5t: the guard now also covers every expanded descendant (a declared directory holding Git metadata refuses
+    # here, before init / copy); the regex is r5s's ledgered `.git` layout constant, unchanged (no new regex).
+    - name: Refuse a copy-set member, descendant or mutate file with a .git segment (it would replace or edit the fixture's git dir)
+      ansible.builtin.assert:
+        that:
+          - _ccopy | select('search', '(^|/)\.git(/|$)') | list | length == 0
+          - _ccx.desc | select('search', '(^|/)\.git(/|$)') | list | length == 0
+          - case.mutate | map(attribute='file') | select('search', '(^|/)\.git(/|$)') | list | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.git_location,
+                                   'rh_rf_detail': [C.harness.texts.git_location, case.id,
+                                                    (_ccopy + _ccx.desc + (case.mutate | map(attribute='file') | list))
+                                                    | select('search', '(^|/)\.git(/|$)') | list | to_json]}) | trim }}
+        quiet: true
+
+    - name: Admit EVERY expanded descendant at the source root (shared policy; links / special files / escapes refuse)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ repo_root }}"
+        ap_items: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for p in _ccx.desc -%}{%- set ns.o = ns.o + [{'rel': p, 'need': C.harness.case_path_classes.tree}] -%}{%- endfor -%}
+          {{ ns.o }}
+        ap_case: "{{ case.id }}"
+
+    - name: Admit the fresh check fixture destination (absent; parent ancestry; no link) -- r2l fresh_init.destination
+      ansible.builtin.include_tasks: fixture_fresh_dest.yml
+      vars:
+        ff_dest: "{{ cd }}/repo"
+        ff_case: "{{ case.id }}"
+        ff_seq: "{{ _gitp.mutation.fresh_init }}"
+
+    - name: Create the fresh destination with the declared mode (r2l fresh_init)
       ansible.builtin.file:
-        path: "{{ cd }}/repo/{{ item | dirname }}"
+        path: "{{ cd }}/repo"
+        state: directory
+        mode: "{{ _gitp.mutation.fresh_init.dir_mode }}"
+
+    - name: Initialise the check fixture repository (mutation prefix + [dest] + fence + mutation.init; r2l fresh_init.init)
+      ansible.builtin.command:
+        argv: "{{ _gitm + [cd ~ '/repo'] + _gitp.mutation.fence + _gitp.mutation.init }}"
+      changed_when: true
+
+    - name: Post-init admission -- location then configuration (r2l fresh_init.post_init)
+      ansible.builtin.include_tasks: fixture_git_admit.yml
+      vars:
+        fg_repo: "{{ cd }}/repo"
+        fg_case: "{{ case.id }}"
+
+    # r5t: only the ADMITTED expansion is written -- every admitted directory (declared or descendant) and the parent of
+    # every admitted file, then each admitted regular file by itself (no recursive tree copy, no link followed).
+    - name: Directories of the admitted expansion (declared directories, their descendants, and file parents)
+      ansible.builtin.file:
+        path: "{{ cd }}/repo/{{ item }}"
         state: directory
         mode: '0755'
-      loop: "{{ C.harness.check_copy }}"
+      loop: >-
+        {{ (_ccx.dirs + (_ccx.files | map('dirname') | select | list))
+           | unique(case_sensitive=_wrp.bootstrap.path_admission.case_sensitive) | list }}
 
-    - name: Copy
+    - name: Copy each admitted file of the expansion
       ansible.builtin.copy:
-        src: "{{ repo_root }}/{{ item }}{{ '/' if (repo_root ~ '/' ~ item) is directory else '' }}"
-        dest: "{{ cd }}/repo/{{ item }}{{ '/' if (repo_root ~ '/' ~ item) is directory else '' }}"
+        src: "{{ repo_root }}/{{ item }}"
+        dest: "{{ cd }}/repo/{{ item }}"
         mode: preserve
-      loop: "{{ C.harness.check_copy }}"
+      loop: "{{ _ccx.files }}"
+
+    # r5r (codex-tick461 R5P-GENERATION-PATH-ADMISSION, extended to the check kind's identical mutate use): every
+    # mutation file is admitted (declared grammar, containment, ancestry, an existing regular non-link file) BEFORE
+    # replace reads or writes it.
+    - name: Admit the declared mutation files inside the check fixture (before any replace)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ cd }}/repo"
+        ap_items: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for m in case.mutate -%}{%- set ns.o = ns.o + [{'rel': m.file, 'need': C.harness.case_path_classes.file}] -%}{%- endfor -%}
+          {{ ns.o }}
+        ap_case: "{{ case.id }}"
 
     - name: Apply the declared mutations
       ansible.builtin.replace:
@@ -72,10 +326,107 @@
       loop: "{{ _mut.results | default([]) }}"
       when: not item.changed
 
+    # r5p X-R1-S9-4: the copied (and mutated) fixture becomes ONE commit of its own repository, so HEAD is the record's
+    # edition and every copied member is a tracked blob whose worktree bytes are that blob (the producer's git
+    # admission). --force: an ignore rule inside a copied tree must not untrack a declared member. Same fixture identity
+    # as the generation kind (harness.generation.fixture_commit).
+    # r5r (codex-tick461 R5P-FIXTURE-GIT-ISOLATION; R2 r2k C1-R2K-GIT-MUTATION consumed verbatim): r5p's comment claimed
+    # --no-verify turns hooks off; it does NOT (it skips only pre-commit and commit-msg; prepare-commit-msg and
+    # post-commit still run). r5p's `-c commit.gpgsign=false` / `-c user.*` were private flags. Now every git process
+    # follows R2's declared order -- location -> config -> mutation -> location -> readback: init / add / commit run under
+    # the mutation prefix + fence (_gitm; core.hooksPath=/dev/null disables EVERY hook, gpgSign off, --template=, identity
+    # from git.mutation.env_pairs), fixture_git_admit.yml admits location and configuration around each mutation, and
+    # the readback is R2's admit_git_paths.yml include. r5s: the repository was created FRESH above (r2l
+    # C1-R2L-GIT-FRESH-INIT: destination admission -> init -> post_init) before any member was copied; the steps below
+    # are the r2k EXISTING order (location -> config -> mutation -> location -> readback).
+    - name: Admit location and configuration (before the first add)
+      ansible.builtin.include_tasks: fixture_git_admit.yml
+      vars:
+        fg_repo: "{{ cd }}/repo"
+        fg_case: "{{ case.id }}"
+
+    - name: Stage every copied path (mutation prefix + fence; --force -- an ignore rule must not untrack a member)
+      ansible.builtin.command:
+        argv: "{{ _gitm + [cd ~ '/repo'] + _gitp.mutation.fence + ['add', '--all', '--force', '.'] }}"
+      changed_when: true
+
+    - name: Admit location and configuration again (before the commit)
+      ansible.builtin.include_tasks: fixture_git_admit.yml
+      vars:
+        fg_repo: "{{ cd }}/repo"
+        fg_case: "{{ case.id }}"
+
+    - name: Commit the check fixture as its own one-commit repository (declared commit words; the producer admits committed bytes only)
+      ansible.builtin.command:
+        argv: >-
+          {{ _gitm + [cd ~ '/repo'] + _gitp.mutation.fence + _gitp.mutation.commit
+             + ['-m', C.harness.generation.fixture_commit.message ~ ' ' ~ case.id] }}
+      changed_when: true
+
+    - name: Admit the location after the commit
+      ansible.builtin.include_tasks: fixture_git_admit.yml
+      vars:
+        fg_repo: "{{ cd }}/repo"
+        fg_case: "{{ case.id }}"
+
+    # READBACK through R2's ONE admission (admit_git_paths.yml): HEAD read once (rh_gp_edition none: HEAD as read IS the
+    # fixture commit), object format, config, conversion attributes, and the bound declaration + every mutated file a
+    # tracked, staged-clean, byte-equal, uncommitted-clean blob of it. rh_gp_head is the record's edition.
+    - name: Read back the fixture commit through R2's git admission (declaration + mutated files)
+      ansible.builtin.include_tasks: "{{ repo_root }}/testing/remote_harness/tasks/admit_git_paths.yml"
+      vars:
+        rh_gp_tool: "{{ _gitt.git }}"
+        rh_gp_env: "{{ _gitt.env }}"
+        rh_gp_git: "{{ _gitp }}"
+        rh_gp_repo: "{{ cd }}/repo"
+        # r5s: r2l admit_git_paths (bddddf74; interface unchanged from r2k) requires case-sensitive path uniqueness; r5r's
+        # folding `unique` could DROP a mutated path differing only by case from another (it would go unadmitted)
+        rh_gp_paths: >-
+          {{ ([_ccs.record_src.declaration_rel] + (case.mutate | map(attribute='file') | list))
+             | unique(case_sensitive=_wrp.bootstrap.path_admission.case_sensitive) | list }}
+        rh_gp_absent: []
+        rh_gp_probe: []
+        rh_gp_edition: null
+        rh_gp_codes: "{{ C.harness.git_readback.codes }}"
+        rh_gp_texts: "{{ C.harness.git_readback.texts }}"
+        rh_gp_history: null   # GEN-ADOPT2: R2's include now requires it explicitly; no historical proof in a readback
+
+    - name: The check fixture's whole-tree state (read prefix; status_args)
+      ansible.builtin.command:
+        argv: "{{ _gitr + [cd ~ '/repo'] + T.controls_source.status_args }}"
+      register: _cgit
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse a dirty fixture tree (nothing launched)
+      ansible.builtin.assert:
+        that:
+          - _cgit.rc == 0
+          - _cgit.stdout | trim | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.git_readback.codes.uncommitted,
+                                   'rh_rf_detail': [C.harness.git_readback.texts.uncommitted, case.id,
+                                                    [_cgit.rc, _cgit.stdout, _cgit.stderr] | to_json]}) | trim }}
+        quiet: true
+
+    # the launcher record (launch_record.yml; the ONE builder for both fixture kinds): bound to the ADMITTED fixture
+    # commit rh_gp_head and the post-commit declaration bytes; the declared record_keys (r2l C1-R2L-TOOL-BINDING: seven,
+    # incl. tools from the PACKAGED effective os_tools identity -- never caller data).
+    - name: Build the typed launcher record for the fixture
+      ansible.builtin.include_tasks: launch_record.yml
+      vars:
+        lr_repo: "{{ cd }}/repo"
+        lr_head: "{{ rh_gp_head }}"
+        lr_case: "{{ case.id }}"
+
+    # ORDER (codex-tick473 X-R2K-TSI-ORDER option 1): the record is the LITERAL FINAL word of this entry-verification
+    # launch -- after every caller word; no word follows it. One typed JSON word (to_json of the mapping).
     - name: Run check.yml on the copy
       ansible.builtin.command:
-        argv: [/bin/sh, -c, 'umask 022 && exec "$0" -i localhost, "$1" 2>&1', "{{ C.harness.ansible_playbook }}",
-               "{{ cd }}/repo/testing/e2e/transfer/check.yml"]
+        argv: [/bin/sh, -c, 'umask 022 && exec "$0" -i localhost, "$1" -e "$2" 2>&1', "{{ C.harness.ansible_playbook }}",
+               "{{ cd }}/repo/testing/e2e/transfer/check.yml",
+               "{{ {C.harness.check_launch.record_var: _lrec} | to_json }}"]
       environment: {ANSIBLE_NOCOLOR: '1', ANSIBLE_RETRY_FILES_ENABLED: '0'}
       register: _r
       changed_when: false
@@ -412,10 +763,1238 @@
       ansible.builtin.set_fact:
         _run: {rc: "{{ _r.rc }}", out: "{{ _r.stdout }}"}
 
+# ============================ generation (r5p; C1-S8-HARNESS-RELOCATE-KIND) ============================
+# Runs the ACTUAL declared generator: the route's package.yml stage under the DECLARED genesis launch
+# (controller.bootstrap.genesis.launch, read from the RESOLVED bootstrap _wrp.bootstrap -- the same resolved policy every
+# other kind reads), in a per-case clone of the ADMITTED source (source_clone.yml), and then, for a reach case, the
+# GENERATED entry itself. No shell, no wrapper, no second launcher: the exec vector is the declaration's argv with its
+# own placeholders substituted from the declaration (an unresolved placeholder refuses); the environment is exactly the
+# declared env.order pairs passed to env -i. This harness is a G-style act launcher (the act is the case id, matched
+# against stage_root.act).
+# NEW DECLARED BEHAVIOUR (r5p): a case that relocates or mutates its fixture COMMITS that change in its own clone (the
+# generator admits only committed bytes against a clean intended commit); the fixture commit's parent is the admitted
+# commit, and both are recorded in the verdict. The admitted source itself is never written.
+# Case schema (CASES `generation`): stage (a genesis.launch.stages key), inputs (mapping: EXACTLY the stage's declared
+# stage_inputs names -> value), relocate ([{from, to}] tree moves in the clone), mutate ([{file, regexp, replace}],
+# applied after relocate; each must apply), output_rel (the generated entry's checkout-relative path), and optionally
+# output_sha256 (the expected bytes' sha256) and reach ({pin_value}: run the generated entry, placed at output_rel in
+# the clone, with the FIRST declared derived name (transfer entry_guard.derived) pinned to pin_value).
+# Typed obstructions (refused before any launch, never worked around): the declared argv carries no '{stage_inputs}'
+# slot or the stage declares no stage_inputs (C1-R5P-H1 / C1-R2J-6); a declared stage input the case does not supply.
+- name: "{{ case.id }} -- generation pre-launch checks (case, launch, produced paths, kind, producer, admission; no clone)"
+  when: case.kind == 'generation'
+  block:
+    - name: Refuse a generation case or launch declaration that is absent or malformed (presence and type first)
+      ansible.builtin.assert:
+        that:
+          - _xc.generation is defined
+          - _xc.generation is mapping
+          - _xc.generation.stage is defined and _xc.generation.stage is string
+          - _xc.generation.inputs is defined and _xc.generation.inputs is mapping
+          - _xc.generation.relocate is defined and _xc.generation.relocate is sequence and _xc.generation.relocate is not string
+          - _xc.generation.mutate is defined and _xc.generation.mutate is sequence and _xc.generation.mutate is not string
+          - _xc.generation.output_rel is defined and _xc.generation.output_rel is string
+          # r5r: separator-prefixed form against the absolute-form grammar (r5p slip corrected; see the check kind);
+          # the full containment / ancestry / leaf admission is admit_case_paths.yml at each use below
+          - (_wrp.bootstrap.path_admission.separator ~ _xc.generation.output_rel) is match(_wrp.bootstrap.path_admission.regex)
+          - _xc.generation.output_rel is not search(_wrp.bootstrap.path_admission.forbidden_segment_regex)
+          - C.harness.generation is defined and C.harness.generation is mapping
+          - C.harness.generation.fixture_commit is mapping
+          - C.harness.generation.fixture_commit.message is string
+          # r5u-rf (codex-tick500 R5U-REFUSAL-AND-INVENTORY-CONTRACT) + r5u-rf2 (codex-tick510 RF-OD-4 / RF-OD-5): the
+          # case SELECTS its inventory kind and names its output area and one area-relative file per produced role
+          # (generation.produce); the harness DECLARES what it can produce (harness.generation.producer): obligations
+          # (obligation key -> producible roles), contents (role -> content) and the protected case artifacts
+          - _xc.generation.produce is defined and _xc.generation.produce is mapping
+          - _xc.generation.produce.kind is defined and _xc.generation.produce.kind is string
+          - _xc.generation.produce.area is defined and _xc.generation.produce.area is string
+          - _xc.generation.produce.files is defined
+          - _xc.generation.produce.files is mapping and _xc.generation.produce.files | length > 0
+          - _xc.generation.produce.files.values() | reject('string') | list | length == 0
+          - C.harness.generation.producer is defined and C.harness.generation.producer is mapping
+          - C.harness.generation.producer.obligations is mapping
+          - C.harness.generation.producer.obligations.values() | reject('sequence') | list | length == 0
+          - C.harness.generation.producer.obligations.values() | select('string') | list | length == 0
+          - C.harness.generation.producer.contents is mapping
+          - C.harness.generation.producer.contents.values() | reject('mapping') | list | length == 0
+          - C.harness.generation.producer.protected is sequence and C.harness.generation.producer.protected is not string
+          - C.harness.generation.producer.protected | reject('string') | list | length == 0
+          # the generation kind's `setup` (when present) carries link entries only (the phase kind's link shape)
+          - >-
+            _xc.setup is not defined
+            or (_xc.setup is sequence and _xc.setup is not string and _xc.setup | reject('mapping') | list | length == 0
+                and _xc.setup | rejectattr('link', 'defined') | list | length == 0
+                and _xc.setup | map(attribute='link') | reject('string') | list | length == 0
+                and _xc.setup | rejectattr('to', 'defined') | list | length == 0
+                and _xc.setup | map(attribute='to') | reject('string') | list | length == 0)
+          - C.harness.generation.inherited_sources is mapping
+          - C.harness.generation.inherited_sources.passwd_home is string
+          - T.entry_guard.guard_route_rel is string
+          - T.entry_guard.derived is sequence and T.entry_guard.derived | length > 0
+          - _wrp.bootstrap.genesis.launch is mapping
+          - _wrp.bootstrap.genesis.builder.executable is mapping
+          - _wrp.bootstrap.genesis.builder.root is mapping
+          - _wrp.bootstrap.work_roots.run_local.resolved_run.var is string
+          - _wrp.bootstrap.work_roots.run_local.resolved_run.var in vars
+          - lookup('ansible.builtin.vars', _wrp.bootstrap.work_roots.run_local.resolved_run.var) is mapping
+          - lookup('ansible.builtin.vars', _wrp.bootstrap.work_roots.run_local.resolved_run.var).ansible_playbook is string
+          - _wrp.bootstrap.os_tools.env.path is string
+          - _wrp.bootstrap.genesis.launch.argv is sequence
+          - _wrp.bootstrap.genesis.launch.stages is mapping
+          - _xc.generation.stage in _wrp.bootstrap.genesis.launch.stages
+          - _wrp.bootstrap.genesis.launch.stages[_xc.generation.stage].playbook_rel is string
+          - _wrp.bootstrap.genesis.launch.stage_root.sub is string
+          - _wrp.bootstrap.genesis.launch.stage_root.rel is string
+          - _wrp.bootstrap.genesis.launch.stage_root.act.var is string
+          - _wrp.bootstrap.genesis.launch.stage_root.act.regex is string
+          - _wrp.bootstrap.genesis.launch.env.order is sequence
+          - _wrp.bootstrap.genesis.launch.env.base is string
+          - _wrp.bootstrap[_wrp.bootstrap.genesis.launch.env.base] is mapping
+          - _wrp.bootstrap.genesis.launch.env.inherited is mapping
+          - _wrp.bootstrap.genesis.launch.env.literal is mapping
+          - _wrp.bootstrap.genesis.launch.env.stage_paths is mapping
+          - _wrp.bootstrap.genesis.launch.prepare.work_root_dirs is sequence
+          - _wrp.bootstrap.genesis.launch.prepare.dirs_rel_to_stage_root is sequence
+          - _wrp.bootstrap.genesis.launch.prepare.exclusive is sequence
+          - _wrp.bootstrap.genesis.launch.prepare.mode is string
+          - _wrp.bootstrap.work_roots.sub_roots[_wrp.bootstrap.genesis.launch.stage_root.sub] is string
+          - case.id is regex(_wrp.bootstrap.genesis.launch.stage_root.act.regex, match_type='fullmatch')
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.generation_input,
+                                   'rh_rf_detail': [C.harness.texts.generation_input, case.id]}) | trim }}
+        quiet: true
+
+    # r5r (codex-tick461 R5P-TYPED-STAGE-INPUTS; C1-R5R-4 supersedes C1-R5P-H1; codex-tick473 X-R2K-TSI-ORDER option 1).
+    # TYPED, SOURCE-BOUND stage inputs: stages.<stage>.stage_inputs is a list of {name, source}; `source` is a role of
+    # launch.input_sources (case = the case supplies the value, opaque; the record is NOT a case input -- it is built
+    # from the declaration and the post-mutation fixture by launch_record.yml). Slot spellings are DECLARED
+    # (launch.slots: role -> list-slot spelling, the accepted list set READ from that node -- r5u B-OD-01: env_pairs,
+    # inventory_args, stage_extra_vars, stage_inputs, source_record; launch.scalar_slots: role -> spelling) and the
+    # placeholder grammar is declared (launch.placeholder {regex, delimiters}); validation runs on the TEMPLATE words of
+    # launch.argv only, before any value is injected -- never a brace search over data. ORDER (option 1): the
+    # source_record slot is a whole word that follows every slot that can carry a caller word, and no template word after
+    # it is the declared extra-vars flag; the generated envelope names (launch.envelope: the record var and any
+    # resolved-run var) are pairwise distinct and disjoint from every case input name (C1-owned names admission,
+    # consumed here). Admission is not by position or naming alone: admit_loader_source.yml's CARRIER ADMISSION
+    # (binding == admitted HEAD / declaration digest; context == effective derivation, type-strict) authenticates the
+    # record at consumption. Before the C1 join every generation case refuses here (UNRUN).
+    - name: Refuse a launch declaration without the typed stage-input / record / slot declarations, or case inputs other than the case-sourced names
+      vars:
+        _gl0: "{{ _wrp.bootstrap.genesis.launch }}"
+        _gsi: "{{ _wrp.bootstrap.genesis.launch.stages[_xc.generation.stage].stage_inputs }}"
+        # brr-follow-s2 OPEN-B: per operator-class stage input, the typed binding check (evaluated only when the stage
+        # declares one; every earlier `that` -- presence / type of operator_inputs -- has passed by then). bad rows:
+        # the NAMES of operator-class stage inputs that fail any of: projection present, declared in operator_inputs,
+        # class word equals the stage input source, case value a string member of the projected domain values. The
+        # refusal is the declared launch_unbound code + launch_inputs text (no extra detail words, no fallback value).
+        _goi: >-
+          {%- set ns = namespace(bad=[]) -%}
+          {%- set proj = _wrp.operator_inputs if (_wrp.operator_inputs is defined and _wrp.operator_inputs is mapping) else none -%}
+          {%- for d in _gsi | rejectattr('source', 'equalto', _gl0.input_sources.case) -%}
+          {%- if proj is none or d.name not in proj
+                 or _gl0.input_sources[proj[d.name]['class']] != d.source
+                 or _xc.generation.operator_inputs[d.name] is not string
+                 or _xc.generation.operator_inputs[d.name] not in proj[d.name]['values'] -%}
+          {%- set ns.bad = ns.bad + [d.name] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ {'projected': proj is not none, 'bad': ns.bad} }}
+      ansible.builtin.assert:
+        that:
+          - _gl0.slots is mapping
+          - _gl0.slots.stage_inputs is string and _gl0.slots.source_record is string and _gl0.slots.env_pairs is string
+          # r5u (B-OD-01 option a): the LIST-slot set is READ from the declared node (genesis.launch.slots values),
+          # never a harness list; every declared list spelling is a string, distinct, and no scalar spelling
+          - _gl0.slots.values() | reject('string') | list | length == 0
+          - (_gl0.slots.values() | list | unique | length) == (_gl0.slots | length)
+          - _gl0.scalar_slots is mapping
+          - _gl0.scalar_slots.values() | reject('string') | list | length == 0
+          - _gl0.slots.values() | select('in', _gl0.scalar_slots.values() | list) | list | length == 0
+          - _gl0.placeholder is mapping and _gl0.placeholder.regex is string
+          - _gl0.placeholder.delimiters is sequence and _gl0.placeholder.delimiters is not string
+          - _gl0.extra_vars_flag is string
+          - _gl0.input_sources is mapping and _gl0.input_sources.case is string
+          - _gl0.envelope is mapping
+          - _gl0.envelope.values() | reject('string') | list | length == 0
+          - (_gl0.envelope.values() | list | unique | length) == (_gl0.envelope | length)
+          - C.harness.check_launch.record_var in (_gl0.envelope.values() | list)
+          - _gsi is sequence and _gsi is not string
+          - _gsi | reject('mapping') | list | length == 0
+          - _gsi | map(attribute='name') | reject('string') | list | length == 0
+          - (_gsi | map(attribute='name') | unique | list | length) == (_gsi | length)
+          # r5s (codex-tick480 R5R-STAGE-SOURCE-OMISSION): r5r admitted ANY declared input_sources class but emitted
+          # values only for the case class, so a declared non-case source passed admission and was silently omitted at
+          # launch. A registry entry is not producer support: the ONLY class this harness's producer path implements is
+          # input_sources.case (the "Substitute the declared argv slots" emission reads _xc.generation.inputs[name]);
+          # every stage input must be of that class, refused here -- before the clone or any fixture effect. A further
+          # class needs its producer implemented first (C1-R5S-3 input-source producer contract).
+          # brr-follow-s2 OPEN-B (codex-tick542 OD-GEN-06 "real operator input class + typed producer binding"; OD-BRR-15;
+          # codex-tick546 U-12): the producer now implements TWO classes -- input_sources.case (opaque case value) and
+          # input_sources.operator (a value of the input's DECLARED domain, which resolve_work_root.yml projects as
+          # _wrp.operator_inputs.<name>.values from the resolved controller; the case names WHICH admitted value the
+          # runner, acting as the operator, supplies: generation.operator_inputs {name: value}). Every other class still
+          # refuses here. An operator-class input needs: the operator role declared in input_sources, the projection
+          # present, the input declared in operator_inputs with a class whose input_sources word is the stage input's
+          # source, and a case value that is a member of the projected domain values (type-strict: string).
+          - >-
+            _gsi | map(attribute='source')
+            | reject('in', [_gl0.input_sources.case] + ([_gl0.input_sources.operator] if ('operator' in _gl0.input_sources) else []))
+            | list | length == 0
+          - >-
+            (_xc.generation.inputs.keys() | list | sort)
+            == (_gsi | selectattr('source', 'equalto', _gl0.input_sources.case) | map(attribute='name') | list | sort)
+          - _xc.generation.operator_inputs is defined and _xc.generation.operator_inputs is mapping
+          - >-
+            (_xc.generation.operator_inputs.keys() | list | sort)
+            == (_gsi | rejectattr('source', 'equalto', _gl0.input_sources.case) | map(attribute='name') | list | sort)
+          - (_gsi | rejectattr('source', 'equalto', _gl0.input_sources.case) | list | length == 0) or (_goi.bad | length == 0 and _goi.projected)
+          - _gsi | map(attribute='name') | select('in', _gl0.envelope.values() | list) | list | length == 0
+          - _xc.generation.inputs.keys() | select('in', _gl0.envelope.values() | list) | list | length == 0
+          - _xc.generation.operator_inputs.keys() | select('in', _gl0.envelope.values() | list) | list | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.launch_unbound,
+                                   'rh_rf_detail': [C.harness.texts.launch_inputs, case.id, _xc.generation.stage,
+                                                    _xc.generation.inputs.keys() | list | sort | to_json,
+                                                    (_xc.generation.operator_inputs.keys() | list | sort | to_json)
+                                                    if (_xc.generation.operator_inputs is defined and _xc.generation.operator_inputs is mapping) else ([] | to_json)]}) | trim }}
+        quiet: true
+
+    # r5u (B-OD-01 option a; N-GEN-STAGES + N-GEN-INVENTORY-ARGV-SLOTS) + r5u-rf (codex-tick500
+    # R5U-REFUSAL-AND-INVENTORY-CONTRACT): the inventory_args list slot expands, for each files entry of the inventory
+    # kind the launch selects, in the kind's declared order, to the declared inventory flag word plus that file's
+    # absolute path. r5u-rf2 (codex-tick510 RF-OD-4): the kind is SELECTED by the case (generation.produce.kind), never
+    # inferred from a singleton shape; the stage must ADMIT it (stages.<stage>.inventory MEMBERSHIP -- an alternative
+    # kind of the same stage is admitted, the singleton-stage restriction is not restored), every file of the kind must
+    # be a declared file role (genesis.launch.file_roles), and the kind's file roles must EQUAL the case's produced roles
+    # (generation.produce.files). The flag word is READ from ssh_auth.run_grammar.inventory_flag (its one home). The stage_extra_vars list
+    # slot expands, per stages.<stage>.extra_vars name, to -e <name>=<value>; this harness implements NO value producer
+    # for a stage extra var, so the stage's declared extra_vars must be present and empty (the
+    # R5R-STAGE-SOURCE-OMISSION rule: a declared name with no producer refuses, it is never silently omitted).
+    # ORDER (all pure, all before the clone and before any produced write): (1) produced paths (RF-OD-5), (2) stage
+    # membership / role equality, (3) EVERY obligation of the selected kind against the declared producer capabilities
+    # (RF-OD-4; receipts included), (4) producer contents, (5) the existing case-path admission of the output area and
+    # of every produced path (shape, containment, ancestry, links, presence). Each refuses with its own text.
+    # r5u-rf2 (codex-tick510 RF-OD-5): the output AREA is the case's declared case-relative directory (never the whole
+    # case directory: the path grammar needs at least one segment), admitted against the harness-declared protected case
+    # artifacts (harness.generation.producer.protected; equal / contains / inside, by whole separator-delimited
+    # segments under the declared path_admission.case_sensitive identity), and the produced paths are distinct after
+    # normalization under the same identity (a second role can no longer overwrite the first).
+    - name: Refuse an output area outside the grammar or overlapping a protected case artifact, or duplicate produced paths
+      vars:
+        _gsep: "{{ _wrp.bootstrap.path_admission.separator }}"
+        _gcs: "{{ _wrp.bootstrap.path_admission.case_sensitive }}"
+        _garea: "{{ _xc.generation.produce.area }}"
+        _gpath_bad: >-
+          {%- set ns = namespace(prot=[], dup=[], seen=[]) -%}
+          {%- set a = _garea if _gcs else (_garea | lower) -%}
+          {%- for p0 in C.harness.generation.producer.protected -%}
+          {%- set p = p0 if _gcs else (p0 | lower) -%}
+          {%- if a == p or a.startswith(p ~ _gsep) or p.startswith(a ~ _gsep) -%}{%- set ns.prot = ns.prot + [p0] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- for r0 in _xc.generation.produce.files.values() | list -%}
+          {%- set r = (r0 | normpath) if _gcs else (r0 | normpath | lower) -%}
+          {%- if r in ns.seen -%}{%- set ns.dup = ns.dup + [r0] -%}{%- endif -%}
+          {%- set ns.seen = ns.seen + [r] -%}
+          {%- endfor -%}
+          {{ {'protected': ns.prot, 'duplicate': ns.dup} }}
+      ansible.builtin.assert:
+        that:
+          - _gcs is boolean
+          - (_gsep ~ _garea) is match(_wrp.bootstrap.path_admission.regex)
+          - _garea is not search(_wrp.bootstrap.path_admission.forbidden_segment_regex)
+          - _gpath_bad.protected | length == 0
+          - _gpath_bad.duplicate | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.case_path,
+                                   'rh_rf_detail': [C.harness.texts.generation_paths, case.id, _garea,
+                                                    _gpath_bad.protected | to_json, _gpath_bad.duplicate | to_json]}) | trim }}
+        quiet: true
+
+    - name: Refuse a generation stage that does not admit the selected inventory kind, or extra vars this harness does not produce (before the clone)
+      vars:
+        _gl0: "{{ _wrp.bootstrap.genesis.launch }}"
+        _gsk: "{{ _wrp.bootstrap.genesis.launch.stages[_xc.generation.stage] }}"
+        _gk: "{{ _xc.generation.produce.kind }}"
+      ansible.builtin.assert:
+        that:
+          - "'inventory_kinds' in _gl0 and _gl0.inventory_kinds is mapping"
+          - "'file_roles' in _gl0 and _gl0.file_roles is mapping"
+          - "'inventory_flag' in _wrp.bootstrap.ssh_auth.run_grammar and _wrp.bootstrap.ssh_auth.run_grammar.inventory_flag is string"
+          - "'inventory' in _gsk and _gsk.inventory is sequence and _gsk.inventory is not string"
+          - _gk in _gsk.inventory
+          - _gk in _gl0.inventory_kinds and _gl0.inventory_kinds[_gk] is mapping
+          - "'files' in _gl0.inventory_kinds[_gk]"
+          - _gl0.inventory_kinds[_gk].files is sequence and _gl0.inventory_kinds[_gk].files is not string
+          - _gl0.inventory_kinds[_gk].files | length > 0
+          - _gl0.inventory_kinds[_gk].files | reject('in', _gl0.file_roles) | list | length == 0
+          - (_gl0.inventory_kinds[_gk].files | sort) == (_xc.generation.produce.files.keys() | list | sort)
+          - "'extra_vars' in _gsk and _gsk.extra_vars is sequence and _gsk.extra_vars is not string"
+          - _gsk.extra_vars | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.launch_unbound,
+                                   'rh_rf_detail': [C.harness.texts.launch_inventory, case.id, _xc.generation.stage, _gk,
+                                                    _gsk | to_json,
+                                                    _xc.generation.produce.files.keys() | list | sort | to_json]}) | trim }}
+        quiet: true
+
+    # r5u-rf2 (codex-tick510 RF-OD-4): role-set equality is not enough for a kind that also declares a receipt. EVERY
+    # obligation key the selected kind declares (files, receipt, or any later key) and EVERY role it names must be
+    # listed under that key in the harness's declared producer capabilities (CASES harness.generation.producer.
+    # obligations) and be a declared file role; an obligation key the harness does not declare is refused, never
+    # skipped (closed world). The declared file capabilities must equal the roles with declared contents. A kind whose
+    # receipt this harness cannot produce and admit refuses HERE, before the clone and before generation; that refusal
+    # never qualifies the receipt-bearing positive case (the measurement path owns it).
+    - name: Refuse a selected kind with an obligation this harness has no producer for (every key and role, receipts included; before the clone)
+      vars:
+        _gl0: "{{ _wrp.bootstrap.genesis.launch }}"
+        _gk: "{{ _xc.generation.produce.kind }}"
+        _gob: "{{ C.harness.generation.producer.obligations }}"
+        _gob_bad: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for key, v in _gl0.inventory_kinds[_gk].items() -%}
+          {%- for role in ([v] if v is string else v) -%}
+          {%- if key not in _gob or role not in _gob[key] or role not in _gl0.file_roles -%}
+          {%- set ns.o = ns.o + [[key, role]] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}{{ ns.o }}
+      ansible.builtin.assert:
+        that:
+          - _gl0.inventory_kinds[_gk].values() | select('mapping') | list | length == 0
+          - _gl0.inventory_kinds[_gk].values() | reject('string') | reject('sequence') | list | length == 0
+          - "'files' in _gob"
+          - (_gob.files | sort) == (C.harness.generation.producer.contents.keys() | list | sort)
+          - _gob_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.launch_unbound,
+                                   'rh_rf_detail': [C.harness.texts.generation_producer, case.id, _gk,
+                                                    _gob_bad | to_json]}) | trim }}
+        quiet: true
+
+    # r5u-rf: every produced file's content is checked for an ansible_* var BEFORE any write (the declared
+    # operator_controller_inventory rule); r5u-rf2: the contents are the declared producer's, checked before the clone.
+    - name: Refuse a producer content that sets an ansible_* variable (the declared operator_controller_inventory rule)
+      ansible.builtin.assert:
+        that:
+          - (C.harness.generation.producer.contents.values() | list | to_json) is not search('"ansible_')
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.generation_input,
+                                   'rh_rf_detail': [C.harness.texts.generation_inventory, case.id,
+                                                    C.harness.generation.producer.contents.keys() | list | sort | to_json]}) | trim }}
+        quiet: true
+
+    # r5u-rf2 (codex-tick510 RF-OD-5): the case's declared `setup` links (generation accepts link entries only; the phase
+    # kind's link shape) are planted first, then the EXISTING admission (admit_case_paths.yml: grammar, forbidden
+    # segment, containment, ancestry through admit_ancestry.yml, no-follow leaf class) admits the output area as
+    # `absent` under the case directory (nothing there, not even a link) and every produced path as `absent` under the
+    # area -- all before the clone, so a traversal or a planted link refuses before any effect of the case.
+    # r5u-rf3 (codex-tick518 RF2-SETUP-LINK-OUTSIDE-CASE; OD-d accepted only after this): rf2 wrote the links from the
+    # raw link / to strings BEFORE any admission, so @cd@/../sibling-link escaped the owned case. Now, before ANY link:
+    # (1) every link destination must lie under the case directory (<cd><separator>...) and is named case-relatively
+    # (the rest of the string after that prefix); it may neither equal, contain nor lie inside a protected case artifact
+    # (harness.generation.producer.protected) nor another setup link (whole normalized segments, the declared
+    # path_admission.case_sensitive identity -- so no later link is created through an earlier one); every link TARGET
+    # must be normalized and be the case directory or lie under it (the hostile fixture stays in owned fixture space);
+    # (2) every destination is admitted by the EXISTING admission (admit_case_paths.yml under ap_root = the case
+    # directory: grammar, forbidden segment -- a `..` refuses --, normalized containment, safe ancestry through
+    # admit_ancestry.yml, leaf `absent`, not even a link); (3) only then are the links created, at <cd><separator><rel>
+    # from the ADMITTED relative name, never from the raw string.
+    - name: Name the declared setup link destinations case-relatively (pure; nothing is created)
+      vars:
+        _gsep: "{{ _wrp.bootstrap.path_admission.separator }}"
+      ansible.builtin.set_fact:
+        _gsetup: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for e in _xc.setup -%}
+          {%- set ns.o = ns.o + [{'link': e.link, 'to': e.to,
+                                  'rel': (e.link[(cd ~ _gsep) | length:] if e.link.startswith(cd ~ _gsep) else none)}] -%}
+          {%- endfor -%}{{ ns.o }}
+      when: _xc.setup is defined
+
+    - name: Refuse a setup link outside the case directory, overlapping a protected case artifact or another setup link, or a target outside the case directory (before any link)
+      vars:
+        _gsep: "{{ _wrp.bootstrap.path_admission.separator }}"
+        _gcs: "{{ _wrp.bootstrap.path_admission.case_sensitive }}"
+        _gsetup_bad: >-
+          {%- set ns = namespace(link=[], to=[], seen=[]) -%}
+          {%- for e in _gsetup -%}
+          {%- if e.rel is none -%}
+          {%- set ns.link = ns.link + [e.link] -%}
+          {%- else -%}
+          {%- set r = (e.rel | normpath) if _gcs else (e.rel | normpath | lower) -%}
+          {%- for p0 in C.harness.generation.producer.protected -%}
+          {%- set p = p0 if _gcs else (p0 | lower) -%}
+          {%- if r == p or r.startswith(p ~ _gsep) or p.startswith(r ~ _gsep) -%}{%- set ns.link = ns.link + [e.link] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- for q in ns.seen -%}
+          {%- if r == q or r.startswith(q ~ _gsep) or q.startswith(r ~ _gsep) -%}{%- set ns.link = ns.link + [e.link] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- set ns.seen = ns.seen + [r] -%}
+          {%- endif -%}
+          {%- if not ((e.to | normpath) == e.to and (e.to == cd or e.to.startswith(cd ~ _gsep))) -%}
+          {%- set ns.to = ns.to + [e.to] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ {'link': ns.link, 'to': ns.to} }}
+      ansible.builtin.assert:
+        that:
+          - _gcs is boolean
+          - _gsetup | length == _xc.setup | length
+          - _gsetup_bad.link | length == 0
+          - _gsetup_bad.to | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.case_path,
+                                   'rh_rf_detail': [C.harness.texts.generation_setup, case.id,
+                                                    _gsetup_bad.link | to_json, _gsetup_bad.to | to_json]}) | trim }}
+        quiet: true
+      when: _xc.setup is defined
+
+    - name: Admit every setup link destination in the case directory (absent, normalized, no traversal, safe ancestry; before any link)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ cd }}"
+        ap_items: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for e in _gsetup -%}
+          {%- set ns.o = ns.o + [{'rel': e.rel, 'need': C.harness.case_path_classes.absent}] -%}
+          {%- endfor -%}
+          {{ ns.o }}
+        ap_case: "{{ case.id }}"
+      when: _xc.setup is defined
+
+    - name: Setup -- links (only the ADMITTED case-relative destinations; after every admission above)
+      ansible.builtin.file:
+        src: "{{ item.to }}"
+        path: "{{ cd ~ _wrp.bootstrap.path_admission.separator ~ item.rel }}"
+        state: link
+      loop: "{{ _gsetup }}"
+      loop_control:
+        label: "{{ item.rel }}"
+      when: _xc.setup is defined
+
+    - name: Admit the declared output area in the case directory (absent; not the case directory itself; links refuse)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ cd }}"
+        ap_items: "{{ [{'rel': _xc.generation.produce.area, 'need': C.harness.case_path_classes.absent}] }}"
+        ap_case: "{{ case.id }}"
+
+    - name: Admit every produced path under the output area (absent; no traversal; links refuse)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ cd ~ _wrp.bootstrap.path_admission.separator ~ _xc.generation.produce.area }}"
+        ap_items: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for r, f in _xc.generation.produce.files.items() -%}
+          {%- set ns.o = ns.o + [{'rel': f, 'need': C.harness.case_path_classes.absent}] -%}
+          {%- endfor -%}
+          {{ ns.o }}
+        ap_case: "{{ case.id }}"
+
+    - name: Refuse an undeclared, partial or misplaced placeholder in the declared argv TEMPLATE (before any value)
+      vars:
+        _gl0: "{{ _wrp.bootstrap.genesis.launch }}"
+        # r5u (B-OD-01): the list-slot spellings are the declared node's values (genesis.launch.slots); the record
+        # slot follows EVERY other declared list slot (each can carry a caller word); each declared list slot occurs
+        # exactly once as a whole word
+        _gslot_bad: >-
+          {%- set ns = namespace(o=[], rec=-1, last_caller=-1, flag_after=false) -%}
+          {%- set lists = _gl0.slots.values() | list -%}
+          {%- for w in _gl0.argv -%}
+          {%- set i = loop.index0 -%}
+          {%- if w in lists -%}
+          {%- if w == _gl0.slots.source_record -%}{%- set ns.rec = i -%}{%- else -%}{%- set ns.last_caller = i -%}{%- endif -%}
+          {%- else -%}
+          {%- set ph = w | regex_findall(_gl0.placeholder.regex) -%}
+          {%- for p in ph if p not in (_gl0.scalar_slots.values() | list) -%}{%- set ns.o = ns.o + [w] -%}{%- endfor -%}
+          {%- for p in ph if p in lists -%}{%- set ns.o = ns.o + [w] -%}{%- endfor -%}
+          {%- set rest = namespace(s=w) -%}
+          {%- for p in ph -%}{%- set rest.s = rest.s | replace(p, '') -%}{%- endfor -%}
+          {%- for d in _gl0.placeholder.delimiters if d in rest.s -%}{%- set ns.o = ns.o + [w] -%}{%- endfor -%}
+          {%- if ns.rec >= 0 and w == _gl0.extra_vars_flag -%}{%- set ns.flag_after = true -%}{%- endif -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set cnt = namespace(o=[]) -%}
+          {%- for s in lists -%}
+          {%- set n = _gl0.argv | select('equalto', s) | list | length -%}
+          {%- if n != 1 -%}{%- set cnt.o = cnt.o + [[s, n]] -%}{%- endif -%}
+          {%- endfor -%}
+          {{ {'bad': ns.o | unique | list, 'rec': ns.rec, 'last_caller': ns.last_caller, 'flag_after': ns.flag_after,
+              'slot_count_bad': cnt.o} }}
+      ansible.builtin.assert:
+        that:
+          - _gslot_bad.bad | length == 0
+          - _gslot_bad.slot_count_bad | length == 0
+          - _gslot_bad.rec > _gslot_bad.last_caller
+          - not _gslot_bad.flag_after
+          # codex-tick473 option 1: in a normal run the expanded record word is the LITERAL FINAL argv word
+          - _gslot_bad.rec == (_gl0.argv | length) - 1
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.launch_unbound,
+                                   'rh_rf_detail': [C.harness.texts.launch_slot, case.id, _gslot_bad | to_json]}) | trim }}
+        quiet: true
+
+  # r5u-rf2 (codex-tick510 RF-OD-4 / RF-OD-5 negatives): every task above is a pure check, the declared setup links and
+  # the existing case-path admission -- nothing is cloned, prepared, written or launched. A refusal here is the CASE's
+  # outcome (its declared code + text in the output, the reset rc of a case with no run, i.e. non-zero), recorded so
+  # that the case's own expectation decides it; it never earns a pass for a case that expects success, and the rest of
+  # the generation (clone, prepare, produced writes, launch, reach) is skipped for that case.
+  rescue:
+    - name: Record the pre-launch refusal as the case outcome (no clone, no write, no launch)
+      ansible.builtin.set_fact:
+        _run: {rc: "{{ _run.rc }}", out: "{{ ansible_failed_result.msg | string }}"}
+        _gref: true
+        # r5u-rf4 (codex-tick526 RF3-PRELAUNCH-VERDICT-SOURCE): the truthful stage -- nothing was cloned, prepared,
+        # written or launched, so the verdict publishes no source / launch evidence for this case
+        _gstage: "{{ C.harness.generation.verdict_stage.pre_launch }}"
+
+- name: "{{ case.id }} -- generation (clone, prepare, produced inventory, launch and reach; only after the pre-launch checks passed)"
+  when: case.kind == 'generation' and not _gref
+  block:
+    - name: A per-case clone at the admitted commit (the generator's checkout)
+      ansible.builtin.include_tasks: source_clone.yml
+      vars:
+        sr_dest: "{{ cd }}/src"
+        sr_decl: "{{ T }}"
+
+    # r5r (codex-tick461 R5P-GENERATION-PATH-ADMISSION): relocate sources (an existing tree, not a link) and
+    # destinations (absent; existing ancestors real directories) are admitted BEFORE the first mkdir or move.
+    - name: Relocate -- admit every from (existing tree) and to (absent) inside the clone (before any mkdir / move)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ cd }}/src"
+        ap_items: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for r in _xc.generation.relocate -%}
+          {%- set ns.o = ns.o + [{'rel': r.from, 'need': C.harness.case_path_classes.tree},
+                                 {'rel': r.to, 'need': C.harness.case_path_classes.absent}] -%}
+          {%- endfor -%}
+          {{ ns.o }}
+        ap_case: "{{ case.id }}"
+
+    - name: Relocate -- parent directories of each declared destination (explicit 0755)
+      ansible.builtin.file:
+        path: "{{ cd }}/src/{{ item.to | dirname }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ _xc.generation.relocate }}"
+      loop_control:
+        label: "{{ item.to }}"
+
+    - name: Relocate -- admit location and configuration before the moves
+      ansible.builtin.include_tasks: fixture_git_admit.yml
+      vars:
+        fg_repo: "{{ cd }}/src"
+        fg_case: "{{ case.id }}"
+      when: _xc.generation.relocate | length > 0
+
+    - name: Relocate -- move each declared tree inside the clone (tracked move; mutation prefix + fence)
+      ansible.builtin.command:
+        argv: "{{ _gitm + [cd ~ '/src'] + _gitp.mutation.fence + ['mv', _gitp.end_of_options, item.from, item.to] }}"
+      loop: "{{ _xc.generation.relocate }}"
+      loop_control:
+        label: "{{ item.from }} -> {{ item.to }}"
+      changed_when: true
+
+    # r5s (codex-tick480 R5R-CASE-SENSITIVE-ANCESTRY): ALL mutate files are admitted in ONE invocation before the first
+    # replace; the helper checks every parent by exact (declared case-sensitive) identity, so src/a and src/A are two
+    # ancestry checks and a linked src/A refuses before either mutation.
+    - name: Admit the declared mutation files inside the clone (after relocation; before any replace)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ cd }}/src"
+        ap_items: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for m in _xc.generation.mutate -%}{%- set ns.o = ns.o + [{'rel': m.file, 'need': C.harness.case_path_classes.file}] -%}{%- endfor -%}
+          {{ ns.o }}
+        ap_case: "{{ case.id }}"
+
+    - name: Apply the declared mutations (after relocation)
+      ansible.builtin.replace:
+        path: "{{ cd }}/src/{{ item.file }}"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop: "{{ _xc.generation.mutate }}"
+      register: _gmut
+
+    - name: A mutation that did not apply makes the case vacuous
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['mutation did not apply: ' ~ item.item.file] }}"
+      loop: "{{ _gmut.results }}"
+      loop_control:
+        label: "{{ item.item.file }}"
+      when: not item.changed
+
+    # r5r (codex-tick461 R5P-FIXTURE-GIT-ISOLATION): R2's declared order around each mutation -- location / config
+    # admission, mutation under the mutation prefix + fence (hooks off, signing off, identity from
+    # git.mutation.env_pairs), location again -- then R2's admit_git_paths readback. r5p's inherited-environment
+    # T.source.git calls (no isolation; signing policy inherited) are RETIRED here.
+    - name: Admit location and configuration before staging the fixture change
+      ansible.builtin.include_tasks: fixture_git_admit.yml
+      vars:
+        fg_repo: "{{ cd }}/src"
+        fg_case: "{{ case.id }}"
+      when: (_xc.generation.relocate | length) + (_xc.generation.mutate | length) > 0
+
+    - name: Stage the relocated / mutated fixture (mutation prefix + fence)
+      ansible.builtin.command:
+        argv: "{{ _gitm + [cd ~ '/src'] + _gitp.mutation.fence + ['add', '-A'] }}"
+      changed_when: true
+      when: (_xc.generation.relocate | length) + (_xc.generation.mutate | length) > 0
+
+    - name: Admit location and configuration before the commit
+      ansible.builtin.include_tasks: fixture_git_admit.yml
+      vars:
+        fg_repo: "{{ cd }}/src"
+        fg_case: "{{ case.id }}"
+      when: (_xc.generation.relocate | length) + (_xc.generation.mutate | length) > 0
+
+    - name: Commit the relocated / mutated fixture in the case clone (declared commit words; the generator admits committed bytes only)
+      ansible.builtin.command:
+        argv: >-
+          {{ _gitm + [cd ~ '/src'] + _gitp.mutation.fence + _gitp.mutation.commit
+             + ['-m', C.harness.generation.fixture_commit.message ~ ' ' ~ case.id] }}
+      changed_when: true
+      when: (_xc.generation.relocate | length) + (_xc.generation.mutate | length) > 0
+
+    - name: Admit the location after the commit
+      ansible.builtin.include_tasks: fixture_git_admit.yml
+      vars:
+        fg_repo: "{{ cd }}/src"
+        fg_case: "{{ case.id }}"
+
+    - name: The bound declaration path the readback and the record name (declared key path; refused when absent)
+      ansible.builtin.set_fact:
+        _gdr: >-
+          {%- set ns = namespace(node=_wrp.bootstrap) -%}
+          {%- for k in C.harness.check_launch.record_from -%}{%- set ns.node = ns.node[k] if (ns.node is mapping and k in ns.node) else none -%}{%- endfor -%}
+          {{ ns.node.declaration_rel if (ns.node is mapping and ns.node.declaration_rel is defined) else '' }}
+
+    - name: Refuse an undeclared bound declaration path (before the readback)
+      ansible.builtin.assert:
+        that:
+          - _gdr is string and _gdr | length > 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.check_input,
+                                   'rh_rf_detail': [C.harness.texts.launch_record, case.id,
+                                                    C.harness.check_launch.record_from | to_json]}) | trim }}
+        quiet: true
+
+    - name: Read back the fixture commit through R2's git admission (bound declaration + mutated files)
+      ansible.builtin.include_tasks: "{{ repo_root }}/testing/remote_harness/tasks/admit_git_paths.yml"
+      vars:
+        rh_gp_tool: "{{ _gitt.git }}"
+        rh_gp_env: "{{ _gitt.env }}"
+        rh_gp_git: "{{ _gitp }}"
+        rh_gp_repo: "{{ cd }}/src"
+        # r5s: exact (case-sensitive) identity, as r2l admit_git_paths requires (see the check kind)
+        rh_gp_paths: >-
+          {{ ([_gdr] + (_xc.generation.mutate | map(attribute='file') | list))
+             | unique(case_sensitive=_wrp.bootstrap.path_admission.case_sensitive) | list }}
+        rh_gp_absent: []
+        rh_gp_probe: []
+        rh_gp_edition: null
+        rh_gp_codes: "{{ C.harness.git_readback.codes }}"
+        rh_gp_texts: "{{ C.harness.git_readback.texts }}"
+        rh_gp_history: null   # GEN-ADOPT2: R2's include now requires it explicitly; no historical proof in a readback
+
+    - name: The fixture's commit, tree, parent and state (read prefix; the generator's intended source)
+      ansible.builtin.command:
+        argv: "{{ _gitr + [cd ~ '/src'] + item }}"
+      loop:
+        - [rev-parse, --verify, --quiet, 'HEAD^{commit}']
+        - [rev-parse, --verify, --quiet, 'HEAD^{tree}']
+        - [rev-parse, --verify, --quiet, 'HEAD^1^{commit}']
+        - "{{ T.controls_source.status_args }}"
+      register: _gsrc
+      changed_when: false
+      failed_when: false
+
+    # unmutated: the fixture IS the admitted commit; mutated: exactly one commit whose first parent is the admitted one
+    # (the parent query is read only for a mutated fixture -- an admitted root commit has no parent)
+    - name: Refuse a fixture that is not a clean single commit on the admitted one (or the admitted one itself)
+      ansible.builtin.assert:
+        that:
+          - _gsrc.results[0].rc == 0 and _gsrc.results[1].rc == 0 and _gsrc.results[3].rc == 0
+          - _gsrc.results[3].stdout | trim | length == 0
+          - >-
+            ((_gsrc.results[0].stdout | trim) == sr.commit)
+            if ((_xc.generation.relocate | length) + (_xc.generation.mutate | length) == 0)
+            else (_gsrc.results[2].rc == 0 and (_gsrc.results[2].stdout | trim) == sr.commit)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.source_mismatch,
+                                   'rh_rf_detail': [C.harness.texts.generation_source, case.id, cd ~ '/src',
+                                                    (_gsrc.results[0].stdout | trim) | to_json,
+                                                    (_gsrc.results[2].stdout | trim) | to_json, sr.commit,
+                                                    (_gsrc.results[3].stdout | trim) | to_json]}) | trim }}
+        quiet: true
+
+    - name: Fix the case source and the launch parts (all from the declaration)
+      ansible.builtin.set_fact:
+        _case_src: {commit: "{{ _gsrc.results[0].stdout | trim }}", tree: "{{ _gsrc.results[1].stdout | trim }}", parent: "{{ sr.commit }}"}
+        _gl: "{{ _wrp.bootstrap.genesis.launch }}"
+        _gwork: "{{ cd }}/src/{{ _wrp.work_roots.root_rel }}"
+        _gstage_root: >-
+          {{ [cd ~ '/src', _wrp.work_roots.root_rel, _wrp.bootstrap.work_roots.sub_roots[_wrp.bootstrap.genesis.launch.stage_root.sub],
+              _wrp.bootstrap.genesis.launch.stage_root.rel, _xc.generation.stage, case.id] | join('/') }}
+
+    # r5r (R5P-TYPED-STAGE-INPUTS): the source-bootstrap record is bound to the POST-MUTATION fixture: its edition is the
+    # commit R2's readback admitted (rh_gp_head, == the fixture HEAD read above) and its digest is the committed
+    # declaration bytes; launch_record.yml is the ONE builder (same as the check kind). Never a case constant.
+    - name: Refuse a readback commit other than the fixture HEAD (record binding)
+      ansible.builtin.assert:
+        that:
+          - rh_gp_head == _case_src.commit
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.git_readback.codes.edition,
+                                   'rh_rf_detail': [C.harness.git_readback.texts.edition, case.id, [rh_gp_head, _case_src.commit] | to_json]}) | trim }}
+        quiet: true
+
+    - name: Build the typed source-bootstrap record for the generation fixture
+      ansible.builtin.include_tasks: launch_record.yml
+      vars:
+        lr_repo: "{{ cd }}/src"
+        lr_head: "{{ rh_gp_head }}"
+        lr_case: "{{ case.id }}"
+
+    # PREPARATION exactly as declared (genesis.launch.prepare): the work root (explicit 0755, the WORK-ROOT rule's mode),
+    # then work_root_dirs and dirs_rel_to_stage_root in declared order at prepare.mode, each created ONLY if absent (an
+    # existing one is admitted, never re-moded); every `exclusive` entry must be absent (never reused).
+    - name: Prepare -- the ordered directory plan (placeholders substituted from the declaration)
+      ansible.builtin.set_fact:
+        _gprep: >-
+          {%- set ns = namespace(l=[{'p': _gwork, 'm': '0755', 'x': false}]) -%}
+          {%- for d in _gl.prepare.work_root_dirs -%}
+          {%- set ns.l = ns.l + [{'p': _gwork ~ '/' ~ (d | replace('{sub_roots.tmp}', _wrp.bootstrap.work_roots.sub_roots[_gl.stage_root.sub])
+                                                       | replace('{stage_root.rel}', _gl.stage_root.rel)),
+                                  'm': _gl.prepare.mode, 'x': false}] -%}
+          {%- endfor -%}
+          {%- for d in _gl.prepare.dirs_rel_to_stage_root -%}
+          {%- set ns.l = ns.l + [{'p': (_gstage_root ~ '/' ~ d) | normpath, 'm': _gl.prepare.mode, 'x': d in _gl.prepare.exclusive}] -%}
+          {%- endfor -%}
+          {{ ns.l }}
+
+    - name: Prepare -- observe every planned directory (no link followed)
+      ansible.builtin.stat:
+        path: "{{ item.p }}"
+        follow: false
+      loop: "{{ _gprep }}"
+      loop_control:
+        label: "{{ item.p }}"
+      register: _gprep_st
+
+    - name: Refuse an unresolved placeholder or an existing exclusive (act) dir
+      ansible.builtin.assert:
+        that:
+          - _gprep | map(attribute='p') | select('search', '[{}]') | list | length == 0
+          - _gprep_st.results | selectattr('item.x') | selectattr('stat.exists') | list | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.generation_act,
+                                   'rh_rf_detail': [C.harness.texts.generation_act, case.id,
+                                                    _gprep | map(attribute='p') | select('search', '[{}]') | list | to_json,
+                                                    _gprep_st.results | selectattr('item.x') | selectattr('stat.exists')
+                                                    | map(attribute='item.p') | list | to_json]}) | trim }}
+        quiet: true
+
+    - name: Prepare -- create each absent planned directory, in declared order
+      ansible.builtin.file:
+        path: "{{ item.item.p }}"
+        state: directory
+        mode: "{{ item.item.m }}"
+      loop: "{{ _gprep_st.results }}"
+      loop_control:
+        label: "{{ item.item.p }}"
+      when: not item.stat.exists
+
+    # r5u-rf (codex-tick500 R5U-REFUSAL-AND-INVENTORY-CONTRACT): every produced inventory file is NAMED by its declared
+    # role. r5u-rf2 (codex-tick510 RF-OD-5): its path is <case dir>/<produce.area>/<produce.files[role]> (paths, kind,
+    # obligations and contents were checked and admitted before the clone). The clone and the prepare ran since, so the
+    # SAME existing admission is repeated at the write boundary (area absent, every produced path absent), then the
+    # area and the parents of each produced path are created in order (explicit 0755) and each role's declared content
+    # is written once to its own distinct path.
+    - name: Re-admit the output area at the write boundary (absent; links refuse)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ cd }}"
+        ap_items: "{{ [{'rel': _xc.generation.produce.area, 'need': C.harness.case_path_classes.absent}] }}"
+        ap_case: "{{ case.id }}"
+
+    - name: Re-admit every produced path under the output area at the write boundary (absent; no traversal; links refuse)
+      ansible.builtin.include_tasks: admit_case_paths.yml
+      vars:
+        ap_root: "{{ cd ~ _wrp.bootstrap.path_admission.separator ~ _xc.generation.produce.area }}"
+        ap_items: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for r, f in _xc.generation.produce.files.items() -%}
+          {%- set ns.o = ns.o + [{'rel': f, 'need': C.harness.case_path_classes.absent}] -%}
+          {%- endfor -%}
+          {{ ns.o }}
+        ap_case: "{{ case.id }}"
+
+    - name: Name each produced inventory file by its declared role (role -> absolute path under the output area)
+      vars:
+        _gsep: "{{ _wrp.bootstrap.path_admission.separator }}"
+      ansible.builtin.set_fact:
+        _gprod: >-
+          {%- set ns = namespace(m={}) -%}
+          {%- for r, f in _xc.generation.produce.files.items() -%}
+          {%- set ns.m = ns.m | combine({r: cd ~ _gsep ~ _xc.generation.produce.area ~ _gsep ~ f}) -%}
+          {%- endfor -%}
+          {{ ns.m }}
+        _gdirs: >-
+          {%- set base = cd ~ _gsep ~ _xc.generation.produce.area -%}
+          {%- set ns = namespace(o=[base]) -%}
+          {%- for f in _xc.generation.produce.files.values() | list -%}
+          {%- set parts = (f.split(_gsep))[:-1] -%}
+          {%- for i in range(parts | length) -%}
+          {%- set d = base ~ _gsep ~ (parts[:i + 1] | join(_gsep)) -%}
+          {%- if d not in ns.o -%}{%- set ns.o = ns.o + [d] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ ns.o }}
+
+    - name: Create the output area and each produced path's parent, in order (explicit 0755, never umask-dependent)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ _gdirs }}"
+
+    - name: The controller-only inventory files (the declared producer contents, one per selected role)
+      ansible.builtin.copy:
+        content: "{{ C.harness.generation.producer.contents[item.key] | to_nice_yaml }}"
+        dest: "{{ _gprod[item.key] }}"
+        mode: '0644'
+      loop: "{{ _xc.generation.produce.files | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # env pairs: EXACTLY env.order, each from ONE declared source (base node, inherited, literal, stage path)
+    - name: Build the declared env -i pairs and the exec vector (no literal vector)
+      ansible.builtin.set_fact:
+        _genv: >-
+          {%- set ns = namespace(p=[], bad=[]) -%}
+          {%- for n in _gl.env.order -%}
+          {%- set srcs = ([1] if n in _wrp.bootstrap[_gl.env.base] else []) + ([1] if n in _gl.env.inherited else [])
+                         + ([1] if n in _gl.env.literal else []) + ([1] if n in _gl.env.stage_paths else []) -%}
+          {%- if srcs | length != 1 -%}{%- set ns.bad = ns.bad + [n] -%}
+          {%- elif n in _wrp.bootstrap[_gl.env.base] -%}{%- set ns.p = ns.p + [n ~ '=' ~ _wrp.bootstrap[_gl.env.base][n]] -%}
+          {%- elif n in _gl.env.inherited and _gl.env.inherited[n] == C.harness.generation.inherited_sources.passwd_home -%}{%- set ns.p = ns.p + [n ~ '=' ~ me_passwd_home] -%}
+          {%- elif n in _gl.env.inherited -%}{%- set ns.bad = ns.bad + [n] -%}
+          {%- elif n in _gl.env.literal -%}{%- set ns.p = ns.p + [n ~ '=' ~ _gl.env.literal[n]] -%}
+          {%- else -%}{%- set ns.p = ns.p + [n ~ '=' ~ _gstage_root ~ '/' ~ _gl.env.stage_paths[n]] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ {'pairs': ns.p, 'bad': ns.bad} }}
+
+    # r5r (R5P-TYPED-STAGE-INPUTS): the scalar-slot BINDING (declared slot role -> this harness's value) and the typed
+    # list slots. The template was validated before the clone (declared placeholder grammar on the template words only);
+    # values are injected opaquely and are NEVER brace-searched (r5p's blanket '[{}]' search over the substituted vector
+    # treated serialized JSON as an unresolved placeholder -- RETIRED). Each case-sourced stage input is ONE typed JSON
+    # extra-vars word {name: value} (types kept; no NAME=value string parsing); the record is ONE typed JSON word
+    # {record_var: record} in the source_record slot, after every caller word (option 1).
+    - name: The declared scalar-slot binding (every declared role bound exactly once)
+      ansible.builtin.set_fact:
+        _gbind:
+          env_path: "{{ _wrp.bootstrap.os_tools.env.path }}"
+          # OD-BRR-11 (codex-tick543): the runner's admitted controller-seed generation (run-local resolved_run record),
+          # the same contract admit_builder binds; the retired scalar genesis.builder.executable is gone
+          builder: "{{ lookup('ansible.builtin.vars', _wrp.bootstrap.work_roots.run_local.resolved_run.var).ansible_playbook }}"
+          # r5u (B-OD-01): no scalar `inventory` role any more -- the controller-only inventory is bound through the
+          # inventory_args LIST slot (_glist below), one flag word + one absolute file per declared file of the kind
+          act_var: "{{ _gl.stage_root.act.var }}"
+          act: "{{ case.id }}"
+          checkout: "{{ cd }}/src"
+          playbook: "{{ _gl.stages[_xc.generation.stage].playbook_rel }}"
+
+    - name: Refuse a declared scalar slot role this harness does not bind (before substitution)
+      vars:
+        _gslot_hits: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for role, v in _gbind.items() -%}
+          {%- for s in _gl.scalar_slots.values() if s in (v | string) -%}{%- set ns.o = ns.o + [[role, s]] -%}{%- endfor -%}
+          {%- endfor -%}{{ ns.o }}
+      ansible.builtin.assert:
+        that:
+          - _gl.scalar_slots.keys() | reject('in', _gbind.keys() | list) | list | length == 0
+          - _genv.bad | length == 0
+          # sequential in-place replacement is single-pass only if no bound value carries a DECLARED slot spelling
+          # (an exact-spelling check against the declared slots, not a delimiter search over data)
+          - _gslot_hits | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.launch_unbound,
+                                   'rh_rf_detail': [C.harness.texts.launch_slot, case.id,
+                                                    _gl.scalar_slots.keys() | reject('in', _gbind.keys() | list) | list | to_json,
+                                                    _genv.bad | to_json]}) | trim }}
+        quiet: true
+
+    # r5s (R5R-STAGE-SOURCE-OMISSION): the case-class producer emits EVERY declared stage input (no source filter that
+    # could drop one silently); admission already refused any other class before the clone, and the emitted word count
+    # is checked against the declared stage inputs before substitution.
+    - name: Produce the typed stage-input words (case-class producer; one flag + one JSON word per declared stage input)
+      ansible.builtin.set_fact:
+        _gsiw: >-
+          {%- set si = namespace(w=[]) -%}
+          {%- for d in _gl.stages[_xc.generation.stage].stage_inputs -%}
+          {%- set si.w = si.w + [_gl.extra_vars_flag,
+                                 {d.name: (_xc.generation.inputs[d.name] if d.source == _gl.input_sources.case
+                                           else _xc.generation.operator_inputs[d.name])} | to_json] -%}
+          {%- endfor -%}
+          {{ si.w }}
+
+    # brr-follow-s2 OPEN-B: the emission carries both produced classes (case: opaque case value; operator: the
+    # admitted domain value, re-checked here against the projection so a stage input can never be emitted with a
+    # value the pre-clone admission did not see). Any other class still refuses.
+    - name: Refuse a stage-input emission that does not carry every declared stage input
+      ansible.builtin.assert:
+        that:
+          - (_gsiw | length) == 2 * (_gl.stages[_xc.generation.stage].stage_inputs | length)
+          - >-
+            _gl.stages[_xc.generation.stage].stage_inputs | map(attribute='source')
+            | reject('in', [_gl.input_sources.case] + ([_gl.input_sources.operator] if ('operator' in _gl.input_sources) else []))
+            | list | length == 0
+          - >-
+            _gl.stages[_xc.generation.stage].stage_inputs | rejectattr('source', 'equalto', _gl.input_sources.case)
+            | map(attribute='name') | reject('in', _xc.generation.operator_inputs.keys() | list) | list | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.launch_unbound,
+                                   'rh_rf_detail': [C.harness.texts.launch_emission, case.id, _xc.generation.stage,
+                                                    _gl.stages[_xc.generation.stage].stage_inputs | to_json]}) | trim }}
+        quiet: true
+
+    # r5u (B-OD-01 option a) + r5u-rf: the LIST-slot binding (declared list-slot role -> this harness's typed words),
+    # the list counterpart of _gbind. inventory_args = for EACH file role of the SELECTED kind (the case's
+    # generation.produce.kind, r5u-rf2; admitted before the clone), in the kind's declared order: the declared
+    # ssh_auth.run_grammar.inventory_flag word + that role's produced file (_gprod); stage_extra_vars = no words (the
+    # stage's declared extra_vars were admitted present and EMPTY before the clone: no producer, never an omission);
+    # stage_inputs = the typed case-class words; source_record = the declared extra-vars flag + ONE typed JSON record
+    # word (the literal final pair).
+    - name: The declared list-slot binding (every declared list-slot role bound exactly once)
+      ansible.builtin.set_fact:
+        _glist:
+          env_pairs: "{{ _genv.pairs }}"
+          inventory_args: >-
+            {%- set ns = namespace(w=[]) -%}
+            {%- for r in _gl.inventory_kinds[_xc.generation.produce.kind].files -%}
+            {%- set ns.w = ns.w + [_wrp.bootstrap.ssh_auth.run_grammar.inventory_flag, _gprod[r]] -%}
+            {%- endfor -%}
+            {{ ns.w }}
+          stage_extra_vars: []
+          stage_inputs: "{{ _gsiw }}"
+          source_record: "{{ [_gl.extra_vars_flag, {C.harness.check_launch.record_var: _lrec} | to_json] }}"
+
+    - name: Refuse a declared list slot role this harness does not bind, or a bound role the launch does not declare
+      ansible.builtin.assert:
+        that:
+          - _gl.slots.keys() | reject('in', _glist.keys() | list) | list | length == 0
+          - _glist.keys() | reject('in', _gl.slots.keys() | list) | list | length == 0
+          - _gl.stages[_xc.generation.stage].extra_vars | length == 0
+          # r5u-rf: ROLE equality (the named kind's declared file roles == the produced roles) and one flag word + one
+          # path word per role -- never `length == 1`
+          - (_gl.inventory_kinds[_xc.generation.produce.kind].files | sort) == (_gprod.keys() | list | sort)
+          - (_glist.inventory_args | length) == 2 * (_gl.inventory_kinds[_xc.generation.produce.kind].files | length)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.launch_unbound,
+                                   'rh_rf_detail': [C.harness.texts.launch_slot, case.id,
+                                                    _gl.slots.keys() | reject('in', _glist.keys() | list) | list | to_json,
+                                                    _glist.keys() | reject('in', _gl.slots.keys() | list) | list | to_json]}) | trim }}
+        quiet: true
+
+    - name: Substitute the declared argv slots (list slots expand to typed words; scalar slots replace in place)
+      ansible.builtin.set_fact:
+        _gargv: >-
+          {%- set lm = namespace(m={}) -%}
+          {%- for role, spelling in _gl.slots.items() -%}{%- set lm.m = lm.m | combine({spelling: _glist[role]}) -%}{%- endfor -%}
+          {%- set lists = lm.m -%}
+          {%- set ns = namespace(v=[]) -%}
+          {%- for w in _gl.argv -%}
+          {%- if w in lists -%}{%- set ns.v = ns.v + lists[w] -%}
+          {%- else -%}
+          {%- set wn = namespace(s=w) -%}
+          {%- for role, slot in _gl.scalar_slots.items() -%}{%- set wn.s = wn.s | replace(slot, _gbind[role]) -%}{%- endfor -%}
+          {%- set ns.v = ns.v + [wn.s] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ ns.v }}
+
+    - name: Refuse a vector whose exec word is not the admitted env tool or whose final words are not the admitted record
+      ansible.builtin.assert:
+        that:
+          - (_gargv | first) == _wrp.bootstrap.os_tools.env.path
+          # codex-tick473 option 1: the admitted record is the literal final word, introduced by the declared flag
+          - (_gargv | last) == ({C.harness.check_launch.record_var: _lrec} | to_json)
+          - _gargv[(_gargv | length) - 2] == _gl.extra_vars_flag
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.launch_unbound,
+                                   'rh_rf_detail': [C.harness.texts.launch_slot, case.id, (_gargv | first)]}) | trim }}
+        quiet: true
+
+    - name: Launch the declared generator stage (env -i, declared builder, declared inventory, act, stage inputs; cwd = checkout)
+      ansible.builtin.command:
+        argv: "{{ _gargv }}"
+        chdir: "{{ cd }}/src"
+      register: _gr
+      changed_when: false
+      failed_when: false
+
+    - name: Record the generation run (native capture -- stdout and stderr kept as the tool returned them)
+      ansible.builtin.set_fact:
+        _run: {rc: "{{ _gr.rc }}", out: "{{ _gr.stdout ~ '\n' ~ _gr.stderr }}"}
+        _gen: {rc: "{{ _gr.rc }}", argv: "{{ _gargv }}", env: "{{ _genv.pairs }}", stage_root: "{{ _gstage_root }}"}
+
+    # The generator never writes the checkout: its output is in the owned mirror under this act's stage root. It is
+    # located by its declared output_rel suffix, inside the stage root only (bounded find), and must be unique.
+    # r5r (codex-tick461 join C1-R5P-3): this bounded unique-suffix lookup is a TEMPORARY harness mechanism, NOT an
+    # authority for choosing expected outputs; it is replaced by the generator's declared output / mirror location when
+    # the R2 join provides it (no discovery framework is added).
+    - name: Locate the generated output in the act's mirror (stage root only)
+      ansible.builtin.find:
+        paths: "{{ _gstage_root }}"
+        recurse: true
+        file_type: file
+        patterns: ["{{ _xc.generation.output_rel | basename }}"]
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: _gmf
+      when:
+        - (_gr.rc | int) == 0
+        - _xc.generation.output_sha256 is defined or _xc.generation.reach is defined
+
+    - name: The mirror output (exactly one file at <mirror>/<output_rel>)
+      ansible.builtin.set_fact:
+        _gm: "{{ _gmf.files | selectattr('path', 'search', '/' ~ (_xc.generation.output_rel | regex_escape) ~ '$') | list }}"
+      when: _gmf.files is defined
+
+    - name: A missing or ambiguous mirror output fails the case
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['mirror output for ' ~ _xc.generation.output_rel ~ ': ' ~ (_gm | map(attribute='path') | list | to_json)] }}"
+      when: _gm is not none and (_gm | length) != 1
+
+    - name: Byte equality with the declared expected digest
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['generated ' ~ _xc.generation.output_rel ~ ' sha256 ' ~ _gm[0].checksum ~ ' != declared ' ~ _xc.generation.output_sha256] }}"
+      when:
+        - _xc.generation.output_sha256 is defined
+        - _gm is not none and (_gm | length) == 1
+        - _gm[0].checksum != _xc.generation.output_sha256
+
+    # REACH (REL-S8-DEPTH within depth): the generated entry is PLACED at its output_rel in the clone (the acceptance
+    # step: the reviewed mirror bytes into the checkout), then run with the first declared derived name pinned. The
+    # first guard's include is resolved from playbook_dir at the relocated depth; reaching the first task header of the
+    # declared guard file (transfer entry_guard.guard_route_rel, its name read from the clone) is the REACHABILITY
+    # observation, asserted separately from the refusal needle (case expect.out). No body task may run.
+    - name: Reach -- place the generated bytes at output_rel in the clone and read the guard and body first-task names
+      when:
+        - _xc.generation.reach is defined
+        - _gm is not none and (_gm | length) == 1
+      block:
+        # r5r (codex-tick461 R5P-GENERATION-PATH-ADMISSION): the placement target and the guard are admitted BEFORE the
+        # copy / slurp (copy and slurp follow links): declared grammar, containment, ancestry, presence class.
+        - name: Admit the placement target and the declared guard inside the clone (before placing or reading)
+          ansible.builtin.include_tasks: admit_case_paths.yml
+          vars:
+            ap_root: "{{ cd }}/src"
+            ap_items:
+              - {rel: "{{ _xc.generation.output_rel }}", need: "{{ C.harness.case_path_classes.replaceable }}"}
+              - {rel: "{{ T.entry_guard.guard_route_rel }}", need: "{{ C.harness.case_path_classes.file }}"}
+            ap_case: "{{ case.id }}"
+
+        - name: Place the generated entry
+          ansible.builtin.copy:
+            src: "{{ _gm[0].path }}"
+            dest: "{{ cd }}/src/{{ _xc.generation.output_rel }}"
+            mode: '0644'
+            remote_src: true
+
+        - name: Read the declared guard file and the relocated entry (first task names)
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          loop:
+            - "{{ cd }}/src/{{ T.entry_guard.guard_route_rel }}"
+            - "{{ cd }}/src/{{ _xc.generation.output_rel }}"
+          register: _gsl
+
+        # the generated entry's static body imports are '<playbook_dir expression>/<rel>' (entry_forms.construct.body_task);
+        # r5r (R5P-GENERATION-PATH-ADMISSION): each is RESOLVED inside the clone before it is admitted or read --
+        # (1) it must carry the playbook_dir expression prefix (anything else is not a resolvable static body: refused,
+        # never read); (2) the trailing path is joined to the PLACED entry's directory and NORMALIZED (a legitimate
+        # relative '../' import resolves here); (3) the normalized path must lie under the clone and its clone-relative
+        # form is then admitted by admit_case_paths.yml (grammar, ancestry, a regular non-link file) -- r5p slurped first
+        # and checked an un-normalized string prefix afterwards (a parent traversal passed). Only then is it read.
+        - name: Resolve the placed entry's static body imports inside the clone (normalize; no read yet)
+          vars:
+            _gsep: "{{ _wrp.bootstrap.path_admission.separator }}"
+            _gclone: "{{ cd }}/src"
+            _gimports: >-
+              {{ _gsl.results[1].content | b64decode | from_yaml | map(attribute='tasks') | flatten
+                 | selectattr('ansible.builtin.import_tasks', 'defined') | map(attribute='ansible.builtin.import_tasks') | list }}
+          ansible.builtin.set_fact:
+            _greach:
+              guard_header: "TASK [{{ (_gsl.results[0].content | b64decode | from_yaml | first).name }}]"
+              imports: "{{ _gimports }}"
+              unprefixed: "{{ _gimports | reject('match', '^\\{\\{ *playbook_dir *\\}\\}' ~ (_gsep | regex_escape)) | list }}"
+              resolved: >-
+                {{ _gimports | select('match', '^\{\{ *playbook_dir *\}\}' ~ (_gsep | regex_escape))
+                   | map('regex_replace', '^\{\{ *playbook_dir *\}\}', _gclone ~ _gsep ~ (_xc.generation.output_rel | dirname))
+                   | map('normpath') | list }}
+
+        - name: Refuse a body import without the playbook_dir prefix, none at all, or one resolving outside the clone
+          vars:
+            _gsep: "{{ _wrp.bootstrap.path_admission.separator }}"
+          ansible.builtin.assert:
+            that:
+              - _greach.imports | length > 0
+              - _greach.unprefixed | length == 0
+              - _greach.resolved | reject('match', ((cd ~ '/src') ~ _gsep) | regex_escape) | list | length == 0
+            fail_msg: >-
+              {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                        template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.case_path,
+                                       'rh_rf_detail': [C.harness.texts.case_path, case.id,
+                                                        [_greach.imports, _greach.resolved] | to_json]}) | trim }}
+            quiet: true
+
+        - name: Admit each resolved body inside the clone (grammar, ancestry, regular non-link file) before any read
+          ansible.builtin.include_tasks: admit_case_paths.yml
+          vars:
+            ap_root: "{{ cd }}/src"
+            ap_items: >-
+              {%- set ns = namespace(o=[]) -%}
+              {%- for p in _greach.resolved -%}
+              {%- set ns.o = ns.o + [{'rel': p[((cd ~ '/src') | length) + 1:], 'need': C.harness.case_path_classes.file}] -%}
+              {%- endfor -%}
+              {{ ns.o }}
+            ap_case: "{{ case.id }}"
+
+        - name: Read the admitted bodies the placed entry imports (their first task names are the no-body-reached needles)
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          loop: "{{ _greach.resolved }}"
+          register: _gbody
+
+        - name: Run the generated entry with the first declared derived name pinned
+          ansible.builtin.command:
+            # r5u-rf: the reach run reads the SAME named produced inventory words as the launch (_glist.inventory_args:
+            # the declared inventory flag + each role's produced file) and the declared extra-vars flag
+            argv: "{{ [C.harness.ansible_playbook] + _glist.inventory_args
+                      + [cd ~ '/src/' ~ _xc.generation.output_rel, _gl.extra_vars_flag,
+                         (T.entry_guard.derived | first) ~ '=' ~ _xc.generation.reach.pin_value] }}"
+            chdir: "{{ cd }}/src"
+          environment: {ANSIBLE_NOCOLOR: '1', ANSIBLE_RETRY_FILES_ENABLED: '0'}
+          register: _grr
+          changed_when: false
+          failed_when: false
+
+        - name: Record the reach run (the verdict rc / out are the generated entry's; the generation run must have passed)
+          ansible.builtin.set_fact:
+            _run: {rc: "{{ _grr.rc }}", out: "{{ _gr.stdout ~ '\n' ~ _gr.stderr ~ '\n' ~ _grr.stdout ~ '\n' ~ _grr.stderr }}"}
+            _fail: >-
+              {{ _fail
+                 + ([] if _greach.guard_header in (_grr.stdout ~ _grr.stderr) else ['unreached: ' ~ _greach.guard_header])
+                 + (_gbody.results | map(attribute='content') | map('b64decode') | map('from_yaml') | map('first') | map(attribute='name')
+                    | map('regex_replace', '^(.*)$', 'TASK [\1]') | select('in', _grr.stdout ~ _grr.stderr)
+                    | map('regex_replace', '^', 'a body task ran before the refusal: ') | list) }}
+
+    - name: A reach case whose generation did not pass fails the case
+      ansible.builtin.set_fact:
+        _fail: "{{ _fail + ['generation rc ' ~ _gr.rc ~ ' before reach'] }}"
+      when:
+        - _xc.generation.reach is defined
+        - (_gr.rc | int) != 0
+
+    # r5u-rf4 (codex-tick526 RF3-PRELAUNCH-VERDICT-SOURCE): the generation block ran to its end (clone, prepare,
+    # produced writes, launch and -- for a reach case -- reach, each with its own recorded outcome); only now does the
+    # verdict publish the clone's source and the launch record
+    - name: The generation stage reached (the verdict's source / launch evidence exists)
+      ansible.builtin.set_fact:
+        _gstage: "{{ C.harness.generation.verdict_stage.generated }}"
+
+# r5u-rf3 (codex-tick518 RF2-PRELAUNCH-REACH-FALSE-PASS; OD-a): a captured pre-launch refusal proves ONLY the stage
+# actually reached (the pre-launch checks). Its rescue keeps the reset rc and records the refusal, and _gref skips the
+# whole generation block -- the reach checks AND the generation-failure accounting ("A reach case whose generation did
+# not pass fails the case"). A declared reach case expects only rc fail plus the grammar marker (its refusal code is
+# the route's, needle_pending R2), so any unrelated pre-launch refusal would satisfy it. Every declared reach case
+# whose pre-launch capture set _gref therefore FAILS here, whatever its output. (A non-reach generation negative names
+# a generator-stage code -- ENTRY-GENERATION-WITHHELD, RH-*, TRANSFER-* -- that no pre-launch check emits, and a
+# generation positive expects rc 0, which the reset rc never is.) The failure is the ONE declared text
+# harness.texts.reach_prelaunch (no restated literal; a control names it by key).
+# r5u-rf4 (codex-tick526 RF3-INNER-FAILURE-CUSTODY): the failure also records its declared IDENTITY
+# (harness.inner_failure.reasons.reach_prelaunch, a harness.texts key) so a control matches identities and counts, never
+# text alone; the raw text stays in _fail.
+- name: "{{ case.id }} -- a reach case whose pre-launch checks refused fails (the generation and the reach did not run)"
+  ansible.builtin.set_fact:
+    _fail: "{{ _fail + [C.harness.texts[C.harness.inner_failure.reasons.reach_prelaunch]] }}"
+    _hreasons: "{{ _hreasons + [C.harness.inner_failure.reasons.reach_prelaunch] }}"
+  when:
+    - case.kind == 'generation'
+    - _gref
+    - _xc.generation is defined
+    - _xc.generation is mapping
+    - _xc.generation.reach is defined
+
+# ============================ genesis kinds (brr-follow-s2 PJ-CONTROLS / U-12) ============================
+# The kinds listed in CASES harness.genesis.kinds (the ONE list) run in controls/genesis_case.yml: typed variants
+# (one isolated run per variant), the declared outcome vocabulary (statuses read from genesis.entry / bootstrap.refusals,
+# never restated), the operator-input producer (the same projected domains as the generation kind) and the host
+# binding (CONTROLS-GENESIS-HOST-UNBOUND until MAIN's QEMU leg supplies it, SC-S2-HOST). It sets _run, _fail, _gstage,
+# _hreasons and _gx (the per-variant evidence); the generic evaluator below does not run for these kinds (their
+# expectations are per variant and typed, not the top-level rc / out vocabulary).
+- name: "{{ case.id }} -- genesis kind"
+  ansible.builtin.include_tasks: genesis_case.yml
+  when:
+    - case.kind not in _k_unrun
+    - case.kind in C.harness.genesis.kinds
+
+- name: "{{ case.id }} -- genesis kind: raw inner verdict into custody (no expect.harness_failures for these kinds)"
+  ansible.builtin.set_fact:
+    _inner: {failed: "{{ _fail | length > 0 }}", failures: "{{ _fail }}", reasons: "{{ _hreasons }}"}
+  when:
+    - case.kind not in _k_unrun
+    - case.kind in C.harness.genesis.kinds
+
 # ============================ expectations (every runnable kind) ============================
 - name: "{{ case.id }} -- evaluate"
-  when: case.kind != 'integration'
+  when: case.kind not in _k_unrun and case.kind not in C.harness.genesis.kinds
   block:
+    # r5u-rf3 (codex-tick518 RF2-PRELAUNCH-REACH-FALSE-PASS control; OD-f accepted codex-tick526 for explicit negative
+    # controls only): a CONTROL reach case may declare expect.harness_failures -- declared inner-failure identities.
+    # r5u-rf4 (codex-tick526 RF3-INNER-FAILURE-CUSTODY): the RAW inner verdict is taken into custody FIRST (_inner:
+    # failed / failures / reasons -- never rewritten, published beside the outer result), then the ONE custody rule
+    # controls/inner_failure_custody.yml derives the OUTER failures: identities matched with exact occurrence counts
+    # (any expected / observed count difference is a declared mismatch diagnostic), a same-text alias is a declared
+    # ambiguity diagnostic, and only min(expected, observed) occurrences of a matched identity's raw text are consumed --
+    # every unmatched, extra or missing failure stays. Without the key the outer failures are the inner ones unchanged.
+    - name: Take the raw inner verdict into custody (before any expectation)
+      ansible.builtin.set_fact:
+        _inner: {failed: "{{ _fail | length > 0 }}", failures: "{{ _fail }}", reasons: "{{ _hreasons }}"}
+
+    - name: Derive the outer failures from the inner ones (the one custody rule; the declared expected identities or none)
+      ansible.builtin.include_tasks: inner_failure_custody.yml
+      vars:
+        ifc_failures: "{{ _fail }}"
+        ifc_reasons: "{{ _hreasons }}"
+        ifc_expected: "{{ _xc.expect.harness_failures if (_xc.expect.harness_failures is defined) else none }}"
+        ifc_texts: "{{ C.harness.texts }}"
+
+    - name: The outer failures so far (the custody result)
+      ansible.builtin.set_fact:
+        _fail: "{{ _ifc_outer }}"
+
     - name: rc and output
       ansible.builtin.set_fact:
         _fail: >-
@@ -583,10 +2162,16 @@
           when: item.rc | default(1) == 0 and (item.stdout_lines | length != 2 or item.stdout_lines[0] != item.stdout_lines[1])
 
 # ============================ verdict ============================
+# r5u-rf4 (codex-tick526): every verdict publishes `stage` (generation: the declared verdict_stage reached; null for
+# other kinds) and `inner` (the raw inner verdict in custody: failed / failures / reasons) beside the OUTER result
+# (ok / failures); out_tail is kept whenever either failed. A generation case refused before launch (stage
+# verdict_stage.pre_launch) publishes NO source_commit / source_tree / source_parent / launch -- nothing was cloned or
+# launched, and _case_src.parent is assigned only by the generation block (RF3-PRELAUNCH-VERDICT-SOURCE); the
+# aggregate accounts it by stage (run_controls.yml), never as a source mismatch and never as a generation that ran.
 - name: "{{ case.id }} -- write the verdict"
   ansible.builtin.copy:
     content: >-
-      {{ {'id': case.id, 'kind': case.kind, 'ok': (_fail | length == 0) if case.kind != 'integration' else none,
+      {{ {'id': case.id, 'kind': case.kind, 'ok': (_fail | length == 0),
           'rc': _run.rc | int, 'failures': _fail, 'status': case.status | default('declared'),
           'narrower': {'phase': 'local stand-in target; resolved rh via resolve_policy but no managed generation (resolve_harness/receipt not run); uid overrides',
                        'gate': 'route launcher rendered from the resolved policy in the case dir (not an admitted bundle) + fake seed + fake ssh; wrapper logic only',
@@ -594,14 +2179,21 @@
                        'regex': 'macro evaluation only',
                        'scope': 'synthetic schema-3 projections (harness.scope_fixture) through the real scope task files; no resolver, no transport',
                        'source': 'source_ref.yml admission against a local fixture clone of this repository; the fixture is not the candidate',
+                       'generation': 'the route generator (package.yml stage) under the declared genesis launch in a per-case clone (fixture commit on the admitted one when relocated / mutated), and for a reach case the generated entry placed at output_rel and run with a pinned derived name; not a seed-dispatched or packaged run',
+                       'genesis_entry': 'the COMMITTED generated genesis entry run by its declared invocation on the BOUND host checkout (host binding record per variant; fixture bytes produced by the binding producer and verified by commit ancestry only); isolated variants each on their own checkout at one baseline',
                        'integration': 'declared, not run'}[case.kind],
-          'out_tail': (_run.out | string)[-1500:] if (_fail | length > 0) else ''}
+          'out_tail': (_run.out | string)[-1500:] if ((_fail | length > 0) or _inner.failed) else '',
+          'stage': _gstage, 'inner': _inner}
          | combine({'source_commit': _case_src.commit, 'source_tree': _case_src.tree, 'load_paths': _case_lp} if case.kind == 'phase' else {})
+         | combine({'source_commit': _case_src.commit, 'source_tree': _case_src.tree, 'source_parent': _case_src.parent, 'launch': _gen}
+                   if (case.kind == 'generation' and _gstage == C.harness.generation.verdict_stage.generated) else {})
+         | combine({'variants': _gx, 'source_parent': sr.commit}
+                   if (case.kind in C.harness.genesis.kinds and _gstage == C.harness.generation.verdict_stage.generated) else {})
          | to_nice_json }}
     dest: "{{ wr }}/verdicts/{{ case.id }}.json"
     mode: '0644'
-  when: case.kind != 'integration'
+  when: case.kind not in _k_unrun
 
 - name: "{{ case.id }} -- line"
   ansible.builtin.debug:
-    msg: "{{ case.id }}: {{ 'DECLARED-UNRUN' if case.kind == 'integration' else ('OK' if _fail | length == 0 else 'FAIL ' ~ (_fail | string)) }}"
+    msg: "{{ case.id }}: {{ 'DECLARED-UNRUN' if case.kind in _k_unrun else ('OK' if _fail | length == 0 else 'FAIL ' ~ (_fail | string)) }}"

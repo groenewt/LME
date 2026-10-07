@@ -417,21 +417,23 @@ END {
 
 {#- the fact gathering for ONE group-writable directory ${dvar} (declared tools only; needs $_uid): prints the
     private-group-facts/1 stream on stdout. The seed pipes it into the program; target_bootstrap.yml runs the same
-    text over its initial-contact raw channel and decides on the controller (tasks/decide_private_group.yml). -#}
+    text over its initial-contact raw channel and decides on the controller (tasks/decide_private_group.yml).
+    codex-tick395 R2: every executable is a DECLARED role of owner_private_group (facts_tools.stat / .read / .filter,
+    identity_provider.enumeration_tool, acl_tool) -- the SAME references tasks/initial_contact.yml admits. -#}
 {%- macro private_group_facts(bs, dvar) -%}
 {% set pg = bs.path_admission.ancestry.owner_private_group %}
-_pgd=$({{ x(bs, 'stat') }} -c '%u %g %a' -- "${{ dvar }}"); _pgd_rc=$?
-_pgn=$({{ x(bs, 'cat') }} -- {{ shq(pg.identity_provider.nsswitch_file) }}); _pgn_rc=$?
+_pgd=$({{ x(bs, pg.facts_tools.stat) }} -c '%u %g %a' -- "${{ dvar }}"); _pgd_rc=$?
+_pgn=$({{ x(bs, pg.facts_tools.read) }} -- {{ shq(pg.identity_provider.nsswitch_file) }}); _pgn_rc=$?
 _pgp=$({{ x(bs, pg.identity_provider.enumeration_tool) }} passwd); _pgp_rc=$?
 _pgg=$({{ x(bs, pg.identity_provider.enumeration_tool) }} group); _pgg_rc=$?
 _pga=$({{ x(bs, pg.acl_tool) }} -c -n -p -P -- "${{ dvar }}"); _pga_rc=$?
 {
   printf 'owner\t%s\npath\t%s\ndir\t%s\n' "$_uid" "${{ dvar }}" "$_pgd"
   printf 'rc\tdir\t%s\nrc\tnss\t%s\nrc\tpasswd\t%s\nrc\tgroup\t%s\nrc\tacl\t%s\n' "$_pgd_rc" "$_pgn_rc" "$_pgp_rc" "$_pgg_rc" "$_pga_rc"
-  printf '%s\n' "$_pgn" | {{ x(bs, 'sed') }} 's/^/nsl\t/'
-  printf '%s\n' "$_pgp" | {{ x(bs, 'sed') }} 's/^/pwl\t/'
-  printf '%s\n' "$_pgg" | {{ x(bs, 'sed') }} 's/^/grl\t/'
-  printf '%s\n' "$_pga" | {{ x(bs, 'sed') }} 's/^/acl\t/'
+  printf '%s\n' "$_pgn" | {{ x(bs, pg.facts_tools.filter) }} 's/^/nsl\t/'
+  printf '%s\n' "$_pgp" | {{ x(bs, pg.facts_tools.filter) }} 's/^/pwl\t/'
+  printf '%s\n' "$_pgg" | {{ x(bs, pg.facts_tools.filter) }} 's/^/grl\t/'
+  printf '%s\n' "$_pga" | {{ x(bs, pg.facts_tools.filter) }} 's/^/acl\t/'
 }
 {%- endmacro -%}
 
@@ -586,7 +588,7 @@ case "$_iavail" in ''|*[!0-9]*) lme_refuse {{ a.refusal }} "free inodes unreadab
 {%- macro work_dirs(bs) -%}
 {%- set w = bs.work_roots -%}
 {%- set ns = namespace(d=[]) -%}
-{%- for s in w.run_env | map(attribute='sub') | unique -%}{%- set ns.d = ns.d + [w.sub_roots[s]] -%}{%- endfor -%}
+{%- for s in w.run_env | map(attribute='sub') | unique(case_sensitive=true) -%}{%- set ns.d = ns.d + [w.sub_roots[s]] -%}{%- endfor -%}
 {%- for e in w.run_env | selectattr('kind', 'equalto', 'dir') -%}{%- set ns.d = ns.d + [w.sub_roots[e.sub] ~ '/' ~ e.rel] -%}{%- endfor -%}
 {%- for r in [w.engine_storage_conf.graphroot_rel, w.engine_storage_conf.runroot_rel, w.engine_containers_conf.image_copy_tmp_rel] -%}{%- set ns.d = ns.d + [w.sub_roots.engine_storage ~ '/' ~ r] -%}{%- endfor -%}
 {{ ns.d | join('\n') }}
@@ -1139,11 +1141,309 @@ else
 fi
 {%- endmacro -%}
 
+{#- run_local.pinned_vars as ONE JSON object in shell variable <var> (RH-RUNLOCAL-OVERRIDES): the one rendering shared
+    by the run-local runner launch and the entry verifier launch (r2i); placeholders {run_tmp} / {venv_python}
+    become the given shell words. -#}
+{%- macro pinned_vars_json(rl, var, run_tmp, venv_python) -%}
+{% set pv = namespace(fmt=[], args=[]) %}
+{% for k, v in rl.pinned_vars | dictsort %}
+{% if v is sameas true or v is sameas false %}{% set pv.fmt = pv.fmt + ['"' ~ k ~ '":' ~ (v | string | lower)] %}
+{% else %}{% set pv.fmt = pv.fmt + ['"' ~ k ~ '":"%s"'] %}{% set pv.args = pv.args + ['"' ~ (v | string | replace('{run_tmp}', run_tmp) | replace('{venv_python}', venv_python)) ~ '"'] %}{% endif %}
+{% endfor %}
+{{ var }}=$(printf {{ shq('{' ~ (pv.fmt | join(',')) ~ '}') }} {{ pv.args | join(' ') }})
+{%- endmacro -%}
+
+{#- ---- ENTRY VERIFY (route r2i; codex-tick424 item 7 before_dependent_invocation; B X-R2-4) ----
+    Emitted on BOTH seed paths immediately before the dependent exec: run-local (inside run_local_exec, before the
+    lme_resolved_run record that stays LAST) and the normal run (before its exec). dp = the explicit declared template
+    input lme_seed_dispatch (policy controller.entry_generation.dispatch). Requires _co _bm _run _user R G SELF.
+    (1) r2j: source_admit (above) runs FIRST and ALWAYS: it reads the recorded edition once, admits the bootstrap
+        members and the selected importer closure, and yields the launcher record rh_source_bootstrap ($_sa_bs), passed
+        on every managed run (dependent and verifier child) instead of r2i's edition-only word;
+    (2) SELECTION, no caller flag: run-local = the runner's playbook rel ($_rl_pb) against dp.entries; normal run =
+        (brr-follow) the ONE playbook admitted through the declared run grammar ($_rn_pbr) against <realpath checkout>/<entry>. An unselected run
+        gains NO dependency (no verifier, no extra read) -- only the always-passed receipt / edition words;
+    (3) when anything is selected: the verifier closure and the source-admission members must be the bytes the bundle
+        packaged (bundle.json source.inputs "<rel><separator><sha256>", the generalised checkout_binding); the selected
+        entries, the roster authority and the accepted record are measured; the verifier runs as a CHILD (never exec,
+        never a nested seed: the root lock fd 9 is held here and closed for the child) under the admitted managed
+        generation with a CLOSED argv; any failure refuses dp.refusals.verify before the dependent playbook starts;
+    (4) the measured bytes are re-hashed after the verifier: any change refuses dp.refusals.drift;
+    (5) the receipt {roster_rel, roster_sha256, source_edition, outputs} (B X-R2-4) is ALWAYS appended (empty when
+        nothing is selected) so a caller-supplied value never survives (extra-vars: last wins, hash_behaviour replace).
+    LIMIT (stated): the dependent ansible-playbook reads its entry file after (4); a same-uid writer racing that window
+    is outside what the seed can bind (the entries' first guard re-checks the receipt against the bytes it runs). -#}
+{#- ---- SOURCE ADMIT (route r2j; codex-tick440 R2I-BOOTSTRAP-TRUST-ORDER; codex-tick446 R1S8-EARLY-CONTEXT c) ----
+    The EXISTING trusted pre-Ansible launcher (this seed: bundle.sha256 + bundle.json bind its own digest) admits, BEFORE
+    any playbook byte is interpreted, (1) UNCONDITIONALLY every bootstrap member sa.members_rel (the bound declaration
+    manifests/profiles/remote-harness.yml, global.yml, the loader, admit_loader_source.yml / admit_git_paths.yml /
+    refuse_pinned_outputs.yml / resolve_policy.yml -- i.e. the early-view PRODUCER and its source admission) and (2)
+    the launched playbook's DECLARED importer closure sa.importers[<rel>] (C1 projects it from transfer.decl entry_guard
+    .protected_set_members + the protected set + the generated entries; B r5m) against bundle.json source.inputs lines
+    "<rel><checksum_format.separator><sha256>"; then it emits ONE launcher record rh_source_bootstrap
+    {edition (bundle.json repo_head), declaration_rel, declaration_sha256 (the digest of the bytes just admitted),
+    declaration_path, controller_delegate; r2k + context; r2l + tools} as an -e word APPENDED AFTER every caller word
+    (codex-tick473 X_R2K_TSI_ORDER option 1: after every caller word and every word able to define the same name; the
+    run-local seed-generated lme_resolved_run word with disjoint ownership may follow -- order unchanged) (extra-vars: last wins; the
+    run-local closed grammar also refuses the name, C1-R2J-11) -- check.yml play 1 (run_local.runners.transfer_check)
+    therefore receives the early view's root before it interprets anything. Run-local: a runner playbook without a
+    declared importer closure refuses (runners are declared). Normal run: the bootstrap members are still admitted
+    unconditionally; brr-follow (OD-S3-03): the playbook selected by the declared run grammar must be a declared
+    importer or the run REFUSES (an UNLISTED playbook is never launched; fixture entrypoints receive a declared closure
+    via runners.<r>.requires or dispatch_admission.authored). Requires _co _bm. Sets _sa_ed _sa_bs (normal run also
+    _rn_inv _rn_pbr and the rebuilt argv). -#}
+{%- macro source_admit(bs, sel, _sa_tools_json) -%}
+{% set sa = bs.source_admission %}
+{% set cf = bs.bundle.checksum_format %}
+{% set rl = bs.work_roots.run_local %}
+{% set bi = sa.bootstrap_input %}
+{#- r2k X_R1_S10_1 (codex-tick463): + context = the COMPLETE typed effective early context, rendered HERE by the ONE
+    normal loader's result the generator consumes (bs = lme_resolved controller.bootstrap: base + profile + operator
+    override applied LAST through the existing configuration path), projected by the declared early_view.context_fields
+    key paths; the seed bytes carrying it are admitted (bundle / receipt) like every other seed byte. -#}
+{#- brr-follow (f05-s3 S3-SEAM-03 / S3-SEAM-04, OD-S3-01): the context ALSO carries the launch_context_fields values
+    (rel_path), walked over the SAME bs node; the two maps are disjoint (an overlap fails the render, typed). -#}
+{#- genesis PJ-SEED-03 (OD-S3-07 / F05 S3-SEAM-03): the context record is the ONE construction bootstrap_context(bs)
+    (GEN2-SEED-01; shared with the genesis entry). The disjointness refusal stays HERE, first: the shared construction
+    merges the two maps (last pair wins) and would otherwise mask an overlap. -#}
+{% if (sa.early_view.context_fields.keys() | list | select('in', sa.early_view.launch_context_fields.keys() | list) | list | length) > 0 %}{#
+  context_fields and launch_context_fields are disjoint -#}{{ sa['REFUSED source_admission.early_view context_fields and launch_context_fields overlap'].refused }}{% endif %}
+{% set _sa_ctx_json = bootstrap_context(bs) %}
+{#- r2l + r2n OD-01 (a-prime): _sa_tools_json (the packaged tools record) is a PARAMETER, computed by the seed entry
+    template lme-controller-seed.sh.j2 (seed artifact only) and passed seed -> run_local_exec / entry_verify -> here;
+    this shared macros file never reads the not_embedded scoped field. -#}
+{% if (bi.record_keys | sort) != ['context', 'controller_delegate', 'declaration_path', 'declaration_rel', 'declaration_sha256', 'edition', 'tools'] %}{#
+  the generator supports exactly the interface record keys -#}{{ sa['REFUSED source_admission.bootstrap_input.record_keys unsupported by the seed generator'].refused }}{% endif %}
+{% if rl.resolved_run.var == bi.var %}{#
+  r2l (codex-tick473 X_R2K_TSI_ORDER option 1 required_invariants): the seed-generated run-local word that may FOLLOW the
+  bootstrap record must own a DISJOINT top-level name; a declared resolved-run name equal to the record name fails the
+  render (admitted before any exec) -#}{{ sa['REFUSED run_local.resolved_run.var collides with the bootstrap record name'].refused }}{% endif %}
+[ -n "$_co" ] && [ -n "$_bm" ] || lme_refuse {{ sa.refusals.input }} 'source admission without the admitted checkout and bundle manifest'
+_sa_ed=$({{ x(bs, 'sed') }} -n {{ shq('s/^ *"' ~ sa.bundle_edition_field ~ '": "\([' ~ sa.git.edition_class ~ ']*\)",*$/\\1/p') }} -- "$_bm") || lme_refuse {{ sa.refusals.input }} "cannot read the recorded source edition from $_bm"
+case "$_sa_ed" in ''|*[!{{ sa.git.edition_class }}]*) lme_refuse {{ sa.refusals.input }} "$_bm records no single source edition" ;; esac
+[ "${{ '{#' }}_sa_ed}" -eq {{ sa.git.edition_length | int }} ] || lme_refuse {{ sa.refusals.input }} "$_bm source edition is not {{ sa.git.edition_length | int }} characters"
+_sa_cl=
+_sa_bd=
+_sa_oe=
+_sa_dh=
+{#- brr-follow RR-06 / OD-S2-04 (a): importer_obligations and document_rels are GENERATION projections, read only when
+    the loader-enforced dispatch_admission.mode is `generation` (<=> entry_generation_contract.active, S3-SEAM-06 law); in
+    the declared / none modes neither key is read. sa.dispatch_admission.mode is read with no fallback: an absent node
+    fails the render. codex-tick548/549 (F05-S4): importer_obligations REPLACES the retired per-importer body list (the old key is refused
+    by the loader; never read here). -#}
+{% set _sa_gen = sa.dispatch_admission.mode == sa.dispatch_modes.generation %}
+{% set _sa_io = sa.importer_obligations if _sa_gen else {} %}
+{#- brr-follow-s2 (codex-tick558 (3)): an EMPTY importer_obligations mapping (and an importer whose entry mapping is
+    empty) is accepted -- nothing is flattened; a non-mapping value refuses typed; an importer not in sa.importers
+    refuses below; no private fallback. -#}
+{% if _sa_io is not mapping %}{#
+  the obligations projection is a mapping (possibly empty) -#}{{ sa['REFUSED source_admission.importer_obligations is not a mapping'].refused }}{% endif %}
+{% if (_sa_io.keys() | list | reject('in', sa.importers) | list | length) > 0 %}{#
+  every obligation-carrying importer is a declared importer -#}{{ sa['REFUSED source_admission.importer_obligations names an undeclared importer'].refused }}{% endif %}
+{#- brr-follow (codex-tick522 F05S2-RELATIVE-PATH-GRAMMAR; S3-SEAM-03): a body rel and a generated entry rel are
+    REPOSITORY-RELATIVE, so each is admitted by the launch-bound registry rel_path grammar, never the absolute
+    path_admission.regex. brr-follow-s2 J-GEN3-01 (F05-S4 F05-GEN3-01; the single-regex key is RETIRED): the grammar is
+    sa.rel_path_grammar = exactly {pattern, refused_components, separator, terminator} (F05-S4 groups-summary 36865155
+    grammar_final_shape: projected from contract_admission.path_law + patterns.rel_path; consumer_roles separator /
+    refused_line_terminator); this render-time (Jinja) consumer (J-S4C-02) refuses the declared terminator FIRST, then
+    fullmatches the pattern, then refuses a refused component of the split on the grammar's separator -- the F05 Jinja
+    consumer form; no separator, terminator or component literal here. -#}
+{% set _sa_rg = sa.rel_path_grammar %}
+{% if not (_sa_rg is mapping and (_sa_rg.keys() | list | sort) == ['pattern', 'refused_components', 'separator', 'terminator']
+           and _sa_rg.pattern is string and _sa_rg.separator is string and _sa_rg.terminator is string
+           and _sa_rg.refused_components is sequence and _sa_rg.refused_components is not string) %}{#
+  the grammar is exactly the declared four-key contract -#}{{ sa['REFUSED source_admission.rel_path_grammar is not the declared {pattern, refused_components, separator, terminator} contract'].refused }}{% endif %}
+{% for ob in _sa_io.values() %}{% if ob is not mapping %}{{ sa['REFUSED source_admission.importer_obligations value is not an entry mapping'].refused }}{% endif %}{% for e, prs in ob | dictsort %}{% if not (e is string and _sa_rg.terminator not in e and e is match('(?:' ~ _sa_rg.pattern ~ ')\\Z') and (e.split(_sa_rg.separator) | select('in', _sa_rg.refused_components) | list | length == 0) and '=' not in e and prs is sequence and prs is not string) %}{#
+  a generated entry key is <admitted rel without '='> and maps to a list of body pairs -#}{{ sa['REFUSED source_admission.importer_obligations entry unsupported by the seed generator'].refused }}{% endif %}{% for pr in prs %}{% if not (pr | length == 2 and pr[0] is string and _sa_rg.terminator not in pr[0] and pr[0] is match('(?:' ~ _sa_rg.pattern ~ ')\\Z')
+     and (pr[0].split(_sa_rg.separator) | select('in', _sa_rg.refused_components) | list | length == 0)
+     and '=' not in pr[0] and pr[1] is match('^[0-9a-f]{64}$')) %}{#
+  a body pair is <admitted rel without '='>, <64 lowercase hex> (the shell pair split uses '=') -#}{{ sa['REFUSED source_admission.importer_obligations pair unsupported by the seed generator'].refused }}{% endif %}{% endfor %}{% endfor %}{% endfor %}
+{#- r2k R2J-RUN-IMPORTER-COVERAGE (codex-tick454) + X-R1-S9-5 (R1 s9): the SAME declared importer closure is applied on
+    BOTH invocation modes. run-local: the runner's playbook rel (undeclared refuses, as in r2j). normal run (brr-follow):
+    the ONE playbook selected by the declared run grammar adds its importer's closure; an undeclared playbook REFUSES
+    (X-R2J-RUNSURFACE is historical evidence only, SUP01-SEAM06-LINE140-CORRECTION).
+    The selected importer's composed generated-play BODIES (codex-tick548/549: F05's ONE transitive projection
+    sa.importer_obligations[<importer>] = {<generated entry rel>: [[body_rel, body_sha256], ...]} over the importer AND
+    its composed closure; the values are flattened here) are admitted HERE, before launch: regular non-link file,
+    raw sha256 == the declared body_sha256 AND == the bundle-packaged line (so the verifier's one retained read proves
+    "replaced between admission and read", R1 BODY-05). Its KEYS ($_sa_oe) are the generated entries entry_verify
+    verifies before execution. -#}
+{% if sel == rl.mode %}
+case "$_rl_pb" in
+{% for p, cl in sa.importers | dictsort %}
+  {{ shq(p) }}) _sa_cl={{ shq(([p] + cl) | join(' ')) }}{% if p in _sa_io %} _sa_bd={{ shq(_sa_io[p].values() | sum(start=[]) | map('join', '=') | join(' ')) }} _sa_oe={{ shq(_sa_io[p].keys() | sort | join(' ')) }}{% endif %} ;;
+{% endfor %}
+  *) lme_refuse {{ sa.refusals.input }} "runner playbook $_rl_pb has no declared importer closure (source_admission.importers)" ;;
+esac
+{% else %}
+{#- brr-follow (codex-tick534 OD-S3-03, codex-tick530 OI-06; f05-s3 SUP01-SEAM06-LINE140-CORRECTION, which supersedes
+    X-R2J-RUNSURFACE for this successor): normal-run SELECTION binds through the DECLARED invocation grammar
+    bs.ssh_auth.run_grammar (MAIN-shared profile record BRR-PROF-05), never by classifying every file-valued word.
+    Word 1 = run_grammar.inventory_flag, word 2 = the inventory (a distinct role; not a source member), word 3 = the ONE
+    selected playbook; every further word is a run_local.arg_flags <value> pair (run_grammar.further: arg_flag_pairs,
+    OD-BRR-06). The selected playbook must resolve to <realpath checkout>/<declared importer>; ANY other playbook
+    REFUSES before Ansible reads it, in EVERY dispatch mode (mode none admits the run-local runners only, which are
+    importers). The argv is then REBUILT from the admitted words only (the playbook word becomes its admitted realpath),
+    so the dependent exec (normal run, below) receives exactly the parsed, admitted words plus the seed's own appended
+    words. -#}
+{% set rg = bs.ssh_auth.run_grammar %}
+{% if rg.further != 'arg_flag_pairs' %}{#
+  the only further-word form this generator implements -#}{{ sa['REFUSED ssh_auth.run_grammar.further unsupported by the seed generator'].refused }}{% endif %}
+_sa_cor=$({{ x(bs, 'realpath') }} -e -- "$_co") || lme_refuse {{ sa.refusals.input }} "cannot resolve the checkout $_co"
+[ $# -ge 3 ] && [ "$1" = {{ shq(rg.inventory_flag) }} ] || lme_refuse RH-SEED-USAGE "run expects {{ rg.inventory_flag }} <inventory> <playbook> [{{ rl.arg_flags | join('|') }} <value> ...] after -- (controller.bootstrap.ssh_auth.run_grammar)"
+_rn_inv=$2
+_rn_pbr=$({{ x(bs, 'realpath') }} -e -- "$3") || lme_refuse {{ sa.refusals.input }} "selected playbook $3 does not resolve"
+_sa_i=0; _sa_pair=''
+for _sa_a in "$@"; do
+  _sa_i=$((_sa_i + 1))
+  [ "$_sa_i" -gt 3 ] || continue
+  if [ -n "$_sa_pair" ]; then _sa_pair=''; continue; fi
+  case "$_sa_a" in
+    {% for f in rl.arg_flags %}{{ shq(f) }}{% if not loop.last %}|{% endif %}{% endfor %}) _sa_pair=1 ;;
+    *) lme_refuse RH-SEED-USAGE "run accepts only {{ rl.arg_flags | join('/') }} <value> pairs after the selected playbook (controller.bootstrap.ssh_auth.run_grammar), not: $_sa_a" ;;
+  esac
+done
+[ -z "$_sa_pair" ] || lme_refuse RH-SEED-USAGE "run: {{ rl.arg_flags | join('/') }} without a value"
+case "$_rn_pbr" in
+{% for p, cl in sa.importers | dictsort %}
+  "$_sa_cor"/{{ shq(p) }}) _sa_cl={{ shq(([p] + cl) | join(' ')) }}{% if p in _sa_io %}; _sa_bd={{ shq(_sa_io[p].values() | sum(start=[]) | map('join', '=') | join(' ')) }}; _sa_oe={{ shq(_sa_io[p].keys() | sort | join(' ')) }}{% endif %} ;;
+{% endfor %}
+  *) lme_refuse {{ sa.refusals.input }} "selected playbook $3 ($_rn_pbr) has no declared importer closure (source_admission.importers); refused before Ansible reads it" ;;
+esac
+shift 3
+set -- {{ shq(rg.inventory_flag) }} "$_rn_inv" "$_rn_pbr" "$@"
+{% endif %}
+{#- brr-follow (codex-tick530 OI-03, f05-s3 S3-SEAM-05): in generation mode the admitted document rels
+    (sa.document_rels values, sorted by name) join the bootstrap member loop -- the SAME projection package.yml packages;
+    no read of the key in any other mode. -#}
+{% set _sa_dr = (sa.document_rels | dictsort | map('last') | list) if _sa_gen else [] %}
+for _sa_f in {% for _sa_m in sa.members_rel + _sa_dr %}{{ ' ' if not loop.first }}{{ shq(_sa_m) }}{% endfor %} $_sa_cl; do
+  _sa_p="$_co/$_sa_f"
+  [ -f "$_sa_p" ] && [ ! -L "$_sa_p" ] || lme_refuse {{ sa.refusals.member }} "source member $_sa_f is not a regular file in $_co"
+  _sa_h=$({{ x(bs, 'sha256sum') }} -- "$_sa_p") || lme_refuse {{ sa.refusals.member }} "cannot digest $_sa_p"
+  {{ x(bs, 'grep') }} -q -F "\"$_sa_f{{ cf.separator }}${_sa_h%% *}\"" -- "$_bm" || lme_refuse {{ sa.refusals.member }} "$_sa_f differs from the packaged source ($_bm)"
+  [ "$_sa_f" != {{ shq(bi.declaration_rel) }} ] || _sa_dh=${_sa_h%% *}
+done
+for _sa_w in $_sa_bd; do
+  _sa_f=${_sa_w%%=*}
+  _sa_p="$_co/$_sa_f"
+  [ -f "$_sa_p" ] && [ ! -L "$_sa_p" ] || lme_refuse {{ sa.refusals.member }} "generated-play body $_sa_f is not a regular file in $_co"
+  _sa_h=$({{ x(bs, 'sha256sum') }} -- "$_sa_p") || lme_refuse {{ sa.refusals.member }} "cannot digest $_sa_p"
+  [ "${_sa_h%% *}" = "${_sa_w#*=}" ] || lme_refuse {{ sa.refusals.member }} "generated-play body $_sa_f raw digest is not its declared body_sha256"
+  {{ x(bs, 'grep') }} -q -F "\"$_sa_f{{ cf.separator }}${_sa_h%% *}\"" -- "$_bm" || lme_refuse {{ sa.refusals.member }} "$_sa_f differs from the packaged source ($_bm)"
+done
+[ -n "${_sa_dh:-}" ] || lme_refuse {{ sa.refusals.input }} 'the bound declaration is not a source-admission member'
+_sa_bs=$(printf {{ shq('{"' ~ bi.var ~ '":{"edition":"%s","declaration_rel":"%s","declaration_sha256":"%s","declaration_path":' ~ (bi.declaration_path | tojson) ~ ',"controller_delegate":"%s","context":' ~ (_sa_ctx_json | replace('\\', '\\\\') | replace('%', '%%')) ~ ',"tools":' ~ (_sa_tools_json | replace('\\', '\\\\') | replace('%', '%%')) ~ '}}') }} "$_sa_ed" {{ shq(bi.declaration_rel) }} "$_sa_dh" {{ shq(sa.controller_delegate) }})
+{%- endmacro -%}
+
+{%- macro entry_verify(bs, dp, sel, _sa_tools_json) -%}
+{% set rl = bs.work_roots.run_local %}
+{% set cf = bs.bundle.checksum_format %}
+{#- brr-follow OD-BRR-07 (codex-tick543): the generation dispatch dp is consumed ONLY under dispatch mode generation --
+    the SAME selector source_admit applies (_sa_gen, sa.dispatch_admission.mode, read with no fallback). Otherwise the
+    caller passes no dispatch, dp is never read, and no empty dispatch view stands in for it. -#}
+{% set _ev_gen = bs.source_admission.dispatch_admission.mode == bs.source_admission.dispatch_modes.generation %}
+{% set fl = rl.arg_flags | first %}
+{% set ap = '$G/' ~ bs.layout.gen_dirs.venv ~ '/bin/ansible-playbook' %}
+{% if _ev_gen %}
+{% set ik = dp.input_keys %}
+{% set rk = dp.receipt_keys %}
+[ -n "$_co" ] && [ -n "$_bm" ] && [ -n "$_run" ] || lme_refuse {{ dp.refusals.verify }} 'entry verify without the admitted checkout, bundle manifest and run directory'
+{% endif %}
+{# r2j: the edition is read ONCE by source_admit (the edition word and its own read are WITHDRAWN here) -#}
+{{ source_admit(bs, sel, _sa_tools_json) }}
+{% if _ev_gen %}
+_ev_ed="$_sa_ed"
+_ev_sel=
+{% if sel == rl.mode %}
+case "$_rl_pb" in
+{% for e in dp.entries %}
+  {{ shq(e) }}) _ev_sel={{ shq(e) }} ;;
+{% endfor %}
+  *) : ;;
+esac
+{% else %}
+{#- brr-follow (OD-S3-03): the normal-run selection is the ONE playbook source_admit admitted through the declared run
+    grammar ($_rn_pbr, an admitted realpath), never a scan of every file-valued word (an inventory is not an entry). -#}
+_ev_cor=$({{ x(bs, 'realpath') }} -e -- "$_co") || lme_refuse {{ dp.refusals.verify }} "cannot resolve the checkout $_co"
+case "$_rn_pbr" in
+{% for e in dp.entries %}
+  "$_ev_cor"/{{ shq(e) }}) _ev_sel={{ shq(e) }} ;;
+{% endfor %}
+  *) : ;;
+esac
+{% endif %}
+{#- brr-follow codex-tick548/549 F05-S3-COMPOSED-BODY-ADMISSION: EVERY generated entry composed into the selected
+    launch (the keys of sa.importer_obligations[<selected importer>], F05's ONE transitive projection -- selected by
+    source_admit as $_sa_oe) is verified here as a generated entry, together with any directly launched one, BEFORE the
+    dependent playbook starts. No walk and no roster here: each key must be a roster entry (dp.entries) or the render
+    refuses. -#}
+{% for e in bs.source_admission.importer_obligations.values() | map('list') | sum(start=[]) %}{% if e not in dp.entries %}{#
+  a composed generated entry the roster does not carry -#}{{ dp['REFUSED source_admission.importer_obligations names a generated entry outside the dispatch roster'].refused }}{% endif %}{% endfor %}
+_ev_d="$_ev_sel"
+for _ev_o in $_sa_oe; do
+  [ "$_ev_o" = "$_ev_d" ] || _ev_sel="$_ev_sel${_ev_sel:+ }$_ev_o"
+done
+_ev_out=
+_ev_rs=
+_ev_rl=
+if [ -n "$_ev_sel" ]; then
+  {# r2j: the source members were admitted by source_admit; only the verifier closure remains here -#}
+  for _ev_f in {% for _ev_m in dp.closure_rel %}{{ ' ' if not loop.first }}{{ shq(_ev_m) }}{% endfor %}; do
+    _ev_p="$_co/$_ev_f"
+    [ -f "$_ev_p" ] && [ ! -L "$_ev_p" ] || lme_refuse {{ dp.refusals.verify }} "verifier closure member $_ev_f is not a regular file in $_co"
+    _ev_h=$({{ x(bs, 'sha256sum') }} -- "$_ev_p") || lme_refuse {{ dp.refusals.verify }} "cannot digest $_ev_p"
+    {{ x(bs, 'grep') }} -q -F "\"$_ev_f{{ cf.separator }}${_ev_h%% *}\"" -- "$_bm" || lme_refuse {{ dp.refusals.verify }} "$_ev_f differs from the packaged source ($_bm)"
+  done
+  _ev_m=
+  for _ev_f in $_ev_sel {{ shq(dp.roster_rel) }} {{ shq(dp.accepted_rel) }}; do
+    _ev_p="$_co/$_ev_f"
+    [ -f "$_ev_p" ] && [ ! -L "$_ev_p" ] || lme_refuse {{ dp.refusals.verify }} "$_ev_f is not a regular file in $_co"
+    lme_ancestry "$_ev_p"
+    _ev_h=$({{ x(bs, 'sha256sum') }} -- "$_ev_p") || lme_refuse {{ dp.refusals.verify }} "cannot digest $_ev_p"
+    _ev_m="$_ev_m${_ev_m:+ }$_ev_f=${_ev_h%% *}"
+  done
+  _ev_rl={{ shq(dp.roster_rel) }}
+  _ev_as=
+  for _ev_w in $_ev_m; do
+    case "${_ev_w%%=*}" in
+      {{ shq(dp.roster_rel) }}) _ev_rs=${_ev_w#*=} ;;
+      {{ shq(dp.accepted_rel) }}) _ev_as=${_ev_w#*=} ;;
+      *) _ev_out="$_ev_out${_ev_out:+,}\"${_ev_w%%=*}\":\"${_ev_w#*=}\"" ;;
+    esac
+  done
+  _ev_tmp="$_run/"{{ shq(dp.run_rel) }}
+  {{ x(bs, 'mkdir') }} -m 0700 -- "$_ev_tmp" "$_ev_tmp/ansible-home" "$_ev_tmp/tmp" || lme_refuse {{ dp.refusals.verify }} "cannot create $_ev_tmp"
+  lme_ancestry "$_ev_tmp/."
+  lme_ancestry "$_co/"{{ shq(dp.verifier_rel) }}
+  {{ pinned_vars_json(rl, '_ev_pin', '$_ev_tmp/tmp', '$G/' ~ bs.layout.gen_dirs.venv ~ '/bin/python') | indent(2) }}
+  _ev_iv=$(printf {{ shq('{"' ~ bs.inventory.root_var ~ '":"%s","' ~ bs.inventory.owner_var ~ '":"%s"}') }} "$R" "$_user")
+  _ev_in=$(printf {{ shq('{"' ~ dp.input_var ~ '":{"' ~ ik.edition ~ '":"%s","' ~ ik.roster ~ '":"%s","' ~ ik.accepted ~ '":"%s","' ~ ik.outputs ~ '":{%s}}}') }} "$_ev_ed" "$_ev_rs" "$_ev_as" "$_ev_out")
+  {# r2j: the child verifier receives the SAME launcher bootstrap record (last word), never an edition-only word -#}
+  {{ managed_env(bs, '$_ev_tmp/ansible-home', '$_ev_tmp/tmp', [dp.mirror_env ~ '=$_ev_tmp']) }} "{{ ap }}" -i {{ shq(rl.inventory) }} -c {{ shq(rl.connection) }} "$_co/"{{ shq(dp.verifier_rel) }} {{ shq(fl) }} "$_ev_pin" {{ shq(fl) }} "$_ev_iv" {{ shq(fl) }} "$_ev_in" {{ shq(fl) }} "$_sa_bs" 9<&- \
+    || lme_refuse {{ dp.refusals.verify }} "the entry verifier refused $_ev_sel (verifier exit $?); the dependent playbook was not started"
+  _ev_m2=
+  for _ev_f in $_ev_sel {{ shq(dp.roster_rel) }} {{ shq(dp.accepted_rel) }}; do
+    _ev_p="$_co/$_ev_f"
+    [ -f "$_ev_p" ] && [ ! -L "$_ev_p" ] || lme_refuse {{ dp.refusals.drift }} "$_ev_f changed after verification"
+    _ev_h=$({{ x(bs, 'sha256sum') }} -- "$_ev_p") || lme_refuse {{ dp.refusals.drift }} "cannot re-digest $_ev_p"
+    _ev_m2="$_ev_m2${_ev_m2:+ }$_ev_f=${_ev_h%% *}"
+  done
+  [ "$_ev_m2" = "$_ev_m" ] || lme_refuse {{ dp.refusals.drift }} "verified bytes changed before use: $_ev_m -> $_ev_m2"
+fi
+_ev_rc=$(printf {{ shq('{"' ~ dp.receipt_var ~ '":{"' ~ rk.roster_rel ~ '":"%s","' ~ rk.roster ~ '":"%s","' ~ rk.edition ~ '":"%s","' ~ rk.outputs ~ '":{%s}}}') }} "$_ev_rl" "$_ev_rs" "$_ev_ed" "$_ev_out")
+set -- "$@" {{ shq(fl) }} "$_ev_rc" {{ shq(fl) }} "$_sa_bs"
+{% else %}
+{#- not generation: no generated entry is selected or verified; the admitted bootstrap record is still passed LAST -#}
+set -- "$@" {{ shq(fl) }} "$_sa_bs"
+{% endif %}
+{%- endmacro -%}
+
 {#- RUN-LOCAL exec (inside the verify/run block, after the W admission and the run dir): the checkout is the work
     root's parent (the work root must be named root_rel); the runner's evidence dir <W>/<run>/<runners.key> is created
     and passed LAST as its work_root_var; connection local is forced; the owner's user manager env is derived here
     (never carried from the caller); LME_SEED_SCOPED is NOT passed (a seed the runner calls enters its own scope). -#}
-{%- macro run_local_exec(bs) -%}
+{%- macro run_local_exec(bs, dp, _sa_tools_json) -%}
 {% set wr = bs.work_roots %}
 {% set rl = wr.run_local %}
 {% set rs = rl.resolved_run %}
@@ -1180,13 +1480,10 @@ _rc=$({{ x(bs, 'sha256sum') }} -- "{{ rcpt }}") || lme_refuse RH-SEED-GENERATION
 _rc=${_rc%% *}
 [ -z "$_rl_var" ] || set -- "$@" {{ shq(rl.arg_flags | first) }} "$_rl_var=$_ev"
 {# pinned_vars (RH-RUNLOCAL-OVERRIDES): one JSON -e after every caller value -#}
-{% set pv = namespace(fmt=[], args=[]) %}
-{% for k, v in rl.pinned_vars | dictsort %}
-{% if v is sameas true or v is sameas false %}{% set pv.fmt = pv.fmt + ['"' ~ k ~ '":' ~ (v | string | lower)] %}
-{% else %}{% set pv.fmt = pv.fmt + ['"' ~ k ~ '":"%s"'] %}{% set pv.args = pv.args + ['"' ~ (v | string | replace('{run_tmp}', '$_run/tmp') | replace('{venv_python}', '$_py')) ~ '"'] %}{% endif %}
-{% endfor %}
-_pin=$(printf {{ shq('{' ~ (pv.fmt | join(',')) ~ '}') }} {{ pv.args | join(' ') }})
+{{ pinned_vars_json(rl, '_pin', '$_run/tmp', '$_py') }}
 set -- "$@" {{ shq(rl.arg_flags | first) }} "$_pin"
+{# r2i ENTRY VERIFY: before the dependent exec; its edition / receipt words precede lme_resolved_run, which stays LAST -#}
+{{ entry_verify(bs, dp, rl.mode, _sa_tools_json) }}
 {# lme_resolved_run (RH-RUNNER-RESOLVED-WORKROOT, codex 144541; exactly rs.fields), passed LAST -#}
 {% set rv = namespace(fmt=[], args=[]) %}
 {% for l in env_rec %}{% set kv = l.split('=', 1) %}{% set rv.fmt = rv.fmt + ['"' ~ kv[0] ~ '":"%s"'] %}{% set rv.args = rv.args + ['"' ~ kv[1] ~ '"'] %}{% endfor %}
@@ -1199,111 +1496,22 @@ lme_ancestry "$_pb"
 exit $?
 {%- endmacro -%}
 
-{#- ---- the complete seed ---- -#}
-{%- macro seed(bs, ctl, lock) -%}
-{% set ssh_auth = bs.ssh_auth %}
-{% set rlm = bs.work_roots.run_local.mode %}
-#!/bin/sh
-# GENERATED by testing/remote_harness/package.yml from {{ cmt(bs.template_rel) }},
-# manifests/profiles/remote-harness.yml (remote_harness.controller) and {{ cmt(ctl.lock_file_rel) }}.
-# A BUILD OUTPUT in a local bundle; never committed, never hand-edited. The generation id binds this file's
-# sha256, and controller.yml refuses a receipt whose seed_sha256 is not a fresh render of the declarations.
-#
-# lme-controller-seed -- the ONE non-circular bootstrap of the managed LME toolchain: uv {{ cmt(bs.uv.version) }}
-#   (official installer, unmanaged, offline file:// base), CPython {{ cmt(bs.python.version) }} ({{ cmt(bs.python.install_mode) }},
-#   PBS {{ cmt(bs.python.pbs_release) }}), ansible-core {{ cmt(ctl.expect_core) }} and the lock's wheels/collections into
-#   <root>/{{ cmt(bs.layout.generations_dir) }}/<generation-id>. No ambient uv/python/pip/ansible, no network, never root,
-#   no shell startup edits. Artifacts come ONLY from <this file's directory>/{{ cmt(bs.bundle.artifacts_dir) }}.
-#
-# usage:
-#   lme-controller-seed.sh apply  --root <owned-root>
-#   lme-controller-seed.sh verify --root <owned-root>
-#   lme-controller-seed.sh purge  --root <owned-root> --confirm <owned-root>
-#   lme-controller-seed.sh run    --root <owned-root> --ssh-auth <mode> -- <ansible-playbook arguments>
-#   (mode: one of remote_harness.ssh_auth.modes; no default; agent mode carries a validated SSH_AUTH_SOCK)
-#   lme-controller-seed.sh {{ bs.work_roots.run_local.mode }} --root <work root>/{{ bs.work_roots.sub_roots.toolchain }} --runner <key> [-- {{ bs.work_roots.run_local.arg_flags | first }} <value> ...]
-#   (key: one of {{ bs.work_roots.run_local.runners | list | sort | join(', ') }}; inventory {{ bs.work_roots.run_local.inventory }}
-#   connection {{ bs.work_roots.run_local.connection }}; no --ssh-auth; only {{ bs.work_roots.run_local.arg_flags | join('/') }} <value> pairs after --, screened
-#   for pinned selectors; each runner's required_inputs as inline name=value; the seed appends -e <work_root_var>=<dir>,
-#   the pinned_vars JSON and, LAST, -e {"{{ bs.work_roots.run_local.resolved_run.var }}": {...}})
-# Before ANY effect (apply/verify/run/{{ rlm }}): the work root (run/{{ rlm }}: through the last /{{ bs.work_roots.root_rel }}/ of --root,
-#   its checkout bound to bundle.json) and every existing destination are admitted (capacity, fs type, custody,
-#   same device); path_admission.ancestry (incl. owner_private_group) is re-checked after the lock and before exec.
-# Every mode runs inside the declared budget scope and holds an exclusive lock on the root (busy -> RH-SEED-BUSY).
-# apply: complete generation for THIS seed -> verify + republish (UNCHANGED); incomplete generation recorded by this
-#        seed in {{ cmt(bs.layout.operations_log) }} -> moved to {{ cmt(bs.layout.abandoned_dir) }}/ and removed, then install; unrecorded
-#        incomplete generation -> refused and preserved. Other generations (other revisions) are retained.
-# run:   verify, prune run/ and check/ to the declared retention, then exec the generation's ansible-playbook with
-#        the declared environment and the selected ssh auth mode, lock held for the whole playbook (serial per root;
-#        a nested seed call on the same root refuses BUSY at once, never waits).
-# apply refuses before any mutation unless its own directory is a complete, bound bundle (bundle.sha256 +
-#        bundle.json). purge destroys nothing unless every entry is in the owned-removal inventory.
-# exit: 0 ok; refusals print 'REFUSED <code> <detail>' on stderr with the declared status.
-set -u
-umask 077
-{{ refusal_fn(bs.refusals) }}
-lme_phase() {
-  [ -z "${PHASE_LOG:-}" ] || printf '%s\t%s\n' "$({{ x(bs, 'date') }} -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$PHASE_LOG"
-  printf 'lme-controller-seed: %s\n' "$1" >&2
-}
-LME_PINS={{ shq(pins_table(bs, ctl, lock) | trim) }}
-{{ launch_base_check(bs) }}
-
-[ "$({{ x(bs, 'id') }} -u)" != 0 ] || lme_refuse RH-SEED-PRIVILEGED 'the seed never runs as root'
-case "${HOME:-}" in /*) : ;; *) lme_refuse RH-SEED-USAGE 'HOME must be an absolute path' ;; esac
-MODE=${1:-}; [ $# -gt 0 ] && shift
-R=''; CONFIRM=''; SSH_AUTH=''; RUNNER=''
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --root) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--root needs a value'; R=$2; shift 2 ;;
-    --runner) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--runner needs a value'; RUNNER=$2; shift 2 ;;
-    --confirm) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--confirm needs a value'; CONFIRM=$2; shift 2 ;;
-    --ssh-auth) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--ssh-auth needs a value'; SSH_AUTH=$2; shift 2 ;;
-    --) shift; break ;;
-    *) lme_refuse RH-SEED-USAGE "unknown argument: $1" ;;
-  esac
-done
-case "$MODE" in apply|verify|purge) [ $# -eq 0 ] || lme_refuse RH-SEED-USAGE "$MODE takes no arguments after --" ;; run|{{ rlm }}) : ;; *) lme_refuse RH-SEED-USAGE 'mode must be apply, verify, purge, run or {{ rlm }}' ;; esac
-[ -n "$R" ] || lme_refuse RH-SEED-USAGE '--root is required (no default)'
-{{ path_arg_check(bs, 'R', '--root') }}
-[ "$MODE" != purge ] || [ "$CONFIRM" = "$R" ] || lme_refuse RH-SEED-USAGE 'purge needs --confirm equal to --root'
-{{ ssh_auth_check(bs, ssh_auth) }}
-{{ combination_check(bs, ctl) }}
-{{ os_tool_checks(bs) }}
-{{ launch_derive(bs) }}
-{{ run_local_args(bs) }}
-{{ platform_check(bs) }}
-{{ ancestry_fn(bs) }}
-{{ dest_fn(bs) }}
-{{ root_check(bs) }}
-
-SELF=$({{ x(bs, 'realpath') }} -e -- "$0") || lme_refuse RH-SEED-USAGE 'cannot resolve the seed path'
-{{ path_arg_check(bs, 'SELF', 'the seed path') }}
-A="${SELF%/*}/{{ bs.bundle.artifacts_dir }}"
-case "$MODE" in
-  purge) set -- "$MODE" --root "$R" --confirm "$CONFIRM" ;;
-  run) set -- "$MODE" --root "$R" --ssh-auth "$SSH_AUTH" -- "$@" ;;
-  {{ rlm }}) set -- "$MODE" --root "$R" --runner "$RUNNER" -- "$@" ;;
-  *) set -- "$MODE" --root "$R" -- ;;
-esac
-{{ budget_enter(bs) }}
-case "$MODE" in
-  purge) set -- ;;
-  run|{{ rlm }}) shift 5; [ "${1:-}" != -- ] || shift ;;
-  *) shift 3; [ "${1:-}" != -- ] || shift ;;
-esac
-
-UTC=$({{ x(bs, 'date') }} -u +%Y%m%dT%H%M%SZ)
-OP_ID="$UTC-$$"
-SEED_SHA=$({{ x(bs, 'sha256sum') }} -- "$SELF") || lme_refuse RH-SEED-USAGE 'cannot digest the seed'
-SEED_SHA=${SEED_SHA%% *}
+{#- ---- GENERATION LIFECYCLE (genesis successor 02; codex-tick542 GEN-STABLE-GENERATION, OD-GEN-08; codex-tick543
+     OD-S3-08). The seed's own lifecycle, LIFTED VERBATIM out of seed() so the cold genesis entry runs the SAME bytes
+     (no second lifecycle, no new framework). Callers: seed() (apply / verify / run / run-local / purge) and the genesis
+     entry (macros/genesis_entry.j2; MODE = genesis.entry.generation.seed_mode). Contract (unchanged): the caller has
+     set R, MODE, OP_ID, UTC, SEED_SHA, SELF, A, LME_PINS, _uid / _parent / _marker / ROOT_STATE (root_check),
+     lme_refuse, lme_phase, lme_ancestry, lme_dest and lme_bundle_check (the caller's artifact-source admission),
+     and defined verify_fns. generation_root takes and KEEPS the root lock (fd 9, exclusive, non-blocking: BUSY).
+     generation_apply ends the process (exit 0 UNCHANGED, refusals exit non-zero; INSTALLED is its last line): a
+     caller that continues runs it in a subshell and propagates its status. ---- -#}
+{%- macro generation_id(bs, ctl) -%}
 GEN_ID="core{{ ctl.expect_core }}-py{{ bs.python.version }}-uv{{ bs.uv.version }}-$(printf '%.12s' "$SEED_SHA")"
 G="$R/{{ bs.layout.generations_dir }}/$GEN_ID"
-{{ verify_fns(bs, ctl) }}
-{{ bundle_check(bs, lock) }}
-W=''; _co=''
-{{ admit_storage(bs, rlm) }}
+{%- endmacro -%}
 
+{%- macro generation_root(bs) -%}
+{% set rlm = bs.work_roots.run_local.mode %}
 # ---- root creation (apply only) and the operation lock (every mode) ----
 if [ "$ROOT_STATE" = absent ]; then
   case "$MODE" in
@@ -1361,50 +1569,9 @@ exec 9<"$R" || lme_refuse RH-SEED-ROOT-NOT-OWNED "cannot open $R for locking"
 [ -z "${_pl:-}" ] || exec 8<&-
 # use boundary: the ancestry rule again, now that the root lock is held and before the first write under R
 lme_ancestry "$R/."
+{%- endmacro -%}
 
-if [ "$MODE" = purge ]; then
-  {{ purge_inventory(bs) | indent(2) }}
-  {{ x(bs, 'chmod') }} -R u+w -- "$R" || lme_refuse RH-SEED-INSTALL-FAILED "cannot make $R writable"
-  {{ x(bs, 'rm') }} -rf --one-file-system -- "$R" || lme_refuse RH-SEED-INSTALL-FAILED "purge of $R failed"
-  [ ! -e "$R" ] || lme_refuse RH-SEED-INSTALL-FAILED "$R still exists after purge"
-  printf 'PURGED %s\n' "$R"
-  exit 0
-fi
-
-if [ "$MODE" = verify ] || [ "$MODE" = run ] || [ "$MODE" = {{ rlm }} ]; then
-  lme_verify_content
-  lme_verify_published
-  if [ "$MODE" = verify ]; then
-    printf '%s verify %s ok\n' "$UTC" "$GEN_ID" >> "$R/{{ bs.layout.check_dir }}/verify.log"
-    printf 'VERIFIED %s %s\n' "$GEN_ID" "$G"
-    exit 0
-  fi
-  _rd="$R/{{ bs.layout.run_dir }}"
-  [ ! -L "$_rd" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "$_rd is a link"
-  [ -d "$_rd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_rd" || lme_refuse RH-SEED-STORAGE "cannot create $_rd"
-  {{ prune_dir(bs, '"$_rd"', bs.layout.run_dir, bs.run_retention.keep) | indent(2) }}
-  {{ storage_check(bs, 'R', bs.run_retention.free_required_bytes) | indent(2) }}
-  # WORK ROOT (work_roots): W, anchored and admitted by admit_storage BEFORE any effect (WORKSPACE ANCHOR: through
-  # the last /{{ bs.work_roots.root_rel }}/ of R, bound to the packaged checkout); its capacity is re-read here, after
-  # the retention prune, immediately before the sub-roots are prepared
-  [ -n "$W" ] || lme_refuse {{ bs.work_roots.admission.refusal }} "no admitted work root for $R"
-  {{ work_root_check(bs, 'W') | indent(2) }}
-  {{ work_root_prepare(bs, 'W') | indent(2) }}
-  _run=$({{ x(bs, 'mktemp') }} -d "$_rd/$UTC.XXXXXXXX") || lme_refuse RH-SEED-STORAGE "cannot create a run directory under $_rd"
-  {{ x(bs, 'mkdir') }} -- "$_run/ansible-home" "$_run/tmp" || lme_refuse RH-SEED-STORAGE "cannot create $_run"
-  if [ "$MODE" = {{ rlm }} ]; then
-    {{ run_local_exec(bs) | indent(4) }}
-  fi
-  # the lock (fd 9) stays held BY THIS PROCESS for the whole playbook run (no concurrent apply/purge can swap the
-  # generation); the playbook gets fd 9 CLOSED, so ssh ControlPersist masters it spawns never retain the lock
-  # Q-D12 (codex-001716): the playbook inherits THIS run's budget scope (LME_SEED_SCOPED=1); a seed it invokes
-  # re-verifies the declared limits from its own cgroup (budget enforcement kept) and then meets the root lock held
-  # by this process: a nested same-root call refuses BUSY (15) at once, never waits, never runs unbudgeted.
-  lme_ancestry "$_run/."
-  {{ managed_env(bs, '$_run/ansible-home', '$_run/tmp') }} {{ work_env(bs, 'W') }} LME_SEED_SCOPED=1 {{ ssh_auth.env_mode }}="$SSH_AUTH" ANSIBLE_SSH_COMMON_ARGS="$_ssh_args" ${LME_CARRY_SOCK:+{{ ssh_auth.modes.agent.socket_env }}="$LME_CARRY_SOCK"} "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" "$@" 9<&-
-  exit $?
-fi
-
+{%- macro generation_apply(bs, ctl, lock) -%}
 # ---- apply ----
 for _d in "$R/{{ bs.layout.generations_dir }}" "$R/{{ bs.layout.abandoned_dir }}" "$R/{{ bs.layout.check_dir }}"; do
   [ -L "$_d" ] && lme_refuse RH-SEED-ROOT-NOT-OWNED "$_d is a link"
@@ -1504,4 +1671,175 @@ lme_log complete "$GEN_ID"
 lme_publish_active
 lme_verify_published
 printf 'INSTALLED %s %s\n' "$GEN_ID" "$G"
+{%- endmacro -%}
+
+{#- ---- the ONE launch-record context construction (genesis successor 02; OD-GEN-02 one declared field -> key-path
+     map; codex-tick536 + S3-SEAM-03 context union): {<field>: <value at its key path in bs>} over
+     early_view.context_fields + early_view.launch_context_fields (disjoint; F05 S3), as JSON. Callers: seed
+     source_admit (parent join PJ-SEED-03) and the genesis entry. ---- -#}
+{%- macro bootstrap_context(bs) -%}
+{%- set ev = bs.source_admission.early_view -%}
+{%- set cx = namespace(p=[]) -%}
+{#- genesis final J-FIN-SEED-01: builtin-only (the shared-artifact proof admits no combine); the pair lists of both
+    maps, re-sorted by key exactly as dictsort orders the combined map (sort default case_sensitive=false, like
+    dictsort), so the iteration order is the same whatever tojson does; the maps are disjoint (:1209) -#}
+{%- for f, kp in ((ev.context_fields | dictsort) + (ev.launch_context_fields | dictsort)) | sort(attribute='0') -%}{%- set nn = namespace(n=bs) -%}{%- for k in kp -%}{%- set nn.n = nn.n[k] -%}{%- endfor -%}{%- set cx.p = cx.p + [[f, nn.n]] -%}{%- endfor -%}
+{{ dict(cx.p) | tojson }}
+{%- endmacro -%}
+
+{#- ---- the complete seed ---- -#}
+{%- macro seed(bs, ctl, lock, disp, _sa_tools_json) -%}
+{% set ssh_auth = bs.ssh_auth %}
+{% set rlm = bs.work_roots.run_local.mode %}
+#!/bin/sh
+# GENERATED by testing/remote_harness/package.yml from {{ cmt(bs.template_rel) }},
+# manifests/profiles/remote-harness.yml (remote_harness.controller) and {{ cmt(ctl.lock_file_rel) }}.
+# A BUILD OUTPUT in a local bundle; never committed, never hand-edited. The generation id binds this file's
+# sha256, and controller.yml refuses a receipt whose seed_sha256 is not a fresh render of the declarations.
+#
+# lme-controller-seed -- the ONE non-circular bootstrap of the managed LME toolchain: uv {{ cmt(bs.uv.version) }}
+#   (official installer, unmanaged, offline file:// base), CPython {{ cmt(bs.python.version) }} ({{ cmt(bs.python.install_mode) }},
+#   PBS {{ cmt(bs.python.pbs_release) }}), ansible-core {{ cmt(ctl.expect_core) }} and the lock's wheels/collections into
+#   <root>/{{ cmt(bs.layout.generations_dir) }}/<generation-id>. No ambient uv/python/pip/ansible, no network, never root,
+#   no shell startup edits. Artifacts come ONLY from <this file's directory>/{{ cmt(bs.bundle.artifacts_dir) }}.
+#
+# usage:
+#   lme-controller-seed.sh apply  --root <owned-root>
+#   lme-controller-seed.sh verify --root <owned-root>
+#   lme-controller-seed.sh purge  --root <owned-root> --confirm <owned-root>
+#   lme-controller-seed.sh run    --root <owned-root> --ssh-auth <mode> -- <ansible-playbook arguments>
+#   (mode: one of remote_harness.ssh_auth.modes; no default; agent mode carries a validated SSH_AUTH_SOCK)
+#   lme-controller-seed.sh {{ bs.work_roots.run_local.mode }} --root <work root>/{{ bs.work_roots.sub_roots.toolchain }} --runner <key> [-- {{ bs.work_roots.run_local.arg_flags | first }} <value> ...]
+#   (key: one of {{ bs.work_roots.run_local.runners | list | sort | join(', ') }}; inventory {{ bs.work_roots.run_local.inventory }}
+#   connection {{ bs.work_roots.run_local.connection }}; no --ssh-auth; only {{ bs.work_roots.run_local.arg_flags | join('/') }} <value> pairs after --, screened
+#   for pinned selectors; each runner's required_inputs as inline name=value; the seed appends -e <work_root_var>=<dir>,
+#   the pinned_vars JSON and, LAST, -e {"{{ bs.work_roots.run_local.resolved_run.var }}": {...}})
+# Before ANY effect (apply/verify/run/{{ rlm }}): the work root (run/{{ rlm }}: through the last /{{ bs.work_roots.root_rel }}/ of --root,
+#   its checkout bound to bundle.json) and every existing destination are admitted (capacity, fs type, custody,
+#   same device); path_admission.ancestry (incl. owner_private_group) is re-checked after the lock and before exec.
+# Every mode runs inside the declared budget scope and holds an exclusive lock on the root (busy -> RH-SEED-BUSY).
+# apply: complete generation for THIS seed -> verify + republish (UNCHANGED); incomplete generation recorded by this
+#        seed in {{ cmt(bs.layout.operations_log) }} -> moved to {{ cmt(bs.layout.abandoned_dir) }}/ and removed, then install; unrecorded
+#        incomplete generation -> refused and preserved. Other generations (other revisions) are retained.
+# run:   verify, prune run/ and check/ to the declared retention, then exec the generation's ansible-playbook with
+#        the declared environment and the selected ssh auth mode, lock held for the whole playbook (serial per root;
+#        a nested seed call on the same root refuses BUSY at once, never waits).
+# apply refuses before any mutation unless its own directory is a complete, bound bundle (bundle.sha256 +
+#        bundle.json). purge destroys nothing unless every entry is in the owned-removal inventory.
+# exit: 0 ok; refusals print 'REFUSED <code> <detail>' on stderr with the declared status.
+set -u
+umask 077
+{{ refusal_fn(bs.refusals) }}
+lme_phase() {
+  [ -z "${PHASE_LOG:-}" ] || printf '%s\t%s\n' "$({{ x(bs, 'date') }} -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$PHASE_LOG"
+  printf 'lme-controller-seed: %s\n' "$1" >&2
+}
+LME_PINS={{ shq(pins_table(bs, ctl, lock) | trim) }}
+{{ launch_base_check(bs) }}
+
+[ "$({{ x(bs, 'id') }} -u)" != 0 ] || lme_refuse RH-SEED-PRIVILEGED 'the seed never runs as root'
+case "${HOME:-}" in /*) : ;; *) lme_refuse RH-SEED-USAGE 'HOME must be an absolute path' ;; esac
+MODE=${1:-}; [ $# -gt 0 ] && shift
+R=''; CONFIRM=''; SSH_AUTH=''; RUNNER=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--root needs a value'; R=$2; shift 2 ;;
+    --runner) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--runner needs a value'; RUNNER=$2; shift 2 ;;
+    --confirm) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--confirm needs a value'; CONFIRM=$2; shift 2 ;;
+    --ssh-auth) [ $# -ge 2 ] || lme_refuse RH-SEED-USAGE '--ssh-auth needs a value'; SSH_AUTH=$2; shift 2 ;;
+    --) shift; break ;;
+    *) lme_refuse RH-SEED-USAGE "unknown argument: $1" ;;
+  esac
+done
+case "$MODE" in apply|verify|purge) [ $# -eq 0 ] || lme_refuse RH-SEED-USAGE "$MODE takes no arguments after --" ;; run|{{ rlm }}) : ;; *) lme_refuse RH-SEED-USAGE 'mode must be apply, verify, purge, run or {{ rlm }}' ;; esac
+[ -n "$R" ] || lme_refuse RH-SEED-USAGE '--root is required (no default)'
+{{ path_arg_check(bs, 'R', '--root') }}
+[ "$MODE" != purge ] || [ "$CONFIRM" = "$R" ] || lme_refuse RH-SEED-USAGE 'purge needs --confirm equal to --root'
+{{ ssh_auth_check(bs, ssh_auth) }}
+{{ combination_check(bs, ctl) }}
+{{ os_tool_checks(bs) }}
+{{ launch_derive(bs) }}
+{{ run_local_args(bs) }}
+{{ platform_check(bs) }}
+{{ ancestry_fn(bs) }}
+{{ dest_fn(bs) }}
+{{ root_check(bs) }}
+
+SELF=$({{ x(bs, 'realpath') }} -e -- "$0") || lme_refuse RH-SEED-USAGE 'cannot resolve the seed path'
+{{ path_arg_check(bs, 'SELF', 'the seed path') }}
+A="${SELF%/*}/{{ bs.bundle.artifacts_dir }}"
+case "$MODE" in
+  purge) set -- "$MODE" --root "$R" --confirm "$CONFIRM" ;;
+  run) set -- "$MODE" --root "$R" --ssh-auth "$SSH_AUTH" -- "$@" ;;
+  {{ rlm }}) set -- "$MODE" --root "$R" --runner "$RUNNER" -- "$@" ;;
+  *) set -- "$MODE" --root "$R" -- ;;
+esac
+{{ budget_enter(bs) }}
+case "$MODE" in
+  purge) set -- ;;
+  run|{{ rlm }}) shift 5; [ "${1:-}" != -- ] || shift ;;
+  *) shift 3; [ "${1:-}" != -- ] || shift ;;
+esac
+
+UTC=$({{ x(bs, 'date') }} -u +%Y%m%dT%H%M%SZ)
+OP_ID="$UTC-$$"
+SEED_SHA=$({{ x(bs, 'sha256sum') }} -- "$SELF") || lme_refuse RH-SEED-USAGE 'cannot digest the seed'
+SEED_SHA=${SEED_SHA%% *}
+{{ generation_id(bs, ctl) }}
+{{ verify_fns(bs, ctl) }}
+{{ bundle_check(bs, lock) }}
+W=''; _co=''
+{{ admit_storage(bs, rlm) }}
+
+{{ generation_root(bs) }}
+
+if [ "$MODE" = purge ]; then
+  {{ purge_inventory(bs) | indent(2) }}
+  {{ x(bs, 'chmod') }} -R u+w -- "$R" || lme_refuse RH-SEED-INSTALL-FAILED "cannot make $R writable"
+  {{ x(bs, 'rm') }} -rf --one-file-system -- "$R" || lme_refuse RH-SEED-INSTALL-FAILED "purge of $R failed"
+  [ ! -e "$R" ] || lme_refuse RH-SEED-INSTALL-FAILED "$R still exists after purge"
+  printf 'PURGED %s\n' "$R"
+  exit 0
+fi
+
+if [ "$MODE" = verify ] || [ "$MODE" = run ] || [ "$MODE" = {{ rlm }} ]; then
+  lme_verify_content
+  lme_verify_published
+  if [ "$MODE" = verify ]; then
+    printf '%s verify %s ok\n' "$UTC" "$GEN_ID" >> "$R/{{ bs.layout.check_dir }}/verify.log"
+    printf 'VERIFIED %s %s\n' "$GEN_ID" "$G"
+    exit 0
+  fi
+  _rd="$R/{{ bs.layout.run_dir }}"
+  [ ! -L "$_rd" ] || lme_refuse RH-SEED-ROOT-NOT-OWNED "$_rd is a link"
+  [ -d "$_rd" ] || {{ x(bs, 'mkdir') }} -m 0700 -- "$_rd" || lme_refuse RH-SEED-STORAGE "cannot create $_rd"
+  {{ prune_dir(bs, '"$_rd"', bs.layout.run_dir, bs.run_retention.keep) | indent(2) }}
+  {{ storage_check(bs, 'R', bs.run_retention.free_required_bytes) | indent(2) }}
+  # WORK ROOT (work_roots): W, anchored and admitted by admit_storage BEFORE any effect (WORKSPACE ANCHOR: through
+  # the last /{{ bs.work_roots.root_rel }}/ of R, bound to the packaged checkout); its capacity is re-read here, after
+  # the retention prune, immediately before the sub-roots are prepared
+  [ -n "$W" ] || lme_refuse {{ bs.work_roots.admission.refusal }} "no admitted work root for $R"
+  {{ work_root_check(bs, 'W') | indent(2) }}
+  {{ work_root_prepare(bs, 'W') | indent(2) }}
+  _run=$({{ x(bs, 'mktemp') }} -d "$_rd/$UTC.XXXXXXXX") || lme_refuse RH-SEED-STORAGE "cannot create a run directory under $_rd"
+  {{ x(bs, 'mkdir') }} -- "$_run/ansible-home" "$_run/tmp" || lme_refuse RH-SEED-STORAGE "cannot create $_run"
+  if [ "$MODE" = {{ rlm }} ]; then
+    {{ run_local_exec(bs, disp, _sa_tools_json) | indent(4) }}
+  fi
+  # the lock (fd 9) stays held BY THIS PROCESS for the whole playbook run (no concurrent apply/purge can swap the
+  # generation); the playbook gets fd 9 CLOSED, so ssh ControlPersist masters it spawns never retain the lock
+  # Q-D12 (codex-001716): the playbook inherits THIS run's budget scope (LME_SEED_SCOPED=1); a seed it invokes
+  # re-verifies the declared limits from its own cgroup (budget enforcement kept) and then meets the root lock held
+  # by this process: a nested same-root call refuses BUSY (15) at once, never waits, never runs unbudgeted.
+  # r2i ENTRY VERIFY (normal run): before the dependent exec, same macro as run-local (brr-follow: selection = the
+  # playbook admitted through the declared run grammar). brr-follow (OD-S3-03): "$@" below is NOT the caller's original
+  # argv -- source_admit REBUILT it from the admitted words (inventory flag, inventory, admitted playbook realpath,
+  # screened arg-flag pairs) and entry_verify appended the receipt and rh_source_bootstrap words LAST.
+  {{ entry_verify(bs, disp, 'run', _sa_tools_json) | indent(2) }}
+  lme_ancestry "$_run/."
+  {{ managed_env(bs, '$_run/ansible-home', '$_run/tmp') }} {{ work_env(bs, 'W') }} LME_SEED_SCOPED=1 {{ ssh_auth.env_mode }}="$SSH_AUTH" ANSIBLE_SSH_COMMON_ARGS="$_ssh_args" ${LME_CARRY_SOCK:+{{ ssh_auth.modes.agent.socket_env }}="$LME_CARRY_SOCK"} "$G/{{ bs.layout.gen_dirs.venv }}/bin/ansible-playbook" "$@" 9<&-
+  exit $?
+fi
+
+{{ generation_apply(bs, ctl, lock) }}
 {%- endmacro -%}

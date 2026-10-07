@@ -73,6 +73,33 @@
       vars:
         rh_gen_stage: package     # genesis.launch.stages key: env and temps under <work root>/tmp/genesis/package/<act>
 
+    # r2i ENTRY GENERATION (codex-tick417 option B; route node controller.entry_generation): the generated entries are
+    # rendered into an owned mirror and gated against the ACCEPTED generation record BEFORE any packaging; a genuinely
+    # inactive generation contract (C1 projection active: false) skips it, an absent contract refuses (typed, no
+    # default). The source/loader closure was admitted against the intended commit by resolve_policy.yml's FIRST task.
+    - name: Refuse a resolution without the entry-generation contract (C1 projection; typed, no default)
+      ansible.builtin.assert:
+        that:
+          - lme_resolved.remote_harness.entry_generation_contract is defined
+          - lme_resolved.remote_harness.entry_generation_contract is mapping
+          - lme_resolved.remote_harness.entry_generation_contract.active is boolean
+        fail_msg: >-
+          REFUSED RH-POLICY-UNRESOLVED: the engine resolve produced no lme_resolved.remote_harness.entry_generation_contract
+          {active} (C1 projection); entry generation is never assumed inactive.
+        quiet: true
+
+    - name: Generate / verify the generated entries in the genesis context (tasks/generate_entries.yml)
+      ansible.builtin.include_tasks: tasks/generate_entries.yml
+      vars:
+        rh_entry_context: genesis
+      when: lme_resolved.remote_harness.entry_generation_contract.active
+
+    - name: End the act after an authoring (generate) or verify-only operation (no bundle is published)
+      ansible.builtin.meta: end_play
+      when:
+        - lme_resolved.remote_harness.entry_generation_contract.active
+        - rh_eg_op != rh.controller.entry_generation.operation.modes.package
+
     # OS-TOOL CONSUMER PARTITION (codex-tick328-329; controller.bootstrap.os_tool_consumers, registry-owned, not tunable):
     # every required_by name is EXACTLY one controller or one target consumer. An entry with ANY controller consumer stays
     # a controller precondition (hashed and admitted below); only entries used exclusively by target consumers are
@@ -175,14 +202,66 @@
       ansible.builtin.include_tasks: tasks/admit_preparation.yml
       when: rh.controller.bootstrap.preparation is defined
 
-    - name: Bind the source edition (read-only git)
+    # r2k R2J-PACKAGING-GIT-CLOSURE (codex-tick454; r2j ran bare `git -C`): every packaging git call uses the SAME admitted
+    # invocation policy as tasks/admit_git_paths.yml -- `<env> -i <git.env_pairs...> <git> <git.global...> <repo>` from
+    # the admitted env / git identities of rh_src_admission and the ONE bootstrap git node; head = git.head; status =
+    # git.package_status + git.end_of_options + the exact pathspec (the r2i literal path list moved to the declared
+    # source_admission.package_status_rel, C1-R2K-GIT). failed_when false + a classified tool refusal (no ambient
+    # GIT_* / HOME / config steers it). The recorded worktree_status digest keeps the porcelain form of r2j.
+    - name: Bind the source edition (read-only git, admitted invocation)
+      vars:
+        _rh_pk_sa: "{{ lme_resolved.remote_harness.source_admission }}"
+        _rh_pk_git: "{{ rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.git] }}"
+        _rh_pk_x: >-
+          {{ [rh_src_admission[_rh_pk_sa.record_fields.tool].env[_rh_pk_sa.tool_fields.path], _rh_pk_git.env_clear] + _rh_pk_git.env_pairs
+             + [rh_src_admission[_rh_pk_sa.record_fields.tool].git[_rh_pk_sa.tool_fields.path]] + _rh_pk_git.global + [rh_repo_root] }}
       ansible.builtin.command:
-        argv: "{{ [rh.controller.bootstrap.os_tools.git.path, '-C', rh_repo_root] + item }}"
-      loop:
-        - [rev-parse, HEAD]
-        - [status, --porcelain=v1, --untracked-files=all, --, manifests/profiles/remote-harness.yml, testing/remote_harness, ansible/roles/podman]
+        argv: "{{ _rh_pk_x + item }}"
+      # r2i: the generation's admission inputs + outputs (incl. roster authority, accepted / retained records), the
+      # verifier closure and the source-admission members join the porcelain pathspec (exact paths)
+      # r2j (R2I-BOOTSTRAP-TRUST-ORDER): the bootstrap members (controller.bootstrap.source_admission.members_rel) and
+      # every declared importer closure (source_admission.importers keys + values) are UNCONDITIONAL, so the seed's
+      # source_admit always finds their bundle.json source.inputs lines (dispatch.source_members_rel WITHDRAWN)
+      loop: >-
+        {{ [_rh_pk_git.head,
+            _rh_pk_git.package_status + [_rh_pk_git.end_of_options]
+            + rh.controller.bootstrap.source_admission.package_status_rel
+            + ((rh_eg_evidence[rh.controller.entry_generation.evidence.paths_field]
+                + rh.controller.entry_generation.dispatch.closure_rel)
+               if lme_resolved.remote_harness.entry_generation_contract.active else [])
+            + rh.controller.bootstrap.source_admission.members_rel
+            + ((rh.controller.bootstrap.source_admission.document_rels | dictsort | map('last') | list)
+               if lme_resolved.remote_harness.entry_generation_contract.active else [])
+            + (rh.controller.bootstrap.source_admission.importers | dict2items | map(attribute='key') | list)
+            + (rh.controller.bootstrap.source_admission.importers.values() | flatten | list)
+            + ((rh.controller.bootstrap.source_admission.importer_obligations.values() | map('dict2items') | flatten(levels=1) | map(attribute='value') | flatten(levels=1) | map('first') | list)
+               if lme_resolved.remote_harness.entry_generation_contract.active else [])] }}
       register: _rh_src_git
       changed_when: false
+      failed_when: false
+
+    - name: Refuse a git tool failure while binding the packaged source (tool cause; nothing continues)
+      ansible.builtin.assert:
+        that:
+          - _rh_src_git.results | map(attribute='rc') | reject('equalto', 0) | list | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}:
+          {{ rh.controller.bootstrap.genesis.builder.messages.source_git }}
+          {{ _rh_src_git.results | map(attribute='rc') | zip(_rh_src_git.results | map(attribute='stderr')) | list | to_json }}
+        quiet: true
+
+    - name: Refuse a packaged source edition that is not the admitted intended commit (loader admission + entry generation)
+      ansible.builtin.assert:
+        that:
+          - _rh_src_git.results[0].rc == 0
+          - _rh_src_git.results[0].stdout == rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.edition]
+          - not lme_resolved.remote_harness.entry_generation_contract.active
+            or _rh_src_git.results[0].stdout == rh_eg_edition
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: the packaged source edition
+          {{ _rh_src_git.results[0].stdout }} is not the admitted intended commit
+          {{ rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.edition] }}.
+        quiet: true
 
     - name: List the engine filter plugins the builder loads (filter closure)
       ansible.builtin.find:
@@ -191,6 +270,8 @@
         file_type: file
       register: _rh_src_filters
 
+    # r2k X-R1-S9-5: every declared generated-play body (importer_obligations body rels) is a packaged input -- the seed admits it
+    # pre-launch (raw digest == body_sha256, controller_seed source_admit)
     - name: Digest every source input of the render (profile, lock, templates, playbook, tasks, filter plugins)
       ansible.builtin.stat:
         path: "{{ item }}"
@@ -201,12 +282,88 @@
         {{ ([rh.controller.bootstrap.template_rel, rh.controller.bootstrap.seed_launcher.template_rel,
              rh.controller.bootstrap.macros_rel, rh.controller.bootstrap.package_playbook_rel,
              rh.controller.lock_file_rel, 'manifests/profiles/remote-harness.yml', 'testing/remote_harness/tasks/admit_builder.yml',
+             'testing/remote_harness/tasks/derive_toolchain_generation.yml', 'testing/remote_harness/tasks/verify_toolchain_receipt.yml',
+             'testing/remote_harness/tasks/admit_ancestry.yml',
              'testing/remote_harness/tasks/resolve_policy.yml', 'testing/remote_harness/tasks/refuse_pinned_outputs.yml',
              'testing/remote_harness/tasks/admit_controller.yml', 'testing/remote_harness/tasks/scope_classes.yml',
              'testing/remote_harness/tasks/package_bundle.yml']
             | map('regex_replace', '^', rh_repo_root ~ '/') | list)
-           + (_rh_src_filters.files | map(attribute='path') | sort) }}
+           + (_rh_src_filters.files | map(attribute='path') | sort)
+           + ((((rh_eg_evidence[rh.controller.entry_generation.evidence.paths_field]
+                 + rh.controller.entry_generation.dispatch.closure_rel)
+                if lme_resolved.remote_harness.entry_generation_contract.active else [])
+               + rh.controller.bootstrap.source_admission.members_rel
+               + ((rh.controller.bootstrap.source_admission.document_rels | dictsort | map('last') | list)
+                  if lme_resolved.remote_harness.entry_generation_contract.active else [])
+               + (rh.controller.bootstrap.source_admission.importers | dict2items | map(attribute='key') | list)
+               + (rh.controller.bootstrap.source_admission.importers.values() | flatten | list)
+               + ((rh.controller.bootstrap.source_admission.importer_obligations.values() | map('dict2items') | flatten(levels=1) | map(attribute='value') | flatten(levels=1) | map('first') | list)
+                  if lme_resolved.remote_harness.entry_generation_contract.active else [])) | unique | sort
+              | map('regex_replace', '^', rh_repo_root ~ rh.controller.bootstrap.path_admission.separator) | list) }}
       register: _rh_src_inputs
+
+    # brr-follow (codex-tick522 F05S2-RELATIVE-PATH-GRAMMAR; f05-s3 S3-SEAM-03 / S3-SEAM-05): every generated-play body
+    # rel and every admitted document rel is REPOSITORY-RELATIVE and is admitted by the registry rel_path grammar
+    # projected as source_admission.rel_path_grammar (the same value the launch record carries) -- before any digest or
+    # join. brr-follow-s2 J-GEN3-01 (F05-S4 F05-GEN3-01; the single-regex key is RETIRED): exactly {pattern,
+    # refused_components, separator, terminator} (F05-S4 groups-summary 36865155 grammar_final_shape); the declared
+    # terminator refused first, then the pattern fullmatch, then a refused component of the split on the grammar's
+    # separator (no literal). Generation projections only (RR-06): inactive reads neither key.
+    - name: Refuse a body or document rel outside the registry rel_path grammar (generation projections; before any digest)
+      vars:
+        _rh_pk_g: "{{ rh.controller.bootstrap.source_admission.rel_path_grammar }}"
+        _rh_pk_rels: >-
+          {{ (rh.controller.bootstrap.source_admission.importer_obligations.values() | map('dict2items') | flatten(levels=1) | map(attribute='value') | flatten(levels=1) | map('first') | list)
+             + (rh.controller.bootstrap.source_admission.document_rels | dictsort | map('last') | list) }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pk_g is mapping and (_rh_pk_g.keys() | list | sort) == ['pattern', 'refused_components', 'separator', 'terminator']
+          - _rh_pk_g.pattern is string and _rh_pk_g.pattern | length > 0
+          - _rh_pk_g.separator is string and _rh_pk_g.separator | length > 0
+          - _rh_pk_g.terminator is string and _rh_pk_g.terminator | length > 0
+          - _rh_pk_g.refused_components is sequence and _rh_pk_g.refused_components is not string
+          - _rh_pk_g.refused_components | reject('string') | list | length == 0
+          - _rh_pk_rels | select('search', _rh_pk_g.terminator | regex_escape) | list | length == 0
+          - _rh_pk_rels | reject('match', '(?:' ~ _rh_pk_g.pattern ~ ')\Z') | list | length == 0
+          - _rh_pk_rels | map('split', _rh_pk_g.separator) | map('intersect', _rh_pk_g.refused_components) | reject('equalto', []) | list | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.source_admission.refusals.member }}: a generated-play body or document rel
+          is not admitted by source_admission.rel_path_grammar (registry contract_admission.path_law + patterns.rel_path:
+          terminator, pattern fullmatch, refused component):
+          {{ ((_rh_pk_rels | select('search', _rh_pk_g.terminator | regex_escape) | list) + (_rh_pk_rels | reject('match', '(?:' ~ _rh_pk_g.pattern ~ ')\Z') | list))
+             | to_json if (_rh_pk_g is mapping and _rh_pk_g.pattern is defined and _rh_pk_g.pattern is string
+                          and _rh_pk_g.terminator is defined and _rh_pk_g.terminator is string) else ([_rh_pk_g] | to_json) }}
+        quiet: true
+      when: lme_resolved.remote_harness.entry_generation_contract.active
+
+    # r2k X-R1-S9-5: a packaged body whose raw digest is not its declared body_sha256 refuses at packaging (before the
+    # seed could ever admit it)
+    - name: Digest every declared generated-play body (no link followed)
+      ansible.builtin.stat:
+        path: "{{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ item[0] }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: >-
+        {{ (rh.controller.bootstrap.source_admission.importer_obligations.values() | map('dict2items') | flatten(levels=1) | map(attribute='value') | flatten(levels=1) | list)
+           if lme_resolved.remote_harness.entry_generation_contract.active else [] }}
+      register: _rh_pk_bodies
+
+    - name: Refuse a generated-play body whose packaged raw digest is not its declared body_sha256
+      vars:
+        _rh_pk_bad: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for r in _rh_pk_bodies.results -%}
+          {%- if not r.stat.exists or r.stat.islnk or not r.stat.isreg or r.stat.checksum != r.item[1] -%}{%- set ns.o = ns.o + [r.item] -%}{%- endif -%}
+          {%- endfor -%}{{ ns.o }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pk_bad | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}:
+          {{ rh.controller.bootstrap.genesis.builder.messages.body_digest }}
+          {{ _rh_pk_bad | to_json }}
+        quiet: true
 
     - name: Bind the controller scope and derive the deployment's artifact classes (RH-SCOPE-BINDING; tasks/scope_classes.yml)
       ansible.builtin.include_tasks: tasks/scope_classes.yml

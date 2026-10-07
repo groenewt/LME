@@ -20,6 +20,24 @@
 # (its set_facts of lme_profile / lme_manifests_dir, and the loaded profile bytes) with the admitted ones. Profile
 # composition (global | remote-harness | lme_global_override) is unchanged; lme_global_override stays a declared input.
 
+# r2i R5K-LOADER-TRUST-BOUNDARY (codex-tick433; tick427-428 loader_source_decision): THIS file is the ONE loader
+# invocation point of every remote-harness producer and consumer path (rg over testing/remote_harness + testing/e2e;
+# LME playbooks outside the harness load the role themselves -- r2i P-15) (package.yml genesis; resolve_harness.yml -> controller.yml,
+# verify_entries.yml, bind_controller.yml, guest.yml; render_run_binding.yml; prereq_observe.yml; resolve_work_root.yml),
+# so the immutable-source admission is its FIRST task: no include_role of ansible/roles/podman (which puts
+# filter_plugins/lme_manifests.py on the plugin path) can happen on any path before the loader's bytes are admitted
+# against the intended commit. Controller-side always (delegated: inside a target play the checkout is the
+# controller's). The admitted record rh_src_admission is a REGISTRY reserved_output (refuse_pinned_outputs.yml, the
+# existing first-entry mechanism -- not a new blacklist), re-derived on every entry, and read back below.
+# r2j (R2I-BOOTSTRAP-TRUST-ORDER, P4): the delegate comes from the launcher record rh_source_bootstrap (bound to the
+# admitted bundle / genesis runner), never from a raw registry read; admit_loader_source.yml refuses unless the bound
+# declaration declares that same delegate (the raw '/manifests/global.yml' read of r2i is REMOVED).
+- name: Admit the resolver / loader closure against the intended immutable commit BEFORE any loader import
+  ansible.builtin.include_tasks:
+    file: admit_loader_source.yml
+    apply:
+      delegate_to: "{{ rh_source_bootstrap.controller_delegate }}"
+
 - name: Resolve through the shared engine entrypoint (profile remote-harness)
   ansible.builtin.include_role:
     name: "{{ rh_repo_root }}/ansible/roles/podman"
@@ -28,6 +46,75 @@
     clone_directory: "{{ rh_repo_root }}"
     lme_manifests_dir: "{{ rh_repo_root }}/manifests"
     lme_profile: remote-harness
+
+# BYTES AT USE (post-import, stated LIMIT: this detects, it cannot un-run): the loader and every admitted member are
+# re-hashed after the import and must still be the admitted observed digest (== the trusted blob of the intended commit).
+- name: Re-hash the admitted source members after the loader import (controller checkout; no link followed)
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root ~ rh_early_view[lme_resolved.remote_harness.source_admission.early_view.roles.context].path_separator ~ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: "{{ lme_resolved.remote_harness.source_admission.digest_algorithm }}"
+    get_mime: false
+    get_attributes: false
+  loop: "{{ rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.members] | list | sort }}"
+  delegate_to: "{{ lme_resolved.remote_harness.source_admission.controller_delegate }}"
+  register: _rh_sa_use
+
+- name: Refuse a loader or source member whose bytes changed between admission and use
+  vars:
+    _rh_sa_f: "{{ lme_resolved.remote_harness.source_admission }}"
+    _rh_sa_m: "{{ rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.members] }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_sa_use.results | rejectattr('stat.exists') | list | length == 0
+      - _rh_sa_use.results | map(attribute='stat.checksum') | list
+        == (_rh_sa_m | list | sort | map('extract', _rh_sa_m) | map(attribute=_rh_sa_f.member_fields.observed) | list)
+      - rh_src_admission[_rh_sa_f.record_fields.loader] == _rh_sa_f.loader_rel
+    fail_msg: >-
+      REFUSED {{ _rh_sa_f.refusals.member }}: {{ _rh_sa_f.texts.use }}
+      {{ _rh_sa_m | list | sort | to_json }}
+    quiet: true
+
+# DOCUMENT VIEWS (br-fixed RR-02 / RR-03; codex OD-F05-01 / OD-F05-03 / OD-F05-12; tick522 F05S2-DOCUMENT-TRUST-BEFORE-
+# CONSUMPTION: this is a LATER READBACK, never the first trust check -- admit_loader_source.yml admits every declared
+# document before the import, and the loader's reader compares its retained exact bytes with the admitted digest before
+# it parses them). Gated by the published contract (OD-S2-04). Active: both views are published, the document view
+# names exactly the declared documents, each rel is an admitted member (checked before its digest is read) and its
+# sha256 is that member's observed digest (exact bytes; a stripped read differs); the admitted members are exactly
+# the loader members plus those rels; the entry_generation roster source is the ONE document with that rel (bound by
+# rel, never by a document name). Inactive: neither view is published and no document node is declared (an admitted
+# inactive profile; a missing admission under an active contract refuses here or earlier, never falls back).
+# The re-hash above already covers every admitted document (they are rh_src_admission members).
+- name: Refuse published document views that are not the admitted document bytes (readback; gated by the published contract)
+  vars:
+    _rh_sa_f: "{{ lme_resolved.remote_harness.source_admission }}"
+    _rh_sa_m: "{{ rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.members] }}"
+    _rh_dc_on: "{{ lme_resolved.remote_harness.entry_generation_contract.active }}"
+    _rh_dc_v: "{{ lme_resolved.remote_harness.document_inputs if 'document_inputs' in lme_resolved.remote_harness else {} }}"
+    _rh_dc_rels: "{{ _rh_dc_v.values() | map(attribute='rel') | list }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_dc_on is boolean
+      - _rh_dc_on or ('document_inputs' not in lme_resolved.remote_harness and 'entry_generation' not in lme_resolved.remote_harness
+                      and 'document_inputs' not in _rh_sa_f)
+      - not _rh_dc_on or ('document_inputs' in lme_resolved.remote_harness and 'entry_generation' in lme_resolved.remote_harness
+                          and 'document_inputs' in _rh_sa_f)
+      - _rh_dc_v is mapping
+      - not _rh_dc_on or (_rh_dc_v | list | sort) == (_rh_sa_f.document_inputs | list | sort)
+      - _rh_dc_v.values() | reject('mapping') | list | length == 0
+      - _rh_dc_v.values() | map('list') | map('sort') | reject('equalto', ['rel', 'sha256']) | list | length == 0
+      - _rh_dc_rels | reject('string') | list | length == 0
+      - _rh_dc_rels | reject('in', _rh_sa_m) | list | length == 0
+      - _rh_dc_v.values() | map(attribute='sha256') | list
+        == _rh_dc_rels | map('extract', _rh_sa_m) | map(attribute=_rh_sa_f.member_fields.observed) | list
+      - (_rh_sa_m | list | sort) == ((_rh_sa_f.members_rel + _rh_dc_rels) | sort)
+      - not _rh_dc_on or (_rh_dc_v.values() | selectattr('rel', 'equalto', lme_resolved.remote_harness.entry_generation.roster_source_rel)
+                          | map(attribute='sha256') | list) == [lme_resolved.remote_harness.entry_generation.roster_source_sha256]
+    fail_msg: >-
+      REFUSED {{ _rh_sa_f.refusals.document }}: {{ _rh_sa_f.texts.document_view }}
+      {{ [_rh_dc_on, _rh_dc_v, _rh_sa_m | list | sort] | to_json }}
+    quiet: true
 
 - name: Refuse an engine resolve whose effective checkout or profile is not this helper's admitted binding
   ansible.builtin.assert:
@@ -68,6 +155,70 @@
     rh_profile_sha256: "{{ lookup('ansible.builtin.file', rh_repo_root ~ '/manifests/profiles/remote-harness.yml') | hash('sha256') }}"
     rh_seed_lock: >-
       {{ lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ lme_resolved.remote_harness.policy.controller.lock_file_rel) | from_yaml }}
+
+# EARLY/RESOLVED RECONCILIATION (codex-tick440 "derive early and resolved views from that same bound declaration";
+# codex-tick446 option c "reconcile it with the later authoritative loader/artifact projection"). r2k
+# R2J-EFFECTIVE-OVERRIDE-BINDING (codex-tick454): the r2j C1-R2J-13 non-tunable freeze is WITHDRAWN; the base / profile /
+# operator composition is preserved and the early view is the EFFECTIVE selection (admit_loader_source.yml composes
+# the admitted override layer before use). Here the resolver's composition must equal it: every early context field ==
+# the resolved node; the selected git / env tools (path + identity as admitted and run) == the resolved os_tools; the
+# resolver's COMPLETE typed context == the admitted launch-binding carrier rh_source_bootstrap.context (r2k
+# X_R1_S10_1; replaces the withdrawn override digest), and the resolver's audited overridden leaves under that path (lme_remote_harness_overridden_paths,
+# re-rooted by early_view.override.audit_root -- dependency R2K-DEP-OVERRIDDEN-PATHS-FORM) are exactly the early
+# override_paths. An override changed between the two, or a resolver composing differently, refuses here.
+# r2l (codex-tick473): override_paths are now read at the override layer's own root (early_view.override.layer_root,
+# R2K-OVERRIDE-ROOT), so a valid override yields the same leaves here and early; the admitted tool record must also
+# equal the launch record's tool contract (R2K-TOOL-FIRST-USE-BINDING).
+- name: Refuse a resolved view that is not the effective selection the early view bound
+  vars:
+    _rh_sa_f: "{{ lme_resolved.remote_harness.source_admission }}"
+    _rh_ev: "{{ rh_early_view[lme_resolved.remote_harness.source_admission.early_view.roles.context] }}"
+    _rh_eb: "{{ rh_early_view[lme_resolved.remote_harness.source_admission.early_view.roles.binding] }}"
+    _rh_ovd: "{{ lme_resolved.remote_harness.source_admission.early_view.override }}"
+    _rh_ctx: >-
+      {%- set ns = namespace(m={}) -%}
+      {%- for f, kp in _rh_sa_f.early_view.context_fields.items() -%}
+      {%- set nn = namespace(n=rh.controller.bootstrap) -%}{%- for k in kp -%}{%- set nn.n = nn.n[k] -%}{%- endfor -%}
+      {%- set ns.m = ns.m | combine({f: nn.n}) -%}
+      {%- endfor -%}{{ ns.m }}
+    # brr-follow (f05-s3 S3-SEAM-03 consumer :180): the LAUNCH fields (rel_path) walked over the SAME resolved node; the
+    # raw early view never projects them, so they join only the carrier comparison below
+    _rh_lctx: >-
+      {%- set ns = namespace(m={}) -%}
+      {%- for f, kp in _rh_sa_f.early_view.launch_context_fields.items() -%}
+      {%- set nn = namespace(n=rh.controller.bootstrap) -%}{%- for k in kp -%}{%- set nn.n = nn.n[k] -%}{%- endfor -%}
+      {%- set ns.m = ns.m | combine({f: nn.n}) -%}
+      {%- endfor -%}{{ ns.m }}
+    _rh_audit: >-
+      {{ lme_remote_harness_overridden_paths | select('match', '^' ~ (_rh_ovd.audit_root | regex_escape)) | map('regex_replace', '^' ~ (_rh_ovd.audit_root | regex_escape), '') | sort | list }}
+    _rh_early_audit: "{{ _rh_eb.override_paths | map('join', _rh_ovd.audit_join) | sort | list }}"
+    _rh_tools: "{{ rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.tool] }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_sa_f == rh.controller.bootstrap.source_admission
+      - _rh_ev == _rh_ctx
+      - _rh_sa_f.tool_roles | dict2items | rejectattr('value', 'in', rh.controller.bootstrap.os_tools) | list | length == 0
+      - _rh_sa_f.tool_roles.keys() | map('extract', _rh_tools) | map(attribute=_rh_sa_f.tool_fields.path) | list
+        == _rh_sa_f.tool_roles.values() | map('extract', rh.controller.bootstrap.os_tools) | map(attribute='path') | list
+      - _rh_sa_f.tool_roles.keys() | map('extract', _rh_tools) | map(attribute=_rh_sa_f.tool_fields.sha256) | list
+        == _rh_sa_f.tool_roles.values() | map('extract', rh.controller.bootstrap.os_tools) | map(attribute='identity') | map(attribute='sha256') | list
+      # r2k X_R1_S10_1: the NORMAL loader's result equals the admitted launch-binding carrier, type-strict (one valid
+      # effective override changes both together; the r2k override digest is withdrawn)
+      # brr-follow (S3-SEAM-03 consumer :199): the carrier = context_fields walk UNION launch_context_fields walk (disjoint)
+      - _rh_ctx.keys() | intersect(_rh_lctx.keys() | list) | list | length == 0
+      - ((_rh_ctx | combine(_rh_lctx)) | to_json(sort_keys=true)) == (rh_source_bootstrap.context | to_json(sort_keys=true))
+      # r2l R2K-TOOL-FIRST-USE-BINDING: the tool contract admission ran (rh_src_admission tool rows) IS the launch
+      # record's, type-strict (the resolved os_tools equality above then binds the normal loader to it too)
+      - (_rh_tools | to_json(sort_keys=true)) == (rh_source_bootstrap.tools | to_json(sort_keys=true))
+      - _rh_audit == _rh_early_audit
+      - _rh_eb.edition == rh_src_admission[_rh_sa_f.record_fields.edition]
+      - _rh_eb.declaration_sha256 == rh_src_admission[_rh_sa_f.record_fields.bootstrap][_rh_sa_f.bootstrap_fields.sha256]
+      # (rh_profile_sha256 is the candidate's rstripped-lookup digest, NOT a raw-byte digest -- it is not compared with
+      # the raw declaration digest; its replacement by the bound digest is PROPOSED to B/R4 as X-R2J-RPSHA)
+    fail_msg: >-
+      REFUSED {{ _rh_sa_f.early_view.refusal }}: {{ _rh_sa_f.early_view.text }}
+      {{ [_rh_eb.declaration_rel, _rh_eb.edition] | to_json }}
+    quiet: true
 
 # ROUTE-INTERFACE-BYTES-BEFORE-CONSUMPTION (codex-tick372 interface-binding verdict): the FIRST point at which the
 # resolved declaration exists, and before ANY consumer includes another pinned member (resolve_harness.yml:14 includes

@@ -1,0 +1,214 @@
+{#- testing/remote_harness/templates/macros/measurement.j2 -- GENUINE, PARAMETERIZED Jinja macros of the controller
+    preparation MEASUREMENT (route-r4e over r4d a4f5395b; profile controller.bootstrap.preparation_measurement REVISION 5,
+    C1 proposal r4d-c1-hunks.yml + r4e-c1-hunks.yml). Reached ONLY through the entry templates/measurement_record.j2, which imports this file WITH
+    CONTEXT from the binding rh_meas_import (= macros_rel relative to dirname(record_template_rel)) and dispatches
+    m.macros.<name>. They turn the resolved declarations and the native stat results into the measured resources and
+    ONE candidate record. They execute nothing and read nothing. Every macro prints ONE JSON value (to_json); the
+    caller reads it back with from_json. AUTHORED, NEVER RENDERED.
+    VALUE SOURCES (r4c-value-ledger.yml + r4d-value-ledger.yml): every emitted key is a declared field name (m.record_fields, m.intermediate,
+    m.custody.finding / result); every emitted word is a declared value (m.dispositions, m.conditions, m.custody.states
+    / reasons, m.record_values, m.claims, m.package_basis); the path grammar is path_admission.separator (sep); a value
+    with no observation is the declared m.unset; a component with no stat result is the declared reason
+    unobserved_component (never a fabricated stat); a refusal is formatted by the common grammar macro (rf, imported
+    below from the binding rh_meas_rf_import; g = controller.bootstrap.refusal_grammar).
+      g     rh.controller.bootstrap.refusal_grammar (C1 common refusal grammar)
+      m     rh.controller.bootstrap.preparation_measurement
+      sep   rh.controller.bootstrap.path_admission.separator
+      bs    rh.controller.bootstrap: os_tools / preparation (where each resource is declared)
+      pk    rh.packages: by_os_family (the declared package association)
+      rule  bs.path_admission.ancestry[m.custody.rule] (allow_owner_uids, refuse_group_other_writable)
+      res   the resources() list (keys m.intermediate); ls / rs = the link-view / resolved-view stat REGISTER results
+            over res (same order); st_results = the stat register results over custody_paths()
+      inv_results  the stat register results over the admitted inventory source FILES (the shared binding admission
+            tasks/admit_binding_receipt.yml output rh_rcpt_inventory: regular non-link files, digest ba.digest)
+      rcpt  [ba, path, st, rc, adm]: ba = controller.bootstrap.binding_admission (r4d: the ONE receipt admission), the
+            admitted receipt path, its stat and its parsed bytes (rh_rcpt_receipt_path / _stat / rh_rcpt_receipt), and
+            the admission evidence rh_rcpt_admission (r4e: keyed by ba.result_keys; recorded verbatim)
+      att   the attribution values, in the order of the attribution() parameters
+    ONE construction for tools and keyrings (resource): their differences are DECLARED in m.kinds.<kind>.
+    Ansible register-result selectors read here (READ-ONLY module API, not emitted schema): results[i].stat, .item;
+    stat keys exists, islnk, isdir, isreg, executable, lnk_source, lnk_target, checksum, uid, wgrp, woth.
+    TRUST: nothing here observes or asserts trust. A digest pins bytes; custody and candidate_adoptable are CANDIDATE
+    claims (m.claims) with a separate source disposition; package names are declared associations (m.package_basis). -#}
+{%- import rh_meas_rf_import as rf -%}
+
+{#- the ancestor components of the absolute path p (path grammar sep), from the root down to (excluding) p -#}
+{%- macro ancestors(sep, p) -%}
+{%- set parts = p.split(sep) -%}
+{%- set ns = namespace(c=[]) -%}
+{%- for i in range(1, parts | length) -%}{%- set ns.c = ns.c + [sep ~ (parts[1:i] | join(sep))] -%}{%- endfor -%}
+{{ ns.c | to_json }}
+{%- endmacro -%}
+
+{#- the parent of the absolute path p (path grammar sep) -#}
+{%- macro parent(sep, p) -%}
+{{ (p.split(sep)[:-1] | join(sep)) | to_json }}
+{%- endmacro -%}
+
+{#- every selected resource, in m.kinds order, keyed by the declared intermediate schema m.intermediate -#}
+{%- macro resources(m, bs) -%}
+{%- set i = m.intermediate -%}
+{%- set ns = namespace(r=[]) -%}
+{%- for kind, k in m.kinds.items() -%}
+{%- for name, sel in m.resources[kind].items() -%}
+{%- set node = bs[k.declared_root][name] if k.declared_member == m.unset else bs[k.declared_root][name][k.declared_member] -%}
+{%- set ns.r = ns.r + [{i.kind: kind, i.name: name, i.path: node.path, i.declared: node, i.package: sel.package}] -%}
+{%- endfor -%}
+{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- every traversed directory component to stat: the ancestors of each declared path and, for a link whose
+    resolution the engine reported, of that resolution -#}
+{%- macro custody_paths(m, sep, res, ls) -%}
+{%- set i = m.intermediate -%}
+{%- set ns = namespace(p=[]) -%}
+{%- for r in res -%}
+{%- set l = ls[loop.index0].stat -%}
+{%- set ns.p = ns.p + (ancestors(sep, r[i.path]) | from_json) -%}
+{%- if l.exists and l.islnk and l.lnk_source is defined -%}
+{%- set ns.p = ns.p + (ancestors(sep, l.lnk_source) | from_json) -%}
+{%- endif -%}
+{%- endfor -%}
+{{ ns.p | unique(case_sensitive=true) | sort | list | to_json }}
+{%- endmacro -%}
+
+{#- ONE custody finding {path, reason} plus its declared state, as a pair [finding, state] -#}
+{%- macro flag(c, p, reason) -%}
+{{ [{c.finding.path: p, c.finding.reason: c.reasons[reason].label}, c.reasons[reason].state] | to_json }}
+{%- endmacro -%}
+
+{#- the custody chain of ONE resource under the declared rule: {state, findings}. l = link view of the declared path,
+    v = the view the kind measures (resolved when kinds.<kind>.resolve, else l), st = {component path: stat}.
+    Missing evidence is never fabricated: a component without a stat result -> reason unobserved_component; a link
+    whose target or resolution the engine did not report -> reason hop_unverified (both declared states). -#}
+{%- macro custody(m, sep, rule, r, l, v, st) -%}
+{%- set c = m.custody -%}{%- set i = m.intermediate -%}
+{%- set ns = namespace(f=[]) -%}
+{%- if l.exists -%}
+{%- set chain = (ancestors(sep, r[i.path]) | from_json) + ((ancestors(sep, l.lnk_source) | from_json) if (l.islnk and l.lnk_source is defined) else []) -%}
+{%- for p in chain | unique(case_sensitive=true) | list -%}
+{%- if p not in st -%}
+{%- set ns.f = ns.f + [flag(c, p, 'unobserved_component') | from_json] -%}
+{%- elif not st[p].exists -%}
+{%- set ns.f = ns.f + [flag(c, p, 'absent_component') | from_json] -%}
+{%- elif st[p].islnk -%}
+{%- set ns.f = ns.f + [flag(c, p, 'link_component') | from_json] -%}
+{%- else -%}
+{%- if not st[p].isdir -%}{%- set ns.f = ns.f + [flag(c, p, 'not_directory') | from_json] -%}{%- endif -%}
+{%- if st[p].uid not in rule.allow_owner_uids -%}{%- set ns.f = ns.f + [flag(c, p, 'owner') | from_json] -%}{%- endif -%}
+{%- if rule.refuse_group_other_writable and (st[p].wgrp or st[p].woth) -%}{%- set ns.f = ns.f + [flag(c, p, 'writable') | from_json] -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if l.islnk -%}
+{%- if l.uid not in rule.allow_owner_uids -%}{%- set ns.f = ns.f + [flag(c, r[i.path], 'owner') | from_json] -%}{%- endif -%}
+{%- if l.lnk_target is not defined or l.lnk_source is not defined -%}
+{%- set ns.f = ns.f + [flag(c, r[i.path], 'hop_unverified') | from_json] -%}
+{%- elif (l.lnk_target if l.lnk_target.startswith(sep) else ((parent(sep, r[i.path]) | from_json) ~ sep ~ l.lnk_target)) != l.lnk_source -%}
+{%- set ns.f = ns.f + [flag(c, r[i.path], 'hop_unverified') | from_json] -%}
+{%- endif -%}
+{%- if not m.kinds[r[i.kind]].resolve -%}{%- set ns.f = ns.f + [flag(c, r[i.path], 'link_not_followed') | from_json] -%}{%- endif -%}
+{%- endif -%}
+{%- if v.exists and not v.islnk -%}
+{%- if v.uid not in rule.allow_owner_uids -%}{%- set ns.f = ns.f + [flag(c, (l.lnk_source if l.islnk else r[i.path]), 'owner') | from_json] -%}{%- endif -%}
+{%- if rule.refuse_group_other_writable and (v.wgrp or v.woth) -%}{%- set ns.f = ns.f + [flag(c, (l.lnk_source if l.islnk else r[i.path]), 'writable') | from_json] -%}{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- set states = ns.f | map('last') | list -%}
+{%- set state = c.states[c.absent] if not l.exists else c.states[(c.precedence | select('in', states) | list + [c.otherwise]) | first] -%}
+{{ {c.result.state: state, c.result.findings: ns.f | map('first') | list} | to_json }}
+{%- endmacro -%}
+
+{#- ONE resource's record entry (tools and keyrings alike; differences from m.kinds.<kind>). The conditions are the
+    declared vocabulary m.conditions (schema key -> declared word); each holds only on an existing observation (no
+    default for an absent stat key). A check outside the vocabulary refuses through the common grammar. -#}
+{%- macro resource(g, m, sep, pk, rule, r, l, rv, st) -%}
+{%- set f = m.record_fields -%}{%- set d = m.dispositions -%}{%- set i = m.intermediate -%}{%- set cv = m.conditions -%}
+{%- set k = m.kinds[r[i.kind]] -%}
+{%- set v = rv if k.resolve else l -%}
+{%- set holds = {cv.absent: not v.exists,
+                 cv.link: l.exists and l.islnk,
+                 cv.not_regular: v.exists and not v.isreg,
+                 cv.not_executable: v.exists and not v.executable,
+                 cv.unreadable: v.exists and v.checksum is not defined} -%}
+{%- if k.checks | reject('in', holds) | list | length > 0 -%}
+{{ rh_meas_refused | mandatory(rf[g.macro](g, m.refusal, [m.diagnostics.checks, r[i.kind], k.checks | reject('in', holds) | list | to_json])) }}
+{%- endif -%}
+{%- set disp = d[(k.checks | select('in', holds | dict2items | selectattr('value') | map(attribute='key') | list) | list + [k.otherwise]) | first] -%}
+{%- set cus = custody(m, sep, rule, r, l, v, st) | from_json -%}
+{%- set entry = {f.path: r[i.path], f.declared: r[i.declared],
+                 f.link_view: l | dict2items | selectattr('key', 'in', m.observed_fields) | items2dict,
+                 f.digest_algorithm: m.digest,
+                 f.digest: v.checksum if (v.exists and v.checksum is defined) else m.unset,
+                 f.disposition: disp,
+                 f.custody: cus[m.custody.result.state], f.custody_findings: cus[m.custody.result.findings],
+                 f.declared_logical_package: r[i.package], f.declared_package: pk.by_os_family[m.family][r[i.package]],
+                 f.package_basis: m.package_basis,
+                 f.candidate_adoptable: disp == d[k.otherwise] and cus[m.custody.result.state] == m.custody.states[m.custody.otherwise]} -%}
+{{ (entry | combine({f.resolved_view: v | dict2items | selectattr('key', 'in', m.observed_fields) | items2dict}) if k.resolve else entry) | to_json }}
+{%- endmacro -%}
+
+{#- the admitted inventory source FILES the engine was given, in launch order: path, digest, observed fields. The
+    shared binding admission (tasks/admit_binding_receipt.yml) admitted every one as an existing, readable, regular,
+    non-link file before any measurement stat, with ba.digest, so each carries its own checksum (no unset branch) -#}
+{%- macro sources(m, ba, inv_results) -%}
+{%- set f = m.record_fields -%}
+{%- set ns = namespace(s=[]) -%}
+{%- for s in inv_results -%}
+{%- set ns.s = ns.s + [{f.path: s.item, f.digest_algorithm: ba.digest, f.digest: s.stat.checksum,
+                        f.link_view: s.stat | dict2items | selectattr('key', 'in', m.observed_fields) | items2dict}] -%}
+{%- endfor -%}
+{{ ns.s | to_json }}
+{%- endmacro -%}
+
+{#- the binding receipt of the launch's receipt-declaring inventory kind (B r5f genesis.launch.inventory_kinds
+    controller_operation_binding.receipt): its path, its own stat digest, the declared attributed receipt fields
+    (ba.attributed, controller.bootstrap.binding_admission -- r4d: the measurement-owned receipt_join is retired), and
+    (r4e) the admission evidence adm verbatim: the compared receipt bindings, the PRODUCER's and this CONSUMER's
+    attributed values kept separately, the effective inputs (incl. the -e stage selector), members and scope. The
+    shared admission (tasks/admit_binding_receipt.yml) admitted the receipt as an existing regular non-link file, read
+    it ONCE, checked the read bytes against the stat digest, joined its binding / lab paths and digests to the admitted
+    inventory sources and its compared bindings to this resolve before this macro runs (no unset branch) -#}
+{%- macro binding_receipt(m, ba, path, st, rc, adm) -%}
+{%- set f = m.record_fields -%}
+{{ {f.path: path, f.digest_algorithm: ba.digest, f.digest: st.checksum,
+    f.receipt_fields: rc | dict2items | selectattr('key', 'in', ba.attributed) | items2dict,
+    f.admission: adm} | to_json }}
+{%- endmacro -%}
+
+{#- the attribution of ONE record, keyed by m.record_fields (codex-tick400 R4-NEW-VALUE-CONSTRUCTION: the former inline
+    task map). deployment_identity is the existing validated-identity helper's value (null when the inventory declares
+    none: diagnostic attribution only, never a proof). -#}
+{%- macro attribution(m, measured_at_utc, act, stage, deployment_identity, profile_sha256, config_revision, engine_revision, builder) -%}
+{%- set f = m.record_fields -%}
+{{ {f.measured_at_utc: measured_at_utc, f.act: act, f.stage: stage, f.deployment_identity: deployment_identity,
+    f.profile_sha256: profile_sha256, f.config_revision: config_revision, f.engine_revision: engine_revision,
+    f.builder: builder} | to_json }}
+{%- endmacro -%}
+
+{#- the WHOLE candidate record: attribution + the inventory sources + the policy values + every resource grouped by its
+    kind's record field + the summary (declared packages of absent resources; completeness). rcpt = [ba, path, st, rc, adm]
+    (its first member also gives the inventory-source digest algorithm) -#}
+{%- macro record(g, m, sep, pk, rule, res, ls, rs, st_results, inv_results, rcpt, att) -%}
+{%- set f = m.record_fields -%}{%- set i = m.intermediate -%}
+{%- set st = st_results | items2dict(key_name='item', value_name='stat') -%}
+{%- set ns = namespace(grp={}, all=[]) -%}
+{%- for kind, k in m.kinds.items() -%}{%- set ns.grp = ns.grp | combine({f[k.record_field]: {}}) -%}{%- endfor -%}
+{%- for r in res -%}
+{%- set l = ls[loop.index0].stat -%}
+{%- set rv = rs[loop.index0].stat if m.kinds[r[i.kind]].resolve else l -%}
+{%- set e = resource(g, m, sep, pk, rule, r, l, rv, st) | from_json -%}
+{%- set rf_key = f[m.kinds[r[i.kind]].record_field] -%}
+{%- set ns.grp = ns.grp | combine({rf_key: ns.grp[rf_key] | combine({r[i.name]: e})}) -%}
+{%- set ns.all = ns.all + [e] -%}
+{%- endfor -%}
+{%- set summary = {f.schema: m.record_schema, f.operation: m.operation, f.declaration: m,
+                   f.inventory_sources: sources(m, rcpt[0], inv_results) | from_json,
+                   f.binding_receipt: binding_receipt(m, *rcpt) | from_json,
+                   f.candidate: m.record_values.candidate, f.self_authorizing: m.record_values.self_authorizing,
+                   f.claims: m.claims, f.package_basis: m.package_basis,
+                   f.missing_packages: ns.all | selectattr(f.disposition, 'equalto', m.dispositions.absent)
+                                       | map(attribute=f.declared_package) | unique(case_sensitive=true) | sort | list,
+                   f.complete: ns.all | rejectattr(f.candidate_adoptable) | list | length == 0} -%}
+{{ (attribution(m, *att) | from_json) | combine(summary) | combine(ns.grp) | to_json }}
+{%- endmacro -%}

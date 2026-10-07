@@ -267,6 +267,78 @@
       scope context is a resolver output (PER-HOST-SCOPE-CONTRACT, C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
     quiet: true
 
+# F05-S3 DOCUMENT READER (LR-14; registry remote_harness_schema.document_channel; codex-tick530 OI-04 / LD01, codex-tick534
+# OD-S3-01 a / OD-S3-02 a). The trust root is the PROTECTED source-admission record rh_src_admission (produced by
+# admit_loader_source.yml, refused pre-supplied by refuse_pinned_outputs.yml, which every active production caller runs
+# FIRST: refuse_pinned_outputs -> rh_source_bootstrap -> admit_loader_source -> resolver, OD-S3-06). It is passed to the
+# loader SEPARATELY as _lme_rh_admission (never copied into the documents), only while the document channel is active.
+# Each document is read ONCE through ansible.builtin.file with the declared exact-byte read options, in admission order:
+# the loader derives and full-matches its rel BEFORE the path is built (lme_rh_document_next_rel) and compares the
+# admitted digest of the exact text BEFORE it is parsed (lme_rh_document_append); a dependent rel comes from the
+# digest-verified parent. Inactive / no policy: nothing is read, _lme_rh_admission is null, _lme_rh_documents is {}.
+- name: Refuse an active document channel without the protected source-admission record (typed, before any read)
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema))
+        or (rh_src_admission is defined and rh_src_admission is mapping)
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.refusal }}: the document channel is
+      active (published view {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.when }}) and
+      rh_src_admission is absent or not a mapping; resolve through the guarded sequence (refuse_pinned_outputs.yml ->
+      rh_source_bootstrap -> admit_loader_source.yml -> resolve_policy.yml); nothing was read.
+    quiet: true
+
+- name: Bind the document admission authority (rh_src_admission while active, null otherwise; a resolver output)
+  ansible.builtin.set_fact:
+    _lme_rh_admission: >-
+      {{ rh_src_admission if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)) else none }}
+
+- name: Read-back guard -- the document admission authority is the recomputed value (type-aware; untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        _lme_rh_admission | lme_type_aware_equal(rh_src_admission if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)) else none)
+    fail_msg: >-
+      _lme_rh_admission was pre-supplied / -e-pinned and disagrees with its freshly recomputed value; the document
+      admission authority is a resolver output (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
+    quiet: true
+
+- name: Start the admitted document set (nothing read yet; a pinned value is re-admitted name by name below and by the loader)
+  ansible.builtin.set_fact:
+    _lme_rh_documents: {}
+
+- name: Read every declared document once, exact bytes, in admission order (rel admitted before the path; digest before parse)
+  ansible.builtin.set_fact:
+    _lme_rh_documents: >-
+      {{ _lme_rh_documents | lme_rh_document_append(
+           lookup('ansible.builtin.file',
+                  lme_manifests_dir ~ '/../' ~ (_lme_rh_documents | lme_rh_document_next_rel(_lme_rh_scope, _lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)),
+                  lstrip=(_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read.lstrip,
+                  rstrip=(_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read.rstrip),
+           _lme_rh_doc_name, _lme_rh_scope, _lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission) }}
+  loop: "{{ (_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).names }}"
+  loop_control:
+    loop_var: _lme_rh_doc_name
+
+# F05-S4 MAIN ruling 4: the publish / read-back / override-audit expressions below carry NO default( fallback. The
+# profile overlay is REQUIRED (every profile declares profile_overlay.lme_global); the optional caller input
+# lme_global_override has ONE declared absent form (registry lme_config_registry.caller_inputs.lme_global_override.absent),
+# selected only when the caller did not define it. A present value of the wrong type refuses typed here, before use.
+- name: Refuse a malformed profile overlay or operator override (typed, before the remote-harness projection)
+  ansible.builtin.assert:
+    that:
+      - "'lme_global' in _lme_profile_file.profile_overlay"
+      - _lme_profile_file.profile_overlay.lme_global is mapping
+      - lme_global_override is not defined or lme_global_override is mapping
+      - _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent is mapping
+    fail_msg: >-
+      lme: profile {{ lme_profile }} profile_overlay.lme_global must be a declared mapping and lme_global_override, when
+      supplied, a mapping (registry lme_config_registry.caller_inputs.lme_global_override.absent is its declared absent
+      form); got overlay {{ (_lme_profile_file.profile_overlay.lme_global | type_debug) if ('lme_global' in _lme_profile_file.profile_overlay) else '<absent>' }}
+      / override {{ (lme_global_override | type_debug) if (lme_global_override is defined) else '<absent>' }}.
+    quiet: true
+
 # Publish the NAMESPACED outputs. lme_enable_flags comes straight from the engine (already
 # strict-bool-coerced) -- it is is_enabled()'s input, an OUTPUT name never read back as
 # operator input, so this is self-capture-free. lme_resolved_origins carries honest
@@ -275,7 +347,7 @@
   ansible.builtin.set_fact:
     # SEED-06 (codex-232517): the effective remote-harness policy is a typed section of the authoritative
     # resolved configuration (absent when no policy is declared), so the revision below binds it.
-    lme_resolved: "{{ (_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope))} if (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope)) is not none else {}))) }}"
+    lme_resolved: "{{ (_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {}))) }}"
     lme_resolved_origins: "{{ _lme_resolution.origins }}"
     lme_enable_flags: "{{ _lme_resolution.enable_flags }}"
 
@@ -304,7 +376,7 @@
 - name: Compute the content-addressed configuration revision (config-only; deterministic; OUTPUT-ONLY; untamperable)
   ansible.builtin.set_fact:
     lme_resolved_revision: >-
-      {{ (_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope))} if (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope)) is not none else {}))) | lme_bind_revision(
+      {{ (_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {}))) | lme_bind_revision(
            _lme_global_file.lme_config_registry,
            [{'name': lme_profile,
              'sha256': lookup('file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | hash('sha256')}]) }}
@@ -331,18 +403,18 @@
     that:
       - _lme_resolution | lme_type_aware_equal(_lme_global_file.lme_config_registry | lme_resolve_from_admitted((_lme_profile_file.profile_overlay.vars | default({})), _lme_operator_selections, lme_inputs | default({})))
       - >-
-        lme_resolved | lme_type_aware_equal(_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope))} if (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope)) is not none else {})))
+        lme_resolved | lme_type_aware_equal(_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {})))
       - lme_resolved_origins | lme_type_aware_equal(_lme_resolution.origins)
       - lme_enable_flags | lme_type_aware_equal(_lme_resolution.enable_flags)
       - >-
-        lme_resolved_revision == ((_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope))} if (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope)) is not none else {}))) | lme_bind_revision(
+        lme_resolved_revision == ((_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {}))) | lme_bind_revision(
            _lme_global_file.lme_config_registry,
            [{'name': lme_profile,
              'sha256': lookup('file', lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml') | hash('sha256')}]))
       # C1-TYPED-OUTPUT-REVISION (codex 022716): bind the ACTUAL published content, not only a recompute it
       # compares equal to -- the published section is schema/type-validated and every digest in it re-derives
       # from its own content, and the revision is the binder over the actual lme_resolved.
-      - lme_resolved | lme_verify_resolved(_lme_global_file.lme_config_registry)
+      - lme_resolved | lme_verify_resolved(_lme_global_file.lme_config_registry, documents=_lme_rh_documents, admission=_lme_rh_admission)
       - >-
         lme_resolved_revision == (lme_resolved | lme_bind_revision(
            _lme_global_file.lme_config_registry,
@@ -450,16 +522,16 @@
 - name: Compose lme_global (global | profile | operator override LAST) -- the one composition
   ansible.builtin.set_fact:
     lme_global: >-
-      {{ (_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True) }}
+      {{ (_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True) }}
     # Audit only (override provenance; NOT revision-bound, codex-232517): the leaf paths the operator set.
     lme_remote_harness_overridden_paths: >-
-      {{ (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_remote_harness_overridden_paths((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema)) }}
+      {{ (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_remote_harness_overridden_paths((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, documents=_lme_rh_documents, admission=_lme_rh_admission)) }}
 
 - name: Read-back guard -- lme_global and the remote-harness audit are the recomputed values (untamperable)
   ansible.builtin.assert:
     that:
-      - lme_global == ((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True))
-      - lme_remote_harness_overridden_paths == (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_remote_harness_overridden_paths((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema))
+      - lme_global == ((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True))
+      - lme_remote_harness_overridden_paths == (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)) | combine((lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_remote_harness_overridden_paths((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global, recursive=True)), (lme_global_override if (lme_global_override is defined) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, documents=_lme_rh_documents, admission=_lme_rh_admission))
     fail_msg: >-
       lme_global or lme_remote_harness_overridden_paths was pre-supplied / -e-pinned and disagrees with its
       freshly recomputed value; the composition is a resolver output (SEED-06, C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).

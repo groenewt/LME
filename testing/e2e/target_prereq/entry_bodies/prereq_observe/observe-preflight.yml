@@ -1,0 +1,144 @@
+# testing/e2e/target_prereq/entry_bodies/prereq_observe/observe-preflight.yml -- the authored BODY of play
+# observe-preflight of the GENERATED entry testing/e2e/target_prereq/prereq_observe.yml (B-owned body; B-r5 r5m
+# extraction, codex-tick417 option B). The play metadata, its contract connection vars (macro target_vars) and the
+# first-entry head of this target host are constructed; this file holds every task AFTER the head, byte-identical to
+# B-r5/r5f-prereq_observe.after.yml (sha256 934c14eda2d32663da9652f740d2c86902143fe61425a2e73e6e66c62da42657) :307-442
+# de-indented by 4. Relocated comment (play vars :290, de-indented):
+# no ansible_remote_tmp / ansible_python_interpreter / become: the PRIVILEGED contact sets both as host facts.
+#
+- name: Resolve the harness policy on this host (its OWN scope)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_policy.yml"
+
+- name: Carry the controller-decided values to this host and bind the policy (controller-side; no target module)
+  ansible.builtin.set_fact:
+    tp_ctl: "{{ hostvars['localhost'].tp_ctl }}"
+    tp: "{{ rh.controller.bootstrap.target_prereq }}"
+
+- name: Refuse a split policy, split target inputs, or a hypervisor member without a resolved guest policy
+  ansible.builtin.assert:
+    that:
+      - tp == hostvars['localhost'].tp
+      - >-
+        ((lme_resolved.remote_harness.binding.deployment.target_inputs | default({}))[inventory_hostname] | default({}))
+        == hostvars['localhost'].tp_ti
+      - not tp_ctl.hypervisor or (rh.guest is defined and rh.guest.allocation is defined and rh.guest.allocation is mapping)
+    fail_msg: >-
+      REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: the target scope's target_prereq or bound target inputs
+      differ from the controller's, or this hypervisor member has no resolved rh.guest.allocation (RS carrier).
+    quiet: true
+
+# MEASUREMENT-ONLY (R5): privileged initial contact, read-only stat/sha256 of the declared selection, publish tp_orec,
+# STOP -- placed BEFORE (and instead of) the shared preflight, so no setup / service_facts / unit probe runs.
+- name: MEASURE (measurement-only operation; the privileged initial contact, then read-only measurement; publish and stop)
+  ansible.builtin.include_tasks: "{{ rh_repo_root ~ tp.reuse.path_separator ~ tp.observe.measure.task_rel }}"
+  when: tp_ctl.operation == tp.observe.measure.measure_op
+
+- name: PREFLIGHT (read-only; the ONE declared preflight tasks shared with target_prereq.yml)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/prereq_preflight.yml"
+  when: tp_ctl.operation == tp.observe.measure.observe_op
+
+# OBSERVE-ONLY extras (read-only; only after an admitted privileged contact). Evidence for the lab file's later
+# obs_prior_dirs declaration: each obs_paths entry, every ancestor (root-only path metadata) and its depth-1 entries.
+- name: Start the observe-only extras (contact-free)
+  ansible.builtin.set_fact:
+    tp_obsx: {obs_paths: null, error: null}
+  when: tp_ctl.operation == tp.observe.measure.observe_op
+
+- name: OBSERVE obs_paths (read-only)
+  when: tp_ctl.operation == tp.observe.measure.observe_op and tp_pre.contact == 'admitted'
+  block:
+    - name: Stat every component of every obs_paths entry (the entry and its ancestors; no link followed)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+        get_mime: false            # R5-IMPLICIT-STAT-HELPERS: otherwise the stat module runs `file` found by PATH
+        get_attributes: false      # R5-IMPLICIT-STAT-HELPERS: otherwise the stat module runs `lsattr` found by PATH
+      loop: >-
+        {%- set ns = namespace(p=[]) -%}
+        {%- for full in tp_ctl.obs_paths -%}{%- for i in range(1, (full.split('/') | length) + 1) -%}
+        {%- set ns.p = ns.p + ['/' ~ (full.split('/')[1:i] | join('/'))] -%}{%- endfor -%}{%- endfor -%}
+        {{ ns.p | unique | list }}
+      register: _tp_ob_st
+
+    - name: List each obs_paths entry that is a real directory, depth 1 (metadata only; no content read, no link followed)
+      ansible.builtin.find:
+        paths: "{{ item.item }}"
+        file_type: any
+        hidden: "{{ tp.observe.listing.hidden }}"
+        recurse: false
+        follow: "{{ tp.observe.listing.follow }}"
+        get_checksum: false
+      loop: "{{ _tp_ob_st.results | selectattr('item', 'in', tp_ctl.obs_paths) | list }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists and item.stat.isdir and not item.stat.islnk
+      register: _tp_ob_ls
+
+    - name: Compose the obs_paths evidence (derived output)
+      ansible.builtin.set_fact:
+        tp_obsx: >-
+          {%- set st = namespace(m={}) -%}
+          {%- for r in _tp_ob_st.results -%}
+          {%- set s = r.stat -%}
+          {%- set st.m = st.m | combine({r.item: {'exists': s.exists,
+                'type': none if not s.exists else ('link' if s.islnk else ('dir' if s.isdir else ('file' if s.isreg else 'other'))),
+                'uid': s.uid | default(none), 'gid': s.gid | default(none), 'owner': s.pw_name | default(none),
+                'group': s.gr_name | default(none), 'mode': s.mode | default(none)}}) -%}
+          {%- endfor -%}
+          {%- set out = namespace(m={}) -%}
+          {%- for e in tp_ctl.obs_paths -%}
+          {%- set ch = namespace(m={}) -%}
+          {%- for i in range(1, (e.split('/') | length) + 1) -%}
+          {%- set p = '/' ~ (e.split('/')[1:i] | join('/')) -%}
+          {%- set ch.m = ch.m | combine({p: st.m[p]}) -%}
+          {%- endfor -%}
+          {%- set fr = _tp_ob_ls.results | selectattr('item.item', 'equalto', e) | list -%}
+          {%- set files = (fr | first).files if (fr | length > 0 and (fr | first).files is defined) else none -%}
+          {%- set ls = namespace(m={}) -%}
+          {%- for f in (files or []) | sort(attribute='path') -%}
+          {%- set ls.m = ls.m | combine({f.path: {
+                'type': 'link' if f.islnk | default(false) else ('dir' if f.isdir | default(false) else ('file' if f.isreg | default(false) else 'other')),
+                'uid': f.uid | default(none), 'gid': f.gid | default(none), 'owner': f.pw_name | default(none),
+                'group': f.gr_name | default(none), 'mode': f.mode | default(none)}}) -%}
+          {%- endfor -%}
+          {%- set out.m = out.m | combine({e: {'chain': ch.m, 'listing': (ls.m if files is not none else none),
+                'listing_depth': tp.observe.listing.depth,
+                'listing_skipped': ((fr | first).skipped_paths | default({})) if fr | length > 0 else 'not a real directory or absent'}}) -%}
+          {%- endfor -%}
+          {{ {'obs_paths': out.m, 'error': none} }}
+  rescue:
+    - name: Record the failed obs_paths observation (the record play still writes it)
+      ansible.builtin.set_fact:
+        tp_obsx:
+          obs_paths: null
+          error: >-
+            {{ 'observation stopped at "' ~ (ansible_failed_task.name | default('?')) ~ '": '
+               ~ (ansible_failed_result.msg | default('') | string)[:2000] }}
+
+- name: Publish the observation record (derived output; ALSO when the contact or an observation failed)
+  when: tp_ctl.operation == tp.observe.measure.observe_op
+  ansible.builtin.set_fact:
+    tp_orec:
+      schema: "{{ tp.observe.record_schema }}"
+      target: "{{ inventory_hostname }}"
+      label: "{{ lme_transfer_label }}"
+      scope: "{{ tp_pre.scope }}"
+      contact: "{{ tp_pre.contact }}"
+      declared:
+        preservation: "{{ tp_ctl.preservation }}"
+        obs_paths: "{{ tp_ctl.obs_paths }}"
+      preflight: "{{ tp_pre }}"
+      preservation: "{{ tp_pre.preservation | default(none) }}"
+      obs_paths: "{{ tp_obsx.obs_paths }}"
+      obs_paths_error: "{{ tp_obsx.error }}"
+      # what target_prereq.yml would refuse (collected; NOT enforced by this leg)
+      findings: "{{ tp_pre.refusals }}"
+      claim: >-
+        read-only privileged observation; no unit was started, stopped, enabled, disabled or masked and no
+        deployment-state mutation was intended on the target (ordinary admitted Ansible module staging under the
+        root module temp occurred). Observation grants no ownership or retirement authority. This record, not the
+        exit code, is the result: rc 0 can include observation errors (preflight.refusals, obs_paths_error) and
+        findings. Coverage: discovery sees system .service units only (no timer / socket / path / user units);
+        expectations and absence are decided by the exact-unit probe, whose errors are retained as probe_unknown
+        findings; UnitFileState generated is admitted despite possible autostart.

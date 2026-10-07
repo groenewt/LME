@@ -1,17 +1,22 @@
 ---
 # testing/e2e/transfer/tasks/endpoint_bind.yml -- B-PER-HOST-POLICY-BINDING, endpoint (localhost, observe-only).
-# The endpoint B's contract actually reaches (resolve_contract.yml: address, port, ProxyJump) plus the target's owner
-# must be the endpoint C1 bound into this target's scope: binding.deployment.endpoints[<target>] in the route's
-# declared key order ssh_auth.composition.endpoint_key = [address, port, proxy_jump, owner] (C1 delta, tick158).
+# The endpoint B's contract actually reaches (resolve_contract.yml: address, port, ProxyJump) plus the peer's owner
+# must be the endpoint C1 bound for this peer, in the route's declared key order ssh_auth.composition.endpoint_key =
+# [address, port, proxy_jump, owner] (C1 delta, tick158):
+#   workload_target       (tr.contract.endpoint_kinds.<kind>.target_scope true) binding.deployment.endpoints[<target>]
+#                         of the target's scope (tr_scope_expect) -- today's behaviour
+#   controller_operation  (target_scope false; r5f, codex-tick400 R4-PRIVILEGED-CONTRACT) the loader-bound
+#                         binding.deployment.<endpoints_at>[<alias>] of this host's resolve (the SAME computation)
 # Every normalisation rule is READ from the resolved policy (tr_bs = rh.controller.bootstrap), never copied here:
 #   address    composition.address (B's contract reads the same var; absent -> the inventory name) | normalize
 #   port       the explicit value as a canonical decimal string, else composition.port.absent_key
 #   proxy_jump B's contract proxy (the form_regex capture, B's proxy_regex == the route's, asserted by bind_controller)
 #              or '' for the three no-jump inventory forms
-#   owner      the declared rule inventory.owner = {var, absent} (route r3h, profile fabb0712): the target's
+#   owner      the declared rule inventory.owner = {var, absent} (route r3h, profile fabb0712): the peer's
 #              inventory.owner.var value, else inventory.owner.absent; owner.var must equal inventory.owner_var
-# An old endpoint, or another target's endpoint, refuses here -- before any target effect and before the contract is
-# recorded. Inputs: tr, tr_bs, tr_contract, tr_scope_expect, lme_transfer_target. Outputs: tr_endpoint.
+# An old endpoint, or another peer's endpoint, refuses here -- before any target effect and before the contract is
+# recorded. Inputs: tr, tr_bs, tr_contract, tr_peer, tr_scope_expect (workload kind), lme_resolved (controller kind).
+# Outputs: tr_endpoint.
 
 - name: Refuse an endpoint rule B's contract does not read the same way (seam)
   vars:
@@ -34,6 +39,17 @@
       ({{ tr.contract.address_var }}, {{ tr.contract.port_var }}, owner {{ tr_bs.inventory.owner | default('undeclared') | to_json }}).
     quiet: true
 
+- name: Refuse a peer that is not the contract's peer, or of an undeclared kind (staged before any use)
+  ansible.builtin.assert:
+    that:
+      - tr_peer is defined and tr_peer is mapping
+      - tr_peer.kind is defined and tr.contract.endpoint_kinds is mapping and tr_peer.kind in tr.contract.endpoint_kinds
+      - tr_peer.alias is defined and tr_peer.alias == tr_contract.alias
+    fail_msg: >-
+      TRANSFER-ENDPOINT-BINDING: the endpoint peer must be the contract's peer ({{ tr_contract.alias }}) of a declared
+      endpoint kind.
+    quiet: true
+
 - name: Compose the endpoint B's contract reaches, in the scope's endpoint key form
   vars:
     _cp: "{{ tr_bs.ssh_auth.composition }}"
@@ -43,20 +59,44 @@
       - "{{ _cp.port.absent_key if tr_contract.port is none else ((tr_contract.port | int) | string) }}"
       - "{{ '' if tr_contract.proxy is none else tr_contract.proxy }}"
       - >-
-        {{ hostvars[lme_transfer_target][tr_bs.inventory.owner.var]
-           if (tr_bs.inventory.owner.var in hostvars[lme_transfer_target]) else tr_bs.inventory.owner.absent }}
+        {{ hostvars[tr_peer.alias][tr_bs.inventory.owner.var]
+           if (tr_bs.inventory.owner.var in hostvars[tr_peer.alias]) else tr_bs.inventory.owner.absent }}
 
-- name: Refuse a contract endpoint that is not the endpoint bound into this target's scope
+# r5g (codex-tick410-412 R5F-DERIVED-ALIASES): the task vars below are in the reserved ^_?tr_ family
+# (reserved_transfer_vars: _tr_ek, _tr_eps), so a supplied -e/inventory value is refused by refuse_reserved_families.yml
+# at the entry's first play, before any contact; a plain task var (r5f _ek, inherited _eps) is outranked by an extra var.
+- name: Refuse a controller-operation peer whose resolve binds no controller endpoints (staged presence)
   vars:
-    _eps: "{{ tr_scope_expect.binding.deployment.endpoints | default(none) }}"
+    _tr_ek: "{{ tr.contract.endpoint_kinds[tr_peer.kind] }}"
   ansible.builtin.assert:
     that:
-      - _eps is mapping
-      - lme_transfer_target in _eps
-      - _eps[lme_transfer_target] is sequence and _eps[lme_transfer_target] is not string
-      - _eps[lme_transfer_target] | list == tr_endpoint
+      - lme_resolved.remote_harness.binding.deployment is defined
+      - lme_resolved.remote_harness.binding.deployment is mapping
+      - _tr_ek.endpoints_at in lme_resolved.remote_harness.binding.deployment
     fail_msg: >-
-      TRANSFER-ENDPOINT-BINDING: the contract for {{ lme_transfer_target }} reaches {{ tr_endpoint | to_json }}, but
-      its scope binds {{ (_eps[lme_transfer_target] if (_eps is mapping and lme_transfer_target in _eps) else 'no endpoint') | to_json }}
-      (binding.deployment.endpoints). An old endpoint or another target's endpoint is refused; nothing was changed.
+      TRANSFER-ENDPOINT-BINDING: {{ tr_peer.alias }} ({{ tr_peer.kind }}) needs the loader-bound
+      binding.deployment.{{ _tr_ek.endpoints_at }}; this host's resolve binds none.
+    quiet: true
+  when: not tr.contract.endpoint_kinds[tr_peer.kind].target_scope
+
+- name: Refuse a contract endpoint that is not the endpoint bound for this peer
+  vars:
+    _tr_ek: "{{ tr.contract.endpoint_kinds[tr_peer.kind] }}"
+    # the workload branch is today's expression unchanged (its inherited absent form); the controller branch was
+    # presence-asserted above
+    _tr_eps: >-
+      {{ (tr_scope_expect.binding.deployment.endpoints | default(none)) if _tr_ek.target_scope
+         else lme_resolved.remote_harness.binding.deployment[_tr_ek.endpoints_at] }}
+  ansible.builtin.assert:
+    that:
+      - _tr_eps is mapping
+      - tr_peer.alias in _tr_eps
+      - _tr_eps[tr_peer.alias] is sequence and _tr_eps[tr_peer.alias] is not string
+      - _tr_eps[tr_peer.alias] | list == tr_endpoint
+    fail_msg: >-
+      TRANSFER-ENDPOINT-BINDING: the contract for {{ tr_peer.alias }} ({{ tr_peer.kind }}) reaches
+      {{ tr_endpoint | to_json }}, but its binding binds
+      {{ (_tr_eps[tr_peer.alias] if (_tr_eps is mapping and tr_peer.alias in _tr_eps) else 'no endpoint') | to_json }}
+      (binding.deployment.{{ 'endpoints' if _tr_ek.target_scope else _tr_ek.endpoints_at }}). An old endpoint or another
+      peer's endpoint is refused; nothing was changed.
     quiet: true

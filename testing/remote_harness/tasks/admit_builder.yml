@@ -1,11 +1,12 @@
 ---
 # testing/remote_harness/tasks/admit_builder.yml -- GENESIS builder admission (codex-tick127 genesis).
 #
-# The package-builder stage (package.yml, acquire.yml) runs on an executor that exists BEFORE any managed
-# generation. It is admitted ONLY when it is exactly the declared builder (controller.bootstrap.genesis.builder):
-# declared executable (exact shebang line), declared python (path + major.minor), declared core, the ansible
-# package imported from the declared directory, NO ansible config file discovered, and no ANSIBLE_* variable
-# outside env_allow. No search, no fallback. Nothing is written before this passes. Non-root only.
+# The package-builder stage (package.yml, acquire.yml) runs on the MANAGED builder: the controller-seed generation of
+# the toolchain root (controller.bootstrap.genesis.builder; one stable verified generation, never per act). It is
+# admitted ONLY when it is exactly that generation: executable and python paths in G equal to the receipt's, the
+# executable's first line running the generation python, the declared core and python major.minor, the ansible package
+# imported from inside G, the generation's sealed ansible.cfg as the config file, the generation collections path, and
+# no ANSIBLE_* variable outside env_allow. No search, no fallback. Nothing is written before this passes. Non-root only.
 # Requires refuse_pinned_outputs.yml and resolve_policy.yml earlier in the play (localhost, connection local; both are
 # controller-side action plugins only -- assert / set_fact / include_vars -- so no module has staged anything yet).
 # Input (no default): rh_gen_stage, the genesis.launch.stages key of the including playbook (acquire | package), and
@@ -22,6 +23,56 @@
 # of 929f5b3 (C1-ACT-REQUIRED-COMPONENT, codex 193337 / 194825; the registry side contract_admission.required_values
 # .genesis_act is already on this lineage). Requires the profile's controller.bootstrap.genesis.launch (C1 hunk):
 # without it the first task fails on an undefined policy node, never on a silent default.
+
+# MANAGED BUILDER = THE CONTROLLER-SEED GENERATION (codex-tick542 OD-GEN-07 + GEN-STABLE-GENERATION; codex-tick543
+# OD-S3-08): ONE stable verified generation, located by the ONE shared recipe tasks/derive_toolchain_generation.yml
+# under the toolchain root R = <repo>/<work_roots.root_rel>/<work_roots.sub_roots[genesis.builder.root.sub]> (== the
+# controller seed --root). G = R/<layout.generations_dir>/<generation id>; each path = G/<layout.gen_dirs[<gen_dir>]>/
+# <rel>. Acts own only scratch and evidence; there is no per-act toolchain. Derived controller-side FIRST, before the
+# launch-environment admission (genesis.launch.env.generation_paths are <G>/<layout key path>: GEN2-PROF-02) and before
+# the first module (the interpreter binding below needs the python path); assert / include_tasks / set_fact only, so
+# nothing is staged. The installed generation is bound to it after the first read-only module by the receipt verifier.
+# The toolchain VALUE, the config_file VALUE and the retired scalar keys are admitted / refused by the registry (F05),
+# never re-checked or read here.
+- name: Refuse a builder declaration that is not the generation shape and derive the managed builder paths (before any module)
+  vars:
+    _gb: "{{ rh.controller.bootstrap.genesis.builder }}"
+    _wr: "{{ rh.controller.bootstrap.work_roots }}"
+    _sep: "{{ rh.controller.bootstrap.path_admission.separator }}"
+    # each env.generation_paths value walked through bootstrap.layout (none where a step is not a key of a mapping)
+    _gwalk: >-
+      {% set ns = namespace(l=[]) %}{% for p in rh.controller.bootstrap.genesis.launch.env.generation_paths.values() %}{% set w = namespace(v=rh.controller.bootstrap.layout) %}{% for s in p %}{% if w.v is mapping and s in w.v %}{% set w.v = w.v[s] %}{% else %}{% set w.v = none %}{% endif %}{% endfor %}{% set ns.l = ns.l + [w.v] %}{% endfor %}{{ ns.l }}
+  block:
+    - name: Refuse a builder declaration that is not the seed generation shape (RH-BUILDER-UNSUPPORTED)
+      ansible.builtin.assert:
+        that:
+          - _gb.root is mapping and _gb.root.sub in _wr.sub_roots
+          - _gb.executable is mapping and _gb.python is mapping
+          - _gb.executable.gen_dir in rh.controller.bootstrap.layout.gen_dirs
+          - _gb.python.gen_dir in rh.controller.bootstrap.layout.gen_dirs
+          - rh.controller.bootstrap.genesis.launch.env.generation_paths is mapping
+          - rh.controller.bootstrap.genesis.launch.env.generation_paths.values() | reject('sequence') | list | length == 0
+          - _gwalk | reject('string') | list | length == 0
+        fail_msg: >-
+          REFUSED {{ _gb.refusal }}: controller.bootstrap.genesis.builder must name the controller-seed generation
+          {root{sub in work_roots.sub_roots}, executable{gen_dir, rel}, python{gen_dir, rel}} with gen_dir in
+          layout.gen_dirs, and genesis.launch.env.generation_paths must map each name to a bootstrap.layout key path
+          that ends on a string (walked: {{ _gwalk }}); the host-package builder and the per-act toolchain are retired
+          (codex-tick537 / tick542). Nothing was staged.
+        quiet: true
+    - name: Derive the seed generation of the toolchain root (the ONE shared recipe; controller-side, no module)
+      ansible.builtin.include_tasks: derive_toolchain_generation.yml
+      vars:
+        rh_tc_root: "{{ [rh_repo_root, _wr.root_rel, _wr.sub_roots[_gb.root.sub]] | join(_sep) }}"
+    - name: Derive the managed builder paths in that generation
+      ansible.builtin.set_fact:
+        _rh_bld_m:
+          root: "{{ [rh_repo_root, _wr.root_rel, _wr.sub_roots[_gb.root.sub]] | join(_sep) }}"
+          g: "{{ _rh_tc_gen }}"
+          executable: "{{ [_rh_tc_gen, rh.controller.bootstrap.layout.gen_dirs[_gb.executable.gen_dir], _gb.executable.rel] | join(_sep) }}"
+          python: "{{ [_rh_tc_gen, rh.controller.bootstrap.layout.gen_dirs[_gb.python.gen_dir], _gb.python.rel] | join(_sep) }}"
+          # builder.config_file generation (GEN2-PROF-10): the sealed generation ansible.cfg (seed SEED-01 managed pair)
+          config: "{{ [_rh_tc_gen, rh.controller.bootstrap.layout.config_file] | join(_sep) }}"
 
 - name: Refuse an undeclared or mis-bound genesis process environment before any module (RH-GENESIS-TEMP-BINDING; lookups only)
   vars:
@@ -50,7 +101,11 @@
     _sr: "{{ _w ~ '/' ~ _wr.sub_roots[_l.stage_root.sub] ~ '/' ~ _l.stage_root.rel ~ '/' ~ (rh_gen_stage | default('')) ~ '/' ~ _act }}"
     _paths: >-
       {% set ns = namespace(d={}) %}{% for k, v in _l.env.stage_paths.items() %}{% set ns.d = ns.d | combine({k: _sr ~ '/' ~ v}) %}{% endfor %}{{ ns.d }}
-    _want: "{{ rh.controller.bootstrap.base_env | combine(_l.env.literal) | combine(_paths) }}"
+    # GEN2-PROF-02 env.generation_paths: names bound INTO the managed generation G (derived by the block above) at
+    # <G>/<bootstrap.layout key path>, admitted at their declared values like every other declared pair
+    _gpaths: >-
+      {% set ns = namespace(d={}) %}{% for k, p in _l.env.generation_paths.items() %}{% set w = namespace(v=rh.controller.bootstrap.layout) %}{% for s in p %}{% set w.v = w.v[s] %}{% endfor %}{% set ns.d = ns.d | combine({k: [_rh_bld_m.g, w.v] | join(rh.controller.bootstrap.path_admission.separator)}) %}{% endfor %}{{ ns.d }}
+    _want: "{{ rh.controller.bootstrap.base_env | combine(_l.env.literal) | combine(_paths) | combine(_gpaths) }}"
     _bad: >-
       {% set ns = namespace(b=[]) %}{% for k, v in _want.items() %}{% set a = lookup('ansible.builtin.env', k, default='<unset>') %}{% if a != v %}{% set ns.b = ns.b + [k ~ '=' ~ a ~ ' (declared ' ~ v ~ ')'] %}{% endif %}{% endfor %}{{ ns.b }}
     _chain: >-
@@ -118,21 +173,27 @@
 - name: Refuse a pre-supplied module interpreter other than the declared builder python (before any module)
   ansible.builtin.assert:
     that:
-      - (ansible_python_interpreter | default(rh.controller.bootstrap.genesis.builder.python)) == rh.controller.bootstrap.genesis.builder.python
+      - ansible_python_interpreter is not defined or ansible_python_interpreter == _rh_bld_m.python
     fail_msg: >-
       REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: the genesis module interpreter is bound by the harness
-      to the declared builder python {{ rh.controller.bootstrap.genesis.builder.python }}; a pre-supplied
+      to the managed builder python {{ _rh_bld_m.python }}; a pre-supplied
       ansible_python_interpreter (inventory or extra-var) must be absent or equal to it (got
       '{{ ansible_python_interpreter | default('unset') }}'). Nothing was staged.
     quiet: true
 
 - name: Bind the module interpreter to the declared builder python (derived after the resolve; before the first module)
   ansible.builtin.set_fact:
-    ansible_python_interpreter: "{{ rh.controller.bootstrap.genesis.builder.python }}"
+    ansible_python_interpreter: "{{ _rh_bld_m.python }}"
 
 - name: Refuse a privileged builder and read the builder's environment and interpreter facts (no writes)
   ansible.builtin.setup:
     gather_subset: ['!all', '!min', 'env', 'python', 'user', 'mounts']
+
+- name: Bind the installed seed generation at consumption (the existing receipt verifier; owner-read, read-only)
+  ansible.builtin.include_tasks: verify_toolchain_receipt.yml
+  vars:
+    rh_tc_root: "{{ _rh_bld_m.root }}"
+    rh_tc_owner: "{{ ansible_facts.user_id }}"
 
 - name: Stat every component from / down to each genesis stage path (no link followed; read-only)
   vars:
@@ -204,21 +265,21 @@
     get_checksum: true
     checksum_algorithm: sha256
   loop:
-    - {path: "{{ rh.controller.bootstrap.genesis.builder.executable }}", follow: false}
-    - {path: "{{ rh.controller.bootstrap.genesis.builder.python }}", follow: false}
-    - {path: "{{ rh.controller.bootstrap.genesis.builder.python }}", follow: true}
+    - {path: "{{ _rh_bld_m.executable }}", follow: false}
+    - {path: "{{ _rh_bld_m.python }}", follow: false}
+    - {path: "{{ _rh_bld_m.python }}", follow: true}
   register: _rh_bld_stat
 
 - name: Read the builder executable's first line (its interpreter binding)
   ansible.builtin.slurp:
-    src: "{{ rh.controller.bootstrap.genesis.builder.executable }}"
+    src: "{{ _rh_bld_m.executable }}"
   register: _rh_bld_head
   when: _rh_bld_stat.results[0].stat.exists
 
 - name: Ask the declared interpreter where its ansible package lives (read-only)
   ansible.builtin.command:
     argv:
-      - "{{ rh.controller.bootstrap.genesis.builder.python }}"
+      - "{{ _rh_bld_m.python }}"
       - -I
       - -B
       - -c
@@ -235,61 +296,81 @@
       - _rh_bld_stat.results[0].stat.exists and _rh_bld_stat.results[0].stat.isreg and _rh_bld_stat.results[0].stat.executable
       - _rh_bld_stat.results[1].stat.exists and _rh_bld_stat.results[1].stat.executable
       - _rh_bld_stat.results[2].stat.exists and _rh_bld_stat.results[2].stat.isreg and _rh_bld_stat.results[2].stat.checksum is defined
-      - (_rh_bld_head.content | b64decode).splitlines()[0] == rh.controller.bootstrap.genesis.builder.shebang
-      - ansible_playbook_python == rh.controller.bootstrap.genesis.builder.python
+      # codex-tick537 item 4: the executable's interpreter binding is the MANAGED python, never the host system python
+      # the seed's declared interpreter rule (controller_seed.j2 run_local_exec): first line #!<python>, or #!/bin/sh with
+      # the launcher exec of exactly '<python>' (a shebang too long for the kernel)
+      - >-
+        (_rh_bld_head.content | b64decode).splitlines()[0] == '#!' ~ _rh_bld_m.python
+        or ((_rh_bld_head.content | b64decode).splitlines()[0] == '#!/bin/sh'
+            and ("'''exec' '" ~ _rh_bld_m.python ~ "' ") in (_rh_bld_head.content | b64decode))
+      # the builder is EXACTLY the verified seed generation (receipt verifier output, bound at consumption)
+      - _rh_bld_m.g == rh_toolchain.generation_dir
+      - _rh_bld_m.executable == rh_toolchain.ansible_playbook
+      - _rh_bld_m.python == rh_toolchain.python
+      - _rh_bld_stat.results[0].stat.checksum == rh_toolchain.ansible_playbook_sha256
+      - ansible_playbook_python == _rh_bld_m.python
       - ansible_version.full == rh.controller.bootstrap.genesis.builder.core
       # the binding held (an extra-var would outrank the set_fact; refused before setup, re-checked here) and no module
       # ran interpreter discovery (2.19 records it as ansible_facts.discovered_interpreter_python)
-      - ansible_python_interpreter == rh.controller.bootstrap.genesis.builder.python
+      - ansible_python_interpreter == _rh_bld_m.python
       - "'discovered_interpreter_python' not in ansible_facts"
       # STRICT path equality, no realpath: the module runs as '<bound path> AnsiballZ_*.py' and CPython reports argv0
       # unresolved as sys.executable (the same property ansible_playbook_python == builder.python relies on)
-      - ansible_facts.python.executable == rh.controller.bootstrap.genesis.builder.python
+      - ansible_facts.python.executable == _rh_bld_m.python
       - (ansible_facts.python.version.major ~ '.' ~ ansible_facts.python.version.minor) == rh.controller.bootstrap.genesis.builder.python_major_minor
-      - _rh_bld_pkg.rc == 0 and _rh_bld_pkg.stdout == rh.controller.bootstrap.genesis.builder.ansible_package_dir
-      - ansible_config_file is none or ansible_config_file | length == 0
+      # the imported ansible package lies inside the managed toolchain G (derived; the retired ansible_package_dir literal is gone)
+      - _rh_bld_pkg.rc == 0 and _rh_bld_pkg.stdout.startswith(_rh_bld_m.g ~ rh.controller.bootstrap.path_admission.separator)
+      # GEN2-PROF-10 (builder.config_file generation): the effective config file IS the sealed generation ansible.cfg
+      # bound by the receipt, and the collections path is the generation's (both admitted at their declared values first)
+      - ansible_config_file is string and ansible_config_file == _rh_bld_m.config
+      - _rh_bld_m.config == rh_toolchain.ansible_config
+      - lookup('ansible.builtin.env', 'ANSIBLE_COLLECTIONS_PATH') == rh_toolchain.collections_path
       - >-
         ansible_facts.env | dict2items | map(attribute='key') | select('match', '^ANSIBLE_')
         | reject('in', rh.controller.bootstrap.genesis.builder.env_allow) | list | length == 0
     fail_msg: >-
-      REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: the package-builder stage runs only on the declared
-      builder {{ rh.controller.bootstrap.genesis.builder.executable }} (first line
-      '{{ rh.controller.bootstrap.genesis.builder.shebang }}', core {{ rh.controller.bootstrap.genesis.builder.core }},
-      python {{ rh.controller.bootstrap.genesis.builder.python }} {{ rh.controller.bootstrap.genesis.builder.python_major_minor }},
-      ansible from {{ rh.controller.bootstrap.genesis.builder.ansible_package_dir }}), non-root, with NO ansible config
-      file (found: {{ ansible_config_file | default('none') }}) and no ANSIBLE_* variables besides
+      REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: the genesis stage runs only on the MANAGED builder
+      {{ _rh_bld_m.executable }} (first line '#!{{ _rh_bld_m.python }}', core {{ rh.controller.bootstrap.genesis.builder.core }},
+      python {{ _rh_bld_m.python }} {{ rh.controller.bootstrap.genesis.builder.python_major_minor }}, ansible package under
+      {{ _rh_bld_m.g }}), non-root, with the generation config file {{ _rh_bld_m.config }} (== the receipt ansible_config;
+      found: {{ ansible_config_file }}), collections path {{ rh_toolchain.collections_path }}, and no ANSIBLE_* variables besides
       {{ rh.controller.bootstrap.genesis.builder.env_allow }} (found:
       {{ ansible_facts.env | dict2items | map(attribute='key') | select('match', '^ANSIBLE_') | list }}).
       Observed: core {{ ansible_version.full }}; controller python (ansible_playbook_python) {{ ansible_playbook_python }};
       bound module interpreter {{ ansible_python_interpreter | default('unset') }}; module python (ansible_facts.python.executable)
       {{ ansible_facts.python.executable | default('?') }} {{ ansible_facts.python.version.major | default('?') }}.{{ ansible_facts.python.version.minor | default('?') }};
       discovered {{ ansible_facts.discovered_interpreter_python | default('none') }}; declared python resolves to
-      {{ (_rh_bld_stat.results[1].stat.lnk_source | default(rh.controller.bootstrap.genesis.builder.python)) if (_rh_bld_stat.results[1].stat.islnk | default(false)) else rh.controller.bootstrap.genesis.builder.python }}
+      {{ ((_rh_bld_stat.results[1].stat.lnk_source if _rh_bld_stat.results[1].stat.islnk else _rh_bld_m.python) if _rh_bld_stat.results[1].stat.exists else 'absent: ' ~ _rh_bld_m.python) }}
       (regular {{ _rh_bld_stat.results[2].stat.isreg | default('?') }}); ansible package
       {{ _rh_bld_pkg.stdout | default('?') }} (rc {{ _rh_bld_pkg.rc | default('?') }}). A missing builder is installed by
-      MAIN (root step) from packages {{ rh.controller.bootstrap.genesis.builder.packages }}; nothing else is searched.
+      the genesis entry as the controller-seed generation in the toolchain root {{ _rh_bld_m.root }} (the seed's own
+      lifecycle; never per act, never an operator package step); this task never installs and nothing else is searched.
     quiet: true
 
 # GENESIS contract reconciliation (codex 143844 bootstrap note; authority genesis.decision.ref, execution binding
-# genesis.builder). ENFORCED above: executable path + regular/executable + exact first line, python path (as run, as
-# BOUND module interpreter with no discovery, AND as reported) + major.minor, core, ansible package dir, no config
-# file, ANSIBLE_* confined to env_allow, non-root.
-# RECORDED below, NOT enforced: executable_sha256 and python_sha256 are MEASUREMENTS (stat sha256) of the executable
-# and of the regular file the declared python path resolves to (python_resolved), written into bundle.json for later
-# audit; no declared digest exists to compare them with, so they do
-# not establish tool identity beyond the enforced facts. identity_basis says so in the record itself.
+# genesis.builder = the controller-seed generation). ENFORCED above: the generation of the toolchain root derived by the
+# ONE shared recipe and bound through the receipt verifier (receipt, COMPLETE, active pointer, tree digests); the
+# executable / python paths in that generation equal the receipt's; the executable bytes equal the receipt's
+# ansible_playbook_sha256; its first line runs the generation python (#! or the declared /bin/sh exec trampoline); the
+# python path as run, as BOUND module interpreter with no discovery, AND as reported + major.minor; core; the ansible
+# package located under G; the config file is the generation's sealed ansible.cfg (== the receipt ansible_config) and
+# ANSIBLE_COLLECTIONS_PATH the generation's collections path (== the receipt collections_path); ANSIBLE_* confined to
+# env_allow; non-root.
+# RECORDED below, NOT separately enforced: python_sha256 is a MEASUREMENT (stat sha256) of the regular file the python
+# path resolves to (python_resolved), written into bundle.json for later audit (the receipt binds interpreter_sha256 to
+# the generation interpreter, not to this venv path). identity_basis says so in the record itself.
 - name: Record the admitted builder identity (derived output)
   ansible.builtin.set_fact:
     rh_builder:
-      identity_basis: enforced_declared_facts; sha256 fields are recorded measurements, not compared
-      executable: "{{ rh.controller.bootstrap.genesis.builder.executable }}"
+      identity_basis: verified_seed_generation; executable_sha256 equals the receipt ansible_playbook_sha256; python_sha256 is a recorded measurement
+      executable: "{{ _rh_bld_m.executable }}"
       executable_sha256: "{{ _rh_bld_stat.results[0].stat.checksum }}"
       python: "{{ ansible_playbook_python }}"
       # the regular file the declared python path resolves to (the path itself may be a link: stat checksums no link)
-      python_resolved: "{{ _rh_bld_stat.results[1].stat.lnk_source if _rh_bld_stat.results[1].stat.islnk else rh.controller.bootstrap.genesis.builder.python }}"
+      python_resolved: "{{ _rh_bld_stat.results[1].stat.lnk_source if _rh_bld_stat.results[1].stat.islnk else _rh_bld_m.python }}"
       python_sha256: "{{ _rh_bld_stat.results[2].stat.checksum }}"
       python_version: "{{ ansible_facts.python.version.major }}.{{ ansible_facts.python.version.minor }}.{{ ansible_facts.python.version.micro }}"
       ansible_core: "{{ ansible_version.full }}"
       ansible_package_dir: "{{ _rh_bld_pkg.stdout }}"
-      config_file: none
+      config_file: "{{ ansible_config_file }}"
       uid: "{{ ansible_facts.user_uid }}"

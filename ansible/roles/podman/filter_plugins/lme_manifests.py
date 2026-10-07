@@ -25,9 +25,11 @@
 #   exactly the observed `lme_backups` volume owner (165536 = 165536 + 0 + 0).
 
 from __future__ import absolute_import, division, print_function
+import copy
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 
 __metaclass__ = type
 
@@ -2453,6 +2455,14 @@ def _rh_kind(v):
     return 'null' if v is None else type(v).__name__
 
 
+# F05-S4 RENDER-CONTEXT-02 (render-interface-02; Codex578 OD-S06-STRUCT-SOURCE-TYPE; Codex580 J-S07-KIND-ADMISSION):
+# the SEVEN supported kind words bool / int / str / float / mapping / list / null -- exactly the words of _rh_kind's
+# DECLARED branches, taken by applying it to one representative of each branch (never respelled). Its unbounded
+# type(v).__name__ fallback (an unsupported value) is NEVER a member: a registry-declared result kind
+# (published_views.<view>.rendered.source_kinds) or a struct_kind_tests key outside these seven refuses.
+_RH_KIND_WORDS = frozenset(_rh_kind(x) for x in (False, 0, '', 0.0, {}, [], None))
+
+
 def _rh_get(tree, dotted):
     cur = tree
     for k in dotted.split('.'):
@@ -2460,6 +2470,906 @@ def _rh_get(tree, dotted):
             return False, None
         cur = cur[k]
     return True, cur
+
+
+# F05-S3 (codex-tick522 / codex-tick530 / codex-tick534): the DOCUMENT CHANNEL, the projection DEPENDENCY ORDER and the
+# entry-generation projection kinds. Every literal below is a registry KEY of the declaration it reads (the kind's own
+# contract, documented beside the declaration in global.yml); every value is read through a registry pointer.
+_RH_DOC_CHANNEL_KEYS = frozenset(('at', 'when', 'fact', 'read', 'encoding', 'digest_algorithm', 'rel_pattern', 'admission',
+                                  'refusal', 'message'))
+_RH_DOC_ADMISSION_KEYS = frozenset(('fact', 'members', 'observed'))
+_RH_DOC_FACT_KEYS = frozenset(('rel', 'text'))
+_RH_DOC_PRIMARY_KEYS = frozenset(('rel_from', 'root'))
+_RH_DOC_DEPENDENT_KEYS = frozenset(('document', 'rel_at'))
+
+
+def _rh_patterns(schema):
+    """contract_admission.patterns, admitted fail-closed (_rh_ca_registry): ({name: compiled}, {name: text})."""
+    if not isinstance(schema, dict) or 'contract_admission' not in schema:
+        raise ValueError('lme: registry remote_harness_schema.contract_admission is absent (the patterns are declared there); got %r' % (
+            sorted(schema) if isinstance(schema, dict) else schema,))
+    ca = schema['contract_admission']
+    return _rh_ca_registry(ca, schema)[0], ca['patterns']
+
+
+def _rh_contract_active(pol, schema, view, where):
+    """The ONE activity rule (codex-tick530 OI-08): the published view `view` must be a declaration_contract; active
+    exactly when the policy declares its when_declared path. No absence-derived skip: callers refuse an inactive
+    policy that carries a gated node."""
+    views = _rh_published_view_decl(schema)
+    if view not in views or views[view]['kind'] != 'declaration_contract':
+        raise ValueError('lme: registry %s names published view %r, which is not a declared declaration_contract view (%s)' % (
+            where, view, sorted(n for n in views if views[n]['kind'] == 'declaration_contract')))
+    return _rh_get(pol, views[view]['when_declared'])[0]
+
+
+def _rh_document_channel(schema):
+    """LR-01: registry remote_harness_schema.document_channel, admitted at every use. Exact keys; at / read / encoding /
+    digest_algorithm are policy paths; `when` names a declaration_contract view; fact and admission.fact are reserved
+    resolver outputs (var_name, listed in resolver_outputs); rel_pattern names a contract_admission pattern (the ONE
+    relative-path grammar, F05S2-RELATIVE-PATH-GRAMMAR); admission.members / admission.observed are policy paths whose
+    values name the admission record's members container and observed-digest field (S3-SEAM-01, OD-S3-02 a);
+    refusal matches patterns.refusal_code."""
+    pats, ptext = _rh_patterns(schema)
+    for k in ('document_channel', 'resolver_outputs'):
+        if k not in schema:
+            raise ValueError('lme: registry remote_harness_schema.%s is absent (F05-S3 document channel, S3-SEAM-01)' % (k,))
+    ch = schema['document_channel']
+    outs = schema['resolver_outputs']
+    if not isinstance(ch, dict) or set(ch) != _RH_DOC_CHANNEL_KEYS \
+            or any(not isinstance(ch[k], str) or not ch[k] for k in _RH_DOC_CHANNEL_KEYS - {'admission'}) \
+            or not isinstance(ch['admission'], dict) or set(ch['admission']) != _RH_DOC_ADMISSION_KEYS \
+            or any(not isinstance(v, str) or not v for v in ch['admission'].values()):
+        raise ValueError('lme: registry remote_harness_schema.document_channel must carry exactly %s (admission exactly %s) with non-empty string values; got %r' % (
+            sorted(_RH_DOC_CHANNEL_KEYS), sorted(_RH_DOC_ADMISSION_KEYS), ch))
+    for f in (ch['fact'], ch['admission']['fact']):
+        if 'var_name' not in pats or not pats['var_name'].fullmatch(f) or not isinstance(outs, list) or f not in outs:
+            raise ValueError('lme: registry remote_harness_schema.document_channel fact %r must be a var_name listed in resolver_outputs (a reserved resolver output); got resolver_outputs %r' % (f, outs))
+    if ch['rel_pattern'] not in pats:
+        raise ValueError('lme: registry remote_harness_schema.document_channel.rel_pattern %r must name a declared contract_admission.patterns entry' % (ch['rel_pattern'],))
+    if 'refusal_code' not in pats:
+        raise ValueError('lme: registry remote_harness_schema.contract_admission.patterns declares no refusal_code; document_channel.refusal %r cannot be admitted' % (ch['refusal'],))
+    if not pats['refusal_code'].fullmatch(ch['refusal']):
+        raise ValueError('lme: registry remote_harness_schema.document_channel.refusal %r must fully match patterns.refusal_code %r' % (ch['refusal'], ptext['refusal_code']))
+    _rh_contract_active({}, schema, ch['when'], 'remote_harness_schema.document_channel.when')
+    return ch
+
+
+def _rh_doc_refuse(ch, key, path, detail, value):
+    raise ValueError('lme: %s (registry remote_harness_schema.document_channel; %s): %s.%s %s; got %r' % (
+        ch['refusal'], ch['message'], key, path, detail, value))
+
+
+def _rh_documents(pol, schema, key, documents, admission):
+    """The complete admission (every declared name carried): see _rh_documents_admit."""
+    active, out, _order, _next = _rh_documents_admit(pol, schema, key, documents, admission, False)
+    return active, out
+
+
+def _rh_documents_admit(pol, schema, key, documents, admission, partial):
+    """LR-03 / LR-04 / LD01 (S3-SEAM-07, OD-S3-02 a): admit the retained document reads BEFORE any parse.
+    inactive (document_channel.when): the node at document_channel.at must be ABSENT, `documents` must be an empty
+      mapping and `admission` must be None (no inert declaration, no read, no admission authority).
+    active: `documents` carries exactly the declared names, each exactly {rel, text}; for EVERY name n the expected
+      rel(n) is re-derived here (rel_from: the policy value; rel_at: the value under the PARENT document's root, read
+      from the parent's already digest-verified parse) and must full-match the channel's rel_pattern; documents[n].rel
+      must EQUAL rel(n) (a coherent swap of two names refuses) and digest(text.encode(encoding)) must EQUAL
+      admission[<members>][rel(n)][<observed>] (a swapped or forged text refuses) -- both BEFORE n is parsed.
+      The document relation is ONE level (OI-05): a {document, rel_at} entry must name a {rel_from, root} entry.
+    Exact bytes: no strip or normalisation (body_domain.read is admitted {lstrip: false, rstrip: false} by contract
+    body_domain); the digested bytes and the parsed value come from the SAME text.
+    partial (the resolve.yml reader, LR-14): `documents` carries exactly the FIRST k names of the admission order
+      (each admitted exactly as above) and the rel of name k+1 is derived and full-matched -- from the policy or from the
+      already digest-verified parent parse -- BEFORE the reader constructs its path; None once every name is carried.
+    Returns (active, {name: {rel, sha256, root}}, admission order, (next name, next rel) | None)."""
+    import yaml
+    ch = _rh_document_channel(schema)
+    pats, ptext = _rh_patterns(schema)
+    relp = pats[ch['rel_pattern']]
+    active = _rh_contract_active(pol, schema, ch['when'], 'remote_harness_schema.document_channel.when')
+    fn, node = _rh_get(pol, ch['at'])
+    if not isinstance(documents, dict):
+        _rh_doc_refuse(ch, key, ch['at'], 'is read through resolver output %s, which must be a mapping' % (ch['fact'],), _rh_kind(documents))
+    if not active:
+        if fn:
+            _rh_doc_refuse(ch, key, ch['at'], 'is declared while published view %s is inactive (no inert declaration)' % (ch['when'],), node)
+        if documents:
+            _rh_doc_refuse(ch, key, ch['at'], 'is inactive but resolver output %s carries documents (nothing is read while inactive)' % (ch['fact'],), sorted(documents))
+        if admission is not None:
+            _rh_doc_refuse(ch, key, ch['at'], 'is inactive but resolver output %s is not null (no admission authority while inactive)' % (ch['admission']['fact'],), _rh_kind(admission))
+        return False, {}, [], None
+    if not fn or not isinstance(node, dict) or not node:
+        _rh_doc_refuse(ch, key, ch['at'], 'must be a declared non-empty mapping while published view %s is active' % (ch['when'],), node if fn else '<absent>')
+    (fe, enc), (fa, alg) = _rh_get(pol, ch['encoding']), _rh_get(pol, ch['digest_algorithm'])
+    if not fe or not isinstance(enc, str) or not enc or not fa or not isinstance(alg, str) or alg not in hashlib.algorithms_available:
+        _rh_doc_refuse(ch, key, '%s / %s' % (ch['encoding'], ch['digest_algorithm']), 'must name a declared encoding and an available digest algorithm', [enc if fe else '<absent>', alg if fa else '<absent>'])
+    try:
+        ''.encode(enc)
+    except LookupError:
+        _rh_doc_refuse(ch, key, ch['encoding'], 'is not a known encoding', enc)
+    am = ch['admission']
+    (fm, mk), (fo, ok) = _rh_get(pol, am['members']), _rh_get(pol, am['observed'])
+    if not fm or not isinstance(mk, str) or not mk or not fo or not isinstance(ok, str) or not ok:
+        _rh_doc_refuse(ch, key, '%s / %s' % (am['members'], am['observed']), 'must name the admission record members container and observed-digest field', [mk if fm else '<absent>', ok if fo else '<absent>'])
+    if not isinstance(admission, dict) or mk not in admission or not isinstance(admission[mk], dict):
+        _rh_doc_refuse(ch, key, ch['at'], 'is active; resolver output %s must be the protected source-admission record carrying a %r mapping (the reader passes rh_src_admission; a caller-supplied record is no authority)' % (am['fact'], mk),
+                       sorted(admission) if isinstance(admission, dict) else _rh_kind(admission))
+    adm = admission[mk]
+    prim = sorted(n for n in node if isinstance(node[n], dict) and set(node[n]) == _RH_DOC_PRIMARY_KEYS)
+    dep = sorted(n for n in node if isinstance(node[n], dict) and set(node[n]) == _RH_DOC_DEPENDENT_KEYS)
+    bad = sorted(n for n in node if n not in prim and n not in dep
+                 or any(not isinstance(v, str) or not v for v in node[n].values()))
+    if bad:
+        _rh_doc_refuse(ch, key, ch['at'], 'entries %s must be exactly %s or %s of non-empty strings' % (bad, sorted(_RH_DOC_PRIMARY_KEYS), sorted(_RH_DOC_DEPENDENT_KEYS)), dict((n, node[n]) for n in bad))
+    deeper = sorted(n for n in dep if node[n]['document'] not in prim)
+    if deeper:
+        _rh_doc_refuse(ch, key, ch['at'], 'entries %s name a document that is not a %s entry: the document relation is ONE level (a deeper, self or cyclic relation refuses, OI-05)' % (deeper, sorted(_RH_DOC_PRIMARY_KEYS)),
+                       dict((n, node[n]['document']) for n in deeper))
+    order = prim + dep
+    carried = order[:len(documents)] if partial else order
+    if sorted(documents) != sorted(carried):
+        _rh_doc_refuse(ch, key, ch['at'], 'declares the documents %s (admission order %s); resolver output %s must carry exactly %s' % (
+            sorted(node), order, ch['fact'], 'a prefix of that order' if partial else 'those names'), sorted(documents))
+    out, seen = {}, {}
+
+    def rel_of(n):
+        # full-match BEFORE any path is constructed (OD-S3-01 a): the reader receives only this admitted rel
+        e = node[n]
+        if n in prim:
+            fr, rel = _rh_get(pol, e['rel_from'])
+            src = '%s.%s' % (key, e['rel_from'])
+        else:
+            fr, rel = _rh_get(out[e['document']]['root'], e['rel_at'])
+            src = 'document %s (%s) root %s' % (e['document'], out[e['document']]['rel'], e['rel_at'])
+        if not fr or not isinstance(rel, str) or not relp.fullmatch(rel):
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'resolves through %s to no repository-relative path fully matching patterns.%s %r' % (src, ch['rel_pattern'], ptext[ch['rel_pattern']]), rel if fr else '<absent>')
+        if rel in seen:
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'resolves to rel %r, already document %s (a document rel is declared once)' % (rel, seen[rel]), rel)
+        return rel
+    for n in carried:
+        e = node[n]
+        rel = rel_of(n)
+        d = documents[n]
+        if not isinstance(d, dict) or set(d) != _RH_DOC_FACT_KEYS or not isinstance(d['rel'], str) or not isinstance(d['text'], str):
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'is carried by resolver output %s.%s, which must be exactly %s of strings' % (ch['fact'], n, sorted(_RH_DOC_FACT_KEYS)),
+                           sorted(d) if isinstance(d, dict) else _rh_kind(d))
+        if d['rel'] != rel:
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'is declared at rel %r; resolver output %s.%s.rel names another file (name-to-rel binding, LD01; nothing is parsed)' % (rel, ch['fact'], n), d['rel'])
+        try:
+            raw = d['text'].encode(enc)
+        except UnicodeError as exc:
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'text of %r is not encodable as %s (%s)' % (rel, enc, exc), rel)
+        sha = hashlib.new(alg, raw).hexdigest()
+        if rel not in adm or not isinstance(adm[rel], dict) or ok not in adm[rel]:
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'rel %r is not admitted by resolver output %s[%r] (no %r digest; the source admission precedes every read)' % (rel, am['fact'], mk, ok), sorted(adm))
+        if adm[rel][ok] != sha:
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'text of %r digests to %s; the admitted %s is %r (exact bytes are compared BEFORE any parse)' % (rel, sha, ok, adm[rel][ok]), sha)
+        try:
+            parsed = yaml.safe_load(d['text'])
+        except yaml.YAMLError as exc:
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'admitted text of %r does not parse (%s)' % (rel, exc), rel)
+        if n in prim:
+            if not isinstance(parsed, dict) or e['root'] not in parsed or not isinstance(parsed[e['root']], dict):
+                _rh_doc_refuse(ch, key, '%s.%s.root' % (ch['at'], n), 'names %r; the admitted %r must be a mapping carrying it as a mapping' % (e['root'], rel), sorted(parsed) if isinstance(parsed, dict) else _rh_kind(parsed))
+            root = parsed[e['root']]
+        else:
+            if not isinstance(parsed, dict):
+                _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'admitted %r must parse to a mapping' % (rel,), _rh_kind(parsed))
+            root = parsed
+        out[n] = {'rel': rel, 'sha256': sha, 'root': root}
+        seen[rel] = n
+    nxt = None
+    if len(carried) < len(order):
+        nxt = (order[len(carried)], rel_of(order[len(carried)]))
+    return True, out, order, nxt
+
+
+def _rh_projection_order(projs):
+    """F05S2-PROJECTION-DEPENDENCY-ORDER: every policy_projections entry declares `after` (a list of OTHER projection
+    names it reads, [] for none); the projections apply in topological order, ties broken by name. An unknown, self
+    or duplicated name, or a cycle, refuses. No name special-case and no reliance on lexical order."""
+    for name in sorted(projs):
+        if not isinstance(projs[name], dict) or 'after' not in projs[name]:
+            raise ValueError('lme: registry policy_projections.%s declares no after (every projection states its order; [] is explicit); got %r' % (name, projs[name]))
+        aft = projs[name]['after']
+        if not isinstance(aft, list) or any(not isinstance(a, str) or a == name or a not in projs for a in aft) or len(set(aft)) != len(aft):
+            raise ValueError('lme: registry policy_projections.%s.after must be a list of distinct OTHER projection names %s; got %r' % (name, sorted(projs), aft))
+    order, done = [], set()
+    while len(order) < len(projs):
+        ready = sorted(n for n in projs if n not in done and set(projs[n]['after']) <= done)
+        if not ready:
+            raise ValueError('lme: registry policy_projections.*.after is cyclic among %s' % (sorted(set(projs) - done),))
+        order.append(ready[0])
+        done.add(ready[0])
+    return order
+
+
+def _rh_doc_root(name, pj, docs, key):
+    """The admitted root of the document a projection reads (`document` names a document_channel entry)."""
+    if pj['document'] not in docs:
+        raise ValueError('lme: registry policy_projections.%s.document %r names no admitted document_channel entry (%s, remote_harness_schema.document_channel.at); admitted %s' % (
+            name, pj['document'], key, sorted(docs)))
+    return docs[pj['document']]['root']
+
+
+def _rh_doc_value(root, path, label, field, docname):
+    """label = the registry declaration that reads it (policy_projections.<name> | published_views.<name>)."""
+    f, v = _rh_get(root, path)
+    if not f:
+        raise ValueError('lme: registry %s.%s: document %s path %s is absent' % (label, field, docname, path))
+    return v
+
+
+def _rh_eg_generated(label, pj, root, pol, key, relp):
+    """The ONE generated selection (B identity): members whose <identity.marker_key> equals the value at
+    <identity.marker_from>; output rel = identity.output_rel_parts mapped through the struct role words member_dir ->
+    member directory, member_file -> member file, joined by the policy value at identity.separator_from.
+    F05-S4 ROSTER-NONPLAYBOOK (Codex546 generated_outputs; OPEN-A / OD-BRR-14 / U-SEAM01): identity.rendered_from is the
+    B pointer of the SECOND generated marker word -- a generated output that is RENDERED (by a declared render, e.g.
+    the genesis entry and its producer) and NOT entry-constructed: no head, no plays, no importer guard closure. Both
+    selections come from this ONE function (one identity, one output-rel law; a rel is unique across both); the
+    rendered word must differ from the entry word. label = the registry declaration that reads it.
+    Returns ({output rel: (dir, file, member)} entry-constructed, members, sep, {output rel: (dir, file, member)} rendered)."""
+    ident = _rh_doc_value(root, pj['identity'], label, 'identity', pj['document'])
+    members = _rh_doc_value(root, pj['members'], label, 'members', pj['document'])
+    if not isinstance(ident, dict) or set(ident) != {'marker_key', 'marker_from', 'rendered_from', 'separator_from', 'output_rel_parts'} \
+            or not isinstance(ident['output_rel_parts'], list) or not ident['output_rel_parts'] \
+            or any(p not in ('member_dir', 'member_file') for p in ident['output_rel_parts']):
+        raise ValueError('lme: registry %s.identity: document %s %s must be {marker_key, marker_from, rendered_from, separator_from, output_rel_parts ⊆ [member_dir, member_file]}; got %r' % (label, pj['document'], pj['identity'], ident))
+    marker = _rh_doc_value(root, ident['marker_from'], label, 'identity.marker_from', pj['document'])
+    rmarker = _rh_doc_value(root, ident['rendered_from'], label, 'identity.rendered_from', pj['document'])
+    fs, sep = _rh_get(pol, ident['separator_from'])
+    if not isinstance(marker, str) or not marker or not isinstance(rmarker, str) or not rmarker or rmarker == marker \
+            or not fs or not isinstance(sep, str) or not sep:
+        raise ValueError('lme: registry %s: markers (%s / %s, distinct) and separator (%s.%s) must be non-empty strings; got %r / %r / %r' % (
+            label, ident['marker_from'], ident['rendered_from'], key, ident['separator_from'], marker, rmarker, sep if fs else '<absent>'))
+    if not isinstance(members, dict) or not members or any(not isinstance(m, dict) or not m for m in members.values()):
+        raise ValueError('lme: registry %s: document %s %s must map member directories to non-empty member mappings; got %r' % (label, pj['document'], pj['members'], members))
+    gen, rendered = {}, {}
+    for d in sorted(members):
+        for f in sorted(members[d]):
+            ent = members[d][f]
+            if not isinstance(ent, dict) or ident['marker_key'] not in ent:
+                raise ValueError('lme: registry %s: document %s %s.%s.%s carries no %r (the generated marker)' % (label, pj['document'], pj['members'], d, f, ident['marker_key']))
+            if ent[ident['marker_key']] not in (marker, rmarker):
+                continue
+            rel = sep.join(d if p == 'member_dir' else f for p in ident['output_rel_parts'])
+            if not relp.fullmatch(rel) or rel in gen or rel in rendered:
+                raise ValueError('lme: registry %s: generated member %r is not a unique repository-relative path' % (label, rel))
+            if ent[ident['marker_key']] == rmarker and set(ent) != {ident['marker_key']}:
+                raise ValueError('lme: registry %s: document %s %s.%s.%s is a rendered output (%s) and must carry exactly {%s} (no entry construction: no head, no plays); got %r' % (
+                    label, pj['document'], pj['members'], d, f, ident['rendered_from'], ident['marker_key'], sorted(ent)))
+            (gen if ent[ident['marker_key']] == marker else rendered)[rel] = (d, f, ent)
+    return gen, members, sep, rendered
+
+
+def _rh_pj_entry_importers(name, pj, out, root, active, docs, schema, key, relp, ptext):
+    """S3-SEAM-06 / OD-S2-01 a / OD-S2-07 / OD-S3-03 a: {<executable rel>: sorted closure}.
+    RUNNER PART (every resolve): each <runners>.<r> declares <runner_key> (the playbook rel) and <requires_key> (the
+      REQUIRED declared dependency list; [] is an explicit statement): importers[playbook] = sorted(requires).
+    DISPATCH ADMISSION (every resolve): <dispatch> = {mode[, authored]}; mode is one of the words of the policy
+      mapping <dispatch_modes> {generation, declared, none} (F05-S4 SC-MM-20 b: declared ONCE in the policy, read by
+      the loader and the seed alike; the registry field is the pointer); mode generation <=> published view `when` active; declared: inactive only, authored REQUIRED; generation:
+      authored OPTIONAL (codex-tick543 OD-BRR-08: declared authored closures alongside the generated entries; an
+      authored key that is also a generated / B / runner key is conflicting ownership and refuses as a repeated
+      importer key); none: inactive only, no authored entry (run-local runners only). A present authored is a
+      non-empty mapping {playbook rel: [closure items]}.
+    B PART (active only): every <members> entry and every <entries> key under the declaration directory; closure =
+      the guard members (relativity repository | entry_dir) + for an <entries> key its <closure>.members items (entry
+      relativity) + every <route_includes> rel (repository). A closure rel must not be its own key; an entry_closure
+      rel must not restate a guard member, a route_includes rel or a <common> member (declared once).
+    CLOSURE ITEMS (requires, authored and entry_closure lists; codex-tick543 OD-BRR-03 / OD-BRR-09): a rel string, or a
+      ONE-key typed reference whose key is a value of the registry field reference_keys:
+        {<reference_keys.value>: <dotted policy path>}: every segment fully matches patterns.<segment_pattern>, the path
+          is declared in the policy being projected and is not under a leaf another projection writes unless that
+          projection is listed in `after`, and its value fully matches the rel pattern; the value is
+          REPOSITORY-relative (never joined to an entry directory). Resolved BEFORE every restated / common check.
+        {<reference_keys.closure>: <importer key>}: the referenced importer key AND its complete closure join this
+          closure; expansion is deterministic (sorted) and recursive; an unknown key (a B key while the generation
+          view is inactive included), a self reference or a cycle refuses; a rel the composition already supplies
+          must not be restated by a rel item (declared once).
+    Every key and closure member full-matches the rel pattern; a key declared twice refuses."""
+    runners, common = _rh_get(out, pj['runners']), _rh_get(out, pj['common'])
+    if not runners[0] or not isinstance(runners[1], dict) or not runners[1]:
+        raise ValueError('lme: %s.%s must be a declared non-empty mapping of runners (policy_projections.%s)' % (key, pj['runners'], name))
+    if not common[0] or not isinstance(common[1], list) or any(not isinstance(c, str) or not relp.fullmatch(c) for c in common[1]):
+        raise ValueError('lme: %s.%s must be a list of repository-relative paths (policy_projections.%s); got %r' % (key, pj['common'], name, common[1] if common[0] else '<absent>'))
+    common = set(common[1])
+    refk = pj['reference_keys']
+    if not isinstance(refk, dict) or set(refk) != {'value', 'closure'} or any(not isinstance(v, str) or not v for v in refk.values()) \
+            or refk['value'] == refk['closure']:
+        raise ValueError('lme: registry policy_projections.%s.reference_keys must map exactly value / closure to distinct non-empty item keys; got %r' % (name, refk))
+    if pj['segment_pattern'] not in _rh_patterns(schema)[0]:
+        raise ValueError('lme: registry policy_projections.%s.segment_pattern %r must name a declared contract_admission.patterns entry' % (name, pj['segment_pattern']))
+    segp = _rh_patterns(schema)[0][pj['segment_pattern']]
+    # MR03-RENDERED-SOURCE-BOOTSTRAP (DEP-MR03-LOADER-01; codex-tick606 / codex-tick610): RENDERED DISPATCH. A rendered
+    # output is never an importer key (ROSTER-NONPLAYBOOK, below); its ONE dispatch owner is its render declaration: each
+    # rendered_dispatch.outputs policy node carries <output_field> (the rendered playbook rel) and <requires_key> (its
+    # closure items). Admitted here on every resolve against the ONE rendered-output authority: the entry_generation view
+    # naming this projection as its importers (rendered.outputs / output_fields.output / when_present).
+    rd = pj['rendered_dispatch']
+    if not isinstance(rd, dict) or set(rd) != {'outputs', 'output_field', 'requires_key', 'to'} or not isinstance(rd['outputs'], list) or not rd['outputs'] \
+            or len(set(map(repr, rd['outputs']))) != len(rd['outputs']) \
+            or any(not isinstance(x, str) or not x or not all(segp.fullmatch(s) for s in x.split('.')) for x in rd['outputs']) \
+            or any(not isinstance(rd[f], str) or not segp.fullmatch(rd[f]) for f in ('output_field', 'requires_key', 'to')) or rd['to'] == pj['to']:
+        raise ValueError('lme: registry policy_projections.%s.rendered_dispatch must be exactly {outputs: [distinct dotted policy paths, segments fully matching patterns.%s], output_field, requires_key, to: <one segment, not %r>}; got %r' % (
+            name, pj['segment_pattern'], pj['to'], rd))
+    if 'published_views' not in schema or not isinstance(schema['published_views'], dict):
+        raise ValueError('lme: registry remote_harness_schema.published_views must be a mapping (policy_projections.%s.rendered_dispatch authority); got %r' % (name, sorted(schema)))
+    owners = sorted(n for n, w in schema['published_views'].items() if isinstance(w, dict) and 'kind' in w and w['kind'] == 'entry_generation' and 'importers' in w and w['importers'] == name)
+    vr = schema['published_views'][owners[0]]['rendered'] if len(owners) == 1 and 'rendered' in schema['published_views'][owners[0]] else None   # absent -> refused below
+    if not isinstance(vr, dict) or any(f not in vr for f in ('outputs', 'output_fields', 'when_present')) or not isinstance(vr['outputs'], list) \
+            or not isinstance(vr['output_fields'], dict) or 'output' not in vr['output_fields'] or not isinstance(vr['when_present'], str) \
+            or any(x not in vr['outputs'] for x in rd['outputs']) or rd['output_field'] != vr['output_fields']['output']:
+        raise ValueError('lme: registry policy_projections.%s.rendered_dispatch must be owned by EXACTLY ONE published_views entry_generation view naming it as importers (found %s) whose rendered.outputs (the ONE rendered-output authority) include every node %r and whose rendered.output_fields.output equals output_field %r; got %r' % (
+            name, owners, rd['outputs'], rd['output_field'], vr))
+    imp, comp, expl, src = {}, {}, {}, {}
+    # value_of must not read a leaf another projection writes unless that projection is in `after` (applied before
+    # this one by _rh_projection_order); otherwise the value would depend on the name tie-break (no lexical reliance)
+    projs = schema['policy_projections']
+    unordered = []
+    for n in sorted(projs):
+        if n in pj['after']:
+            continue
+        o = projs[n]
+        if o['kind'] == 'lookup_merge':
+            fsel, sel = _rh_get(out, '%s.%s' % (o['at'], o['from']))
+            unordered += [('%s.%s.%s' % (o['at'], o['to'], r), n) for r in (sorted(sel) if fsel and isinstance(sel, dict) else [])]
+        else:
+            unordered.append(('%s.%s' % (o['at'], o['to']), n))
+            unordered += [('%s.%s' % (o['at'], s), n) for s in _rh_pj_secondary(n, o)]   # MR03: secondary destinations
+
+    # MR03 J-MR03-COMMON-POLICY-LITERALS (codex-tick612): every policy path listed at <common_refs> SELECTS a common
+    # member: its value in the policy being projected (the RESOLVED, override-LAST policy) is a <common> element (a
+    # membership relation, no filename literal). A relocation that moves the selection without its members_rel entry
+    # refuses here, before any consumer hashes, reads or renders the selected path; a coherent relocation passes.
+    fcr, crefs = _rh_get(out, pj['common_refs'])
+    if not fcr or not isinstance(crefs, list) or not crefs or len(set(map(repr, crefs))) != len(crefs):
+        raise ValueError('lme: %s.%s must be a non-empty list of distinct policy paths (policy_projections.%s.common_refs); got %r' % (
+            key, pj['common_refs'], name, crefs if fcr else '<absent>'))
+    for i, cp in enumerate(crefs):
+        hit = sorted(n for d, n in unordered if isinstance(cp, str) and (cp == d or cp.startswith(d + '.')))
+        fv, cv = _rh_get(out, cp) if isinstance(cp, str) and cp and all(segp.fullmatch(s) for s in cp.split('.')) else (False, None)
+        if hit or not fv or not isinstance(cv, str) or cv not in common:
+            raise ValueError('lme: %s.%s[%d] (policy_projections.%s.common_refs): policy path %r must be declared (not a leaf RESOLVED by %s) and select a %s.%s member; resolved value %r (relocate the selected file and its %s entry together)' % (
+                key, pj['common_refs'], i, name, cp, hit, key, pj['common'], cv if fv else '<absent>', pj['common']))
+
+    def items(lst, where, joiner):
+        """-> (rels, closure refs): rel strings (joined by `joiner` when given) and resolved value references."""
+        rels, refs = [], []
+        for i, x in enumerate(lst):
+            if isinstance(x, str):
+                rels.append(joiner(x) if joiner is not None else x)
+                continue
+            rk = next(iter(x)) if isinstance(x, dict) and len(x) == 1 else None
+            if rk == refk['value']:
+                p = x[rk]
+                hit = sorted(n for d, n in unordered if isinstance(p, str) and (p == d or p.startswith(d + '.')))
+                if hit:
+                    raise ValueError('lme: %s[%d] (policy_projections.%s): {%s: %r} reads a leaf RESOLVED by policy_projections %s, which is not listed in its after %r (declare the order; no lexical reliance)' % (
+                        where, i, name, rk, p, hit, pj['after']))
+                fv, v = _rh_get(out, p) if isinstance(p, str) and p and all(segp.fullmatch(s) for s in p.split('.')) else (False, None)
+                if not fv or not isinstance(v, str) or not relp.fullmatch(v):
+                    raise ValueError('lme: %s[%d] (policy_projections.%s): {%s: %r} must name a declared %s path (segments fully matching patterns.%s) whose value fully matches patterns.%s %r; got %r' % (
+                        where, i, name, rk, p, key, pj['segment_pattern'], pj['rel_pattern'], ptext[pj['rel_pattern']], v if fv else '<absent or malformed path>'))
+                rels.append(v)
+            elif rk == refk['closure'] and isinstance(x[rk], str) and relp.fullmatch(x[rk]):
+                refs.append(x[rk])
+            else:
+                raise ValueError('lme: %s[%d] (policy_projections.%s): a closure item is a rel string, {%s: <policy path>} or {%s: <importer key>}; got %r' % (
+                    where, i, name, refk['value'], refk['closure'], x))
+        return rels, refs
+
+    def add(k, deps, refs, where, explicit):
+        bad = sorted(repr(x) for x in [k] + list(deps) if not isinstance(x, str) or not relp.fullmatch(x))
+        if bad or k in imp or k in deps or k in refs or len(set(refs)) != len(refs):
+            raise ValueError('lme: %s (policy_projections.%s): executable %r closure must be distinct repository-relative paths fully matching patterns.%s %r, not repeat an importer key (one owner per key) and not contain or compose itself; bad %r, repeated %r, composed %r' % (
+                where, name, k, pj['rel_pattern'], ptext[pj['rel_pattern']], bad, k in imp, refs))
+        imp[k] = sorted(set(deps))
+        comp[k] = sorted(refs)
+        expl[k] = set(explicit)
+        src[k] = where
+
+    def common_restated(rels, where):
+        restated = sorted(set(rels) & common)
+        if restated:
+            raise ValueError('lme: %s restates %s.%s members %s (declared once; policy_projections.%s)' % (where, key, pj['common'], restated, name))
+
+    def composed():
+        full = {}
+        for k0 in sorted(imp):
+            stack = [(k0, False)]
+            path = []
+            while stack:
+                k, done = stack.pop()
+                if done:
+                    path.pop()
+                    acc = set(imp[k])
+                    for r in comp[k]:
+                        acc |= {r} | set(full[r])
+                    dup = sorted(expl[k] & set(x for r in comp[k] for x in [r] + full[r]))
+                    if dup:
+                        raise ValueError('lme: %s (policy_projections.%s): importer %r restates %s, already supplied by its composed closures %s (declared once)' % (src[k], name, k, dup, comp[k]))
+                    full[k] = sorted(acc)
+                    continue
+                if k in full:
+                    continue
+                path.append(k)
+                stack.append((k, True))
+                for r in reversed(comp[k]):
+                    if r not in imp:
+                        raise ValueError('lme: %s (policy_projections.%s): importer %r composes %r, which is no importer key (a B entry composes only while published view %s is active); importers %s' % (
+                            src[k], name, k, r, pj['when'], sorted(imp)))
+                    if r in path:
+                        raise ValueError('lme: %s (policy_projections.%s): importer %r composes %r: closure composition is cyclic (%s)' % (src[k], name, k, r, path + [r]))
+                    if r not in full:
+                        stack.append((r, False))
+        return full
+    for r in sorted(runners[1]):
+        rr = runners[1][r]
+        if not isinstance(rr, dict) or pj['runner_key'] not in rr or pj['requires_key'] not in rr or not isinstance(rr[pj['requires_key']], list) \
+                or len(set(map(repr, rr[pj['requires_key']]))) != len(rr[pj['requires_key']]):
+            raise ValueError('lme: %s.%s.%s must declare %s and %s (a list of distinct closure items; [] is explicit) (policy_projections.%s); got %r' % (
+                key, pj['runners'], r, pj['runner_key'], pj['requires_key'], name, rr))
+        where = '%s.%s.%s.%s' % (key, pj['runners'], r, pj['requires_key'])
+        rels, refs = items(rr[pj['requires_key']], where, None)
+        common_restated(rels, where)
+        add(rr[pj['runner_key']], rels, refs, where, rels)
+    fd, da = _rh_get(out, pj['dispatch'])
+    fm, modes = _rh_get(out, pj['dispatch_modes'])
+    if not fm or not isinstance(modes, dict) or set(modes) != {'generation', 'declared', 'none'} or len(set(modes.values())) != 3 \
+            or any(not isinstance(v, str) or not v for v in modes.values()):
+        raise ValueError('lme: %s.%s (registry policy_projections.%s.dispatch_modes; SC-MM-20: the ONE home of the dispatch mode words) must map exactly generation/declared/none to distinct non-empty words; got %r' % (
+            key, pj['dispatch_modes'], name, modes if fm else '<absent>'))
+    mode = da['mode'] if fd and isinstance(da, dict) and 'mode' in da else None   # absent -> refused below
+    want = [{'mode', 'authored'}] if mode == modes['declared'] else [{'mode'}, {'mode', 'authored'}] if mode == modes['generation'] else [{'mode'}]
+    if not fd or not isinstance(da, dict) or mode not in modes.values() or set(da) not in want:
+        raise ValueError('lme: %s.%s must be {mode: one of %s} + authored (required when mode is %r, optional when %r, refused when %r) (policy_projections.%s; OD-S2-04, OD-BRR-08); got %r' % (
+            key, pj['dispatch'], sorted(modes.values()), modes['declared'], modes['generation'], modes['none'], name, da if fd else '<absent>'))
+    if (mode == modes['generation']) != active:
+        raise ValueError('lme: %s.%s.mode %r contradicts published view %s (active %r): mode %r exactly while the generation contract is active (policy_projections.%s)' % (
+            key, pj['dispatch'], mode, pj['when'], active, modes['generation'], name))
+    if 'authored' in da:
+        au = da['authored']
+        if not isinstance(au, dict) or not au or any(not isinstance(v, list) for v in au.values()):
+            raise ValueError('lme: %s.%s.authored must be a non-empty mapping {playbook rel: [closure items]} (policy_projections.%s); got %r' % (key, pj['dispatch'], name, au))
+        for k in sorted(au):
+            where = '%s.%s.authored.%s' % (key, pj['dispatch'], k)
+            rels, refs = items(au[k], where, None)
+            common_restated(rels, where)
+            add(k, rels, refs, where, rels)
+    if not active:
+        return composed(), {}   # MR03: no rendered dispatch row while the generation contract is inactive
+    rel_doc = docs[pj['document']]['rel']
+    lab = 'policy_projections.%s' % (name,)
+    gen, members, sep, rendered = _rh_eg_generated(lab, pj, root, out, key, relp)
+    guard = _rh_doc_value(root, pj['guard'], lab, 'guard', pj['document'])
+    relv = _rh_doc_value(root, pj['relativity_from'], lab, 'relativity_from', pj['document'])
+    entries = _rh_doc_value(root, pj['entries'], lab, 'entries', pj['document'])
+    eclos = _rh_doc_value(root, pj['closure'], lab, 'closure', pj['document'])
+    rincs = _rh_doc_value(root, pj['route_includes'], lab, 'route_includes', pj['document'])
+    words = ('repository', 'entry_dir')
+    psm = guard['protected_set_members'] if isinstance(guard, dict) and 'protected_set_members' in guard else None   # absent -> refused below
+    if not isinstance(psm, list) or not psm or any(not isinstance(m, str) or m not in guard or not isinstance(guard[m], str) for m in psm) \
+            or not isinstance(relv, dict) or sorted(relv) != sorted(psm) or any(v not in words for v in relv.values()):
+        raise ValueError('lme: policy_projections.%s: document %s %s.protected_set_members must name string members and %s must map exactly those to %s; got %r / %r' % (
+            name, pj['document'], pj['guard'], pj['relativity_from'], list(words), psm, relv))
+    if not isinstance(entries, dict) or not entries or not isinstance(eclos, dict) or set(eclos) != {'relativity', 'members'} \
+            or eclos['relativity'] not in words or not isinstance(eclos['members'], dict) or sorted(eclos['members']) != sorted(entries) \
+            or any(not isinstance(v, list) for v in eclos['members'].values()):
+        raise ValueError('lme: policy_projections.%s: document %s %s must be {relativity: one of %s, members: {<each %s key>: [rels]}} (BR-08, OD-S2-07); got %r' % (
+            name, pj['document'], pj['closure'], list(words), pj['entries'], eclos))
+    if not isinstance(rincs, list) or any(not isinstance(x, dict) or 'rel' not in x or not isinstance(x['rel'], str) for x in rincs):
+        raise ValueError('lme: policy_projections.%s: document %s %s must be a list of {rel, ...} entries; got %r' % (name, pj['document'], pj['route_includes'], rincs))
+    rinc = sorted(x['rel'] for x in rincs)
+    ddir = rel_doc.rsplit(sep, 1)[0] if sep in rel_doc else ''
+    if not ddir:
+        raise ValueError('lme: policy_projections.%s: declaration rel %r has no directory under separator %r' % (name, rel_doc, sep))
+
+    def join(base, rel, word):
+        return rel if word == 'repository' else base + sep + rel
+
+    # F05-S4 ROSTER-NONPLAYBOOK: a RENDERED member (identity.rendered_from) is no B-guarded entry: it is not an importer
+    # key and carries no guard closure (its dispatch, if any, is its render owner's declaration).
+    keyed = [(d + sep + f, d, None) for d in sorted(members) for f in sorted(members[d]) if (d + sep + f) not in rendered] \
+        + [(ddir + sep + e, ddir, e) for e in sorted(entries)]
+    # ... and its ONE owner is its render declaration: a runner or authored importer key naming a rendered rel refuses
+    # (conflicting ownership, OD-BRR-08 -- formerly refused as a repeated B key, so it never passes silently)
+    owned = sorted(k for k in imp if k in rendered)
+    if owned:
+        raise ValueError('lme: policy_projections.%s: %s.%s / %s.%s.authored key(s) %s are rendered outputs of document %s (%s): a rendered output is never a runner or authored importer key (one owner per key)' % (
+            name, key, pj['runners'], key, pj['dispatch'], owned, pj['document'], rel_doc))
+    for k, edir, ent in keyed:
+        gclos = [join(edir, guard[m], relv[m]) for m in psm]
+        deps, refs, extra = list(gclos), [], []
+        if ent is not None:
+            where = 'document %s %s.members.%s' % (pj['document'], pj['closure'], ent)
+            extra, refs = items(eclos['members'][ent], where, lambda x, edir=edir: join(edir, x, eclos['relativity']))
+            restated = sorted(set(extra) & (set(gclos) | set(rinc) | common))
+            if restated:
+                raise ValueError('lme: policy_projections.%s: %s restates %s (a guard member, a %s rel or a %s.%s member is declared once)' % (
+                    name, where, restated, pj['route_includes'], key, pj['common']))
+            deps = deps + extra + rinc
+        add(k, deps, refs, '%s (%s)' % (where, rel_doc) if ent is not None else 'document %s (%s)' % (pj['document'], rel_doc), extra)
+    full = composed()
+    # MR03-RENDERED-SOURCE-BOOTSTRAP (DEP-MR03-LOADER-01): one rendered dispatch row per rendered_dispatch.outputs node,
+    # published only while the rendered kind is active (its authority's when_present; inactive: {} -- omitted as the
+    # rendered roster rows are). <output_field> must be a B rendered member of this document (never an importer key:
+    # `owned` above). <requires_key> is admitted EXACTLY as runner requires (codex-tick612 F2): DISTINCT RAW items, then
+    # items + common_restated, then the RESOLVED rels deduplicated (a literal and a {value_of} naming the same rel are
+    # one member); a closure_of item composes an importer key under the composed() declared-once rule; [] is explicit.
+    # codex-tick612 F4: the rendered root must not appear ANYWHERE in its completed expanded closure (direct or through
+    # a composed importer that itself names it).
+    rrows = {}
+    for ro in (rd['outputs'] if _rh_get(out, vr['when_present'])[0] else []):
+        fo, onode = _rh_get(out, ro)
+        rrel = onode[rd['output_field']] if fo and isinstance(onode, dict) and rd['output_field'] in onode else None   # absent -> refused below
+        rreq = onode[rd['requires_key']] if fo and isinstance(onode, dict) and rd['requires_key'] in onode else None   # absent -> refused below
+        if not isinstance(rrel, str) or not relp.fullmatch(rrel) or rrel not in rendered or rrel in full or rrel in rrows \
+                or not isinstance(rreq, list) or len(set(map(repr, rreq))) != len(rreq):
+            raise ValueError('lme: %s.%s (policy_projections.%s.rendered_dispatch): %s must be a rendered output of document %s (%s; rendered %s), dispatched once and never an importer key, and %s a list of distinct closure items ([] is explicit); got %r / %r' % (
+                key, ro, name, rd['output_field'], pj['document'], rel_doc, sorted(rendered), rd['requires_key'], rrel, rreq))
+        where = '%s.%s.%s' % (key, ro, rd['requires_key'])
+        rels, refs = items(rreq, where, None)
+        common_restated(rels, where)
+        badr = sorted(repr(x) for x in rels if not relp.fullmatch(x))
+        unknown = sorted(r for r in refs if r not in full)
+        dup = sorted(set(rels) & set(x for r in refs if r in full for x in [r] + full[r]))
+        clos = sorted(set(rels) | set(x for r in refs if r in full for x in [r] + full[r]))
+        if badr or unknown or dup or rrel in clos or len(set(refs)) != len(refs):
+            raise ValueError('lme: %s (policy_projections.%s.rendered_dispatch): rendered playbook %r closure must be repository-relative paths fully matching patterns.%s %r, compose only importer keys, restate nothing its composed closures supply (declared once) and never contain the rendered playbook itself, directly or in its expanded closure; bad %r, unknown %r, restated %r, self %r' % (
+                where, name, rrel, pj['rel_pattern'], ptext[pj['rel_pattern']], badr, unknown, dup, rrel in clos))
+        rrows[rrel] = clos
+    return full, rrows
+
+
+def _rh_pj_entry_bodies(name, pj, out, root, docs, key, relp, ptext, resolved, schema):
+    """{<importer rel>: {<generated entry rel>: [[body, sha256], ...]}} (F05-S4 transitive obligations): for every
+    importer, each generated member in {importer} + its composed closure, keyed by its generated-entry identity (output
+    rel), with that member's declared plays in declared order; bodies.from and
+    bodies.sha256_from (BR-04) are leaves of one plays list. Every body full-matches the rel pattern and is declared
+    once; every sha fully matches the value at digest_pattern; every key is an importer of projection <importers>
+    (which must be in `after`)."""
+    if pj['importers'] not in pj['after'] or pj['importers'] not in resolved:
+        raise ValueError('lme: registry policy_projections.%s.importers %r must name a projection listed in its after %r' % (name, pj['importers'], pj['after']))
+    # MR03 (DEP-MR03-LOADER-01): <importers> must be the entry_importers projection whose rendered dispatch rows are published
+    ipj = schema['policy_projections'][pj['importers']]
+    if ipj['kind'] != 'entry_importers' or not _rh_get(out, '%s.%s' % (ipj['at'], ipj['rendered_dispatch']['to']))[0] \
+            or not isinstance(_rh_get(out, '%s.%s' % (ipj['at'], ipj['rendered_dispatch']['to']))[1], dict):
+        raise ValueError('lme: registry policy_projections.%s.importers %r must name the entry_importers projection whose rendered_dispatch rows are published (MR03)' % (name, pj['importers']))
+    lab = 'policy_projections.%s' % (name,)
+    gen, _m, _s, _r = _rh_eg_generated(lab, pj, root, out, key, relp)
+    bod = _rh_doc_value(root, pj['bodies'], lab, 'bodies', pj['document'])
+    dpat = _rh_doc_value(root, pj['digest_pattern'], lab, 'digest_pattern', pj['document'])
+    if not isinstance(bod, dict) or not {'from', 'sha256_from'} <= set(bod) or any(not isinstance(bod[k], str) or bod[k].count('.') != 1 for k in ('from', 'sha256_from')) \
+            or bod['from'].split('.')[0] != bod['sha256_from'].split('.')[0] or not isinstance(dpat, str):
+        raise ValueError('lme: policy_projections.%s: document %s %s must declare from and sha256_from as leaves of ONE list (<list>.<leaf>), and %s a pattern; got %r / %r' % (
+            name, pj['document'], pj['bodies'], pj['digest_pattern'], bod, dpat))
+    lst, bl, sl = bod['from'].split('.')[0], bod['from'].split('.')[1], bod['sha256_from'].split('.')[1]
+    res, seen = {}, {}
+    for k in sorted(gen):
+        if k not in resolved[pj['importers']]:
+            raise ValueError('lme: policy_projections.%s: generated member %r is not an importer of projection %s' % (name, k, pj['importers']))
+        plays = gen[k][2][lst] if isinstance(gen[k][2], dict) and lst in gen[k][2] else None   # absent -> refused below
+        if not isinstance(plays, list) or not plays:
+            raise ValueError('lme: policy_projections.%s: generated member %r declares no %s' % (name, k, lst))
+        rows = []
+        for i, p in enumerate(plays):
+            b, s = (p[bl], p[sl]) if isinstance(p, dict) and bl in p and sl in p else (None, None)   # absent -> refused below
+            if not isinstance(b, str) or not relp.fullmatch(b) or not isinstance(s, str) or not re.fullmatch(dpat, s) or b in seen:
+                raise ValueError('lme: policy_projections.%s: generated member %r %s[%d] must carry %s (a repository-relative path fully matching patterns.%s %r, declared once) and %s (fully matching %r); got %r (already %r)' % (
+                    name, k, lst, i, bl, pj['rel_pattern'], ptext[pj['rel_pattern']], sl, dpat, p, seen[b] if isinstance(b, str) and b in seen else '<not seen>'))
+            seen[b] = k
+            rows.append([b, s])
+        res[k] = rows
+    # F05-S4 F05-S3-COMPOSED-BODY-ADMISSION (codex-tick548 HIGH, codex-tick549 scope): ONE authoritative transitive
+    # obligation projection. An importer whose composed closure contains a generated member (closure_of, direct or
+    # transitive: the importers projection already carries every composed member key) inherits that member as an
+    # OBLIGATION: its generated-entry identity (the B output rel, the same key entry_outputs publishes) AND its pinned
+    # body pairs, so a launch of the composing importer verifies every generated entry and admits every body digest it
+    # can reach BEFORE execution. Shape: {<importer rel>: {<generated entry rel>: [[body, sha256], ...]}} over the
+    # generated members in {<importer>} + importers[<importer>]; plays in declared order. Deterministic: a wrapper
+    # reached by several composition paths is one key with its one value (the generated identity is unique, refused
+    # in _rh_eg_generated; a body is declared once across all members, refused above), so no conflict can arise.
+    # F05-S4 CORRECTIONS (codex-tick558 F05-S4-EMPTY-IMPORTER-ROW): EVERY admitted importer of projection <importers>
+    # (runner, authored dispatch closure or B member: the established declaration contract) is published, with the
+    # empty obligation mapping {} when its closure reaches no generated member; an unknown importer stays absent, so
+    # the consumer's refusal of a stage playbook without a row is kept (no consumer-side fallback).
+    imps = resolved[pj['importers']]
+    oblig = {}
+    for k in sorted(imps):
+        ms = sorted(m for m in res if m == k or m in imps[k])
+        oblig[k] = dict((m, [list(r) for r in res[m]]) for m in ms)
+    # MR03 (DEP-MR03-LOADER-01): the SAME transitive obligation rule over each rendered dispatch row of projection
+    # <importers> (written before this projection: `after`); an EMPTY mapping is a valid row
+    rimps = _rh_get(out, '%s.%s' % (ipj['at'], ipj['rendered_dispatch']['to']))[1]
+    roblig = {}
+    for k in sorted(rimps):
+        ms = sorted(m for m in res if m == k or m in rimps[k])
+        roblig[k] = dict((m, [list(r) for r in res[m]]) for m in ms)
+    return oblig, roblig
+
+
+def _rh_pj_document_kind(name, pj, out, node, schema, key, docs, active, pats, ptext, resolved):
+    """The F05-S3 projection kinds (registry_pattern, document_rels, entry_importers, entry_bodies, entry_outputs,
+    document_value). Returns (applied, value). A document-reading kind applies only while its `when` view is active
+    (entry_importers: its B part only)."""
+    relp = pats[pj['rel_pattern']] if 'rel_pattern' in pj else None
+    if 'rel_pattern' in pj and pj['rel_pattern'] not in pats:
+        raise ValueError('lme: registry policy_projections.%s.rel_pattern %r must name a declared contract_admission.patterns entry' % (name, pj['rel_pattern']))
+    if pj['kind'] == 'registry_pattern':
+        if pj['pattern'] not in pats:
+            raise ValueError('lme: registry policy_projections.%s.pattern %r must name a declared contract_admission.patterns entry' % (name, pj['pattern']))
+        # F05-S4 F05-GEN3-01: the projected grammar crosses into the shell consumer, so only a declared path grammar
+        # {pattern, refused_components} (admitted by _rh_path_grammar) projects; a plain Python regex refuses.
+        if not isinstance(pats[pj['pattern']], _RhPathGrammar):
+            raise ValueError('lme: registry policy_projections.%s.pattern %r must name a contract_admission.patterns path grammar {pattern, refused_components} (a registry_pattern projection reaches the shell consumer); got %r' % (
+                name, pj['pattern'], ptext[pj['pattern']]))
+        # F05-S4 CORRECTIONS (codex-tick558 S4-D04, codex-tick560): the projected form {pattern, refused_components,
+        # separator, terminator} (= contract_admission.path_law.*; the shell consumer reads them with the grammar)
+        return True, copy.deepcopy(pats[pj['pattern']].pattern)
+    on = _rh_contract_active(out, schema, pj['when'], 'policy_projections.%s.when' % (name,))
+    if on != active:
+        raise ValueError('lme: registry policy_projections.%s.when %r and document_channel.when disagree on activity (one activity rule)' % (name, pj['when']))
+    if pj['kind'] == 'entry_importers':
+        # MR03 (DEP-MR03-LOADER-01): the secondary destination rendered_dispatch.to (guarded by the caller, S-GUARD)
+        full, rrows = _rh_pj_entry_importers(name, pj, out, _rh_doc_root(name, pj, docs, key) if active else None, active, docs, schema, key, relp, ptext)
+        node[pj['rendered_dispatch']['to']] = rrows
+        return True, full
+    if not active:
+        return False, None
+    if pj['kind'] == 'document_rels':
+        return True, dict((n, docs[n]['rel']) for n in sorted(docs))
+    root = _rh_doc_root(name, pj, docs, key)
+    if pj['kind'] == 'entry_bodies':
+        # MR03 (DEP-MR03-LOADER-01): the secondary destination rendered_to (guarded by the caller, S-GUARD)
+        oblig, roblig = _rh_pj_entry_bodies(name, pj, out, root, docs, key, relp, ptext, resolved, schema)
+        node[pj['rendered_to']] = roblig
+        return True, oblig
+    if pj['kind'] == 'entry_outputs':
+        return True, sorted(_rh_eg_generated('policy_projections.%s' % (name,), pj, root, out, key, relp)[0])
+    v = _rh_doc_value(root, pj['value_at'], 'policy_projections.%s' % (name,), 'value_at', pj['document'])
+    if not isinstance(v, str) or not relp.fullmatch(v):
+        raise ValueError('lme: policy_projections.%s: document %s %s must be a repository-relative path fully matching patterns.%s %r; got %r' % (
+            name, pj['document'], pj['value_at'], pj['rel_pattern'], ptext[pj['rel_pattern']], v))
+    return True, v
+
+
+_RH_DOC_KIND_SHAPES = {
+    'registry_pattern': frozenset(('kind', 'after', 'at', 'to', 'pattern', 'segment_pattern')),
+    'document_rels': frozenset(('kind', 'after', 'when', 'at', 'to', 'segment_pattern')),
+    'entry_importers': frozenset(('kind', 'after', 'when', 'document', 'at', 'to', 'members', 'entries', 'closure', 'route_includes',
+                                  'identity', 'guard', 'relativity_from', 'runners', 'runner_key', 'requires_key', 'common',
+                                  'dispatch', 'dispatch_modes', 'reference_keys', 'rel_pattern', 'segment_pattern',
+                                  'rendered_dispatch', 'common_refs')),   # MR03-GL-01; MR03-F05-GL-01
+    'entry_bodies': frozenset(('kind', 'after', 'when', 'document', 'at', 'to', 'members', 'identity', 'bodies', 'importers',
+                               'digest_pattern', 'rel_pattern', 'segment_pattern', 'rendered_to')),   # MR03-GL-02
+    'entry_outputs': frozenset(('kind', 'after', 'when', 'document', 'at', 'to', 'members', 'identity', 'rel_pattern', 'segment_pattern')),
+    'document_value': frozenset(('kind', 'after', 'when', 'document', 'at', 'to', 'value_at', 'rel_pattern', 'segment_pattern')),
+}
+# non-string fields of the projection shapes (every other field is a non-empty string)
+_RH_PJ_NONSTRING = frozenset(('parts', 'fields', 'after', 'reference_keys', 'rendered_dispatch'))
+
+
+def _rh_pj_secondary(name, pj):
+    """MR03 (DEP-MR03-LOADER-01; codex-tick610 / codex-tick612): the SECONDARY publication destinations (one segment
+    each under `at`) a document-kind projection writes beside its primary `to`: entry_importers rendered_dispatch.to,
+    entry_bodies rendered_to. The ONE list read by the projection guard, the publication, lme_verify_resolved and
+    excluded_paths. Every other projection has none."""
+    out = []
+    if 'rendered_to' in pj:
+        out.append(pj['rendered_to'])
+    if 'rendered_dispatch' in pj:
+        rd = pj['rendered_dispatch']
+        if not isinstance(rd, dict) or 'to' not in rd:
+            raise ValueError('lme: registry policy_projections.%s.rendered_dispatch must be a mapping carrying to; got %r' % (name, rd))
+        out.append(rd['to'])
+    if any(not isinstance(s, str) or not s for s in out):
+        raise ValueError('lme: registry policy_projections.%s secondary destinations must be non-empty strings; got %r' % (name, out))
+    return out
+# F05-S4 (codex-tick546 inactive_profiles; MAIN ruling 1): the kinds that MAY declare `when`
+_RH_PJ_GATED = frozenset(('lookup_merge', 'sorted_values'))
+
+
+def _rh_pj_shape_view(name, pj):
+    """F05-S4 (codex-tick546 inactive_profiles, MAIN ruling 1): a lookup_merge or sorted_values projection MAY declare
+    `when` (a declaration_contract published view: the ONE activity rule); without it the kind keeps its existing
+    unconditional semantics. Returns the declaration without `when` for the exact-shape check (every other kind is
+    returned unchanged: the document kinds carry `when` in their shape). A non-string or empty `when` refuses."""
+    if not isinstance(pj, dict) or 'when' not in pj or 'kind' not in pj or not isinstance(pj['kind'], str) or pj['kind'] not in _RH_PJ_GATED:
+        return pj
+    if not isinstance(pj['when'], str) or not pj['when']:
+        raise ValueError('lme: registry policy_projections.%s.when must name a declaration_contract published view; got %r' % (name, pj['when']))
+    return dict((k, v) for k, v in pj.items() if k != 'when')
+
+
+def _rh_project_policy(pol, schema, key, active, docs):
+    """The registry-declared RESOLVED projections (remote_harness_schema.policy_projections) and partitions
+    (policy_partitions), applied to a COPY of the admitted composed policy after contract admission and before any
+    digest, so consumers read one resolved node and the composed input is never mutated (a second validation of the
+    same composition sees the authored node). No fallback: an absent or malformed declaration, node or reference refuses.
+    Projection kinds (each names at = a declared policy mapping, from = its authored selector key, to = the resolved key):
+      path_list (LI-MAIN-1, B-OD-09 b): parts = ordered [{key, in}]; the authored node must not carry `to`;
+        to = [<policy node at in>[<at.from.key>] ...], each a non-empty string.
+      lookup_merge (LI-03, B-OD-10 a): source = a policy mapping; for every role of at.from, at.to[role] =
+        source[at.from[role]] (a non-empty string); an authored at.to key that is also a role of at.from refuses
+        (no second authority).
+      select_record (L-11, codex-tick498 R2N-L11-NONROLE-REUSE): roles = a policy mapping {role: <source key>};
+        source = a policy mapping; fields_from = a policy mapping {field role: <output name>}; fields = {field role:
+        <dotted sub-path of source[<key>]>} with the same field roles; at.to = {role: {<output name>: <value>}}, each a
+        non-empty string; the composed policy (declaration AND override) must not carry at.to (one authority). A leaf
+        whose sub-path starts with a registry host_scope.scoped_fields member is HOST-SCOPED: it is returned for
+        host_scoped_paths (scope_invariant_sha256 strips it like its source) and its output name may not be any
+        shared artifact's not_embedded_fields name (_rh_shared_inputs strips by that last segment; it would silently
+        drop an embedded input from the reuse key). segment_pattern names a registry contract_admission.patterns entry
+        that `to`, every role key and every output name must fully match BEFORE any value or host_scoped_paths entry
+        is built (a dotted name would be one literal key but address a different metadata path; codex-tick500
+        L11-PROJECTED-PATH-SEGMENTS).
+      sorted_values (LI-07, codex-tick507 LI-07-RENDER-STAGE-INPUTS): source = a non-empty policy mapping whose
+        values are distinct strings each fully matching contract_admission.patterns[segment_pattern]; at.to =
+        sorted(those values); the composed policy (declaration AND override) must not carry at.to (one authority).
+    Partitions (LI-03 resolved ownership map): universe = a policy list; parts = [{values_of | keys_of | value_of: path}];
+    the parts are pairwise disjoint and their union equals the universe, both read on the RESOLVED copy.
+    F05-S3: every projection declares `after` and they apply in that dependency order (_rh_projection_order); the
+    document kinds (_RH_DOC_KIND_SHAPES) read the ADMITTED documents `docs` (_rh_documents; `active` = the one
+    activity rule evaluated on the admitted policy BEFORE any projection) and never accept an authored `to`.
+    F05-S4 (MAIN ruling 1, codex-tick546 inactive_profiles): a lookup_merge / sorted_values projection MAY declare
+    `when` (_rh_pj_shape_view); gated, it applies exactly while that view is active (agreeing with `active`); while
+    inactive nothing is projected and nothing refuses here (a declared `at` stays under its own contracts).
+    Returns (resolved copy, sorted host-scoped projected leaves)."""
+    projs, parts_decl = schema.get('policy_projections'), schema.get('policy_partitions')
+    if not isinstance(projs, dict) or not isinstance(parts_decl, dict):
+        raise ValueError('lme: registry remote_harness_schema.policy_projections and policy_partitions must be mappings; got %r / %r' % (projs, parts_decl))
+    out = copy.deepcopy(pol)
+    shapes = {'path_list': {'kind', 'after', 'at', 'from', 'to', 'parts'}, 'lookup_merge': {'kind', 'after', 'at', 'from', 'to', 'source'},
+              'select_record': {'kind', 'after', 'at', 'to', 'roles', 'source', 'fields_from', 'fields', 'segment_pattern'},
+              'sorted_values': {'kind', 'after', 'at', 'to', 'source', 'segment_pattern'}}
+    shapes.update((k, set(v)) for k, v in _RH_DOC_KIND_SHAPES.items())
+    hs = schema['host_scope']
+    ne_names = set(f for d in _rh_artifact_decl(hs).values() for f in d['not_embedded_fields'])
+    pscoped = []
+    for name in sorted(projs):
+        pj = _rh_pj_shape_view(name, projs[name])
+        if not isinstance(pj, dict) or pj.get('kind') not in shapes or set(pj) != shapes[pj['kind']] \
+                or any(not isinstance(pj[k], str) or not pj[k] for k in shapes[pj['kind']] - _RH_PJ_NONSTRING):
+            raise ValueError('lme: registry policy_projections.%s must be one of %s; got %r' % (name, {k: sorted(v) for k, v in shapes.items()}, pj))
+    pats, ptext = _rh_patterns(schema)
+    resolved = {}
+    for name in _rh_projection_order(projs):
+        pj = projs[name]
+        if pj['kind'] in _RH_PJ_GATED and 'when' in pj:
+            # F05-S4 MAIN ruling 1 (codex-tick546 inactive_profiles / OD-BRR-07): gated by the ONE activity rule. Active:
+            # the projection applies as before (an absent `at` refuses below). Inactive: nothing is projected, no view is
+            # fabricated and nothing refuses here -- a declared `at` stays subject to its own when_present contracts
+            # (genesis_inventory_kinds exact key sets refuse an authored projection leaf), never to this projection.
+            on = _rh_contract_active(out, schema, pj['when'], 'policy_projections.%s.when' % (name,))
+            if on != active:
+                raise ValueError('lme: registry policy_projections.%s.when %r and document_channel.when disagree on activity (one activity rule)' % (name, pj['when']))
+            if not on:
+                continue
+        fn_, node = _rh_get(out, pj['at'])
+        if not fn_ or not isinstance(node, dict):
+            raise ValueError('lme: %s.%s must be a declared mapping (policy_projections.%s); got %r' % (key, pj['at'], name, node if fn_ else '<absent>'))
+        if pj['kind'] in _RH_DOC_KIND_SHAPES:
+            if pj['to'] in node:
+                raise ValueError('lme: %s.%s declares %s; it is RESOLVED (policy_projections.%s; one authority -- neither the declaration nor an override may supply it)' % (key, pj['at'], pj['to'], name))
+            if pj['segment_pattern'] not in pats or not pats[pj['segment_pattern']].fullmatch(pj['to']):
+                raise ValueError('lme: policy_projections.%s.to %r does not fully match a declared patterns.%s (a segment is one metadata path step)' % (name, pj['to'], pj['segment_pattern']))
+            # MR03 (codex-tick610 / codex-tick612 F3): each SECONDARY destination carries the primary `to` protections above,
+            # checked here -- before any activity skip -- so a declaration- or override-supplied secondary leaf refuses
+            # whether or not the projection then publishes it (inactive: honest absence / {} is kept by the kind)
+            sec = _rh_pj_secondary(name, pj)
+            for s in sec:
+                if s in node or s == pj['to'] or sec.count(s) != 1 or not pats[pj['segment_pattern']].fullmatch(s):
+                    raise ValueError('lme: %s.%s declares %s, or it is not one segment fully matching patterns.%s distinct from %r; it is RESOLVED (policy_projections.%s secondary destination; one authority -- neither the declaration nor an override may supply it)' % (
+                        key, pj['at'], s, pj['segment_pattern'], pj['to'], name))
+            applied, val = _rh_pj_document_kind(name, pj, out, node, schema, key, docs, active, pats, ptext, resolved)
+            if applied:
+                node[pj['to']] = val
+                resolved[name] = val
+            continue
+        if pj['kind'] == 'sorted_values':
+            if pj['to'] in node:
+                raise ValueError('lme: %s.%s declares %s; it is RESOLVED from %s (policy_projections.%s; one authority -- neither the declaration nor an override may supply it)' % (key, pj['at'], pj['to'], pj['source'], name))
+            seg = (schema.get('contract_admission') or {}).get('patterns', {}).get(pj['segment_pattern'])
+            if not isinstance(seg, str) or not seg:
+                raise ValueError('lme: policy_projections.%s.segment_pattern %r must name a declared contract_admission.patterns entry' % (name, pj['segment_pattern']))
+            if not re.fullmatch(seg, pj['to']):
+                raise ValueError('lme: policy_projections.%s.to %r does not fully match patterns.%s %r (a segment is one metadata path step; codex F05-SORTED-VALUES-DESTINATION-SEGMENT)' % (name, pj['to'], pj['segment_pattern'], seg))
+            fsrc, src = _rh_get(out, pj['source'])
+            if not fsrc or not isinstance(src, dict) or not src:
+                raise ValueError('lme: %s.%s must be a declared non-empty mapping (policy_projections.%s); got %r' % (key, pj['source'], name, src if fsrc else '<absent>'))
+            vals = list(src.values())
+            bad = sorted(repr(v) for v in vals if not isinstance(v, str) or not re.fullmatch(seg, v))
+            if bad or len(set(vals)) != len(vals):
+                raise ValueError('lme: %s.%s values must be distinct strings fully matching patterns.%s %r (policy_projections.%s); got bad %r / duplicated %r' % (
+                    key, pj['source'], pj['segment_pattern'], seg, name, bad, sorted(v for v in set(vals) if vals.count(v) > 1) if not bad else []))
+            node[pj['to']] = sorted(vals)
+            continue
+        if pj['kind'] == 'select_record':
+            if pj['to'] in node:
+                raise ValueError('lme: %s.%s declares %s; it is RESOLVED (policy_projections.%s; one authority -- neither the declaration nor an override may supply it)' % (key, pj['at'], pj['to'], name))
+            (fr, roles), (fsrc, src), (ff, fmap) = _rh_get(out, pj['roles']), _rh_get(out, pj['source']), _rh_get(out, pj['fields_from'])
+            subs = pj['fields']
+            seg = (schema.get('contract_admission') or {}).get('patterns', {}).get(pj['segment_pattern'])
+            if not isinstance(seg, str) or not seg:
+                raise ValueError('lme: policy_projections.%s.segment_pattern %r must name a declared contract_admission.patterns entry' % (name, pj['segment_pattern']))
+            if not fr or not isinstance(roles, dict) or not roles or not fsrc or not isinstance(src, dict) or not ff or not isinstance(fmap, dict) \
+                    or not isinstance(subs, dict) or sorted(subs) != sorted(fmap) or any(not isinstance(v, str) or not v for v in list(subs.values()) + list(fmap.values())):
+                raise ValueError('lme: policy_projections.%s needs declared mappings %s.%s / %s.%s / %s.%s and fields keyed exactly like %s.%s; got %r / %r / %r / %r' % (
+                    name, key, pj['roles'], key, pj['source'], key, pj['fields_from'], key, pj['fields_from'], roles, sorted(src) if isinstance(src, dict) else src, fmap, subs))
+            badseg = sorted(s for s in [pj['to']] + list(roles) + list(fmap.values())
+                            if not isinstance(s, str) or not re.fullmatch(seg, s))
+            if badseg:
+                raise ValueError('lme: policy_projections.%s generated path segments %r do not fully match patterns.%s %r (a segment is one metadata path step)' % (name, badseg, pj['segment_pattern'], seg))
+            rec = {}
+            for role in sorted(roles):
+                ent = src.get(roles[role]) if isinstance(roles[role], str) else None
+                rec[role] = {}
+                for fr_ in sorted(subs):
+                    fv, v = _rh_get(ent, subs[fr_]) if isinstance(ent, dict) else (False, None)
+                    if not fv or not isinstance(v, str) or not v:
+                        raise ValueError('lme: %s.%s.%s (role %s, field %s) does not resolve to a non-empty string (policy_projections.%s)' % (key, pj['source'], '%s.%s' % (roles[role], subs[fr_]), role, fr_, name))
+                    rec[role][fmap[fr_]] = v
+                    if subs[fr_].split('.')[0] in hs['scoped_fields']:
+                        if fmap[fr_] in ne_names:
+                            raise ValueError('lme: policy_projections.%s output name %r is a shared-artifact not_embedded_fields name; the host-scoped projected leaf would be stripped from every reuse key' % (name, fmap[fr_]))
+                        pscoped.append('%s.%s.%s.%s' % (pj['at'], pj['to'], role, fmap[fr_]))
+            node[pj['to']] = rec
+            continue
+        sel = node.get(pj['from'])
+        if pj['kind'] == 'path_list':
+            if not isinstance(pj['parts'], list) or not pj['parts'] or any(not isinstance(p, dict) or set(p) != {'key', 'in'} for p in pj['parts']):
+                raise ValueError('lme: registry policy_projections.%s.parts must be a non-empty list of {key, in}; got %r' % (name, pj['parts']))
+            if pj['to'] in node:
+                raise ValueError('lme: %s.%s declares %s; it is RESOLVED from %s (policy_projections.%s; one authority)' % (key, pj['at'], pj['to'], pj['from'], name))
+            if not isinstance(sel, dict) or sorted(sel) != sorted(p['key'] for p in pj['parts']):
+                raise ValueError('lme: %s.%s.%s must name exactly %s (policy_projections.%s); got %r' % (key, pj['at'], pj['from'], [p['key'] for p in pj['parts']], name, sel))
+            res = []
+            for p in pj['parts']:
+                fi, src = _rh_get(out, p['in'])
+                v = src.get(sel[p['key']]) if fi and isinstance(src, dict) and isinstance(sel[p['key']], str) else None
+                if not isinstance(v, str) or not v:
+                    raise ValueError('lme: %s.%s.%s.%s %r does not resolve to a non-empty string in %s.%s (policy_projections.%s)' % (key, pj['at'], pj['from'], p['key'], sel[p['key']], key, p['in'], name))
+                res.append(v)
+            node[pj['to']] = res
+        else:
+            fs_, src = _rh_get(out, pj['source'])
+            tgt = node.get(pj['to'])
+            if not isinstance(sel, dict) or not sel or not fs_ or not isinstance(src, dict) or not isinstance(tgt, dict):
+                raise ValueError('lme: %s.%s.%s / .%s and %s.%s must be declared mappings (policy_projections.%s); got %r / %r / %r' % (
+                    key, pj['at'], pj['from'], pj['to'], key, pj['source'], name, sel, tgt, src if fs_ else '<absent>'))
+            dup = sorted(set(tgt) & set(sel))
+            if dup:
+                raise ValueError('lme: %s.%s.%s authors %s; they are RESOLVED from %s.%s through %s (policy_projections.%s; one authority)' % (key, pj['at'], pj['to'], dup, key, pj['source'], pj['from'], name))
+            for role in sorted(sel):
+                v = src.get(sel[role]) if isinstance(sel[role], str) else None
+                if not isinstance(v, str) or not v:
+                    raise ValueError('lme: %s.%s.%s.%s %r does not name a non-empty string in %s.%s (policy_projections.%s)' % (key, pj['at'], pj['from'], role, sel[role], key, pj['source'], name))
+                tgt[role] = v
+    for name in sorted(parts_decl):
+        pt = parts_decl[name]
+        if not isinstance(pt, dict) or set(pt) != {'universe', 'parts'} or not isinstance(pt['parts'], list) or not pt['parts'] \
+                or any(not isinstance(p, dict) or len(p) != 1 or next(iter(p)) not in ('values_of', 'keys_of', 'value_of') for p in pt['parts']):
+            raise ValueError('lme: registry policy_partitions.%s must be {universe, parts: [{values_of | keys_of | value_of: <path>}, ...]}; got %r' % (name, pt))
+        fu, uni = _rh_get(out, pt['universe'])
+        if not fu or not isinstance(uni, list) or any(not isinstance(u, str) for u in uni) or len(set(uni)) != len(uni):
+            raise ValueError('lme: %s.%s must be a list of distinct strings (policy_partitions.%s); got %r' % (key, pt['universe'], name, uni if fu else '<absent>'))
+        seen, got = {}, []
+        for p in pt['parts']:
+            how, path = next(iter(p.items()))
+            fp, v = _rh_get(out, path)
+            if not fp or (how == 'value_of' and not isinstance(v, str)) or (how != 'value_of' and not isinstance(v, dict)):
+                raise ValueError('lme: %s.%s must be declared (%s; policy_partitions.%s); got %r' % (key, path, how, name, v if fp else '<absent>'))
+            for m in ([v] if how == 'value_of' else list(v.values()) if how == 'values_of' else list(v)):
+                if m in seen:
+                    raise ValueError('lme: %s policy_partitions.%s: %r is owned by both %s and %s (collision)' % (key, name, m, seen[m], path))
+                seen[m] = path
+                got.append(m)
+        if sorted(got) != sorted(uni):
+            raise ValueError('lme: %s policy_partitions.%s: the parts cover %s, the universe %s.%s is %s (unowned: %s; outside: %s)' % (
+                key, name, sorted(got), key, pt['universe'], sorted(uni), sorted(set(uni) - set(got)), sorted(set(got) - set(uni))))
+    return out, sorted(pscoped)
 
 
 def _rh_leaves(x, prefix):
@@ -2585,15 +3495,108 @@ def _rh_ca_ere(v, form, sed):
     return None
 
 
+class _RhPathGrammar(object):
+    """A declared path grammar (contract_admission.patterns.<n> = {pattern, refused_components}) under the registry
+    path law (contract_admission.path_law): a path is admitted iff it fully matches `pattern` AND none of its
+    path_law.separator-split components is a refused component (refused_components includes every path_law.traversal
+    component, so the traversal invariant holds by construction for every pattern). `pattern` fully matches the
+    declared ERE subset patterns.<path_law.syntax>, which Python re.fullmatch and POSIX `grep -E -x` decide identically,
+    so the loader and the shell consumer validate the ONE declaration with the same two steps (no second spelling).
+    .pattern is the projected form {pattern, refused_components, separator, terminator} (codex-tick558 S4-D04,
+    codex-tick560: the consumer reads the separator and the line terminator with the grammar, no format literal); a
+    value holding the terminator is refused here as the shell refuses it before grep. fullmatch / pattern mirror a
+    compiled regex for every pats[...] reader."""
+    __slots__ = ('pattern', '_rx', '_refused', '_sep', '_term')
+
+    def __init__(self, decl, rx, sep, term):
+        self.pattern = {'pattern': decl['pattern'], 'refused_components': list(decl['refused_components']), 'separator': sep, 'terminator': term}
+        self._rx = rx
+        self._refused = frozenset(decl['refused_components'])
+        self._sep = sep
+        self._term = term
+
+    def fullmatch(self, s):
+        return isinstance(s, str) and self._term not in s and self._rx.fullmatch(s) is not None and not (self._refused & set(s.split(self._sep)))
+
+
+def _rh_path_law(ca, plain):
+    """contract_admission.path_law (codex-tick558 S4-D04 / F05-S4-PATH-LAW-FLOOR, codex-tick560), admitted fail-closed:
+    exactly {separator, terminator, traversal, syntax, consumers}; separator and terminator distinct one-character
+    strings; traversal a non-empty list of distinct non-empty components holding neither; syntax the name of a declared
+    plain (string) patterns entry; and (codex-tick564 F05-GROUP-PATH-READER-COMPATIBILITY) every separator / terminator /
+    traversal value bound by at least one declared reader (consumers.<reader> = {law field: [supported value, ...]}) and
+    in EVERY binding reader's supported list, so an unsupported law refuses here, before any projection.
+    Returns (separator, terminator, traversal, compiled syntax)."""
+    law = ca['path_law']
+    where = 'registry remote_harness_schema.contract_admission.path_law'
+    if not isinstance(law, dict) or set(law) != {'separator', 'terminator', 'traversal', 'syntax', 'consumers'}:
+        raise ValueError('lme: %s must declare exactly {separator, terminator, traversal, syntax, consumers}; got %r' % (where, law))
+    sep, term, trav, syn = law['separator'], law['terminator'], law['traversal'], law['syntax']
+    if not isinstance(sep, str) or len(sep) != 1 or not isinstance(term, str) or len(term) != 1 or sep == term:
+        raise ValueError('lme: %s.separator / .terminator must be distinct one-character strings; got %r / %r' % (where, sep, term))
+    if not isinstance(trav, list) or not trav or any(not isinstance(x, str) or not x or sep in x or term in x for x in trav) or len(set(trav)) != len(trav):
+        raise ValueError('lme: %s.traversal must be a non-empty list of distinct non-empty components without the separator %r or the terminator %r; got %r' % (where, sep, term, trav))
+    if not isinstance(syn, str) or syn not in plain:
+        raise ValueError('lme: %s.syntax must name a declared contract_admission.patterns regex (a string entry); got %r (declared %s)' % (where, syn, sorted(plain)))
+    # F05-S4 GROUPS CORRECTIONS (codex-tick564 F05-GROUP-PATH-READER-COMPATIBILITY): the law binds to its declared
+    # readers (POSIX pathname resolution, grep -E -x per-line records); the supported values live in YAML only.
+    rdr, bound = law['consumers'], ('separator', 'terminator', 'traversal')
+    if not isinstance(rdr, dict) or not rdr or any(not isinstance(c, str) or not isinstance(rdr[c], dict) or not rdr[c] or not set(rdr[c]) <= set(bound)
+                                                   or any(not isinstance(s, list) or not s for s in rdr[c].values()) for c in rdr):
+        raise ValueError('lme: %s.consumers must be a non-empty mapping {reader: {law field among %s: [supported value, ...]}}; got %r' % (where, list(bound), rdr))
+    unbound = [f for f in bound if not any(f in rdr[c] for c in rdr)]
+    if unbound:
+        raise ValueError('lme: %s.%s must be bound by at least one declared reader in %s.consumers (an unbound law value is an unchecked reader contract); got readers %r' % (
+            where, unbound, where, rdr))
+    unsupported = sorted((c, f) for c in rdr for f in rdr[c] if law[f] not in rdr[c][f])
+    if unsupported:
+        raise ValueError('lme: %s: %s; the declared value(s) %r are not supported by the reader(s) that consume them (supported %r); an unsupported path law refuses before projection' % (
+            where, ', '.join('%s.%s is outside %s.consumers.%s.%s' % (where, f, where, c, f) for c, f in unsupported),
+            dict((f, law[f]) for c, f in unsupported), dict(('%s.%s' % (c, f), rdr[c][f]) for c, f in unsupported)))
+    return sep, term, trav, plain[syn]
+
+
+def _rh_path_grammar(n, p, law):
+    """contract_admission.patterns.<n> declared as a path grammar, admitted fail-closed under the path law
+    (_rh_path_law): exactly {pattern, refused_components}; pattern ASCII, inside the bounded ERE subset (_rh_ca_ere
+    'anchored': anchoring, banned tokens, Python compiles) AND fully matching patterns.<path_law.syntax> (the PRECISE
+    positive subset both engines decide identically; a quantifier never follows a quantifier, so possessive / lazy /
+    stacked forms refuse); refused_components distinct non-empty components without the separator that include EVERY
+    path_law.traversal component (no finite sample probe: the component check is the invariant). A refused component
+    beyond the traversal law must be one `pattern` alone admits (else that entry is vacuous); a traversal component is
+    exempt from that test because it may arise only INSIDE a path (e.g. X/../X under ^[.X](/[.X]+)*$)."""
+    sep, term, trav, syn = law
+    where = 'registry contract_admission.patterns.%s' % (n,)
+    if set(p) != {'pattern', 'refused_components'}:
+        raise ValueError('lme: %s (a path grammar) must declare exactly {pattern, refused_components}; got %r' % (where, sorted(p)))
+    pt, rc = p['pattern'], p['refused_components']
+    why = _rh_ca_ere(pt, 'anchored', False) if isinstance(pt, str) and pt.isascii() else 'must be a non-empty ASCII string'
+    if not why and not syn.fullmatch(pt):
+        why = 'is outside the declared path ERE subset (patterns per contract_admission.path_law.syntax %r: literals, flat groups, bracket literals / same-class ranges, at most one quantifier per unit)' % (syn.pattern,)
+    if why:
+        raise ValueError('lme: %s.pattern %s (the ONE path grammar is validated by Python re.fullmatch AND POSIX grep -E -x; only the declared bounded ERE subset is decided identically); got %r' % (where, why, pt))
+    rx = re.compile(pt)
+    if not isinstance(rc, list) or not rc or len(set(x for x in rc if isinstance(x, str))) != len(rc) \
+            or any(not isinstance(x, str) or not x or sep in x or term in x or (x not in trav and not rx.fullmatch(x)) for x in rc):
+        raise ValueError('lme: %s.refused_components must be a non-empty list of distinct single components (no %r; a component beyond contract_admission.path_law.traversal must be one %s.pattern alone admits); got %r' % (
+            where, sep, where, rc))
+    missing = [x for x in trav if x not in rc]
+    if missing:
+        raise ValueError('lme: %s.refused_components must include every contract_admission.path_law.traversal component %r (the traversal invariant of every path grammar); missing %r, declared %r' % (
+            where, trav, missing, p))
+    return _RhPathGrammar(p, rx, sep, term)
+
+
 def _rh_ca_registry(ca, schema):
     """The registry declaration contract_admission, shape-checked (fail-closed: admission can never be disabled or
     weakened by a malformed or missing registry entry). Returns ({pattern name: compiled}, contracts, required_values)."""
-    if not isinstance(ca, dict) or set(ca) != {'patterns', 'contracts', 'required_values'} or not isinstance(ca['patterns'], dict) \
+    if not isinstance(ca, dict) or set(ca) != {'path_law', 'patterns', 'contracts', 'required_values'} or not isinstance(ca['patterns'], dict) \
             or not isinstance(ca['contracts'], dict) or not ca['contracts'] \
             or not isinstance(ca['required_values'], dict) or not ca['required_values']:
-        raise ValueError('lme: registry remote_harness_schema.contract_admission must declare {patterns, contracts, required_values} (bootstrap contract admission is fail-closed); got %r' % (ca,))
+        raise ValueError('lme: registry remote_harness_schema.contract_admission must declare {path_law, patterns, contracts, required_values} (bootstrap contract admission is fail-closed); got %r' % (ca,))
     pats = {}
-    for n in sorted(ca['patterns']):
+    # plain regex entries first; then every path grammar under the ONE path law (whose syntax is a plain entry)
+    for n in sorted(n for n in ca['patterns'] if not isinstance(ca['patterns'][n], dict)):
         p = ca['patterns'][n]
         try:
             pats[n] = re.compile(p) if isinstance(p, str) and p else None
@@ -2601,6 +3604,9 @@ def _rh_ca_registry(ca, schema):
             pats[n] = None
         if pats[n] is None:
             raise ValueError('lme: registry contract_admission.patterns.%s must be a compilable regex; got %r' % (n, p))
+    law = _rh_path_law(ca, dict(pats))
+    for n in sorted(n for n in ca['patterns'] if isinstance(ca['patterns'][n], dict)):
+        pats[n] = _rh_path_grammar(n, ca['patterns'][n], law)
     strs = lambda a: isinstance(a, list) and bool(a) and all(isinstance(x, str) and x for x in a)
     for cname in sorted(ca['contracts']):
         c = ca['contracts'][cname]
@@ -3021,13 +4027,19 @@ def _rh_admit_contracts(pol, schema, key):
                 raise ValueError('lme: %s.%s fails contract_admission.%s (%s): %s; got %r' % (key, dotted, cname, kind, why, v))
 
 
-def _rh_validate(composed, declared, override, schema):
+def _rh_validate(composed, declared, override, schema, *, documents, admission):
+    """F05-S3 LR-02: `documents` (the resolve.yml reader fact) and `admission` (the protected source-admission record or
+    None) are REQUIRED keyword arguments -- a call without them is a TypeError, never an implied empty mapping.
+    Returns (section, sorted overridden paths, (active, admitted documents))."""
     key = schema['policy_key']
     ov = (override or {}).get(key) if isinstance(override, dict) else None
     if not isinstance(declared, dict) or key not in declared:
         if ov is not None:
             raise ValueError('lme: lme_global_override.%s supplied but no %s policy is declared (global/profile)' % (key, key))
-        return None, []
+        if documents != {} or admission is not None:
+            raise ValueError('lme: no %s policy is declared; the document reader outputs must be an empty mapping and null; got %r / %r' % (
+                key, sorted(documents) if isinstance(documents, dict) else _rh_kind(documents), _rh_kind(admission)))
+        return None, [], (False, {})
     decl, pol = declared[key], (composed or {}).get(key)
     if not isinstance(decl, dict) or not isinstance(pol, dict):
         raise ValueError('lme: %s must be a mapping (declared %s, composed %s)' % (key, _rh_kind(decl), _rh_kind(pol)))
@@ -3190,16 +4202,24 @@ def _rh_validate(composed, declared, override, schema):
         if '.' in t or not isinstance(req, list) or not req or any(not isinstance(r, str) for r in req):
             raise ValueError('lme: %s.%s.%s.%s must be a non-empty list of consumer names (host scope derives from it); got %r' % (key, ei['entries'], t, hs['consumer_field'], req))
         scoped.extend('%s.%s.%s' % (ei['entries'], t, fld) for fld in hs['scoped_fields'] if fld in entries[t])
+    # LI-MAIN-1 / LI-03 / L-11: the declared resolved projections, after every composed-policy check above, before every
+    # digest below; host-scoped projected leaves join host_scoped_paths (derived, never listed).
+    # F05-S3 (LR-03 / LR-04 / LD01): the declared documents are admitted against the protected admission record on the
+    # ADMITTED composed policy, BEFORE any projection reads them (trust before parse; one activity rule).
+    docs = _rh_documents(pol, schema, key, documents, admission)
+    pol, pscoped = _rh_project_policy(pol, schema, key, docs[0], docs[1])
+    scoped = scoped + pscoped
     shared_inputs = _rh_shared_inputs(pol, hs, scoped, key)
     section = {'schema_version': schema['projection_schema_version'], 'policy': pol, 'policy_sha256': _digest(pol),
                'adapter': {'name': sel, 'tools': derived},
                'host_scoped_paths': scoped,
                'scope_invariant_sha256': _digest({'policy': _rh_without(pol, scoped), 'host_scoped_paths': scoped}),
                'shared_artifact_inputs_sha256': _digest(shared_inputs)}
-    return section, sorted(overridden)
+    return section, sorted(overridden), docs
 
 
-_RH_ARTIFACT_KEYS = frozenset(('templates', 'inputs', 'checkout_inputs', 'consumers', 'not_embedded_fields'))
+# F05-S4 RENDER-CONTEXT-02 (genesis J-FIN-F05-01): + entry_count, the number of LEADING entry templates (required).
+_RH_ARTIFACT_KEYS = frozenset(('templates', 'inputs', 'checkout_inputs', 'consumers', 'not_embedded_fields', 'entry_count'))
 # INSTALLED-SET-FRAGMENT (codex-tick313 R2 (a)): the ONE optional artifact key. when_present names a policy path; a
 # scope whose resolved policy does not declare it neither binds the artifact's inputs nor its declared-reference
 # import (an OPTIONAL fragment, composable per profile). The template proof itself stays policy-free and total.
@@ -3228,6 +4248,11 @@ def _rh_artifact_decl(hs):
         if not isinstance(tpl, list) or not tpl or len(set(tpl)) != len(tpl) or any(
                 not isinstance(p, str) or not p or p.startswith('/') or '..' in p.split('/') for p in tpl):
             raise ValueError('lme: shared_artifacts.%s.templates must be distinct repository-relative paths, entry first; got %r' % (a, tpl))
+        # F05-S4 RENDER-CONTEXT-02 (J-FIN-F05-01): the leading entry_count templates are entries (each one's free
+        # variables EQUAL inputs + checkout_inputs); an integer (never a bool) in [1, len(templates)]; no default.
+        if not _rh_int(d['entry_count']) or not 1 <= d['entry_count'] <= len(tpl):
+            raise ValueError('lme: registry host_scope.shared_artifacts.%s.entry_count must be an integer in [1, %d] (the leading entry templates of %r); got %r' % (
+                a, len(tpl), tpl, d['entry_count']))
         for n, m in (('inputs', ins), ('checkout_inputs', cins)):
             if not isinstance(m, dict) or any(not isinstance(k, str) or not isinstance(v, str) or not v for k, v in m.items()):
                 raise ValueError('lme: shared_artifacts.%s.%s must map template variables to policy paths; got %r' % (a, n, m))
@@ -3400,9 +4425,9 @@ def _rh_bind_declared_import(rec, d, label, pol):
     if not start or not tgt.startswith(start + '/'):
         raise ValueError('%s target %r lies outside the entry directory %r: relpath would carry \'..\', which the template loader refuses (unsafe path)%s' % (
             at, tgt, start, where))
-    if tgt not in d['templates'][1:]:
+    if tgt not in d['templates'][d['entry_count']:]:
         raise ValueError('%s resolves to %r (relpath %r), which is not a declared non-entry template of this artifact %r (mismatch)%s' % (
-            at, tgt, tgt[len(start) + 1:], d['templates'][1:], where))
+            at, tgt, tgt[len(start) + 1:], d['templates'][d['entry_count']:], where))
     return tgt[len(start) + 1:]
 
 
@@ -3478,10 +4503,11 @@ def _rh_prove_artifact_templates(hs, sources):
             except jinja2.TemplateError as e:
                 raise ValueError('lme: shared artifact %s template %s does not analyze statically (plain Jinja plus the declared-import stand-ins): %s' % (a, path, e))
             declared = set(d['inputs']) | set(d['checkout_inputs'])
-            if i == 0 and free != declared:
+            # F05-S4 RENDER-CONTEXT-02 (J-FIN-F05-01): every one of the leading entry_count templates is an entry
+            if i < d['entry_count'] and free != declared:
                 raise ValueError('lme: shared artifact %s entry template %s consumes %s; the declaration names %s (undeclared: %s; unconsumed: %s)' % (
                     a, path, sorted(free), sorted(declared), sorted(free - declared), sorted(declared - free)))
-            if i > 0 and free:
+            if i >= d['entry_count'] and free:
                 raise ValueError('lme: shared artifact %s template %s reads variables %s outside its macro parameters' % (a, path, sorted(free)))
             if list(ast.find_all((nodes.Include, nodes.Extends))):
                 raise ValueError('lme: shared artifact %s template %s includes/extends (context-carrying; undeclared inputs)' % (a, path))
@@ -3500,7 +4526,159 @@ def _rh_prove_artifact_templates(hs, sources):
 
 
 _RH_ENDPOINT_KEY = ('address', 'port', 'proxy_jump', 'owner')
-_RH_FORM_TESTS = frozenset(('undefined', 'equals_empty', 'equals_mode_args', 'match_form_regex'))
+# H-FORM-1 / H-FORM-VOCAB (route r4j, codex-tick445/455/462): the ONE shared inventory-form interpreter. Its
+# vocabulary (entry keys, refuse token, tests, outcomes, result keys, cause tokens) is the DECLARED node
+# controller.bootstrap.ssh_auth.composition.form_semantics (registry host_scope.endpoint.semantics_path). The only
+# code-side names are the primitive implementation table (name -> its declared parameter set) and the cause-emission
+# roles; neither is an exemption: both are joined by SET EQUALITY to the registry (host_scope.endpoint.form_primitives,
+# .form_cause_roles) on every resolve, and the cause roles to the key set of form_semantics.causes, so neither side can
+# add, drop or rename one alone (drift refuses).
+_RH_FORM_PRIMITIVES = {'key_absent': frozenset(), 'equals_literal': frozenset(('literal',)),
+                       'equals_selected_mode_field': frozenset(('field',)),
+                       'full_match_capture': frozenset(('regex', 'groups', 'group'))}
+_RH_FORM_CAUSE_ROLES = frozenset(('rule_invalid', 'source_not_mapping', 'no_accepted_form'))
+_RH_FORM_SEMANTICS_KEYS = frozenset(('entry_keys', 'refuse_token', 'tests', 'outcomes', 'result', 'causes'))
+_RH_FORM_RESULT_ROLES = frozenset(('admitted', 'jump', 'cause'))
+
+
+def _rh_form_admit(fs, rule, primitives, cause_roles, where):
+    """PHASE 1 (r4j declaration_admission): admit the form vocabulary as a DECLARATION before the interpreter is ever
+    invoked. primitives / cause_roles are the registry lists (the loader) or the code tables (the filter adapter, which
+    runs on a projection the loader already joined). A malformed or missing vocabulary RAISES (a declaration refusal);
+    it never becomes a typed interpreter result. Returns the admitted form_semantics."""
+    nes = lambda x: isinstance(x, str) and bool(x)
+    if not isinstance(primitives, list) or not all(nes(p) for p in primitives) or set(primitives) != set(_RH_FORM_PRIMITIVES) \
+            or len(set(primitives)) != len(primitives):
+        raise ValueError('lme: %s: form_primitives %r must be exactly the interpreter primitive table %s (set equality, no duplicates)' % (
+            where, primitives, sorted(_RH_FORM_PRIMITIVES)))
+    if not isinstance(cause_roles, list) or not all(nes(c) for c in cause_roles) or set(cause_roles) != _RH_FORM_CAUSE_ROLES \
+            or len(set(cause_roles)) != len(cause_roles):
+        raise ValueError('lme: %s: form_cause_roles %r must be exactly the interpreter cause roles %s (set equality, no duplicates)' % (
+            where, cause_roles, sorted(_RH_FORM_CAUSE_ROLES)))
+    if not isinstance(fs, dict) or set(fs) != _RH_FORM_SEMANTICS_KEYS:
+        raise ValueError('lme: %s.form_semantics must be exactly %s; got %r' % (where, sorted(_RH_FORM_SEMANTICS_KEYS), fs))
+    ek, tests, outs, res, causes = fs['entry_keys'], fs['tests'], fs['outcomes'], fs['result'], fs['causes']
+    if not isinstance(ek, list) or not ek or not all(nes(k) for k in ek) or len(set(ek)) != len(ek) or not nes(fs['refuse_token']):
+        raise ValueError('lme: %s.form_semantics.entry_keys must be distinct non-empty strings and refuse_token a non-empty string; got %r / %r' % (
+            where, ek, fs['refuse_token']))
+    if not isinstance(tests, dict) or not tests:
+        raise ValueError('lme: %s.form_semantics.tests must be a non-empty mapping; got %r' % (where, tests))
+    for t in sorted(tests, key=str):
+        d = tests[t]
+        p = d.get('primitive') if isinstance(d, dict) else None
+        if not nes(t) or p not in primitives or set(d) != {'primitive'} | _RH_FORM_PRIMITIVES[p]:
+            raise ValueError('lme: %s.form_semantics.tests.%s must be {primitive in %s, exactly that primitive\'s parameters}; got %r' % (
+                where, t, sorted(primitives), d))
+        if 'literal' in d and not isinstance(d['literal'], str) or 'field' in d and not nes(d['field']) \
+                or 'regex' in d and not nes(d['regex']) \
+                or 'groups' in d and not (_rh_int(d['groups']) and d['groups'] >= 1 and _rh_int(d['group']) and 1 <= d['group'] <= d['groups']):
+            raise ValueError('lme: %s.form_semantics.tests.%s has a mistyped parameter (literal string; field / regex non-empty string; 1 <= group <= groups integers); got %r' % (
+                where, t, d))
+    if not isinstance(outs, dict) or not outs or any(
+            not nes(o) or not isinstance(outs[o], dict) or not isinstance(outs[o].get('value'), str)
+            or not (set(outs[o]) == {'value', 'jump'} and isinstance(outs[o]['jump'], str)
+                    or set(outs[o]) == {'value', 'test'} and outs[o]['test'] in tests and 'regex' in tests[outs[o]['test']])
+            for o in outs) or len(set(outs[o]['value'] for o in outs)) != len(outs):
+        raise ValueError('lme: %s.form_semantics.outcomes must map each outcome to {value, jump} (a fixed jump) or {value, test} (the capture of a capture test), values distinct; got %r' % (
+            where, outs))
+    if not isinstance(res, dict) or set(res) != _RH_FORM_RESULT_ROLES or not all(nes(v) for v in res.values()) or len(set(res.values())) != len(res):
+        raise ValueError('lme: %s.form_semantics.result must map exactly %s to distinct non-empty keys; got %r' % (
+            where, sorted(_RH_FORM_RESULT_ROLES), res))
+    if not isinstance(causes, dict) or set(causes) != set(cause_roles) or not all(nes(v) for v in causes.values()) \
+            or len(set(causes.values())) != len(causes):
+        raise ValueError('lme: %s.form_semantics.causes must map exactly the cause roles %s to distinct non-empty tokens; got %r' % (
+            where, sorted(cause_roles), causes))
+    return fs
+
+
+def _rh_form_invalid(fs, rule, auth):
+    """PHASE 2: the WHOLE declared rule under the ADMITTED vocabulary (every entry, whatever its position; independent
+    of the mode argument). None when valid, else the reason."""
+    if not isinstance(rule, dict) or not isinstance(rule.get('inventory_forms'), dict) or not isinstance(rule.get('proxy_jump'), dict):
+        return 'the rule must carry inventory_forms and proxy_jump mappings'
+    fm = rule['inventory_forms']
+    acc, tests, outs = fm.get('accepted'), fs['tests'], fs['outcomes']
+    by_value = dict((o['value'], o) for o in outs.values())
+    if fm.get('other') != fs['refuse_token']:
+        return 'inventory_forms.other must be the declared refuse token %r; got %r' % (fs['refuse_token'], fm.get('other'))
+    if not isinstance(acc, list) or not acc:
+        return 'inventory_forms.accepted must be a non-empty list'
+    for i, a in enumerate(acc):
+        if not isinstance(a, dict) or set(a) != set(fs['entry_keys']):
+            return 'inventory_forms.accepted[%d] must carry exactly the declared entry keys %s; got %r' % (i, fs['entry_keys'], a)
+        if a.get('test') not in tests or a.get('proxy_jump') not in by_value:
+            return 'inventory_forms.accepted[%d] test must be a declared test %s and proxy_jump a declared outcome value %s; got %r' % (
+                i, sorted(tests), sorted(by_value), a)
+        o = by_value[a['proxy_jump']]
+        if any((a['test'] == p['test']) != (a['proxy_jump'] == p['value']) for p in outs.values() if 'test' in p):
+            return 'inventory_forms.accepted[%d] breaks the declared outcome pairing (a capture outcome iff its capture test); got %r' % (i, a)
+        if 'test' in o and o['test'] != a['test']:
+            return 'inventory_forms.accepted[%d] pairs capture outcome %r with test %r' % (i, a['proxy_jump'], a['test'])
+    if fm.get('var') != rule['proxy_jump'].get('var') or not isinstance(fm.get('var'), str) or not fm['var']:
+        return 'inventory_forms.var must be the proxy_jump var %r' % (rule['proxy_jump'].get('var'),)
+    for t in sorted(tests):
+        d = tests[t]
+        if 'regex' in d:
+            f, rx = _rh_get(rule, d['regex'])
+            try:
+                ok = f and isinstance(rx, str) and re.compile(rx).groups == d['groups']
+            except re.error:
+                ok = False
+            if not ok:
+                return 'test %s regex %s must be a compilable string with exactly %d group(s); got %r' % (t, d['regex'], d['groups'], rx if f else '<absent>')
+        if 'field' in d:
+            modes = auth.get('modes') if isinstance(auth, dict) else None
+            if not isinstance(modes, dict) or not modes or any(not isinstance(m, dict) or not isinstance(m.get(d['field']), str) for m in modes.values()):
+                return 'auth modes must be a mapping, each mode with a string %s (test %s)' % (d['field'], t)
+    return None
+
+
+def _rh_form_classify(fs, rule, auth, source, mode):
+    """The pure core (both adapters): (admitted, jump, cause role). Validation first (rule_invalid), then the source
+    (source_not_mapping: collections.abc.Mapping, so Ansible HostVarsVars qualifies), then the FIRST accepted form in
+    declared order whose test holds. The proxy role is ABSENT iff the var is not a key; a supplied null is a value no
+    test admits. mode is classification context only: ONLY a string key of auth.modes enables a selected-mode test; any
+    other value just leaves that test false (never a refusal, never a mode cause). Capture is anchored at end of string
+    (re.match + \\Z, the loader law); no normalization -- the jump is the exact input substring."""
+    if _rh_form_invalid(fs, rule, auth) is not None:
+        return False, None, 'rule_invalid'
+    if not isinstance(source, Mapping):
+        return False, None, 'source_not_mapping'
+    var = rule['inventory_forms']['var']
+    present = var in source
+    j = source[var] if present else None
+    sel = auth['modes'][mode] if isinstance(mode, str) and mode in auth['modes'] else None
+    by_value = dict((o['value'], o) for o in fs['outcomes'].values())
+    for a in rule['inventory_forms']['accepted']:
+        d = fs['tests'][a['test']]
+        p, m = d['primitive'], None
+        if p == 'key_absent':
+            hold = not present
+        elif p == 'equals_literal':
+            hold = present and isinstance(j, str) and j == d['literal']
+        elif p == 'equals_selected_mode_field':
+            hold = present and sel is not None and isinstance(j, str) and j == sel[d['field']]
+        else:
+            m = re.match(_rh_get(rule, d['regex'])[1] + r'\Z', j) if present and isinstance(j, str) else None
+            hold = m is not None
+        if hold:
+            o = by_value[a['proxy_jump']]
+            return True, (o['jump'] if 'jump' in o else m.group(d['group'])), None
+    return False, None, 'no_accepted_form'
+
+
+def lme_rh_proxy_outcome(source, rule, auth, mode=None):
+    """H-FORM-1 typed adapter (Ansible filter): <source mapping> | lme_rh_proxy_outcome(<composition>, <ssh_auth>, <mode>).
+    Admits the vocabulary at rule.form_semantics (the declared node; the loader's resolve joined it to the registry
+    before publishing this projection) and RAISES the declaration refusal when it is not admitted. For an admitted
+    vocabulary it never raises on malformed source / form / rule: it returns the mapping keyed by the DECLARED result
+    keys {admitted: bool, jump: the exact jump | null, cause: null | the declared cause token}. It says nothing about
+    whether mode is admitted (mode admission stays at its declared boundaries)."""
+    fs = _rh_form_admit(rule.get('form_semantics') if isinstance(rule, dict) else None, rule,
+                        sorted(_RH_FORM_PRIMITIVES), sorted(_RH_FORM_CAUSE_ROLES), 'lme_rh_proxy_outcome rule')
+    ok, jump, cause = _rh_form_classify(fs, rule, auth, source, mode)
+    r = fs['result']
+    return {r['admitted']: ok, r['jump']: jump, r['cause']: None if cause is None else fs['causes'][cause]}
 
 
 def _rh_endpoint_vars(pol, hs, key):
@@ -3510,8 +4688,9 @@ def _rh_endpoint_vars(pol, hs, key):
     and B consume. Returns the inventory variable name per endpoint role and the rule (with the declared owner rule
     as 'owner_rule'); refuses a rule this resolver cannot apply exactly as declared."""
     ep = hs.get('endpoint')
-    if not isinstance(ep, dict) or set(ep) != {'rule_path', 'owner_var_path', 'owner_rule_path', 'auth_path'}:
-        raise ValueError('lme: registry host_scope.endpoint must be {rule_path, owner_var_path, owner_rule_path, auth_path}; got %r' % (ep,))
+    if not isinstance(ep, dict) or set(ep) != {'rule_path', 'owner_var_path', 'owner_rule_path', 'auth_path',
+                                                'semantics_path', 'form_primitives', 'form_cause_roles'}:
+        raise ValueError('lme: registry host_scope.endpoint must be {rule_path, owner_var_path, owner_rule_path, auth_path, semantics_path, form_primitives, form_cause_roles}; got %r' % (ep,))
     f, rule = _rh_get(pol, ep['rule_path'])
     fo, owner_var = _rh_get(pol, ep['owner_var_path'])
     fr, owner_rule = _rh_get(pol, ep['owner_rule_path'])
@@ -3533,27 +4712,27 @@ def _rh_endpoint_vars(pol, hs, key):
         raise ValueError('lme: %s.%s.var %r must equal %s %r (one owner rule, one place)' % (
             key, ep['owner_rule_path'], owner_rule['var'], ep['owner_var_path'], owner_var))
     if not fa or not isinstance(auth, dict) or not isinstance(auth.get('mode_var'), str) or not auth['mode_var'] \
-            or not isinstance(auth.get('modes'), dict) or any(not isinstance(m, dict) or not isinstance(m.get('ssh_common_args'), str) for m in auth['modes'].values()):
-        raise ValueError('lme: %s.%s must declare mode_var and modes, each mode with its ssh_common_args' % (key, ep['auth_path']))
-    fm = rule['inventory_forms']
-    acc = fm.get('accepted')
-    if fm.get('other') != 'refuse' or not isinstance(acc, list) or not acc or any(
-            not isinstance(a, dict) or set(a) != {'form', 'test', 'proxy_jump'} or a['test'] not in _RH_FORM_TESTS
-            or a['proxy_jump'] not in ('', 'form_regex_capture_1')
-            or (a['proxy_jump'] == 'form_regex_capture_1') != (a['test'] == 'match_form_regex') for a in acc):
-        raise ValueError('lme: %s.%s.inventory_forms must be {var, accepted: [{form, test in %s, proxy_jump in [\'\', form_regex_capture_1]}], other: refuse}; got %r' % (
-            key, ep['rule_path'], sorted(_RH_FORM_TESTS), fm))
-    if fm['var'] != rule['proxy_jump']['var']:
-        raise ValueError('lme: %s.%s.inventory_forms.var must be the proxy_jump var %r' % (key, ep['rule_path'], rule['proxy_jump']['var']))
-    ad, pt, pj = rule['address'], rule['port'], rule['proxy_jump']
+            or not isinstance(auth.get('modes'), dict) or not auth['modes'] or any(not isinstance(m, dict) for m in auth['modes'].values()):
+        raise ValueError('lme: %s.%s must declare mode_var and modes (a non-empty mapping of mode mappings)' % (key, ep['auth_path']))
+    # H-FORM-1 PHASE 1 (declaration admission) then PHASE 2 (whole-rule validation): the vocabulary is read through the
+    # registry semantics_path and joined to the registry form_primitives / form_cause_roles; it must be the rule's own
+    # form_semantics member (the node the filter adapter reads from the same composition), so both adapters admit ONE
+    # node. A malformed vocabulary or rule refuses here, before any interpreter call and before publication.
+    fsm, fs = _rh_get(pol, ep['semantics_path']) if isinstance(ep['semantics_path'], str) else (False, None)
+    if not fsm or fs is not rule.get('form_semantics'):
+        raise ValueError('lme: registry host_scope.endpoint.semantics_path %r must name the form_semantics member of the rule at %s; got %s' % (
+            ep['semantics_path'], ep['rule_path'], 'a different node' if fsm else '<absent>'))
+    _rh_form_admit(fs, rule, ep['form_primitives'], ep['form_cause_roles'], '%s.%s' % (key, ep['rule_path']))
+    why = _rh_form_invalid(fs, rule, auth)
+    if why is not None:
+        raise ValueError('lme: %s.%s: %s' % (key, ep['rule_path'], why))
+    ad, pt = rule['address'], rule['port']
     if ad.get('absent') != 'inventory_hostname' or ad.get('normalize') != 'lower':
         raise ValueError('lme: %s.%s.address must be {var, absent: inventory_hostname, normalize: lower}; got %r' % (key, ep['rule_path'], ad))
     if pt.get('absent') != 'delegate_ssh_config' or not isinstance(pt.get('absent_key'), str) or not pt['absent_key'] \
             or not isinstance(pt.get('explicit_regex'), str) or isinstance(pt.get('explicit_max'), bool) or not isinstance(pt.get('explicit_max'), int):
         raise ValueError('lme: %s.%s.port must be {var, absent: delegate_ssh_config, absent_key, explicit_regex, explicit_max}; got %r' % (key, ep['rule_path'], pt))
-    if not isinstance(pj.get('form_regex'), str) or re.compile(pj['form_regex']).groups != 1:
-        raise ValueError('lme: %s.%s.proxy_jump.form_regex must capture exactly the jump; got %r' % (key, ep['rule_path'], pj.get('form_regex')))
-    return ({'address': ad['var'], 'port': pt['var'], 'proxy_jump': fm['var'], 'owner': owner_var, 'mode': auth['mode_var']},
+    return ({'address': ad['var'], 'port': pt['var'], 'proxy_jump': rule['inventory_forms']['var'], 'owner': owner_var, 'mode': auth['mode_var']},
             dict(rule, modes=auth['modes'], owner_rule=owner_rule))
 
 
@@ -3593,18 +4772,13 @@ def _rh_endpoint(raw, rule, host, key):
     # requires that mode to equal the run's selected mode, so under admission they are the same args. No accepted
     # form -> refuse (other: refuse). An absent or unknown host mode matches no equals_mode_args form.
     # The `undefined` test holds for an ABSENT var only; a supplied null matches no accepted form and refuses.
+    # H-FORM-1 RAISING ADAPTER: the same admitted vocabulary and pure core as lme_rh_proxy_outcome (validated by
+    # _rh_endpoint_vars); the source is the selected endpoint values with the proxy role under the inventory var.
     jp = 'proxy_jump' in raw
     j = raw.get('proxy_jump')
-    mode = rule['modes'].get(raw.get('mode')) if isinstance(raw.get('mode'), str) else None
-    jump = None
-    for form in rule['inventory_forms']['accepted']:
-        t = form['test']
-        m = re.match(rule['proxy_jump']['form_regex'] + r'\Z', j) if t == 'match_form_regex' and isinstance(j, str) else None
-        if (t == 'undefined' and not jp) or (t == 'equals_empty' and j == '') \
-                or (t == 'equals_mode_args' and mode is not None and isinstance(j, str) and j == mode['ssh_common_args']) or m:
-            jump = m.group(1) if form['proxy_jump'] == 'form_regex_capture_1' else ''
-            break
-    if jump is None:
+    ok, jump, cause = _rh_form_classify(rule['form_semantics'], rule, {'modes': rule['modes']},
+                                        {rule['inventory_forms']['var']: j} if jp else {}, raw.get('mode'))
+    if not ok:
         raise ValueError('lme: %s endpoint of %r: %s %r is none of the declared accepted inventory forms %r (host mode %r)' % (
             key, host, rule['inventory_forms']['var'], j if jp else '<absent>', [f['form'] for f in rule['inventory_forms']['accepted']], raw.get('mode')))
     # Owner: ABSENT -> the declared owner rule's absent value (a separate, declared policy); a SUPPLIED value (null
@@ -3765,7 +4939,7 @@ _RH_SCOPE_ENTRY = ('policy', 'policy_sha256', 'adapter', 'host_scoped_paths', 's
                    'shared_artifact_inputs_sha256')
 
 
-def _rh_scoped(section, composed, declared, override, schema, scope):
+def _rh_scoped(section, composed, declared, override, schema, scope, *, documents, admission):
     """PER-HOST-SCOPE-CONTRACT (codex-r3f-scope-binding-and-join-023332). Every host resolves the FULL intended
     policy of EVERY scope of the deployment -- the controller (registry host_scope.controller_id) and each member
     of the policy's declared target group -- each composed by the loader's ONE composition (global | profile |
@@ -3826,7 +5000,10 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
         raise ValueError('lme: remote-harness scope connections carry target inputs the policy does not declare')
 
     def entry(i):
-        sec = section if i == me else _rh_validate(comp[i], declared, ovs[i], schema)[0]
+        # F05-S3 LR-02: every scope is validated with the SAME retained documents and admission record: the documents
+        # are the ONE admitted source checkout's bytes (not per-host data), so a sibling scope whose policy names
+        # another document rel refuses in _rh_documents (rel binding) instead of reading anything.
+        sec = section if i == me else _rh_validate(comp[i], declared, ovs[i], schema, documents=documents, admission=admission)[0]
         if _rh_get(sec['policy'], hs['target_group_path'])[1] != tg or _rh_get(sec['policy'], hs['operation_path'])[1] != op:
             raise ValueError('lme: scope %r resolves another target group/operation than the deployment binding' % (i,))
         ident = {'kind': 'controller' if i == cid else 'target', 'id': i}
@@ -3849,7 +5026,7 @@ def _rh_scoped(section, composed, declared, override, schema, scope):
                 scopes=scopes, scopes_sha256=_digest(scopes))
 
 
-def lme_project_remote_harness(composed, declared, override, schema, scope=None):
+def lme_project_remote_harness(composed, declared, override, schema, scope=None, *, documents, admission):
     """SEED-06 (codex-tick121-223811, codex-232517): the typed lme_resolved.<policy_key> section
     {schema_version, policy, policy_sha256}, or None when no policy is declared.
 
@@ -3869,10 +5046,493 @@ def lme_project_remote_harness(composed, declared, override, schema, scope=None)
     Every section also carries host_scoped_paths / scope_invariant_sha256 (an ADDITIONAL compatibility digest)
     and shared_artifact_inputs_sha256. With scope (the loader's inline scope context), the section is bound to
     this host's scope and carries every scope's full intended policy (PER-HOST-SCOPE-CONTRACT, _rh_scoped)."""
-    section = _rh_validate(composed, declared, override, schema)[0]
-    if section is None or scope is None:
+    section, _ov, docs = _rh_validate(composed, declared, override, schema, documents=documents, admission=admission)
+    if section is None:
         return section
-    return _rh_scoped(section, composed, declared, override, schema, scope)
+    # F05 (codex-tick507 R2-F05-ACTUAL-CONSUMER): the registry-declared published views ride at the TOP level only
+    # (_rh_scoped copies _RH_SCOPE_ENTRY into scopes); outside every policy/scope digest, inside lme_resolved_revision.
+    # F05-S3: the document-gated views read the SAME admitted documents (docs) the projections read.
+    section = dict(section, **_rh_published_views(section['policy'], schema, schema['policy_key'], docs))
+    if scope is None:
+        return section
+    return _rh_scoped(section, composed, declared, override, schema, scope, documents=documents, admission=admission)
+
+
+def _rh_published_view_decl(schema):
+    """F05-G2 LV-2: remote_harness_schema.published_views admitted at every use. Each name is a
+    contract_admission.patterns.var_name, collides with no section/scope key, and carries exactly its kind's keys:
+      policy_node {kind, from}: the view is a deep copy of the policy node at `from` (absent refuses; no empty view).
+      declaration_contract {kind, when_declared, fields, refusal, message}: fields = exactly {active, refusal,
+        message} -> distinct var_name output names; refusal matches patterns.refusal_code; message non-empty.
+      document_binding {kind, when} (F05-S3 P6): {name: {rel, sha256}} of the admitted documents.
+      entry_generation {_RH_EG_VIEW_KEYS} (F05-S3 P5, LR-12): see _rh_eg_view.
+    A `when` names a declaration_contract view; the gated view is published exactly while it is active (LR-10).
+    Returns the admitted mapping."""
+    views = schema.get('published_views')
+    pats = (schema.get('contract_admission') or {}).get('patterns') or {}
+    vn, rc = pats.get('var_name'), pats.get('refusal_code')
+    if not isinstance(views, dict) or not isinstance(vn, str) or not isinstance(rc, str):
+        raise ValueError('lme: registry remote_harness_schema.published_views must be a mapping and contract_admission.patterns must declare var_name and refusal_code; got %r' % (views,))
+    shapes = {'policy_node': {'kind', 'from'}, 'declaration_contract': {'kind', 'when_declared', 'fields', 'refusal', 'message'},
+              'document_binding': {'kind', 'when'}, 'entry_generation': set(_RH_EG_VIEW_KEYS)}
+    taken = _RH_BASE_KEYS | _RH_SCOPED_KEYS | set(_RH_SCOPE_ENTRY) | {'kind', 'id'}
+    for name in sorted(views):
+        v = views[name]
+        if not isinstance(name, str) or not re.fullmatch(vn, name) or name in taken:
+            raise ValueError('lme: registry published_views name %r must fully match patterns.var_name and not be a section or scope key %s' % (name, sorted(taken)))
+        if not isinstance(v, dict) or v.get('kind') not in shapes or set(v) != shapes[v['kind']] \
+                or any(not isinstance(v[k], str) or not v[k] for k in shapes[v['kind']] - {'fields'} - _RH_EG_VIEW_NONSTRING):
+            raise ValueError('lme: registry published_views.%s must be one of %s with non-empty string values; got %r' % (name, {k: sorted(x) for k, x in shapes.items()}, v))
+        # F05-S3 LR-10: a gated view names a declaration_contract view (admitted after the loop: order-free)
+        if 'when' in v and (v['when'] not in views or not isinstance(views[v['when']], dict) or 'kind' not in views[v['when']]
+                                 or views[v['when']]['kind'] != 'declaration_contract'):
+            raise ValueError('lme: registry published_views.%s.when %r must name a declared declaration_contract view' % (name, v['when']))
+        if v['kind'] == 'declaration_contract':
+            f = v['fields']
+            if not isinstance(f, dict) or set(f) != {'active', 'refusal', 'message'} \
+                    or any(not isinstance(x, str) or not re.fullmatch(vn, x) for x in f.values()) or len(set(f.values())) != 3:
+                raise ValueError('lme: registry published_views.%s.fields must map exactly active/refusal/message to distinct var_name strings; got %r' % (name, f))
+            if not re.fullmatch(rc, v['refusal']):
+                raise ValueError('lme: registry published_views.%s.refusal %r must fully match patterns.refusal_code %r' % (name, v['refusal'], rc))
+    # F05-S4 RENDER-CONTEXT-03 (Codex585 RC02-INACTIVE-ARTIFACT-ENTRY-COUNT): the ONE entry_count cross-reference,
+    # admitted HERE -- registry-only, at every use, before any view is gated on policy activity -- so it holds when
+    # the whole generation contract is inactive too. More than one entry template is admitted ONLY on a shared
+    # artifact the registry already names as an entry_generation view's rendered.render_artifact; every other
+    # shared artifact keeps exactly one entry. (The active rendered-output equality stays in _rh_eg_view.)
+    rarts = set()
+    for name in sorted(views):
+        v = views[name]
+        if v['kind'] != 'entry_generation':
+            continue
+        rd = v['rendered']
+        if not isinstance(rd, dict) or 'render_artifact' not in rd or not isinstance(rd['render_artifact'], str) or not rd['render_artifact']:
+            raise ValueError('lme: registry published_views.%s.rendered.render_artifact must name a shared artifact (non-empty string); got %r' % (name, rd))
+        rarts.add(rd['render_artifact'])
+    if 'host_scope' not in schema:
+        raise ValueError('lme: registry remote_harness_schema.host_scope must be declared (shared_artifacts entry_count admission); got %r' % (sorted(schema),))
+    arts = _rh_artifact_decl(schema['host_scope'])
+    multi = sorted(a for a, d in arts.items() if d['entry_count'] != 1 and a not in rarts)
+    if multi:
+        raise ValueError('lme: registry host_scope.shared_artifacts.%s.entry_count must be 1: several entry templates are admitted only on a declared published_views.<entry_generation view>.rendered.render_artifact %s; got %r' % (
+            multi[0], sorted(rarts), dict((a, arts[a]['entry_count']) for a in multi)))
+    return views
+
+
+def _rh_published_views(policy, schema, key, docs):
+    """F05-G2 LV-3: the published views, a pure function of the resolved policy, the registry and (F05-S3) the
+    admitted documents docs = (active, {name: {rel, sha256, root}}) from _rh_documents. A view with `when` is
+    published exactly while that declaration_contract view is active (LR-10); inactive it is ABSENT (no manufactured
+    inactive state; the consumer's own typed assert refuses)."""
+    views = _rh_published_view_decl(schema)
+    res = {}
+    for name, v in sorted(views.items()):
+        if 'when' in v:
+            on = _rh_get(policy, views[v['when']]['when_declared'])[0]
+            if on != docs[0]:
+                raise ValueError('lme: published_views.%s.when %r and the admitted documents disagree on activity (one activity rule)' % (name, v['when']))
+            if not on:
+                continue
+        if v['kind'] == 'policy_node':
+            fv, node = _rh_get(policy, v['from'])
+            if not fv:
+                raise ValueError('lme: %s.%s is absent; published view %s has no empty form (published_views.%s)' % (key, v['from'], name, name))
+            res[name] = copy.deepcopy(node)
+        elif v['kind'] == 'declaration_contract':
+            res[name] = {v['fields']['active']: _rh_get(policy, v['when_declared'])[0] is True,
+                         v['fields']['refusal']: v['refusal'], v['fields']['message']: v['message']}
+        elif v['kind'] == 'document_binding':
+            res[name] = dict((n, {'rel': d['rel'], 'sha256': d['sha256']}) for n, d in sorted(docs[1].items()))
+        else:
+            res[name] = _rh_eg_view(name, v, views[v['when']], policy, schema, key, docs[1])
+    return res
+
+
+# F05-S3 LR-12 / STRUCT-ROLE / L-ADO-01..06 / LD05 (OD-S3-05 a + dynamic references): the entry_generation view
+# declaration keys. Pointers only: B paths relative to the `document` root (b_paths, members, select, identity), policy
+# paths absolute; record_codes / record_code_refs are the ONE generator-consumer contract.
+_RH_EG_VIEW_KEYS = ('kind', 'when', 'schema_version', 'document', 'roster_document', 'names_family', 'derived_row_keys',
+                    'members', 'select', 'identity', 'b_paths', 'template_vars', 'template_var_roles', 'declaration_rel',
+                    'never_generated', 'importers', 'bodies', 'context', 'context_root', 'policy_path_separator', 'interface',
+                    'render_artifact', 'record_codes', 'record_code_refs', 'record_code_pattern', 'adoption_checks',
+                    'row_id_key', 'row_template_key', 'rendered')
+_RH_EG_VIEW_NONSTRING = frozenset(('schema_version', 'derived_row_keys', 'b_paths', 'template_var_roles', 'never_generated',
+                                   'interface', 'record_codes', 'record_code_refs', 'adoption_checks', 'rendered'))
+# F05-S4 ROSTER-NONPLAYBOOK (Codex546 generated_outputs; OPEN-A / OD-BRR-14 / U-SEAM01): the rendered-output row kind's
+# registry declaration (policy pointers; output_fields maps the two row roles onto the leaf names of every outputs node).
+# F05-S4 RENDER-CONTEXT (render-interface-01): + struct_sources / context_binding (policy paths) and source_facts (the
+# registry key of the fact universe a struct source must name exactly).
+_RH_EG_RENDERED_KEYS = frozenset(('when_present', 'render_artifact', 'context_kind', 'context_kinds', 'struct_roles', 'outputs', 'output_fields',
+                                  'struct_sources', 'context_binding', 'source_facts',
+                                  # F05-S4 RENDER-CONTEXT-02: the declared entry shape and the permitted kinds
+                                  'source_entry_fields', 'source_kinds', 'kind_tests', 'kind_test_names'))
+_RH_EG_B_PATHS = frozenset(('roster_key', 'roster_member_key', 'roster_member_keys', 'roster_source_keys', 'retire_key',
+                            'retire_row_keys', 'records', 'pending_roles', 'record_refusals', 'record_texts', 'adoption_rel',
+                            'blob_id_regex', 'edition_regex', 'ownership', 'struct_roles', 'identity_refusal', 'identity_text',
+                            'adoption', 'adoption_baseline', 'adoption_authored'))
+_RH_EG_ADOPTION_CHECKS = frozenset(('retention_root', 'dispatch_closure', 'common', 'excludes', 'exclude_forms', 'adoption_keys'))
+_RH_EG_STRUCT_WORDS = ('declaration_rel', 'member_dir', 'member_file')
+_RH_EG_EXCLUDE_WORDS = ('component', 'prefix', 'suffix')
+
+
+def _rh_eg_view(name, v, contract, policy, schema, key, docs):
+    """LR-12: the entry-generation view (spec.yml P5 fields, codex-tick522 corrections, L-ADO-01..06, LD05). Any absent
+    or malformed input refuses with the contract view's refusal (RH-ENTRY-DECLARATION-MISSING) naming the registry,
+    policy/document path and value; the roster identity law refuses with B's identity code and text."""
+    def bad(where, detail, value):
+        raise ValueError('lme: %s (published_views.%s; %s): %s %s; got %r' % (contract['refusal'], name, contract['message'], where, detail, value))
+    pats, ptext = _rh_patterns(schema)
+    if not _rh_int(v['schema_version']) or not isinstance(v['derived_row_keys'], list) or not v['derived_row_keys'] \
+            or any(not isinstance(x, str) or not x for x in v['derived_row_keys']) \
+            or not isinstance(v['b_paths'], dict) or set(v['b_paths']) != _RH_EG_B_PATHS or any(not isinstance(x, str) or not x for x in v['b_paths'].values()) \
+            or not isinstance(v['template_var_roles'], dict) or set(v['template_var_roles']) != {'context', 'struct', 'decl'} \
+            or not isinstance(v['never_generated'], list) or not isinstance(v['interface'], dict) or set(v['interface']) != {'base', 'files'} \
+            or not isinstance(v['record_codes'], list) or not v['record_codes'] or len(set(v['record_codes'])) != len(v['record_codes']) \
+            or not isinstance(v['record_code_refs'], list) or any(not isinstance(r, dict) or len(r) != 1 or next(iter(r)) not in ('values_of', 'items_of') for r in v['record_code_refs']) \
+            or not isinstance(v['adoption_checks'], dict) or set(v['adoption_checks']) != _RH_EG_ADOPTION_CHECKS \
+            or v['names_family'] not in pats or v['record_code_pattern'] not in pats or 'rel_path' not in pats:
+        bad('registry remote_harness_schema.published_views.%s' % (name,), 'must carry exactly %s with typed values (b_paths exactly %s, adoption_checks exactly %s)' % (
+            list(_RH_EG_VIEW_KEYS), sorted(_RH_EG_B_PATHS), sorted(_RH_EG_ADOPTION_CHECKS)), sorted(v))
+    rd = v['rendered']
+    if not isinstance(rd, dict) or set(rd) != _RH_EG_RENDERED_KEYS \
+            or any(not isinstance(rd[k], str) or not rd[k] for k in _RH_EG_RENDERED_KEYS - {'outputs', 'output_fields', 'source_entry_fields', 'source_kinds', 'kind_test_names'}) \
+            or not isinstance(rd['source_entry_fields'], dict) or set(rd['source_entry_fields']) != {'fact', 'path', 'kind'} \
+            or any(not isinstance(x, str) or not x for x in rd['source_entry_fields'].values()) or len(set(rd['source_entry_fields'].values())) != 3 \
+            or not isinstance(rd['source_kinds'], list) or not rd['source_kinds'] or len(set(x for x in rd['source_kinds'] if isinstance(x, str))) != len(rd['source_kinds']) \
+            or any(x not in _RH_KIND_WORDS for x in rd['source_kinds']) \
+            or not isinstance(rd['kind_test_names'], list) or not rd['kind_test_names'] or any(not isinstance(x, str) or not x for x in rd['kind_test_names']) \
+            or len(set(rd['kind_test_names'])) != len(rd['kind_test_names']) \
+            or not isinstance(rd['outputs'], list) or not rd['outputs'] or any(not isinstance(x, str) or not x for x in rd['outputs']) \
+            or len(set(rd['outputs'])) != len(rd['outputs']) \
+            or not isinstance(rd['output_fields'], dict) or set(rd['output_fields']) != {'output', 'template'} \
+            or any(not isinstance(x, str) or not x for x in rd['output_fields'].values()) or len(set(rd['output_fields'].values())) != 2:
+        bad('registry remote_harness_schema.published_views.%s.rendered' % (name,),
+            'must carry exactly %s (policy path strings; outputs a non-empty distinct list of policy paths; output_fields exactly {output, template} -> two distinct leaf names; source_entry_fields exactly {fact, path, kind} -> three distinct entry key names; source_kinds a non-empty distinct list of the supported kind words %s; kind_test_names a non-empty distinct list of test names)' % (
+                sorted(_RH_EG_RENDERED_KEYS), sorted(_RH_KIND_WORDS)), rd)
+    relp = pats['rel_path']
+    for dn in (v['document'], v['roster_document']):
+        if dn not in docs:
+            bad('published_views.%s document %r' % (name, dn), 'names no admitted document', sorted(docs))
+    root, rroot = docs[v['document']]['root'], docs[v['roster_document']]['root']
+    B = v['b_paths']
+
+    def b(field, want=None):
+        f, x = _rh_get(root, B[field])
+        if not f or (want is not None and not isinstance(x, want)):
+            bad('document %s %s' % (v['document'], B[field]), 'must be a declared %s' % (want.__name__ if want else 'value'), x if f else '<absent>')
+        return x
+
+    def p(path, want=None):
+        f, x = _rh_get(policy, path)
+        if not f or (want is not None and not isinstance(x, want)):
+            bad('%s.%s' % (key, path), 'must be a declared %s' % (want.__name__ if want else 'value'), x if f else '<absent>')
+        return x
+    projs = schema['policy_projections']
+    for pn in (v['importers'], v['bodies']):
+        if pn not in projs:
+            bad('published_views.%s' % (name,), 'names projection %r, which is not declared' % (pn,), sorted(projs))
+    importers = p('%s.%s' % (projs[v['importers']]['at'], projs[v['importers']]['to']), dict)
+    bodies = p('%s.%s' % (projs[v['bodies']]['at'], projs[v['bodies']]['to']), dict)
+    # MR03 (DEP-MR03-LOADER-01): the rendered dispatch rows / their obligation rows (same projections, second destinations)
+    rimps = p('%s.%s' % (projs[v['importers']]['at'], projs[v['importers']]['rendered_dispatch']['to']), dict)
+    robls = p('%s.%s' % (projs[v['bodies']]['at'], projs[v['bodies']]['rendered_to']), dict)
+    pseparator = p(v['policy_path_separator'], str)
+    gen, _members, sep, rendered = _rh_eg_generated('published_views.%s' % (name,), {'identity': v['identity'], 'members': v['members'], 'document': v['document']}, root, policy, key, relp)
+    # ---- STRUCT-ROLE (codex-tick522): struct_roles and bound.struct keys are BOTH the select VALUES of the struct.roles keys
+    sroles, select = b('struct_roles', dict), _rh_get(root, v['select'])[1]
+    if sorted(sroles.values()) != sorted(_RH_EG_STRUCT_WORDS) or not isinstance(select, dict) \
+            or any(r not in select or not isinstance(select[r], str) or not select[r] for r in sroles) \
+            or len(set(select[r] for r in sroles)) != len(sroles):
+        bad('document %s %s / %s' % (v['document'], B['struct_roles'], v['select']), 'must map struct roles onto %s and select a distinct field name for every struct role' % (list(_RH_EG_STRUCT_WORDS),), [sroles, select])
+    role_of = dict((w, r) for r, w in sroles.items())
+    struct_roles = sorted(select[r] for r in sroles)
+    # ---- roster (identity law) ----
+    skeys, mkey, mkeys = b('roster_source_keys', list), b('roster_member_key', str), b('roster_member_keys', list)
+    if sorted(mkeys) != sorted([role_of['member_dir'], role_of['member_file']]) or mkey not in skeys:
+        bad('document %s %s / %s' % (v['document'], B['roster_member_keys'], B['roster_member_key']), 'must be the struct roles of member_dir/member_file and a source key', [mkeys, mkey])
+    rows = _rh_get(rroot, b('roster_key', str))[1]
+    retire_rows, rr_keys = _rh_get(rroot, b('retire_key', str))[1], b('retire_row_keys', list)
+    if not isinstance(rroot, dict) or not isinstance(rows, list) or not isinstance(retire_rows, list) \
+            or any(not isinstance(r, dict) or sorted(r) != sorted(rr_keys) for r in retire_rows):
+        bad('document %s (%s)' % (v['roster_document'], docs[v['roster_document']]['rel']), 'must carry a row list and a retire list of exactly %s rows' % (sorted(rr_keys),), sorted(rroot) if isinstance(rroot, dict) else type(rroot).__name__)
+    tv = p(v['template_vars'], dict)
+    tvr = v['template_var_roles']
+    if any(tvr[r] not in tv or not isinstance(tv[tvr[r]], str) for r in tvr):
+        bad('%s.%s' % (key, v['template_vars']), 'must name a template variable for every role %s' % (sorted(tvr.values()),), tv)
+    tvc, tvs, tvd = tv[tvr['context']], tv[tvr['struct']], tv[tvr['decl']]
+    cfields = p(v['context'], dict)
+    cpaths = dict((f, pseparator.join([v['context_root']] + list(kp))) for f, kp in sorted(cfields.items()))
+    decl_rel = p(v['declaration_rel'], str)
+    if decl_rel != docs[v['document']]['rel']:
+        bad('%s.%s' % (key, v['declaration_rel']), 'must be the admitted %s document rel %r' % (v['document'], docs[v['document']]['rel']), decl_rel)
+    arts = _rh_artifact_decl(schema['host_scope'])
+    if v['render_artifact'] not in arts:
+        bad('host_scope.shared_artifacts.%s' % (v['render_artifact'],), 'is not declared (the render closure is SEQUENCED on C1-S9-SHARED-MACRO-REACH + C1-S9-MANDATORY-CAPABILITY, OD-S2-06)', sorted(arts))
+    closure = list(arts[v['render_artifact']]['templates'])
+    # F05-S4 RENDER-CONTEXT-02/-03 (J-FIN-F05-01; Codex585): entry_count > 1 only on a declared rendered.render_artifact
+    # is admitted UNCONDITIONALLY in _rh_published_view_decl (before this view is gated); the leading entries of this
+    # view's render_artifact must equal the declared rendered output templates (checked below while active).
+    # ---- F05-S4 ROSTER-NONPLAYBOOK (Codex546 generated_outputs; OPEN-A / OD-BRR-14 / U-SEAM01): the RENDERED row kind.
+    # A row whose member is a rendered member (identity.rendered_from) is the same B roster row shape; its kind is its
+    # member's marker (declared once, in B entry_sets). Active exactly while rendered.when_present is declared in the
+    # policy (OD-BRR-07: no fabricated inactive view): its render closure is shared artifact rendered.render_artifact,
+    # its context kind (policy rendered.context_kind) is a key of rendered.context_kinds, its struct binding is the
+    # policy mapping rendered.struct_roles, and the PRODUCER declaration rendered.outputs (policy nodes, each carrying
+    # the output_fields leaves) is the ONE authority of {output rel: template rel}: the rendered rows must equal it in
+    # both directions (no second spelling passes silently). Inactive: rendered rows stay identity-checked (B roster law)
+    # and are OMITTED from the published roster.
+    ron = _rh_get(policy, rd['when_present'])[0]
+    rclosure, rpairs, rstruct, rsrc, rbind = [], {}, {}, {}, {}
+    if ron:
+        rkind, rkinds = p(rd['context_kind'], str), p(rd['context_kinds'], dict)
+        if rkind not in rkinds:
+            bad('%s.%s' % (key, rd['context_kind']), 'must be a key of %s.%s %s' % (key, rd['context_kinds'], sorted(rkinds)), rkind)
+        rstruct = p(rd['struct_roles'], dict)
+        if not rstruct or any(not isinstance(x, str) or not x for x in rstruct.values()) or len(set(rstruct.values())) != len(rstruct):
+            bad('%s.%s' % (key, rd['struct_roles']), 'must map struct roles to distinct non-empty names', rstruct)
+        # F05-S4 RENDER-CONTEXT (render-interface-01 s1): the ONE runtime role -> source binding. Keys EXACTLY the
+        # struct_roles keys; each source exactly {fact, path}: fact an EXACT member of the registry list named by
+        # rendered.source_facts, path a list of non-empty keys walked inside it ([] = the fact itself). No default.
+        found, facts = _rh_get(schema, rd['source_facts'])
+        if not found or not isinstance(facts, list) or not facts:
+            bad('registry remote_harness_schema.%s (published_views.%s.rendered.source_facts)' % (rd['source_facts'], name), 'must be a declared non-empty list of fact names', facts if found else '<absent>')
+        # F05-S4 RENDER-CONTEXT-02 (render-interface-02 s1): each entry carries EXACTLY the declared entry keys
+        # (rendered.source_entry_fields values, now incl. the kind key); the kind is one of rendered.source_kinds (a
+        # subset of the seven supported kind words, admitted above); no default.
+        sef = rd['source_entry_fields']
+        fk, pk, kk = sef['fact'], sef['path'], sef['kind']
+        rsrc = p(rd['struct_sources'], dict)
+        if set(rsrc) != set(rstruct) or any(not isinstance(s, dict) or set(s) != set(sef.values()) or not isinstance(s[fk], str) or s[fk] not in facts
+                                             or not isinstance(s[pk], list) or any(not isinstance(x, str) or not x for x in s[pk])
+                                             or not isinstance(s[kk], str) or s[kk] not in rd['source_kinds'] for s in rsrc.values()):
+            bad('%s.%s' % (key, rd['struct_sources']), 'must map EXACTLY the %s.%s roles %s to entries of exactly %s (%s a registry %s member, %s a list of non-empty keys, %s one of the permitted kinds %s)' % (
+                key, rd['struct_roles'], sorted(rstruct), sorted(sef.values()), fk, rd['source_facts'], pk, kk, rd['source_kinds']), rsrc)
+        # parent successor-07 J-S07-PROFILE-KEY-ADMISSION / Codex580 J-S07-KIND-ADMISSION: the ONE kind -> {test,
+        # excludes} map the generator applies, admitted before render (no default): keys among the seven supported kind
+        # words and covering every permitted kind; each value exactly {test, excludes}; test one of the registry's
+        # CLOSED rendered.kind_test_names (parent successor-08 J-S07-KIND-RANGE; each of which must be a Jinja builtin
+        # test, the generator's render engine); no two kinds share a test (ambiguous); excludes a distinct list from the
+        # same closed set, each the test of ANOTHER declared kind (an unknown or self exclusion refuses).
+        import jinja2
+        jtests = frozenset(jinja2.Environment().tests)
+        tnames = rd['kind_test_names']
+        if any(x not in jtests for x in tnames):
+            bad('registry remote_harness_schema.published_views.%s.rendered.kind_test_names' % (name,), 'must name only Jinja builtin tests %s' % (sorted(jtests),), tnames)
+        ktests = p(rd['kind_tests'], dict)
+        kt_ok = all(isinstance(k, str) and k in _RH_KIND_WORDS for k in ktests) and set(rd['source_kinds']) <= set(ktests) \
+            and all(isinstance(t, dict) and set(t) == {'test', 'excludes'} and isinstance(t['test'], str) and t['test'] in tnames
+                    and isinstance(t['excludes'], list) and all(isinstance(x, str) and x in tnames for x in t['excludes'])
+                    and len(set(t['excludes'])) == len(t['excludes']) for t in ktests.values())
+        if kt_ok:
+            kt_tests = [t['test'] for t in ktests.values()]
+            kt_ok = len(set(kt_tests)) == len(kt_tests) and all(x in kt_tests and x != t['test'] for t in ktests.values() for x in t['excludes'])
+        if not kt_ok:
+            bad('%s.%s' % (key, rd['kind_tests']), 'must map supported kind words %s (covering every permitted kind %s) to exactly {test, excludes}: test one of the declared kind_test_names %s, distinct across kinds; excludes a distinct list of the tests of OTHER declared kinds from the same set' % (
+                sorted(_RH_KIND_WORDS), rd['source_kinds'], tnames), ktests)
+        # context_binding exactly {key, value}: value = the render-contract key it carries (the leaf of the struct_roles
+        # policy path); key = the nested context key the templates read, never an early context field name.
+        rbind = p(rd['context_binding'], dict)
+        if set(rbind) != {'key', 'value'} or rbind['value'] != rd['struct_roles'].split(pseparator)[-1] \
+                or not isinstance(rbind['key'], str) or not rbind['key'] or rbind['key'] in cfields:
+            bad('%s.%s' % (key, rd['context_binding']), 'must be exactly {key, value} with value %r (the %s leaf) and key a non-empty name outside the early context fields %s' % (
+                rd['struct_roles'].split(pseparator)[-1], rd['struct_roles'], sorted(cfields)), rbind)
+        of, tf = rd['output_fields']['output'], rd['output_fields']['template']
+        for o in rd['outputs']:
+            node = p(o, dict)
+            if any(f not in node or not isinstance(node[f], str) or not relp.fullmatch(node[f]) for f in (of, tf)) or node[of] in rpairs:
+                bad('%s.%s' % (key, o), 'must carry %s and %s, repository-relative paths, the output declared once across %s' % (of, tf, rd['outputs']),
+                    [node[f] if f in node else '<absent>' for f in (of, tf)])
+            rpairs[node[of]] = node[tf]
+        if rd['render_artifact'] not in arts:
+            bad('host_scope.shared_artifacts.%s' % (rd['render_artifact'],), 'is not declared (the rendered-output render closure is SEQUENCED on GEN2-J-RENDER)', sorted(arts))
+        rclosure = list(arts[rd['render_artifact']]['templates'])
+        if sorted(rpairs) != sorted(rendered):
+            raise ValueError('lme: %s (document %s %s / %s.%s): %s; the rendered members %s must equal the declared rendered outputs %s' % (
+                b('identity_refusal', str), v['document'], v['members'], key, rd['outputs'], b('identity_text', str), sorted(rendered), sorted(rpairs)))
+        # F05-S4 RENDER-CONTEXT-02 (J-FIN-F05-01): the render artifact's leading entry_count templates (each proved:
+        # free variables EQUAL its declared inputs, incl. lme_entry_binding) are EXACTLY the declared rendered output
+        # templates -- every declared rendered root an entry, nothing else (its macros stay non-entry, free-variable-free)
+        rentries = rclosure[:arts[rd['render_artifact']]['entry_count']]
+        if sorted(rentries) != sorted(set(rpairs.values())):
+            bad('host_scope.shared_artifacts.%s.entry_count / %s.%s' % (rd['render_artifact'], key, rd['outputs']),
+                'the leading entry templates must be exactly the declared rendered output templates %s' % (sorted(set(rpairs.values())),), rentries)
+    # the consumer's row identity / template fields (generate_entries :243, :250) are declared once in the registry
+    # view and must be roster source keys (no second literal of a B value; a renamed B key refuses typed)
+    if len(v['derived_row_keys']) != 5 or set(v['derived_row_keys']) & set(skeys) \
+            or v['row_id_key'] not in skeys or v['row_template_key'] not in skeys or len({v['row_id_key'], v['row_template_key'], mkey}) != 3:
+        bad('registry published_views.%s.derived_row_keys / row_id_key / row_template_key' % (name,),
+            'must name the five derived row fields [output_rel, inputs, bound, checkout_inputs, bound_checkout] (in that order) disjoint from the source keys %s, and two distinct non-member source keys' % (skeys,),
+            [v['derived_row_keys'], v['row_id_key'], v['row_template_key']])
+    out_k, in_k, bound_k, cin_k, bcin_k = v['derived_row_keys']
+    seen_ids, seen_g, roster = [], {}, []
+    ident_code, ident_text = b('identity_refusal', str), b('identity_text', str)
+    parts = _rh_get(root, v['identity'])[1]['output_rel_parts']
+    for i, r in enumerate(rows):
+        m = r[mkey] if isinstance(r, dict) and mkey in r else None
+        if not isinstance(r, dict) or sorted(r) != sorted(skeys) or not isinstance(m, dict) or sorted(m) != sorted(mkeys) \
+                or any(not isinstance(x, str) or not x for x in m.values()):
+            raise ValueError('lme: %s (document %s %s[%d]): %s; got %r' % (ident_code, v['roster_document'], B['roster_key'], i, ident_text, r))
+        orel = sep.join(m[role_of['member_dir']] if w == 'member_dir' else m[role_of['member_file']] for w in parts)
+        if (orel not in gen and orel not in rendered) or orel in seen_g:
+            raise ValueError('lme: %s (document %s %s[%d]): %s; got %r (generated %s, rendered %s)' % (ident_code, v['roster_document'], B['roster_key'], i, ident_text, orel, sorted(gen), sorted(rendered)))
+        if r[v['row_id_key']] in seen_ids:
+            bad('document %s %s[%d]' % (v['roster_document'], B['roster_key'], i), 'must carry a unique %s' % (v['row_id_key'],), r[v['row_id_key']])
+        seen_g[orel] = i
+        seen_ids.append(r[v['row_id_key']])
+        if orel in rendered:
+            # F05-S4 ROSTER-NONPLAYBOOK: inactive -> identity-checked above, omitted from the published roster
+            if not ron:
+                continue
+            if r[v['row_template_key']] not in rclosure or rpairs[orel] != r[v['row_template_key']]:
+                bad('document %s %s[%d] / %s.%s' % (v['roster_document'], B['roster_key'], i, key, rd['outputs']),
+                    'a rendered row must carry the declared %s of its output (%r) and it must be in the rendered render closure %s' % (v['row_template_key'], rpairs[orel], rclosure),
+                    r[v['row_template_key']])
+            row = copy.deepcopy(r)
+            # F05-S4 RENDER-CONTEXT (render-interface-01 s2, decision (a) NESTED): context = the early context + ONE
+            # nested key context_binding.key -> struct_roles; struct = struct_sources (entry rows unchanged)
+            row.update({out_k: orel,
+                        in_k: {tvc: sorted(list(cpaths.values()) + [rd['context_binding'], rd['struct_roles']]), tvs: [rd['struct_sources']]},
+                        bound_k: {tvc: dict([(f, p(cpaths[f])) for f in sorted(cpaths)] + [(rbind['key'], copy.deepcopy(rstruct))]), tvs: copy.deepcopy(rsrc)},
+                        cin_k: {tvd: decl_rel},
+                        bcin_k: {tvd: decl_rel}})
+            roster.append(row)
+            continue
+        if r[v['row_template_key']] not in closure:
+            bad('document %s %s[%d]' % (v['roster_document'], B['roster_key'], i),
+                'must carry a %s in the render closure %s' % (v['row_template_key'], closure), r[v['row_template_key']])
+        sval = {'declaration_rel': decl_rel, 'member_dir': m[role_of['member_dir']], 'member_file': m[role_of['member_file']]}
+        row = copy.deepcopy(r)
+        row.update({out_k: orel,
+                    in_k: {tvc: sorted(cpaths.values()), tvs: [v['declaration_rel']]},
+                    bound_k: {tvc: dict((f, p(cpaths[f])) for f in sorted(cpaths)),
+                              tvs: dict((select[rk], sval[sroles[rk]]) for rk in sorted(sroles))},
+                    cin_k: {tvd: decl_rel},
+                    bcin_k: {tvd: decl_rel}})
+        roster.append(row)
+    unref = sorted((set(gen) | set(rendered)) - set(seen_g))
+    if unref:
+        raise ValueError('lme: %s (document %s %s): %s; unreferenced generated members %s' % (ident_code, v['roster_document'], B['roster_key'], ident_text, unref))
+    # ---- retire_roles (OD-S2-05): pending_roles restricted to retire_row_keys ----
+    pend = b('pending_roles', dict)
+    retire_roles = dict((role, f) for role, f in sorted(pend.items()) if f in rr_keys)
+    if sorted(retire_roles.values()) != sorted(rr_keys):
+        bad('document %s %s' % (v['document'], B['pending_roles']), 'must cover exactly the retire row keys %s' % (sorted(rr_keys),), pend)
+    # ---- LD05 (OD-S3-05 a + dynamic references): every consumed code, direct or through a declared selector ----
+    records, refusals, texts = b('records', dict), b('record_refusals', dict), b('record_texts', dict)
+    need = [(c, 'record_codes') for c in v['record_codes']]
+    for ref in v['record_code_refs']:
+        how, path = next(iter(ref.items()))
+        f, sel = _rh_get(records, path)
+        if not f or (how == 'values_of' and not isinstance(sel, dict)) or (how == 'items_of' and not isinstance(sel, list)):
+            bad('document %s %s.%s' % (v['document'], B['records'], path), 'is an admitted dynamic code selector (record_code_refs %s) and must be declared' % (how,), sel if f else '<absent>')
+        need += [(c, '%s %s' % (how, path)) for c in (sel.values() if how == 'values_of' else sel)]
+    cpat = pats[v['record_code_pattern']]
+    for c, via in need:
+        if not isinstance(c, str) or c not in refusals or not isinstance(refusals[c], str) or not cpat.fullmatch(refusals[c]) \
+                or c not in texts or not isinstance(texts[c], str) or not texts[c].strip():
+            bad('registry remote_harness_schema.published_views.%s.record_code_refs/record_codes: document %s %s.%s / %s.%s' % (name, v['document'], B['record_refusals'], c, B['record_texts'], c),
+                'is absent or not a code fully matching patterns.%s with a non-empty text (generator-consumed custody key, reached through %s)' % (v['record_code_pattern'], via),
+                [_rh_get(refusals, c)[1] if isinstance(c, str) else c, _rh_get(texts, c)[1] if isinstance(c, str) else c])
+    # ---- adoption (L-ADO-01..05) ----
+    ac = v['adoption_checks']
+    adoption = b('adoption', dict)
+    if not isinstance(ac['adoption_keys'], list) or sorted(adoption) != sorted(ac['adoption_keys']):
+        bad('document %s %s' % (v['document'], B['adoption']), 'must carry exactly %s' % (ac['adoption_keys'],), sorted(adoption))
+    base, authored = b('adoption_baseline'), b('adoption_authored', dict)
+    erx, brx = b('edition_regex', str), b('blob_id_regex', str)
+    if not (base is None or (isinstance(base, str) and re.fullmatch(erx, base))) \
+            or any(not isinstance(k, str) or not relp.fullmatch(k) or not isinstance(x, str) or not re.fullmatch(brx, x) for k, x in authored.items()):
+        bad('document %s %s / %s' % (v['document'], B['adoption_baseline'], B['adoption_authored']), 'must be null or a commit (%s) and {output rel: blob id (%s)}' % (erx, brx), [base, authored])
+    adoption_rel, retention = b('adoption_rel', str), p(ac['retention_root'], str)
+    excludes, forms = _rh_get(root, ac['excludes'])[1], ac['exclude_forms']
+    if not isinstance(excludes, list) or not isinstance(forms, dict) or any(x not in _RH_EG_EXCLUDE_WORDS for x in forms.values()) \
+            or any(not isinstance(e, dict) or len(e) != 1 or next(iter(e)) not in forms for e in excludes):
+        bad('document %s %s' % (v['document'], ac['excludes']), 'must be a list of single-key excludes of the declared forms %s' % (forms,), excludes)
+
+    def excluded(rel):
+        parts = rel.split(sep)
+        for e in excludes:
+            k, x = next(iter(e.items()))
+            if (forms[k] == 'component' and x in parts) or (forms[k] == 'prefix' and (rel == x or rel.startswith(x + sep))) \
+                    or (forms[k] == 'suffix' and rel.endswith(x)):
+                return True
+        return False
+    # MR03-RENDERED-SOURCE-BOOTSTRAP (DEP-MR03-LOADER-01; codex-tick606 / codex-tick610): the rendered dispatch rows are
+    # owned by the rendered-output authority (rpairs, equal to the B rendered members above), never ordinary importer
+    # keys, empty while the rendered kind is inactive, one obligation row each; their closures and body obligations
+    # join the protected executable set beside the importers.
+    if set(rimps) - set(rpairs) or set(rimps) & set(importers) or (not ron and rimps) or sorted(robls) != sorted(rimps):
+        bad('%s.%s / %s.%s' % (projs[v['importers']]['at'], projs[v['importers']]['rendered_dispatch']['to'], projs[v['bodies']]['at'], projs[v['bodies']]['rendered_to']),
+            'must key only declared rendered outputs %s (never an ordinary importer key), be empty while the rendered kind is inactive and carry exactly one obligation row per rendered dispatch row' % (sorted(rpairs),),
+            [sorted(rimps), sorted(robls)])
+    executable = set(p(ac['dispatch_closure'], list)) | set(p(ac['common'], list)) | set(importers) \
+        | set(x for c in importers.values() for x in c) | set(x[0] for ws in bodies.values() for rs in ws.values() for x in rs) | {decl_rel} | set(closure) | set(rclosure) \
+        | set(rendered) | set(rimps) | set(x for c in rimps.values() for x in c) | set(x[0] for ws in robls.values() for rs in ws.values() for x in rs)
+    # F05-S4 GROUPS CORRECTIONS (codex-tick564 F05-GROUP-RENDERED-RETENTION-OVERLAP): the declared rendered OUTPUT
+    # identities (B members marked rendered, read by _rh_eg_generated whether or not rendered.when_present is declared)
+    # join the protected set beside their template closure, so a retention root or adoption manifest equal to or an
+    # ancestor of a rendered output refuses, active and inactive alike; every entry-output protection above is kept.
+    for what, rel in (('retention root %s.%s' % (key, ac['retention_root']), retention), ('adoption manifest %s' % (B['adoption_rel'],), adoption_rel)):
+        hit = sorted(x for x in executable if x == rel or x.startswith(rel + sep))
+        if not relp.fullmatch(rel) or not excluded(rel) or hit:
+            bad(what, 'must be a repository-relative path under a transfer exclude and outside every executable closure, admission member and render input (L-ADO-04)', [rel, hit])
+    gpaths = sorted(set(list(cpaths.values()) + [v['declaration_rel'], v['policy_path_separator']]
+                        # F05-S4 ROSTER-NONPLAYBOOK: every policy input of an active rendered row is in the structural digest
+                        # F05-S4 RENDER-CONTEXT: + struct_sources and context_binding (render-interface-01 s3)
+                        # F05-S4 RENDER-CONTEXT-02: + kind_tests (parent successor-07 J-S07-PROFILE-KEY-ADMISSION)
+                        + ([rd['context_kind'], rd['struct_roles'], rd['struct_sources'], rd['context_binding'], rd['kind_tests']] + [pseparator.join([o, f]) for o in rd['outputs'] for f in (of, tf)] if ron else [])))
+    iface_base = _rh_get(root, v['interface']['base'])[1]
+    files = p(v['interface']['files'], dict)
+    if not isinstance(iface_base, str) or not relp.fullmatch(iface_base):
+        bad('document %s %s' % (v['document'], v['interface']['base']), 'must be a repository-relative path', iface_base)
+    iface = sorted(iface_base + sep + f for f in files)
+    # spec P5 never_generated_rel: the declared never-generated rels + every entry-dir family guard closure (the closure
+    # of every B member key -- guard members only; runner requires / entry_closure / route_includes are NOT in it)
+    nevers = [p(x, str) for x in v['never_generated']]
+    # F05-S4 ROSTER-NONPLAYBOOK: a rendered member is no B-guarded entry (no importer key, no guard closure)
+    bmem = [(d, f) for d in sorted(_members) for f in sorted(_members[d]) if (d + sep + f) not in rendered]
+    guards = [x for d, f in bmem for x in importers[d + sep + f]] if all((d + sep + f) in importers for d, f in bmem) else None
+    if guards is None or set(nevers + guards) & (set(gen) | set(rendered)):
+        bad('%s.%s / published_views.%s.importers' % (key, v['never_generated'], name),
+            'must give every B-guarded member an importer closure and never name a generated or rendered member',
+            [sorted(set(nevers + (guards or [])) & (set(gen) | set(rendered))), guards is None])
+    return {'schema_version': v['schema_version'],
+            'names_family': ptext[v['names_family']],
+            'source_keys': list(skeys),
+            'row_keys': sorted(list(skeys) + list(v['derived_row_keys'])),
+            'roster_source_rel': docs[v['roster_document']]['rel'],
+            'roster_source_sha256': docs[v['roster_document']]['sha256'],
+            'roster': roster,
+            'retire': copy.deepcopy(retire_rows),
+            'retire_roles': retire_roles,
+            'records': copy.deepcopy(records),
+            'ownership': copy.deepcopy(b('ownership', dict)),
+            'policy_path_separator': pseparator,
+            'struct_roles': struct_roles,
+            'struct_policy_paths': gpaths,
+            # MR03 (DEP-MR03-LOADER-01): + the secondary destinations (_rh_pj_secondary), RESOLVED too
+            'excluded_paths': sorted([pseparator.join([projs[n]['at'], projs[n]['to']]) for n in projs]
+                                     + [pseparator.join([projs[n]['at'], s]) for n in projs for s in _rh_pj_secondary(n, projs[n])]),
+            # F05-S4 RENDER-CONTEXT-02: while the rendered kind is active, the declared entry shape and permitted kinds
+            # are digest-bound with struct_sources (the inactive digest input is unchanged)
+            'structural_inputs_sha256': _digest(dict([('struct_policy_paths', dict((x, p(x)) for x in gpaths)), ('documents', dict((n, d['sha256']) for n, d in sorted(docs.items())))]
+                                                     + ([('rendered_source_entry', {'fields': copy.deepcopy(rd['source_entry_fields']), 'kinds': list(rd['source_kinds']), 'test_names': list(rd['kind_test_names'])})] if ron else []))),
+            'never_generated_rel': sorted(set(nevers + guards)),
+            'interface_rel': iface,
+            'interface_entries_rel': sorted(set(gen) & set(iface)),
+            'body_rel': sorted(set(x[0] for ws in bodies.values() for rs in ws.values() for x in rs)),
+            'closure': closure,
+            # F05-S4 ROSTER-NONPLAYBOOK: the published rendered rows' output rels and their render closure ([] while
+            # rendered.when_present is undeclared: this profile owns no rendered output; the rows are omitted above)
+            'rendered_rel': sorted(r[out_k] for r in roster if r[out_k] in rendered),
+            'rendered_closure': rclosure,
+            # F05-S4 RENDER-CONTEXT: the projected <K> (context_binding) and the render struct_roles the generator
+            # compares bound[context][<K>] with ({} while rendered.when_present is undeclared, as rendered_closure [])
+            'rendered_context_binding': copy.deepcopy(rbind),
+            'rendered_struct_roles': copy.deepcopy(rstruct),
+            # F05-S4 RENDER-CONTEXT-02: the declaration-owned struct_sources entry key set (replaces the generator's
+            # literal [fact, path]); [] while rendered.when_present is undeclared
+            'rendered_source_entry_keys': sorted(rd['source_entry_fields'].values()) if ron else [],
+            'adoption': copy.deepcopy(adoption)}
 
 
 _RH_BASE_KEYS = frozenset(('schema_version', 'policy', 'policy_sha256', 'adapter', 'host_scoped_paths',
@@ -3895,8 +5555,12 @@ def _rh_verify_entry(where, sec, keys, schema):
         raise ValueError('lme: published %s.shared_artifact_inputs_sha256 is not the digest of its declared artifact inputs' % (where,))
 
 
-def lme_verify_resolved(resolved, registry):
-    """C1-TYPED-OUTPUT-REVISION (codex 022716). Validates the ACTUAL published lme_resolved -- not a recompute
+def lme_verify_resolved(resolved, registry, *, documents, admission):
+    """F05-S3 LR-15: `documents` / `admission` are the SAME resolver outputs the projection read (required keyword
+    arguments; a call without them is a TypeError). They are re-admitted here (_rh_documents: rel re-derivation +
+    admitted digest before parse), the ACTIVE view set is the one the section's own policy publishes, and every
+    document-kind projected leaf re-derives from the section's policy with its projected destinations stripped.
+    C1-TYPED-OUTPUT-REVISION (codex 022716). Validates the ACTUAL published lme_resolved -- not a recompute
     it merely compares equal to. Registry fields present in it must be canonical for their declared type
     (lme_validate_config: rejects, never coerces -- 3.0 is not an int, 1 is not a bool). The remote-harness
     section must carry the exact key set of its projection, schema_version must be the declared int (a float
@@ -3917,10 +5581,47 @@ def lme_verify_resolved(resolved, registry):
                          'declared config field (a declared input must stay usable); got %r' % (outs,))
     key = schema.get('policy_key')
     if not key or key not in resolved:
+        if documents != {} or admission is not None:
+            raise ValueError('lme: published lme_resolved carries no %s section; the document reader outputs must be an empty mapping and null; got %r / %r' % (
+                key, sorted(documents) if isinstance(documents, dict) else _rh_kind(documents), _rh_kind(admission)))
         return True
     sec = resolved[key]
     scoped = isinstance(sec, dict) and 'scope' in sec
-    _rh_verify_entry(key, sec, _RH_BASE_KEYS | (_RH_SCOPED_KEYS if scoped else frozenset()), schema)
+    if not isinstance(sec, dict) or 'policy' not in sec or not isinstance(sec['policy'], dict):
+        raise ValueError('lme: published %s must be a mapping carrying a policy mapping; got %r' % (key, _rh_kind(sec)))
+    docs = _rh_documents(sec['policy'], schema, key, documents, admission)
+    want_views = _rh_published_views(sec['policy'], schema, key, docs)
+    _rh_verify_entry(key, sec, _RH_BASE_KEYS | set(want_views) | (_RH_SCOPED_KEYS if scoped else frozenset()), schema)
+    # F05 LV-4: every published view re-derives from the section's OWN policy + the registry (type-aware), so a view
+    # edited after resolve, or a pre-supplied section carrying a stale view, refuses. F05-S3: only the ACTIVE set.
+    for name, want_v in sorted(want_views.items()):
+        if not _leaf_equal(sec[name], want_v):
+            raise ValueError('lme: published %s.%s is not the view its own policy and the registry derive (published_views.%s)' % (key, name, name))
+    # F05-S3 LR-15: the document-kind projected leaves re-derive from the admitted documents. EXACTLY the leaves each
+    # projection writes are stripped -- lookup_merge: at.to.<role> for every role of at.from (at.to also holds authored
+    # producer-only roles, which stay); every other kind: at.to (it refuses an authored `to`) -- and the projections
+    # (and partitions) re-applied; only the document-kind leaves are compared here (the rest are digest-bound).
+    projs = schema['policy_projections']
+    dests = []
+    for n in sorted(projs):
+        pj = projs[n]
+        if pj['kind'] in _RH_PJ_GATED and 'when' in pj and not _rh_contract_active(sec['policy'], schema, pj['when'], 'policy_projections.%s.when' % (n,)):
+            continue   # F05-S4: gated and inactive -> it wrote nothing
+        if pj['kind'] == 'lookup_merge':
+            fsel, sel = _rh_get(sec['policy'], '%s.%s' % (pj['at'], pj['from']))
+            if not fsel or not isinstance(sel, dict):
+                raise ValueError('lme: published %s.policy.%s.%s must be a mapping (policy_projections.%s)' % (key, pj['at'], pj['from'], n))
+            dests += ['%s.%s.%s' % (pj['at'], pj['to'], r) for r in sorted(sel)]
+        else:
+            dests.append('%s.%s' % (pj['at'], pj['to']))
+            dests += ['%s.%s' % (pj['at'], s) for s in _rh_pj_secondary(n, pj)]   # MR03 (codex-tick612 F1)
+    again = _rh_project_policy(_rh_without(sec['policy'], dests), schema, key, docs[0], docs[1])[0]
+    # MR03 (codex-tick612 F1): the secondary destinations (_rh_pj_secondary) are compared exactly like the primary one
+    for n, d in sorted((n, '%s.%s' % (projs[n]['at'], s)) for n in projs if projs[n]['kind'] in _RH_DOC_KIND_SHAPES
+                       for s in [projs[n]['to']] + _rh_pj_secondary(n, projs[n])):
+        (fh, have), (fw, want_l) = _rh_get(sec['policy'], d), _rh_get(again, d)
+        if fh != fw or (fh and not _leaf_equal(have, want_l)):
+            raise ValueError('lme: published %s.policy.%s is not the leaf the admitted documents derive (policy_projections.%s); got %r' % (key, d, n, have if fh else '<absent>'))
     want = schema['projection_schema_version']
     if not _leaf_equal(sec['schema_version'], want):
         raise ValueError('lme: published %s.schema_version is %r (%s); the registry declares %r (%s)' % (
@@ -3966,9 +5667,84 @@ def lme_verify_resolved(resolved, registry):
     return True
 
 
-def lme_remote_harness_overridden_paths(composed, declared, override, schema):
-    """Audit view (not revision-bound): sorted dotted leaf paths the operator override set; same validation."""
-    return _rh_validate(composed, declared, override, schema)[1]
+# F05-S3 LR-14: the resolve.yml DOCUMENT READER. Ansible reads the bytes (lookup ansible.builtin.file with the declared
+# read options); these filters only decide WHAT may be read and admit what was read, through the SAME
+# _rh_documents_admit the projection uses. scope = the resolver output _lme_rh_scope ({} = no policy declared); the
+# policy is this host's own composition scope.composed[scope.self] (_rh_scoped proves it equals the projected one).
+def _rh_reader_policy(scope, schema):
+    key = schema['policy_key']
+    if scope == {}:
+        return key, None
+    if not isinstance(scope, dict) or 'self' not in scope or 'composed' not in scope or not isinstance(scope['composed'], dict) \
+            or scope['self'] not in scope['composed'] or not isinstance(scope['composed'][scope['self']], dict) \
+            or key not in scope['composed'][scope['self']] or not isinstance(scope['composed'][scope['self']][key], dict):
+        raise ValueError('lme: remote-harness scope context must carry this host\'s composition composed[self].%s (a mapping) for the document reader; got %r' % (
+            key, sorted(scope) if isinstance(scope, dict) else _rh_kind(scope)))
+    return key, scope['composed'][scope['self']][key]
+
+
+def lme_rh_documents_active(scope, schema):
+    """True exactly when the document channel's declaration_contract view is active for this host's policy (the ONE
+    activity rule; no policy declared -> False). resolve.yml binds _lme_rh_admission to rh_src_admission only then."""
+    key, pol = _rh_reader_policy(scope, schema)
+    if pol is None:
+        return False
+    return _rh_contract_active(pol, schema, _rh_document_channel(schema)['when'], 'remote_harness_schema.document_channel.when')
+
+
+def lme_rh_document_plan(scope, schema, *, admission):
+    """{names: the admission order (primaries, then dependents), read: {lstrip, rstrip} -- the policy value at
+    document_channel.read, each a bool (contract body_domain admits only false)}. Inactive or no policy: names [] and
+    read {} -- nothing is read -- and `admission` must be None. Active: `admission` must be the protected record."""
+    key, pol = _rh_reader_policy(scope, schema)
+    if pol is None:
+        if admission is not None:
+            raise ValueError('lme: no %s policy is declared; resolver output %s must be null; got %r' % (key, _rh_document_channel(schema)['admission']['fact'], _rh_kind(admission)))
+        return {'names': [], 'read': {}}
+    active, _out, order, _nxt = _rh_documents_admit(pol, schema, key, {}, admission, True)
+    if not active:
+        return {'names': [], 'read': {}}
+    ch = _rh_document_channel(schema)
+    fr, rd = _rh_get(pol, ch['read'])
+    if not fr or not isinstance(rd, dict) or sorted(rd) != ['lstrip', 'rstrip'] or any(not isinstance(x, bool) for x in rd.values()):
+        _rh_doc_refuse(ch, key, ch['read'], 'must be exactly {lstrip, rstrip} of bools (the declared exact-byte read options)', rd if fr else '<absent>')
+    return {'names': list(order), 'read': {'lstrip': rd['lstrip'], 'rstrip': rd['rstrip']}}
+
+
+def lme_rh_document_next_rel(documents, scope, schema, *, admission):
+    """The admitted rel of the next document in admission order, derived and full-matched BEFORE the reader builds a
+    path, stats or reads it (OD-S3-01 a). `documents` = the documents read so far (a prefix of the order, each
+    re-admitted: rel binding + admitted digest before parse). Refuses when every document is already carried."""
+    key, pol = _rh_reader_policy(scope, schema)
+    if pol is None:
+        raise ValueError('lme: no %s policy is declared; the document reader reads nothing' % (key,))
+    active, _out, order, nxt = _rh_documents_admit(pol, schema, key, documents, admission, True)
+    if not active or nxt is None:
+        raise ValueError('lme: the document reader asked for a document beyond the admission order %s (carried %s)' % (
+            order, sorted(documents) if isinstance(documents, dict) else _rh_kind(documents)))
+    return nxt[1]
+
+
+def lme_rh_document_append(documents, text, name, scope, schema, *, admission):
+    """documents + {name: {rel, text}}, returned only after the extended prefix is admitted (name-to-rel binding and
+    the admitted digest of the exact text compared BEFORE it is parsed). `name` is the reader's loop item: it must be
+    the next name of the admission order (the loop is bound to the plan). The loader re-admits the complete set."""
+    key, pol = _rh_reader_policy(scope, schema)
+    if pol is None:
+        raise ValueError('lme: no %s policy is declared; the document reader reads nothing' % (key,))
+    _a, _o, order, nxt = _rh_documents_admit(pol, schema, key, documents, admission, True)
+    if nxt is None or nxt[0] != name:
+        raise ValueError('lme: the document reader appended %r; the next document of the admission order %s is %r' % (name, order, nxt[0] if nxt else None))
+    grown = dict(documents)
+    grown[nxt[0]] = {'rel': nxt[1], 'text': text}
+    _rh_documents_admit(pol, schema, key, grown, admission, True)
+    return grown
+
+
+def lme_remote_harness_overridden_paths(composed, declared, override, schema, *, documents, admission):
+    """Audit view (not revision-bound): sorted dotted leaf paths the operator override set; same validation (LR-16:
+    the same documents/admission; a projected destination supplied by an override refuses as an authored `to`)."""
+    return _rh_validate(composed, declared, override, schema, documents=documents, admission=admission)[1]
 
 
 class FilterModule(object):
@@ -3979,7 +5755,12 @@ class FilterModule(object):
             'lme_project_remote_harness': lme_project_remote_harness,
             'lme_remote_harness_overridden_paths': lme_remote_harness_overridden_paths,
             'lme_verify_resolved': lme_verify_resolved,
+            'lme_rh_documents_active': lme_rh_documents_active,
+            'lme_rh_document_plan': lme_rh_document_plan,
+            'lme_rh_document_next_rel': lme_rh_document_next_rel,
+            'lme_rh_document_append': lme_rh_document_append,
             'lme_rh_connection_values': lme_rh_connection_values,
+            'lme_rh_proxy_outcome': lme_rh_proxy_outcome,
             'lme_resolve_config': lme_resolve_config,
             'lme_validate_config': lme_validate_config,
             'lme_config_revision': lme_config_revision,
