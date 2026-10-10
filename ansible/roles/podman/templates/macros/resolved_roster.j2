@@ -1,0 +1,96 @@
+{%- macro walk(facts, descriptor, d) -%}
+{%- set f = d.atoms.structural -%}
+{%- set n = namespace(value=d.atoms.absent, available=d.atoms.false) -%}
+{%- if descriptor is mapping and descriptor[f.fact] in facts -%}
+  {%- set n.value = facts[descriptor[f.fact]] -%}
+  {%- set n.available = d.atoms.true -%}
+  {%- for component in descriptor[f.path] -%}
+    {%- if n.available and n.value is mapping and component in n.value -%}
+      {%- set n.value = n.value[component] -%}
+    {%- else -%}
+      {%- set n.available = d.atoms.false -%}
+      {%- set n.value = d.atoms.absent -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{{- {f.available: n.available, f.value: n.value} | to_json -}}
+{%- endmacro -%}
+
+{%- macro select_fields(source, fields, d) -%}
+{%- set n = namespace(value=d.atoms.empty_mapping) -%}
+{%- for field in fields if field in source -%}
+  {%- set n.value = n.value | combine({field: source[field]}) -%}
+{%- endfor -%}
+{{- n.value | to_json -}}
+{%- endmacro -%}
+
+{%- macro obligation(descriptor, required, reason, d) -%}
+{%- set f = d.atoms.structural -%}
+{{- {f.descriptor: descriptor, f.required: required, f.applicable: d.atoms.absent,
+     f.applicability_reason: reason, f.executed: d.atoms.false,
+     f.status: d.atoms.statuses.missing, f.evidence: d.atoms.empty_sequence} | to_json -}}
+{%- endmacro -%}
+
+{%- macro project(facts, d) -%}
+{%- set f = d.atoms.structural -%}
+{%- set n = namespace(inputs=d.atoms.empty_mapping, services=d.atoms.empty_sequence,
+                     projections=d.atoms.empty_mapping, missing=d.atoms.empty_mapping,
+                     families=d.atoms.empty_sequence, selectors=d.atoms.empty_mapping) -%}
+{%- for role, descriptor in d.inputs.items() -%}
+  {%- set value = walk(facts, descriptor, d) | from_json -%}
+  {%- set n.inputs = n.inputs | combine({role: value[f.value]}) -%}
+{%- endfor -%}
+{%- for role, descriptor in d.selector_bindings.items() -%}
+  {%- set value = walk(facts, descriptor, d) | from_json -%}
+  {%- set n.selectors = n.selectors | combine({role: value | combine({f.source_record: descriptor})}) -%}
+{%- endfor -%}
+{%- for service_id, service in n.inputs.services.items() -%}
+  {%- set selected = service_id in n.inputs.rendered_services -%}
+  {%- set s = namespace(values=select_fields(service, d.service_projection.copied_fields, d) | from_json,
+                       refs=d.atoms.empty_mapping, nested=d.atoms.empty_sequence,
+                       copied=d.service_projection.copied_fields) -%}
+  {%- for field in service -%}
+    {%- set s.refs = s.refs | combine({field: {f.fact: d.inputs.services[f.fact], f.path: d.inputs.services[f.path] + [service_id, field]}}) -%}
+  {%- endfor -%}
+  {%- for field, allowed in d.service_projection.nested_reference_fields.items() if field in service -%}
+    {%- set s.nested = d.atoms.empty_sequence -%}
+    {%- for reference in service[field] -%}
+      {%- set s.nested = s.nested + [select_fields(reference, allowed, d) | from_json] -%}
+    {%- endfor -%}
+    {%- set s.values = s.values | combine({field: s.nested}) -%}
+    {%- set s.copied = s.copied + [field] -%}
+  {%- endfor -%}
+  {%- for field, allowed in d.service_projection.named_reference_fields.items() if field in service -%}
+    {%- set named = namespace(value=d.atoms.empty_mapping) -%}
+    {%- for name, reference in service[field].items() -%}
+      {%- set named.value = named.value | combine({name: select_fields(reference, allowed, d) | from_json}) -%}
+    {%- endfor -%}
+    {%- set s.values = s.values | combine({field: named.value}) -%}
+    {%- set s.copied = s.copied + [field] -%}
+  {%- endfor -%}
+  {%- set owner_required = selected and service[d.service_projection.kind_field] == d.service_projection.container_kind -%}
+  {%- set owner = obligation(d.service_projection.runtime_owner, owner_required, d.atoms.applicability.runtime_owner, d) | from_json -%}
+  {%- set n.services = n.services + [{f.id: service_id, f.selected: selected,
+       f.source_record: {f.fact: d.inputs.services[f.fact], f.path: d.inputs.services[f.path] + [service_id]},
+       f.declared_values: s.values, f.field_references: s.refs,
+       f.unprojected_fields: service.keys() | difference(s.copied) | sort,
+       f.runtime_owner: owner}] -%}
+{%- endfor -%}
+{%- for role, descriptor in d.resolved_projections.items() -%}
+  {%- set value = walk(facts, descriptor, d) | from_json -%}
+  {%- set n.projections = n.projections | combine({role: {f.available: value[f.available], f.source_record: descriptor}}) -%}
+{%- endfor -%}
+{%- for role, descriptor in d.missing_producer_bindings.items() -%}
+  {%- set n.missing = n.missing | combine({role: obligation(descriptor, d.atoms.true, d.atoms.applicability.missing, d) | from_json}) -%}
+{%- endfor -%}
+{%- for family in d.required_family_authority.families -%}
+  {%- set n.families = n.families + [
+      (obligation(d.missing_producer_bindings.required_service_families, d.atoms.true, d.atoms.applicability.family, d) | from_json)
+      | combine({f.family: family, f.source_record: d.required_family_authority})] -%}
+{%- endfor -%}
+{{- {f.schema_version: d.schema_version, f.phase: d.phase, f.node: n.inputs.node,
+     f.selectors: n.selectors, f.enable_flags: n.inputs.enable_flags,
+     f.services: n.services, f.resolved_projection_refs: n.projections,
+     f.missing_producer_bindings: n.missing, f.required_family_bindings: n.families,
+     f.consumer_join: d.consumer_join} | to_nice_yaml(indent=d.render.indent, width=d.render.width, sort_keys=d.render.sort_keys) -}}
+{%- endmacro -%}

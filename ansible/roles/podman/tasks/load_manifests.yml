@@ -85,6 +85,20 @@
 - name: Resolve config into facts via the shared early-resolve entrypoint (CR-B3)
   ansible.builtin.include_tasks: resolve.yml
 
+- name: Invalidate previous record outputs before this postload composition
+  ansible.builtin.set_fact:
+    "{{ item }}": "{{ _lme_global_file.lme_config_registry.resolved_record.atoms.absent }}"
+  loop: "{{ _lme_global_file.lme_config_registry.resolved_record.outputs.values() | list + [_lme_global_file.lme_config_registry.resolved_record.source_fact] }}"
+  no_log: "{{ _lme_global_file.lme_config_registry.resolved_record.atoms.true }}"
+
+- name: Refuse a pinned previous record output
+  ansible.builtin.assert:
+    that: vars[item] is none
+    fail_msg: "{{ _lme_global_file.lme_config_registry.resolved_record.diagnostics.record }}"
+    quiet: "{{ _lme_global_file.lme_config_registry.resolved_record.atoms.true }}"
+  loop: "{{ _lme_global_file.lme_config_registry.resolved_record.outputs.values() | list + [_lme_global_file.lme_config_registry.resolved_record.source_fact] }}"
+  no_log: "{{ _lme_global_file.lme_config_registry.resolved_record.atoms.true }}"
+
 # lme_global (global | profile | operator override LAST) is composed ONCE, in resolve.yml above, with an
 # inline read-back (SEED-06); this file consumes that composition and builds no second one.
 
@@ -101,26 +115,14 @@
     that:
       - "'material_catalog_schema' not in (lme_global_override | default({}))"
       - "'material_provision_schema' not in (lme_global_override | default({}))"
-      - "'material_catalog_schema' not in (_lme_profile_file.profile_overlay.lme_global | default({}))"
-      - "'material_provision_schema' not in (_lme_profile_file.profile_overlay.lme_global | default({}))"
+      - "'material_catalog_schema' not in ((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}))"
+      - "'material_provision_schema' not in ((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}))"
     fail_msg: >-
       a material_catalog_schema / material_provision_schema was supplied through lme_global_override or a
       profile overlay -- the material SCHEMAS are the security policy and are admitted ONLY from the
       declared manifest (_lme_global_file). Recompose the DATA registries instead; policy is not an
       override channel (C1 fix_3 / codex-1710 invalid-policy control).
     quiet: true
-
-# Temporary failure boundary during canonical-engine reconciliation. This is an
-# implementation gap, not an operator prohibition or an alternate deployment path.
-- name: Reject selectors whose canonical composition is not yet integrated
-  ansible.builtin.assert:
-    that:
-      - lme_database_profile | default('') | length == 0
-      - lme_telemetry_profile | default('') | length == 0
-      - lme_telemetry_destinations | default([]) | length == 0
-    fail_msg: >-
-      Database and telemetry composition is not yet integrated into the existing
-      manifest engine. Deployment cannot satisfy the selected requirements.
 
 - name: Require resolved consumer secret and certificate bindings
   ansible.builtin.assert:
@@ -317,7 +319,7 @@
       {{ lme_services | default({}) | combine({
            (lookup('file', item.path) | from_yaml).id:
              (lookup('file', item.path) | from_yaml)
-             | combine(_lme_profile_file.profile_overlay.services[(lookup('file', item.path) | from_yaml).id] | default({}), recursive=True)
+             | combine((_lme_profile_file.profile_overlay.services | combine(_lme_profile_composition.overlay.services, recursive=True))[(lookup('file', item.path) | from_yaml).id] | default({}), recursive=True)
              | combine((lme_service_overrides | default({}) | lme_effective_service_overrides(({}
                           | combine({'node_name': es_node_name} if es_node_name is defined else {})
                           | combine({'publish_host': es_publish_host} if es_publish_host is defined else {})
@@ -477,6 +479,9 @@
       Wants= on an absent unit (C1-COMPLETE-CONFIGURATION-VALIDATION, dependency half).
     quiet: true
 
+- name: Admit selected independent-profile services before activation
+  ansible.builtin.include_tasks: admit_profile_services.yml
+
 # C1-MATERIAL A2 -- validate the shared material_catalog THROUGH the consuming loader path
 # (not only a standalone helper), fail-closed pre-mutation, BEFORE any obligation references
 # it. Also reject a security-registry OVERRIDE: material_catalog / material_catalog_schema are
@@ -612,6 +617,16 @@
          | combine({'deployment_identity': (_lme_resolution.resolved | lme_validated_deployment_identity)}
                    if (_lme_resolution.resolved | lme_validated_deployment_identity) else {}) }}
 
+- name: Project the declared application roster from actual postload facts
+  ansible.builtin.include_tasks: project_resolved_roster.yml
+  vars:
+    lme_roster_contract: "{{ _lme_global_file.lme_config_registry.resolved_record.roster }}"
+
+- name: Publish the application roster inside the resolved configuration
+  ansible.builtin.set_fact:
+    lme_resolved: "{{ lme_resolved | combine({_lme_global_file.lme_config_registry.resolved_record.projection_key: _lme_roster_projection}) }}"
+  no_log: "{{ _lme_global_file.lme_config_registry.resolved_record.atoms.true }}"
+
 # COMPLETE-REVISION REBIND (C1-COMPLETE-RESOLVED-REVISION, codex-0645). resolve.yml computed a
 # CONFIG-ONLY revision before lme_services / lme_global / the material+datastore+membership
 # projections existed -- so a change to a service manifest, an operator lme_service_overrides /
@@ -629,7 +644,7 @@
       {{ lme_resolved | lme_bind_revision(
            _lme_global_file.lme_config_registry,
            [{'name': lme_profile,
-             'sha256': lookup('file', lme_profile_loaded[_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields | last]) | hash('sha256')}],
+             _lme_global_file.lme_config_registry.resolved_record.profile_fields.sha256: lme_profile_loaded[_lme_global_file.lme_config_registry.resolved_record.profile_fields.sha256]}],
            lme_services, lme_global, lme_host_rendered_services) }}
 
 # READ-BACK GUARD for the complete revision + the post-projection artifact (mirrors resolve.yml).
@@ -641,10 +656,12 @@
 # lme_global_override is NOT a silent desync: it changes lme_services/lme_global, which are now
 # IN the revision payload, so the revision moves with the rendered units.)
 - name: C1 -- read-back guard for the complete revision + post-projection lme_resolved (reject -e pins)
+  vars:
+    lme_roster_contract: "{{ _lme_global_file.lme_config_registry.resolved_record.roster }}"
   ansible.builtin.assert:
     that:
       - >-
-        lme_resolved | lme_type_aware_equal((_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {})))
+        lme_resolved | lme_type_aware_equal((_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {})))
            | combine(lme_services | lme_project_required_material(
                        inventory_hostname, lme_global.material_catalog,
                        _lme_global_file.lme_config_registry.material_requirements_schema,
@@ -659,12 +676,15 @@
            | combine(_lme_resolution.resolved.lme_database_membership | default(None)
                        | lme_project_database_membership, recursive=True)
            | combine({'deployment_identity': (_lme_resolution.resolved | lme_validated_deployment_identity)}
-                     if (_lme_resolution.resolved | lme_validated_deployment_identity) else {}))
+                     if (_lme_resolution.resolved | lme_validated_deployment_identity) else {})
+           | combine({_lme_global_file.lme_config_registry.resolved_record.projection_key:
+               lookup(_lme_global_file.lme_config_registry.resolved_record.roster.render.lookup,
+                      _lme_global_file.lme_config_registry.resolved_record.roster.render.template) | from_yaml}))
       - >-
         lme_resolved_revision == (lme_resolved | lme_bind_revision(
            _lme_global_file.lme_config_registry,
            [{'name': lme_profile,
-             'sha256': lookup('file', lme_profile_loaded[_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields | last]) | hash('sha256')}],
+             _lme_global_file.lme_config_registry.resolved_record.profile_fields.sha256: lme_profile_loaded[_lme_global_file.lme_config_registry.resolved_record.profile_fields.sha256]}],
            lme_services, lme_global, lme_host_rendered_services))
       # C1-TYPED-OUTPUT-REVISION: the actual published artifact is schema/type-validated and self-consistent.
       # C1-INVOCATION-CONTEXT-01 LM12-01 (SR-302-05; registry source_binding.verification): the ONE complete
@@ -689,6 +709,13 @@
       disagrees with its freshly recomputed value -- the canonical derived artifact must bind the
       COMPLETE composed state (C1-COMPLETE-RESOLVED-REVISION / C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
     quiet: true
+
+- name: Prepare the complete source-bound resolved-record verification inputs
+  ansible.builtin.include_tasks: prepare_resolved_record.yml
+
+- name: Publish the complete versioned record for an independently selected matrix cell
+  ansible.builtin.include_tasks: publish_resolved_record.yml
+  when: _lme_global_file.lme_config_registry.resolved_record.selection_fact in vars
 
 # C1 IDENTITY PROJECTION PRODUCER (codex-identity-and-authoring-correction-1500). Until now NO
 # loader set_fact derived lme_runtime_inventory -- only a test fixture set it -- so its

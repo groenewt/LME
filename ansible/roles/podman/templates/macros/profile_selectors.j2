@@ -1,0 +1,113 @@
+{% macro compose(schema, base, selections) -%}
+{%- set ns = namespace(overlay=schema.empty_overlay, selected=schema.empty.mapping,
+                      roles=schema.empty.sequence, inputs=schema.empty.sequence,
+                      errors=schema.empty.sequence) -%}
+{%- for key in schema.overlay_fields.values() -%}
+  {%- if base is not mapping or key not in base or base[key] is not mapping -%}
+    {%- set ns.errors = ns.errors + [schema.errors.overlay] -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if schema.destination_field in selections and schema.destination_selector not in selections -%}
+  {%- set ns.errors = ns.errors + [schema.errors.destinations_without_profile] -%}
+{%- endif -%}
+{%- for axis in schema.axes -%}
+  {%- if axis.field in selections -%}
+    {%- set requested = selections[axis.field] -%}
+    {%- if requested is not string or requested not in axis.options -%}
+      {%- set ns.errors = ns.errors + [schema.errors.selector] -%}
+    {%- else -%}
+      {%- set choice = namespace(name=requested, destinations=schema.empty.sequence) -%}
+      {%- if axis.field == schema.destination_selector -%}
+        {%- set choice.destinations = axis.options[requested].destinations -%}
+        {%- if schema.destination_field in selections -%}
+          {%- set explicit = selections[schema.destination_field] -%}
+          {%- if explicit is string -%}
+            {%- set choice.destinations = explicit.split(schema.destination_separator) -%}
+          {%- elif explicit is sequence and explicit is not mapping -%}
+            {%- set choice.destinations = explicit | list -%}
+          {%- else -%}
+            {%- set ns.errors = ns.errors + [schema.errors.destinations_type] -%}
+            {%- set choice.destinations = schema.empty.sequence -%}
+          {%- endif -%}
+          {%- if choice.destinations | length == schema.constants.zero
+                  or choice.destinations | reject(schema.tests.string) | list | length > schema.constants.zero -%}
+            {%- set ns.errors = ns.errors + [schema.errors.destinations_type] -%}
+          {%- elif choice.destinations | unique | list | length != choice.destinations | length -%}
+            {%- set ns.errors = ns.errors + [schema.errors.destinations_duplicate] -%}
+          {%- else -%}
+            {%- set match = namespace(names=schema.empty.sequence) -%}
+            {%- for name, preset in axis.options.items() -%}
+              {%- if choice.destinations | sort == preset.destinations | sort -%}
+                {%- set match.names = match.names + [name] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if match.names | length == schema.constants.zero -%}
+              {%- set ns.errors = ns.errors + [schema.errors.destinations_unsupported] -%}
+            {%- else -%}
+              {%- set choice.name = match.names | first -%}
+              {%- set choice.destinations = axis.options[choice.name].destinations -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endif -%}
+      {%- set selected = axis.options[choice.name] -%}
+      {%- if ns.errors | length == schema.constants.zero -%}
+        {%- set ns.overlay = ns.overlay | combine(selected.profile_overlay, recursive=schema.constants.enabled) -%}
+        {%- if axis.field == schema.destination_selector -%}
+          {%- set ns.overlay = ns.overlay | combine({schema.overlay_fields.variables: {
+                schema.derived_profile_field: choice.name,
+                schema.derived_destinations_field: choice.destinations}}, recursive=schema.constants.enabled) -%}
+        {%- endif -%}
+      {%- endif -%}
+      {%- set ns.roles = ns.roles + selected.required_roles -%}
+      {%- set ns.inputs = ns.inputs + selected.required_inputs -%}
+      {%- set ns.selected = ns.selected | combine({axis.id: {
+            schema.selected_profile_field: requested,
+            schema.destination_effective_field: choice.name,
+            schema.selected_destinations_field: choice.destinations}}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{{- {schema.result_fields.overlay: ns.overlay,
+     schema.result_fields.selected: ns.selected,
+     schema.result_fields.required_roles: ns.roles | unique | list,
+     schema.result_fields.required_inputs: ns.inputs | unique | list,
+     schema.result_fields.errors: ns.errors | unique | list} | to_json -}}
+{%- endmacro %}
+
+{% macro admit(schema, composition, resolved, global_config, services, flags) -%}
+{%- set ns = namespace(errors=composition[schema.result_fields.errors]) -%}
+{%- for field in composition[schema.result_fields.required_inputs] -%}
+  {%- if field not in resolved or not resolved[field] -%}
+    {%- set ns.errors = ns.errors + [schema.errors.input] -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- for role in composition[schema.result_fields.required_roles] -%}
+  {%- if schema.global_bindings_field not in global_config
+          or global_config[schema.global_bindings_field] is not mapping
+          or role not in global_config[schema.global_bindings_field]
+          or global_config[schema.global_bindings_field][role] is not mapping
+          or schema.role_services_field not in global_config[schema.global_bindings_field][role] -%}
+    {%- set ns.errors = ns.errors + [schema.errors.bindings] -%}
+  {%- else -%}
+    {%- set refs = global_config[schema.global_bindings_field][role][schema.role_services_field] -%}
+    {%- if refs is not sequence or refs is string or refs is mapping
+            or refs | length == schema.constants.zero
+            or refs | reject(schema.tests.string) | list | length > schema.constants.zero
+            or refs | unique | list | length != refs | length -%}
+      {%- set ns.errors = ns.errors + [schema.errors.bindings] -%}
+    {%- else -%}
+      {%- for service in refs -%}
+        {%- if service not in services -%}
+          {%- set ns.errors = ns.errors + [schema.errors.service] -%}
+        {%- elif not (services[service][schema.service_enabled_field]
+                      if schema.service_enabled_field in services[service] else schema.service_always)
+                      | is_enabled(flags) -%}
+          {%- set ns.errors = ns.errors + [schema.errors.disabled] -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{{- ns.errors | unique | list | to_json -}}
+{%- endmacro %}

@@ -851,6 +851,15 @@ def _revision_payload(resolved, registry, profile_identities,
         payload['global'] = global_manifest
     if host_rendered is not None:
         payload['host_rendered_services'] = sorted(host_rendered)
+    if services is not None and 'resolved_record' in registry:
+        declaration = registry['resolved_record']
+        projections = declaration['projection_keys']
+        if not isinstance(projections, list) or not projections or any(
+                not isinstance(key, str) or not key or key not in resolved or key in payload
+                for key in projections) or len(projections) != len(set(projections)):
+            raise ValueError(declaration['diagnostics']['revision'])
+        for key in projections:
+            payload[key] = resolved[key]
     return payload
 
 
@@ -2682,9 +2691,10 @@ def _rh_documents_admit(pol, schema, key, documents, admission, partial):
     Exact bytes: no strip or normalisation (body_domain.read is admitted {lstrip: false, rstrip: false} by contract
     body_domain); the digested bytes and the parsed value come from the SAME text.
     partial (the resolve.yml reader, LR-14): `documents` carries exactly the FIRST k names of the admission order
-      (each admitted exactly as above) and the rel of name k+1 is derived and full-matched -- from the policy or from the
-      already digest-verified parent parse -- BEFORE the reader constructs its path; None once every name is carried.
-    Returns (active, {name: {rel, sha256, root}}, admission order, (next name, next rel) | None)."""
+      (each admitted exactly as above; the empty prefix only here) and the rels of the next LEVEL are derived and
+      full-matched -- from the policy or from the already digest-verified, strictly parsed parents -- BEFORE the reader
+      constructs, stats, Git-admits or reads a path; `admission` is the one-key reading-stage partial admission.
+    Returns (active, {name: {rel, sha256, root}}, admission order, [(next name, next rel)] of the next level | None)."""
     import yaml
     ch = _rh_document_channel(schema)
     pats, ptext = _rh_patterns(schema)
@@ -2714,10 +2724,18 @@ def _rh_documents_admit(pol, schema, key, documents, admission, partial):
     (fm, mk), (fo, ok) = _rh_get(pol, am['members']), _rh_get(pol, am['observed'])
     if not fm or not isinstance(mk, str) or not mk or not fo or not isinstance(ok, str) or not ok:
         _rh_doc_refuse(ch, key, '%s / %s' % (am['members'], am['observed']), 'must name the admission record members container and observed-digest field', [mk if fm else '<absent>', ok if fo else '<absent>'])
-    if not isinstance(admission, dict) or mk not in admission or not isinstance(admission[mk], dict):
+    # records-staged-reader-01 (codex-tick740 single_engine_document_reader; codex-tick747; codex-tick750): admission
+    # authority BY STAGE. partial (the resolve.yml reader): `admission` is exactly ONE key -- the reading-stage word
+    # resolve.yml takes from the declared admission_stages.words, never the members key -- whose value is the record
+    # (the executable_closure members plus the rels the reader Git-admitted); the empty prefix is valid only here.
+    # complete (_rh_validate, the projection): `admission` is the completed receipt itself. A receipt offered to the
+    # partial reader (more than one key) and a partial admission offered to the projection (no members key) refuse.
+    pk = next(iter(admission)) if partial and isinstance(admission, dict) and admission else None
+    rec = admission[pk] if pk is not None and pk != mk and set(admission) == {pk} else (None if partial else admission)
+    if not isinstance(rec, dict) or mk not in rec or not isinstance(rec[mk], dict):
         _rh_doc_refuse(ch, key, ch['at'], 'is active; resolver output %s must be the protected source-admission record carrying a %r mapping (the reader passes rh_src_admission; a caller-supplied record is no authority)' % (am['fact'], mk),
                        sorted(admission) if isinstance(admission, dict) else _rh_kind(admission))
-    adm = admission[mk]
+    adm = rec[mk]
     prim = sorted(n for n in node if isinstance(node[n], dict) and set(node[n]) == _RH_DOC_PRIMARY_KEYS)
     dep = sorted(n for n in node if isinstance(node[n], dict) and set(node[n]) == _RH_DOC_DEPENDENT_KEYS)
     bad = sorted(n for n in node if n not in prim and n not in dep
@@ -2794,9 +2812,18 @@ def _rh_documents_admit(pol, schema, key, documents, admission, partial):
             root = parsed
         out[n] = {'rel': rel, 'sha256': sha, 'root': root}
         seen[rel] = n
-    nxt = None
-    if len(carried) < len(order):
-        nxt = (order[len(carried)], rel_of(order[len(carried)]))
+    # records-staged-reader-01 (codex-tick740 / 747; supersedes records-dkjoin-02 C1-DKJ2-LM-723, NOT applied): the next
+    # LEVEL of the ONE-level relation (OI-05 above) as [(name, rel)] -- the uncarried primaries, else the uncarried
+    # dependents, whose parents are then all carried, digest-checked and strictly parsed above. Each rel is derived and
+    # full-matched by rel_of BEFORE the reader builds a path and is unique against every carried and earlier level rel.
+    # A derived rel is not yet a member: resolve.yml stats it, Git-admits it and adds it to the partial admission
+    # before it reads; the membership and admitted-digest refusals above then run on the carried text before its
+    # strict parse. Empty once every name is carried.
+    nxt = list()
+    for nn in order[len(carried):len(prim) if len(carried) < len(prim) else len(order)]:
+        nr = rel_of(nn)
+        seen[nr] = nn
+        nxt.append((nn, nr))
     return True, out, order, nxt
 
 
@@ -4797,6 +4824,7 @@ def _rh_validate(composed, declared, override, schema, *, documents, admission):
     # C1-RECIPE-PUB-02 (codex-tick884 Q290_2 c; codex-tick886 Q_R2_PROV_02; SR-292-04): the per-role generation bindings of
     # this scope (= class), after every digest above and outside the policy (a class key inside it would digest itself).
     section[_rh_gb_decl(schema)['to']] = _rh_generation_bindings(pol, section, schema, key, admission)
+    section[_rh_tr_decl(schema)['to']] = _rh_toolchain_renderers(pol, schema, key)
     return section, sorted(overridden), docs
 
 
@@ -4930,6 +4958,68 @@ def _rh_gb_decl(schema):
             or 'kind' not in projs[gb['projection']] or projs[gb['projection']]['kind'] != 'select_tree':
         raise ValueError('lme: registry remote_harness_schema.generation_binding: to and every field / applicability word must be a distinct var_name, to no section, scope or published view key, and projection a declared select_tree projection; got %r' % (gb,))
     return gb
+
+
+def _rh_tr_decl(schema):
+    """The declared complete-renderer view is outside policy, alongside generation bindings.
+
+    It consumes the existing selected recipe projection; it never selects a recipe address
+    or reads declarations. The destination and content names belong to the registry.
+    """
+    d = schema.get('toolchain_rendering')
+    pats = _rh_patterns(schema)[0]
+    if not isinstance(d, dict) or set(d) != {'to', 'base', 'projection', 'output'} \
+            or any(not isinstance(v, str) or not v for v in d.values()):
+        raise ValueError(schema['toolchain_rendering_errors']['shape'])
+    if 'var_name' not in pats or any(not pats['var_name'].fullmatch(d[k]) for k in ('to', 'output')) \
+            or any(not pats['var_name'].fullmatch(x) for x in d['base'].split('.')):
+        raise ValueError(schema['toolchain_rendering_errors']['names'])
+    taken = _RH_BASE_KEYS | _RH_SCOPED_KEYS | set(_RH_SCOPE_ENTRY) | {'kind', 'id'} \
+        | set(_rh_published_view_decl(schema)) | {_rh_gb_decl(schema)['to']}
+    projs = schema['policy_projections']
+    if d['to'] in taken or d['projection'] not in projs or projs[d['projection']]['kind'] != 'select_tree':
+        raise ValueError(schema['toolchain_rendering_errors']['destination'])
+    if d['projection'] != schema['generation_binding']['projection']:
+        raise ValueError(schema['toolchain_rendering_errors']['projection'])
+    return d
+
+
+def _rh_toolchain_renderers(pol, schema, key):
+    """Materialize complete renderer inputs from one fully resolved policy.
+
+    Copy the declared common base, then replace exactly the recipe projection's admitted
+    leaves with their already published values. This is a loader projection, not another
+    desired-state merge: no defaults, selection, file I/O or consumer-side reconstruction.
+    The view stays outside policy, so it cannot contain itself. Both publication and
+    verification invoke this same function.
+    """
+    d = _rh_tr_decl(schema)
+    pj = schema['policy_projections'][d['projection']]
+    fb, base = _rh_get(pol, d['base'])
+    fp, published = _rh_get(pol, pj['at'] + '.' + pj['to'])
+    if not fb or not isinstance(base, dict) or not fp or not isinstance(published, dict) or not published:
+        raise ValueError(schema['toolchain_rendering_errors']['inputs'] % (key,))
+    expected = _rh_pj_select_tree(d['projection'], pj, pol, key, _rh_patterns(schema)[0])
+    if not _leaf_equal(published, expected):
+        raise ValueError(schema['toolchain_rendering_errors']['selected'] % (key,))
+    out = {}
+    for role in sorted(published):
+        ctl = copy.deepcopy(base)
+        tree = published[role][pj['outputs']['tree']]
+        for path in pj['leaves']:
+            found, value = _rh_get(tree, path)
+            if not found:
+                raise ValueError(schema['toolchain_rendering_errors']['leaf'] % (key, role, path))
+            parent, parts = ctl, path.split('.')
+            for part in parts[:-1]:
+                if part not in parent or not isinstance(parent[part], dict):
+                    raise ValueError(schema['toolchain_rendering_errors']['base_path'] % (key, path))
+                parent = parent[part]
+            if parts[-1] not in parent:
+                raise ValueError(schema['toolchain_rendering_errors']['base_leaf'] % (key, path))
+            parent[parts[-1]] = copy.deepcopy(value)
+        out[role] = {d['output']: ctl}
+    return out
 
 
 def _rh_generation_bindings(pol, sec, schema, key, admission):
@@ -5686,7 +5776,7 @@ def _rh_scoped(section, composed, declared, override, schema, scope, *, document
         if _rh_get(sec['policy'], hs['target_group_path'])[1] != tg or _rh_get(sec['policy'], hs['operation_path'])[1] != op:
             raise ValueError('lme: scope %r resolves another target group/operation than the deployment binding' % (i,))
         ident = {'kind': 'controller' if i == cid else 'target', 'id': i}
-        out = dict(ident, **{k: sec[k] for k in _RH_SCOPE_ENTRY + (_rh_gb_decl(schema)['to'],)})   # C1-RECIPE-PUB-02: + the class generation bindings
+        out = dict(ident, **{k: sec[k] for k in _RH_SCOPE_ENTRY + (_rh_gb_decl(schema)['to'], _rh_tr_decl(schema)['to'])})   # C1-RECIPE-PUB-02: + the class generation bindings
         out['scope_sha256'] = _digest({'scope': ident, 'binding': binding, 'policy_sha256': sec['policy_sha256']})
         return out
     scopes = {'controller': entry(cid), 'targets': {t: entry(t) for t in targets}}
@@ -6237,6 +6327,9 @@ def _rh_verify_entry(where, sec, keys, schema, admission):
     gbk = _rh_gb_decl(schema)['to']
     if not _leaf_equal(sec[gbk], _rh_generation_bindings(sec['policy'], sec, schema, where, admission)):
         raise ValueError('lme: published %s.%s is not the binding its own policy, class key and the admission record derive (registry generation_binding)' % (where, gbk))
+    trk = _rh_tr_decl(schema)['to']
+    if not _leaf_equal(sec[trk], _rh_toolchain_renderers(sec['policy'], schema, where)):
+        raise ValueError(schema['toolchain_rendering_errors']['readback'] % (where, trk))
 
 
 def lme_verify_resolved_structure(resolved, registry, *, documents, admission):
@@ -6279,7 +6372,8 @@ def lme_verify_resolved_structure(resolved, registry, *, documents, admission):
     docs = _rh_documents(sec['policy'], schema, key, documents, admission)
     want_views = _rh_published_views(sec['policy'], schema, key, docs)
     gbk = _rh_gb_decl(schema)['to']   # C1-RECIPE-PUB-02: the generation-binding key of the section and of every scope entry
-    _rh_verify_entry(key, sec, _RH_BASE_KEYS | set(want_views) | {gbk} | (_RH_SCOPED_KEYS if scoped else frozenset()), schema, admission)
+    trk = _rh_tr_decl(schema)['to']
+    _rh_verify_entry(key, sec, _RH_BASE_KEYS | set(want_views) | {gbk, trk} | (_RH_SCOPED_KEYS if scoped else frozenset()), schema, admission)
     # F05 LV-4: every published view re-derives from the section's OWN policy + the registry (type-aware), so a view
     # edited after resolve, or a pre-supplied section carrying a stale view, refuses. F05-S3: only the ACTIVE set.
     for name, want_v in sorted(want_views.items()):
@@ -6339,7 +6433,7 @@ def lme_verify_resolved_structure(resolved, registry, *, documents, admission):
         raise ValueError('lme: published %s.scopes must be {controller, targets}' % (key,))
     entries = [('controller', scopes['controller'])] + [('targets.' + t, scopes['targets'][t]) for t in sorted(scopes['targets'])]
     for where, ent in entries:
-        _rh_verify_entry('%s.scopes.%s' % (key, where), ent, set(_RH_SCOPE_ENTRY) | {'kind', 'id', 'scope_sha256', gbk}, schema, admission)
+        _rh_verify_entry('%s.scopes.%s' % (key, where), ent, set(_RH_SCOPE_ENTRY) | {'kind', 'id', 'scope_sha256', gbk, trk}, schema, admission)
         ident = {'kind': ent['kind'], 'id': ent['id']}
         if ent['scope_sha256'] != _digest({'scope': ident, 'binding': binding, 'policy_sha256': ent['policy_sha256']}):
             raise ValueError('lme: published %s.scopes.%s.scope_sha256 is not bound to its scope/binding/policy' % (key, where))
@@ -6362,7 +6456,7 @@ def lme_verify_resolved_structure(resolved, registry, *, documents, admission):
     mine = scopes['controller'] if isinstance(me, dict) and me.get('kind') == 'controller' else \
         scopes['targets'].get(me.get('id')) if isinstance(me, dict) else None
     if not isinstance(mine, dict) or not _leaf_equal({'kind': mine['kind'], 'id': mine['id']}, me) \
-            or not _leaf_equal({k: mine[k] for k in _RH_SCOPE_ENTRY + (gbk,)}, {k: sec[k] for k in _RH_SCOPE_ENTRY + (gbk,)}) \
+            or not _leaf_equal({k: mine[k] for k in _RH_SCOPE_ENTRY + (gbk, trk)}, {k: sec[k] for k in _RH_SCOPE_ENTRY + (gbk, trk)}) \
             or sec['scope_sha256'] != mine['scope_sha256']:
         raise ValueError('lme: published %s is not its own scope entry %r of scopes' % (key, me))
     return True
@@ -6435,31 +6529,32 @@ def lme_rh_document_plan(scope, schema, *, admission):
 
 
 def lme_rh_document_next_rel(documents, scope, schema, *, admission):
-    """The admitted rel of the next document in admission order, derived and full-matched BEFORE the reader builds a
-    path, stats or reads it (OD-S3-01 a). `documents` = the documents read so far (a prefix of the order, each
-    re-admitted: rel binding + admitted digest before parse). Refuses when every document is already carried."""
+    """records-staged-reader-01: the admitted rels of the NEXT LEVEL as {name: rel}, each derived and full-matched
+    BEFORE the reader builds a path, stats, Git-admits or reads it (OD-S3-01 a). `documents` = the documents read so
+    far (a prefix of the order, each re-admitted). Empty once every name is carried; append refuses beyond it."""
     key, pol = _rh_reader_policy(scope, schema)
     if pol is None:
         raise ValueError('lme: no %s policy is declared; the document reader reads nothing' % (key,))
     active, _out, order, nxt = _rh_documents_admit(pol, schema, key, documents, admission, True)
-    if not active or nxt is None:
+    if not active:
         raise ValueError('lme: the document reader asked for a document beyond the admission order %s (carried %s)' % (
             order, sorted(documents) if isinstance(documents, dict) else _rh_kind(documents)))
-    return nxt[1]
+    return dict(nxt)
 
 
 def lme_rh_document_append(documents, text, name, scope, schema, *, admission):
-    """documents + {name: {rel, text}}, returned only after the extended prefix is admitted (name-to-rel binding and
-    the admitted digest of the exact text compared BEFORE it is parsed). `name` is the reader's loop item: it must be
-    the next name of the admission order (the loop is bound to the plan). The loader re-admits the complete set."""
+    """documents + {name: {rel, text}}, returned only after the extended prefix is admitted (name-to-rel binding,
+    membership in the reading-stage admission and the admitted digest of the exact text, BEFORE the strict parse).
+    `name` is the reader's loop item: the first name of the next level. The loader re-admits the complete set."""
     key, pol = _rh_reader_policy(scope, schema)
     if pol is None:
         raise ValueError('lme: no %s policy is declared; the document reader reads nothing' % (key,))
     _a, _o, order, nxt = _rh_documents_admit(pol, schema, key, documents, admission, True)
-    if nxt is None or nxt[0] != name:
-        raise ValueError('lme: the document reader appended %r; the next document of the admission order %s is %r' % (name, order, nxt[0] if nxt else None))
+    nn, nr = next(iter(nxt)) if nxt else (None, None)
+    if nn != name:
+        raise ValueError('lme: the document reader appended %r; the next document of the admission order %s is %r' % (name, order, nn))
     grown = dict(documents)
-    grown[nxt[0]] = {'rel': nxt[1], 'text': text}
+    grown[nn] = {'rel': nr, 'text': text}
     _rh_documents_admit(pol, schema, key, grown, admission, True)
     return grown
 
@@ -7262,9 +7357,312 @@ def lme_doc_admit_text(text, parse, rel):
     return parsed
 
 
+def _lme_ev_refusal(adm, reason, ordinal=None, name=None):
+    node, code = adm
+    fmt = node['parser']['diagnostics']
+    fields = fmt['fields']
+    metadata = {fields['refusal']: code, fields['ordinal']: ordinal, fields['name']: name}
+    shown = [fmt['metadata'].format(key=k, value=metadata[k])
+             for k in node['diagnostics']['allow'] if k in metadata and metadata[k] is not None]
+    return ValueError(fmt['format'].format(code=code, text=node['texts'][reason],
+                                         metadata=fmt['separator'].join(shown)))
+
+
+def _lme_ev_admission(node, policy):
+    """Bind the declared parser to the current generation before examining caller data."""
+    from ansible.release import __version__ as running_core
+    from ansible.parsing.vault import VaultSecretsContext
+    failed = False
+    try:
+        references = [node['arg_flags_from'], node['refusal_from'],
+                      *node['toolchain'].values(), node['file']['path_rule_from'],
+                      node['file']['retain_impl_from'], *node['file']['roots_from']]
+        if not all(isinstance(p, str) and p and _rh_get(policy, p)[0] for p in references):
+            raise ValueError()
+        code = _rh_get(policy, node['refusal_from'])[1]
+        adm = (node, code)
+        parser = node['parser']
+        if (not isinstance(code, str) or not code
+                or _rh_get(policy, node['toolchain']['core_from'])[1] != running_core
+                or not _rec_int(parser['ordinal_start']) or parser['ordinal_start'] != 1
+                or parser['binding'] != 'pinned_ansible'
+                or parser['duplicate_keys'] != 'refuse_within_argument'
+                or parser['non_string_keys'] != 'refuse_at_every_depth'
+                or parser['merge_collisions'] != 'refuse' or parser['recursive_aliases'] != 'refuse'):
+            raise ValueError()
+        # This is a binding to the pinned Ansible dispatch, never a configurable alternative grammar.
+        if (parser['syntax'] != {'file_prefix': '@', 'bare_path_prefixes': ['/', '.'],
+                                 'mapping_prefixes': ['[', '{'], 'raw_params': '_raw_params'}
+                or parser['encoding'] != 'utf-8' or parser['decode_errors'] != ['strict', 'surrogateescape']
+                or parser['path']['separator'] != '/' or parser['path']['forbidden_segments'] != ['', '.', '..']):
+            raise ValueError()
+        _rh_yaml_roles_bound(parser['tags'])
+        for dotted in node['protected_name_sources']['policy_scalar_paths']:
+            found, name = _rh_get(policy, dotted)
+            if not found or not isinstance(name, str) or not name:
+                raise ValueError()
+        for dotted in node['protected_name_sources']['policy_glob_paths']:
+            found, names = _rh_get(policy, dotted)
+            if not found or not isinstance(names, list) or not all(isinstance(n, str) and n for n in names):
+                raise ValueError()
+        # Check diagnostic construction without ever carrying caller content into an error.
+        _lme_ev_refusal(adm, 'configuration')
+    except Exception:
+        failed = True
+    if failed:
+        try:
+            refusal = _lme_ev_refusal((node, _rh_get(policy, node['refusal_from'])[1]), 'configuration')
+        except Exception:
+            refusal = ValueError()
+        raise refusal
+    context = VaultSecretsContext.current(optional=True)
+    if context is not None and context.secrets:
+        raise _lme_ev_refusal(adm, 'vault_variant')
+    return adm
+
+
+def _lme_ev_values(values, adm):
+    node, _ = adm
+    parser = node['parser']
+    kinds, syntax = parser['kinds'], parser['syntax']
+    if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+        raise _lme_ev_refusal(adm, 'configuration')
+    dispatched = []
+    for ordinal, value in enumerate(values, start=parser['ordinal_start']):
+        if not value:
+            kind, payload = kinds['skip'], value
+        elif value.startswith(syntax['file_prefix']):
+            kind, payload = kinds['file'], value[len(syntax['file_prefix']):]
+        elif value.startswith(tuple(syntax['bare_path_prefixes'])):
+            kind, payload = kinds['bare_path'], value
+        elif value.startswith(tuple(syntax['mapping_prefixes'])):
+            kind, payload = kinds['mapping'], value
+        else:
+            kind, payload = kinds['kv'], value
+        dispatched.append((ordinal, kind, payload))
+    return dispatched
+
+
+def _lme_ev_mapping_check(payload, parser):
+    """Check authored keys before pinned construction can collapse or display them.
+
+    JSON uses its own key semantics first, just as Ansible from_yaml does. YAML
+    keys are constructed by an instance of the pinned Ansible loader. Values,
+    including lazy vault values, are left to DataLoader.load after this check.
+    No global parser, constructor, config or display state is changed.
+    """
+    from ansible.parsing.yaml.loader import AnsibleLoader
+    from ansible._internal._json._profiles import _legacy
+    import yaml
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if not isinstance(key, str) or key in result:
+                raise ValueError()
+            result[key] = value
+        return result
+
+    # A syntax failure may be YAML. A duplicate-key failure must not fall back.
+    try:
+        json.loads(payload, cls=_legacy.Decoder, object_pairs_hook=pairs)
+        return
+    except json.JSONDecodeError:
+        pass
+    loader = AnsibleLoader(payload)
+    try:
+        root = loader.get_single_node()
+        visited, active = set(), set()
+
+        def visit(current):
+            if id(current) in active:
+                raise ValueError()
+            if id(current) in visited:
+                return
+            active.add(id(current))
+            if isinstance(current, yaml.MappingNode):
+                if sum(key.tag == parser['tags']['merge']['tag'] for key, _ in current.value) > 1:
+                    raise ValueError()
+                for key, value in current.value:
+                    visit(key)
+                    visit(value)
+                # Flatten using the pinned implementation, then reject collisions,
+                # including merge collisions, before its warning-producing constructor.
+                loader.flatten_mapping(current)
+                seen = set()
+                for key, _ in current.value:
+                    if not isinstance(key, yaml.ScalarNode):
+                        raise ValueError()
+                    # Vault keys would decrypt during hashing; never construct one.
+                    if key.tag not in loader.yaml_constructors:
+                        raise ValueError()
+                    if loader.yaml_constructors[key.tag] == loader.construct_yaml_vault.__func__:
+                        raise ValueError()
+                    name = loader.construct_object(key)
+                    if not isinstance(name, str) or name in seen:
+                        raise ValueError()
+                    seen.add(name)
+            elif isinstance(current, yaml.SequenceNode):
+                for child in current.value:
+                    visit(child)
+            active.remove(id(current))
+            visited.add(id(current))
+
+        visit(root)
+    finally:
+        loader.dispose()
+
+
+def _lme_ev_parse(payload, kind, parser):
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.parsing.splitter import parse_kv, split_args
+    if kind == parser['kinds']['kv']:
+        seen, raw = set(), False
+        for token in split_args(payload):
+            parsed = parse_kv(token)
+            keys = set(parsed)
+            raw_key = parser['syntax']['raw_params']
+            if raw_key in keys and parse_kv(token, check_raw=True) == parsed:
+                keys.remove(raw_key)
+                raw = True
+            if seen.intersection(keys):
+                raise ValueError()
+            seen.update(keys)
+        if raw and parser['syntax']['raw_params'] in seen:
+            raise ValueError()
+        data = parse_kv(payload)
+    else:
+        _lme_ev_mapping_check(payload, parser)
+        data = DataLoader().load(payload, show_content=False)
+    if not isinstance(data, Mapping) or not all(isinstance(key, str) for key in data):
+        raise ValueError()
+    return data
+
+
+def _lme_ev_retained_bytes(path, digest, node, policy, ordinal):
+    """Read only the retained bytes; every path component is opened without following links."""
+    import os
+    import stat
+    parser = node['parser']
+    separator = parser['path']['separator']
+    if not isinstance(path, str) or not isinstance(digest, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
+        return None
+    parts = path.split(separator)[1:]
+    suffix = node['file']['snapshot']['rel'].replace(node['file']['placeholders']['ordinal'], str(ordinal))
+    if not parts or any(p in parser['path']['forbidden_segments'] for p in parts) or not path.endswith(separator + suffix):
+        return None
+    rule = _rh_get(policy, node['file']['path_rule_from'])[1]
+    if not re.fullmatch(rule['regex'], path) or re.search(rule['forbidden_segment_regex'], path):
+        return None
+    failed, data, parent_fd = False, None, None
+    try:
+        parent_fd = os.open(separator, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for part in parts[:-1]:
+            child_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        with os.fdopen(fd, 'rb') as held:
+            observed = os.fstat(held.fileno())
+            if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.getuid()
+                    or stat.S_IMODE(observed.st_mode) != int(node['file']['snapshot']['mode'], 8)):
+                failed = True
+            else:
+                data = held.read()
+    except (OSError, ValueError):
+        failed = True
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+    algorithm = _rh_get(policy, node['file']['retain_impl_from'])[1]['fixed']['digest']
+    if failed or data is None or hashlib.new(algorithm, data).hexdigest() != digest:
+        return None
+    return data
+
+
+def lme_extra_var_files(values, node, policy):
+    """Return the existing route's ordered ordinal/path carrier; install nothing."""
+    adm = _lme_ev_admission(node, policy)
+    kinds = node['parser']['kinds']
+    ordinal_key, path_key, _ = node['file']['snapshot_record']
+    out = []
+    for ordinal, kind, payload in _lme_ev_values(values, adm):
+        if kind == kinds['bare_path']:
+            raise _lme_ev_refusal(adm, 'parse', ordinal)
+        if kind == kinds['file']:
+            if not payload:
+                raise _lme_ev_refusal(adm, 'file_kind', ordinal)
+            out.append({ordinal_key: ordinal, path_key: payload})
+    return out
+
+
+def lme_extra_var_admit(values, node, policy, protected, snapshots):
+    """Admit argument ordinals only; Ansible retains final merge and override ownership."""
+    import fnmatch
+    from ansible.parsing.vault import is_encrypted
+    from ansible._internal._display_utils import DeferredWarningContext
+    adm = _lme_ev_admission(node, policy)
+    if not isinstance(protected, list) or not protected or not all(isinstance(p, str) and p for p in protected):
+        raise _lme_ev_refusal(adm, 'configuration')
+    protected = set(protected)
+    sources = node['protected_name_sources']
+    protected.update(_rh_get(policy, dotted)[1] for dotted in sources['policy_scalar_paths'])
+    globs = [name for dotted in sources['policy_glob_paths'] for name in _rh_get(policy, dotted)[1]]
+    parser, kinds = node['parser'], node['parser']['kinds']
+    dispatched = _lme_ev_values(values, adm)
+    ordinal_key, path_key, digest_key = node['file']['snapshot_record']
+    if not isinstance(snapshots, list) or not all(
+            isinstance(s, Mapping) and set(s) == set(node['file']['snapshot_record'])
+            and _rec_int(s[ordinal_key]) for s in snapshots):
+        raise _lme_ev_refusal(adm, 'configuration')
+    held = {s[ordinal_key]: s for s in snapshots}
+    files = {o for o, kind, _ in dispatched if kind == kinds['file']}
+    if len(held) != len(snapshots) or set(held) != files:
+        raise _lme_ev_refusal(adm, 'configuration')
+    admitted = []
+    for ordinal, kind, payload in dispatched:
+        if kind == kinds['skip']:
+            continue
+        if kind == kinds['bare_path']:
+            raise _lme_ev_refusal(adm, 'parse', ordinal)
+        if kind == kinds['file']:
+            snap = held[ordinal]
+            payload = _lme_ev_retained_bytes(snap[path_key], snap[digest_key], node, policy, ordinal)
+            if payload is None:
+                raise _lme_ev_refusal(adm, 'file_snapshot', ordinal)
+            if is_encrypted(payload):
+                raise _lme_ev_refusal(adm, 'vault_file', ordinal)
+            try:
+                payload = payload.decode(parser['encoding'], errors=parser['decode_errors'][0])
+            except UnicodeDecodeError:
+                payload = payload.decode(parser['encoding'], errors=parser['decode_errors'][1])
+        failed, hit = False, None
+        try:
+            # Parser warnings can include source values even when exceptions are
+            # redacted. Keep them in this invocation-local context, never in the
+            # outer Ansible task result or display singleton.
+            with DeferredWarningContext(variables={}):
+                data = _lme_ev_parse(payload, kind, parser)
+            for key in data:
+                if key in protected or any(fnmatch.fnmatchcase(key, pattern) for pattern in globs):
+                    # Only a declaration-owned exact name may appear in diagnostics.
+                    hit = key if key in protected else None
+                    failed = 'protected'
+                    break
+        except Exception:
+            failed = 'parse'
+        # Raise after the handler: no parser exception, source, value or chained context escapes.
+        if failed:
+            raise _lme_ev_refusal(adm, failed, ordinal, hit)
+        admitted.append(ordinal)
+    return admitted
+
+
 class FilterModule(object):
     def filters(self):
         return {
+            'lme_extra_var_files': lme_extra_var_files,
+            'lme_extra_var_admit': lme_extra_var_admit,
             'strict_enable_bool': strict_enable_bool,
             'lme_service_typed_inputs': lme_service_typed_inputs,
             'lme_project_remote_harness': lme_project_remote_harness,

@@ -836,19 +836,13 @@ run_playbook() {
     sudo mkdir -p /opt/ansible-tmp
     sudo chown $(whoami):$(whoami) /opt/ansible-tmp
 
-    # Operator extra-vars passthrough (--extra-vars): appended as a SECOND -e AFTER
-    # the base JSON so its top-level keys win last. Empty => no-op (default path
-    # unchanged). Quoted array expansion keeps a JSON value a single argv element.
-    local EXTRA_VARS_ARGS=()
-    if [ -n "$EXTRA_VARS_PASSTHROUGH" ]; then
-        EXTRA_VARS_ARGS=(--extra-vars "$EXTRA_VARS_PASSTHROUGH")
-        echo -e "${GREEN}✓ Passthrough extra-vars: ${EXTRA_VARS_PASSTHROUGH}${NC}"
-    fi
 
     if [ -f "$SCRIPT_DIR/inventory" ]; then
-        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"""'}' "${EXTRA_VARS_ARGS[@]}" $ANSIBLE_OPTS
+        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"""'}' "${LME_SELECTOR_ARGS[@]}" $ANSIBLE_OPTS "${LME_OPERATOR_ARGS[@]}"
+
     else
-        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"""'}' "${EXTRA_VARS_ARGS[@]}" $ANSIBLE_OPTS
+        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'","lme_profile":"'"${EFFECTIVE_PROFILE}"'"'"${EFFECTIVE_GLOBAL_OVERRIDE}""${EFFECTIVE_TAILSCALE_OVERRIDE}"""'}' "${LME_SELECTOR_ARGS[@]}" $ANSIBLE_OPTS "${LME_OPERATOR_ARGS[@]}"
+
     fi
     
     if [ $? -eq 0 ]; then
@@ -1016,13 +1010,12 @@ base['es_master_publish_host'] = sys.argv[3]
 print(json.dumps(base))
 " "$BASE_EXTRA_VARS" "$CLUSTER_SEED_HOSTS" "$CLUSTER_MASTER_PUBLISH_HOST")
 
-        local site_cmd="ansible-playbook"
-        if [ -f "$SCRIPT_DIR/inventory" ]; then
-            site_cmd="$site_cmd -i $SCRIPT_DIR/inventory"
+        local site_cmd=('ansible-playbook')
+        if [[ -f "${SCRIPT_DIR}/inventory" ]]; then
+        site_cmd+=('-i' "${SCRIPT_DIR}/inventory")
         fi
-        site_cmd="$site_cmd $PLAYBOOK_PATH --extra-vars '$master_extra_vars' $ANSIBLE_OPTS"
-
-        eval $site_cmd
+        site_cmd+=("${PLAYBOOK_PATH}" '--extra-vars' "${master_extra_vars}" "${LME_SELECTOR_ARGS[@]}" $ANSIBLE_OPTS "${LME_OPERATOR_ARGS[@]}")
+        "${site_cmd[@]}"
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}✓ Master installation (site.yml) completed successfully!${NC}"
         else
@@ -1034,9 +1027,8 @@ print(json.dumps(base))
     # Phase 2: Run elasticsearch.yml on cluster nodes (unless --cluster-master-only)
     if [ "$CLUSTER_MASTER_ONLY" != "true" ]; then
         echo -e "${YELLOW}Phase 2: Running elasticsearch.yml on cluster nodes...${NC}"
-        local cluster_cmd="ansible-playbook -i $CLUSTER_INVENTORY $SCRIPT_DIR/ansible/elasticsearch.yml --extra-vars '$BASE_EXTRA_VARS' $ANSIBLE_OPTS"
-
-        eval $cluster_cmd
+        local cluster_cmd=('ansible-playbook' '-i' "${CLUSTER_INVENTORY}" "${SCRIPT_DIR}/ansible/elasticsearch.yml" '--extra-vars' "${BASE_EXTRA_VARS}" "${LME_SELECTOR_ARGS[@]}" $ANSIBLE_OPTS "${LME_OPERATOR_ARGS[@]}")
+        "${cluster_cmd[@]}"
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}✓ Cluster node installation (elasticsearch.yml) completed successfully!${NC}"
         else
@@ -1053,13 +1045,40 @@ echo "==============================================="
 echo "    Ansible Setup and Playbook Runner"
 echo "==============================================="
 
-# Keep incomplete selector integration from mutating a host during reconciliation.
-# The canonical installer owns these selectors; there is no alternate backend.
-if [[ -n "$LME_DATABASE_PROFILE$LME_TELEMETRY_PROFILE$LME_TELEMETRY_DESTINATIONS" ]]; then
-    printf '%s\n' \
-        "Database and telemetry composition is not yet integrated into the existing manifest engine." \
-        "Deployment cannot satisfy the selected requirements; no installation work was started." >&2
-    exit 2
+LME_SELECTOR_ARGS=()
+if [[ -n "${LME_DATABASE_PROFILE}" ]]; then
+case "${LME_DATABASE_PROFILE}" in
+  'dual-owned-ha'|'shared-ha') ;;
+  *) printf '%s\n' 'Unsupported independent profile selector.' >&2; exit 2 ;;
+esac
+fi
+if [[ -n "${LME_DATABASE_PROFILE}" ]]; then
+LME_SELECTOR_ARGS+=('--extra-vars' "lme_database_profile=${LME_DATABASE_PROFILE}")
+fi
+if [[ -n "${LME_TELEMETRY_PROFILE}" ]]; then
+case "${LME_TELEMETRY_PROFILE}" in
+  'elastic-only'|'elastic-plus-hertzbeat'|'full-mirror') ;;
+  *) printf '%s\n' 'Unsupported independent profile selector.' >&2; exit 2 ;;
+esac
+fi
+if [[ -n "${LME_TELEMETRY_PROFILE}" ]]; then
+LME_SELECTOR_ARGS+=('--extra-vars' "lme_telemetry_profile=${LME_TELEMETRY_PROFILE}")
+fi
+if [[ -n "${LME_TELEMETRY_DESTINATIONS}" ]]; then
+if [[ -z "${LME_TELEMETRY_PROFILE}" ]]; then
+printf '%s\n' 'Explicit destinations require a telemetry profile.' >&2; exit 2
+fi
+case "${LME_TELEMETRY_DESTINATIONS}" in
+  'elastic'|'elastic,hertzbeat'|'hertzbeat,elastic'|'elastic,hertzbeat,malcolm'|'elastic,malcolm,hertzbeat'|'hertzbeat,elastic,malcolm'|'hertzbeat,malcolm,elastic'|'malcolm,elastic,hertzbeat'|'malcolm,hertzbeat,elastic') ;;
+  *) printf '%s\n' 'Unsupported, empty or duplicate destination selection.' >&2; exit 2 ;;
+esac
+fi
+if [[ -n "${LME_TELEMETRY_DESTINATIONS}" ]]; then
+LME_SELECTOR_ARGS+=('--extra-vars' "lme_telemetry_destinations=${LME_TELEMETRY_DESTINATIONS}")
+fi
+LME_OPERATOR_ARGS=()
+if [[ -n "${EXTRA_VARS_PASSTHROUGH}" ]]; then
+LME_OPERATOR_ARGS+=('--extra-vars' "${EXTRA_VARS_PASSTHROUGH}")
 fi
 
 # Reject unsupported flag combinations
