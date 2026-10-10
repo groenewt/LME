@@ -5198,6 +5198,112 @@ def _rh_generation_bindings(pol, sec, schema, key, admission):
     return out
 
 
+def _rh_authoring_location_decl(schema):
+    """Admit the registry-owned location vocabulary without deriving configuration."""
+    d = schema['authoring_location']
+    err = schema['authoring_location_errors']['declaration']
+    shapes = {'input_fields': {'sub', 'locator'}, 'locator_fields': {'kind', 'path'},
+              'kinds': {'checkout', 'absolute'}, 'fields': {'root', 'receipt', 'source'},
+              'source_fields': {'locator', 'checkout'}}
+    strings = {'to', 'checkout_context', 'root_from', 'work_root_from', 'sub_roots_from',
+               'path_rule_from', 'receipt_rel'}
+    if not isinstance(d, dict) or set(d) != set(shapes) | strings | {'empty_path'} \
+            or any(not isinstance(d[k], str) or not d[k] for k in strings) \
+            or not isinstance(d['empty_path'], str) or d['empty_path']:
+        raise ValueError(err)
+    pats = _rh_patterns(schema)[0]
+    if any(not isinstance(d[k], dict) or set(d[k]) != roles
+           or any(not isinstance(v, str) or not pats['var_name'].fullmatch(v) for v in d[k].values())
+           or len(set(d[k].values())) != len(roles) for k, roles in shapes.items()):
+        raise ValueError(err)
+    if any(not pats['var_name'].fullmatch(d[k]) for k in ('to', 'checkout_context')) \
+            or any(not pats['var_name'].fullmatch(part)
+                   for k in ('root_from', 'work_root_from', 'sub_roots_from', 'path_rule_from')
+                   for part in d[k].split('.')) \
+            or not _rh_safe_rel(d['receipt_rel']):
+        raise ValueError(err)
+    taken = _RH_BASE_KEYS | _RH_SCOPED_KEYS | set(_RH_SCOPE_ENTRY) | {'kind', 'id'} \
+        | set(_rh_published_view_decl(schema)) | {_rh_gb_decl(schema)['to'], _rh_tr_decl(schema)['to']}
+    if d['to'] in taken:
+        raise ValueError(err)
+    return d
+
+
+def lme_authoring_location(pol, schema, checkout):
+    """One pure projection of the controller's declared A locator and actual source checkout.
+
+    No manifests, receipts or filesystem state are read. The complete resolved verifier
+    additionally binds checkout to its independently admitted source-binding root.
+    """
+    import posixpath
+    d = _rh_authoring_location_decl(schema)
+    errors = schema['authoring_location_errors']
+    (fr, root), (fw, work), (fs, subs), (fp, rule) = (
+        _rh_get(pol, d[k]) for k in ('root_from', 'work_root_from', 'sub_roots_from', 'path_rule_from'))
+    if not all((fr, fw, fs, fp)) or not isinstance(root, dict) \
+            or set(root) != set(d['input_fields'].values()) or not isinstance(subs, dict) \
+            or not isinstance(rule, dict):
+        raise ValueError(errors['input'])
+    ri, li, f, sf = d['input_fields'], d['locator_fields'], d['fields'], d['source_fields']
+    locator = root[ri['locator']]
+    if not isinstance(locator, dict) or set(locator) != set(li.values()) \
+            or locator[li['kind']] not in d['kinds'].values() \
+            or not isinstance(locator[li['path']], str):
+        raise ValueError(errors['locator'])
+
+    def absolute(p):
+        return isinstance(p, str) and posixpath.isabs(p) and posixpath.normpath(p) == p \
+            and re.fullmatch(rule['regex'], p) is not None \
+            and re.search(rule['forbidden_segment_regex'], p) is None
+
+    if not absolute(checkout):
+        raise ValueError(errors['checkout'])
+    if not isinstance(root[ri['sub']], str) or root[ri['sub']] not in subs \
+            or not _rh_safe_rel(work) or not _rh_safe_rel(subs[root[ri['sub']]]):
+        raise ValueError(errors['path'])
+    if locator[li['kind']] == d['kinds']['checkout']:
+        if locator[li['path']] != d['empty_path']:
+            raise ValueError(errors['locator'])
+        base = rule['separator'].join((checkout, work))
+    else:
+        base = locator[li['path']]
+    if not absolute(base):
+        raise ValueError(errors['path'])
+    actual_root = rule['separator'].join((base, subs[root[ri['sub']]]))
+    receipt = rule['separator'].join((actual_root, d['receipt_rel']))
+    if not absolute(actual_root) or not absolute(receipt):
+        raise ValueError(errors['path'])
+    return {f['root']: actual_root, f['receipt']: receipt,
+            f['source']: {sf['locator']: copy.deepcopy(locator), sf['checkout']: checkout}}
+
+
+def lme_authoring_location_with_locator(pol, schema, checkout, locator):
+    """Apply one explicitly admitted locator override through the same pure projection.
+
+    Preseal callers supply this only after admitting the captured override as exactly
+    the locator subtree. No other policy leaf is merged, selected or defaulted here;
+    the original policy is preserved and the complete projection validates the result.
+    """
+    d = _rh_authoring_location_decl(schema)
+    effective = copy.deepcopy(pol)
+    found, parent = _rh_get(effective, d['root_from'])
+    if not found or not isinstance(parent, dict) or set(parent) != set(d['input_fields'].values()):
+        raise ValueError(schema['authoring_location_errors']['input'])
+    parent[d['input_fields']['locator']] = copy.deepcopy(locator)
+    return lme_authoring_location(effective, schema, checkout)
+
+def _rh_verify_authoring_location(section, schema):
+    """Read back the sole controller projection; target policy never selects A."""
+    d = _rh_authoring_location_decl(schema)
+    f, sf = d['fields'], d['source_fields']
+    have = section[d['to']]
+    if not isinstance(have, dict) or set(have) != set(f.values()) \
+            or not isinstance(have[f['source']], dict) or set(have[f['source']]) != set(sf.values()) \
+            or not _leaf_equal(have, lme_authoring_location(section['scopes']['controller']['policy'], schema,
+                                                           have[f['source']][sf['checkout']])):
+        raise ValueError(schema['authoring_location_errors']['output'])
+
+
 def _rh_safe_rel(p):
     """A normalized, relative repository path: non-empty, not absolute, no '.' / '..' / empty component."""
     import posixpath
@@ -5919,8 +6025,12 @@ def _rh_scoped(section, composed, declared, override, schema, scope, *, document
             if _rh_artifact_active(arts[rec['artifact']], spol):
                 _rh_bind_declared_import(rec, arts[rec['artifact']], label, spol)
     mine =scopes['controller'] if me == cid else scopes['targets'][me]
+    al = _rh_authoring_location_decl(schema)
+    if al['checkout_context'] not in scope:
+        raise ValueError(schema['authoring_location_errors']['checkout'])
     return dict(section, scope={'kind': mine['kind'], 'id': me}, binding=binding, scope_sha256=mine['scope_sha256'],
-                scopes=scopes, scopes_sha256=_digest(scopes))
+                scopes=scopes, scopes_sha256=_digest(scopes),
+                **{al['to']: lme_authoring_location(scopes['controller']['policy'], schema, scope[al['checkout_context']])})
 
 
 def lme_project_remote_harness(composed, declared, override, schema, scope=None, *, documents, admission):
@@ -6501,7 +6611,8 @@ def lme_verify_resolved_structure(resolved, registry, *, documents, admission):
     want_views = _rh_published_views(sec['policy'], schema, key, docs)
     gbk = _rh_gb_decl(schema)['to']   # C1-RECIPE-PUB-02: the generation-binding key of the section and of every scope entry
     trk = _rh_tr_decl(schema)['to']
-    _rh_verify_entry(key, sec, _RH_BASE_KEYS | set(want_views) | {gbk, trk} | (_RH_SCOPED_KEYS if scoped else frozenset()), schema, admission)
+    _rh_verify_entry(key, sec, _RH_BASE_KEYS | set(want_views) | {gbk, trk}
+                     | (_RH_SCOPED_KEYS | {_rh_authoring_location_decl(schema)['to']} if scoped else frozenset()), schema, admission)
     # F05 LV-4: every published view re-derives from the section's OWN policy + the registry (type-aware), so a view
     # edited after resolve, or a pre-supplied section carrying a stale view, refuses. F05-S3: only the ACTIVE set.
     for name, want_v in sorted(want_views.items()):
@@ -6568,6 +6679,7 @@ def lme_verify_resolved_structure(resolved, registry, *, documents, admission):
         _st_back('%s.scopes.%s' % (key, where), ent['policy'])
     if sec['scopes_sha256'] != _digest(scopes):
         raise ValueError('lme: published %s.scopes_sha256 is not the digest of its actual scopes' % (key,))
+    _rh_verify_authoring_location(sec, schema)
     # GRAPH-SHARED-CONTRACT (codex-tick304): the bound target inputs are present exactly when the controller scope's
     # policy declares them, cover exactly the bound targets, and re-type to themselves (no undeclared role, no value
     # of another type).
@@ -6606,6 +6718,13 @@ def lme_verify_resolved(resolved, registry, *, documents, admission, source):
     lme_verify_resolved_structure(resolved, registry, documents=documents, admission=admission)
     lme_verify_source_binding(source[sf['binding']], resolved, registry, captures=source[sf['captures']], admission=admission,
                               manifests_dir=source[sf['manifests_dir']], record_blocks=source[sf['record_blocks']])
+    rs = registry['remote_harness_schema']
+    sec = resolved.get(rs['policy_key'])
+    if isinstance(sec, dict) and 'scope' in sec:
+        al = _rh_authoring_location_decl(rs)
+        if not _leaf_equal(sec[al['to']][al['fields']['source']][al['source_fields']['checkout']],
+                           source[sf['binding']][sb['fields']['root']]):
+            raise ValueError(rs['authoring_location_errors']['source'])
     return True
 
 
@@ -6732,11 +6851,9 @@ def _rec_refuse(name, at, why):
 
 
 def _rec_same(a, b):
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, dict):
-        return set(a) == set(b) and all(_rec_same(a[k], b[k]) for k in a)
-    return a == b
+    # Use the existing canonical-kind comparison for native and Ansible-tagged
+    # values. It preserves bool/int/float and mapping-key distinctions recursively.
+    return _leaf_equal(a, b)
 
 
 def _rec_spec_ok(spec, blocks):
@@ -6747,7 +6864,7 @@ def _rec_spec_ok(spec, blocks):
     form, arg = list(spec.items())[0]
     if form == 'enum':
         return (isinstance(arg, list) and len(arg) > 0
-                and all(type(e) is int or _REC_SCALARS['str'](e) for e in arg))
+                and all(_rec_int(e) or _REC_SCALARS['str'](e) for e in arg))
     if form == 'block':
         return isinstance(arg, str) and arg in blocks
     if form == 'list':
@@ -6802,7 +6919,7 @@ def _rec_check(v, t, blocks, name, at):
         return
     form, arg = list(t.items())[0]
     if form == 'enum':
-        if not any(type(v) is type(e) and v == e for e in arg):
+        if not any(_leaf_equal(v, e) for e in arg):
             _rec_refuse(name, at, 'value outside the declared enum')
     elif form == 'list':
         if not isinstance(v, list):
@@ -7794,6 +7911,8 @@ class FilterModule(object):
             'strict_enable_bool': strict_enable_bool,
             'lme_service_typed_inputs': lme_service_typed_inputs,
             'lme_project_remote_harness': lme_project_remote_harness,
+            'lme_authoring_location': lme_authoring_location,
+            'lme_authoring_location_with_locator': lme_authoring_location_with_locator,
             'lme_remote_harness_overridden_paths': lme_remote_harness_overridden_paths,
             'lme_verify_resolved': lme_verify_resolved,
             'lme_verify_resolved_structure': lme_verify_resolved_structure,

@@ -1,0 +1,70 @@
+- ansible.builtin.set_fact:
+    _rh_ar_bundle: '{{ _rh_ar_texts[rh_ar_contract.observation_roles.bundle_manifest] | lme_manifest_strict(rh_ar_subject.observation_files[rh_ar_contract.observation_roles.bundle_manifest].path,
+      rh_ar_contract.parse) }}'
+  name: Strict parse the observed historical bundle and the captured current dependency lock
+- ansible.builtin.assert:
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.dependency }}'
+    quiet: true
+    that:
+    - _rh_ar_bundle.schema == rh_ar_contract.legacy_bundle_schema
+    - _rh_ar_bundle.seed_sha256 == rh_ar_subject.seed_sha256
+    - _rh_ar_bundle.expected_generation == rh_ar_subject.generation
+    - _rh_ar_bundle.source.repo_head == rh_ar_subject.historical_origin.source_commit
+    - _rh_ar_bundle.source.worktree_status_sha256 == rh_ar_subject.historical_origin.source_status_sha256
+    - _rh_ar_bundle.lock_sha256 == rh_ar_subject.historical_origin.normalized_lock_sha256
+    - _rh_ar_bundle.class_key == rh_ar_subject.historical_origin.class_key
+    - (_rh_ar_texts[rh_ar_contract.observation_roles.historical_lock] | hash(rh_ar_contract.digest)) == rh_ar_subject.historical_origin.raw_lock_sha256
+    - (_rh_ar_texts[rh_ar_contract.observation_roles.artifacts].splitlines() | map('regex_replace', rh_ar_contract.manifest_hash_extract, rh_ar_contract.manifest_hash_replacement)
+      | sort) == (rh_ar_context.dependencies.dependency_sha256s | sort)
+    - (_rh_ar_bundle.artifacts | map('split', rh_ar_contract.bundle_artifact_separator) | map('last') | sort) == (rh_ar_context.dependencies.dependency_sha256s
+      | sort)
+  name: Verify historical source provenance and current exact artifact compatibility
+- name: Confine historical source observations to their declared checkout
+  ansible.builtin.assert:
+    that:
+    - item.rel is match(rh_ar_contract.source_rel_pattern)
+    - item.rel is not search(rh_ar_contract.forbidden_segments)
+    - item.sha256 is match(rh_ar_contract.digest_pattern)
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }}'
+    quiet: true
+  loop: '{{ rh_ar_subject.historical_source.inputs }}'
+- name: Bind historical input declarations to the actually captured bundle
+  ansible.builtin.assert:
+    that:
+    - _rh_ar_bundle.source.checkout == rh_ar_subject.historical_source.checkout
+    - _rh_ar_bundle.source.inputs == (rh_ar_subject.historical_source.inputs | map(attribute='rel') | zip(rh_ar_subject.historical_source.inputs
+      | map(attribute='sha256')) | map('join', rh_ar_contract.bundle_artifact_separator) | list)
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }}'
+    quiet: true
+- name: Read the recorded historical commit tree through the admitted Git binary
+  ansible.builtin.command:
+    argv: '{{ [rh_ar_tools.git.path] + rh_ar_contract.historical_git_tree_args + [rh_ar_subject.historical_origin.source_commit ~ rh_ar_contract.git_tree_suffix]
+      }}'
+    chdir: '{{ rh_ar_subject.historical_source.checkout }}'
+  register: _rh_ar_historical_tree
+  changed_when: false
+- name: Require the historical tree to exist with the independently observed identity
+  ansible.builtin.assert:
+    that:
+    - _rh_ar_historical_tree.stdout == rh_ar_subject.historical_origin.source_tree
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }}'
+    quiet: true
+- name: Rehash every historical bundle source observation
+  ansible.builtin.stat:
+    path: '{{ rh_ar_subject.historical_source.checkout ~ rh_ar_contract.separator ~ item.rel }}'
+    follow: false
+    get_checksum: true
+    checksum_algorithm: '{{ rh_ar_contract.digest }}'
+    get_mime: false
+    get_attributes: false
+  loop: '{{ rh_ar_subject.historical_source.inputs }}'
+  register: _rh_ar_historical_inputs
+- name: Require the observed historical source bytes without rewriting their provenance
+  ansible.builtin.assert:
+    that:
+    - item.stat.exists and item.stat.isreg and not item.stat.islnk
+    - item.stat.checksum == item.item.sha256
+    - not item.stat.wgrp and not item.stat.woth
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }} {{ item.item.rel }}'
+    quiet: true
+  loop: '{{ _rh_ar_historical_inputs.results }}'

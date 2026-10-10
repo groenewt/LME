@@ -1,0 +1,83 @@
+- name: Verify the exact enumerated parent and held allocator before reading a record
+  ansible.builtin.include_tasks: '{{ [fw_source_root, rh_fw_stage.source.allocation_directory_task] | path_join }}'
+
+- name: Inspect the exact invocation allocation record
+  ansible.builtin.stat:
+    path: "{{ [rh_fw_allocation_directory.path, rh_fw_transport.paths.context_record_basename] | path_join }}"
+    follow: "{{ rh_fw_transport.structural.refused }}"
+    get_checksum: "{{ rh_fw_transport.structural.accepted }}"
+    checksum_algorithm: "{{ rh_fw.output.digest_algorithm }}"
+  register: rh_fw_allocation_record_stat
+
+- name: Refuse absent or unsafe recorded invocation state
+  ansible.builtin.assert:
+    quiet: true
+    fail_msg: "{{ rh_fw_transport.diagnostics.incomplete }}"
+    that:
+      - rh_fw_allocation_record_stat.stat.exists
+      - rh_fw_allocation_record_stat.stat.isreg
+      - not rh_fw_allocation_record_stat.stat.islnk
+      - rh_fw_allocation_record_stat.stat.nlink == rh_fw_transport.structural.one
+      - rh_fw_allocation_record_stat.stat.uid == rh_fw_producer_uid
+      - rh_fw_allocation_record_stat.stat.mode == rh_fw_transport.allocation_record.mode
+
+- name: Read the owned allocation record once
+  ansible.builtin.slurp:
+    src: "{{ [rh_fw_allocation_directory.path, rh_fw_transport.paths.context_record_basename] | path_join }}"
+  register: rh_fw_allocation_record_capture
+
+- name: Parse the record with the existing strict manifest parser
+  ansible.builtin.set_fact:
+    rh_fw_allocation_record: "{{ rh_fw_allocation_record_capture.content | b64decode | lme_manifest_strict(rh_fw_transport.diagnostics.record, fw_parse_contract) }}"
+
+- name: Verify exact record shape, retained digest and locator binding
+  vars:
+    rh_fw_record_keys: "{{ rh_fw_transport.allocation_record.f }}"
+  ansible.builtin.assert:
+    quiet: true
+    fail_msg: "{{ rh_fw_transport.diagnostics.record }}"
+    that:
+      - rh_fw_allocation_record is mapping
+      - rh_fw_allocation_record.keys() | list | sort == rh_fw_transport.allocation_record.fields | sort
+      - rh_fw_allocation_record[rh_fw_record_keys.schema] == rh_fw_transport.allocation_record.schema
+      - rh_fw_allocation_record[rh_fw_record_keys.context] is mapping
+      - rh_fw_allocation_record[rh_fw_record_keys.binding] is mapping
+      - rh_fw_allocation_record[rh_fw_record_keys.context].keys() | list | sort == fw_contract.fields | sort
+      - rh_fw_allocation_record[rh_fw_record_keys.binding].keys() | list | sort == rh_fw_transport.allocation_record.binding_fields | sort
+      - rh_fw_allocation_record[rh_fw_record_keys.context][fw_contract.f.locator] == rh_fw_allocation_directory.path
+      - (rh_fw_allocation_record_capture.content | b64decode | hash(rh_fw.output.digest_algorithm)) == rh_fw_allocation_record_stat.stat.checksum
+
+- name: Admit the recorded context's actual kinds and grammar
+  ansible.builtin.include_tasks: "{{ fw_source_root ~ rh_fw_transport.structural.separator ~ fw_contract.validation.tasks.payload }}"
+  vars:
+    fw_payload: "{{ rh_fw_allocation_record[rh_fw_transport.allocation_record.f.context] }}"
+    fw_supervised: "{{ rh_fw_allocation_record[rh_fw_transport.allocation_record.f.context][fw_contract.f.occurrence] is not none }}"
+
+- name: Reobserve the allocation record after retaining and parsing its bytes
+  ansible.builtin.stat:
+    path: '{{ [rh_fw_allocation_directory.path, rh_fw_transport.paths.context_record_basename] | path_join }}'
+    follow: '{{ rh_fw_transport.structural.refused }}'
+    get_checksum: '{{ rh_fw_transport.structural.accepted }}'
+    checksum_algorithm: '{{ rh_fw.output.digest_algorithm }}'
+  register: rh_fw_allocation_record_after
+
+- name: Refuse changed allocation file identity or bytes
+  ansible.builtin.assert:
+    quiet: true
+    fail_msg: '{{ rh_fw_transport.diagnostics.record }}'
+    that:
+      - rh_fw_allocation_record_after.stat.exists
+      - rh_fw_allocation_record_after.stat.isreg and not rh_fw_allocation_record_after.stat.islnk
+      - rh_fw_allocation_record_after.stat.dev == rh_fw_allocation_record_stat.stat.dev
+      - rh_fw_allocation_record_after.stat.inode == rh_fw_allocation_record_stat.stat.inode
+      - rh_fw_allocation_record_after.stat.uid == rh_fw_producer_uid
+      - rh_fw_allocation_record_after.stat.mode == rh_fw_transport.allocation_record.mode
+      - rh_fw_allocation_record_after.stat.nlink == rh_fw_transport.structural.one
+      - rh_fw_allocation_record_after.stat.checksum == rh_fw_allocation_record_stat.stat.checksum
+
+- name: Refuse a parent rename or linked substitution after retaining record bytes
+  ansible.builtin.include_tasks: '{{ [fw_source_root, rh_fw_stage.source.allocation_directory_task] | path_join }}'
+
+- name: Retain the verified allocator record for freshness and resume checks
+  ansible.builtin.set_fact:
+    rh_fw_allocation_records: "{{ rh_fw_allocation_records + [rh_fw_allocation_record] }}"
