@@ -1,0 +1,373 @@
+schema: hertzbeat.public-source.numeric-arrow-history-author/v1
+kind: values.history-adapters
+lane_boundary: Service-owned SQL PromQL HTTP payload templates, selectors, conversions, time, null, error, drop, and retention. Backing Kafka Redis PostgreSQL Greptime IoTDB Doris QuestDB TDengine Influx VM server internals remain separate owners.
+shared_drop_gates:
+  all_history_saveData:
+    skip_if_not_serverAvailable: true
+    skip_if_code_not_SUCCESS: true
+    skip_if_values_empty: true
+  note: QuestDB and DuckDB combine the empty-values gate in the same if as SUCCESS. VictoriaMetrics also rejects after closed.get.
+history:
+  - class: GreptimeDbDataStorage
+    editions: ["180", v190, head]
+    protocol: greptime_java_write_plus_promql_http
+    prefix: warehouse.store.greptime
+    path_suffix: store/history/tsdb/greptime/GreptimeDbDataStorage.java
+    write:
+      client: greptimeDb.write(Table)
+      table_name: "app + '_' + metrics"
+      schema_tags: [instance]
+      timestamp_column: ts
+      timestamp_type: TimestampMillisecond
+      timestamp_value: System.currentTimeMillis
+      TYPE_NUMBER: Float64 Double.parseDouble
+      TYPE_STRING: String
+      LABEL_true: tag String
+      NULL_VALUE: Java null cell
+      drop_empty_values: ignore
+      write_timeout: 10s
+      write_err: log warn result.getErr
+      v190_head_only:
+        custom_label_collisions_dropped: [instance, ts, fieldNames]
+        LABEL_KEY_TS: ts
+        spans: [172, 180]
+    query:
+      http_path: /v1/prometheus/api/v1/query_range
+      selector_template: '__name__="{app}_{metrics}",instance="{instance}"'
+      extra_field_unless_prometheus: '__field__="{metric}"'
+      start_end: epoch seconds from TimePeriodUtil.parseTokenTime or numeric seconds-ago; parse fail defaults 6h
+      step:
+        under_1d: 60s
+        "1d_to_7d": 1h
+        "7d_or_more": 4h
+      interval_promql:
+        - "max_over_time({selector}[{step}])"
+        - "min_over_time({selector}[{step}])"
+        - "avg_over_time({selector}[{step}])"
+      spans:
+        saveData: [153, 252]
+        getHistoryMetricData: [276, 285]
+        getHistoryData: [396, 410]
+        getTimeRange: [344, 364]
+        getTimeStep: [373, 381]
+        interval: [292, 336]
+  - class: InfluxdbDataStorage
+    editions: ["180", v190, head]
+    protocol: influxql_plus_java_point_write
+    prefix: warehouse.store.influxdb
+    path_suffix: store/history/tsdb/influxdb/InfluxdbDataStorage.java
+    write:
+      measurement: generateTable(app, metrics, instance)
+      time_unit: MILLISECONDS
+      TYPE_NUMBER: addField Double.parseDouble
+      TYPE_STRING: addField String
+      TYPE_TIME: not_written
+      NULL_VALUE: addField empty string then return
+      labels_tag: metric_labels JSON
+      database: hertzbeat
+    query:
+      history_sql: "SELECT metric_labels, \"%s\" FROM \"%s\" WHERE time >= now() - %s order by time desc"
+      interval_sql: "SELECT FIRST(\"%s\"), MEAN(\"%s\"), MAX(\"%s\"), MIN(\"%s\") FROM \"%s\" WHERE metric_labels = '%s' and time >= now() - %s GROUP BY time(4h)"
+      instance_sql: "show tag values from \"%s\" with key = \"metric_labels\""
+      history_token: interpolated as-is into now() - %s; interval path lowercases history
+      null_value_row: continue skip
+      query_time_unit: MILLISECONDS
+    retention:
+      sql: "CREATE RETENTION POLICY \"%s_retention\" ON \"%s\" DURATION %s REPLICATION %d DEFAULT"
+      application_expire_time: 30d
+      replication: 1
+    error: log error on write and select; no rethrow
+    spans:
+      constants: [68, 80]
+      saveData: [148, 196]
+      getHistoryMetricData: [199, 226]
+      interval: [229, 255]
+  - class: IotDbDataStorage
+    editions: ["180", v190, head]
+    protocol: iotdb_session_tablet
+    prefix: warehouse.store.iot-db
+    path_suffix: store/history/tsdb/iotdb/IotDbDataStorage.java
+    write:
+      storage_group: root.hertzbeat
+      TYPE_NUMBER: TSDataType.DOUBLE
+      TYPE_STRING: TSDataType.TEXT
+      TYPE_TIME: schema not added
+      NULL_VALUE: tablet.addValue null
+      timestamp: System.currentTimeMillis incremented on label-key collision
+      deviceId: getDeviceId(app, metrics, instance, labelsJson, quoted)
+    query:
+      history_sql: "SELECT %s FROM %s WHERE Time >= now() - %s order by Time desc"
+      interval_sql: "SELECT FIRST_VALUE(%s), AVG(%s), MIN_VALUE(%s), MAX_VALUE(%s) FROM %s GROUP BY ([now() - %s, now()), 4h)"
+      metric_quoted: addQuote(metric)
+      devices: SHOW DEVICES then SHOW DEVICES deviceId.*
+      empty_devices: warn return empty map
+    retention:
+      set_ttl: "set ttl to %s %s"
+      unset_ttl: "unset ttl to %s"
+      never_expire_token: "-1"
+      application_expire_time: "7776000000"
+    error: log StatementExecutionException IoTDBConnectionException
+    spans:
+      constants: [55, 81]
+      saveData: [177, 257]
+      getHistoryMetricData: [262, 293]
+      initTtl: [157, 172]
+  - class: TdEngineDataStorage
+    editions: ["180", v190, head]
+    protocol: taos_jdbc_sql
+    prefix: warehouse.store.td-engine
+    path_suffix: store/history/tsdb/tdengine/TdEngineDataStorage.java
+    write:
+      insert_sql: "INSERT INTO `%s` USING `%s` TAGS (%s) VALUES %s"
+      create_stable: "CREATE STABLE IF NOT EXISTS `%s` %s TAGS (instance NCHAR(128))"
+      stable_version_suffix: _v2
+      TYPE_NUMBER_or_TYPE_TIME: Double.parseDouble else NULL; NaN Infinity to NULL
+      TYPE_STRING: quoted escaped
+      NULL_VALUE: SQL NULL
+      empty_values: ignore
+      ts: metricsData.getTime plus row index
+      labels: JSON into metric_labels via String.format placeholder
+    query:
+      history_sql: "SELECT ts, metric_labels, `%s` FROM `%s` WHERE ts >= now - %s order by ts desc"
+      history_with_instance_sql: "SELECT ts, metric_labels, `%s` FROM `%s` WHERE metric_labels = '%s' AND ts >= now - %s order by ts desc"
+      interval_sql: "SELECT first(ts), first(`%s`), avg(`%s`), min(`%s`), max(`%s`) FROM `%s` WHERE metric_labels = '%s' AND ts >= now - %s interval(4h)"
+      instance_sql: "SELECT DISTINCT metric_labels FROM `%s` WHERE ts >= now - 1w"
+      history_token: interpolated unlowercased into now - %s
+      double_scale: BigDecimal 4 HALF_UP
+      ts_null: continue skip
+      table_not_exist: swallow SQLException
+    retention: absent_client_ttl; CREATE DATABASE IF NOT EXISTS only
+    error: unavailable prints INSTANCE_EXCEPTION_PRINT; destroy closes HikariDataSource
+    spans:
+      constants: [71, 91]
+      saveData: [180, 262]
+      getHistoryMetricData: [367, 416]
+      interval: [419, 427]
+  - class: VictoriaMetricsDataStorage
+    editions: ["180", v190, head]
+    protocol: prometheus_http
+    prefix: warehouse.store.victoria-metrics
+    path_suffix: store/history/tsdb/vm/VictoriaMetricsDataStorage.java
+    write:
+      http_path: /api/v1/import
+      method: POST JSON lines VictoriaMetricsContent
+      TYPE_NUMBER_non_label: CommonUtil.parseStrDouble unless NULL_VALUE dropped
+      labels: field LABEL true
+      name: "metrics + '_' + field unless prometheus auto"
+      extra_labels: [job, instance, __metrics__, __metric__, __monitor_id__]
+      closed_reject: warn return
+    query:
+      export_path: /api/v1/export
+      export_params: "match[]={selector}&start=now-{history}&end=now"
+      query_range_path: /api/v1/query_range
+      interval_params: "query={selector}&step=4h&start={epoch}&end={epoch}"
+      selector: '__name__="{metrics}_{metric}",instance="{instance}",__metric__="{metric}"'
+      prometheus_auto_omits_metric_label: true
+      parse_fail_history: default 6h epoch
+      double_scale: BigDecimal 4 HALF_UP
+    retention: absent_client_ttl
+    error: non-2xx log error; exception log error return empty
+    spans:
+      constants: [88, 103]
+      saveData: [179, 268]
+      getHistoryMetricData: [351, 419]
+      interval: [422, 476]
+  - class: VictoriaMetricsClusterDataStorage
+    editions: ["180", v190, head]
+    protocol: prometheus_http_cluster
+    prefix: warehouse.store.victoria-metrics.cluster
+    path_suffix: store/history/tsdb/vm/VictoriaMetricsClusterDataStorage.java
+    write:
+      insert_base: "/insert/%s/%s"
+      import_rel: prometheus/api/v1/import
+    query:
+      select_base: "/select/%s/%s"
+      export_rel: prometheus/api/v1/export
+      query_range_rel: prometheus/api/v1/query_range
+      status_rel: prometheus/api/v1/status/tsdb
+      conversions_same_as: VictoriaMetricsDataStorage
+    retention: absent_client_ttl
+    spans:
+      constants: [90, 103]
+      saveData: [188, 247]
+      getHistoryMetricData: [333, 333]
+      interval: [409, 411]
+  - class: QuestdbDataStorage
+    editions: ["180", v190, head]
+    protocol: ilp_write_plus_http_exec_sql
+    prefix: warehouse.store.questdb
+    path_suffix: store/history/tsdb/questdb/QuestdbDataStorage.java
+    write:
+      sender: ILP table then symbol then columns then atNow
+      TYPE_NUMBER: doubleColumn Double.parseDouble
+      TYPE_STRING: stringColumn
+      TYPE_TIME: not_written
+      NULL_VALUE: skip field
+      labels_empty_symbol: app_metrics
+      row_error: cancelRow continue
+    query:
+      http_path: "/exec?query="
+      extra: "&timestamptype=rfc3339"
+      history_sql: "SELECT timestamp AS ts, metric_labels, \"%s\" AS value FROM \"%s\" WHERE timestamp >= %s ORDER BY timestamp DESC"
+      history_with_instance_sql: "SELECT timestamp AS ts, metric_labels, \"%s\" AS value FROM \"%s\" WHERE metric_labels = '%s' AND timestamp >= %s ORDER BY timestamp DESC"
+      interval_sql: "SELECT timestamp AS ts, first(\"%s\") AS origin, avg(\"%s\") AS mean, max(\"%s\") AS max, min(\"%s\") AS min FROM \"%s\" WHERE metric_labels = '%s' AND timestamp >= %s SAMPLE BY 4h"
+      instance_sql: "SELECT DISTINCT metric_labels FROM \"%s\""
+      dateadd: "dateadd('%s', %d, now())"
+      dateadd_units: [d, h, m, s]
+      dateadd_invalid: IllegalArgumentException
+      null_value_row: continue skip
+      unsuccessful_http: return null
+    retention: absent_client_ttl
+    spans:
+      constants: [69, 77]
+      saveData: [129, 186]
+      getHistoryMetricData: [189, 228]
+      getDateAdd: [340, 360]
+      executeQuery: [313, 337]
+  - class: DuckdbDatabaseDataStorage
+    editions: ["180", v190, head]
+    protocol: jdbc_sql
+    prefix: warehouse.store.duckdb
+    path_suffix: store/history/tsdb/duckdb/DuckdbDatabaseDataStorage.java
+    write:
+      insert_sql: "INSERT INTO hzb_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      NULL_VALUE: TYPE_NUMBER with three null value columns
+      TYPE_STRING: str_value
+      TYPE_TIME: Integer.parseInt to int32_value
+      default_number: Double.parseDouble to double_value
+      labels: JSON including NULL_VALUE label cells
+    query:
+      history_sql: |
+        SELECT record_time, metric_type, int32_value, double_value, str_value, labels FROM hzb_history
+        WHERE instance = ? AND app = ? AND metrics = ? AND metric = ?
+      history_time_filter: AND record_time >= ?
+      history_limit: "ORDER BY record_time DESC LIMIT 20000"
+      history_parse: TimePeriodUtil.parseTokenTime to epoch ms
+      interval_sql: |
+        SELECT CAST(record_time / ? AS BIGINT) * ? AS ts_bucket,
+        AVG(double_value) AS avg_val, MIN(double_value) AS min_val, MAX(double_value) AS max_val,
+        FIRST(str_value) AS str_val, metric_type, labels
+        FROM hzb_history
+        WHERE instance = ? AND app = ? AND metrics = ? AND metric = ? AND record_time >= ?
+        GROUP BY ts_bucket, metric_type, labels
+        ORDER BY ts_bucket
+      interval_min_ms: 60000
+      interval_parse_fail: 24h window and 60000 ms bucket
+    retention:
+      application_expire_time: 90d
+      cleaner: DELETE WHERE record_time < computed_expire
+      expire_numeric_ms: epoch_now_seconds minus value times 1000
+      expire_token: TimePeriodUtil.parseTokenTime
+      expire_parse_fail: 30d
+    error: log SQLException; unavailable returns empty map
+    spans:
+      saveData: [164, 244]
+      getHistoryMetricData: [247, 305]
+      interval: [308, 350]
+      expiredDataCleaner: [455, 498]
+  - class: DorisDataStorage
+    editions: [v190, head]
+    protocol: jdbc_sql_or_stream_load
+    prefix: warehouse.store.doris
+    path_suffix: store/history/tsdb/doris/DorisDataStorage.java
+    write:
+      insert_sql: |
+        INSERT INTO hertzbeat.hzb_history (instance, app, metrics, metric, metric_type, int32_value, double_value, str_value, record_time, labels)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      modes: [jdbc, stream]
+      NULL_VALUE: continue drop cell
+      TYPE_NUMBER: Double.parseDouble else continue drop
+      TYPE_STRING: str_value
+      TYPE_TIME: Integer.parseInt else continue drop
+      LABEL_true: into labels JSON not metric row
+    query:
+      history_sql: |
+        SELECT record_time, metric_type, int32_value, double_value, str_value, labels
+        FROM hertzbeat.hzb_history
+        WHERE instance = ? AND app = ? AND metrics = ? AND metric = ?
+        AND record_time >= ? AND record_time <= ?
+        ORDER BY record_time DESC
+        LIMIT 20000
+      time_range: same as Greptime getTimeRange epoch seconds then Timestamp * 1000
+      MAX_QUERY_LIMIT: 20000
+    retention:
+      application_yml_partition_retention_days: 30
+      java_DefaultValue: 7
+      applied_only_when_enable_partition: true
+      application_enable_partition: false
+      property_key: dynamic_partition.history_partition_num
+    error: JDBC rollback on batch SQLException; stream fail logs; unavailable empty map
+    spans:
+      saveData: [384, 469]
+      jdbc_insert: [592, 644]
+      getHistoryMetricData: [647, 659]
+      queryMetricData: [699, 718]
+      partition_suffix: [131, 144]
+query_executors:
+  - class: GreptimeSqlQueryExecutor
+    editions: ["180", v190, head]
+    datasource: Greptime-sql
+    language: sql
+    prefix: warehouse.store.greptime
+    http_method: POST
+    http_path: /v1/sql
+    body: "sql={urlencoded expr}"
+    content_type: application/x-www-form-urlencoded
+    db_query_param: optional ?db=
+    execute_maps_rows: schema column name to value else col_N
+    query_method: inherited_SqlQueryExecutor_query_returns_null
+    http_warehouse_query_frames: inherited_null
+    storage_unavailable: StorageUnavailableException on exchange failure
+    spans:
+      constants: [56, 57]
+      execute: [71, 134]
+  - class: GreptimePromqlQueryExecutor
+    editions: ["180", v190, head]
+    datasource: Greptime-promql
+    language: promql
+    prefix: warehouse.store.greptime
+    base_url_suffix: /v1/prometheus
+    inherited: PromqlQueryExecutor
+    spans:
+      constants: [38, 40]
+  - class: VictoriaMetricsQueryExecutor
+    editions: ["180", v190, head]
+    datasource: VictoriaMetrics
+    language: promql
+    prefix: warehouse.store.victoria-metrics
+    base_url: victoriaMetricsProp.url unchanged
+    inherited: PromqlQueryExecutor
+    spans:
+      constants: [34, 34]
+  - class: VictoriaMetricsClusterQueryExecutor
+    editions: [v190, head]
+    datasource: VictoriaMetricsCluster
+    language: promql
+    prefix: warehouse.store.victoria-metrics.cluster
+    base_url_suffix: "/select/{accountID}/prometheus"
+    inherited: PromqlQueryExecutor
+    spans:
+      constants: [35, 36]
+      ctor: [38, 49]
+promql_query_executor_base:
+  class: PromqlQueryExecutor
+  editions: ["180", v190, head]
+  range_path: /api/v1/query_range
+  instant_path: /api/v1/query
+  params:
+    query: expr
+    range: [start, end, step]
+    instant: query only
+  unknown_timeType: IllegalArgumentException
+  value_time: TimePeriodUtil.normalizeToMilliseconds on first column
+  schema_fields: [{name: __ts__, type: time}, {name: __value__, type: number}]
+  error_status: 400
+  non_2xx: status from HTTP
+  spans: [56, 65, 137, 209]
+sql_query_executor_base:
+  class: SqlQueryExecutor
+  execute: returns_null
+  query: returns_null
+  spans: [58, 66]
+not_copied_whole_impl: true
+backing_server_internals_excluded: true

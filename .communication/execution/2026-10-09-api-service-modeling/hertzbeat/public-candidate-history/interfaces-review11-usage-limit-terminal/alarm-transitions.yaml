@@ -1,0 +1,170 @@
+schema: hertzbeat.public-source.interface-model/v1
+kind: alarm-transitions
+statuses:
+  pending: pending
+  firing: firing
+  resolved: resolved
+  source:
+    path: hertzbeat-common-core/src/main/java/org/apache/hertzbeat/common/constants/CommonConstants.java
+    versions: [v1.9.0, HEAD]
+    lines: [136, 148]
+severities:
+  emergency: emergency
+  critical: critical
+  warning: warning
+  info: info
+  fatal_label: fatal
+  source:
+    path: hertzbeat-common-core/src/main/java/org/apache/hertzbeat/common/constants/CommonConstants.java
+    lines: [106, 133]
+rule_types:
+  realtime_metric: realtime_metric
+  periodic_metric: periodic_metric
+  realtime_log: realtime_log
+  periodic_log: periodic_log
+  source:
+    path: hertzbeat-common-core/src/main/java/org/apache/hertzbeat/common/constants/CommonConstants.java
+    lines: [151, 167]
+alert_modes:
+  group: group
+  individual: individual
+define_entity:
+  type: org.apache.hertzbeat.common.entity.alerter.AlertDefine
+  table: hzb_alert_define
+  required: [name]
+  fields: [id, name, type, expr, period, times, labels, annotations, template, datasource, enable]
+  source:
+    path: hertzbeat-common-spring/src/main/java/org/apache/hertzbeat/common/entity/alerter/AlertDefine.java
+    versions: [v1.9.0, HEAD]
+    lines: [48, 104]
+pipeline:
+  - stage: calculate
+    realtime_metrics: org.apache.hertzbeat.alert.calculate.realtime.MetricsRealTimeAlertCalculator
+    periodic_metrics: org.apache.hertzbeat.alert.calculate.periodic.MetricsPeriodicAlertCalculator
+    realtime_log: org.apache.hertzbeat.alert.calculate.realtime.WindowedLogRealTimeAlertCalculator
+    periodic_log: org.apache.hertzbeat.alert.calculate.periodic.LogPeriodicAlertCalculator
+  - stage: fingerprint
+    component: AlarmCommonReduce.generateAlertFingerprint
+    excludes: [timestamp, starts_at, actives_at, end_at, ends_at, start_at, active_at]
+    join: "key:value,"
+    source:
+      path: hertzbeat-alerter/src/main/java/org/apache/hertzbeat/alert/reduce/AlarmCommonReduce.java
+      lines: [117, 126]
+  - stage: group
+    component: AlarmGroupReduce
+  - stage: inhibit
+    component: AlarmInhibitReduce
+    note: This is the suppress implementation. There is no separate suppress reducer class.
+  - stage: silence
+    component: AlarmSilenceReduce
+  - stage: notify
+    component: AlertNoticeDispatch.dispatchAlarm
+trigger:
+  source:
+    path: hertzbeat-alerter/src/main/java/org/apache/hertzbeat/alert/calculate/realtime/MetricsRealTimeAlertCalculator.java
+    lines: [370, 429]
+  laws:
+    - requiredTimes defaults to 1 when define.times is null
+    - first match with requiredTimes <= 1 creates SingleAlert status=firing, putFiring, reduceAndSendAlarm
+    - first match with requiredTimes > 1 creates SingleAlert status=pending, putPending
+    - subsequent pending increments triggerTimes and activeAt
+    - pending becomes firing when triggerTimes >= requiredTimes; then removePending, putFiring, reduceAndSendAlarm
+    - expr may match on commonContext before rows (availability/up-down); a successful pre-row compile skips row evaluation
+    - row evaluation uses field types and label fields as extra fingerprint keys
+    - blank expr is skipped
+recover:
+  source:
+    path: hertzbeat-alerter/src/main/java/org/apache/hertzbeat/alert/calculate/realtime/MetricsRealTimeAlertCalculator.java
+    lines: [356, 367]
+  laws:
+    - non-match calls handleRecoveredAlert
+    - removeFiring; if a firing alert existed, set triggerTimes=1, endAt=now, status=resolved, reduceAndSendAlarm
+    - always removePending for that fingerprint
+    - comment records unresolved multi-times recover policy ("todo consider multi times to tig for resolved alert")
+filter:
+  required_app_equals_in_expr: 'equals(__app__,"...")'
+  optional_metrics: 'equals(__metrics__,"...")'
+  optional_instance: 'equals(__instance__, "digits")'
+  optional_labels: 'contains(__labels__, "k:v")'
+  available_expr_rejected_when_priority_not_0: true
+  available_filter_law: When priority != 0, an expr that matches AVAILABLE_PATTERN is dropped.
+  source:
+    path: hertzbeat-alerter/src/main/java/org/apache/hertzbeat/alert/calculate/realtime/MetricsRealTimeAlertCalculator.java
+    lines: [295, 350]
+    verified_span:
+      app_required: [303, 307]
+      available_priority: [309, 315]
+      metrics_optional: [317, 321]
+      instance_and_labels: [323, 348]
+group:
+  defaults:
+    groupWait: 30000
+    groupInterval: 300000
+    repeatInterval: 14400000
+    checkInterval: 1000
+  source:
+    path: hertzbeat-alerter/src/main/java/org/apache/hertzbeat/alert/reduce/AlarmGroupReduce.java
+    lines: [55, 78]
+  laws:
+    - no labels or no group defines -> wrap as single GroupAlert and inhibit
+    - match requires all rule groupLabels present
+    - first send after groupWait; later after groupInterval
+    - all-resolved group sends immediately
+    - firing repeatInterval suppresses repeated firing notifications only; a resolved member still sends
+    - group status is firing if any member is firing, else resolved
+    - resolved members are dropped from cache after emit; firing members remain
+    - startAt is preserved when updating an existing fingerprint
+inhibit_suppress:
+  source:
+    path: hertzbeat-alerter/src/main/java/org/apache/hertzbeat/alert/reduce/AlarmInhibitReduce.java
+    lines: [194, 272]
+  laws:
+    - empty rules pass through to silence
+    - source alerts must be status=firing and match sourceLabels
+    - source cache TTL default 4 hours, cleanup every 60s
+    - resolved targets are never inhibited
+    - target matching sourceLabels/targetLabels plus equalLabels (all equal, or true if equalLabels empty)
+    - inhibited alerts are removed from the group; empty remaining group does not silence/notify
+silence:
+  source:
+    path: hertzbeat-alerter/src/main/java/org/apache/hertzbeat/alert/reduce/AlarmSilenceReduce.java
+    lines: [52, 143]
+  types:
+    0: one-time periodStart/periodEnd LocalDateTime
+    1: cyclic days-of-week plus LocalTime window, including cross-midnight
+  match: matchAll or any configured label equals a groupLabel
+  silenced: increment times, persist, return without notify
+  not_silenced: AlertNoticeDispatch.dispatchAlarm
+notify:
+  source:
+    path: hertzbeat-alerter/src/main/java/org/apache/hertzbeat/alert/notice/AlertNoticeDispatch.java
+    lines: [117, 155]
+  order:
+    - store via alertStoreHandler
+    - sendNotify for matching NoticeRule receivers
+    - Plugin.alert (legacy)
+    - PostAlertPlugin.execute
+    - SSE broadcast JsonUtil.toJson(storedGroupAlert)
+  skip_receiver: receiver null or type null
+  notice_exception: logged, not rethrown from worker
+periodic:
+  disabled_or_blank_expr: log error and return
+  datasource_eval: DataSourceService.calculate(define.datasource, define.expr)
+  source:
+    path: hertzbeat-alerter/src/main/java/org/apache/hertzbeat/alert/calculate/periodic/MetricsPeriodicAlertCalculator.java
+    lines: [62, 80]
+rest_status_edit:
+  PUT /api/alerts/group/status/{status} with ids edits stored group status
+  empty ids is success noop
+suppress_gap:
+  statement: No dedicated suppress class or REST resource exists. Inhibit is the Prometheus-style suppress path. Group repeatInterval suppresses repeated firing notifications. Silence drops notify.
+caches:
+  CACHE_NOTICE_RULE: notice_rule
+  CACHE_ALERT_SILENCE: alert_silence
+  METRIC_CACHE_ALERT_DEFINE: metric_alert_define
+  LOG_CACHE_ALERT_DEFINE: log_alert_define
+  CACHE_ALERT_GROUP_CONVERGE: alert_group_converge
+  CACHE_ALERT_INHIBIT: alert_inhibit
+  source:
+    path: hertzbeat-common-core/src/main/java/org/apache/hertzbeat/common/constants/CommonConstants.java
+    lines: [251, 278]

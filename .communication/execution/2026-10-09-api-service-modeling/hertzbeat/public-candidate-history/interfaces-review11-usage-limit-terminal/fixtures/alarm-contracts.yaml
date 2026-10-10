@@ -1,0 +1,107 @@
+schema: hertzbeat.public-source.interface-model/v1
+kind: fixtures.alarm
+independent: true
+positive:
+  - id: alarm.pending.to.firing
+    define: {id: 11, name: cpu, times: 3, expr: 'equals(__app__,"linux") && usage>90', labels: {severity: warning}, template: "cpu {{ usage }}"}
+    samples:
+      - {match: true}
+      - {match: true}
+      - {match: true}
+    expect:
+      - {status: pending, triggerTimes: 1, notified: false}
+      - {status: pending, triggerTimes: 2, notified: false}
+      - {status: firing, triggerTimes: 3, notified: true}
+    source: MetricsRealTimeAlertCalculator.java:370-429
+  - id: alarm.immediate.firing
+    define: {times: 1, expr: 'equals(__app__,"linux") && usage>90'}
+    samples: [{match: true}]
+    expect: [{status: firing, triggerTimes: 1, notified: true}]
+    source: MetricsRealTimeAlertCalculator.java:407-411
+  - id: alarm.recover
+    prior: {status: firing, fingerprint: "defineid:11,alertname:cpu"}
+    sample: {match: false}
+    expect: {status: resolved, triggerTimes: 1, endAt: set, notified: true, pending_removed: true}
+    source: MetricsRealTimeAlertCalculator.java:356-367
+  - id: alarm.filter.app
+    define_expr: 'equals(__app__,"linux") && usage>90'
+    metrics: {app: mysql}
+    expect: define dropped before eval
+    source: MetricsRealTimeAlertCalculator.java:303-306
+  - id: alarm.group.wait
+    rule: {groupLabels: [alertname], groupWait: 30, groupInterval: 300, repeatInterval: 14400}
+    first_member_at: t0
+    expect_first_send_at: t0+30000ms
+    source: AlarmGroupReduce.java:328-340
+  - id: alarm.group.all.resolved.immediate
+    cache_members: [{status: resolved}]
+    expect: send immediately
+    source: AlarmGroupReduce.java:343-347
+  - id: alarm.group.repeat.allows.recovery
+    cache: {status: firing, lastRepeatTime: now}
+    incoming: {status: resolved}
+    expect: send despite repeatInterval
+    source: AlarmGroupReduce.java:291-304
+  - id: alarm.inhibit.source.caches
+    rule: {sourceLabels: {severity: critical}, targetLabels: {severity: warning}, equalLabels: [instance]}
+    source_alert: {status: firing, labels: {severity: critical, instance: a}}
+    target_alert: {status: firing, labels: {severity: warning, instance: a}}
+    expect: target removed, group empty => no silence/notify
+    source: AlarmInhibitReduce.java:205-220
+  - id: alarm.silence.once
+    silence: {type: 0, matchAll: true, periodStart: past, periodEnd: future, enable: true}
+    expect: times incremented, no dispatchAlarm
+    source: AlarmSilenceReduce.java:72-78
+  - id: alarm.notify.store.then.sse
+    given: unmatched silence, matching NoticeRule and receiver
+    expect_order: [store, sendNotify, Plugin.alert, PostAlertPlugin.execute, SSE broadcast]
+    source: AlertNoticeDispatch.java:117-128
+negative:
+  - id: alarm.blank.expr
+    define: {expr: ""}
+    expect: skipped
+    source: MetricsRealTimeAlertCalculator.java:203-205
+  - id: alarm.available.on.non.priority0
+    define_expr: 'equals(__app__,"linux") && equals(__available__,"up")'
+    metrics: {priority: 1}
+    expect: filtered out
+    source: MetricsRealTimeAlertCalculator.java:310-314
+  - id: alarm.inhibit.resolved.target
+    target: {status: resolved}
+    expect: not inhibited
+    source: AlarmInhibitReduce.java:251-253
+  - id: alarm.inhibit.non.firing.source
+    source_alert: {status: pending}
+    expect: not cached as source
+    source: AlarmInhibitReduce.java:236-238
+  - id: alarm.silence.outside.window
+    silence: {type: 0, periodStart: future, periodEnd: later}
+    expect: dispatchAlarm
+    source: AlarmSilenceReduce.java:129-142
+  - id: alarm.periodic.disabled
+    define: {enable: false, expr: up==0}
+    expect: return
+    source: MetricsPeriodicAlertCalculator.java:63-65
+  - id: alarm.group.no.labels
+    alert: {labels: {}}
+    groupDefines: present
+    expect: sendSingleAlert wrap
+    source: AlarmGroupReduce.java:201-205
+  - id: alarm.fingerprint.ignores.time.keys
+    labels: {alertname: cpu, timestamp: "1", starts_at: "2", instance: a}
+    expect_fingerprint: "alertname:cpu,instance:a"
+    source: AlarmCommonReduce.java:117-126
+rest:
+  - id: alarm.rest.status.edit.noop
+    request: {method: PUT, path: /api/alerts/group/status/resolved}
+    expect: {code: 0}
+    source: AlertsController.java:102-111
+  - id: alarm.rest.group.delete.noop
+    request: {method: DELETE, path: /api/alerts/group}
+    expect: {code: 0}
+    source: AlertsController.java:91-99
+suppress_mapping:
+  inhibit: suppress by source/target labels
+  group_repeatInterval: suppress repeated firing notify
+  silence: drop notify
+  dedicated_suppress_resource: absent
