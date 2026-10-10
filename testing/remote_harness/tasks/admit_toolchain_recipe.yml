@@ -1,0 +1,90 @@
+---
+# testing/remote_harness/tasks/admit_toolchain_recipe.yml -- the ONE role-recipe admission (codex-tick853 option (a)).
+# Roles: builder -- the declared controller recipe (controller.expect_core, controller.bootstrap, controller.lock_file_rel),
+# bound here to controller.bootstrap.genesis.builder (core, python_major_minor); test -- the controller-under-test recipe
+# controller.test_recipes[controller.test_leg], selected by the registry-admitted selector controller.test_leg (REQUIRED).
+# A recipe names whole subtrees (expect_core, lock_file_rel, bootstrap.{python, core_supported_python, artifacts}); the
+# seed reads only ctl.expect_core / ctl.lock_file_rel (controller_seed.j2 :29, :288, :877, :932, :1509, :1696), so the
+# builder render and its generation do not move when a leg is selected. Controller-side only (assert / set_fact / file
+# lookup): every refusal is before any effect. Inputs (include vars, no default): rh_rc_policy (a resolved remote-harness
+# policy), rh_rc_key (the record key). Output: rh_rc_acc[rh_rc_key] = {builder, test}, each {role, leg, ctl, bs, lock,
+# lock_rel, lock_sha256, rows, recipe_sha256}; the caller starts rh_rc_acc as an explicit empty record.
+# DRAFT, CANDIDATE_PENDING_C1_ATOMIC_JOIN.
+
+- name: Refuse an undeclared, unknown, incompatible or incompletely bound recipe selection (before any effect)
+  vars:
+    _c: "{{ rh_rc_policy.controller }}"
+    _gb: "{{ rh_rc_policy.controller.bootstrap.genesis.builder }}"
+  ansible.builtin.assert:
+    that:
+      - rh_rc_key is string and rh_rc_key | length > 0
+      - rh_rc_acc is mapping and rh_rc_key not in rh_rc_acc
+      - _c.expect_core is string and _c.lock_file_rel is string
+      - _c.expect_core == _gb.core
+      - _c.bootstrap.python.major_minor == _gb.python_major_minor
+      - _c.test_recipes is mapping
+      - _c.test_leg is string
+      - _c.test_leg in _c.test_recipes
+      - _c.test_recipes[_c.test_leg] is mapping
+      - (_c.test_recipes[_c.test_leg].keys() | list | sort) == ['bootstrap', 'expect_core', 'lock_file_rel']
+      - _c.test_recipes[_c.test_leg].expect_core is string and _c.test_recipes[_c.test_leg].lock_file_rel is string
+      - _c.test_recipes[_c.test_leg].bootstrap is mapping
+      - (_c.test_recipes[_c.test_leg].bootstrap.keys() | list | sort) == ['artifacts', 'core_supported_python', 'python']
+    fail_msg: >-
+      REFUSED RH-TOOLCHAIN-RECIPE ({{ rh_rc_key }}): the builder recipe must be controller.expect_core ==
+      genesis.builder.core and python major.minor == genesis.builder.python_major_minor; controller.test_leg is required
+      and must name a key of controller.test_recipes whose recipe is exactly {expect_core, lock_file_rel, bootstrap:
+      {artifacts, core_supported_python, python}}. Nothing was rendered, fetched or installed.
+    quiet: true
+
+# HOLE OQ-ROUTE-853-SELECTOR-OMISSION (with Codex; seat ruling 1): what an omitted selection means is not decided here.
+# Candidate shapes: (1) seat recommendation -- controller.test_leg is mandatory and the declared controller recipe is an
+# explicit controller.test_recipes entry (this file then stays as written); (2) an omitted selection means the declared
+# controller recipe (needs an explicit, Codex-admitted form; no optional-key handling is written here). Until decided,
+# the selector is REQUIRED (asserted above).
+- name: Compose the role recipes from the declarations (builder = the declared controller recipe; test = the selected leg)
+  vars:
+    _c: "{{ rh_rc_policy.controller }}"
+    _t: "{{ rh_rc_policy.controller.test_recipes[rh_rc_policy.controller.test_leg] }}"
+    _tbs: "{{ rh_rc_policy.controller.bootstrap | combine(_t.bootstrap) }}"
+  ansible.builtin.set_fact:
+    _rh_rc_raw:
+      builder: {role: builder, ctl: "{{ _c }}", bs: "{{ _c.bootstrap }}", lock_rel: "{{ _c.lock_file_rel }}"}
+      test: {role: test, ctl: "{{ _c | combine({'expect_core': _t.expect_core, 'lock_file_rel': _t.lock_file_rel, 'bootstrap': _tbs}) }}", bs: "{{ _tbs }}", lock_rel: "{{ _t.lock_file_rel }}"}
+
+- name: Refuse a swapped lock or interpreter (each role's lock is its own recipe's leg; before any effect)
+  vars:
+    _r: "{{ _rh_rc_raw[item] }}"
+    _k: "{{ lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ _rh_rc_raw[item].lock_rel) | from_yaml }}"
+  ansible.builtin.assert:
+    that:
+      - _k is mapping
+      - _k.leg == 'core-' ~ _r.ctl.expect_core
+      - _k.python_major_minor == _r.bs.python.major_minor
+      - _r.bs.python.major_minor in _r.bs.core_supported_python
+      - _r.bs.artifacts | selectattr('key', 'equalto', _r.bs.python.artifact) | list | length == 1
+      - _k.packages is sequence and _k.collections is sequence
+    fail_msg: >-
+      REFUSED RH-TOOLCHAIN-RECIPE ({{ rh_rc_key }}, role {{ item }}): lock {{ _r.lock_rel }} declares leg
+      {{ _k.leg | to_json }} / python {{ _k.python_major_minor | to_json }}, but the recipe is core {{ _r.ctl.expect_core }} on
+      python {{ _r.bs.python.major_minor }} (supported {{ _r.bs.core_supported_python | to_json }}); one python_archive row is required.
+    quiet: true
+  loop: [builder, test]
+
+- name: Publish this scope's admitted role recipes (derived output; registry reserved)
+  vars:
+    _out: >-
+      {%- set ns = namespace(d={}) -%}
+      {%- for role in ['builder', 'test'] -%}
+      {%- set r = _rh_rc_raw[role] -%}
+      {%- set raw = lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ r.lock_rel) -%}
+      {%- set k = raw | from_yaml -%}
+      {%- set ident = {'expect_core': r.ctl.expect_core, 'lock_rel': r.lock_rel, 'lock_sha256': raw | hash('sha256'),
+                       'python': r.bs.python, 'core_supported_python': r.bs.core_supported_python,
+                       'artifacts': r.bs.artifacts, 'uv': r.bs.uv} -%}
+      {%- set ns.d = ns.d | combine({role: r | combine({'leg': k.leg, 'lock': k, 'lock_sha256': raw | hash('sha256'),
+                                                       'rows': r.bs.artifacts + k.packages + k.collections,
+                                                       'recipe_sha256': ident | to_json(sort_keys=true) | hash('sha256')})}) -%}
+      {%- endfor -%}{{ ns.d }}
+  ansible.builtin.set_fact:
+    rh_rc_acc: "{{ rh_rc_acc | combine({rh_rc_key: _out}) }}"

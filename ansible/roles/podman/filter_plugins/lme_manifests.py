@@ -28,6 +28,7 @@ from __future__ import absolute_import, division, print_function
 import copy
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 
@@ -772,9 +773,9 @@ def lme_config_revision(payload):
     (codex-0200). A timestamp, if recorded at all, is METADATA and is NOT part of
     the payload. OUTPUT-ONLY: the id is never fed back as a resolution input.
 
-    Value-pure: canonical JSON (sorted keys, no whitespace) then sha256."""
-    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'), default=str)
-    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    Value-pure: canonical JSON (sorted keys, no whitespace) then sha256 -- the ONE canonical digest _digest
+    (C1-RECIPE-PUB-02, OW-L1-JSON-DEFAULT-STR-01): an unsupported value refuses, an admitted payload keeps its bytes."""
+    return _digest(payload)
 
 
 def _strip_resource_ids(status):
@@ -2435,8 +2436,43 @@ def lme_service_coverage_gap(declared_universe, services):
 
 # Prerequisite hunk (byte-identical to the helper introduced by stack commit ea67f95 REV-ACCEL-MODEL): its
 # SEED-06 consumer is _rh_validate (policy_sha256). The later accelerator join keeps ONE definition.
+# C1-RECIPE-PUB-02 (OW-L1-JSON-DEFAULT-STR-01 closed; codex-tick884 Q290_2 b): THE canonical digest -- policy, scope,
+# reuse-key and structural digests, every select_tree digest and lme_config_revision. The payload is admitted first
+# (_rh_canonical_admit) and json gets no default hook, so it serializes an admitted payload natively (the old bytes,
+# since json called the old hook only for unsupported values); any other value refuses instead of becoming its str().
+_RH_CANONICAL_SCALARS = (str, bool, int)
+
+
+def _rh_canonical_admit(v, at):
+    """C1-RECIPE-PUB-02 (codex-tick884 Q290_2 b): admit v for _digest, recursively: null, str, bool, int, a finite
+    float, a list of admitted values, or a dict whose keys are all str and whose values are admitted (a subclass of an
+    admitted type serializes as that type). Anything else -- tuple, set, bytes, date or datetime, a non-dict Mapping, an
+    undefined or any other object --, a non-str key or a nonfinite float raises ValueError naming the path and the
+    type, never the value."""
+    where = '.'.join(at) if at else '<root>'
+    if v is None or isinstance(v, _RH_CANONICAL_SCALARS):
+        return
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            raise ValueError('lme: canonical digest refuses a nonfinite number at %s' % (where,))
+        return
+    if isinstance(v, list):
+        for i, x in enumerate(v):
+            _rh_canonical_admit(x, at + ['[%d]' % (i,)])
+        return
+    if isinstance(v, dict):
+        bad = sorted(type(k).__name__ for k in v if not isinstance(k, str))
+        if bad:
+            raise ValueError('lme: canonical digest refuses non-string mapping keys (%s) at %s' % (', '.join(bad), where))
+        for k in v:
+            _rh_canonical_admit(v[k], at + [k])
+        return
+    raise ValueError('lme: canonical digest refuses an unsupported %s at %s (admitted: null, str, bool, int, finite float, list, string-keyed mapping)' % (type(v).__name__, where))
+
+
 def _digest(obj):
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(',', ':'), default=str).encode('utf-8')).hexdigest()
+    _rh_canonical_admit(obj, [])
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest()
 
 
 def _rh_kind(v):
@@ -2476,8 +2512,25 @@ def _rh_get(tree, dotted):
 # entry-generation projection kinds. Every literal below is a registry KEY of the declaration it reads (the kind's own
 # contract, documented beside the declaration in global.yml); every value is read through a registry pointer.
 _RH_DOC_CHANNEL_KEYS = frozenset(('at', 'when', 'fact', 'read', 'encoding', 'digest_algorithm', 'rel_pattern', 'admission',
-                                  'refusal', 'message'))
-_RH_DOC_ADMISSION_KEYS = frozenset(('fact', 'members', 'observed'))
+                                  'refusal', 'message', 'parse'))
+# F-LIS12-DUPKEY (codex-tick710 C1-DK-DIAGNOSTIC-KEY-DISCLOSURE; OD-DK-DECL-01; codex-tick712): document_channel.parse.
+# Its registry keys, and the ONLY fields each declared position / diagnostic text may name (sorted): the admitted
+# document identity (rel), the declared encoding, an exception class name (error) and position metadata. No field
+# carries a key, a value, source text or an exception message.
+_RH_DOC_PARSE_KEYS = frozenset(('tags', 'bases', 'positions', 'diagnostics'))
+_RH_DOC_PARSE_TAG_KEYS = frozenset(('merge', 'value'))
+_RH_DOC_PARSE_TAG_FIELDS = frozenset(('tag', 'plain'))
+_RH_DOC_PARSE_BASES = frozenset(('authored', 'aliased'))
+_RH_DOC_PARSE_POSITIONS = {'marked': ('column', 'line'), 'unmarked': ()}
+_RH_DOC_PARSE_DIAGNOSTICS = {
+    'duplicate_key': ('basis', 'column', 'first_basis', 'first_column', 'first_line', 'line', 'rel'),
+    'duplicate_merge': ('basis', 'column', 'first_basis', 'first_column', 'first_line', 'line', 'rel'),
+    'unconstructable': ('error', 'rel', 'where'),
+    'unencodable': ('encoding', 'error', 'rel'),
+    'unparsable': ('error', 'rel', 'where')}
+# C1 s10 L10-01 (records-c1-framework-27; codex-tick821 item 5): + declaration / partial, the presence names of the
+# reader inputs (_rh_sa_decl, rh_src_partial) declared WITH the document-admission contract.
+_RH_DOC_ADMISSION_KEYS = frozenset(('declaration', 'fact', 'members', 'observed', 'partial'))
 _RH_DOC_FACT_KEYS = frozenset(('rel', 'text'))
 _RH_DOC_PRIMARY_KEYS = frozenset(('rel_from', 'root'))
 _RH_DOC_DEPENDENT_KEYS = frozenset(('document', 'rel_at'))
@@ -2509,7 +2562,9 @@ def _rh_document_channel(schema):
     resolver outputs (var_name, listed in resolver_outputs); rel_pattern names a contract_admission pattern (the ONE
     relative-path grammar, F05S2-RELATIVE-PATH-GRAMMAR); admission.members / admission.observed are policy paths whose
     values name the admission record's members container and observed-digest field (S3-SEAM-01, OD-S3-02 a);
-    refusal matches patterns.refusal_code."""
+    admission.partial / admission.declaration are the presence names of the reader inputs (var_name, distinct from
+    both facts; records-c1-framework-27 L10), distinct from each other and each a reserved output (records-c1-framework-29
+    L11-05); refusal matches patterns.refusal_code."""
     pats, ptext = _rh_patterns(schema)
     for k in ('document_channel', 'resolver_outputs'):
         if k not in schema:
@@ -2517,7 +2572,7 @@ def _rh_document_channel(schema):
     ch = schema['document_channel']
     outs = schema['resolver_outputs']
     if not isinstance(ch, dict) or set(ch) != _RH_DOC_CHANNEL_KEYS \
-            or any(not isinstance(ch[k], str) or not ch[k] for k in _RH_DOC_CHANNEL_KEYS - {'admission'}) \
+            or any(not isinstance(ch[k], str) or not ch[k] for k in _RH_DOC_CHANNEL_KEYS - {'admission', 'parse'}) \
             or not isinstance(ch['admission'], dict) or set(ch['admission']) != _RH_DOC_ADMISSION_KEYS \
             or any(not isinstance(v, str) or not v for v in ch['admission'].values()):
         raise ValueError('lme: registry remote_harness_schema.document_channel must carry exactly %s (admission exactly %s) with non-empty string values; got %r' % (
@@ -2525,14 +2580,82 @@ def _rh_document_channel(schema):
     for f in (ch['fact'], ch['admission']['fact']):
         if 'var_name' not in pats or not pats['var_name'].fullmatch(f) or not isinstance(outs, list) or f not in outs:
             raise ValueError('lme: registry remote_harness_schema.document_channel fact %r must be a var_name listed in resolver_outputs (a reserved resolver output); got resolver_outputs %r' % (f, outs))
+    # C1 s10 L10-02 (records-c1-framework-27): admission.partial / admission.declaration name reader INPUTS (presence
+    # names tested by membership in vars), so resolver_outputs membership is NOT required; each is a var_name distinct
+    # from both facts.
+    for k in ('partial', 'declaration'):
+        f = ch['admission'][k]
+        if 'var_name' not in pats or not pats['var_name'].fullmatch(f) or f in (ch['fact'], ch['admission']['fact']):
+            raise ValueError('lme: registry remote_harness_schema.document_channel.admission.%s %r must be a var_name distinct from document_channel.fact %r and admission.fact %r' % (k, f, ch['fact'], ch['admission']['fact']))
+    # C1 s11 L11-05 (records-c1-framework-29; codex-tick823 OPEN-NOTE-L10-DISTINCT): the two reader-input roles name
+    # DIFFERENT inputs (different structures), and each is a reserved output, so its first-entry protection
+    # (refuse_pinned_outputs.yml) and its producer follow the declared name: presence, value and protection move together.
+    if ch['admission']['partial'] == ch['admission']['declaration']:
+        raise ValueError('lme: registry remote_harness_schema.document_channel.admission.partial and admission.declaration must name distinct reader inputs; both are %r' % (ch['admission']['partial'],))
+    if 'reserved_outputs' not in schema or not isinstance(schema['reserved_outputs'], list):
+        raise ValueError('lme: registry remote_harness_schema.reserved_outputs must be a list (document_channel.admission input names are first-entry protected through it); got %r' % (
+            _rh_kind(schema['reserved_outputs']) if 'reserved_outputs' in schema else '<absent>',))
+    miss = [k for k in ('partial', 'declaration') if ch['admission'][k] not in schema['reserved_outputs']]
+    if miss:
+        raise ValueError('lme: registry remote_harness_schema.document_channel.admission %s %r must each be listed in remote_harness_schema.reserved_outputs (first-entry protected)' % (
+            miss, [ch['admission'][k] for k in miss]))
+    # C1 records-c1-framework-30-r2 (codex-tick826 FW30-PUBLICATION-ROLE-COLLISION; the registry ingress applies the same
+    # rule, R2-03): each reader-input publication name is disjoint from every declared pre-view name (every value of every
+    # entry of contract_admission.early_names: the internal binding and working facts bound before any view). The other
+    # publication role is excluded above (L11-05). This code names no early name and no entry key.
+    if 'contract_admission' not in schema or not isinstance(schema['contract_admission'], dict) \
+            or 'early_names' not in schema['contract_admission'] or not isinstance(schema['contract_admission']['early_names'], dict) \
+            or any(not isinstance(e, dict) or any(not isinstance(v, str) for v in e.values()) for e in schema['contract_admission']['early_names'].values()):
+        raise ValueError('lme: registry remote_harness_schema.contract_admission.early_names must be a mapping of entry mappings with string values (document_channel.admission names are checked against it)')
+    early = [v for e in schema['contract_admission']['early_names'].values() for v in e.values()]
+    hit = [k for k in ('partial', 'declaration') if ch['admission'][k] in early]
+    if hit:
+        raise ValueError('lme: registry remote_harness_schema.document_channel.admission %s %r must not be declared pre-view names (contract_admission.early_names: internal binding and working facts)' % (
+            hit, [ch['admission'][k] for k in hit]))
     if ch['rel_pattern'] not in pats:
         raise ValueError('lme: registry remote_harness_schema.document_channel.rel_pattern %r must name a declared contract_admission.patterns entry' % (ch['rel_pattern'],))
     if 'refusal_code' not in pats:
         raise ValueError('lme: registry remote_harness_schema.contract_admission.patterns declares no refusal_code; document_channel.refusal %r cannot be admitted' % (ch['refusal'],))
     if not pats['refusal_code'].fullmatch(ch['refusal']):
         raise ValueError('lme: registry remote_harness_schema.document_channel.refusal %r must fully match patterns.refusal_code %r' % (ch['refusal'], ptext['refusal_code']))
+    _rh_doc_parse_decl(ch['parse'])
     _rh_contract_active({}, schema, ch['when'], 'remote_harness_schema.document_channel.when')
     return ch
+
+
+def _rh_doc_parse_decl(p):
+    """F-LIS12-DUPKEY (codex-tick710 C1-DK-DIAGNOSTIC-KEY-DISCLOSURE; OD-DK-DECL-01; codex-tick712 C1-DK-TAG-ROLE-BINDING):
+    registry remote_harness_schema.document_channel.parse, admitted with the channel at every use. tags: the merge and
+    value keys ({tag, plain}); after the shape check each role is bound to THIS parser's resolver AND role semantics
+    (_rh_yaml_roles_bound), so a refusal precedes every document read; bases: the words for where a reported key
+    position comes from; positions / diagnostics: str.format texts naming EXACTLY the fields of
+    _RH_DOC_PARSE_POSITIONS / _RH_DOC_PARSE_DIAGNOSTICS, each once, plain names only (no attribute, index, conversion or
+    format spec), so no text can reach anything but the supplied metadata. The node supplies words, never a choice: no
+    declared value disables the duplicate refusal."""
+    import string
+
+    def fields(text):
+        try:
+            parts = list(string.Formatter().parse(text))
+        except ValueError:
+            return None
+        if any(f is not None and (spec or conv is not None) for _lit, f, spec, conv in parts):
+            return None
+        return tuple(sorted(f for _lit, f, _spec, _conv in parts if f is not None))
+
+    def texts(node, want):
+        return isinstance(node, dict) and set(node) == set(want) and all(
+            isinstance(node[k], str) and node[k] and fields(node[k]) == tuple(want[k]) for k in want)
+    if not isinstance(p, dict) or set(p) != _RH_DOC_PARSE_KEYS or not isinstance(p['tags'], dict) \
+            or set(p['tags']) != _RH_DOC_PARSE_TAG_KEYS \
+            or any(not isinstance(t, dict) or set(t) != _RH_DOC_PARSE_TAG_FIELDS
+                   or any(not isinstance(x, str) or not x for x in t.values()) for t in p['tags'].values()) \
+            or not texts(p['bases'], dict((b, ()) for b in _RH_DOC_PARSE_BASES)) \
+            or not texts(p['positions'], _RH_DOC_PARSE_POSITIONS) or not texts(p['diagnostics'], _RH_DOC_PARSE_DIAGNOSTICS):
+        raise ValueError('lme: registry remote_harness_schema.document_channel.parse must carry exactly %s: tags exactly %s, each exactly %s of non-empty strings; bases exactly %s with no format field; positions %s and diagnostics %s as non-empty texts whose str.format fields are exactly those named, each once (no attribute, index, conversion or format spec); got %r' % (
+            sorted(_RH_DOC_PARSE_KEYS), sorted(_RH_DOC_PARSE_TAG_KEYS), sorted(_RH_DOC_PARSE_TAG_FIELDS), sorted(_RH_DOC_PARSE_BASES),
+            _RH_DOC_PARSE_POSITIONS, _RH_DOC_PARSE_DIAGNOSTICS, p))
+    _rh_yaml_roles_bound(p['tags'])
 
 
 def _rh_doc_refuse(ch, key, path, detail, value):
@@ -2622,7 +2745,9 @@ def _rh_documents_admit(pol, schema, key, documents, admission, partial):
             fr, rel = _rh_get(out[e['document']]['root'], e['rel_at'])
             src = 'document %s (%s) root %s' % (e['document'], out[e['document']]['rel'], e['rel_at'])
         if not fr or not isinstance(rel, str) or not relp.fullmatch(rel):
-            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'resolves through %s to no repository-relative path fully matching patterns.%s %r' % (src, ch['rel_pattern'], ptext[ch['rel_pattern']]), rel if fr else '<absent>')
+            # codex-tick712 OBS-DK2-01: a dependent rel is a VALUE of the parent document; a value that fails the pattern is
+            # not an admitted identity, so only its kind is shown. A primary rel is the policy value (a declaration).
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'resolves through %s to no repository-relative path fully matching patterns.%s %r' % (src, ch['rel_pattern'], ptext[ch['rel_pattern']]), (rel if n in prim else _rh_kind(rel)) if fr else '<absent>')
         if rel in seen:
             _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'resolves to rel %r, already document %s (a document rel is declared once)' % (rel, seen[rel]), rel)
         return rel
@@ -2635,22 +2760,33 @@ def _rh_documents_admit(pol, schema, key, documents, admission, partial):
                            sorted(d) if isinstance(d, dict) else _rh_kind(d))
         if d['rel'] != rel:
             _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'is declared at rel %r; resolver output %s.%s.rel names another file (name-to-rel binding, LD01; nothing is parsed)' % (rel, ch['fact'], n), d['rel'])
+        # codex-tick712 OBS-DK2-02: the exception text names the offending character; only its class is kept, and the
+        # refusal is raised after the handler (no exception context; records-dupkey-03 exception_chain).
+        raw, unenc = b'', ''
         try:
             raw = d['text'].encode(enc)
         except UnicodeError as exc:
-            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'text of %r is not encodable as %s (%s)' % (rel, enc, exc), rel)
+            unenc = type(exc).__name__
+        if unenc:
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), ch['parse']['diagnostics']['unencodable'].format(rel=rel, encoding=enc, error=unenc), rel)
         sha = hashlib.new(alg, raw).hexdigest()
         if rel not in adm or not isinstance(adm[rel], dict) or ok not in adm[rel]:
             _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'rel %r is not admitted by resolver output %s[%r] (no %r digest; the source admission precedes every read)' % (rel, am['fact'], mk, ok), sorted(adm))
         if adm[rel][ok] != sha:
             _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'text of %r digests to %s; the admitted %s is %r (exact bytes are compared BEFORE any parse)' % (rel, sha, ok, adm[rel][ok]), sha)
-        try:
-            parsed = yaml.safe_load(d['text'])
-        except yaml.YAMLError as exc:
-            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), 'admitted text of %r does not parse (%s)' % (rel, exc), rel)
+        # F-LIS12-DUPKEY (codex-tick702 mechanism 2; codex-tick710; codex-tick712 C1-DK-CONSTRUCTOR-DIAGNOSTICS): the SAME
+        # text whose bytes were digested above is parsed; a mapping repeating a key refuses. The parse never raises for the
+        # text: every failure comes back as metadata (role, class name, positions) and the declared document_channel.parse
+        # text is raised HERE, outside any exception handler, so the refusal has no exception context or cause.
+        dp = ch['parse']
+        parsed, failure = _rh_yaml_load_unique(d['text'], dp['tags'])
+        if failure:
+            _rh_doc_refuse(ch, key, '%s.%s' % (ch['at'], n), _rh_doc_parse_text(dp, rel, failure), rel)
         if n in prim:
             if not isinstance(parsed, dict) or e['root'] not in parsed or not isinstance(parsed[e['root']], dict):
-                _rh_doc_refuse(ch, key, '%s.%s.root' % (ch['at'], n), 'names %r; the admitted %r must be a mapping carrying it as a mapping' % (e['root'], rel), sorted(parsed) if isinstance(parsed, dict) else _rh_kind(parsed))
+                # codex-tick710 (same class as C1-DK-DIAGNOSTIC-KEY-DISCLOSURE): the parsed KEYS are not echoed; a top-level key
+                # may be an aliased credential scalar. Only the kind of the parsed value is shown.
+                _rh_doc_refuse(ch, key, '%s.%s.root' % (ch['at'], n), 'names %r; the admitted %r must be a mapping carrying it as a mapping (its keys are not shown)' % (e['root'], rel), _rh_kind(parsed))
             root = parsed[e['root']]
         else:
             if not isinstance(parsed, dict):
@@ -2662,6 +2798,186 @@ def _rh_documents_admit(pol, schema, key, documents, admission, partial):
     if len(carried) < len(order):
         nxt = (order[len(carried)], rel_of(order[len(carried)]))
     return True, out, order, nxt
+
+
+class _RhDuplicateKey(Exception):
+    """F-LIS12-DUPKEY (codex-tick702 mechanism 2; codex-tick710 C1-DK-DIAGNOSTIC-KEY-DISCLOSURE): one mapping of one
+    admitted document repeats a key. Carries ONLY metadata: role (a document_channel.parse.diagnostics key), and for the
+    repeated key node and the first one a (line, column, basis) triple -- 1-based position of the node definition and
+    a document_channel.parse.bases key. Never the key, a value or source text: not in its attributes, not in its
+    exception arguments. It never leaves _rh_yaml_load_unique."""
+
+    def __init__(self, role, here, first):
+        Exception.__init__(self, role, here, first)
+        self.role = role
+        (self.line, self.column, self.basis), (self.first_line, self.first_column, self.first_basis) = here, first
+
+
+def _rh_yaml_unique_loader(tags):
+    """F-LIS12-DUPKEY: the ONE loader class of the document-channel parse, used both by the role binding
+    (_rh_yaml_roles_bound) and by the parse (_rh_yaml_load_unique), so the semantics bound are the semantics used.
+    yaml.SafeLoader unchanged except:
+    - construct_object records, before delegating, that construction has begun and the 1-based (line, column) of the
+      node DEFINITION being entered (two ints; never the node, its tag or its text);
+    - construct_document first judges the COMPOSED node structure, every mapping at every depth, before anything is
+      constructed (SafeConstructor flattens merge keys IN PLACE, so a check during construction could not tell authored
+      keys from merged ones): key identity = the constructed scalar key under Python equality, i.e. exactly what the
+      resulting dict would collapse (1, 1.0 and true collide; '1' and 1 do not); the value key (bound to the parser's
+      value semantics) is judged by its text, as flatten_mapping retags it to a string; pairs arriving through a merge
+      are not authored in that mapping, an authored key overriding a merged one keeps YAML merge semantics, two merge
+      keys in one mapping refuse; a node reached by more than one edge (an alias) reports basis aliased at its anchor
+      definition, the repeated occurrence is not located; a non-scalar key keeps SafeConstructor's own refusal.
+    The class is local: no global loader, constructor, resolver or PyYAML state is modified."""
+    import yaml
+    merge_tag, value_tag = tags['merge']['tag'], tags['value']['tag']
+
+    class _UniqueKeyLoader(yaml.SafeLoader):
+        lme_constructing = False
+        lme_at = ()
+
+        def construct_object(self, node, deep=False):
+            self.lme_constructing = True
+            if node.start_mark is not None:
+                self.lme_at = (node.start_mark.line + 1, node.start_mark.column + 1)
+            return yaml.SafeLoader.construct_object(self, node, deep)
+
+        def construct_document(self, node):
+            # pass 1: every parent-to-child edge; a node reached by more than one edge was reused through an alias
+            edges, stack, visited = [], [node], set()
+            while stack:
+                cur = stack.pop()
+                if id(cur) in visited:
+                    continue
+                visited.add(id(cur))
+                if isinstance(cur, yaml.MappingNode):
+                    kids = [x for pair in cur.value for x in pair]
+                elif isinstance(cur, yaml.SequenceNode):
+                    kids = list(cur.value)
+                else:
+                    continue
+                edges.extend(id(x) for x in kids)
+                stack.extend(kids)
+            once, aliased = set(), set()
+            for i in edges:
+                if i in once:
+                    aliased.add(i)
+                once.add(i)
+            # pass 2: every mapping, its keys judged before construction
+            stack, visited = [node], set()
+            while stack:
+                cur = stack.pop()
+                if id(cur) in visited:
+                    continue
+                visited.add(id(cur))
+                if isinstance(cur, yaml.SequenceNode):
+                    stack.extend(cur.value)
+                if not isinstance(cur, yaml.MappingNode):
+                    continue
+                seen, merges = {}, []
+                for kn, vn in cur.value:
+                    stack.extend((kn, vn))
+                    here = (kn.start_mark.line + 1, kn.start_mark.column + 1, 'aliased' if id(kn) in aliased else 'authored')
+                    if kn.tag == merge_tag:
+                        if merges:
+                            raise _RhDuplicateKey('duplicate_merge', here, merges[0])
+                        merges.append(here)
+                    elif isinstance(kn, yaml.ScalarNode):
+                        k = kn.value if kn.tag == value_tag else self.construct_object(kn)
+                        if k in seen:
+                            raise _RhDuplicateKey('duplicate_key', here, seen[k])
+                        seen[k] = here
+            return yaml.SafeLoader.construct_document(self, node)
+
+    return _UniqueKeyLoader
+
+
+def _rh_yaml_roles_bound(tags):
+    """F-LIS12-DUPKEY (codex-tick712 C1-DK-TAG-ROLE-BINDING; codex-tick713): bind the declared merge / value roles
+    (document_channel.parse.tags, shape already admitted) to THIS parser's semantics, not to whatever tag the resolver
+    happens to give a declared spelling. Runs at every channel admission on a probe instance of the parse loader class
+    over the EMPTY text, so a refusal precedes every document read, compose and construction:
+    - resolver: each declared plain spelling, as a plain key, resolves to its declared tag;
+    - merge: flatten_mapping, given a synthetic mapping whose only key carries the declared merge tag and whose value
+      is a one-pair mapping, removes that key and splices in exactly that pair (only the merge tag does);
+    - value: construct_scalar, given a synthetic mapping whose only key carries the declared value tag, returns that
+      pair's value text (only the value tag does; any other tag raises ConstructorError, kept local).
+    So {plain: 'true', tag: 'tag:yaml.org,2002:bool'} as the value role resolves but has no value semantics: refused.
+    A swapped pair (merge / value tags exchanged) is refused on both roles. The synthetic scalars are the role NAMES;
+    the refusal names only declaration words. Every handler here assigns a local; the refusal raises after."""
+    import yaml
+    probe = _rh_yaml_unique_loader(tags)('')
+    unbound = set()
+    try:
+        for role in sorted(tags):
+            if probe.resolve(yaml.ScalarNode, tags[role]['plain'], (True, False)) != tags[role]['tag']:
+                unbound.add(role)
+        mtag = probe.resolve(yaml.MappingNode, None, (True, False))
+        word = dict((r, yaml.ScalarNode(probe.resolve(yaml.ScalarNode, r, (True, False)), r)) for r in sorted(tags))
+        pair = (word['merge'], word['value'])
+        merged = yaml.MappingNode(mtag, [(yaml.ScalarNode(tags['merge']['tag'], tags['merge']['plain']), yaml.MappingNode(mtag, [pair]))])
+        probe.flatten_mapping(merged)
+        if merged.value != [pair]:
+            unbound.add('merge')
+        holder = yaml.MappingNode(mtag, [(yaml.ScalarNode(tags['value']['tag'], tags['value']['plain']), word['value'])])
+        try:
+            got = probe.construct_scalar(holder)
+        except yaml.YAMLError:
+            got = holder
+        if got != word['value'].value:
+            unbound.add('value')
+    finally:
+        probe.dispose()
+    if unbound:
+        raise ValueError('lme: registry remote_harness_schema.document_channel.parse.tags %s must each name the tag this YAML parser resolves from the declared plain spelling AND that carries the role semantics of this parser (merge: spliced by flatten_mapping; value: read by construct_scalar); a spelling / tag pair that only resolves is not the role (no configurable duplicate bypass); got %r' % (
+            sorted(unbound), dict((r, tags[r]) for r in sorted(unbound))))
+
+
+def _rh_yaml_load_unique(text, tags):
+    """F-LIS12-DUPKEY (codex-tick702 mechanism 2; codex-tick710; codex-tick712 C1-DK-CONSTRUCTOR-DIAGNOSTICS): parse ONE
+    admitted document text exactly as yaml.safe_load does (SafeLoader resolver, tags, constructors and merge handling;
+    yaml.load = Loader(text), get_single_data(), dispose()), with the duplicate judgement of _rh_yaml_unique_loader.
+    tags is the admitted, role-bound document_channel.parse.tags. Returns (parsed, ()) or (None, failure); it raises
+    nothing for the text. failure, metadata only:
+    - (role, (line, column, basis), (first_line, first_column, first_basis)) for duplicate_key / duplicate_merge;
+    - ('unparsable', class name, position) when reading / scanning / parsing / composing fails, position the
+      parser problem mark or () when the exception has none (a ReaderError has none);
+    - ('unconstructable', class name, position) when any exception is raised once construction has begun: a
+      ConstructorError, or a native exception of a scalar constructor (bool KeyError, int / float ValueError or
+      IndexError, timestamp AttributeError or ValueError, and any other Exception subclass), position the problem
+      mark when there is one, else the definition of the node construction last entered.
+    Only the class NAME and integer positions leave a handler; the exception (its args, message and traceback, which
+    holds the walk locals with constructed keys) is released when the handler ends. Not converted: BaseException
+    subclasses that are not Exception (KeyboardInterrupt, SystemExit, GeneratorExit)."""
+    import yaml
+    loader, parsed, failure = (), None, ()
+    try:
+        loader = _rh_yaml_unique_loader(tags)(text)
+        parsed = loader.get_single_data()
+    except _RhDuplicateKey as dup:
+        failure = (dup.role, (dup.line, dup.column, dup.basis), (dup.first_line, dup.first_column, dup.first_basis))
+    except Exception as exc:
+        mark = exc.problem_mark if isinstance(exc, yaml.MarkedYAMLError) else ()
+        built = bool(loader) and loader.lme_constructing
+        at = (mark.line + 1, mark.column + 1) if mark else (loader.lme_at if built else ())
+        failure = ('unconstructable' if built else 'unparsable', type(exc).__name__, at)
+    finally:
+        if loader:
+            loader.dispose()
+    return (None, failure) if failure else (parsed, ())
+
+
+def _rh_doc_parse_text(dp, rel, failure):
+    """F-LIS12-DUPKEY: the declared document_channel.parse diagnostic for one _rh_yaml_load_unique failure, filled with
+    the admitted rel and the failure's class name / position / basis metadata only. The role literals are
+    document_channel.parse.diagnostics keys (registry keys, the convention of :2476-2477)."""
+    role = failure[0]
+    if role in ('duplicate_key', 'duplicate_merge'):
+        (line, column, basis), (first_line, first_column, first_basis) = failure[1], failure[2]
+        return dp['diagnostics'][role].format(rel=rel, line=line, column=column, basis=dp['bases'][basis],
+                                              first_line=first_line, first_column=first_column, first_basis=dp['bases'][first_basis])
+    at = failure[2]
+    where = dp['positions']['marked'].format(line=at[0], column=at[1]) if at else dp['positions']['unmarked'].format()
+    return dp['diagnostics'][role].format(rel=rel, error=failure[1], where=where)
 
 
 def _rh_projection_order(projs):
@@ -2747,6 +3063,8 @@ def _rh_pj_entry_importers(name, pj, out, root, active, docs, schema, key, relp,
     """S3-SEAM-06 / OD-S2-01 a / OD-S2-07 / OD-S3-03 a: {<executable rel>: sorted closure}.
     RUNNER PART (every resolve): each <runners>.<r> declares <runner_key> (the playbook rel) and <requires_key> (the
       REQUIRED declared dependency list; [] is an explicit statement): importers[playbook] = sorted(requires).
+      Each runner also declares <runner_transport.key>, its ingress transport word, equal to the word of its
+      declared launch purpose (C1 s11 L11-03; records-c1-framework-28).
     DISPATCH ADMISSION (every resolve): <dispatch> = {mode[, authored]}; mode is one of the words of the policy
       mapping <dispatch_modes> {generation, declared, none} (F05-S4 SC-MM-20 b: declared ONCE in the policy, read by
       the loader and the seed alike; the registry field is the pointer); mode generation <=> published view `when` active; declared: inactive only, authored REQUIRED; generation:
@@ -2905,6 +3223,21 @@ def _rh_pj_entry_importers(name, pj, out, root, active, docs, schema, key, relp,
                     if r not in full:
                         stack.append((r, False))
         return full
+    # C1 s11 L11-02 (records-c1-framework-28; codex-tick822 B-E1): the RUNNER TRANSPORT pointers. key: the runner
+    # field naming its declared ingress transport; words: the policy mapping launcher -> transport word; launcher:
+    # the words key of the run-local launcher; purposes: the record-free launch rows keyed by playbook rel;
+    # purpose_transport: the row field holding that purpose's transport word.
+    rt = pj['runner_transport']
+    if not isinstance(rt, dict) or set(rt) != {'key', 'words', 'launcher', 'purposes', 'purpose_transport'} \
+            or any(not isinstance(rt[f], str) or not rt[f] or not all(segp.fullmatch(s) for s in rt[f].split('.')) for f in rt):
+        raise ValueError('lme: registry policy_projections.%s.runner_transport must be exactly {key, words, launcher, purposes, purpose_transport} of dotted names whose segments fully match patterns.%s; got %r' % (
+            name, pj['segment_pattern'], rt))
+    fw, tw = _rh_get(out, rt['words'])
+    fp, tp = _rh_get(out, rt['purposes'])
+    if not fw or not isinstance(tw, dict) or not tw or any(not isinstance(v, str) or not v for v in tw.values()) \
+            or len(set(tw.values())) != len(tw) or rt['launcher'] not in tw or not fp or not isinstance(tp, dict):
+        raise ValueError('lme: %s.%s must be a non-empty mapping of distinct non-empty transport words holding launcher %r, and %s.%s a mapping (policy_projections.%s.runner_transport); got %r / %r' % (
+            key, rt['words'], rt['launcher'], key, rt['purposes'], name, tw if fw else '<absent>', tp if fp else '<absent>'))
     for r in sorted(runners[1]):
         rr = runners[1][r]
         if not isinstance(rr, dict) or pj['runner_key'] not in rr or pj['requires_key'] not in rr or not isinstance(rr[pj['requires_key']], list) \
@@ -2915,6 +3248,19 @@ def _rh_pj_entry_importers(name, pj, out, root, active, docs, schema, key, relp,
         rels, refs = items(rr[pj['requires_key']], where, None)
         common_restated(rels, where)
         add(rr[pj['runner_key']], rels, refs, where, rels)
+        # C1 s11 L11-03 (records-c1-framework-28): the runner's declared transport word equals the word of its
+        # declared launch purpose: a record-free launch row's transport when its playbook is such a row, otherwise
+        # the run-local launcher's word. No inference from supplied variables.
+        want, why = tw[rt['launcher']], 'the %s launcher' % (rt['launcher'],)
+        if rr[pj['runner_key']] in tp:
+            pr = tp[rr[pj['runner_key']]]
+            if not isinstance(pr, dict) or rt['purpose_transport'] not in pr:
+                raise ValueError('lme: %s.%s[%r] must carry %s (policy_projections.%s.runner_transport); got %r' % (
+                    key, rt['purposes'], rr[pj['runner_key']], rt['purpose_transport'], name, pr))
+            want, why = pr[rt['purpose_transport']], 'its record-free launch row'
+        if rt['key'] not in rr or not isinstance(rr[rt['key']], str) or rr[rt['key']] != want:
+            raise ValueError('lme: %s.%s.%s.%s %r does not match the declared launch purpose of %r (expected %r: %s) (policy_projections.%s)' % (
+                key, pj['runners'], r, rt['key'], rr[rt['key']] if rt['key'] in rr else '<absent>', rr[pj['runner_key']], want, why, name))
     fd, da = _rh_get(out, pj['dispatch'])
     fm, modes = _rh_get(out, pj['dispatch_modes'])
     if not fm or not isinstance(modes, dict) or set(modes) != {'generation', 'declared', 'none'} or len(set(modes.values())) != 3 \
@@ -3091,8 +3437,8 @@ def _rh_pj_entry_bodies(name, pj, out, root, docs, key, relp, ptext, resolved, s
 
 
 def _rh_pj_document_kind(name, pj, out, node, schema, key, docs, active, pats, ptext, resolved):
-    """The F05-S3 projection kinds (registry_pattern, document_rels, entry_importers, entry_bodies, entry_outputs,
-    document_value). Returns (applied, value). A document-reading kind applies only while its `when` view is active
+    """The F05-S3 projection kinds (registry_pattern, document_parse, document_rels, entry_importers, entry_bodies, entry_outputs,
+    document_value, document_ere). Returns (applied, value). A document-reading kind applies only while its `when` view is active
     (entry_importers: its B part only)."""
     relp = pats[pj['rel_pattern']] if 'rel_pattern' in pj else None
     if 'rel_pattern' in pj and pj['rel_pattern'] not in pats:
@@ -3108,6 +3454,12 @@ def _rh_pj_document_kind(name, pj, out, node, schema, key, docs, active, pats, p
         # F05-S4 CORRECTIONS (codex-tick558 S4-D04, codex-tick560): the projected form {pattern, refused_components,
         # separator, terminator} (= contract_admission.path_law.*; the shell consumer reads them with the grammar)
         return True, copy.deepcopy(pats[pj['pattern']].pattern)
+    if pj['kind'] == 'document_parse':
+        # C1-SR922 (codex 922 OBS_SR919B_R0_PROJECTION_DROPS; restores records-dk03-launch-01 C1-DKL-LM-01 :206-224 byte form):
+        # the admitted document_channel.parse (exact shape and parser role binding at _rh_document_channel), projected
+        # into the resolved source_admission so the seed renders it into the launch record context. Ungated: the
+        # first-entry guard parses on every phase. No authored copy (an authored `to` refuses in the caller).
+        return True, copy.deepcopy(_rh_document_channel(schema)['parse'])
     on = _rh_contract_active(out, schema, pj['when'], 'policy_projections.%s.when' % (name,))
     if on != active:
         raise ValueError('lme: registry policy_projections.%s.when %r and document_channel.when disagree on activity (one activity rule)' % (name, pj['when']))
@@ -3129,6 +3481,15 @@ def _rh_pj_document_kind(name, pj, out, node, schema, key, docs, active, pats, p
     if pj['kind'] == 'entry_outputs':
         return True, sorted(_rh_eg_generated('policy_projections.%s' % (name,), pj, root, out, key, relp)[0])
     v = _rh_doc_value(root, pj['value_at'], 'policy_projections.%s' % (name,), 'value_at', pj['document'])
+    if pj['kind'] == 'document_ere':
+        # C1-SR922 (codex 922 OBS_SR919B_R0_PROJECTION_DROPS; codex-tick626 OD-LI-03 UNIFY, s11 engine form): one authority
+        # for a grammar both engines read; admitted inside the bounded ERE subset of the declared form by the SAME
+        # admission as the `ere` contract kind (_rh_ca_ere; its forms are the `ere` arg check's), never re-spelled.
+        why = _rh_ca_ere(v, pj['ere'], False) if pj['ere'] in ('fragment', 'anchored') else 'names no declared ERE form (fragment, anchored)'
+        if why:
+            raise ValueError('lme: policy_projections.%s: document %s %s must be an ERE of form %r inside the bounded subset: %s; got %r' % (
+                name, pj['document'], pj['value_at'], pj['ere'], why, v))
+        return True, v
     if not isinstance(v, str) or not relp.fullmatch(v):
         raise ValueError('lme: policy_projections.%s: document %s %s must be a repository-relative path fully matching patterns.%s %r; got %r' % (
             name, pj['document'], pj['value_at'], pj['rel_pattern'], ptext[pj['rel_pattern']], v))
@@ -3137,18 +3498,21 @@ def _rh_pj_document_kind(name, pj, out, node, schema, key, docs, active, pats, p
 
 _RH_DOC_KIND_SHAPES = {
     'registry_pattern': frozenset(('kind', 'after', 'at', 'to', 'pattern', 'segment_pattern')),
+    'document_parse': frozenset(('kind', 'after', 'at', 'to', 'segment_pattern')),   # records-dk03-launch-01 C1-DKL-LM-02; C1-SR922
     'document_rels': frozenset(('kind', 'after', 'when', 'at', 'to', 'segment_pattern')),
     'entry_importers': frozenset(('kind', 'after', 'when', 'document', 'at', 'to', 'members', 'entries', 'closure', 'route_includes',
                                   'identity', 'guard', 'relativity_from', 'runners', 'runner_key', 'requires_key', 'common',
                                   'dispatch', 'dispatch_modes', 'reference_keys', 'rel_pattern', 'segment_pattern',
-                                  'rendered_dispatch', 'common_refs')),   # MR03-GL-01; MR03-F05-GL-01
+                                  'rendered_dispatch', 'common_refs', 'runner_transport')),   # MR03-GL-01; MR03-F05-GL-01; C1 s11 L11-01
     'entry_bodies': frozenset(('kind', 'after', 'when', 'document', 'at', 'to', 'members', 'identity', 'bodies', 'importers',
                                'digest_pattern', 'rel_pattern', 'segment_pattern', 'rendered_to')),   # MR03-GL-02
     'entry_outputs': frozenset(('kind', 'after', 'when', 'document', 'at', 'to', 'members', 'identity', 'rel_pattern', 'segment_pattern')),
     'document_value': frozenset(('kind', 'after', 'when', 'document', 'at', 'to', 'value_at', 'rel_pattern', 'segment_pattern')),
+    # codex-tick626 OD-LI-03 UNIFY; C1-SR922: a document GRAMMAR (an ERE of the declared form `ere`), projected verbatim
+    'document_ere': frozenset(('kind', 'after', 'when', 'document', 'at', 'to', 'value_at', 'ere', 'segment_pattern')),
 }
 # non-string fields of the projection shapes (every other field is a non-empty string)
-_RH_PJ_NONSTRING = frozenset(('parts', 'fields', 'after', 'reference_keys', 'rendered_dispatch'))
+_RH_PJ_NONSTRING = frozenset(('parts', 'fields', 'after', 'reference_keys', 'rendered_dispatch', 'runner_transport', 'address', 'outputs', 'leaves'))   # C1-RECIPE-PUB-01: + select_tree
 
 
 def _rh_pj_secondary(name, pj):
@@ -3183,6 +3547,66 @@ def _rh_pj_shape_view(name, pj):
     return dict((k, v) for k, v in pj.items() if k != 'when')
 
 
+def _rh_pj_select_tree(name, pj, out, key, pats):
+    """C1-RECIPE-PUB-01 (OW-H11-C1-01-PUB; codex-tick883 SR290_09) and C1-RECIPE-PUB-02 (OW-H11-C1-01-PUB-02; codex-tick884
+    Q290_2 a, b): the ONE derivation of a select_tree projection, read by _rh_project_policy and re-run by
+    lme_verify_resolved (no second resolver, no merge). roles = a policy mapping {role: address}; an address is exactly
+    {<address.node>: <policy path>, <address.label>: <policy path of a non-empty string>} (that node, named by that
+    declared word; never inferred) or {<address.entries>: <policy path of a mapping>, <address.selector>: <policy path of
+    a non-empty string naming one of its keys>}; every path is read from `out`, the resolved copy of the override-LAST
+    composition. Each role yields exactly {<outputs.tree>: the declared `leaves` of the selected node, deep-copied and
+    nested by segment (the declared content projection), <outputs.selected>: the label or selector value,
+    <outputs.digest>: _digest of that tree alone, computed before it is added}. No fallback: an absent, malformed or
+    unknown address, label, selector, entry or leaf refuses."""
+    fr, roles = _rh_get(out, pj['roles'])
+    ad, ow, lv = pj['address'], pj['outputs'], pj['leaves']
+    if not fr or not isinstance(roles, dict) or not roles or not isinstance(ad, dict) or set(ad) != {'node', 'label', 'entries', 'selector'} \
+            or not isinstance(ow, dict) or set(ow) != {'tree', 'selected', 'digest'} or not isinstance(lv, list) or not lv \
+            or any(not isinstance(x, str) or not x for x in list(ad.values()) + list(ow.values()) + lv) \
+            or len(set(ad.values())) != 4 or len(set(ow.values())) != 3 or len(set(lv)) != len(lv) \
+            or any(y.startswith(x + '.') for x in lv for y in lv):
+        raise ValueError('lme: policy_projections.%s needs a declared non-empty mapping %s.%s, address {node, label, entries, selector} and outputs {tree, selected, digest} of distinct non-empty strings, and leaves of distinct, non-nested dotted paths; got %r / %r / %r / %r' % (
+            name, key, pj['roles'], roles if fr else '<absent>', ad, ow, lv))
+    if pj['segment_pattern'] not in pats:
+        raise ValueError('lme: policy_projections.%s.segment_pattern %r must name a declared contract_admission.patterns entry' % (name, pj['segment_pattern']))
+    badseg = sorted(repr(s) for s in [pj['to']] + list(roles) + list(ow.values()) + [p for x in lv for p in x.split('.')]
+                    if not isinstance(s, str) or not pats[pj['segment_pattern']].fullmatch(s))
+    if badseg:
+        raise ValueError('lme: policy_projections.%s generated path segments %s do not fully match patterns.%s (a segment is one metadata path step)' % (name, badseg, pj['segment_pattern']))
+    rec = {}
+    for role in sorted(roles):
+        a = roles[role]
+        if isinstance(a, dict) and set(a) == {ad['node'], ad['label']} and isinstance(a[ad['node']], str) and isinstance(a[ad['label']], str):
+            (fsrc, src), (fs, sel) = _rh_get(out, a[ad['node']]), _rh_get(out, a[ad['label']])
+            if not fs or not isinstance(sel, str) or not sel:
+                raise ValueError('lme: %s.%s.%s: %s.%s must be a declared non-empty string naming the recipe at %s.%s (policy_projections.%s); got %s' % (
+                    key, pj['roles'], role, key, a[ad['label']], key, a[ad['node']], name, _rh_kind(sel) if fs else '<absent>'))
+        elif isinstance(a, dict) and set(a) == {ad['entries'], ad['selector']} and isinstance(a[ad['entries']], str) and isinstance(a[ad['selector']], str):
+            (fe, ents), (fs, sel) = _rh_get(out, a[ad['entries']]), _rh_get(out, a[ad['selector']])
+            if not fe or not isinstance(ents, dict) or not fs or not isinstance(sel, str) or not sel or sel not in ents:
+                raise ValueError('lme: %s.%s.%s: %s.%s must be a non-empty string naming a key of the mapping %s.%s (policy_projections.%s); got %r of %r' % (
+                    key, pj['roles'], role, key, a[ad['selector']], key, a[ad['entries']], name, sel if fs else '<absent>', sorted(repr(k) for k in ents) if fe and isinstance(ents, dict) else '<absent>'))
+            fsrc, src = True, ents[sel]
+        else:
+            raise ValueError('lme: %s.%s.%s must be exactly {%s: <path>, %s: <path>} or {%s: <path>, %s: <path>} (policy_projections.%s); got %r' % (
+                key, pj['roles'], role, ad['node'], ad['label'], ad['entries'], ad['selector'], name, a))
+        if not fsrc or not isinstance(src, dict):
+            raise ValueError('lme: %s.%s.%s selects no mapping (policy_projections.%s); got %r' % (key, pj['roles'], role, name, _rh_kind(src) if fsrc else '<absent>'))
+        tree = {}
+        for p in sorted(lv):
+            fl, v = _rh_get(src, p)
+            if not fl:
+                raise ValueError('lme: %s.%s.%s: the selected node carries no %s (policy_projections.%s.leaves)' % (key, pj['roles'], role, p, name))
+            cur, segs = tree, p.split('.')
+            for s in segs[:-1]:
+                if s not in cur:
+                    cur[s] = {}
+                cur = cur[s]
+            cur[segs[-1]] = copy.deepcopy(v)
+        rec[role] = {ow['tree']: tree, ow['selected']: sel, ow['digest']: _digest(tree)}
+    return rec
+
+
 def _rh_project_policy(pol, schema, key, active, docs):
     """The registry-declared RESOLVED projections (remote_harness_schema.policy_projections) and partitions
     (policy_partitions), applied to a COPY of the admitted composed policy after contract admission and before any
@@ -3191,9 +3615,10 @@ def _rh_project_policy(pol, schema, key, active, docs):
     Projection kinds (each names at = a declared policy mapping, from = its authored selector key, to = the resolved key):
       path_list (LI-MAIN-1, B-OD-09 b): parts = ordered [{key, in}]; the authored node must not carry `to`;
         to = [<policy node at in>[<at.from.key>] ...], each a non-empty string.
-      lookup_merge (LI-03, B-OD-10 a): source = a policy mapping; for every role of at.from, at.to[role] =
+      lookup_merge (LI-03, B-OD-10 a): source = a mapping read from source_root (policy: the resolved policy copy;
+        registry: the admitted remote_harness_schema; C1 s08 LH-2, FW22-BOOT-OWNER); for every role of at.from, at.to[role] =
         source[at.from[role]] (a non-empty string); an authored at.to key that is also a role of at.from refuses
-        (no second authority).
+        (no second authority). A registry source names no projection, so it adds no after edge.
       select_record (L-11, codex-tick498 R2N-L11-NONROLE-REUSE): roles = a policy mapping {role: <source key>};
         source = a policy mapping; fields_from = a policy mapping {field role: <output name>}; fields = {field role:
         <dotted sub-path of source[<key>]>} with the same field roles; at.to = {role: {<output name>: <value>}}, each a
@@ -3208,6 +3633,10 @@ def _rh_project_policy(pol, schema, key, active, docs):
       sorted_values (LI-07, codex-tick507 LI-07-RENDER-STAGE-INPUTS): source = a non-empty policy mapping whose
         values are distinct strings each fully matching contract_admission.patterns[segment_pattern]; at.to =
         sorted(those values); the composed policy (declaration AND override) must not carry at.to (one authority).
+      select_tree (C1-RECIPE-PUB-01, OW-H11-C1-01-PUB; codex-tick883 SR290_09; C1-RECIPE-PUB-02, codex-tick884 Q290_2):
+        roles = a policy mapping {role: address}; at.to = {role: {<outputs.tree>: the declared `leaves` of the addressed
+        node, <outputs.selected>: the label or selector value, <outputs.digest>: _digest of that tree}} (_rh_pj_select_tree,
+        also the readback derivation); the composed policy must not carry at.to.
     Partitions (LI-03 resolved ownership map): universe = a policy list; parts = [{values_of | keys_of | value_of: path}];
     the parts are pairwise disjoint and their union equals the universe, both read on the RESOLVED copy.
     F05-S3: every projection declares `after` and they apply in that dependency order (_rh_projection_order); the
@@ -3221,9 +3650,11 @@ def _rh_project_policy(pol, schema, key, active, docs):
     if not isinstance(projs, dict) or not isinstance(parts_decl, dict):
         raise ValueError('lme: registry remote_harness_schema.policy_projections and policy_partitions must be mappings; got %r / %r' % (projs, parts_decl))
     out = copy.deepcopy(pol)
-    shapes = {'path_list': {'kind', 'after', 'at', 'from', 'to', 'parts'}, 'lookup_merge': {'kind', 'after', 'at', 'from', 'to', 'source'},
+    # C1 s08 LH-2: every lookup_merge declares source_root (policy | registry; required, no implicit value).
+    shapes = {'path_list': {'kind', 'after', 'at', 'from', 'to', 'parts'}, 'lookup_merge': {'kind', 'after', 'at', 'from', 'to', 'source', 'source_root'},
               'select_record': {'kind', 'after', 'at', 'to', 'roles', 'source', 'fields_from', 'fields', 'segment_pattern'},
-              'sorted_values': {'kind', 'after', 'at', 'to', 'source', 'segment_pattern'}}
+              'sorted_values': {'kind', 'after', 'at', 'to', 'source', 'segment_pattern'},
+              'select_tree': {'kind', 'after', 'at', 'to', 'roles', 'address', 'outputs', 'leaves', 'segment_pattern'}}
     shapes.update((k, set(v)) for k, v in _RH_DOC_KIND_SHAPES.items())
     hs = schema['host_scope']
     ne_names = set(f for d in _rh_artifact_decl(hs).values() for f in d['not_embedded_fields'])
@@ -3233,6 +3664,8 @@ def _rh_project_policy(pol, schema, key, active, docs):
         if not isinstance(pj, dict) or pj.get('kind') not in shapes or set(pj) != shapes[pj['kind']] \
                 or any(not isinstance(pj[k], str) or not pj[k] for k in shapes[pj['kind']] - _RH_PJ_NONSTRING):
             raise ValueError('lme: registry policy_projections.%s must be one of %s; got %r' % (name, {k: sorted(v) for k, v in shapes.items()}, pj))
+        if pj['kind'] == 'lookup_merge' and pj['source_root'] not in ('policy', 'registry'):
+            raise ValueError('lme: registry policy_projections.%s.source_root must be policy or registry; got %r' % (name, pj['source_root']))
     pats, ptext = _rh_patterns(schema)
     resolved = {}
     for name in _rh_projection_order(projs):
@@ -3317,6 +3750,12 @@ def _rh_project_policy(pol, schema, key, active, docs):
                         pscoped.append('%s.%s.%s.%s' % (pj['at'], pj['to'], role, fmap[fr_]))
             node[pj['to']] = rec
             continue
+        if pj['kind'] == 'select_tree':
+            # C1-RECIPE-PUB-01 (OW-H11-C1-01-PUB): the ONE derivation, on the resolved copy of the override-LAST composition
+            if pj['to'] in node:
+                raise ValueError('lme: %s.%s declares %s; it is RESOLVED (policy_projections.%s; one authority -- neither the declaration nor an override may supply it)' % (key, pj['at'], pj['to'], name))
+            node[pj['to']] = _rh_pj_select_tree(name, pj, out, key, pats)
+            continue
         sel = node.get(pj['from'])
         if pj['kind'] == 'path_list':
             if not isinstance(pj['parts'], list) or not pj['parts'] or any(not isinstance(p, dict) or set(p) != {'key', 'in'} for p in pj['parts']):
@@ -3334,7 +3773,10 @@ def _rh_project_policy(pol, schema, key, active, docs):
                 res.append(v)
             node[pj['to']] = res
         else:
-            fs_, src = _rh_get(out, pj['source'])
+            # C1 s08 LH-2 (records-c1-framework-22 FW22-BOOT-OWNER / FW22-HOSTS-SEED; codex-tick818 :33-55): the source is
+            # read by the existing _rh_get from the resolved policy copy (source_root policy) or from the admitted registry
+            # (source_root registry; admitted by the shape check above). Every other line below is unchanged.
+            fs_, src = _rh_get(out if pj['source_root'] == 'policy' else schema, pj['source'])
             tgt = node.get(pj['to'])
             if not isinstance(sel, dict) or not sel or not fs_ or not isinstance(src, dict) or not isinstance(tgt, dict):
                 raise ValueError('lme: %s.%s.%s / .%s and %s.%s must be declared mappings (policy_projections.%s); got %r / %r / %r' % (
@@ -3411,16 +3853,23 @@ def _rh_int(v):
 # DATA; this code names no contract, tool, env name or deployment value.
 _RH_CA_KINDS = frozenset(('keys', 'has_keys', 'enum', 'pattern', 'key_pattern', 'positive_int', 'strings', 'within',
                           'ere', 'ere_compose', 'umask_yields', 'not_in', 'rejects',
-                          'matches_ere', 'distinct_from', 'placeholder_words', 'equals_registry',
+                          'matches_ere', 'distinct_from', 'placeholder_words', 'equals_registry', 'equals_registry_set',
                           'records', 'rel_disjoint', 'int_range', 'key_set', 'int_gt_sum', 'disjoint_from',
-                          'mode_regex_domain', 'values_distinct', 'includes'))
+                          'mode_regex_domain', 'values_distinct', 'includes', 'not_within'))
 # GRAPH-SHARED-CONTRACT (codex-tick304): `within` joins each (a role -> executable-name mapping: every VALUE is one
 # scalar member, e.g. guest.tools.<role> names a controller.bootstrap.os_tools key the guest consumer requires).
 _RH_CA_EACH = frozenset(('enum', 'pattern', 'strings', 'positive_int', 'has_keys', 'placeholder_words', 'int_range',
                          'within'))
 _RH_CA_MODS = {'each': _RH_CA_EACH, 'where': _RH_CA_EACH,
-               'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',)), 'subject': frozenset(('within',)),
-               'key_at': frozenset(('within',)), 'placeholders': frozenset(('within',))}
+               'having': frozenset(('within',)), 'sed_delimited': frozenset(('ere',)), 'subject': frozenset(('within', 'not_within')),
+               'key_at': frozenset(('within',)), 'placeholders': frozenset(('within',)),
+               # codex-tick626 LI-OPTIONAL-RULE-EMPTY-EXPANSION: the kinds an optional key_set member row may carry
+               'optional': frozenset(('strings', 'keys', 'within', 'pattern', 'enum')),
+               # C1 CURRENT correction (codex-tick860 (b)): the kinds an explicitly empty-mapping wildcard row may carry
+               'empty_mapping': frozenset(('keys', 'within')),
+               # C1 s08 LH-3 (records-c1-framework-22 LH-3; codex-tick818 :43): the kinds a `registry` (subject in the admitted
+               # registry) check may carry
+               'registry': frozenset(('keys', 'has_keys', 'pattern', 'enum', 'not_in', 'distinct_from', 'values_distinct'))}
 # C1-CONTRACT-SCALAR-SHAPE (codex 193253): the declared shape of a `within` value (REQUIRED on every within check):
 # scalar = one non-empty string; list = a non-empty list of strings; keys = a non-empty mapping (its keys checked).
 _RH_CA_SUBJECTS = ('scalar', 'list', 'keys')
@@ -3590,10 +4039,24 @@ def _rh_path_grammar(n, p, law):
 def _rh_ca_registry(ca, schema):
     """The registry declaration contract_admission, shape-checked (fail-closed: admission can never be disabled or
     weakened by a malformed or missing registry entry). Returns ({pattern name: compiled}, contracts, required_values)."""
-    if not isinstance(ca, dict) or set(ca) != {'path_law', 'patterns', 'contracts', 'required_values'} or not isinstance(ca['patterns'], dict) \
-            or not isinstance(ca['contracts'], dict) or not ca['contracts'] \
+    if not isinstance(ca, dict) or set(ca) != {'path_law', 'patterns', 'contracts', 'required_values', 'bootstrap_input_refusal', 'bootstrap_identity_task', 'cold_inputs', 'carrier_state', 'member_rel_grammar', 'vocabulary', 'early_names'} \
+            or not isinstance(ca['patterns'], dict) or not isinstance(ca['contracts'], dict) or not ca['contracts'] \
             or not isinstance(ca['required_values'], dict) or not ca['required_values']:
-        raise ValueError('lme: registry remote_harness_schema.contract_admission must declare {path_law, patterns, contracts, required_values} (bootstrap contract admission is fail-closed); got %r' % (ca,))
+        raise ValueError('lme: registry remote_harness_schema.contract_admission must declare {path_law, patterns, contracts, required_values, bootstrap_input_refusal, bootstrap_identity_task, cold_inputs, carrier_state, member_rel_grammar, vocabulary, early_names} (bootstrap contract admission is fail-closed); got %r' % (ca,))
+    # C1 s08 LH-4 (codex-tick818 :33-53; records-c1-framework-23 A3-FW23-LH34; FW19 :69 governs over FW22 LH4 :132): early_names
+    # is the eleventh member. Structural admission before use only: a non-empty mapping of non-empty string keys to
+    # mappings. Its required-member roster, entry keys, var pattern and identity are DECLARED contract rows carrying
+    # `registry: true` (LH-3), evaluated by the one check engine at resolve (a missing required early name fails there);
+    # this code names no early name and no entry key.
+    en = ca['early_names']
+    if not isinstance(en, dict) or not en or any(not isinstance(k, str) or not k or not isinstance(e, dict) for k, e in en.items()):
+        raise ValueError('lme: registry remote_harness_schema.contract_admission.early_names must be a non-empty mapping of names to entry mappings; got %r' % (en,))
+    # codex-tick637 boot_shape: the ONE literal of the bootstrap-input refusal codes, a named mapping of two distinct
+    # non-empty strings (their code grammar is admitted where they are used: contract bootstrap_refusal_statuses)
+    bir = ca['bootstrap_input_refusal']
+    if not isinstance(bir, dict) or sorted(bir) != ['bytes', 'input'] or any(not isinstance(v, str) or not v for v in bir.values()) \
+            or bir['bytes'] == bir['input']:
+        raise ValueError('lme: registry remote_harness_schema.contract_admission.bootstrap_input_refusal must map exactly {input, bytes} to two distinct non-empty codes; got %r' % (bir,))
     pats = {}
     # plain regex entries first; then every path grammar under the ONE path law (whose syntax is a plain entry)
     for n in sorted(n for n in ca['patterns'] if not isinstance(ca['patterns'][n], dict)):
@@ -3608,6 +4071,29 @@ def _rh_ca_registry(ca, schema):
     for n in sorted(n for n in ca['patterns'] if isinstance(ca['patterns'][n], dict)):
         pats[n] = _rh_path_grammar(n, ca['patterns'][n], law)
     strs = lambda a: isinstance(a, list) and bool(a) and all(isinstance(x, str) and x for x in a)
+    # records-contract-set-kind-01 (codex-tick755 OPEN-S17-RF-MEMBER-GRAMMAR-CONSUMER / OPEN-S18-LATE-BINDING-KIND): the shared
+    # consumer vocabulary (role -> word mappings) and the member rel grammar, admitted fail-closed. Every literal below is a
+    # registry KEY of the declaration it reads; every value is registry data. Shapes and references only: the in-play
+    # consumer type-checks the same nodes before use (pre-import); this is the late (resolve) admission.
+    voc, mg = ca['vocabulary'], ca['member_rel_grammar']
+    words = lambda m: isinstance(m, dict) and bool(m) and all(isinstance(k, str) and k and isinstance(w, str) and w for k, w in m.items())
+    if not isinstance(voc, dict) or set(voc) != {'tests', 'attributes', 'projections', 'filters', 'probes'} \
+            or not all(words(voc[r]) for r in ('tests', 'attributes', 'projections', 'filters')) \
+            or set(voc['projections']) != {'keys', 'members'} or voc['projections']['keys'] == voc['projections']['members'] \
+            or not isinstance(voc['probes'], dict) or set(voc['probes']) != set(voc['filters']) \
+            or not all(isinstance(p, dict) and set(p) == {'input', 'output'} and isinstance(p['input'], list) and p['input']
+                       and isinstance(p['output'], list) and len(p['output']) == len(p['input']) for p in voc['probes'].values()):
+        raise ValueError('lme: registry remote_harness_schema.contract_admission.vocabulary must be {tests, attributes, projections, filters, probes}: the first four non-empty mappings of role -> non-empty word, projections exactly {keys, members} with distinct words, probes exactly one {input, output} pair of equal-length non-empty lists per filters role; got %r' % (voc,))
+    frc, rel_pat = _rh_get(schema, 'document_channel.rel_pattern')
+    if not isinstance(mg, dict) or set(mg) != {'pattern', 'grammar_fields', 'law_fields', 'entry_rel', 'macros_rel', 'macro', 'output'} \
+            or not isinstance(mg['pattern'], str) or mg['pattern'] not in pats or not isinstance(pats[mg['pattern']], _RhPathGrammar) \
+            or not frc or not _rh_ca_same(rel_pat, mg['pattern']) \
+            or not strs(mg['grammar_fields']) or sorted(mg['grammar_fields']) != sorted(ca['patterns'][mg['pattern']]) \
+            or not strs(mg['law_fields']) or len(set(mg['law_fields'])) != len(mg['law_fields']) or set(mg['law_fields']) - set(ca['path_law']) \
+            or not pats[mg['pattern']].fullmatch(mg['entry_rel']) or not pats[mg['pattern']].fullmatch(mg['macros_rel']) \
+            or not isinstance(mg['macro'], str) or not mg['macro'] \
+            or not words(mg['output']) or set(mg['output']) != {'form', 'refused'} or mg['output']['form'] == mg['output']['refused']:
+        raise ValueError('lme: registry remote_harness_schema.contract_admission.member_rel_grammar must be {pattern (a declared path grammar, equal to document_channel.rel_pattern), grammar_fields (exactly its fields), law_fields (distinct path_law fields), entry_rel / macros_rel (rels that grammar admits), macro, output {form, refused} (distinct words)}; got %r' % (mg,))
     for cname in sorted(ca['contracts']):
         c = ca['contracts'][cname]
         if not isinstance(c, dict) or not {'root', 'checks'} <= set(c) or set(c) - {'root', 'checks', 'when_present'} \
@@ -3623,7 +4109,8 @@ def _rh_ca_registry(ca, schema):
                 raise ValueError('lme: registry contract_admission.contracts.%s.checks[%d] must carry exactly one of path/at, exactly one check kind of %s and only the modifiers %s; got %r' % (
                     cname, i, sorted(_RH_CA_KINDS), sorted(_RH_CA_MODS), chk))
             kind, arg = kinds[0], chk[kinds[0]]
-            ok = {'keys': strs(arg), 'has_keys': strs(arg), 'within': strs(arg), 'ere_compose': strs(arg),
+            # MR03 S13 (F-E4-01): not_within takes within's argument (a non-empty list of policy references)
+            ok = {'keys': strs(arg), 'has_keys': strs(arg), 'within': strs(arg), 'not_within': strs(arg), 'ere_compose': strs(arg),
                   'enum': isinstance(arg, list) and bool(arg),
                   'pattern': isinstance(arg, str) and arg in pats, 'key_pattern': isinstance(arg, str) and arg in pats,
                   'positive_int': arg is True,
@@ -3651,6 +4138,10 @@ def _rh_ca_registry(ca, schema):
                   and ('params' not in arg or (isinstance(arg['params'], str) and arg['params'] in pats)),
                   'equals_registry': isinstance(arg, dict) and 'path' in arg and not set(arg) - {'path', 'index'}
                   and isinstance(arg['path'], str) and bool(arg['path']) and ('index' not in arg or (_rh_int(arg['index']) and arg['index'] >= 0)),
+                  # records-contract-set-kind-01 (codex-tick755 OPEN-S18-LATE-BINDING-KIND option ii): exact SET equality with a
+                  # registry string collection; projection is a declared vocabulary.projections word (members / keys)
+                  'equals_registry_set': isinstance(arg, dict) and set(arg) == {'path', 'projection'} and isinstance(arg['path'], str)
+                  and bool(arg['path']) and arg['projection'] in ca['vocabulary']['projections'].values(),
                   'records': isinstance(arg, dict) and set(arg) == {'fields'} and isinstance(arg['fields'], dict) and bool(arg['fields'])
                   and all(isinstance(k, str) and k and isinstance(p, str) and p in pats for k, p in arg['fields'].items()),
                   'rel_disjoint': isinstance(arg, dict) and 'field' in arg and not set(arg) - {'field', 'from', 'from_under', 'ref_pattern'}
@@ -3682,8 +4173,16 @@ def _rh_ca_registry(ca, schema):
                     and chk.get('each') is True,
                     'subject': lambda: v in _RH_CA_SUBJECTS,
                     'key_at': lambda: isinstance(v, str) and bool(v),
-                    'placeholders': lambda: isinstance(v, list) and all(isinstance(x, str) and x for x in v)}.get(m, lambda: isinstance(v, bool))()
-            if kind == 'within' and 'subject' not in chk:
+                    'placeholders': lambda: isinstance(v, list) and all(isinstance(x, str) and x for x in v),
+                    # codex-tick626: `optional` is exactly true, and only on a location with a '*' segment
+                    'optional': lambda: v is True and '*' in chk[locs[0]].split('.'),
+                    # C1 CURRENT correction (codex-tick860 (b)): `empty_mapping` is exactly true, on a location with exactly one '*'
+                    # C1 records-c1-d4-g2-l2-01 CX-D4-04: never together with `registry` (the empty-holder test reads the policy)
+                    'empty_mapping': lambda: v is True and chk[locs[0]].split('.').count('*') == 1 and 'registry' not in chk,
+                    # C1 s08 LH-3 (codex-tick818 :43-45): `registry` is exactly true, and only on an `at` location (the kind
+                    # set is _RH_CA_MODS['registry']); any other value, type or location refuses here, at registry admission
+                    'registry': lambda: v is True and locs[0] == 'at'}.get(m, lambda: isinstance(v, bool))()
+            if kind in ('within', 'not_within') and 'subject' not in chk:
                 ok = False    # C1-CONTRACT-SCALAR-SHAPE: a membership check must declare its value's shape
             if not ok:
                 raise ValueError('lme: registry contract_admission.contracts.%s.checks[%d] %s argument/modifiers are malformed; got %r' % (cname, i, kind, chk))
@@ -3700,6 +4199,42 @@ def _rh_ca_registry(ca, schema):
     rop = schema.get('reserved_output_patterns', [])
     if not isinstance(rop, list) or any(not isinstance(n, str) or n not in pats for n in rop):
         raise ValueError('lme: registry remote_harness_schema.reserved_output_patterns must be a list of contract_admission.patterns names; got %r' % (rop,))
+    # MR03 S12E2 (codex-tick655 OD-S11-COLD-E-FAMILY; codex-tick656): the ONE exact PUBLIC cold-input set. required is a
+    # non-empty mapping, both_or_neither exactly one pair, disjoint; every name a var_name of type string with exactly one
+    # decision leaf (grammar_at or equals_at: a dotted policy path). No public name is a reserved / resolver output or
+    # matches a reserved_output_patterns family (a broad prefix family can never reject one).
+    ci = ca['cold_inputs']
+    if not isinstance(ci, dict) or set(ci) != {'required', 'both_or_neither'} or not isinstance(ci['required'], dict) \
+            or not ci['required'] or not isinstance(ci['both_or_neither'], dict) or len(ci['both_or_neither']) != 2 \
+            or set(ci['required']) & set(ci['both_or_neither']):
+        raise ValueError('lme: registry contract_admission.cold_inputs must be {required: <non-empty mapping>, both_or_neither: <exactly two>}, disjoint; got %r' % (ci,))
+    if 'var_name' not in pats:
+        raise ValueError('lme: registry contract_admission.patterns.var_name is required to admit contract_admission.cold_inputs')
+    # seat ruling (codex697 presence form; supersedes the E02 :202 spelling): reserved_outputs and resolver_outputs are
+    # each read by KEY PRESENCE. An absent key declares no names; a present one must be a list of strings (null or
+    # another type refuses).
+    ci_reserved = set()
+    for rk in ('reserved_outputs', 'resolver_outputs'):
+        if rk in schema:
+            if not isinstance(schema[rk], list) or any(not isinstance(n, str) for n in schema[rk]):
+                raise ValueError('lme: registry remote_harness_schema.%s must be a list of output names; got %r' % (rk, schema[rk]))
+            ci_reserved |= set(schema[rk])
+    for grp in ('required', 'both_or_neither'):
+        for v in sorted(ci[grp], key=str):
+            spec = ci[grp][v]
+            ok = isinstance(v, str) and bool(pats['var_name'].fullmatch(v)) and isinstance(spec, dict) \
+                and set(spec) in ({'type', 'grammar_at'}, {'type', 'equals_at'}) and spec['type'] == 'string' \
+                and all(isinstance(spec[k], str) and spec[k] and all(s for s in spec[k].split('.')) for k in spec if k != 'type')
+            if not ok:
+                raise ValueError('lme: registry contract_admission.cold_inputs.%s.%s must be {type: string, grammar_at | equals_at: <dotted policy path>} under a var_name; got %r' % (grp, v, spec))
+            if v in ci_reserved or any(pats[p].fullmatch(v) for p in rop):
+                raise ValueError('lme: registry contract_admission.cold_inputs.%s.%s is a reserved / resolver OUTPUT name or matches a reserved_output_patterns family, never a public input' % (grp, v))
+    # MR03 S14 (codex-tick675 OD-ALS02-INCLUDE-REL-01): the ONE pre-parse declaration identity task rel, exactly {rel}
+    # under the ONE relative-path grammar (it is an include target before any declaration is readable).
+    bit = ca['bootstrap_identity_task']
+    if not isinstance(bit, dict) or sorted(bit) != ['rel'] or not isinstance(bit['rel'], str) or 'rel_path' not in pats \
+            or not pats['rel_path'].fullmatch(bit['rel']):
+        raise ValueError('lme: registry remote_harness_schema.contract_admission.bootstrap_identity_task must be exactly {rel: <a patterns.rel_path relative path>}; got %r' % (bit,))
     return pats, ca['contracts'], ca['required_values']
 
 
@@ -3760,7 +4295,7 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
         if arg.get('distinct') and len(set(s)) != len(s):
             return 'must hold distinct entries'
         return None
-    if kind == 'within':
+    if kind in ('within', 'not_within'):
         # C1-CONTRACT-SCALAR-SHAPE (codex 193253): the value must have its DECLARED shape before membership is judged;
         # an empty or differently shaped value never passes vacuously (e.g. {} / [] / [getent] for a scalar key).
         shape = chk['subject']
@@ -3794,6 +4329,13 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
                     allowed.extend(node)
                 else:
                     allowed.append(node)
+        if kind == 'not_within':
+            # MR03 S13 (F-E4-01 / OD-GL-DISJ-01; codex665 minimal generic check): the complement of within over the SAME
+            # declared-shape check and the SAME reference walk above (an absent reference refuses as a missing dependency,
+            # never vacuous): no member of the subject may equal (type-exact) a member of a referenced node. No consumer-
+            # specific rule; having / key_at / placeholders never reach here (_RH_CA_MODS admits them for within only).
+            hit = [m for m in _rh_ca_members(s) if any(_rh_ca_same(m, a) for a in allowed)]
+            return 'names %r inside %s (the subject must share no member with them)' % (hit, arg) if hit else None
         miss = [m for m in _rh_ca_members(s) if isinstance(m, (dict, list)) or not any(_rh_ca_same(m, a) for a in allowed)]
         return 'names %r outside %s%s%s%s (missing dependency)' % (
             miss, arg, ' with %s containing %r' % (hv['field'], hv['contains']) if hv else '',
@@ -3886,6 +4428,28 @@ def _rh_ca_check(kind, arg, s, chk, pol, pats, schema, root):
         if _rh_kind(s) not in ('str', 'int', 'bool'):
             return 'must be a scalar (str, int, bool) to equal registry %s; got a %s' % (where, _rh_kind(s))
         return None if _rh_ca_same(s, want) else 'must equal registry %s (%r)' % (where, want)
+    if kind == 'equals_registry_set':
+        # records-contract-set-kind-01 (codex-tick755 OPEN-S18-LATE-BINDING-KIND option ii): EXACT SET equality of a policy
+        # string collection with a registry string collection: the members of a registry list, or the keys of a registry
+        # mapping when the declared projection is the vocabulary.projections keys word. Both sides must be lists of strings
+        # (type-exact) without a duplicate, checked BEFORE the set conversion; order is not significant; an empty set
+        # equals only an empty set; an absent or differently typed reference refuses (missing dependency).
+        fg, want = _rh_get(schema, arg['path'])
+        if not fg:
+            return 'requires registry %s declared (missing dependency)' % (arg['path'],)
+        if arg['projection'] == schema['contract_admission']['vocabulary']['projections']['keys']:
+            if not isinstance(want, dict):
+                return 'projects the keys of registry %s, which is a %s, not a mapping (missing dependency)' % (arg['path'], _rh_kind(want))
+            want = list(want)
+        elif not isinstance(want, list):
+            return 'compares the members of registry %s, which is a %s, not a list (missing dependency)' % (arg['path'], _rh_kind(want))
+        for side, xs in (('registry %s' % (arg['path'],), want), ('the value', s)):
+            if not isinstance(xs, list) or any(_rh_kind(x) != 'str' for x in xs):
+                return '%s must be a list of strings; got %r' % (side, xs)
+            if len(set(xs)) != len(xs):
+                return '%s holds a duplicate member; got %r' % (side, xs)
+        miss, extra = sorted(set(want) - set(s)), sorted(set(s) - set(want))
+        return 'must equal the set of registry %s (missing %s, undeclared %s)' % (arg['path'], miss, extra) if miss or extra else None
     if kind == 'ere':
         return _rh_ca_ere(s, arg, chk.get('sed_delimited', False))
     if kind == 'ere_compose':
@@ -4002,12 +4566,27 @@ def _rh_admit_contracts(pol, schema, key):
         for chk in c['checks']:
             kind = [k for k in chk if k in _RH_CA_KINDS][0]
             dotted = chk['at'] if 'at' in chk else '.'.join(p for p in (c['root'], chk['path']) if p)
+            # C1 s08 LH-3 (codex-tick818 :43-45; records-c1-framework-22 LH-3): a `registry` check (admitted exactly true, on
+            # an `at` location, for the declared registry kinds) resolves its SUBJECT in the admitted registry; every other
+            # check resolves it in the policy. Both the plain and the '*' branch use this one tree. Comparands keep their
+            # existing sources (_rh_ca_check below still receives pol and schema) and the contract root stays a policy mapping.
+            subj_tree = schema if 'registry' in chk else pol
             if '*' in dotted.split('.'):
-                # a '*' segment: every expanded node is a subject; expanding to nothing refuses (never vacuous)
-                vals = [n for _p, n in _rh_expand(pol, dotted)]
-                found, v = bool(vals), vals
+                # a '*' segment: every expanded node is a subject; expanding to nothing refuses (never vacuous). codex-tick626
+                # LI-OPTIONAL-RULE-EMPTY-EXPANSION: an `optional` row (a key_set optional member) checks every PRESENT member;
+                # none present is admitted ONLY while the expansion up to its LAST '*' (the owner rows' subjects) is non-empty,
+                # so the owner stays never-vacuous and a present malformed member still refuses
+                vals = [n for _p, n in _rh_expand(subj_tree, dotted)]
+                found, v = bool(vals) or (chk.get('optional') is True and bool(_rh_expand(subj_tree, dotted[:dotted.rindex('*') + 1]))), vals
+                if not found and chk.get('empty_mapping') is True:
+                    # C1 CURRENT correction (codex-tick860 (b)): an empty expansion is admitted ONLY when the node holding the
+                    # row's '*' is present, a mapping, and empty; a missing, null or list holder refuses (is not declared), and
+                    # a non-empty holder whose members do not reach the row still refuses (never vacuous otherwise).
+                    segs = dotted.split('.')
+                    fh, holder = _rh_get(pol, '.'.join(segs[:segs.index('*')]))
+                    found = fh and isinstance(holder, dict) and not holder
             else:
-                found, v = _rh_get(pol, dotted)
+                found, v = _rh_get(subj_tree, dotted)
                 vals = [v]
             why = 'is not declared' if not found else None
             for val in (vals if why is None else []):
@@ -4215,6 +4794,9 @@ def _rh_validate(composed, declared, override, schema, *, documents, admission):
                'host_scoped_paths': scoped,
                'scope_invariant_sha256': _digest({'policy': _rh_without(pol, scoped), 'host_scoped_paths': scoped}),
                'shared_artifact_inputs_sha256': _digest(shared_inputs)}
+    # C1-RECIPE-PUB-02 (codex-tick884 Q290_2 c; codex-tick886 Q_R2_PROV_02; SR-292-04): the per-role generation bindings of
+    # this scope (= class), after every digest above and outside the policy (a class key inside it would digest itself).
+    section[_rh_gb_decl(schema)['to']] = _rh_generation_bindings(pol, section, schema, key, admission)
     return section, sorted(overridden), docs
 
 
@@ -4301,11 +4883,108 @@ def _rh_shared_inputs(pol, hs, scoped, key):
     return out
 
 
+# C1-RECIPE-PUB-02 (OW-H11-C1-01-PUB-02; codex-tick884 Q290_2 b, c; codex-tick886 Q_R2_PROV_02; SR-292-04): the keys of
+# the registry remote_harness_schema.generation_binding declaration, the semantic roles of one published binding and
+# the two applicability roles. Every output word is the registry's.
+_RH_GB_KEYS = frozenset(('to', 'projection', 'class_key_from', 'payload_role', 'lock_field_from', 'roles_from',
+                         'lock_algorithm', 'fields', 'applicability',
+                         # SR-300-09/10 HOLE-RT3-PROV-FIELD-MAP (C1 r12): the R3 provenance attestation map
+                         'provenance_block', 'provenance_fields', 'not_attested'))
+_RH_GB_FIELDS = frozenset(('role', 'leg', 'recipe_sha256', 'class_key', 'lock_rel', 'lock_sha256', 'bundle_provenance'))
+_RH_GB_APPLICABILITY = frozenset(('applies', 'not_applicable'))
+
+
+def _rh_gb_decl(schema):
+    """C1-RECIPE-PUB-02: registry remote_harness_schema.generation_binding, admitted at every use. to: the section and
+    scope-entry key carrying the bindings (a var_name; no section, scope or published view key); projection: a declared
+    select_tree projection; class_key_from, payload_role, lock_field_from, roles_from, lock_algorithm: policy paths;
+    fields: exactly the _RH_GB_FIELDS roles mapped to distinct var_name words; applicability: exactly applies and
+    not_applicable mapped to distinct var_name words."""
+    pats = _rh_patterns(schema)[0]
+    if 'generation_binding' not in schema or 'var_name' not in pats:
+        raise ValueError('lme: registry remote_harness_schema.generation_binding and contract_admission.patterns.var_name must be declared (C1-RECIPE-PUB-02)')
+    gb, views, projs = schema['generation_binding'], _rh_published_view_decl(schema), schema['policy_projections']
+    if not isinstance(gb, dict) or set(gb) != _RH_GB_KEYS \
+            or any(not isinstance(gb[k], str) or not gb[k] for k in sorted(_RH_GB_KEYS - {'fields', 'applicability', 'provenance_fields', 'not_attested'})) \
+            or not isinstance(gb['fields'], dict) or set(gb['fields']) != _RH_GB_FIELDS \
+            or not isinstance(gb['applicability'], dict) or set(gb['applicability']) != _RH_GB_APPLICABILITY:
+        raise ValueError('lme: registry remote_harness_schema.generation_binding must carry exactly %s of non-empty strings, fields exactly %s and applicability exactly %s; got %r' % (
+            sorted(_RH_GB_KEYS), sorted(_RH_GB_FIELDS), sorted(_RH_GB_APPLICABILITY), gb))
+    # SR-300-09/10 HOLE-RT3-PROV-FIELD-MAP (C1 r12): provenance_block is a var_name; provenance_fields maps distinct
+    # var_name block keys to distinct fields roles; not_attested lists the remaining roles; together exactly
+    # _RH_GB_FIELDS, disjoint (lme_source_binding ties the block keys and its role enum to the record schema and policy).
+    pf, na = gb['provenance_fields'], gb['not_attested']
+    if not isinstance(pf, dict) or not pf or not isinstance(na, list) \
+            or any(not isinstance(k, str) or not pats['var_name'].fullmatch(k) for k in pf) \
+            or any(not isinstance(v, str) or v not in _RH_GB_FIELDS for v in list(pf.values()) + na) \
+            or len(set(pf.values())) != len(pf) or len(set(na)) != len(na) \
+            or set(pf.values()) & set(na) or set(pf.values()) | set(na) != _RH_GB_FIELDS \
+            or not pats['var_name'].fullmatch(gb['provenance_block']):
+        raise ValueError('lme: registry remote_harness_schema.generation_binding (HOLE-RT3-PROV-FIELD-MAP): provenance_block must be a var_name, provenance_fields map distinct var_name block keys to distinct fields roles and not_attested list the other roles, together exactly %s and disjoint; got %r / %r / %r' % (
+            sorted(_RH_GB_FIELDS), gb['provenance_block'], pf, na))
+    words = [gb['to']] + list(gb['fields'].values()) + list(gb['applicability'].values())
+    if any(not isinstance(w, str) or not pats['var_name'].fullmatch(w) for w in words) \
+            or len(set(gb['fields'].values())) != len(_RH_GB_FIELDS) or len(set(gb['applicability'].values())) != len(_RH_GB_APPLICABILITY) \
+            or gb['to'] in _RH_BASE_KEYS | _RH_SCOPED_KEYS | set(_RH_SCOPE_ENTRY) | {'kind', 'id'} or gb['to'] in views \
+            or not isinstance(projs, dict) or gb['projection'] not in projs or not isinstance(projs[gb['projection']], dict) \
+            or 'kind' not in projs[gb['projection']] or projs[gb['projection']]['kind'] != 'select_tree':
+        raise ValueError('lme: registry remote_harness_schema.generation_binding: to and every field / applicability word must be a distinct var_name, to no section, scope or published view key, and projection a declared select_tree projection; got %r' % (gb,))
+    return gb
+
+
+def _rh_generation_bindings(pol, sec, schema, key, admission):
+    """C1-RECIPE-PUB-02 (codex-tick884 Q290_2 b, c; codex-tick883 Q290_1; codex-tick886 Q_R2_PROV_02; SR-292-04):
+    {role: binding} for every role the projection published in pol (one scope's resolved policy = one class), each
+    exactly the declared fields: role; leg and recipe_sha256 as the projection published them; class_key = sec[<the
+    value at class_key_from>] (the serving scope's own class identity, bootstrap.bundle.per_class.key_field -- the
+    engine-derived key PUB-01 names, never a receipt claim); lock_rel = the role recipe's <value at lock_field_from>
+    (lock_capture.input_binding.field); lock_sha256 = the observed digest the protected source-admission record holds
+    for lock_rel (the admitted lock bytes, read through document_channel.admission; lock_algorithm must equal the
+    channel digest algorithm); bundle_provenance = applicability.applies exactly for the role at payload_role, else
+    applicability.not_applicable (declared, so absence never switches a check off). Outside the policy and after its
+    digests. No fallback: no admission record, an unadmitted lock, an unknown role or a differing algorithm refuses."""
+    gb, ch = _rh_gb_decl(schema), _rh_document_channel(schema)
+    pj = schema['policy_projections'][gb['projection']]
+    ow, am = pj['outputs'], ch['admission']
+    paths = {'published': '%s.%s' % (pj['at'], pj['to']), 'class_key_from': gb['class_key_from'], 'payload_role': gb['payload_role'],
+             'lock_field_from': gb['lock_field_from'], 'roles_from': gb['roles_from'], 'lock_algorithm': gb['lock_algorithm'],
+             'admission_algorithm': ch['digest_algorithm'], 'members': am['members'], 'observed': am['observed']}
+    got = dict((n, _rh_get(pol, p)) for n, p in sorted(paths.items()))
+    absent = sorted(paths[n] for n in got if not got[n][0])
+    if absent:
+        raise ValueError('lme: %s generation bindings (C1-RECIPE-PUB-02): the resolved policy declares no %s' % (key, absent))
+    pub, kf, prole, lf, roles = (got[n][1] for n in ('published', 'class_key_from', 'payload_role', 'lock_field_from', 'roles_from'))
+    lalg, aalg, mk, ok = (got[n][1] for n in ('lock_algorithm', 'admission_algorithm', 'members', 'observed'))
+    if not isinstance(pub, dict) or not isinstance(roles, list) or any(not isinstance(r, str) for r in roles) or sorted(pub) != sorted(roles) \
+            or len(set(roles)) != len(roles) or not isinstance(prole, str) or prole not in roles or not isinstance(lf, str) or not lf \
+            or not isinstance(kf, str) or kf not in sec or not isinstance(sec[kf], str) or not sec[kf] \
+            or not isinstance(lalg, str) or lalg != aalg or not isinstance(mk, str) or not isinstance(ok, str):
+        raise ValueError('lme: %s generation bindings (C1-RECIPE-PUB-02): %s must publish exactly the roles at %s, %s must name one of them, %s a section class key, and %s must equal %s; got roles %r / %r, payload role %r, class key field %r, algorithms %r / %r' % (
+            key, paths['published'], gb['roles_from'], gb['payload_role'], gb['class_key_from'], gb['lock_algorithm'], ch['digest_algorithm'],
+            sorted(pub) if isinstance(pub, dict) else _rh_kind(pub), roles, prole, kf, lalg, aalg))
+    if not isinstance(admission, dict) or mk not in admission or not isinstance(admission[mk], dict):
+        raise ValueError('lme: %s generation bindings (C1-RECIPE-PUB-02): lock_sha256 is read only from the protected source-admission record (%s), which is absent or carries no %r mapping; nothing stands in for it' % (
+            key, am['fact'], mk))
+    adm, f, ap, out = admission[mk], gb['fields'], gb['applicability'], {}
+    for role in sorted(pub):
+        ent = pub[role]
+        if not isinstance(ent, dict) or set(ent) != set(ow.values()) or not isinstance(ent[ow['tree']], dict) or lf not in ent[ow['tree']]:
+            raise ValueError('lme: %s.%s.%s must carry exactly %s with %s in its %s (C1-RECIPE-PUB-02)' % (key, paths['published'], role, sorted(ow.values()), lf, ow['tree']))
+        rel = ent[ow['tree']][lf]
+        if not isinstance(rel, str) or rel not in adm or not isinstance(adm[rel], dict) or ok not in adm[rel] or not isinstance(adm[rel][ok], str) or not adm[rel][ok]:
+            raise ValueError('lme: %s generation bindings.%s: lock %r is no admitted source member with an observed digest (%s.%s.<rel>.%s); lock_sha256 has no source' % (
+                key, role, rel, am['fact'], mk, ok))
+        out[role] = {f['role']: role, f['leg']: ent[ow['selected']], f['recipe_sha256']: ent[ow['digest']], f['class_key']: sec[kf],
+                     f['lock_rel']: rel, f['lock_sha256']: adm[rel][ok],
+                     f['bundle_provenance']: ap['applies'] if role == prole else ap['not_applicable']}
+    return out
+
+
 def _rh_safe_rel(p):
     """A normalized, relative repository path: non-empty, not absolute, no '.' / '..' / empty component."""
     import posixpath
     return isinstance(p, str) and bool(p) and not p.startswith('/') and posixpath.normpath(p) == p \
-        and '..' not in p.split('/')
+        and not ({'.', '..'} & set(p.split('/')))
 
 
 _RH_IMPORT_FILTERS = ('relpath', 'dirname')
@@ -5007,7 +5686,7 @@ def _rh_scoped(section, composed, declared, override, schema, scope, *, document
         if _rh_get(sec['policy'], hs['target_group_path'])[1] != tg or _rh_get(sec['policy'], hs['operation_path'])[1] != op:
             raise ValueError('lme: scope %r resolves another target group/operation than the deployment binding' % (i,))
         ident = {'kind': 'controller' if i == cid else 'target', 'id': i}
-        out = dict(ident, **{k: sec[k] for k in _RH_SCOPE_ENTRY})
+        out = dict(ident, **{k: sec[k] for k in _RH_SCOPE_ENTRY + (_rh_gb_decl(schema)['to'],)})   # C1-RECIPE-PUB-02: + the class generation bindings
         out['scope_sha256'] = _digest({'scope': ident, 'binding': binding, 'policy_sha256': sec['policy_sha256']})
         return out
     scopes = {'controller': entry(cid), 'targets': {t: entry(t) for t in targets}}
@@ -5540,7 +6219,7 @@ _RH_BASE_KEYS = frozenset(('schema_version', 'policy', 'policy_sha256', 'adapter
 _RH_SCOPED_KEYS = frozenset(('scope', 'binding', 'scope_sha256', 'scopes', 'scopes_sha256'))
 
 
-def _rh_verify_entry(where, sec, keys, schema):
+def _rh_verify_entry(where, sec, keys, schema, admission):
     if not isinstance(sec, dict) or set(sec) != set(keys):
         raise ValueError('lme: published %s must carry exactly %s; got %r' % (where, sorted(keys), sorted(sec) if isinstance(sec, dict) else sec))
     if sec['policy_sha256'] != _digest(sec['policy']):
@@ -5553,10 +6232,18 @@ def _rh_verify_entry(where, sec, keys, schema):
     # C1-ARTIFACT-REUSE-INPUT-COVERAGE: the reuse key re-derives from the entry's own policy + the registry declaration.
     if sec['shared_artifact_inputs_sha256'] != _digest(_rh_shared_inputs(sec['policy'], schema['host_scope'], hsp, schema['policy_key'])):
         raise ValueError('lme: published %s.shared_artifact_inputs_sha256 is not the digest of its declared artifact inputs' % (where,))
+    # C1-RECIPE-PUB-02 (codex-tick886 Q_R2_PROV_02): the generation bindings re-derive from the entry's OWN policy, its
+    # (just verified) class key and the protected admission record; an edited or stale binding refuses.
+    gbk = _rh_gb_decl(schema)['to']
+    if not _leaf_equal(sec[gbk], _rh_generation_bindings(sec['policy'], sec, schema, where, admission)):
+        raise ValueError('lme: published %s.%s is not the binding its own policy, class key and the admission record derive (registry generation_binding)' % (where, gbk))
 
 
-def lme_verify_resolved(resolved, registry, *, documents, admission):
-    """F05-S3 LR-15: `documents` / `admission` are the SAME resolver outputs the projection read (required keyword
+def lme_verify_resolved_structure(resolved, registry, *, documents, admission):
+    """C1-INVOCATION-CONTEXT-01 L8-02 (codex 896 DEV-L7-03): the NARROW structural verification of a published
+    lme_resolved (the body lme_verify_resolved carried through L7); it never claims completeness: the complete
+    verification is lme_verify_resolved, which runs this check and then the source binding.
+    F05-S3 LR-15: `documents` / `admission` are the SAME resolver outputs the projection read (required keyword
     arguments; a call without them is a TypeError). They are re-admitted here (_rh_documents: rel re-derivation +
     admitted digest before parse), the ACTIVE view set is the one the section's own policy publishes, and every
     document-kind projected leaf re-derives from the section's policy with its projected destinations stripped.
@@ -5591,7 +6278,8 @@ def lme_verify_resolved(resolved, registry, *, documents, admission):
         raise ValueError('lme: published %s must be a mapping carrying a policy mapping; got %r' % (key, _rh_kind(sec)))
     docs = _rh_documents(sec['policy'], schema, key, documents, admission)
     want_views = _rh_published_views(sec['policy'], schema, key, docs)
-    _rh_verify_entry(key, sec, _RH_BASE_KEYS | set(want_views) | (_RH_SCOPED_KEYS if scoped else frozenset()), schema)
+    gbk = _rh_gb_decl(schema)['to']   # C1-RECIPE-PUB-02: the generation-binding key of the section and of every scope entry
+    _rh_verify_entry(key, sec, _RH_BASE_KEYS | set(want_views) | {gbk} | (_RH_SCOPED_KEYS if scoped else frozenset()), schema, admission)
     # F05 LV-4: every published view re-derives from the section's OWN policy + the registry (type-aware), so a view
     # edited after resolve, or a pre-supplied section carrying a stale view, refuses. F05-S3: only the ACTIVE set.
     for name, want_v in sorted(want_views.items()):
@@ -5600,7 +6288,7 @@ def lme_verify_resolved(resolved, registry, *, documents, admission):
     # F05-S3 LR-15: the document-kind projected leaves re-derive from the admitted documents. EXACTLY the leaves each
     # projection writes are stripped -- lookup_merge: at.to.<role> for every role of at.from (at.to also holds authored
     # producer-only roles, which stay); every other kind: at.to (it refuses an authored `to`) -- and the projections
-    # (and partitions) re-applied; only the document-kind leaves are compared here (the rest are digest-bound).
+    # (and partitions) re-applied; the document-kind leaves are compared here, select_tree below (the rest are digest-bound).
     projs = schema['policy_projections']
     dests = []
     for n in sorted(projs):
@@ -5626,6 +6314,18 @@ def lme_verify_resolved(resolved, registry, *, documents, admission):
     if not _leaf_equal(sec['schema_version'], want):
         raise ValueError('lme: published %s.schema_version is %r (%s); the registry declares %r (%s)' % (
             key, sec['schema_version'], type(sec['schema_version']).__name__, want, type(want).__name__))
+    # C1-RECIPE-PUB-01 (OW-H11-C1-01-PUB; codex-tick883 SR290_09): every select_tree object re-derives through the SAME
+    # _rh_pj_select_tree from its own policy with that object stripped: the section's policy here and, when scoped, every
+    # scope entry's policy below (each class's own selected recipe). An object edited after resolve refuses.
+    stp, stn = _rh_patterns(schema)[0], sorted(n for n in projs if projs[n]['kind'] == 'select_tree')
+
+    def _st_back(where, p):
+        for n in stn:
+            d = '%s.%s' % (projs[n]['at'], projs[n]['to'])
+            fh, have = _rh_get(p, d)
+            if not fh or not _leaf_equal(have, _rh_pj_select_tree(n, projs[n], _rh_without(p, [d]), key, stp)):
+                raise ValueError('lme: published %s.policy.%s is not the object its own policy derives (policy_projections.%s); got %r' % (where, d, n, _rh_kind(have) if fh else '<absent>'))
+    _st_back(key, sec['policy'])
     if not scoped:
         return True
     scopes, binding = sec['scopes'], sec['binding']
@@ -5639,10 +6339,11 @@ def lme_verify_resolved(resolved, registry, *, documents, admission):
         raise ValueError('lme: published %s.scopes must be {controller, targets}' % (key,))
     entries = [('controller', scopes['controller'])] + [('targets.' + t, scopes['targets'][t]) for t in sorted(scopes['targets'])]
     for where, ent in entries:
-        _rh_verify_entry('%s.scopes.%s' % (key, where), ent, set(_RH_SCOPE_ENTRY) | {'kind', 'id', 'scope_sha256'}, schema)
+        _rh_verify_entry('%s.scopes.%s' % (key, where), ent, set(_RH_SCOPE_ENTRY) | {'kind', 'id', 'scope_sha256', gbk}, schema, admission)
         ident = {'kind': ent['kind'], 'id': ent['id']}
         if ent['scope_sha256'] != _digest({'scope': ident, 'binding': binding, 'policy_sha256': ent['policy_sha256']}):
             raise ValueError('lme: published %s.scopes.%s.scope_sha256 is not bound to its scope/binding/policy' % (key, where))
+        _st_back('%s.scopes.%s' % (key, where), ent['policy'])
     if sec['scopes_sha256'] != _digest(scopes):
         raise ValueError('lme: published %s.scopes_sha256 is not the digest of its actual scopes' % (key,))
     # GRAPH-SHARED-CONTRACT (codex-tick304): the bound target inputs are present exactly when the controller scope's
@@ -5661,9 +6362,28 @@ def lme_verify_resolved(resolved, registry, *, documents, admission):
     mine = scopes['controller'] if isinstance(me, dict) and me.get('kind') == 'controller' else \
         scopes['targets'].get(me.get('id')) if isinstance(me, dict) else None
     if not isinstance(mine, dict) or not _leaf_equal({'kind': mine['kind'], 'id': mine['id']}, me) \
-            or not _leaf_equal({k: mine[k] for k in _RH_SCOPE_ENTRY}, {k: sec[k] for k in _RH_SCOPE_ENTRY}) \
+            or not _leaf_equal({k: mine[k] for k in _RH_SCOPE_ENTRY + (gbk,)}, {k: sec[k] for k in _RH_SCOPE_ENTRY + (gbk,)}) \
             or sec['scope_sha256'] != mine['scope_sha256']:
         raise ValueError('lme: published %s is not its own scope entry %r of scopes' % (key, me))
+    return True
+
+
+def lme_verify_resolved(resolved, registry, *, documents, admission, source):
+    """C1-INVOCATION-CONTEXT-01 L8-02 (codex 896 DEV-L7-03 join; SR-302-05): the ONE complete verification of a
+    published lme_resolved. documents / admission are the SAME resolver outputs the projection read; source is REQUIRED
+    (a call without it is a TypeError) and must carry exactly the registry source_binding.verification.source_fields
+    keys: the published binding, the authoritative captures, the manifests dir and the record blocks. Applicability
+    follows the DECLARED verification.requirement (the closed word list admits required only), never the presence of
+    evidence: lme_verify_resolved_structure runs, then lme_verify_source_binding re-derives the binding from the same
+    resolved object and admission. Nothing downgrades to configuration-only verification. Returns True; raises otherwise."""
+    sb = _sb_decl(registry)[0]
+    sf = sb['verification']['source_fields']
+    if not isinstance(source, Mapping) or sorted(source) != sorted(sf.values()):
+        _sb_refuse(sb, 'the complete verification requires %s with exactly %s; nothing downgrades to configuration-only verification' % (
+            sb['verification']['source_arg'], sorted(sf.values())), sorted(source) if isinstance(source, Mapping) else _rh_kind(source))
+    lme_verify_resolved_structure(resolved, registry, documents=documents, admission=admission)
+    lme_verify_source_binding(source[sf['binding']], resolved, registry, captures=source[sf['captures']], admission=admission,
+                              manifests_dir=source[sf['manifests_dir']], record_blocks=source[sf['record_blocks']])
     return True
 
 
@@ -5686,10 +6406,13 @@ def _rh_reader_policy(scope, schema):
 def lme_rh_documents_active(scope, schema):
     """True exactly when the document channel's declaration_contract view is active for this host's policy (the ONE
     activity rule; no policy declared -> False). resolve.yml binds _lme_rh_admission to rh_src_admission only then."""
+    # C1 s11 L11-07 (records-c1-framework-29): the channel, its reader-input names included, is admitted on EVERY
+    # call, before the no-policy return, so a colliding or unprotected declaration refuses before any document access.
+    ch = _rh_document_channel(schema)
     key, pol = _rh_reader_policy(scope, schema)
     if pol is None:
         return False
-    return _rh_contract_active(pol, schema, _rh_document_channel(schema)['when'], 'remote_harness_schema.document_channel.when')
+    return _rh_contract_active(pol, schema, ch['when'], 'remote_harness_schema.document_channel.when')
 
 
 def lme_rh_document_plan(scope, schema, *, admission):
@@ -5747,6 +6470,798 @@ def lme_remote_harness_overridden_paths(composed, declared, override, schema, *,
     return _rh_validate(composed, declared, override, schema, documents=documents, admission=admission)[1]
 
 
+# C1-H11 (records-c1-h11-yaml-receipts-01; codex 855 / 860 / 865 / 868 / 870): the ONE renderer and the ONE whole-document
+# admitter of every record in lme_global.record_schemas. The record names its serialization policy, which must equal
+# _REC_POLICY (the one policy this code implements; any other refuses). Admission = ASCII text, one document parsed by
+# _rh_yaml_load_unique (unique keys, no second document), exact declared keys and types, and byte equality with the
+# canonical rendering of the parsed value. Refusals name the record, the key path and declaration words, never a value.
+_REC_POLICY = {
+    'encoding': 'ascii', 'serialization': 'yaml', 'key_order': 'schema_keys', 'duplicate_keys': 'refuse',
+    'terminator': '\n', 'documents': 'single', 'indent': 2, 'string_style': 'single_quoted',
+    'string_domain': 'printable_ascii', 'int_style': 'decimal', 'bool_style': 'lowercase',
+    'null_values': 'refuse', 'empty_forms': {'mapping': '{}', 'sequence': '[]'}, 'key_style': 'plain',
+    'keyed_key_style': 'single_quoted', 'keyed_order': 'sorted', 'canonical': 'render_equal'}
+_REC_KEY = re.compile(r'[a-z][a-z0-9_]*\Z')
+_REC_TEXT = re.compile(r'[ -~]+\Z')
+_REC_HEX40 = re.compile(r'[0-9a-f]{40}\Z')
+_REC_HEX64 = re.compile(r'[0-9a-f]{64}\Z')
+_REC_STR_TAG = 'tag:yaml.org,2002:str'
+_REC_KEY_TYPES = ('str', 'hex40', 'hex64')
+
+
+def _rec_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+_REC_SCALARS = {
+    'str': lambda v: isinstance(v, str) and bool(_REC_TEXT.match(v)),
+    'hex40': lambda v: isinstance(v, str) and bool(_REC_HEX40.match(v)),
+    'hex64': lambda v: isinstance(v, str) and bool(_REC_HEX64.match(v)),
+    'int': _rec_int,
+    'nonneg_int': lambda v: _rec_int(v) and v >= 0,
+    'posint': lambda v: _rec_int(v) and v > 0,
+    'bool': lambda v: isinstance(v, bool),
+}
+
+
+def _rec_refuse(name, at, why):
+    raise ValueError('lme: record %s at %s: %s' % (name, '/'.join(at) if at else '(root)', why))
+
+
+def _rec_same(a, b):
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return set(a) == set(b) and all(_rec_same(a[k], b[k]) for k in a)
+    return a == b
+
+
+def _rec_spec_ok(spec, blocks):
+    if isinstance(spec, str):
+        return spec in _REC_SCALARS
+    if not isinstance(spec, dict) or len(spec) != 1:
+        return False
+    form, arg = list(spec.items())[0]
+    if form == 'enum':
+        return (isinstance(arg, list) and len(arg) > 0
+                and all(type(e) is int or _REC_SCALARS['str'](e) for e in arg))
+    if form == 'block':
+        return isinstance(arg, str) and arg in blocks
+    if form == 'list':
+        return _rec_spec_ok(arg, blocks)
+    if form == 'keyed':
+        return (isinstance(arg, dict) and set(arg) == {'key', 'value'} and arg['key'] in _REC_KEY_TYPES
+                and _rec_spec_ok(arg['value'], blocks))
+    return False
+
+
+def _rec_decl(schemas, policies, tags, name):
+    import yaml
+    if not isinstance(name, str) or not _REC_KEY.match(name):
+        _rec_refuse('(unnamed)', (), 'the record name must be a declared plain word')
+    if not isinstance(schemas, dict) or set(schemas) != {'blocks', 'records'}:
+        _rec_refuse(name, (), 'record_schemas must carry exactly blocks and records')
+    blocks, records = schemas['blocks'], schemas['records']
+    if not isinstance(blocks, dict) or not isinstance(records, dict) or name not in records:
+        _rec_refuse(name, (), 'no such record in record_schemas.records')
+    rec = records[name]
+    if (not isinstance(rec, dict) or set(rec) != {'policy', 'root'} or not isinstance(rec['root'], str)
+            or rec['root'] not in blocks or not isinstance(rec['policy'], str)):
+        _rec_refuse(name, (), 'a record declaration is exactly {policy, root}, root a declared block')
+    if (not isinstance(policies, dict) or rec['policy'] not in policies
+            or not _rec_same(policies[rec['policy']], _REC_POLICY)):
+        _rec_refuse(name, (), 'serialization policy %s differs from the policy this renderer implements' % rec['policy'])
+    for bname in blocks:
+        b = blocks[bname]
+        ok = (isinstance(bname, str) and isinstance(b, dict) and set(b) == {'keys', 'types'}
+              and isinstance(b['keys'], list) and isinstance(b['types'], dict) and len(b['keys']) > 0
+              and all(isinstance(k, str) and bool(_REC_KEY.match(k)) for k in b['keys'])
+              and len(set(b['keys'])) == len(b['keys']) and set(b['keys']) == set(b['types'])
+              and all(_rec_spec_ok(b['types'][k], blocks) for k in b['keys']))
+        if not ok:
+            _rec_refuse(name, ('blocks', str(bname)), 'a block is {keys, types}: unique plain keys, one declared type each')
+    _rh_yaml_roles_bound(tags)
+    probe = _rh_yaml_unique_loader(tags)('')
+    try:
+        bad = sorted(set(k for b in blocks.values() for k in b['keys']
+                         if probe.resolve(yaml.ScalarNode, k, (True, False)) != _REC_STR_TAG))
+    finally:
+        probe.dispose()
+    if bad:
+        _rec_refuse(name, ('blocks',), 'declared keys %s do not resolve as plain strings' % bad)
+    return blocks, {'block': rec['root']}
+
+
+def _rec_check(v, t, blocks, name, at):
+    if isinstance(t, str):
+        if not _REC_SCALARS[t](v):
+            _rec_refuse(name, at, 'value is not of declared type %s' % t)
+        return
+    form, arg = list(t.items())[0]
+    if form == 'enum':
+        if not any(type(v) is type(e) and v == e for e in arg):
+            _rec_refuse(name, at, 'value outside the declared enum')
+    elif form == 'list':
+        if not isinstance(v, list):
+            _rec_refuse(name, at, 'value is not a sequence')
+        for i, e in enumerate(v):
+            _rec_check(e, arg, blocks, name, at + (str(i),))
+    elif form == 'keyed':
+        if not isinstance(v, dict) or not all(_REC_SCALARS[arg['key']](k) for k in v):
+            _rec_refuse(name, at, 'value is not a mapping keyed by %s' % arg['key'])
+        for k in sorted(v):
+            _rec_check(v[k], arg['value'], blocks, name, at + (k,))
+    else:
+        keys = blocks[arg]['keys']
+        if not isinstance(v, dict) or not all(isinstance(k, str) for k in v) or set(v) != set(keys):
+            _rec_refuse(name, at, 'mapping keys differ from the declared key list of block %s' % arg)
+        for k in keys:
+            _rec_check(v[k], blocks[arg]['types'][k], blocks, name, at + (k,))
+
+
+def _rec_q(s):
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _rec_node(v, t, blocks):
+    """('', lines) for a non-empty mapping or sequence, lines at relative indent 0; (text, ()) otherwise."""
+    pad = ' ' * _REC_POLICY['indent']
+    if isinstance(t, dict) and 'block' in t:
+        b = blocks[t['block']]
+        return '', _rec_pairs([(k, v[k], b['types'][k]) for k in b['keys']], blocks)
+    if isinstance(t, dict) and 'keyed' in t:
+        if len(v) == 0:
+            return _REC_POLICY['empty_forms']['mapping'], ()
+        return '', _rec_pairs([(_rec_q(k), v[k], t['keyed']['value']) for k in sorted(v)], blocks)
+    if isinstance(t, dict) and 'list' in t:
+        if len(v) == 0:
+            return _REC_POLICY['empty_forms']['sequence'], ()
+        lines = []
+        for e in v:
+            text, sub = _rec_node(e, t['list'], blocks)
+            lines.extend(['- ' + sub[0]] + [pad + s for s in sub[1:]] if sub else ['- ' + text])
+        return '', tuple(lines)
+    if isinstance(v, bool):
+        return ('true' if v else 'false'), ()
+    if isinstance(v, int):
+        return '%d' % v, ()
+    return _rec_q(v), ()
+
+
+def _rec_pairs(pairs, blocks):
+    pad = ' ' * _REC_POLICY['indent']
+    lines = []
+    for key, v, t in pairs:
+        text, sub = _rec_node(v, t, blocks)
+        lines.extend([key + ':'] + [pad + s for s in sub] if sub else [key + ': ' + text])
+    return tuple(lines)
+
+
+def lme_render_record(value, schemas, policies, tags, name):
+    """C1-H11: the canonical text of declared record name over value, the only writer path of every declared record.
+    Refuses (ValueError) a declaration other than the implemented policy or a value whose keys or types differ."""
+    blocks, root = _rec_decl(schemas, policies, tags, name)
+    _rec_check(value, root, blocks, name, ())
+    return '\n'.join(_rec_node(value, root, blocks)[1]) + _REC_POLICY['terminator']
+
+
+def lme_admit_record(text, schemas, policies, tags, name):
+    """C1-H11 (codex 860 :82-85): whole-document admission of one declared record. A non-ASCII text, a parse,
+    duplicate-key or second-document failure, any key or type difference, and any byte difference from the canonical
+    rendering (order, quoting, comments, trailing content, terminator) refuse. Returns the admitted parsed value."""
+    blocks, root = _rec_decl(schemas, policies, tags, name)
+    if not isinstance(text, str) or not text.isascii():
+        _rec_refuse(name, (), 'document is not %s text' % _REC_POLICY['encoding'])
+    parsed, failure = _rh_yaml_load_unique(text, tags)
+    if failure:
+        _rec_refuse(name, (), 'document refused by the admitted loader (%s)' % (failure[0],))
+    _rec_check(parsed, root, blocks, name, ())
+    if lme_render_record(parsed, schemas, policies, tags, name) != text:
+        _rec_refuse(name, (), 'document bytes differ from the canonical rendering')
+    return parsed
+
+
+def lme_manifest_strict(text, rel, parse):
+    """DKJ-01: the ONE strict construction of a manifest or record text read outside the document channel. parse is the
+    registry document_channel.parse, re-admitted here (shape, exact text fields, role binding: _rh_doc_parse_decl); the
+    exact text is parsed by _rh_yaml_load_unique and a failure raises the declared document_channel.parse diagnostic for
+    rel (metadata only), outside any handler. Returns the constructed document."""
+    if not isinstance(text, str) or not isinstance(rel, str) or not rel:
+        raise ValueError('lme: lme_manifest_strict takes the exact text (a string) and a non-empty rel (a string); got %s / %s' % (_rh_kind(text), _rh_kind(rel)))
+    _rh_doc_parse_decl(parse)
+    parsed, failure = _rh_yaml_load_unique(text, parse['tags'])
+    if failure:
+        raise ValueError('lme: %s' % (_rh_doc_parse_text(parse, rel, failure),))
+    return parsed
+
+
+# C1-PROFILE-IDENTITY-02 / C1-SOURCE-BINDING-01 (codex 892 Q1-A, source_edition_join; codex 894; SR-301-02):
+# lme_profile_load_identity is retired (resolve.yml binds each native load to its retained capture). The registry
+# profile_identity node keys and fields, the source_binding node keys and the roles of one binding and of one
+# expectation row.
+_PROFILE_IDENTITY_KEYS = frozenset(('var', 'global_var', 'fields', 'digest_algorithm', 'digest_of', 'encoding', 'refusal'))
+_PROFILE_IDENTITY_FIELDS = ['path', 'sha256', 'capture_path']
+_SB_KEYS = frozenset(('var', 'fields', 'expectation_fields', 'manifests_rel', 'edition_from', 'edition_regex_from',
+                      'applicability', 'admission_absent', 'verification', 'refusal'))
+# C1-INVOCATION-CONTEXT-01 L8-01 (codex 896 DEV-L7-03): the source_binding.verification node keys, its closed
+# requirement words, the complete verifier's keyword argument name (an interface constant compared with the declared
+# source_arg) and the roles of its source mapping.
+_SB_VERIFICATION_KEYS = frozenset(('requirement', 'requirements', 'source_arg', 'source_fields'))
+_SB_VERIFICATION_REQUIREMENTS = ['required']
+_SB_SOURCE_ARG = 'source'
+_SB_SOURCE_FIELDS = frozenset(('binding', 'captures', 'manifests_dir', 'record_blocks'))
+_SB_FIELDS = frozenset(('applicability', 'root', 'commit', 'members', 'expectations'))
+_SB_EXPECTATION_FIELDS = frozenset(('scope', 'class_key', 'role', 'binding_sha256'))
+
+
+def _sb_decl(registry):
+    """C1-SOURCE-BINDING-01: (source_binding, profile_identity) of registry remote_harness_schema, admitted at every
+    use. source_binding: exactly _SB_KEYS; fields, expectation_fields and applicability exactly their roles mapped to
+    distinct var_name words; manifests_rel a safe relative path; var, edition_from, edition_regex_from and refusal
+    non-empty strings; admission_absent null. profile_identity: exactly _PROFILE_IDENTITY_KEYS of non-empty strings
+    with fields _PROFILE_IDENTITY_FIELDS, digest_of exact_file_bytes and a guaranteed digest algorithm. Raises."""
+    schema = registry.get('remote_harness_schema') if isinstance(registry, Mapping) else None
+    if not isinstance(schema, Mapping) or 'source_binding' not in schema or 'profile_identity' not in schema:
+        raise ValueError('lme: registry remote_harness_schema.source_binding and profile_identity must be declared (C1-SOURCE-BINDING-01)')
+    sb, pi = schema['source_binding'], schema['profile_identity']
+    pats = _rh_patterns(schema)[0]
+    maps = (('fields', _SB_FIELDS), ('expectation_fields', _SB_EXPECTATION_FIELDS), ('applicability', _RH_GB_APPLICABILITY))
+    if not isinstance(sb, Mapping) or set(sb) != _SB_KEYS or sb['admission_absent'] is not None or 'var_name' not in pats \
+            or any(not isinstance(sb[k], str) or not sb[k] for k in ('var', 'manifests_rel', 'edition_from', 'edition_regex_from', 'refusal')) \
+            or not _rh_safe_rel(sb['manifests_rel']) \
+            or any(not isinstance(sb[k], Mapping) or set(sb[k]) != r for k, r in maps) \
+            or any(not isinstance(w, str) or not pats['var_name'].fullmatch(w) for k, r in maps for w in sb[k].values()) \
+            or any(len(set(sb[k].values())) != len(r) for k, r in maps):
+        raise ValueError('lme: registry remote_harness_schema.source_binding must carry exactly %s (fields %s, expectation_fields %s and applicability %s each mapped to distinct var_name words; admission_absent null); got %r' % (
+            sorted(_SB_KEYS), sorted(_SB_FIELDS), sorted(_SB_EXPECTATION_FIELDS), sorted(_RH_GB_APPLICABILITY), sb))
+    if not isinstance(pi, Mapping) or set(pi) != _PROFILE_IDENTITY_KEYS or pi['fields'] != _PROFILE_IDENTITY_FIELDS \
+            or any(not isinstance(pi[k], str) or not pi[k] for k in sorted(_PROFILE_IDENTITY_KEYS - {'fields'})) \
+            or pi['var'] == pi['global_var'] or pi['digest_of'] != 'exact_file_bytes' \
+            or pi['digest_algorithm'] not in hashlib.algorithms_guaranteed:
+        raise ValueError('lme: registry remote_harness_schema.profile_identity must be exactly %s of non-empty strings with distinct var and global_var, fields %s, digest_of exact_file_bytes and a guaranteed digest algorithm; got %r' % (
+            sorted(_PROFILE_IDENTITY_KEYS), _PROFILE_IDENTITY_FIELDS, pi))
+    # C1-INVOCATION-CONTEXT-01 L8-01: verification is exactly _SB_VERIFICATION_KEYS; requirements the closed word list,
+    # requirement one of them; source_arg the complete verifier's keyword; source_fields exactly _SB_SOURCE_FIELDS mapped
+    # to distinct var_name words.
+    vf = sb['verification']
+    if not isinstance(vf, Mapping) or set(vf) != _SB_VERIFICATION_KEYS or vf['requirements'] != _SB_VERIFICATION_REQUIREMENTS \
+            or not isinstance(vf['requirement'], str) or vf['requirement'] not in vf['requirements'] \
+            or vf['source_arg'] != _SB_SOURCE_ARG or not isinstance(vf['source_fields'], Mapping) \
+            or set(vf['source_fields']) != _SB_SOURCE_FIELDS \
+            or any(not isinstance(w, str) or not pats['var_name'].fullmatch(w) for w in vf['source_fields'].values()) \
+            or len(set(vf['source_fields'].values())) != len(_SB_SOURCE_FIELDS):
+        raise ValueError('lme: registry remote_harness_schema.source_binding.verification must be exactly %s: requirements %s, requirement one of them, source_arg %r and source_fields %s mapped to distinct var_name words; got %r' % (
+            sorted(_SB_VERIFICATION_KEYS), _SB_VERIFICATION_REQUIREMENTS, _SB_SOURCE_ARG, sorted(_SB_SOURCE_FIELDS), vf))
+    return sb, pi
+
+
+def _sb_refuse(sb, what, got):
+    raise ValueError('lme: %s: %s; got %r' % (sb['refusal'], what, got))
+
+
+def lme_source_binding(resolved, registry, *, captures, admission, manifests_dir, record_blocks):
+    """C1-SOURCE-BINDING-01 (codex 892 source_edition_join; answers HOLE-PUB2-ADMISSION-EDITION-TIE; SR-301-02): the ONE
+    source-admission binding of a resolve invocation under the registry source_binding.fields words, published by
+    resolve.yml beside (never inside) lme_resolved, so outside policy_sha256 and the revision payload. captures is
+    exactly {<profile_identity.global_var>: <global identity>, <profile_identity.var>: <profile identity>}, each
+    exactly profile_identity.fields. root = manifests_dir (normalized) with its trailing /<manifests_rel> removed;
+    members = {<source path relative to root>: <capture sha256>}: the key is the SOURCE path, never capture_path (a
+    harness capture lives inside the leased run directory and is never required below root). Without the policy_key
+    section: not_applicable, admission must be admission_absent, commit null, expectations empty. With it: applies;
+    the section policy names the admission members container, observed field and digest algorithm
+    (document_channel.admission; the algorithm must be profile_identity.digest_algorithm); every member digest must
+    be the admission record's observed digest for its rel; commit is the admission record value under the field named
+    at edition_from, full-matching the pattern at edition_regex_from; record_blocks[generation_binding.provenance_block]
+    must carry exactly the provenance_fields keys with its role key enum equal to the role list at roles_from;
+    expectations = one row per scope entry (controller, then targets sorted; scope null for an unscoped section) and
+    role: scope {kind, id}, class_key, role and binding_sha256 = the digest of that generation binding. No fallback:
+    any mismatch raises the declared refusal."""
+    import posixpath
+    sb, pi = _sb_decl(registry)
+    schema = registry['remote_harness_schema']
+    f, ef, ap = sb['fields'], sb['expectation_fields'], sb['applicability']
+    tail = '/' + sb['manifests_rel']
+    mdir = posixpath.normpath(manifests_dir) if isinstance(manifests_dir, str) and manifests_dir else ''
+    if not mdir.endswith(tail) or len(mdir) == len(tail):
+        _sb_refuse(sb, 'the manifests dir must end with %s below a checkout root' % (tail,), manifests_dir)
+    root = mdir[:-len(tail)]
+    names = [pi['global_var'], pi['var']]
+    if not isinstance(captures, Mapping) or sorted(captures) != sorted(names):
+        _sb_refuse(sb, 'captures must carry exactly the published identities %s' % (names,),
+                   sorted(captures) if isinstance(captures, Mapping) else _rh_kind(captures))
+    hexlen = hashlib.new(pi['digest_algorithm']).digest_size * 2
+    members = {}
+    for m in names:
+        c = captures[m]
+        if not isinstance(c, Mapping) or set(c) != set(_PROFILE_IDENTITY_FIELDS) \
+                or any(not isinstance(c[k], str) or not c[k] for k in _PROFILE_IDENTITY_FIELDS) \
+                or not re.fullmatch('[0-9a-f]{%d}' % (hexlen,), c['sha256']):
+            _sb_refuse(sb, 'identity %s must be exactly %s of non-empty strings with a %s hex digest' % (m, _PROFILE_IDENTITY_FIELDS, pi['digest_algorithm']),
+                       sorted(c) if isinstance(c, Mapping) else _rh_kind(c))
+        src = posixpath.normpath(c['path'])
+        rel = src[len(root) + 1:] if src.startswith(root + '/') else None
+        if not _rh_safe_rel(rel) or rel in members:
+            _sb_refuse(sb, 'identity %s must name a distinct source file below the checkout root %s (the member key is the source path, never the capture path)' % (m, root), c['path'])
+        members[rel] = c['sha256']
+    if not isinstance(resolved, Mapping):
+        _sb_refuse(sb, 'lme_resolved must be a mapping', _rh_kind(resolved))
+    key = schema.get('policy_key')
+    if not key or key not in resolved:
+        if admission != sb['admission_absent']:
+            _sb_refuse(sb, 'lme_resolved carries no %s section, so the admission must be the declared absent form' % (key,), _rh_kind(admission))
+        return {f['applicability']: ap['not_applicable'], f['root']: root, f['commit']: None, f['members']: members, f['expectations']: []}
+    sec = resolved[key]
+    pol = sec.get('policy') if isinstance(sec, Mapping) else None
+    if not isinstance(pol, Mapping):
+        _sb_refuse(sb, 'the published %s section must carry a policy mapping' % (key,), _rh_kind(sec))
+    ch = _rh_document_channel(schema)
+    am = ch['admission']
+    want = (('members', am['members']), ('observed', am['observed']), ('algorithm', ch['digest_algorithm']),
+            ('edition field', sb['edition_from']), ('edition pattern', sb['edition_regex_from']))
+    got = [_rh_get(pol, p) for _n, p in want]
+    if any(not fd or not isinstance(v, str) or not v for fd, v in got) or got[2][1] != pi['digest_algorithm']:
+        _sb_refuse(sb, 'the %s policy must name %s as non-empty strings, the algorithm equal to profile_identity.digest_algorithm %s' % (
+            key, ', '.join('%s (%s)' % (n, p) for n, p in want), pi['digest_algorithm']), [v if fd else '<absent>' for fd, v in got])
+    mk, ok, efld, erx = got[0][1], got[1][1], got[3][1], got[4][1]
+    if not isinstance(admission, Mapping) or not isinstance(admission.get(mk), Mapping):
+        _sb_refuse(sb, 'the protected source-admission record must carry a %r mapping; nothing stands in for it' % (mk,),
+                   sorted(admission) if isinstance(admission, Mapping) else _rh_kind(admission))
+    adm = admission[mk]
+    for rel in sorted(members):
+        ent = adm.get(rel)
+        if not isinstance(ent, Mapping) or ent.get(ok) != members[rel]:
+            _sb_refuse(sb, 'member %s: the engine-consumed capture digest is not the admitted observed digest' % (rel,),
+                       'unadmitted' if not isinstance(ent, Mapping) else 'digest differs')
+    commit = admission.get(efld)
+    if not isinstance(commit, str) or not re.fullmatch(erx, commit):
+        _sb_refuse(sb, 'the admission record %s must full-match the declared edition pattern' % (efld,), _rh_kind(commit))
+    gb = _rh_gb_decl(schema)
+    gf, pf = gb['fields'], gb['provenance_fields']
+    blk = record_blocks.get(gb['provenance_block']) if isinstance(record_blocks, Mapping) else None
+    froles, roles = _rh_get(pol, gb['roles_from'])
+    rkeys = sorted(k for k in pf if pf[k] == 'role')
+    if not isinstance(blk, Mapping) or not isinstance(blk.get('keys'), list) or sorted(blk['keys']) != sorted(pf) \
+            or not isinstance(blk.get('types'), Mapping) or len(rkeys) != 1 or not froles \
+            or not _leaf_equal(blk['types'].get(rkeys[0]), {'enum': roles}):
+        _sb_refuse(sb, 'record block %s must carry exactly the generation_binding.provenance_fields keys and its role key enum must be the role list at %s (HOLE-RT3-PROV-FIELD-MAP)' % (
+            gb['provenance_block'], gb['roles_from']), sorted(blk['keys']) if isinstance(blk, Mapping) and isinstance(blk.get('keys'), list) else _rh_kind(blk))
+    if 'scope' in sec:
+        scopes = sec.get('scopes')
+        if not isinstance(scopes, Mapping) or not isinstance(scopes.get('targets'), Mapping):
+            _sb_refuse(sb, 'the scoped %s section must carry scopes {controller, targets}' % (key,), _rh_kind(scopes))
+        ents = [scopes.get('controller')] + [scopes['targets'][t] for t in sorted(scopes['targets'])]
+        rows = [({'kind': e.get('kind'), 'id': e.get('id')} if isinstance(e, Mapping) else None, e) for e in ents]
+    else:
+        rows = [(None, sec)]
+    exp = []
+    for ident, ent in rows:
+        bs = ent.get(gb['to']) if isinstance(ent, Mapping) else None
+        if not isinstance(bs, Mapping):
+            _sb_refuse(sb, 'every scope entry must carry its generation bindings %s' % (gb['to'],), ident)
+        for role in sorted(bs):
+            b = bs[role]
+            if not isinstance(b, Mapping) or b.get(gf['role']) != role or not isinstance(b.get(gf['class_key']), str):
+                _sb_refuse(sb, 'generation binding %s of scope %r must name its role and a class key' % (role, ident), _rh_kind(b))
+            exp.append({ef['scope']: ident, ef['class_key']: b[gf['class_key']], ef['role']: role, ef['binding_sha256']: _digest(b)})
+    return {f['applicability']: ap['applies'], f['root']: root, f['commit']: commit, f['members']: members, f['expectations']: exp}
+
+
+def lme_verify_source_binding(binding, resolved, registry, *, captures, admission, manifests_dir, record_blocks):
+    """C1-SOURCE-BINDING-01 (codex 892: publication and verification re-derive the join independently): re-derives the
+    binding from the captures, the protected admission record, the actual lme_resolved and the record blocks (required
+    keyword arguments; a call without them is a TypeError) and requires the published binding to equal it type-aware.
+    Returns True; raises otherwise."""
+    want = lme_source_binding(resolved, registry, captures=captures, admission=admission, manifests_dir=manifests_dir,
+                              record_blocks=record_blocks)
+    if not _leaf_equal(binding, want):
+        sb = _sb_decl(registry)[0]
+        _sb_refuse(sb, 'published %s is not the binding the captures, the admission record and lme_resolved derive' % (sb['var'],),
+                   sorted(binding) if isinstance(binding, Mapping) else _rh_kind(binding))
+    return True
+
+
+def lme_invocation_root(anchor_dir, capture_rel, explicit_root, refusal):
+    """C1-INVOCATION-CONTEXT-01 L8-04 (codex 894 capture_root; SR-309-05): the ordinary capture root of the invocation
+    context, computed before the global manifest is consumed. explicit_root (the lme_invocation_root input) is null or
+    an absolute path in normal form below /; when given it is the root. Otherwise the root is anchor_dir (the checkout
+    clone_directory names, absolute) normalized LEXICALLY (never link-resolved, never derived from an inventory
+    location) joined with capture_rel, a relative path of plain segments. refusal is the declared words.refusal. Raises
+    '<refusal>: ...' on any other input; never falls back."""
+    import posixpath
+    if not isinstance(refusal, str) or not refusal:
+        raise ValueError('lme: lme_invocation_root requires the declared refusal word; got %r' % (_rh_kind(refusal),))
+
+    def bad(what, got):
+        raise ValueError('lme: %s: %s; got %r' % (refusal, what, got))
+    if explicit_root is not None:
+        if not isinstance(explicit_root, str) or not explicit_root.startswith('/') or explicit_root.startswith('//') \
+                or explicit_root == '/' or posixpath.normpath(explicit_root) != explicit_root:
+            bad('an explicit invocation root must be an absolute path in normal form below /', explicit_root)
+        return explicit_root
+    if not isinstance(anchor_dir, str) or not anchor_dir.startswith('/'):
+        bad('the checkout anchor must be an absolute path', anchor_dir)
+    # F942 / SR-319-01: capture_rel is admitted by the shared relative-path grammar _rh_safe_rel (a non-empty string,
+    # not absolute, normpath-stable, no '.' or '..' component), never by a private copy of it.
+    if not _rh_safe_rel(capture_rel):
+        bad('capture_rel must be a relative path of plain segments', capture_rel)
+    anchor = posixpath.normpath(anchor_dir)
+    if anchor == '/' or anchor.startswith('//'):
+        bad('the checkout anchor must name a directory below /', anchor_dir)
+    return posixpath.join(anchor, capture_rel)
+
+
+# C1-INVOCATION-CONTEXT-01 L8-05: the registry cluster_topology node keys, its host word roles, and the published
+# field and member field keys in order (interface constants the declaration must equal).
+_CT_KEYS = frozenset(('var', 'required_by_profiles', 'group', 'host_words', 'host_word_absent', 'declared_seed_word',
+                      'declared_seed_forms', 'seed_endpoint', 'fields', 'member_fields', 'absent', 'refusal'))
+_CT_HOST_WORDS = frozenset(('publish', 'node_name', 'initial_master'))
+_CT_FIELDS = ['group', 'initial_master', 'publish_host', 'seed_hosts', 'members']
+_CT_MEMBER_FIELDS = ['host', 'publish_host', 'node_name', 'initial_master']
+# C1-INVOCATION-CONTEXT-01 codex 900 / SR-317-01 (supersedes SR-315-01): the host word roles that carry a declared
+# absent value in host_word_absent (role -> the kind its present or declared absent value must have); every other role
+# is required on every member.
+_CT_ABSENT_ROLES = (('initial_master', bool),)
+# codex 900 / SR-317-02 (supersedes SR-315-02): the declared seed forms (form name -> the Python kind it dispatches
+# on), the option keys of the string form and the keys of a one-character bracket pair (wrapper, seed_endpoint); every
+# character is read from the declaration only.
+_CT_SEED_FORM_KINDS = (('list', list), ('string', str))
+_CT_SEED_FORMS = frozenset(n for n, _k in _CT_SEED_FORM_KINDS)
+_CT_SEED_STRING_KEYS = frozenset(('wrapper', 'separator', 'strip_chars'))
+_CT_PAIR_KEYS = frozenset(('open', 'close'))
+
+
+def _ct_pair_ok(p):
+    """A declared bracket pair: exactly _CT_PAIR_KEYS, each one character, the two distinct."""
+    return isinstance(p, Mapping) and set(p) == _CT_PAIR_KEYS \
+        and all(isinstance(p[k], str) and len(p[k]) == 1 for k in _CT_PAIR_KEYS) and p['open'] != p['close']
+
+
+def _ct_entry_ok(s, ep, strip_chars):
+    """One seed entry under the declared seed_endpoint pair ep: a non-empty string with no strip_chars character at
+    either end, at most one open and one close, the open (when present) its first character and the close after it
+    with something between. Brackets inside an entry are endpoint syntax and are kept."""
+    return isinstance(s, str) and len(s) > 0 and s == s.strip(strip_chars) \
+        and s.count(ep['open']) == s.count(ep['close']) and s.count(ep['open']) <= 1 \
+        and (ep['open'] not in s or (s.startswith(ep['open']) and s.index(ep['close']) > 1))
+
+
+def _ct_seed_readings(d, sfs, ep):
+    """The well-formed readings of a seed string d under the declared string form sfs: the unwrapped reading, and the
+    wrapped reading when d's first character is wrapper.open and its last wrapper.close (one character removed at
+    each end, only around the whole string). Each reading splits on separator and strips strip_chars from both ends of
+    every entry; a reading is kept only when every entry is well formed under ep."""
+    w = sfs['wrapper']
+    cands = [d]
+    if len(d) >= 2 and d.startswith(w['open']) and d.endswith(w['close']):
+        cands.append(d[1:-1])
+    readings = []
+    for c in cands:
+        got = [s.strip(sfs['strip_chars']) for s in c.split(sfs['separator'])]
+        if all(_ct_entry_ok(s, ep, sfs['strip_chars']) for s in got):
+            readings.append(got)
+    return readings
+
+
+def lme_cluster_topology(hostvars, groups, decl, profile):
+    """C1-INVOCATION-CONTEXT-01 L8-05 (codex 896 storage_and_secrets; SR-302-15 PH-SEED-HOSTS / PH-PUBLISH-HOST;
+    codex 900 SR-317-01/02, superseding SR-315-01/02): the cluster topology of registry
+    remote_harness_schema.cluster_topology (decl), derived from B-declared inventory words only. decl is exactly
+    _CT_KEYS with fields _CT_FIELDS, member_fields _CT_MEMBER_FIELDS, host_words roles _CT_HOST_WORDS, host_word_absent
+    exactly the _CT_ABSENT_ROLES roles with values of their kinds, declared_seed_forms exactly _CT_SEED_FORMS (list
+    carries no options; string carries exactly _CT_SEED_STRING_KEYS: a wrapper pair, a non-empty separator that is no
+    bracket character, and a non-empty strip_chars string) and seed_endpoint a pair. When profile is not in
+    required_by_profiles the result is decl absent. Otherwise: the group is declared and lists one or more distinct
+    members (inventory order); every member carries the publish and node_name words (non-empty strings, each distinct
+    across members); the initial_master word, when present, must be a bool (null or any other kind refuses) and when
+    omitted takes the declared host_word_absent value; exactly one member is the initial master; seed_hosts = the
+    members' publish values in group order; publish_host = the initial master's publish value. A member carrying
+    declared_seed_word must carry exactly the seed set in one declared form, dispatched on its kind (any other kind
+    refuses): an empty, duplicate, malformed or ambiguous (both string readings well formed) value refuses. No
+    first-host fallback, no defaulted read. Returns the fields mapping; raises '<refusal>: ...' otherwise."""
+    if not isinstance(decl, Mapping) or set(decl) != _CT_KEYS or decl['fields'] != _CT_FIELDS \
+            or decl['member_fields'] != _CT_MEMBER_FIELDS or not isinstance(decl['host_words'], Mapping) \
+            or set(decl['host_words']) != _CT_HOST_WORDS \
+            or any(not isinstance(decl[k], str) or not decl[k] for k in ('var', 'group', 'declared_seed_word', 'refusal')) \
+            or any(not isinstance(w, str) or not w for w in decl['host_words'].values()) \
+            or not isinstance(decl['required_by_profiles'], list) \
+            or any(not isinstance(p, str) or not p for p in decl['required_by_profiles']):
+        raise ValueError('lme: registry remote_harness_schema.cluster_topology must be exactly %s with fields %s, member_fields %s and host_words %s; got %r' % (
+            sorted(_CT_KEYS), _CT_FIELDS, _CT_MEMBER_FIELDS, sorted(_CT_HOST_WORDS), sorted(decl) if isinstance(decl, Mapping) else _rh_kind(decl)))
+    sfm, ep, hwa = decl['declared_seed_forms'], decl['seed_endpoint'], decl['host_word_absent']
+    if not isinstance(sfm, Mapping) or set(sfm) != _CT_SEED_FORMS or not isinstance(sfm['list'], Mapping) or len(sfm['list']) != 0 \
+            or not isinstance(sfm['string'], Mapping) or set(sfm['string']) != _CT_SEED_STRING_KEYS \
+            or not _ct_pair_ok(sfm['string']['wrapper']) or not _ct_pair_ok(ep) \
+            or not isinstance(sfm['string']['separator'], str) or not sfm['string']['separator'] \
+            or sfm['string']['separator'] in (ep['open'], ep['close'], sfm['string']['wrapper']['open'], sfm['string']['wrapper']['close']) \
+            or not isinstance(sfm['string']['strip_chars'], str) or not sfm['string']['strip_chars']:
+        raise ValueError('lme: registry remote_harness_schema.cluster_topology.declared_seed_forms must be exactly %s (list without options; string exactly %s: a one-character open / close wrapper pair, a non-empty separator that is no bracket character and a non-empty strip_chars string) and seed_endpoint a one-character open / close pair; got %r' % (
+            sorted(_CT_SEED_FORMS), sorted(_CT_SEED_STRING_KEYS), [sfm, ep]))
+    if not isinstance(hwa, Mapping) or set(hwa) != set(r for r, _k in _CT_ABSENT_ROLES) \
+            or any(not isinstance(hwa[r], k) for r, k in _CT_ABSENT_ROLES):
+        raise ValueError('lme: registry remote_harness_schema.cluster_topology.host_word_absent must be exactly the roles %s with values of their kinds; got %r' % (
+            [r for r, _k in _CT_ABSENT_ROLES], hwa))
+    if not isinstance(profile, str) or not profile:
+        raise ValueError('lme: %s: the selected profile must be a non-empty string; got %r' % (decl['refusal'], _rh_kind(profile)))
+    if profile not in decl['required_by_profiles']:
+        return decl['absent']
+
+    def bad(what, got):
+        raise ValueError('lme: %s: %s; got %r' % (decl['refusal'], what, got))
+    hw, f, mf, sfs = decl['host_words'], decl['fields'], decl['member_fields'], sfm['string']
+    required = sorted(hw[r] for r in hw if r not in hwa)
+    if not isinstance(groups, Mapping) or decl['group'] not in groups:
+        bad('group %s must be declared' % (decl['group'],), _rh_kind(groups))
+    members = groups[decl['group']]
+    if not isinstance(members, list) or not members or any(not isinstance(h, str) or not h for h in members) \
+            or len(set(members)) != len(members):
+        bad('group %s must list one or more distinct members' % (decl['group'],), _rh_kind(members))
+    if not isinstance(hostvars, Mapping):
+        bad('hostvars must be the inventory host variables', _rh_kind(hostvars))
+    rows, hvs, seen = [], {}, {'publish': set(), 'node_name': set()}
+    for h in members:
+        if h not in hostvars:
+            bad('member %s has no host vars' % (h,), h)
+        hv = hostvars[h]
+        if not isinstance(hv, Mapping) or any(w not in hv for w in required):
+            bad('member %s must carry every required host word %s' % (h, required), _rh_kind(hv))
+        hvs[h] = hv
+        vals = {}
+        for role in ('publish', 'node_name'):
+            v = hv[hw[role]]
+            if not isinstance(v, str) or not v.strip() or v in seen[role]:
+                bad('member %s must carry a non-empty %s distinct across members' % (h, hw[role]), _rh_kind(v))
+            seen[role].add(v)
+            vals[role] = v
+        # SR-317-01: presence by membership; an omitted word takes the declared absent value; a present value (null
+        # included) is checked as given and never replaced.
+        if hw['initial_master'] in hv:
+            im = hv[hw['initial_master']]
+        else:
+            im = hwa['initial_master']
+        if not isinstance(im, bool):
+            bad('member %s %s, when present, must be a bool' % (h, hw['initial_master']), _rh_kind(im))
+        rows.append({mf[0]: h, mf[1]: vals['publish'], mf[2]: vals['node_name'], mf[3]: im})
+    masters = [r for r in rows if r[mf[3]]]
+    if len(masters) != 1:
+        bad('exactly one member of group %s must resolve %s true (no first-host fallback)' % (decl['group'], hw['initial_master']), [r[mf[0]] for r in masters])
+    seeds = [r[mf[1]] for r in rows]
+    for h in members:
+        if decl['declared_seed_word'] in hvs[h]:
+            d = hvs[h][decl['declared_seed_word']]
+            form = [n for n, k in _CT_SEED_FORM_KINDS if isinstance(d, k)]
+            if len(form) != 1:
+                bad('member %s %s must be one of the declared seed forms %s' % (h, decl['declared_seed_word'], sorted(_CT_SEED_FORMS)), _rh_kind(d))
+            if form[0] == 'string':
+                readings = _ct_seed_readings(d, sfs, ep)
+                if len(readings) != 1:
+                    bad('member %s %s must have exactly one well-formed reading (%d found: empty, malformed or ambiguous)' % (h, decl['declared_seed_word'], len(readings)), d)
+                got = readings[0]
+            else:
+                got = d
+                if not all(_ct_entry_ok(s, ep, sfs['strip_chars']) for s in got):
+                    bad('member %s %s entries must be well-formed non-empty endpoints' % (h, decl['declared_seed_word']), d)
+            if len(set(got)) != len(got) or sorted(got) != sorted(seeds):
+                bad('member %s %s must be exactly the derived seed set %s without duplicates' % (h, decl['declared_seed_word'], seeds), d)
+    return {f[0]: decl['group'], f[1]: masters[0][mf[0]], f[2]: masters[0][mf[1]], f[3]: seeds, f[4]: rows}
+
+
+# C1-INVOCATION-CONTEXT-01 SR-320-07 (codex 902 SR-320-01; SR-320-06 G14-01): the registry
+# remote_harness_schema.template_detection node keys, its start-string role keys, the reason word of an override-header
+# detection (the node key itself) and the position words of a detected global position. The detection RULE is
+# ansible-core 2.19.11 _jinja_bits.py is_possibly_template (:955-960, pinned in the node by_core): a string is a possible
+# template when it starts with the override header or contains any start string (:134-142). The words themselves are
+# declared ONCE in the global in split-character form (SR-321-04 / Codex 905: the decoding contract is the declared
+# remote_harness_schema.split_character_form, which template_detection.word_form names); a declared word is decoded by
+# joining its characters with that node's declared separator, which every caller passes EXPLICITLY by pointer (no
+# private separator, no implicit join default), so this module carries no detection literal and no separator literal.
+# SR-321-04 (Codex 904 Option A; MAIN 947): the node declares ONE shared predicate (the rule above) and its relation
+# to each declared leg's own rule (predicate.relation_by_core: exact on 2.19.11, a conservative superset on 2.17), and
+# per leg the pinned source identity (by_core.<core>.source_pins). The relation words are declared data, not checked
+# against a literal here; their key set must be exactly the by_core key set.
+_TD_KEYS = frozenset(('word_form', 'start_strings', 'override_header', 'predicate', 'by_core'))
+_TD_PREDICATE_KEYS = frozenset(('consumers', 'relation_by_core'))
+_TD_LEG_PINS = 'source_pins'
+_TD_START_KEYS = frozenset(('block', 'variable', 'comment'))
+_TD_HEADER_REASON = 'override_header'
+_TD_POSITIONS = ('value', 'key')
+
+
+def _td_word(chars, separator, where, bad):
+    """one declared detection word: a non-empty list of one-character strings, decoded by joining them with the
+    declared separator (the caller passes split_character_form.separator by pointer)"""
+    if not isinstance(chars, list) or not chars or not all(isinstance(c, str) and len(c) == 1 for c in chars):
+        bad('%s must be a non-empty list of one-character strings' % (where,))
+    return separator.join(chars)
+
+
+def _td_decl(detection, separator, refusal):
+    """the validated detection words: ([(start role, word)] sorted by role, override header word)"""
+    if not isinstance(refusal, str) or not refusal:
+        raise ValueError('lme: template detection takes a non-empty refusal word; got %s' % (_rh_kind(refusal),))
+
+    def bad(msg):
+        raise ValueError('lme: %s: template_detection %s' % (refusal, msg))
+    if not isinstance(separator, str):
+        bad('decoding takes the declared split_character_form separator as a string; got %s' % (_rh_kind(separator),))
+    if not isinstance(detection, dict) or set(detection) != _TD_KEYS:
+        bad('must be a mapping with exactly the keys %s' % (sorted(_TD_KEYS),))
+    if not isinstance(detection['word_form'], str) or not detection['word_form']:
+        bad('word_form must name the declared decoding contract node')
+    legs = detection['by_core']
+    if not isinstance(legs, dict) or not legs or not all(isinstance(k, str) and k for k in legs):
+        bad('by_core must be a non-empty mapping keyed by ansible-core version words (the per-leg detection rule)')
+    for leg in sorted(legs):
+        if not isinstance(legs[leg], dict) or _TD_LEG_PINS not in legs[leg]:
+            bad('by_core %s must be a mapping declaring %s' % (leg, _TD_LEG_PINS))
+        pins = legs[leg][_TD_LEG_PINS]
+        if not isinstance(pins, dict) or not pins \
+                or not all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in pins.items()):
+            bad('by_core %s %s must be a non-empty mapping of source paths to digests' % (leg, _TD_LEG_PINS))
+    pred = detection['predicate']
+    if not isinstance(pred, dict) or set(pred) != _TD_PREDICATE_KEYS:
+        bad('predicate must be a mapping with exactly the keys %s' % (sorted(_TD_PREDICATE_KEYS),))
+    if not isinstance(pred['consumers'], list) or not pred['consumers'] \
+            or not all(isinstance(c, str) and c for c in pred['consumers']):
+        bad('predicate consumers must be a non-empty list of filter names')
+    rel = pred['relation_by_core']
+    if not isinstance(rel, dict) or set(rel) != set(legs) or not all(isinstance(w, str) and w for w in rel.values()):
+        bad('predicate relation_by_core must name one relation word for exactly the by_core legs %s' % (sorted(legs),))
+    starts = detection['start_strings']
+    if not isinstance(starts, dict) or set(starts) != _TD_START_KEYS:
+        bad('start_strings must be a mapping with exactly the keys %s' % (sorted(_TD_START_KEYS),))
+    words = [(k, _td_word(starts[k], separator, 'start_strings %s' % (k,), bad)) for k in sorted(starts)]
+    if len(set(w for _, w in words)) != len(words):
+        bad('start_strings must decode to distinct words')
+    return words, _td_word(detection['override_header'], separator, _TD_HEADER_REASON, bad)
+
+
+def _td_reasons(value, words, header):
+    """the detection reasons of one value (is_possibly_template :960): the override-header reason when a string starts
+    with the header, then each start role whose word it contains; [] for a non-string or an undetected string"""
+    if not isinstance(value, str):
+        return []
+    found = [r for r in (_TD_HEADER_REASON,) if value.startswith(header)]
+    return found + [k for k, w in words if w in value]
+
+
+def _td_scan(v, path, words, header, out):
+    reasons = _td_reasons(v, words, header)
+    if reasons:
+        out.append({'path': path, 'position': _TD_POSITIONS[0], 'reasons': reasons})
+    if isinstance(v, dict):
+        for k in v:
+            key_reasons = _td_reasons(k, words, header)
+            if key_reasons:
+                out.append({'path': path + [k], 'position': _TD_POSITIONS[1], 'reasons': key_reasons})
+            _td_scan(v[k], path + [k], words, header, out)
+    elif isinstance(v, (list, tuple)):
+        for i in range(len(v)):
+            _td_scan(v[i], path + [i], words, header, out)
+
+
+def lme_template_positions(data, detection, separator, refusal):
+    """C1-INVOCATION-CONTEXT-01 SR-320-06 / codex 902 (D): the global invariant scan. data is the RAW strict parse of a
+    capture (lme_manifest_strict), never a loaded fact, so no value is templated by this walk. Returns every position
+    whose string value or string mapping key the declared detection rule detects, as {path: typed components (mapping
+    keys as parsed, list indices as ints), position: value or key, reasons: [detection words' roles]}; [] when none.
+    The declaration node itself is scanned with the rest of the data (it must pass its own invariant). separator is
+    the declared split_character_form separator (SR-321-04 / Codex 905), passed by pointer; the rule applied is the ONE
+    shared predicate (exact on 2.19.11, a conservative superset on 2.17)."""
+    words, header = _td_decl(detection, separator, refusal)
+    out = []
+    _td_scan(data, [], words, header, out)
+    return out
+
+
+def _rpc_walk(r, f, path, str_keys, words, header, out, bad):
+    kr, kf = _canonical_kind(r), _canonical_kind(f)
+    if kr != kf:
+        bad(path, 'raw kind %s, fact kind %s' % (kr, kf))
+    if kr == 'dict':
+        # keys only: iterating a mapping's keys evaluates no value
+        rk = set((_canonical_kind(k), k) for k in r)
+        fk = set((_canonical_kind(k), k) for k in f)
+        if rk != fk:
+            bad(path, 'mapping key sets differ (raw %r, fact %r)' % (sorted(rk, key=repr), sorted(fk, key=repr)))
+        children = [(k, isinstance(k, str)) for k in r]
+    elif kr == 'list':
+        if len(r) != len(f):
+            bad(path, 'sequence lengths differ (raw %d, fact %d)' % (len(r), len(f)))
+        children = [(i, True) for i in range(len(r))]
+    else:
+        if not _leaf_equal(r, f):
+            bad(path, 'the %s fact value is not the raw value' % (kr,))
+        return
+    for c, typed in children:
+        here = path + [c]
+        reasons = _td_reasons(r[c], words, header)
+        if reasons:
+            # a skipped position: its fact value is never read (a list is indexed per selected index, never iterated)
+            if not (str_keys and typed):
+                bad(here, 'a possible-template position under a non-string mapping key cannot be reported as typed path components')
+            out.append({'path': here, 'reasons': reasons})
+            continue
+        _rpc_walk(r[c], f[c], here, str_keys and typed, words, header, out, bad)
+
+
+def lme_raw_partial_correspondence(raw, fact, detection, separator, refusal):
+    """C1-INVOCATION-CONTEXT-01 SR-320-07 (codex 902 SR-320-01; DEV-E12-06-PROFILE-RAW stays PARTIAL): a scoped PARTIAL
+    correspondence guard between the RAW strict parse of the consumed profile capture bytes (raw; lme_manifest_strict)
+    and the loaded profile fact (fact). Traversal is driven by raw: at every inspected position the kinds must match
+    (_canonical_kind), a mapping must have exactly the raw key set (type-aware keys), a sequence exactly the raw length
+    with each index compared in order, and a scalar must be type-aware equal (_leaf_equal). ONLY a position whose raw
+    value the declared detection rule (template_detection; is_possibly_template) detects is skipped; its fact value is
+    never read, every other list index and nested container is inspected, and a list is indexed per selected index.
+    Returns the excluded positions as [{path: typed components (mapping keys as strings, list indices as ints),
+    reasons: [detection roles]}]; refuses with refusal otherwise. NOT a full binding (OW-C1-FULL-BYTE-BINDING): the
+    skipped values and kinds are not established, and a template substituted at a raw non-template position may
+    evaluate to the expected value and pass. Per-leg limits (SR-321-04): on 2.19 the fact arrives lazily and a skipped
+    position's fact value is never read here; on 2.17 the caller's variable reference has already rendered the whole
+    fact recursively, so this filter receives a rendered copy and only non-template positions are compared. Neither leg
+    protects the later profile_overlay.lme_global compositions of resolve.yml, which read every overlay value."""
+    words, header = _td_decl(detection, separator, refusal)
+
+    def bad(path, msg):
+        raise ValueError('lme: %s: (SR-320-07 raw-guided PARTIAL correspondence) at %r: %s' % (refusal, path, msg))
+    if _td_reasons(raw, words, header):
+        bad([], 'the raw root is a possible template')
+    out = []
+    _rpc_walk(raw, fact, [], True, words, header, out, bad)
+    return out
+
+
+def lme_capture_text_bound(text, expected_checksum, algorithm, encoding, refusal):
+    """C1-INVOCATION-CONTEXT-01 SR-321-01 (seat SEAT-W2C-01): binds ONE read of a capture's exact text to the capture
+    stat checksum before anything parses or guards it. text is the exact text of that read (a file lookup with nothing
+    stripped); expected_checksum the registered capture stat checksum; algorithm the digest algorithm word that stat
+    used (lme_invocation_words.digest_algorithm, which SR-320-04 / E12-05 bind to profile_identity.digest_algorithm);
+    encoding the declared profile_identity.encoding; refusal the declared profile_identity.refusal. The digest of text
+    encoded by encoding must equal expected_checksum. Returns text unchanged (the same object, so the chain that follows
+    consumes exactly the bound read); raises '<refusal>: ...' otherwise. It narrows, and does not close,
+    OW-C1-FULL-BYTE-BINDING: the native include_vars load still reads the capture separately."""
+    if not isinstance(refusal, str) or not refusal:
+        raise ValueError('lme: lme_capture_text_bound requires the declared refusal word; got %s' % (_rh_kind(refusal),))
+
+    def bad(what, got):
+        raise ValueError('lme: %s: (SR-321-01 capture text binding) %s; got %r' % (refusal, what, got))
+    if not isinstance(algorithm, str) or algorithm not in hashlib.algorithms_guaranteed:
+        bad('the digest algorithm must be a guaranteed hashlib algorithm word', algorithm)
+    if not isinstance(encoding, str) or not encoding:
+        bad('the declared encoding must be a non-empty string', _rh_kind(encoding))
+    if not isinstance(expected_checksum, str) or not expected_checksum:
+        bad('the capture stat checksum must be a non-empty string', _rh_kind(expected_checksum))
+    if not isinstance(text, str):
+        bad('the capture text must be a string', _rh_kind(text))
+    try:
+        got = hashlib.new(algorithm, text.encode(encoding)).hexdigest()
+    except (LookupError, UnicodeError, TypeError) as exc:
+        bad('the capture text cannot be digested by the declared algorithm under the declared encoding', type(exc).__name__)
+    if got != expected_checksum:
+        bad('the %s digest of the exact capture text read here is not the capture stat checksum' % (algorithm,), [got, expected_checksum])
+    return text
+
+
+def lme_doc_admit_text(text, parse, rel):
+    """records-dk03-launch-01 (codex-tick764 / 765 DK03 option A): the narrow adapter of the first-entry ingress guard
+    (templates/registry_ingress.j2 and its macro). text: the ONE captured text (the ingress declaration; the registry
+    text after its digest equals the admitted identity); parse: the document_channel.parse contract carried by the
+    admitted launch record (rh_source_bootstrap.context); rel: the admitted repository-relative identity for the
+    diagnostic. It runs the SAME DK03 parser as the document channel -- _rh_doc_parse_decl (shape and parser role
+    binding, before the text is read), _rh_yaml_load_unique, _rh_doc_parse_text -- and raises the declared text outside
+    any handler. No second parser, no manifest reload, no resolve.
+    C1-SR323-J-INGRESS-FILTER (G first-operation-03 J-INGRESS-FILTER): restored unchanged from the C1 s-lineage L
+    (s11 d97ac55e :7997-8012) -- the r-lineage L dropped it while registry_ingress.j2 :10 (bc1b631c) and the ingress
+    macro (s12 :56) still call it; its three helpers are byte-identical in this L."""
+    _rh_doc_parse_decl(parse)
+    if not isinstance(text, str) or not isinstance(rel, str) or not rel:
+        raise ValueError('lme: lme_doc_admit_text takes the captured text and a non-empty admitted rel; got %s / %s' % (
+            type(text).__name__, type(rel).__name__))
+    parsed, failure = _rh_yaml_load_unique(text, parse['tags'])
+    if failure:
+        raise ValueError('lme: %s' % (_rh_doc_parse_text(parse, rel, failure),))
+    return parsed
+
+
 class FilterModule(object):
     def filters(self):
         return {
@@ -5755,12 +7270,24 @@ class FilterModule(object):
             'lme_project_remote_harness': lme_project_remote_harness,
             'lme_remote_harness_overridden_paths': lme_remote_harness_overridden_paths,
             'lme_verify_resolved': lme_verify_resolved,
+            'lme_verify_resolved_structure': lme_verify_resolved_structure,
+            'lme_invocation_root': lme_invocation_root,
+            'lme_cluster_topology': lme_cluster_topology,
+            'lme_template_positions': lme_template_positions,
+            'lme_raw_partial_correspondence': lme_raw_partial_correspondence,
+            'lme_capture_text_bound': lme_capture_text_bound,
             'lme_rh_documents_active': lme_rh_documents_active,
             'lme_rh_document_plan': lme_rh_document_plan,
             'lme_rh_document_next_rel': lme_rh_document_next_rel,
             'lme_rh_document_append': lme_rh_document_append,
             'lme_rh_connection_values': lme_rh_connection_values,
             'lme_rh_proxy_outcome': lme_rh_proxy_outcome,
+            'lme_admit_record': lme_admit_record,
+            'lme_render_record': lme_render_record,
+            'lme_manifest_strict': lme_manifest_strict,
+            'lme_doc_admit_text': lme_doc_admit_text,   # records-dk03-launch-01: the sole DK03 guard adapter (C1-SR323 restored)
+            'lme_source_binding': lme_source_binding,
+            'lme_verify_source_binding': lme_verify_source_binding,
             'lme_resolve_config': lme_resolve_config,
             'lme_validate_config': lme_validate_config,
             'lme_config_revision': lme_config_revision,

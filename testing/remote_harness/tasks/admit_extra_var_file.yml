@@ -1,0 +1,177 @@
+---
+# testing/remote_harness/tasks/admit_extra_var_file.yml -- ONE @file of the normal-run extra-var admission (route
+# records-route-adm-01). NEW FILE. AUTHORED, NEVER EXECUTED (UNRUN). Included ONLY by admit_extra_vars.yml, once per
+# lme_extra_var_files row (loop_var rh_adm_f = {ordinal, path}). Every task that holds the caller path or the
+# snapshot reference is no_log. Each block refuses with the common refusal grammar, its declared text and the
+# argument ordinal only (life-15 L15-ADM-02).
+# Path: Ansible reads an @file through DataLoader.load_from_file -> path_dwim -> utils/path.py unfrackpath(follow=False)
+# (vars.py :191-193; dataloader :104, :237-251; path.py :55, :63: expandvars, expanduser, join with the base dir,
+# normpath). The same steps are applied here with the seed's invocation cwd as the base dir (parity UNVERIFIED,
+# CT-ADM01-07).
+# Retention: custody retain_impl {params [rel, mode]; fixed root evidence_dir, owner running_uid, follow false, create
+# exclusive, digest sha256} (s04 :750-752), the semantics the N11 custody retain implements for cold stages
+# (custody.successor-15 :586-609), here as module tasks: absent first; copy without overwrite; the declared mode;
+# owner == the running uid; the declared digest of the copy == that of the admitted file. The carrier row is
+# {ordinal, path, sha256} of THIS retention (C1 records-35); no snapshot content is read into a variable.
+- name: Admit the @file root, path rule and ancestry (file_root)
+  no_log: true
+  block:
+    - name: Resolve the path as Ansible will read it, and the snapshot reference of this ordinal
+      ansible.builtin.set_fact:
+        rh_adm_p: >-
+          {{ [rh_adm_in[rh_adm_x.stage.input_keys.cwd], rh_adm_f.path | ansible.builtin.expandvars | ansible.builtin.expanduser]
+             | ansible.builtin.path_join | ansible.builtin.normpath }}
+        rh_adm_s: >-
+          {{ rh_adm_in[rh_adm_x.stage.input_keys.evidence_dir] ~ rh_adm_sep
+             ~ (rh_adm_x.file.snapshot.rel | replace(rh_adm_x.file.placeholders.ordinal, rh_adm_f.ordinal | string)) }}
+
+    - name: Refuse a path outside every admitted root or outside the path rule
+      vars:
+        _rw: "{{ rh_adm_x.file.roots_as_words }}"
+        _roots: >-
+          {%- set ns = namespace(l=[]) -%}
+          {%- for a, p in rh_adm_x.file.roots_as | ansible.builtin.zip(rh_adm_x.file.roots_from) -%}
+          {%- if a == _rw.checkout -%}{%- set ns.l = ns.l + [rh_repo_root] -%}
+          {%- elif a == _rw.work_root_sub -%}
+          {%- set v = namespace(n=rh) -%}{%- for k in p.split('.') -%}{%- set v.n = v.n[k] -%}{%- endfor -%}
+          {%- set ns.l = ns.l + [rh_adm_in[rh_adm_x.stage.input_keys.work_root] ~ rh_adm_sep ~ v.n] -%}
+          {%- endif -%}
+          {%- endfor -%}{{ ns.l }}
+        _in: "{% for r in _roots if rh_adm_p.startswith(r ~ rh_adm_sep) %}{{ r }}{% endfor %}"
+      ansible.builtin.assert:
+        that:
+          - (rh_adm_x.file.roots_as | length) == (rh_adm_x.file.roots_from | length)
+          - (_roots | length) == (rh_adm_x.file.roots_as | length)
+          - _in | length > 0
+          - rh_adm_p is match(rh_adm_bs.path_admission.regex)
+          - rh_adm_p is not search(rh_adm_bs.path_admission.forbidden_segment_regex)
+        quiet: true
+
+    - name: Admit every ancestor with the ONE ancestry rule
+      ansible.builtin.include_tasks: admit_ancestry.yml
+      vars:
+        rh_anc_bs: "{{ rh_adm_bs }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ rh_adm_p | ansible.builtin.dirname }}"
+        rh_anc_refusal: "{{ rh_adm_code }}"
+  rescue:
+    - name: Refuse file_root with the argument ordinal only
+      ansible.builtin.fail:
+        msg: >-
+          {{ lookup('ansible.builtin.template', rh_adm_rf,
+                    template_vars={'rh_rf_grammar': rh_adm_bs.refusal_grammar, 'rh_rf_code': rh_adm_code,
+                                   'rh_rf_detail': [rh_adm_x.texts.file_root, rh_adm_f.ordinal]}) }}
+
+- name: Admit the @file kind (file_kind)
+  no_log: true
+  block:
+    - name: Stat the file (no link followed; read-only)
+      ansible.builtin.stat:
+        path: "{{ rh_adm_p }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: rh_adm_fst
+
+    - name: Refuse an absent, linked, non-regular or unreadable file
+      ansible.builtin.assert:
+        that:
+          - rh_adm_fst.stat.exists
+          - not rh_adm_fst.stat.islnk
+          - rh_adm_fst.stat.isreg
+          - rh_adm_fst.stat.readable
+        quiet: true
+  rescue:
+    - name: Refuse file_kind with the argument ordinal only
+      ansible.builtin.fail:
+        msg: >-
+          {{ lookup('ansible.builtin.template', rh_adm_rf,
+                    template_vars={'rh_rf_grammar': rh_adm_bs.refusal_grammar, 'rh_rf_code': rh_adm_code,
+                                   'rh_rf_detail': [rh_adm_x.texts.file_kind, rh_adm_f.ordinal]}) }}
+
+- name: Retain the @file once in the stage's own act evidence dir (file_snapshot; custody retain_impl)
+  no_log: true
+  vars:
+    _ri: "{{ rh_adm_bs.genesis.initializer.custody.retain_impl }}"
+    _ck: "{{ rh_adm_x.file.snapshot_record }}"
+  block:
+    - name: Refuse a snapshot row that is not the implemented retention (its keys are exactly retain_impl.params)
+      ansible.builtin.assert:
+        that:
+          - (rh_adm_x.file.snapshot.keys() | list | sort) == (_ri.params | sort)
+          - rh_adm_s == rh_adm_s | ansible.builtin.normpath
+        quiet: true
+
+    - name: Digest the admitted file with the declared digest
+      ansible.builtin.stat:
+        path: "{{ rh_adm_p }}"
+        follow: "{{ _ri.fixed.follow }}"
+        get_checksum: true
+        checksum_algorithm: "{{ _ri.fixed.digest }}"
+        get_mime: false
+        get_attributes: false
+      register: rh_adm_src
+
+    - name: Stat the snapshot reference (exclusive create; it must be absent)
+      ansible.builtin.stat:
+        path: "{{ rh_adm_s }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: rh_adm_pre
+
+    - name: Refuse an existing snapshot
+      ansible.builtin.assert:
+        that:
+          - not rh_adm_pre.stat.exists
+        quiet: true
+
+    - name: Copy the admitted bytes to the snapshot (no overwrite; declared mode; no link followed)
+      ansible.builtin.copy:
+        src: "{{ rh_adm_p }}"
+        dest: "{{ rh_adm_s }}"
+        remote_src: true
+        force: false
+        follow: "{{ _ri.fixed.follow }}"
+        mode: "{{ rh_adm_x.file.snapshot.mode }}"
+      register: rh_adm_cp
+
+    - name: Refuse a copy that did not occur (force false skips an existing destination without error)
+      ansible.builtin.assert:
+        that:
+          - rh_adm_cp.changed
+        quiet: true
+
+    - name: Read back the snapshot facts with the declared digest
+      ansible.builtin.stat:
+        path: "{{ rh_adm_s }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: "{{ _ri.fixed.digest }}"
+        get_mime: false
+        get_attributes: false
+      register: rh_adm_dst
+
+    - name: Refuse a snapshot that is not the retained bytes, owner, kind or mode
+      ansible.builtin.assert:
+        that:
+          - rh_adm_dst.stat.exists
+          - not rh_adm_dst.stat.islnk
+          - rh_adm_dst.stat.isreg
+          - rh_adm_dst.stat.uid == rh_adm_uid.stdout | int
+          - rh_adm_dst.stat.mode == rh_adm_x.file.snapshot.mode
+          - rh_adm_dst.stat.checksum == rh_adm_src.stat.checksum
+        quiet: true
+
+    - name: Append this retention to the C1 records-35 carrier (ordinal, protected snapshot reference, retention digest)
+      ansible.builtin.set_fact:
+        rh_adm_snaps: "{{ rh_adm_snaps + [dict(_ck | ansible.builtin.zip([rh_adm_f.ordinal, rh_adm_s, rh_adm_dst.stat.checksum]) | list)] }}"
+  rescue:
+    - name: Refuse file_snapshot with the argument ordinal only
+      ansible.builtin.fail:
+        msg: >-
+          {{ lookup('ansible.builtin.template', rh_adm_rf,
+                    template_vars={'rh_rf_grammar': rh_adm_bs.refusal_grammar, 'rh_rf_code': rh_adm_code,
+                                   'rh_rf_detail': [rh_adm_x.texts.file_snapshot, rh_adm_f.ordinal]}) }}
