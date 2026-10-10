@@ -1,0 +1,235 @@
+---
+# Private consumer validation. Consumes hook_decl plus supplied hook_resolved_projection.
+# Does not load manifests, merge desired state, or invent dataset/reader identities.
+
+- name: Require hook_root for declaration-relative task includes
+  ansible.builtin.assert:
+    that:
+      - hook_root is defined
+      - (hook_root | length) > 0
+    fail_msg: "hook_root must be supplied by the caller; this consumer does not discover paths"
+    quiet: true
+
+- name: Require declaration and supplied resolved projection
+  ansible.builtin.assert:
+    that:
+      - hook_decl is defined
+      - hook_decl.consumes.merge == 'forbidden'
+      - hook_resolved_projection is defined
+      - hook_transport_mode is defined
+      - hook_transport_mode != hook_decl.transport_modes.default
+      - hook_transport_mode != 'unknown_ambient'
+    fail_msg: "hook_decl, hook_resolved_projection, and an explicit transport mode are required; ambient unknown selection cannot pass"
+    quiet: true
+
+- name: Refuse competing invocation_context schema
+  ansible.builtin.assert:
+    that:
+      - hook_resolved_projection.invocation_context is not defined
+      - hook_decl.consumes.competing_invocation_context_schema == 'forbidden'
+    fail_msg: "Do not supply a competing invocation_context schema; consume existing join keys and model keys"
+    quiet: true
+
+- name: Collect expected assertions without shrinking the denominator
+  ansible.builtin.set_fact:
+    hook_expected_assertions: "{{ hook_resolved_projection.expected_assertions | default([]) }}"
+    hook_expected_denominator: "{{ (hook_resolved_projection.expected_assertions | default([])) | length }}"
+    hook_unfilled_required_fields: []
+
+- name: List required fields that are missing or empty
+  ansible.builtin.set_fact:
+    hook_unfilled_required_fields: "{{ hook_unfilled_required_fields + [item] }}"
+  when: >-
+    (hook_resolved_projection.context[item] is not defined)
+    or (hook_resolved_projection.context[item] is string and ((hook_resolved_projection.context[item] | length) == 0))
+    or (hook_resolved_projection.context[item] is sequence and ((hook_resolved_projection.context[item] | length) == 0))
+    or (hook_resolved_projection.context[item] is mapping and ((hook_resolved_projection.context[item] | length) == 0))
+  loop: "{{ hook_decl.required_context_fields }}"
+  loop_control: {label: "{{ item }}"}
+
+- name: Record fingerprint occupancy and digest mismatch
+  ansible.builtin.set_fact:
+    hook_missing_fingerprints: "{{ hook_decl.fingerprints_required_before_effect | reject('in', (hook_resolved_projection.fingerprints | default({})).keys() | list) | list }}"
+    hook_source_mismatch: "{{ ((hook_resolved_projection.fingerprints.source_digest | default('')) | length > 0) and ((hook_resolved_projection.context.source_digest | default('')) | length > 0) and ((hook_resolved_projection.fingerprints.source_digest | default('')) != (hook_resolved_projection.context.source_digest | default(''))) }}"
+    hook_query_mismatch: "{{ ((hook_resolved_projection.fingerprints.query_digest | default('')) | length > 0) and ((hook_resolved_projection.context.query_digest | default('')) | length > 0) and ((hook_resolved_projection.fingerprints.query_digest | default('')) != (hook_resolved_projection.context.query_digest | default(''))) }}"
+    hook_model_mismatch: "{{ ((hook_resolved_projection.fingerprints.model_digest | default('')) | length > 0) and ((hook_resolved_projection.context.model_digest | default('')) | length > 0) and ((hook_resolved_projection.fingerprints.model_digest | default('')) != (hook_resolved_projection.context.model_digest | default(''))) }}"
+    hook_snapshot_mismatch: "{{ ((hook_resolved_projection.fingerprints.snapshot_digest | default('')) | length > 0) and ((hook_resolved_projection.context.graph_snapshot | default('')) | length > 0) and ((hook_resolved_projection.fingerprints.snapshot_digest | default('')) != (hook_resolved_projection.context.graph_snapshot | default(''))) }}"
+    hook_acl_mismatch: "{{ (hook_resolved_projection.acl_generation | default('')) != (hook_resolved_projection.context.acl_generation | default(hook_resolved_projection.acl_generation | default(''))) and ((hook_resolved_projection.acl_mismatch | default(false)) | bool) }}"
+    hook_graph_mismatch: "{{ (hook_resolved_projection.foreign_graph | default(false)) | bool }}"
+    hook_unregistered_reader: "{{ (hook_resolved_projection.unregistered_reader | default(false)) | bool }}"
+
+- name: Inspect proposed argv
+  ansible.builtin.set_fact:
+    hook_proposed_argv: "{{ hook_resolved_projection.proposed_argv | default([]) }}"
+    hook_proposed_positionals: "{{ (hook_resolved_projection.proposed_positionals | default([])) }}"
+    hook_proposed_env: "{{ hook_resolved_projection.environment | default({}) }}"
+    hook_caller_query_text: "{{ hook_resolved_projection.caller_query_text | default('') }}"
+    hook_extra_query_fragments: "{{ hook_resolved_projection.extra_query_fragments | default([]) }}"
+    hook_iri_probe: "{{ (hook_resolved_projection.typed_bindings | default({})).values() | selectattr('term_type', 'equalto', 'iri') | map(attribute='value') | list | join(' ') }}"
+
+- name: Detect structural injection, not quoted literal characters
+  ansible.builtin.set_fact:
+    hook_injection_hits: "{{ hook_decl.forbidden_query_tokens | select('in', (hook_caller_query_text ~ ' ' ~ hook_iri_probe ~ ' ' ~ (hook_extra_query_fragments | join(' ')))) | list }}"
+
+- name: Detect rejected dataset atoms
+  ansible.builtin.set_fact:
+    hook_dataset_value: "{{ hook_resolved_projection.context.dataset | default('') }}"
+    hook_jena_rejected: "{{ (hook_resolved_projection.context.dataset | default('')) in hook_decl.cli.source_observed.rejected_dataset_atoms }}"
+
+- name: Detect graph flag misuse
+  ansible.builtin.set_fact:
+    hook_graph_flag_present: "{{ (hook_decl.cli.source_observed.option_parser.graph.long in (hook_proposed_argv | default([]))) or (hook_resolved_projection.use_graph_flag_as_scope | default(false)) }}"
+    hook_named_graphs: "{{ hook_resolved_projection.context.named_graphs | default([]) }}"
+
+- name: Detect environment conflict
+  ansible.builtin.set_fact:
+    hook_env_dataset: "{{ hook_proposed_env.dataset | default('') }}"
+    hook_env_conflict: "{{ (hook_proposed_env.dataset | default('')) != '' and (hook_proposed_env.dataset | default('')) != (hook_resolved_projection.context.dataset | default('')) }}"
+    hook_env_ambient: "{{ (hook_proposed_env.ambient_unknown | default(false)) | bool }}"
+    hook_env_explicit: "{{ (hook_proposed_env.explicit | default(false)) | bool }}"
+
+- name: Detect CLI shape violations
+  ansible.builtin.set_fact:
+    hook_subcommand: "{{ hook_resolved_projection.subcommand | default('') }}"
+    hook_unsupported_operation: "{{ (hook_resolved_projection.subcommand | default('')) != hook_decl.cli.allowed_invocation_shape.subcommand }}"
+    hook_has_positionals: "{{ (hook_proposed_positionals | length) > 0 }}"
+    hook_extra_operands: "{{ (hook_resolved_projection.extra_operands | default([]) | length) > 0 }}"
+    hook_missing_required_options: "{{ hook_decl.cli.allowed_invocation_shape.required_options | reject('in', hook_proposed_argv) | list }}"
+    hook_accept_defaulted: "{{ (hook_resolved_projection.accept_defaulted | default(false)) | bool }}"
+    hook_stdin_payload: "{{ (hook_resolved_projection.stdin_payload | default(false)) | bool }}"
+
+- name: Detect grant and lease occupancy independently of query truth
+  ansible.builtin.set_fact:
+    hook_grant: "{{ hook_resolved_projection.grant | default({}) }}"
+    hook_lease: "{{ hook_resolved_projection.lease | default({}) }}"
+    hook_grant_status: "{{ hook_resolved_projection.grant.validity | default('absent') }}"
+    hook_lease_status: "{{ hook_resolved_projection.lease.validity | default('absent') }}"
+    hook_grant_current: "{{ (hook_resolved_projection.grant.validity | default('absent')) == 'current' }}"
+    hook_lease_current: "{{ (hook_resolved_projection.lease.validity | default('absent')) == 'current' }}"
+
+- name: Detect geometry occupancy
+  ansible.builtin.set_fact:
+    hook_geometry: "{{ hook_resolved_projection.geometry | default({}) }}"
+    hook_geometry_requested: "{{ (hook_resolved_projection.geometry.enabled | default(false)) | bool }}"
+    hook_geometry_frame_ok: "{{ (not (hook_resolved_projection.geometry.enabled | default(false))) or ((hook_resolved_projection.geometry.frame_kind | default('')) in hook_decl.geometry.frames) }}"
+    hook_geometry_rejoin_ok: "{{ (not (hook_resolved_projection.geometry.enabled | default(false))) or ((hook_resolved_projection.geometry.omitted_axis_rejoin | default('')) | length > 0) }}"
+    hook_geometry_nonspatial_ok: "{{ (not (hook_resolved_projection.geometry.enabled | default(false))) or ((hook_decl.geometry.nonspatial_rejoin_fields | reject('in', (hook_resolved_projection.geometry.nonspatial | default({})).keys() | list) | list | length) == 0) }}"
+
+- name: Detect live-enforcement blockers
+  ansible.builtin.set_fact:
+    hook_live_blockers: "{{ hook_decl.missing_owner_contracts | selectattr('blocks_live_qualification', 'equalto', true) | map(attribute='id') | list }}"
+    hook_unresolved_slots: "{{ hook_decl.unresolved_runtime_inputs | selectattr('state', 'search', 'unresolved|unexecuted') | map(attribute='id') | list }}"
+
+- name: Classify validation first failure
+  ansible.builtin.set_fact:
+    hook_validate_first_failure: >-
+      {{
+        'missing_required_context' if (hook_unfilled_required_fields | length) > 0
+        else (
+          'missing_fingerprints' if (hook_missing_fingerprints | length) > 0
+          else (
+            'forbidden_query_token' if (hook_injection_hits | length) > 0
+            else (
+              'rejected_dataset' if hook_jena_rejected
+              else (
+                'named_graphs_absent' if (hook_named_graphs | length) == 0
+                else (
+                  'graph_flag_as_scope' if hook_graph_flag_present
+                  else (
+                    'environment_conflict' if hook_env_conflict
+                    else (
+                      'ambient_environment' if (hook_env_ambient or (not hook_env_explicit))
+                      else (
+                        'unsupported_operation' if hook_unsupported_operation
+                        else (
+                          'positional_payload' if hook_has_positionals
+                          else (
+                            'extra_operand' if hook_extra_operands
+                            else (
+                              'missing_required_option' if (hook_missing_required_options | length) > 0
+                              else (
+                                'accept_defaulted' if hook_accept_defaulted
+                                else (
+                                  'stdin_payload' if hook_stdin_payload
+                                  else (
+                                    'grant_not_current' if (not hook_grant_current)
+                                    else (
+                                      'lease_not_current' if (not hook_lease_current)
+                                      else (
+                                        'geometry_frame' if (not hook_geometry_frame_ok)
+                                        else (
+                                          'geometry_rejoin' if (not hook_geometry_rejoin_ok)
+                                          else (
+                                            'geometry_nonspatial' if (not hook_geometry_nonspatial_ok)
+                                            else (
+                                              'unbounded_limit' if ((hook_resolved_projection.context.limits.max_rows | default(0) | int) <= 0)
+                                              else (
+                                                'source_mismatch' if hook_source_mismatch
+                                                else (
+                                                  'query_mismatch' if hook_query_mismatch
+                                                  else (
+                                                    'model_mismatch' if hook_model_mismatch
+                                                    else (
+                                                      'snapshot_mismatch' if hook_snapshot_mismatch
+                                                      else (
+                                                        'acl_mismatch' if hook_acl_mismatch
+                                                        else (
+                                                          'graph_mismatch' if hook_graph_mismatch
+                                                          else (
+                                                            'unregistered_reader' if hook_unregistered_reader
+                                                            else (
+                                                            'live_owner_contracts' if ((hook_transport_mode == hook_decl.transport_modes.live_authorized) and ((hook_live_blockers | length) > 0))
+                                                            else (
+                                                              'unresolved_live_slots' if ((hook_transport_mode == hook_decl.transport_modes.live_authorized) and ((hook_unresolved_slots | length) > 0))
+                                                              else ''
+                                                            )
+                                                            )
+                                                          )
+                                                        )
+                                                      )
+                                                    )
+                                                  )
+                                                )
+                                              )
+                                            )
+                                          )
+                                        )
+                                      )
+                                    )
+                                  )
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+            )
+          )
+        )
+      }}
+
+- name: Publish validation decision
+  ansible.builtin.set_fact:
+    hook_validate:
+      eligible: "{{ (hook_validate_first_failure | length) == 0 }}"
+      first_failure: "{{ hook_validate_first_failure }}"
+      missing_required_fields: "{{ hook_unfilled_required_fields }}"
+      missing_fingerprints: "{{ hook_missing_fingerprints }}"
+      injection_hits: "{{ hook_injection_hits }}"
+      named_graphs: "{{ hook_named_graphs }}"
+      graph_flag_present: "{{ hook_graph_flag_present }}"
+      env_conflict: "{{ hook_env_conflict }}"
+      grant_current: "{{ hook_grant_current }}"
+      lease_current: "{{ hook_lease_current }}"
+      grant_status: "{{ hook_grant_status }}"
+      lease_status: "{{ hook_lease_status }}"
+      expected_denominator: "{{ hook_expected_denominator | int }}"
+      expected_assertions: "{{ hook_expected_assertions }}"
+      live_blockers: "{{ hook_live_blockers }}"
+      unresolved_slots: "{{ hook_unresolved_slots }}"
+      would_invoke_existing_cli: "{{ ((hook_validate_first_failure | length) == 0) and (hook_transport_mode == hook_decl.transport_modes.live_authorized) }}"
+      query_truth_authorizes_effect: false
+      evidence_class: "{{ 'synthetic-control' if (hook_transport_mode == hook_decl.transport_modes.synthetic_control) else 'live_unexecuted_or_authorized' }}"

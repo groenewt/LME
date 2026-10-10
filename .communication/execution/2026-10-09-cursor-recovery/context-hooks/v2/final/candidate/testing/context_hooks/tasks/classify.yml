@@ -1,0 +1,317 @@
+---
+# Classification preserves observation, validity, execution, eligibility, and
+# evidence as distinct fields. Query truth does not authorize an effect.
+
+- name: Require execute products and the original expected denominator
+  ansible.builtin.assert:
+    that:
+      - hook_validate is defined
+      - hook_execute is defined
+      - hook_transport_record is defined
+      - (hook_validate.expected_denominator | int) == ((hook_validate.expected_assertions | default([])) | length)
+    fail_msg: "classify requires validate/execute products and a preserved expected denominator"
+    quiet: true
+
+- name: Read supplied semantic controls without treating missing population as false
+  ansible.builtin.set_fact:
+    hook_semantic: "{{ hook_transport_record.semantic_controls | default({}) }}"
+    hook_raw_observation: "{{ hook_transport_record.observation_state | default('') }}"
+    hook_validity_status: "{{ hook_transport_record.validity_status | default('') }}"
+    hook_capture_status: "{{ hook_transport_record.capture_status | default(hook_execute.capture_status) }}"
+    hook_producer_status: "{{ hook_transport_record.producer_status | default(hook_execute.producer_status) }}"
+    hook_readback_status: "{{ hook_transport_record.readback_status | default('not_observed') }}"
+    hook_recovery: "{{ hook_transport_record.recovery_obligations | default([]) }}"
+    hook_parse_status: "{{ hook_transport_record.parse_status | default('not_applied') }}"
+    hook_row_count: "{{ hook_transport_record.row_count | default(0) | int }}"
+    hook_duplicate_rows: "{{ (hook_transport_record.duplicate_rows | default(false)) | bool }}"
+    hook_missing_columns: "{{ hook_transport_record.missing_columns | default([]) }}"
+    hook_malformed: "{{ (hook_transport_record.malformed | default(false)) | bool }}"
+    hook_transport_exit: "{{ hook_transport_record.transport_exit | default('') }}"
+
+- name: Derive observation when the producer did not supply one
+  ansible.builtin.set_fact:
+    hook_raw_observation: >-
+      {{
+        hook_raw_observation if (hook_raw_observation | length) > 0
+        else (
+          'timeout' if (hook_transport_record.timeout | default(false))
+          else (
+            'unavailable' if (hook_transport_record.unavailable | default(false))
+            else (
+              'not_observed' if (hook_producer_status == 'not_observed')
+              else (
+                'unknown' if (not (hook_validate.eligible | bool))
+                else (
+                  'stale' if ((hook_validity_status == 'stale') or (hook_transport_record.stale | default(false)))
+                  else (
+                    'not_applicable' if (hook_resolved_projection.applicable | default('unresolved')) == false
+                    else 'unknown'
+                  )
+                )
+              )
+            )
+          )
+        )
+      }}
+
+- name: Preserve stale as validity rather than coercing false or empty
+  ansible.builtin.set_fact:
+    hook_validity_status: "{{ 'stale' if ((hook_raw_observation == 'stale') or (hook_validity_status == 'stale') or (hook_transport_record.stale | default(false))) else (hook_validity_status if (hook_validity_status | length) > 0 else 'current') }}"
+    hook_older_enum_can_serialize: "{{ hook_raw_observation in hook_decl.observation_states.older_row_interface }}"
+
+- name: Map stale onto the older row interface without dropping freshness
+  ansible.builtin.set_fact:
+    hook_row_observation_state: "{{ hook_raw_observation if hook_older_enum_can_serialize else '' }}"
+    hook_stale_binding_blocker: "{{ hook_decl.stale_mapping.blocker if (not hook_older_enum_can_serialize) else '' }}"
+
+- name: Evaluate known-present and known-absent controls
+  ansible.builtin.set_fact:
+    hook_present_control_state: "{{ hook_semantic.present_control_state | default('unmeasured') }}"
+    hook_absent_control_state: "{{ hook_semantic.absent_control_state | default('unmeasured') }}"
+    hook_zero_with_nonzero_control: "{{ (hook_present_control_state == hook_decl.syntax_atoms.present_token) and ((hook_row_count | int) >= 0) }}"
+
+- name: Completeness cannot pass from empty joins or truncated bodies
+  ansible.builtin.set_fact:
+    hook_completeness: >-
+      {{
+        'truncated' if ((hook_execute.truncated_observed | bool) or (hook_transport_record.truncated | default(false)))
+        else (
+          'malformed' if hook_malformed
+          else (
+            'duplicate_columns' if hook_duplicate_rows
+            else (
+              'missing_columns' if (hook_missing_columns | length) > 0
+              else (
+                'unmeasured' if (hook_present_control_state != hook_decl.syntax_atoms.present_token)
+                else (
+                  'negative_control_failed' if (hook_absent_control_state == hook_decl.syntax_atoms.present_token)
+                  else (
+                    'complete' if (hook_present_control_state == hook_decl.syntax_atoms.present_token)
+                    else 'unmeasured'
+                  )
+                )
+              )
+            )
+          )
+        )
+      }}
+
+- name: Exit zero does not hide capture, parse, or recovery failure
+  ansible.builtin.set_fact:
+    hook_exit_zero: "{{ (hook_transport_exit | string) == (hook_decl.cli.source_observed.exit_ok | string) }}"
+    hook_capture_ok: "{{ hook_capture_status == 'captured' }}"
+    hook_effect_ok: "{{ (hook_execute.effect_receipt | default('missing')) not in ['missing', 'absent', ''] }}"
+    hook_readback_ok: "{{ hook_readback_status == 'verified' }}"
+    hook_recovery_outstanding: "{{ (hook_recovery | length) > 0 }}"
+
+- name: Independent grant and lease remain the authorization boundary
+  ansible.builtin.set_fact:
+    hook_authorized: "{{ (hook_validate.grant_current | bool) and (hook_validate.lease_current | bool) }}"
+    hook_query_truth: "{{ (hook_raw_observation == 'known_true') and (hook_completeness == 'complete') }}"
+
+- name: Eligibility is not query truth and is not authorization
+  ansible.builtin.set_fact:
+    hook_eligibility: >-
+      {{
+        'unresolved' if ((hook_validity_status == 'stale') or (hook_raw_observation in ['unknown', 'unavailable', 'timeout', 'not_observed', 'stale']))
+        else (
+          'refused' if ((not (hook_validate.eligible | bool)) or (not hook_authorized))
+          else (
+            'eligible' if (hook_validate.eligible | bool) and hook_authorized
+            else 'unresolved'
+          )
+        )
+      }}
+
+- name: First failure remains visible
+  ansible.builtin.set_fact:
+    hook_first_failure: >-
+      {{
+        hook_validate.first_failure if ((hook_validate.first_failure | default('')) | length) > 0
+        else (
+          'stale_validity' if (hook_validity_status == 'stale')
+          else (
+            'capture_missing' if (not hook_capture_ok)
+            else (
+              'effect_receipt_missing' if (not hook_effect_ok)
+              else (
+                'malformed_or_truncated' if (hook_completeness in ['malformed', 'truncated', 'duplicate_columns', 'missing_columns'])
+                else (
+                  'present_control_unmeasured' if (hook_completeness == 'unmeasured')
+                  else (
+                    'negative_control_failed' if (hook_completeness == 'negative_control_failed')
+                    else (
+                      'readback_unverified' if (not hook_readback_ok)
+                      else (
+                        'recovery_outstanding' if hook_recovery_outstanding
+                        else (
+                          'unauthorized' if (not hook_authorized)
+                          else ''
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      }}
+
+- name: Map qualification without shrinking expected assertions
+  ansible.builtin.set_fact:
+    hook_qualification: >-
+      {{
+        'unrun' if (hook_execute.evidence_class in ['unexecuted', 'synthetic-control'] and (hook_transport_mode != hook_decl.transport_modes.synthetic_control) and (not (hook_resolved_projection.control_executed | default(false))))
+        else (
+          'blocked' if ((hook_eligibility == 'unresolved') or (hook_validity_status == 'stale') or ((hook_stale_binding_blocker | default('')) | length) > 0 or ((hook_resolved_projection.applicable | default('unresolved')) == 'unresolved'))
+          else (
+            'not_applicable' if ((hook_resolved_projection.applicable | default('unresolved')) == false)
+            else (
+              'fail' if ((hook_first_failure | length) > 0 and (hook_resolved_projection.expected_semantic_outcome | default('qualify')) == 'qualify')
+              else (
+                'pass' if ((hook_first_failure | length) == 0 and hook_query_truth and hook_authorized and hook_readback_ok and hook_effect_ok)
+                else (
+                  'fail' if (hook_first_failure | length) > 0
+                  else 'blocked'
+                )
+              )
+            )
+          )
+        )
+      }}
+
+- name: Keep expected-refusal control success off the deployment qualification plane
+  ansible.builtin.set_fact:
+    hook_expected_refusal: "{{ (hook_resolved_projection.expected_semantic_outcome | default('')) == 'refuse' }}"
+    hook_control_qualification: >-
+      {{
+        'pass' if (((hook_resolved_projection.expected_semantic_outcome | default('')) == 'refuse') and ((hook_validate.eligible | bool) == false) and ((hook_validate.first_failure | default('')) == (hook_resolved_projection.expected_first_failure | default(hook_validate.first_failure | default('')))))
+        else (
+          'pass' if ((not ((hook_resolved_projection.expected_semantic_outcome | default('')) == 'refuse')) and (hook_qualification == 'pass'))
+          else (
+            'fail' if (hook_qualification == 'fail')
+            else hook_qualification
+          )
+        )
+      }}
+    hook_deployment_qualification: >-
+      {{
+        'not_qualified' if ((hook_resolved_projection.expected_semantic_outcome | default('')) == 'refuse')
+        else (
+          'not_qualified' if (hook_qualification != 'pass')
+          else (
+            'not_qualified' if (hook_transport_mode == hook_decl.transport_modes.synthetic_control)
+            else 'qualified'
+          )
+        )
+      }}
+
+- name: Map live matrix status separately from synthetic-control classification
+  ansible.builtin.set_fact:
+    hook_executed_fact: "{{ hook_execute.evidence_class == 'live_execution' }}"
+    hook_matrix_status: >-
+      {{
+        'unrun' if ((not (hook_execute.evidence_class == 'live_execution')) or (hook_qualification == 'unrun'))
+        else (
+          'blocked' if (hook_qualification == 'blocked')
+          else (
+            'not_applicable' if (hook_qualification == 'not_applicable')
+            else (
+              'pass' if ((hook_qualification == 'pass') and (not hook_expected_refusal) and (hook_deployment_qualification == 'qualified'))
+              else (
+                'fail' if (hook_qualification == 'fail')
+                else 'blocked'
+              )
+            )
+          )
+        )
+      }}
+
+
+- name: Build allowlisted diagnostics only
+  ansible.builtin.set_fact:
+    hook_diagnostics:
+      case_id: "{{ hook_resolved_projection.context.case_id | default('') }}"
+      instance_id: "{{ hook_resolved_projection.context.instance_id | default('') }}"
+      requirement_ids: "{{ hook_resolved_projection.context.requirement_ids | default([]) }}"
+      operation_id: "{{ hook_resolved_projection.context.operation_id | default('') }}"
+      run_id: "{{ hook_resolved_projection.context.run_id | default('') }}"
+      attempt_id: "{{ hook_resolved_projection.context.attempt_id | default('') }}"
+      actor_id: "{{ hook_resolved_projection.context.actor_id | default('') }}"
+      observation_state: "{{ hook_raw_observation }}"
+      validity_status: "{{ hook_validity_status }}"
+      required: "{{ hook_resolved_projection.required | default(true) }}"
+      applicable: "{{ hook_resolved_projection.applicable | default('unresolved') }}"
+      executed: "{{ hook_executed_fact | bool }}"
+      status: "{{ hook_matrix_status }}"
+      qualification: "{{ hook_qualification }}"
+      control_qualification: "{{ hook_control_qualification }}"
+      deployment_qualification: "{{ hook_deployment_qualification }}"
+      producer_status: "{{ hook_producer_status }}"
+      capture_status: "{{ hook_capture_status }}"
+      readback_status: "{{ hook_readback_status }}"
+      transport_exit: "{{ hook_transport_exit }}"
+      argv_flag_names: "{{ hook_execute.argv_flag_names | default(hook_decl.argv_flag_name_order) }}"
+      accept_media: "{{ hook_resolved_projection.context.accept_media | default('') }}"
+      truncated: "{{ hook_execute.truncated_observed | bool }}"
+      row_count: "{{ hook_row_count | int }}"
+      byte_count: "{{ hook_execute.byte_count | default(0) | int }}"
+      present_control_state: "{{ hook_present_control_state }}"
+      absent_control_state: "{{ hook_absent_control_state }}"
+      completeness: "{{ hook_completeness }}"
+      first_failure: "{{ hook_first_failure }}"
+      grant_validity: "{{ hook_validate.grant_status }}"
+      lease_validity: "{{ hook_validate.lease_status }}"
+      missing_owner_contracts: "{{ hook_validate.live_blockers }}"
+      unresolved_slots: "{{ hook_validate.unresolved_slots }}"
+      eligibility: "{{ hook_eligibility }}"
+      fingerprint_names: "{{ (hook_resolved_projection.fingerprints | default({})).keys() | list }}"
+      evidence_class: "{{ hook_execute.evidence_class }}"
+
+- name: Refuse nested synthetic secret canary in published diagnostics
+  ansible.builtin.set_fact:
+    hook_secret_canary_leaked: "{{ hook_decl.nested_secret_canary.value in (hook_diagnostics | to_json) }}"
+
+- name: Append classified result without dropping expected rows
+  ansible.builtin.set_fact:
+    hook_result:
+      required: "{{ hook_resolved_projection.required | default(true) }}"
+      applicable: "{{ hook_resolved_projection.applicable | default('unresolved') }}"
+      executed: "{{ hook_executed_fact | bool }}"
+      status: "{{ 'fail' if (hook_secret_canary_leaked | bool) else hook_matrix_status }}"
+      evidence:
+        observation_state: "{{ hook_raw_observation }}"
+        validity_status: "{{ hook_validity_status }}"
+        row_observation_state: "{{ hook_row_observation_state }}"
+        stale_binding_blocker: "{{ hook_stale_binding_blocker }}"
+        producer_status: "{{ hook_producer_status }}"
+        capture_status: "{{ hook_capture_status }}"
+        readback_status: "{{ hook_readback_status }}"
+        recovery_obligations: "{{ hook_recovery }}"
+        first_failure: "{{ hook_first_failure }}"
+        control_qualification: "{{ hook_control_qualification }}"
+        deployment_qualification: "{{ hook_deployment_qualification }}"
+        expected_denominator: "{{ hook_validate.expected_denominator | int }}"
+        expected_assertion_ids: "{{ hook_validate.expected_assertions | map(attribute='identity') | list }}"
+        secret_canary_excluded: "{{ (not (hook_secret_canary_leaked | bool)) }}"
+        diagnostics: "{{ hook_diagnostics }}"
+      identities:
+        case_id: "{{ hook_resolved_projection.context.case_id | default('') }}"
+        instance_id: "{{ hook_resolved_projection.context.instance_id | default('') }}"
+        execution_attempt: "{{ hook_resolved_projection.context.attempt_id | default('') }}"
+        observation_occurrence: "{{ hook_transport_record.occurrence_id | default('') }}"
+        entity: "{{ hook_resolved_projection.context.target_incarnation | default('') }}"
+        revision: "{{ hook_resolved_projection.fingerprints.model_digest | default('') }}"
+      relations:
+        executes: Invocation_to_OperationContract
+        queries: HookContract_to_QueryContract
+        guards: HookContract_to_Transition
+        evidences: EvidenceArtifact_to_Observation
+        supports: EvidenceArtifact_to_Claim
+        tests: ExpectedAssertion_to_QueryContract_or_Transition
+        retains: RecoveryObligation_to_EvidenceArtifact_or_Entity
+      authorization:
+        query_truth: "{{ hook_query_truth | bool }}"
+        grant_and_lease_current: "{{ hook_authorized | bool }}"
+        query_authorizes_effect: false

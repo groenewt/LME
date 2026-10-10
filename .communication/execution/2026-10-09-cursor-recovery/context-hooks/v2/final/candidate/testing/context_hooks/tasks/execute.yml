@@ -1,0 +1,185 @@
+---
+# Existing-transport argv modeling. No new HTTP/query transport. This author task
+# does not run subprocesses; live command is gated and remains unexecuted here.
+
+- name: Bind a synthetic-control case as the supplied resolved projection
+  ansible.builtin.set_fact:
+    hook_resolved_projection: "{{ hook_case }}"
+  when: hook_case is defined
+
+- name: Reset per-invocation transport binding
+  ansible.builtin.set_fact:
+    hook_transport_bound: false
+    hook_transport_record: {}
+
+- name: Validate before any effect
+  ansible.builtin.include_tasks: "{{ hook_root }}/tasks/validate.yml"
+
+- name: Initialize execution identities separately from observation identities
+  ansible.builtin.set_fact:
+    hook_execution:
+      operation_id: "{{ hook_resolved_projection.context.operation_id | default('') }}"
+      run_id: "{{ hook_resolved_projection.context.run_id | default('') }}"
+      attempt_id: "{{ hook_resolved_projection.context.attempt_id | default('') }}"
+      actor_id: "{{ hook_resolved_projection.context.actor_id | default('') }}"
+      relation: executes
+    hook_work: "{{ hook_work | default(hook_root ~ '/.work/' ~ (hook_resolved_projection.context.case_id | default('unbound'))) }}"
+
+- name: Refuse live command when validation failed or owner contracts are missing
+  ansible.builtin.set_fact:
+    hook_execute_gate: >-
+      {{
+        'validation_ineligible' if (not (hook_validate.eligible | bool))
+        else (
+          'synthetic-control' if (hook_transport_mode == hook_decl.transport_modes.synthetic_control)
+          else (
+            'live_owner_contracts' if ((hook_validate.live_blockers | length) > 0)
+            else (
+              'unresolved_live_slots' if ((hook_validate.unresolved_slots | length) > 0)
+              else (
+                'query_cannot_authorize' if ((not (hook_validate.grant_current | bool)) or (not (hook_validate.lease_current | bool)))
+                else 'live_authorized'
+              )
+            )
+          )
+        )
+      }}
+
+- name: Create work directory for rendered query identity
+  ansible.builtin.file:
+    path: "{{ hook_work }}"
+    state: directory
+    mode: "0755"
+  when: (hook_validate.eligible | bool) or (hook_transport_mode == hook_decl.transport_modes.synthetic_control)
+
+- name: Render bounded SELECT from declared macros and tokens
+  ansible.builtin.template:
+    src: "{{ hook_root }}/templates/query.rq.j2"
+    dest: "{{ hook_work }}/query.rq"
+    mode: "0644"
+  vars:
+    hook_syntax: "{{ hook_decl.syntax_atoms }}"
+    hook_serializers: "{{ hook_decl.serializers }}"
+    query: "{{ hook_resolved_projection.query }}"
+  when:
+    - hook_validate.eligible | bool
+    - hook_resolved_projection.query is defined
+    - (hook_resolved_projection.caller_query_text | default('')) | length == 0
+
+- name: Bind query file digest separately from CLI payload identity
+  ansible.builtin.stat:
+    path: "{{ hook_work }}/query.rq"
+    checksum_algorithm: sha256
+  register: hook_query_stat
+  when: hook_validate.eligible | bool
+
+- name: Compose selected SELECT argv with zero positionals
+  ansible.builtin.set_fact:
+    hook_argv: >-
+      {{
+        [
+          hook_resolved_projection.context.executable,
+          hook_decl.cli.allowed_invocation_shape.subcommand,
+          hook_decl.cli.source_observed.option_parser.file.long,
+          (hook_work ~ '/query.rq'),
+          hook_decl.cli.source_observed.option_parser.accept.long,
+          hook_resolved_projection.context.accept_media,
+          hook_decl.cli.source_observed.option_parser.dataset.long,
+          hook_resolved_projection.context.dataset,
+          hook_decl.cli.source_observed.option_parser.binding.long,
+          hook_resolved_projection.context.reader_binding
+        ]
+      }}
+    hook_argv_flag_names: "{{ hook_decl.argv_flag_name_order }}"
+    hook_command_env: "{{ hook_resolved_projection.environment.explicit_map | default({}) }}"
+  when: hook_validate.eligible | bool
+
+- name: Invoke existing CLI only through argv when live-authorized and unblocked
+  ansible.builtin.command:
+    argv: "{{ hook_argv }}"
+  environment: "{{ hook_command_env }}"
+  register: hook_cli_run
+  changed_when: false
+  failed_when: false
+  when:
+    - hook_execute_gate == 'live_authorized'
+    - hook_transport_mode == hook_decl.transport_modes.live_authorized
+
+- name: Accept synthetic-control transport record as the same consumer input
+  ansible.builtin.set_fact:
+    hook_transport_record: "{{ hook_resolved_projection.synthetic_transport_record }}"
+    hook_transport_bound: true
+  when:
+    - hook_transport_mode == hook_decl.transport_modes.synthetic_control
+    - hook_resolved_projection.synthetic_transport_record is defined
+
+- name: Bind live CLI capture when a live command actually ran
+  ansible.builtin.set_fact:
+    hook_transport_record:
+      evidence_class: live_execution
+      producer_status: "{{ 'ok' if ((hook_cli_run.rc | default(1) | int) == (hook_decl.cli.source_observed.exit_ok | int)) else 'error' }}"
+      capture_status: "{{ 'captured' if (hook_cli_run.stdout is defined) else 'missing' }}"
+      transport_exit: "{{ hook_cli_run.rc | default('') }}"
+      stdout_body: "{{ hook_cli_run.stdout | default('') }}"
+      stderr_body: "{{ hook_cli_run.stderr | default('') }}"
+      argv: "{{ hook_cli_run.cmd | default(hook_argv | default([])) }}"
+      truncated: false
+      effect_receipt: missing
+      capture_owner_contract: TELEPHONE-SELECT-DURABLE-CAPTURE
+    hook_transport_bound: true
+  when:
+    - hook_cli_run is defined
+    - hook_cli_run.rc is defined
+
+- name: Record skipped live invocation
+  ansible.builtin.set_fact:
+    hook_transport_record:
+      evidence_class: unexecuted
+      producer_status: not_observed
+      capture_status: not_observed
+      transport_exit: ""
+      stdout_body: ""
+      stderr_body: ""
+      argv: "{{ hook_argv | default([]) }}"
+      truncated: false
+      effect_receipt: missing
+      skip_reason: "{{ hook_execute_gate }}"
+    hook_transport_bound: true
+  when: not (hook_transport_bound | default(false) | bool)
+
+- name: Observe declared byte bound without claiming transport enforcement
+  ansible.builtin.set_fact:
+    hook_byte_count: "{{ (hook_transport_record.stdout_body | default('')) | length }}"
+    hook_truncated_observed: "{{ ((hook_resolved_projection.context.limits.max_bytes | default(0) | int) > 0) and (((hook_transport_record.stdout_body | default('')) | length) > (hook_resolved_projection.context.limits.max_bytes | default(0) | int)) }}"
+
+- name: Persist source/query payload identity separately from CLI stdout framing
+  ansible.builtin.set_fact:
+    hook_execute:
+      gate: "{{ hook_execute_gate }}"
+      rendered_query_path: "{{ hook_work ~ '/query.rq' }}"
+      rendered_query_digest: "{{ (hook_query_stat.stat.checksum | default('')) if ((hook_query_stat is defined) and (hook_query_stat.stat is defined) and (hook_query_stat.stat.checksum is defined)) else '' }}"
+      source_digest: "{{ hook_resolved_projection.fingerprints.source_digest | default('') }}"
+      query_digest: "{{ hook_resolved_projection.fingerprints.query_digest | default('') }}"
+      producer_status: "{{ hook_transport_record.producer_status }}"
+      capture_status: "{{ hook_transport_record.capture_status }}"
+      effect_receipt: "{{ hook_transport_record.effect_receipt | default('missing') }}"
+      transport_exit: "{{ hook_transport_record.transport_exit }}"
+      byte_count: "{{ hook_byte_count | int }}"
+      truncated_observed: "{{ hook_truncated_observed | bool }}"
+      transport_enforced_limits: false
+      argv_flag_names: "{{ hook_argv_flag_names | default(hook_decl.argv_flag_name_order) }}"
+      stdout_framing: cli_halt_ok_puts_body
+      parser_output: not_applied_until_classify
+      evidence_class: "{{ hook_transport_record.evidence_class }}"
+      live_qualification: refused
+
+- name: Classify producer, capture, semantic, eligibility, and evidence separately
+  ansible.builtin.include_tasks: "{{ hook_root }}/tasks/classify.yml"
+  when: hook_accumulate_controls | default(false)
+
+- name: Accumulate synthetic-control results without dropping rows
+  ansible.builtin.set_fact:
+    hook_results: "{{ (hook_results | default([])) + [hook_result | combine({'id': (hook_case.id | default(hook_resolved_projection.context.case_id | default(''))), 'family': (hook_case.family | default(''))})] }}"
+  when:
+    - hook_accumulate_controls | default(false)
+    - hook_result is defined

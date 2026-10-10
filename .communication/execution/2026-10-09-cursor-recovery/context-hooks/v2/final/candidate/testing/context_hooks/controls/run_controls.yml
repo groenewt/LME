@@ -1,0 +1,97 @@
+---
+# Deterministic synthetic-control runner. Does not satisfy live_query_qualification.
+# This author task does not execute this playbook.
+- name: Context-hook synthetic controls
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hook_transport_mode: synthetic-control
+    hook_root: "{{ playbook_dir }}/.."
+    hook_author_executed: false
+    hook_authorized_control_runner: false
+    hook_accumulate_controls: true
+  tasks:
+    - name: Load hook declaration
+      ansible.builtin.include_vars:
+        file: "{{ hook_root }}/context.decl.yml"
+        name: hook_decl
+
+    - name: Load synthetic-control cases
+      ansible.builtin.include_vars:
+        file: "{{ hook_root }}/controls/cases.yml"
+        name: hook_cases
+
+    - name: Initialize result accumulator and preserved denominator
+      ansible.builtin.set_fact:
+        hook_results: []
+        hook_control_roster: []
+        hook_campaign_coverage_metadata:
+          indexed_ids: "{{ hook_decl.coverage_metadata.indexed_ids }}"
+          coordination_rows: "{{ hook_decl.coverage_metadata.coordination_rows }}"
+          axes: "{{ hook_decl.coverage_metadata.axes }}"
+          role: "{{ hook_decl.coverage_metadata.role }}"
+
+    - name: Queue the fully bound fixture
+      ansible.builtin.set_fact:
+        hook_control_roster: "{{ hook_control_roster + [hook_cases.valid_bound] }}"
+
+    - name: Queue explicit family overlays on the bound fixture
+      ansible.builtin.set_fact:
+        hook_control_roster: "{{ hook_control_roster + [hook_cases.valid_bound | combine(item.overlay | default({}), recursive=True) | combine({'id': item.id, 'family': item.family, 'expected_semantic_outcome': item.expected_semantic_outcome, 'expected_first_failure': item.expected_first_failure | default(''), 'expected_validate_eligible': item.expected_validate_eligible | default(false)}, recursive=True)] }}"
+      loop: "{{ hook_cases.explicit_cases }}"
+      loop_control: {label: "{{ item.id }}"}
+
+    - name: Queue required-field absence mutations
+      ansible.builtin.set_fact:
+        hook_control_roster: "{{ hook_control_roster + [hook_cases.valid_bound | combine({'id': item.id, 'family': 'required_context_field_absent', 'expected_semantic_outcome': item.expected_semantic_outcome, 'expected_first_failure': item.expected_first_failure, 'expected_validate_eligible': false, 'context': (hook_cases.valid_bound.context | dict2items | rejectattr('key', 'equalto', item.field) | items2dict)}, recursive=False)] }}"
+      loop: "{{ hook_cases.field_mutations | selectattr('mutation', 'equalto', 'absent') | list }}"
+      loop_control: {label: "{{ item.id }}"}
+
+    - name: Queue required-field substitution mutations
+      ansible.builtin.set_fact:
+        hook_control_roster: "{{ hook_control_roster + [hook_cases.valid_bound | combine({'id': item.id, 'family': 'required_context_field_substituted', 'expected_semantic_outcome': item.expected_semantic_outcome, 'expected_first_failure': item.expected_first_failure, 'expected_validate_eligible': false, 'foreign_graph': item.foreign_graph | default(false), 'unregistered_reader': item.unregistered_reader | default(false), 'subcommand': item.subcommand | default(hook_cases.valid_bound.subcommand), 'grant': (hook_cases.valid_bound.grant | combine({'validity': item.grant_validity}) if (item.grant_validity is defined) else hook_cases.valid_bound.grant), 'lease': (hook_cases.valid_bound.lease | combine({'validity': item.lease_validity}) if (item.lease_validity is defined) else hook_cases.valid_bound.lease), 'context': (hook_cases.valid_bound.context | combine({item.field: hook_cases.substituted_values[item.field]}))}, recursive=False)] }}"
+      loop: "{{ hook_cases.field_mutations | selectattr('mutation', 'equalto', 'substituted') | list }}"
+      loop_control: {label: "{{ item.id }}"}
+
+    - name: Preserve the control roster length as the control denominator
+      ansible.builtin.set_fact:
+        hook_control_denominator: "{{ hook_control_roster | length }}"
+
+    - name: Run validate, execute-model, and classify for each synthetic control
+      ansible.builtin.include_tasks: "{{ hook_root }}/tasks/execute.yml"
+      loop: "{{ hook_control_roster }}"
+      loop_control: {loop_var: hook_case, label: "{{ hook_case.id }}"}
+
+    - name: Never shrink the control denominator
+      ansible.builtin.assert:
+        that:
+          - (hook_results | length) == (hook_control_denominator | int)
+          - (hook_campaign_coverage_metadata.role == 'coverage_metadata_never_runtime_denominator')
+        fail_msg: "synthetic-control results vanished or coverage metadata was treated as a runtime denominator"
+        quiet: true
+
+    - name: Nested synthetic secret canary must not appear in published diagnostics
+      ansible.builtin.assert:
+        that:
+          - hook_decl.nested_secret_canary.value not in (hook_results | map(attribute='evidence') | map(attribute='diagnostics') | list | to_json)
+        fail_msg: "synthetic nested secret canary leaked into published diagnostics"
+        quiet: true
+
+    - name: Expected-refusal controls cannot qualify deployment
+      ansible.builtin.assert:
+        that: "{{ (hook_results | selectattr('evidence.deployment_qualification', 'equalto', 'qualified') | list | length) == 0 }}"
+        fail_msg: "synthetic-control or expected-refusal produced a deployment qualification"
+        quiet: true
+
+    - name: Record that this author did not execute the control runner
+      ansible.builtin.set_fact:
+        hook_controls_execution:
+          execution_status: unrun
+          evidence_class: synthetic-control
+          live_query_qualification: unexecuted
+          tests_actually_run: []
+          proposed_command:
+            argv:
+              - "{{ hook_decl.consumed_resolved_input.supplied_variable }}"
+            playbook: "{{ hook_root }}/controls/run_controls.yml"
+            note: Authorized test runner only; this author used Read/Write/edit tools only.
