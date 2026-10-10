@@ -295,7 +295,11 @@ lme_global:
     #     names are declared, not byte-enforced (payload_validity_rule_registry is OPEN debt, C lane).
     persistent_addresses_record:
       kind: local_state_record
-      payload_validity: json_object_exact_keys
+      # RQ-219 class 2 (codex-tick843): a NEW record (no develop artifact); schema-versioned YAML with exact keys. The
+      # writer, every reader and the validation move together (DEP-D-PLATFORM); the exact key set is the writer's.
+      payload_validity: yaml_mapping_exact_keys
+      serialization: yaml
+      schema_version: 1
       description: Write-once record of the persistent addresses at first initialization; governs over the desired view.
     inhibit_marker_record:
       kind: local_state_record
@@ -341,6 +345,9 @@ lme_global:
       kind:             {type: str, required: true,  vocab: [public_key, private_key, certificate, password_file, json, conf, pgpass, dsn, local_state_record]}
       payload_validity: {type: str, required: true}
       description:      {type: str, required: false}
+      # RQ-219 class 2 (codex-tick843): a local state record payload declares its serialization and schema version.
+      serialization:    {type: str, required: false, vocab: [yaml]}
+      schema_version:   {type: int, required: false}
     # Kinds an obligation MAY reference (material distributed to a consumer). A kind
     # NOT listed here (e.g. private_key) is host-local / non-distributable.
     distributable_kinds: [public_key, certificate, password_file, json, conf, pgpass, dsn]
@@ -433,11 +440,11 @@ lme_global:
         keys: [status, decision]
         types: {status: str, decision: str}
       acquisition_v3:
-        keys: [act, builder_uid, cold_qualified, lock_sha256, observed_at_utc, profile_sha256, revision, rows, schema, store, store_empty_before, store_entries_before, store_foreign_entries]
-        types: {act: str, builder_uid: nonneg_int, cold_qualified: bool, lock_sha256: hex64, observed_at_utc: str, profile_sha256: hex64, revision: posint, rows: {list: {block: acquisition_row}}, schema: {enum: [lme-acquisition-receipt/3]}, store: str, store_empty_before: bool, store_entries_before: {list: str}, store_foreign_entries: {list: str}}
+        keys: ["act", "builder_uid", "cold_qualified", "lock_sha256", "observed_at_utc", "profile_sha256", "revision", "rows", "schema", "store", "store_empty_before", "store_entries_before", "store_foreign_entries", "recipes"]
+        types: {"act": "str", "builder_uid": "nonneg_int", "cold_qualified": "bool", "lock_sha256": "hex64", "observed_at_utc": "str", "profile_sha256": "hex64", "revision": "posint", "rows": {"list": {"block": "acquisition_row"}}, "schema": {"enum": ["lme-acquisition-receipt/3"]}, "store": "str", "store_empty_before": "bool", "store_entries_before": {"list": "str"}, "store_foreign_entries": {"list": "str"}, "recipes": {"list": {"block": "acquisition_recipe"}}}
       acquisition_row:
-        keys: [disposition, file, sha256, url]
-        types: {disposition: {enum: [fetched, reused]}, file: str, sha256: hex64, url: str}
+        keys: ["disposition", "file", "sha256", "url", "max_bytes", "recipes"]
+        types: {"disposition": {"enum": ["fetched", "reused"]}, "file": "str", "sha256": "hex64", "url": "str", "max_bytes": "posint", "recipes": {"list": {"block": "acquisition_recipe"}}}
       package_publication_v2:
         keys: [act, classes, resumed, schema, source, stage]
         types: {act: str, classes: {keyed: {key: hex64, value: {block: class_record_v2}}}, resumed: bool, schema: {enum: [lme-package-publication/2]}, source: {block: publication_source}, stage: str}
@@ -561,6 +568,24 @@ lme_global:
   # {blocks, records} and a block as exactly {keys, types}. Every word is a member of that block's pair enum and the
   # words are distinct; a reader selects a law row by this word, never by an enum difference, a position or a record
   # root key.
+      acquisition_recipe:
+        types:
+          role:
+            enum:
+            - builder
+            - test
+          leg: str
+          class_key: hex64
+          recipe_sha256: hex64
+          lock_rel: str
+          lock_sha256: hex64
+        keys:
+        - role
+        - leg
+        - class_key
+        - recipe_sha256
+        - lock_rel
+        - lock_sha256
   record_pair_laws:
     rb3_pair:
       LAW-RB3-PROVENANCE: provenance
@@ -711,6 +736,124 @@ lme_global:
         owner_role: 'cert_owner:fleet-server'
         mode: '0640'
         lifecycle: bootstrap
+    # OD-PERM-02 (codex654, codex683): typed LOCAL, NON-DISTRIBUTABLE state records -- the ONE declaration of each
+    # record's producer, consumers, destination, owner, group, mode, custody class, lifecycle and retention. Values
+    # are TODAY's task values (postgresql_backup tasks/main.yml :72-98 and D s4); values with no prior declaration are
+    # flagged OD-S14-DB-NEWVAL (persistent_addresses 0644 + dir 0755: D 07 a; inhibit marker: writer absent).
+    # Validated by lme_validate_material_registries against material_provision_schema.local_state_*; projected per
+    # host ONLY for the components selected there (database_views.components).
+    local_state_provision:
+      persistent_addresses_record:
+        material: persistent_addresses_record
+        producer: postgresql_platform_role
+        consumers: [postgresql_platform, postgresql_backup, fencing_guardian, reconcile_guest]
+        destination: '{database_state_root}/persistent-addresses.yaml'
+        per: [database_state_root]
+        owner_role: root
+        group: root
+        mode: '0644'
+        custody_class: record
+        lifecycle: write_once
+        retention: durable
+        host_scope: local_host
+      inhibit_marker_record:
+        material: inhibit_marker_record
+        producer: fencing_guardian
+        consumers: [fencing_guardian, reconcile_guest, rejoin]
+        destination: '{inhibit_root}/{inhibit_marker}'
+        per: [inhibit_marker, inhibit_root]
+        owner_role: root
+        group: root
+        mode: '0644'
+        custody_class: record
+        lifecycle: rewrite
+        retention: none
+        host_scope: local_host
+      backup_ownership_record:
+        material: backup_ownership_record
+        producer: postgresql_backup_role
+        consumers: [postgresql_backup]
+        destination: '{backup_root}/ownership.json'
+        per: [backup_root]
+        owner_role: root
+        group: root
+        mode: '0600'
+        custody_class: record
+        lifecycle: write_once
+        retention: durable
+        host_scope: local_host
+      backup_runtime_identity_record:
+        material: backup_runtime_identity_record
+        producer: postgresql_backup_role
+        consumers: [postgresql_backup]
+        destination: '{backup_root}/runtime-identity.json'
+        per: [backup_root]
+        owner_role: root
+        group: root
+        mode: '0600'
+        custody_class: record
+        lifecycle: write_once
+        retention: durable
+        host_scope: local_host
+      backup_transition_record:
+        material: backup_transition_record
+        producer: postgresql_backup_role
+        consumers: [postgresql_backup]
+        destination: '{backup_root}/transition.json'
+        per: [backup_root]
+        owner_role: root
+        group: root
+        mode: '0600'
+        custody_class: record
+        lifecycle: write_once
+        retention: durable
+        host_scope: local_host
+      backup_declared_record:
+        material: backup_declared_record
+        producer: postgresql_backup_role
+        consumers: [postgresql_backup]
+        destination: '{backup_root}/config/declared.json'
+        per: [backup_root]
+        owner_role: root
+        group: root
+        mode: '0600'
+        custody_class: record
+        lifecycle: write_once
+        retention: durable
+        host_scope: local_host
+    local_state_control_dirs:
+      persistent_addresses_dir:
+        destination: '{database_state_root}'
+        per: [database_state_root]
+        owner_role: root
+        group: root
+        mode: '0755'
+        custody_class: control_dir
+        consumers: [postgresql_platform, postgresql_backup, fencing_guardian, reconcile_guest]
+      backup_root_prefix_dir:
+        destination: '{root_prefix}'
+        per: [root_prefix]
+        owner_role: root
+        group: owner_group
+        mode: '0750'
+        custody_class: control_dir
+        consumers: [postgresql_backup]
+      backup_root_dir:
+        destination: '{backup_root}'
+        per: [backup_root]
+        owner_role: root
+        group: owner_group
+        mode: '0750'
+        custody_class: control_dir
+        consumers: [postgresql_backup]
+      backup_config_dir:
+        destination: '{backup_root}/config'
+        per: [backup_root]
+        owner_role: root
+        group: owner_group
+        mode: '0750'
+        custody_class: control_dir
+        consumers: [postgresql_backup]
     ca_key_rule:
       material: ca_key
       non_publication: true                  # never in a published bundle; never delivered to a bundle consumer
@@ -750,6 +893,90 @@ lme_global:
   # gate asserts producer_registry / custody_registry / material_provision /
   # material_provision_schema each equal the declared file value (no override may rebind custody).
   material_provision_schema:
+    local_state_admission:
+      schema_version: 1
+      constants:
+        zero: 0
+        one: 1
+        mode_radix: 8
+        enabled: true
+        disabled: false
+        absent: null
+      types:
+        text: str
+        integer: int
+        mapping: dict
+        sequence: list
+        boolean: bool
+      sections:
+        local_state_provision: local_state_provision_record
+        local_state_control_dirs: local_state_control_dir_record
+      records_section: local_state_provision
+      entry_types:
+        material: str
+        producer: str
+        consumers: list
+        destination: str
+        per: list
+        owner_role: str
+        group: str
+        mode: str
+        custody_class: str
+        lifecycle: str
+        retention: str
+        host_scope: str
+      root_owner_fields:
+      - name
+      - uid
+      class_vocab_fields:
+      - object_type
+      - owner
+      - no_follow
+      stat_policy_fields:
+      - attribute
+      - flag_namespace
+      - observer
+      - unsupported_record
+      - when_class_missing
+      - when_unsupported
+      stat_text_fields:
+      - attribute
+      - unsupported_record
+      stat_vocab_fields:
+      - flag_namespace
+      - observer
+      - when_class_missing
+      - when_unsupported
+      placement_vocab_fields:
+        owner_role: owner_role_vocab
+        group: group_vocab
+        custody_class: custody_class_vocab
+      record_vocab_fields:
+        lifecycle: lifecycle_vocab
+        retention: retention_vocab
+        host_scope: host_scope_vocab
+      routes:
+        leaf: leaf_key_provision
+        non_publication: non_publication
+        local: local_state_provision
+      errors:
+        schema: 'lme: local-state material schema is malformed: {detail}'
+        sections: 'lme: local-state material sections must be declared together as admitted mappings: {detail}'
+        entry: 'lme: local-state material entry has invalid shape or placement: {detail}'
+        custody: 'lme: local-state material custody class does not admit the declared object, owner or mode: {detail}'
+        consumer: 'lme: local-state material consumer is absent from the declared component registry: {detail}'
+        producer: 'lme: local-state material producer does not uniquely own the declared material: {detail}'
+        partition: 'lme: produced non-distributable material must have exactly one valid declared ownership route: {detail}'
+      details:
+        schema: local_state_provision_schema
+        sections: local_state_provision_and_control_dirs
+        components: database_views.components
+      empty:
+        mapping: {}
+        text: ''
+      placeholder_delimiters:
+      - '{'
+      - '}'
     producer_record:
       required: [id, implementation, host_scope, produces_materials, reference_form]
       host_scope_vocab: [source_host, signer_host, controller, every_host, local_host]   # local_host: OD-PERM-02 local state producers
@@ -797,7 +1024,7 @@ lme_global:
       owner_role_vocab: [root, owner_role]
       group_vocab: [root, owner_role, owner_group]
       host_scope_vocab: [local_host]
-      placeholders: [backup_root, inhibit_marker, inhibit_root, root_prefix]
+      placeholders: [backup_root, database_state_root, inhibit_marker, inhibit_root, root_prefix]
       placeholder_pattern: '[{]([a-z_]+)[}]'
     local_state_control_dir_record:
       empty_section_admitted: false   # codex697: a DECLARED but EMPTY local_state_control_dirs refuses; absence declares none
@@ -807,7 +1034,7 @@ lme_global:
       custody_class_vocab: [control_dir]
       owner_role_vocab: [root]
       group_vocab: [root, owner_group]
-      placeholders: [backup_root, inhibit_root, root_prefix]
+      placeholders: [backup_root, database_state_root, inhibit_root, root_prefix]
       placeholder_pattern: '[{]([a-z_]+)[}]'
     # The reusable no-follow / type / owner / permission predicates, ONE PER CLASS (no universal mode). forbid_mode_bits
     # is an octal string here; the engine publishes it as an int (lme_resolved.database.local_state_custody). Stat
@@ -1122,6 +1349,17 @@ lme_global:
       lme_database_profile:
         bridge_absent: ''
 lme_config_registry:
+  database_views:
+    components:
+      selectors:
+      - member
+      - repository_node
+      selected_by:
+        postgresql_platform: member
+        rejoin: member
+        reconcile_guest: member
+        fencing_guardian: member
+        postgresql_backup: repository_node
   schema_version: 1
   # Precedence tiers, high -> low, ENFORCED by lme_resolve_config: it ITERATES this
   # list, so reordering it changes resolution (C1-DECLARED-PRECEDENCE / A2). Each
@@ -5944,340 +6182,1108 @@ lme_config_registry:
             # F05-S4 PROVISIONAL GLO-33 (F05-GEN2-02; GEN-EARLY-PATH): the successor key set; registry_rel / registry_leaf /
             # requires / anchor.fields are RETIRED (the producer reads no declaration or registry bytes) and refuse by the
             # exact key sets; interface.var is the rendered play interface var (never reserved; distinct from the anchor).
-            - {path: genesis.source_record, keys: [anchor, interface, output, refusals, stage, texts]}
-            # F05-S4 RENDER-CONTEXT-03 (genesis FIN-F05-08): the acquisition declaration's EXACT key set through the existing
-            # keys kind (a stale, missing or undeclared acquisition key refuses pre-render; was read by the producer only)
-            - {path: genesis.acquisition, keys: [bundle_var, cold_qualification, dispositions, historical, receipt_format, receipt_identity_fields, receipt_schema, receipt_var, refusal, report, revision, source_var]}
-            # C1-PKG records-pkg-receipt-words-01 (codex727 OD_LOCKSHA_ACQ_RECEIPT_01 / SCHEMA_01): the receipt epoch and
-            # identity words, pinned (/1 refuses even where old and new digests coincide).
-            - {path: genesis.acquisition.receipt_schema, pattern: schema_tag}
-            - {path: genesis.acquisition.receipt_schema, enum: [lme-acquisition-receipt/3]}
-            - {path: genesis.acquisition.revision, enum: [2]}
-            - {path: genesis.acquisition.receipt_identity_fields, enum: [[act, revision]]}
-            - {path: genesis.acquisition.receipt_format, enum: [yaml]}
-            # records-c1-h11-yaml-receipts-02 (codex 873 Q278_3): the fixed declared revision of the /3 contract and the
-            # preserved earlier binding, each pinned (a changed revision is a new declaration, never a counter).
-            - {path: genesis.acquisition.historical, keys: [disposition, receipt_format, receipt_schema, revision]}
-            - {path: genesis.acquisition.historical.receipt_schema, enum: [lme-acquisition-receipt/2]}
-            - {path: genesis.acquisition.historical.revision, enum: [1]}
-            - {path: genesis.acquisition.historical.receipt_format, enum: [json]}
-            - {path: genesis.acquisition.historical.disposition, enum: [retained_unread]}
-            # the CONSUMED members (genesis_source_record_emit equality with the producer interface): three distinct host
-            # var names; the declared refusal code and the disposition words through the existing pattern / strings kinds
-            - {path: genesis.acquisition.receipt_var, pattern: var_name}
-            - {path: genesis.acquisition.source_var, pattern: var_name}
-            - {path: genesis.acquisition.bundle_var, pattern: var_name}
-            - {path: genesis.acquisition.bundle_var, distinct_from: [genesis.acquisition.receipt_var, genesis.acquisition.source_var]}
-            - {path: genesis.acquisition.receipt_var, distinct_from: [genesis.acquisition.source_var]}
-            - {path: genesis.acquisition.refusal, pattern: refusal_code}
-            - {path: genesis.acquisition.dispositions, strings: {nonempty: true, distinct: true}}
-            - {path: genesis.source_record.stage, subject: scalar, within: [controller.bootstrap.genesis.launch.stages]}
-            - {path: genesis.source_record.anchor, keys: [source, var]}
-            - {path: genesis.source_record.anchor.var, pattern: var_name}
-            - {path: genesis.source_record.anchor.var, not_in: [reserved_outputs, resolver_outputs]}
-            - {path: genesis.source_record.anchor.source, subject: scalar, within: [controller.bootstrap.genesis.launch.input_sources]}
-            - {path: genesis.source_record.interface, keys: [var]}
-            - {path: genesis.source_record.interface.var, pattern: var_name}
-            - {path: genesis.source_record.interface.var, not_in: [reserved_outputs, resolver_outputs]}
-            - {path: genesis.source_record.interface.var, distinct_from: [genesis.source_record.anchor.var]}
-            # F05-S4 GROUPS CORRECTIONS (codex-tick564 F05-GROUP-SOURCE-REFUSAL-KEYSET): EXACTLY the seven refusal roles
-            # (keys, not has_keys: a paired extra refusal + text refuses here; the mutual `within` below closes texts)
-            - {path: genesis.source_record.refusals, keys: [builder, forged, input, interface, inventory, output, projection]}
-            - {path: genesis.source_record.output, keys: [marker, mode, record_rel]}
-            - {path: genesis.source_record.output.record_rel, pattern: rel_segment}
-            - {path: genesis.source_record.output.mode, enum: ['0600']}
-            - {path: genesis.source_record.output.marker, pattern: marker_word}
-            - {path: genesis.source_record.refusals, subject: keys, within: [controller.bootstrap.genesis.source_record.texts]}
-            - {path: genesis.source_record.texts, subject: keys, within: [controller.bootstrap.genesis.source_record.refusals]}
-            - {path: genesis.source_record.refusals, each: true, pattern: refusal_code}
-            - {path: genesis.source_record.refusals, values_distinct: true}
-            - {path: genesis.source_record.texts, each: true, pattern: text_line}
-            # records-lrh-profile-p6-01 G1-04 (codex-tick821 REP-G1; records-c1-framework-27 RH-27-02 / s1_result_unchanged): the
-            # S1 result of the cold G01 occurrence, in the genesis.source_record form. Its writer is owed by route (OW-27-04).
-            # route life-09 O-GL-01..04 / lineage-rh p6-03 OW-63-GL: values re-pathed to absent; proposed_record_fields; output format + serialise.
-            - {path: genesis.s1_result, keys: [absent, field_words, fields, flow, output, proposed_record_fields, stage]}
-            - {path: genesis.s1_result.stage, subject: scalar, within: [controller.bootstrap.genesis.launch.stages]}
-            # records-lrh-profile-p6-06 OW-66-GL-01 (route life-13 OW-L13-G01-FLOW-GL): the G01 occurrence's own flow, a
-            # genesis.entry.selection.flows KEY in the initializer.dispatch.flow form; S2 reads selection.flows[s1_result.flow].
-            - {path: genesis.s1_result.flow, subject: scalar, within: [controller.bootstrap.genesis.entry.selection.flows]}
-            - {path: genesis.s1_result.output, keys: [format, mode, record_rel, serialise]}
-            - {path: genesis.s1_result.output.record_rel, pattern: rel_segment}
-            - {path: genesis.s1_result.output.mode, enum: ['0600']}
-            - {path: genesis.s1_result.output.format, enum: [yaml]}
-            - {path: genesis.s1_result.output.serialise, keys: [indent, sort_keys, width]}
-            - {path: genesis.s1_result.output.serialise.indent, positive_int: true}
-            - {path: genesis.s1_result.output.serialise.width, positive_int: true}
-            - {path: genesis.s1_result.output.serialise.sort_keys, enum: [true]}
-            - {path: genesis.s1_result.fields, keys: [edition, generation, mirror, proposed_record, staged]}
-            - {path: genesis.s1_result.fields, each: true, pattern: text_line}
-            - {path: genesis.s1_result.absent, keys: [proposed_record_unchanged]}
-            - {path: genesis.s1_result.absent.proposed_record_unchanged, enum: [none]}
-            - {path: genesis.s1_result.proposed_record_fields, keys: [path, sha256]}
-            - {path: genesis.s1_result.proposed_record_fields, each: true, pattern: text_line}
-            - {path: genesis.s1_result.proposed_record_fields, values_distinct: true}
-            # records-lrh-profile-p6-04 OW-64-GL-06 (codex-tick824 S1-FIELD-WORDS): the ONE role -> emitted key word map of the S1
-            # result (fields keeps the descriptions); every word non-empty and distinct (values_distinct refuses an empty value).
-            - {path: genesis.s1_result.field_words, keys: [edition, generation, mirror, proposed_record, staged]}
-            - {path: genesis.s1_result.field_words, each: true, pattern: text_line}
-            - {path: genesis.s1_result.field_words, values_distinct: true}
-            - {path: genesis.launch.step_record.files.retained.genesis_generate.rel, distinct_from: [genesis.s1_result.output.record_rel]}
-            # records-c1-framework-22 FW22-BOOT-OWNER (codex-tick816 option ii): the source-bootstrap record var is owned once by
-            # registry contract_admission.early_names.rh_source_bootstrap; registry-subject rows (LH-3).
-            - {at: contract_admission.early_names.rh_source_bootstrap.var, registry: true, not_in: [reserved_outputs, resolver_outputs]}
-            - {at: contract_admission.early_names.rh_source_bootstrap.var, registry: true, distinct_from: [genesis.launch.envelope.resolved_run, genesis.source_record.anchor.var, genesis.source_record.interface.var, genesis.initializer.root_input.var]}
-            # C1 records-c1-d4-g2-l2-01 D4-B (records-c1-framework-19 J-FW19-GL-SHAPE :69; seat SR-267-13 / SR-267-14): the ONE
-            # pre-view name declaration as a registry subject (LH-3; loader LH-4 admits its structure only). Roster exactly
-            # the nine declared names (records-c1-framework-19 six, records-c1-framework-30-r2 OW-R2-01 three); each entry
-            # exactly {var}; each var fully matches patterns.var_name and equals its key (one enum row per entry).
-            # C1-SR323-CENSUS-01: + rh_invocation_requirement (ten names), equal to invocation_context.leased_requirement.var.
-            # C1-SR917: + rh_clp_entry_sha256, rh_clp_parse (the projector carrier early names; sorted)
-            # C1-SR918: + rh_clp_x2 (the X2 identity binding of the early carrier selection)
-            # C1-SR918-RECONCILE: the three rh_clp_* rows RETIRED -> rh_x2_admission (the ONE external X2 admission early
-            # name; equals entry_carriers.projector.admission.var by the shared literal of the two exact enums)
-            - {at: contract_admission.early_names.rh_x2_admission.var, registry: true, enum: [rh_x2_admission]}
-            - {at: contract_admission.early_names.rh_x2_admission.var, registry: true, not_in: [reserved_outputs, resolver_outputs]}
-            - {at: contract_admission.early_names, registry: true, keys: [_rh_sa_decl, _rh_sa_idt, _rh_sa_reg, _rh_sa_regadm, _rh_sa_rref, rh_invocation_requirement, rh_rp_caller, rh_rp_input, rh_rp_phase, rh_source_bootstrap, rh_x2_admission]}
-            - {at: contract_admission.early_names.rh_invocation_requirement.var, registry: true, enum: [rh_invocation_requirement]}
-            - {at: 'contract_admission.early_names.*', registry: true, keys: [var]}
-            - {at: 'contract_admission.early_names.*.var', registry: true, pattern: var_name}
-            - {at: contract_admission.early_names._rh_sa_decl.var, registry: true, enum: [_rh_sa_decl]}
-            - {at: contract_admission.early_names._rh_sa_idt.var, registry: true, enum: [_rh_sa_idt]}
-            - {at: contract_admission.early_names._rh_sa_reg.var, registry: true, enum: [_rh_sa_reg]}
-            - {at: contract_admission.early_names._rh_sa_regadm.var, registry: true, enum: [_rh_sa_regadm]}
-            - {at: contract_admission.early_names._rh_sa_rref.var, registry: true, enum: [_rh_sa_rref]}
-            - {at: contract_admission.early_names.rh_rp_caller.var, registry: true, enum: [rh_rp_caller]}
-            - {at: contract_admission.early_names.rh_rp_input.var, registry: true, enum: [rh_rp_input]}
-            - {at: contract_admission.early_names.rh_rp_phase.var, registry: true, enum: [rh_rp_phase]}
-            - {at: contract_admission.early_names.rh_source_bootstrap.var, registry: true, enum: [rh_source_bootstrap]}
-            # MR03 FIRST-SOURCE-BUILD INITIALIZER + INITIAL RELEASE (codex-tick628 OD-FR-01 = D; codex-tick630; codex-tick637 Q1;
-            # codex-tick647 / 652 / 655 / 656 / 661): the source-authored initializer, its ONE root input declaration (the cold
-            # carrier of both record-free entries; C1 S12E-AL-02P), its admission fact, refusals / texts; the custody runtime keys
-            # genesis owns (the ALT-B artifact rows are C1's initializer_release_custody contract, has_keys).
-            - {path: genesis.initializer, keys: [admission, custody, dispatch, playbook_rel, refusals, root_input, stage, texts]}
-            - {path: genesis.initializer.playbook_rel, pattern: rel_path}
-            - {path: genesis.initializer.playbook_rel, distinct_from: [genesis.entry.producer.generated_rel, genesis.entry.generated_rel, genesis.initializer.custody.entry_rel]}
-            - {path: genesis.initializer.stage, subject: scalar, within: [controller.bootstrap.genesis.builder.authoring.initializer]}
-            - {path: genesis.initializer.stage, subject: scalar, within: [controller.bootstrap.genesis.launch.stages]}
-            # codex-tick715 OPT-ACT-STAGE (C1-PKG records-dispatch-01): the initializer stage is never the W1 source record
-            # producer stage; the dispatch node: the role word, the W1 flow key, the evidence sub_roots keys, the publication
-            # stage and the child-generation key path. "Not a step stage of the dispatched plan" is a list of mappings no
-            # existing kind walks: N8 (the :84 replacement) asserts it.
-            - {path: genesis.initializer.stage, distinct_from: [genesis.source_record.stage]}
-            - {path: genesis.initializer.dispatch, keys: [evidence, flow, inputs, role]}
-            - {path: genesis.initializer.dispatch.role, enum: [dispatcher]}
-            - {path: genesis.initializer.dispatch.flow, subject: scalar, within: [controller.bootstrap.genesis.entry.selection.flows]}
-            # records-dispatch-02 (OPEN-N8-07-FLOWS-INDEX): flow indexes selection.plans DIRECTLY (W1 :267 / :443-449); it is a
-            # plans key as well as a flows key, never a flow word used as a plans key.
-            - {path: genesis.initializer.dispatch.flow, subject: scalar, within: [controller.bootstrap.genesis.entry.selection.plans]}
-            # records-lg-compose-07 (seat ruling on lineage-rh p6-06 CF-P66-01): the G01 occurrence's flow EQUALS the dispatch
-            # flow; within over the one scalar reference admits exactly its value (type-exact; the evidence.step_record.sub form).
-            - {path: genesis.s1_result.flow, subject: scalar, within: [controller.bootstrap.genesis.initializer.dispatch.flow]}
-            # records-dispatch-03 (OB-N1-DSP-OP-01): the dispatcher's operator-input values: name -> a KEY of that input's
-            # domain mapping (N1 passes domain[key]). "Keys == the dispatched plan's operator stage_inputs minus
-            # selection.input" is a list-of-mappings derivation no existing kind walks: N1 asserts it.
-            - {path: genesis.initializer.dispatch.inputs, keys: [rh_entry_operation]}
-            - {path: genesis.initializer.dispatch.inputs, subject: keys, within: [controller.bootstrap.genesis.launch.operator_inputs]}
-            - {path: genesis.initializer.dispatch.inputs.rh_entry_operation, subject: scalar, within: [controller.entry_generation.operation.modes]}
-            - {path: genesis.initializer.dispatch.inputs.rh_entry_operation, enum: [package]}
-            - {path: genesis.initializer.dispatch.evidence, keys: [generation, publication, source_record, step_record]}
-            - {path: genesis.initializer.dispatch.evidence.step_record, keys: [sub]}
-            - {path: genesis.initializer.dispatch.evidence.step_record.sub, subject: scalar, within: [controller.bootstrap.genesis.launch.step_record.emit.evidence_sub]}
-            - {path: genesis.initializer.dispatch.evidence.source_record, keys: [sub]}
-            - {path: genesis.initializer.dispatch.evidence.source_record.sub, subject: scalar, within: [controller.bootstrap.genesis.launch.stage_root.sub]}
-            - {path: genesis.initializer.dispatch.evidence.publication, keys: [stage]}
-            - {path: genesis.initializer.dispatch.evidence.publication.stage, subject: scalar, within: [controller.bootstrap.genesis.launch.stages]}
-            - {path: genesis.initializer.dispatch.evidence.publication.stage, distinct_from: [genesis.initializer.stage]}
-            - {path: genesis.initializer.dispatch.evidence.generation, strings: {nonempty: true, distinct: true}}
-            - {path: genesis.initializer.dispatch.evidence.generation, subject: list, within: [controller.bootstrap.genesis.launch.step_record.emit.keys, controller.bootstrap.genesis.launch.step_record.emit.keys.builder]}
-            - {path: genesis.initializer.root_input, keys: [cold_forms, cold_only, keys, override_keys, override_state, phase, runtime, source, var]}
-            # records-ctx-producer-02 (codex-tick738 OPEN-EF0-GGEN-COMBINE; spelling accepted by codex-tick740): the record-free
-            # carrier declares its override state: the carrier key, the state words, and the exact carrier field list of each
-            # state. The absent state carries no field; the present state carries exactly the override pair (set-equal both
-            # ways). root_input.keys does NOT gain context: context is absent before the staged reader (codex-tick740).
-            # The node and state key sets are the source_admission.carrier_state_schema values (codex-tick744), set-equal both ways.
-            - {path: genesis.initializer.root_input.override_state, subject: keys, within: [controller.bootstrap.source_admission.carrier_state_schema.node_fields]}
-            - {path: source_admission.carrier_state_schema.node_fields, subject: list, within: [controller.bootstrap.genesis.initializer.root_input.override_state]}
-            - {path: genesis.initializer.root_input.override_state.key, pattern: var_name}
-            - {path: genesis.initializer.root_input.override_state.words, subject: keys, within: [controller.bootstrap.source_admission.carrier_state_schema.states]}
-            - {path: source_admission.carrier_state_schema.states, subject: list, within: [controller.bootstrap.genesis.initializer.root_input.override_state.words]}
-            - {path: genesis.initializer.root_input.override_state.words, each: true, pattern: var_name}
-            - {path: genesis.initializer.root_input.override_state.words, values_distinct: true}
-            - {path: genesis.initializer.root_input.override_state.fields, subject: keys, within: [controller.bootstrap.source_admission.carrier_state_schema.states]}
-            - {path: source_admission.carrier_state_schema.states, subject: list, within: [controller.bootstrap.genesis.initializer.root_input.override_state.fields]}
-            - {path: genesis.initializer.root_input.override_state.fields.absent, equals_registry_set: {path: contract_admission.carrier_state.node.fields.absent, projection: members}}
-            - {path: genesis.initializer.root_input.override_state.fields.present, strings: {nonempty: true, distinct: true}}
-            - {path: genesis.initializer.root_input.override_state.fields.present, subject: list, within: [controller.bootstrap.genesis.initializer.root_input.override_keys]}
-            - {path: genesis.initializer.root_input.override_keys, subject: list, within: [controller.bootstrap.genesis.initializer.root_input.override_state.fields.present]}
-            - {path: genesis.initializer.root_input.var, pattern: var_name}
-            - {path: genesis.initializer.root_input.var, not_in: [reserved_outputs, resolver_outputs]}
-            - {path: genesis.initializer.root_input.var, distinct_from: [genesis.source_record.anchor.var, genesis.source_record.interface.var]}
-            - {path: genesis.initializer.root_input.source, subject: scalar, within: [controller.bootstrap.genesis.launch.input_sources]}
-            - {path: genesis.initializer.root_input.source, distinct_from: [genesis.source_record.anchor.source]}
-            - {path: genesis.initializer.root_input.keys, strings: {nonempty: true, distinct: true}}
-            - {path: genesis.initializer.root_input.override_keys, strings: {nonempty: true, distinct: true}}
-            - {path: genesis.initializer.root_input.override_keys, subject: list, not_within: [controller.bootstrap.genesis.initializer.root_input.keys]}
-            - {path: genesis.initializer.root_input.phase, subject: scalar, within: [controller.bootstrap.source_admission.resolve_phases.words]}
-            - {path: genesis.initializer.root_input.runtime, subject: keys, within: [controller.bootstrap.genesis.initializer.root_input.keys]}
-            - {path: genesis.initializer.root_input.runtime, subject: keys, not_within: [controller.bootstrap.source_admission.bootstrap_input.record_keys]}
-            - {path: genesis.initializer.root_input.runtime, each: true, pattern: var_name}
-            # codex-tick715 INV-01 (C1-PKG records-dispatch-01): the cold-only dispatch keys (never carrier keys, never
-            # launch-record keys) and the declared form of each.
-            - {path: genesis.initializer.root_input.cold_only, strings: {nonempty: true, distinct: true}}
-            - {path: genesis.initializer.root_input.cold_only, each: true, pattern: var_name}
-            - {path: genesis.initializer.root_input.cold_only, disjoint_from: [genesis.initializer.root_input.keys, genesis.initializer.root_input.override_keys, source_admission.bootstrap_input.record_keys]}
-            - {path: genesis.initializer.root_input.cold_forms, subject: keys, within: [controller.bootstrap.genesis.initializer.root_input.cold_only]}
-            - {path: genesis.initializer.root_input.cold_forms, keys: [inventory]}
-            - {path: genesis.initializer.root_input.cold_forms.inventory, keys: [fields, form, inventory_kind, runtime]}
-            - {path: genesis.initializer.root_input.cold_forms.inventory.form, enum: [ordered_records]}
-            - {path: genesis.initializer.root_input.cold_forms.inventory.runtime, pattern: var_name}
-            - {path: genesis.initializer.root_input.cold_forms.inventory.inventory_kind, subject: scalar, within: [controller.bootstrap.genesis.launch.inventory_kinds]}
-            - {path: genesis.initializer.root_input.cold_forms.inventory.inventory_kind, subject: scalar, within: [controller.bootstrap.genesis.initializer.custody.launch.inventory_kind]}
-            # OW-B07-157-GL-01 (codex-tick861 SR258_05; B records-08 :205 / B07 :157): N8 direct flow is a declared selection flow.
-            - {path: genesis.initializer.custody.launch.flow, subject: scalar, within: [controller.bootstrap.genesis.entry.selection.flows]}
-            - {path: genesis.initializer.root_input.cold_forms.inventory.fields, enum: [[role, path, sha256]]}
-            - {path: genesis.initializer.root_input.cold_forms.inventory.fields, subject: list, within: [controller.bootstrap.genesis.launch.step_record.emit.keys.config.inventory]}
-            - {path: genesis.initializer.admission, keys: [var]}
-            - {path: genesis.initializer.admission.var, pattern: var_name}
-            - {path: genesis.initializer.admission.var, distinct_from: [genesis.initializer.root_input.var, genesis.source_record.anchor.var, genesis.source_record.interface.var, genesis.initializer.custody.admission.var]}
-            - {path: genesis.initializer.refusals, subject: keys, within: [controller.bootstrap.genesis.initializer.texts]}
-            - {path: genesis.initializer.texts, subject: keys, within: [controller.bootstrap.genesis.initializer.refusals]}
-            - {path: genesis.initializer.refusals, each: true, pattern: refusal_code}
-            - {path: genesis.initializer.refusals, values_distinct: true}
-            - {path: genesis.initializer.texts, each: true, pattern: text_line}
-            # custody runtime keys (genesis-owned; C1 S6-GL-06 admits the ALT-B rows with has_keys)
-            # records-lg-compose-13 LG13-03 (records-lrh-profile-p6-17 OW-617-GL-01 / P617-01): + override_input_roles (sorted).
-            - {path: genesis.initializer.custody, has_keys: [admission, builders, override_input_roles, override_inputs, producers, record_free_launches, retain_impl, sed_words, tool_argv, tools]}
-            - {path: genesis.initializer.custody.admission, keys: [var]}
-            - {path: genesis.initializer.custody.admission.var, pattern: var_name}
-            - {path: genesis.initializer.custody.override_inputs, strings: {nonempty: true, distinct: true}}
-            - {path: genesis.initializer.custody.override_inputs, each: true, pattern: var_name}
-            # records-lg-compose-13 LG13-04 (records-lrh-profile-p6-17 OW-617-GL-01): the role of each override_inputs member, roles
-            # exactly path / sha256; the values are distinct and SET-EQUAL to override_inputs by mutual within (each value a member,
-            # each member a value), the extra_var_params mutual-within form; so also the registry both_or_neither keys (LG12-03).
-            - {path: genesis.initializer.custody.override_input_roles, keys: [path, sha256]}
-            - {path: genesis.initializer.custody.override_input_roles, values_distinct: true}
-            - {path: 'genesis.initializer.custody.override_input_roles.*', subject: scalar, within: [controller.bootstrap.genesis.initializer.custody.override_inputs]}
-            - {path: genesis.initializer.custody.override_inputs, subject: list, within: [controller.bootstrap.genesis.initializer.custody.override_input_roles.*]}
-            - {path: genesis.initializer.custody.sed_words, keys: [print, step]}
-            - {path: genesis.initializer.custody.retain_impl, keys: [fixed, params]}
-            - {path: genesis.initializer.custody.retain_impl.params, strings: {nonempty: true, distinct: true}}
-            # C1-SR323-OP1 (codex 822 B-E2): + external_invocation, the producer word of the externally admitted first occurrence.
-            - {path: genesis.initializer.custody.producers, keys: [external_invocation, genesis_entry, release_artifact, release_preparation]}
-            - {path: genesis.initializer.custody.producers.external_invocation, enum: [external_invocation]}
-            - {path: genesis.initializer.custody.producers.genesis_entry, enum: [genesis_entry]}
-            - {path: genesis.initializer.custody.producers.release_artifact, enum: [release_artifact]}
-            - {path: genesis.initializer.custody.producers.release_preparation, enum: [release_preparation]}
-            - {path: genesis.initializer.custody.builders, keys: [authoring]}
-            - {path: genesis.initializer.custody.builders.authoring, enum: [authoring]}
-            # codex698 OD-S14W1-LIST-ROWS (b): a MAPPING keyed by the admitted relative entry path; each entry exactly
-            # {builder, inputs, producer, purpose}. Uniqueness is structural (one key per rel).
-            - {path: genesis.initializer.custody.record_free_launches, key_pattern: rel_path}
-            - {path: genesis.initializer.custody.record_free_launches, subject: keys, within: [controller.bootstrap.source_admission.resolve_phases.callers]}
-            # C1-SR323-OP1 (lineage repair): the r-lineage carried the pre-FW20 four-key row while every profile since s13 carries
-            # the seven-field rows (s29 :806-813), so the exact-key row refused them. Restored from C1 s13 global (598c7cf3
-            # :4911-4919, records-c1-framework-20 FW20-COLD rfl_row_fields, J-FW20-COLD-GL): + purpose_class (the
-            # genesis.builder.authoring list holding purpose), transport (the launch transport word) and admission (the
-            # admission-fact var, a resolve_phases.record_free_admissions member). RESIDUE (no contract kind states them;
-            # admit_record_free_entry enforces at run): purpose within authoring[purpose_class] per row, and admission
-            # distinct across rows.
-            - {path: 'genesis.initializer.custody.record_free_launches.*', keys: [admission, builder, inputs, producer, purpose, purpose_class, transport]}
-            - {path: 'genesis.initializer.custody.record_free_launches.*.purpose_class', enum: [stages, releases, initializer]}
-            - {path: 'genesis.initializer.custody.record_free_launches.*.transport', enum: [cold]}
-            # C1-SR328 (codex 912 answers.transport): every record-free row's transport (the registry runner_transport
-            # purpose_transport) is the source_admission.launch_transports genesis selection the X4 / X2P ingress names.
-            - {path: 'genesis.initializer.custody.record_free_launches.*.transport', subject: scalar, within: [controller.bootstrap.source_admission.launch_transports.genesis]}
-            - {path: 'genesis.initializer.custody.record_free_launches.*.admission', pattern: var_name}
-            - {path: 'genesis.initializer.custody.record_free_launches.*.admission', subject: scalar, within: [controller.bootstrap.source_admission.resolve_phases.record_free_admissions]}
-            - {path: 'genesis.initializer.custody.record_free_launches.*.purpose', subject: scalar, within: [controller.bootstrap.genesis.builder.authoring.stages, controller.bootstrap.genesis.builder.authoring.releases, controller.bootstrap.genesis.builder.authoring.initializer]}
-            - {path: 'genesis.initializer.custody.record_free_launches.*.producer', subject: scalar, within: [controller.bootstrap.genesis.initializer.custody.producers]}
-            - {path: 'genesis.initializer.custody.record_free_launches.*.builder', subject: scalar, within: [controller.bootstrap.genesis.initializer.custody.builders]}
-            - {path: 'genesis.initializer.custody.record_free_launches.*.inputs', strings: {nonempty: true, distinct: true}}
-            - {path: 'genesis.initializer.custody.record_free_launches.*.inputs', each: true, pattern: var_name}
-            - {path: genesis.initializer.custody.tools, each: true, subject: scalar, within: [controller.bootstrap.os_tools]}
-            - {path: genesis.initializer.custody.tools, strings: {nonempty: true, distinct: true}}
-            - {path: genesis.initializer.custody.tool_argv, key_pattern: var_name}
-            # records-b-ggen-cold-launch-08 OW-B08-GL-01: the ONE-rename publication role N11 reads by name (B08-H6 tv rename); its
-            # words are lineage-rh's (OW-B08-RH-03); its tool mv is a custody.tools member, admitted by the os_tools row above.
-            - {path: genesis.initializer.custody.tool_argv, has_keys: [rename]}
-            - {path: genesis.initializer.custody.tool_argv.rename, strings: {nonempty: true}}
-            # records-lg-reconstruct-01 K3 (codex-tick840 outcome 2): the S2 source-acceptance node rows of records-c1-framework-16
-            # FW16-GL-02 (:260, :289) with records-c1-framework-22 J-FW22-BD-GL (:262), folding records-lg-compose-02 edits 1-3
-            # (records-c1-framework-23 :273, :275-277, :461-469; E-FW23-01 :284-293). No count is restated. RESIDUE (no contract
-            # kind states it; tasks/accept_source.yml enforces): records-lg-compose-01 :203-206.
-            # records-lg-compose-09 LG9-03 (records-lrh-profile-p6-09 OW-69-GL-02 / P69-02; route records-route-life-15 OW-L15-UID-GL):
-            # + running_uid, the S2 running uid binding (an admitted fact): argv_from a custody tool_argv role, regex_from the one
-            # declared uid regex (anchored, so the reference resolves), var the reserved S2 output _rh_acc_uid (LG9-01).
-            - {path: genesis.initializer.custody.acceptance, keys: [purpose, input, owned, deletions_rel, rel_regex, digest_regex, new_file_mode, attempt,
-                                                                    commit, ref, serial, receipt, blob_digest, refusals, texts, running_uid]}
-            - {path: genesis.initializer.custody.acceptance.running_uid, keys: [argv_from, regex_from, var]}
-            - {path: genesis.initializer.custody.acceptance.running_uid.var, enum: [_rh_acc_uid]}
-            - {path: genesis.initializer.custody.acceptance.running_uid.argv_from, subject: scalar, within: [controller.bootstrap.genesis.initializer.custody.tool_argv]}
-            - {path: genesis.initializer.custody.acceptance.running_uid.regex_from, enum: [controller.entry_generation.uid_regex]}
-            - {at: controller.entry_generation.uid_regex, ere: anchored}
-            # C1-SR922H (C1-GAP-ANCESTRY-UID-GRAMMAR; profile s47): the ancestry include's uid grammar is the SAME literal as
-            # entry_generation.uid_regex; both are pinned to one value here, so they cannot diverge.
-            - {at: controller.entry_generation.uid_regex, enum: ['^[0-9]+$']}
-            - {at: controller.bootstrap.path_admission.ancestry.uid_regex, enum: ['^[0-9]+$']}
-            - {path: genesis.initializer.custody.acceptance.purpose, subject: scalar, within: [controller.bootstrap.genesis.builder.authoring.stages]}
-            - {path: genesis.initializer.custody.acceptance.purpose, subject: scalar, within: [controller.bootstrap.genesis.launch.stages]}
-            - {path: genesis.initializer.custody.acceptance.rel_regex, equals_registry: {path: contract_admission.patterns.rel_path.pattern}}
-            - {path: genesis.initializer.custody.acceptance.digest_regex, equals_registry: {path: contract_admission.patterns.sha256_hex}}
-            - {path: genesis.initializer.custody.acceptance.new_file_mode, subject: scalar, within: [controller.bootstrap.source_admission.git.blob.modes]}
-            - {path: genesis.initializer.custody.acceptance.ref.absent_value, matches_ere: source_admission.git.edition_regex}
-            - {path: genesis.initializer.custody.acceptance.ref.expect, subject: scalar, within: [controller.bootstrap.genesis.initializer.custody.acceptance.ref.expect_words]}
-            # records-c1-framework-31 OW-31-01 (codex-tick825 S2-DERIVED-INPUT): input.var is removed; S2 derives its input from
-            # input.from. CT-31-03 (seat): the exact key set refuses a stale var, and the retired input.keys, at manifest load
-            # (lineage-rh p6-05 P65-05 deletes input.keys in the same landing).
-            - {path: genesis.initializer.custody.acceptance.input, keys: [from]}
-            # records-lrh-profile-p6-01 G1-06 (codex-tick821 REP-G1): the S1-result reader names its genesis source node.
-            - {path: genesis.initializer.custody.acceptance.input.from, enum: [s1_result]}
-            - {path: genesis.initializer.custody.acceptance.receipt.var, pattern: var_name}
-            - {path: genesis.initializer.custody.acceptance.receipt.fields, enum: [[owned, edition, staged, commit, tree, blobs, w1_blob, ref, deletions, publication, observed_at]]}
-            - {path: genesis.initializer.custody.acceptance.receipt.fields, each: true, pattern: var_name}
-            - {path: genesis.initializer.custody.acceptance.receipt.identity_fields, enum: [[owned, edition, staged, commit, tree, blobs, w1_blob, ref, deletions]]}
-            - {path: genesis.initializer.custody.acceptance.receipt.words, keys: [published, recovered]}
-            - {path: genesis.initializer.custody.acceptance.receipt.words, values_distinct: true}
-            - {path: genesis.initializer.custody.acceptance.receipt.root_sub, subject: scalar, within: [controller.bootstrap.work_roots.sub_roots]}
-            - {path: genesis.initializer.custody.acceptance.attempt.root_sub, subject: scalar, within: [controller.bootstrap.work_roots.sub_roots]}
-            - {path: work_roots.sub_roots, values_distinct: true}
-            - {path: genesis.initializer.custody.acceptance.receipt.file_suffix, distinct_from: [genesis.initializer.custody.acceptance.attempt.index_suffix, genesis.initializer.custody.acceptance.attempt.capture_suffix]}
-            - {path: genesis.initializer.custody.acceptance.attempt.capture_suffix, distinct_from: [genesis.initializer.custody.acceptance.attempt.index_suffix]}
-            # records-c1-framework-23 :273, :275-277 (records-lg-compose-02 edit 2). HELD with H2-FW23-BLOB-STREAM: r23 :271-272
-            # (blob_digest.blob_suffix) and the whole :274 observation_suffix distinct_from row.
-            - {path: genesis.initializer.custody.acceptance.receipt.observation_suffix, pattern: dot_suffix}
-            - {path: genesis.initializer.custody.acceptance.receipt.file_suffix, pattern: dot_suffix}
-            - {path: genesis.initializer.custody.acceptance.attempt.capture_suffix, pattern: dot_suffix}
-            - {path: genesis.initializer.custody.acceptance.attempt.index_suffix, pattern: dot_suffix}
-            - {path: genesis.initializer.custody.acceptance.receipt.file_mode, subject: scalar, within: [controller.bootstrap.genesis.launch.step_record.files.retained.*.mode]}
-            - {path: genesis.initializer.custody.acceptance.attempt.capture_mode, subject: scalar, within: [controller.bootstrap.genesis.launch.step_record.files.retained.*.mode]}
-            - {path: genesis.initializer.custody.acceptance.refusals, keys: [attempt, blob, conflict, delta, input, metadata, mirror, owned, prior_receipt, purpose, readback, ref, s1_parse, tool]}
-            - {path: genesis.initializer.custody.acceptance.refusals, each: true, pattern: refusal_code}
-            - {path: genesis.initializer.custody.acceptance.refusals, values_distinct: true}
-            - {path: genesis.initializer.custody.acceptance.texts, keys: [attempt, blob, conflict, delta, input, metadata, mirror, owned, prior_receipt, purpose, readback, ref, s1_parse, tool]}
-            - {path: genesis.initializer.custody.acceptance.texts, each: true, pattern: text_line}
-            - {path: genesis.initializer.custody.acceptance.commit.identity_pairs, keys: [GIT_AUTHOR_EMAIL, GIT_AUTHOR_NAME, GIT_COMMITTER_EMAIL, GIT_COMMITTER_NAME]}
-            - {path: genesis.initializer.custody.acceptance.commit.identity_pairs, key_pattern: env_name}
-            - {path: genesis.initializer.custody.acceptance.commit.identity_pairs, each: true, pattern: text_line}
-            - {path: genesis.initializer.custody.acceptance.commit.date_regex, ere: anchored}
-            # records-c1-framework-23 F2-FW23-IPR J-FW23-IPR2-GL-01 (:461-469; records-lg-compose-02 edit 1, LG2-CC-01..03 open
-            # for C1): the commit keys row, the identity_pair_regex row and the identity_names rows.
-            - {at: controller.bootstrap.genesis.initializer.custody.acceptance.commit, keys: [date_regex, identity_names, identity_pair_regex, identity_pairs, message, message_regex]}
-            - {path: genesis.initializer.custody.acceptance.commit.identity_pair_regex, ere: anchored}
-            - {path: genesis.initializer.custody.acceptance.commit.identity_names, strings: {nonempty: true, distinct: true}}
-            - {path: genesis.initializer.custody.acceptance.commit.identity_names, each: true, pattern: env_name}
-            - {path: genesis.initializer.custody.acceptance.commit.message_regex, ere: anchored}
-            - {path: genesis.initializer.custody.acceptance.ref.name_regex, ere: anchored}
-            - {path: genesis.initializer.custody.acceptance.commit.message, matches_ere: genesis.initializer.custody.acceptance.commit.message_regex}
-            - {path: genesis.initializer.custody.acceptance.ref.name, matches_ere: genesis.initializer.custody.acceptance.ref.name_regex}
-            - {path: genesis.initializer.custody.acceptance.owned, keys: [records_never, records_node, records_staged, records_when_prior, roster_key, roster_output_index, view]}
-            - {path: genesis.initializer.custody.acceptance.owned.records_staged, disjoint_from: [genesis.initializer.custody.acceptance.owned.records_when_prior, genesis.initializer.custody.acceptance.owned.records_never]}
-            - {path: genesis.initializer.custody.acceptance.owned.records_when_prior, disjoint_from: [genesis.initializer.custody.acceptance.owned.records_never]}
-            - {path: genesis.initializer.custody.acceptance.serial, keys: [checkout_equality, consumption_kind, edition_equality, verdict]}
-            - {path: genesis.initializer.custody.acceptance.serial.edition_equality.stage_input, subject: scalar, within: [controller.bootstrap.genesis.s1_result.field_words]}
-            - {at: controller.bootstrap.genesis.initializer.custody.acceptance.blob_digest, keys: [blob_suffix, capture_script, digest_args, digest_tool, line_regex, shell_tool]}
-            - {path: genesis.initializer.custody.acceptance.blob_digest.digest_tool, subject: scalar, within: [controller.bootstrap.os_tools]}
-            - {path: genesis.initializer.custody.acceptance.blob_digest.shell_tool, subject: scalar, within: [controller.bootstrap.os_tools]}
-            - {path: genesis.initializer.custody.acceptance.blob_digest.line_regex, ere: anchored}
+            - path: genesis.source_record
+              keys:
+              - anchor
+              - interface
+              - output
+              - refusals
+              - stage
+              - texts
+            - path: genesis.acquisition
+              keys:
+              - bundle_var
+              - cold_qualification
+              - dispositions
+              - historical
+              - receipt_format
+              - receipt_identity_fields
+              - receipt_schema
+              - receipt_var
+              - refusal
+              - report
+              - revision
+              - source_var
+              - execution
+            - path: genesis.acquisition.receipt_schema
+              pattern: schema_tag
+            - path: genesis.acquisition.receipt_schema
+              enum:
+              - lme-acquisition-receipt/3
+            - path: genesis.acquisition.revision
+              enum:
+              - 2
+            - path: genesis.acquisition.receipt_identity_fields
+              enum:
+              - - act
+                - revision
+            - path: genesis.acquisition.receipt_format
+              enum:
+              - yaml
+            - path: genesis.acquisition.historical
+              keys:
+              - disposition
+              - receipt_format
+              - receipt_schema
+              - revision
+            - path: genesis.acquisition.historical.receipt_schema
+              enum:
+              - lme-acquisition-receipt/2
+            - path: genesis.acquisition.historical.revision
+              enum:
+              - 1
+            - path: genesis.acquisition.historical.receipt_format
+              enum:
+              - json
+            - path: genesis.acquisition.historical.disposition
+              enum:
+              - retained_unread
+            - path: genesis.acquisition.receipt_var
+              pattern: var_name
+            - path: genesis.acquisition.source_var
+              pattern: var_name
+            - path: genesis.acquisition.bundle_var
+              pattern: var_name
+            - path: genesis.acquisition.bundle_var
+              distinct_from:
+              - genesis.acquisition.receipt_var
+              - genesis.acquisition.source_var
+            - path: genesis.acquisition.receipt_var
+              distinct_from:
+              - genesis.acquisition.source_var
+            - path: genesis.acquisition.refusal
+              pattern: refusal_code
+            - path: genesis.acquisition.dispositions
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.source_record.stage
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.stages
+            - path: genesis.source_record.anchor
+              keys:
+              - source
+              - var
+            - path: genesis.source_record.anchor.var
+              pattern: var_name
+            - path: genesis.source_record.anchor.var
+              not_in:
+              - reserved_outputs
+              - resolver_outputs
+            - path: genesis.source_record.anchor.source
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.input_sources
+            - path: genesis.source_record.interface
+              keys:
+              - var
+            - path: genesis.source_record.interface.var
+              pattern: var_name
+            - path: genesis.source_record.interface.var
+              not_in:
+              - reserved_outputs
+              - resolver_outputs
+            - path: genesis.source_record.interface.var
+              distinct_from:
+              - genesis.source_record.anchor.var
+            - path: genesis.source_record.refusals
+              keys:
+              - builder
+              - forged
+              - input
+              - interface
+              - inventory
+              - output
+              - projection
+            - path: genesis.source_record.output
+              keys:
+              - marker
+              - mode
+              - record_rel
+            - path: genesis.source_record.output.record_rel
+              pattern: rel_segment
+            - path: genesis.source_record.output.mode
+              enum:
+              - '0600'
+            - path: genesis.source_record.output.marker
+              pattern: marker_word
+            - path: genesis.source_record.refusals
+              subject: keys
+              within:
+              - controller.bootstrap.genesis.source_record.texts
+            - path: genesis.source_record.texts
+              subject: keys
+              within:
+              - controller.bootstrap.genesis.source_record.refusals
+            - path: genesis.source_record.refusals
+              each: true
+              pattern: refusal_code
+            - path: genesis.source_record.refusals
+              values_distinct: true
+            - path: genesis.source_record.texts
+              each: true
+              pattern: text_line
+            - path: genesis.s1_result
+              keys:
+              - absent
+              - field_words
+              - fields
+              - flow
+              - output
+              - proposed_record_fields
+              - stage
+            - path: genesis.s1_result.stage
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.stages
+            - path: genesis.s1_result.flow
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.entry.selection.flows
+            - path: genesis.s1_result.output
+              keys:
+              - format
+              - mode
+              - record_rel
+              - serialise
+            - path: genesis.s1_result.output.record_rel
+              pattern: rel_segment
+            - path: genesis.s1_result.output.mode
+              enum:
+              - '0600'
+            - path: genesis.s1_result.output.format
+              enum:
+              - yaml
+            - path: genesis.s1_result.output.serialise
+              keys:
+              - indent
+              - sort_keys
+              - width
+            - path: genesis.s1_result.output.serialise.indent
+              positive_int: true
+            - path: genesis.s1_result.output.serialise.width
+              positive_int: true
+            - path: genesis.s1_result.output.serialise.sort_keys
+              enum:
+              - true
+            - path: genesis.s1_result.fields
+              keys:
+              - edition
+              - generation
+              - mirror
+              - proposed_record
+              - staged
+            - path: genesis.s1_result.fields
+              each: true
+              pattern: text_line
+            - path: genesis.s1_result.absent
+              keys:
+              - proposed_record_unchanged
+            - path: genesis.s1_result.absent.proposed_record_unchanged
+              enum:
+              - none
+            - path: genesis.s1_result.proposed_record_fields
+              keys:
+              - path
+              - sha256
+            - path: genesis.s1_result.proposed_record_fields
+              each: true
+              pattern: text_line
+            - path: genesis.s1_result.proposed_record_fields
+              values_distinct: true
+            - path: genesis.s1_result.field_words
+              keys:
+              - edition
+              - generation
+              - mirror
+              - proposed_record
+              - staged
+            - path: genesis.s1_result.field_words
+              each: true
+              pattern: text_line
+            - path: genesis.s1_result.field_words
+              values_distinct: true
+            - path: genesis.launch.step_record.files.retained.genesis_generate.rel
+              distinct_from:
+              - genesis.s1_result.output.record_rel
+            - at: contract_admission.early_names.rh_source_bootstrap.var
+              registry: true
+              not_in:
+              - reserved_outputs
+              - resolver_outputs
+            - at: contract_admission.early_names.rh_source_bootstrap.var
+              registry: true
+              distinct_from:
+              - genesis.launch.envelope.resolved_run
+              - genesis.source_record.anchor.var
+              - genesis.source_record.interface.var
+              - genesis.initializer.root_input.var
+            - at: contract_admission.early_names.rh_x2_admission.var
+              registry: true
+              enum:
+              - rh_x2_admission
+            - at: contract_admission.early_names.rh_x2_admission.var
+              registry: true
+              not_in:
+              - reserved_outputs
+              - resolver_outputs
+            - at: contract_admission.early_names
+              registry: true
+              keys:
+              - _rh_sa_decl
+              - _rh_sa_idt
+              - _rh_sa_reg
+              - _rh_sa_regadm
+              - _rh_sa_rref
+              - rh_invocation_requirement
+              - rh_rp_caller
+              - rh_rp_input
+              - rh_rp_phase
+              - rh_source_bootstrap
+              - rh_x2_admission
+            - at: contract_admission.early_names.rh_invocation_requirement.var
+              registry: true
+              enum:
+              - rh_invocation_requirement
+            - at: contract_admission.early_names.*
+              registry: true
+              keys:
+              - var
+            - at: contract_admission.early_names.*.var
+              registry: true
+              pattern: var_name
+            - at: contract_admission.early_names._rh_sa_decl.var
+              registry: true
+              enum:
+              - _rh_sa_decl
+            - at: contract_admission.early_names._rh_sa_idt.var
+              registry: true
+              enum:
+              - _rh_sa_idt
+            - at: contract_admission.early_names._rh_sa_reg.var
+              registry: true
+              enum:
+              - _rh_sa_reg
+            - at: contract_admission.early_names._rh_sa_regadm.var
+              registry: true
+              enum:
+              - _rh_sa_regadm
+            - at: contract_admission.early_names._rh_sa_rref.var
+              registry: true
+              enum:
+              - _rh_sa_rref
+            - at: contract_admission.early_names.rh_rp_caller.var
+              registry: true
+              enum:
+              - rh_rp_caller
+            - at: contract_admission.early_names.rh_rp_input.var
+              registry: true
+              enum:
+              - rh_rp_input
+            - at: contract_admission.early_names.rh_rp_phase.var
+              registry: true
+              enum:
+              - rh_rp_phase
+            - at: contract_admission.early_names.rh_source_bootstrap.var
+              registry: true
+              enum:
+              - rh_source_bootstrap
+            - path: genesis.initializer
+              keys:
+              - admission
+              - custody
+              - dispatch
+              - playbook_rel
+              - refusals
+              - root_input
+              - stage
+              - texts
+            - path: genesis.initializer.playbook_rel
+              pattern: rel_path
+            - path: genesis.initializer.playbook_rel
+              distinct_from:
+              - genesis.entry.producer.generated_rel
+              - genesis.entry.generated_rel
+              - genesis.initializer.custody.entry_rel
+            - path: genesis.initializer.stage
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.builder.authoring.initializer
+            - path: genesis.initializer.stage
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.stages
+            - path: genesis.initializer.stage
+              distinct_from:
+              - genesis.source_record.stage
+            - path: genesis.initializer.dispatch
+              keys:
+              - evidence
+              - flow
+              - inputs
+              - role
+            - path: genesis.initializer.dispatch.role
+              enum:
+              - dispatcher
+            - path: genesis.initializer.dispatch.flow
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.entry.selection.flows
+            - path: genesis.initializer.dispatch.flow
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.entry.selection.plans
+            - path: genesis.s1_result.flow
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.initializer.dispatch.flow
+            - path: genesis.initializer.dispatch.inputs
+              keys:
+              - rh_entry_operation
+            - path: genesis.initializer.dispatch.inputs
+              subject: keys
+              within:
+              - controller.bootstrap.genesis.launch.operator_inputs
+            - path: genesis.initializer.dispatch.inputs.rh_entry_operation
+              subject: scalar
+              within:
+              - controller.entry_generation.operation.modes
+            - path: genesis.initializer.dispatch.inputs.rh_entry_operation
+              enum:
+              - package
+            - path: genesis.initializer.dispatch.evidence
+              keys:
+              - generation
+              - publication
+              - source_record
+              - step_record
+            - path: genesis.initializer.dispatch.evidence.step_record
+              keys:
+              - sub
+            - path: genesis.initializer.dispatch.evidence.step_record.sub
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.step_record.emit.evidence_sub
+            - path: genesis.initializer.dispatch.evidence.source_record
+              keys:
+              - sub
+            - path: genesis.initializer.dispatch.evidence.source_record.sub
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.stage_root.sub
+            - path: genesis.initializer.dispatch.evidence.publication
+              keys:
+              - stage
+            - path: genesis.initializer.dispatch.evidence.publication.stage
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.stages
+            - path: genesis.initializer.dispatch.evidence.publication.stage
+              distinct_from:
+              - genesis.initializer.stage
+            - path: genesis.initializer.dispatch.evidence.generation
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.dispatch.evidence.generation
+              subject: list
+              within:
+              - controller.bootstrap.genesis.launch.step_record.emit.keys
+              - controller.bootstrap.genesis.launch.step_record.emit.keys.builder
+            - path: genesis.initializer.root_input
+              keys:
+              - cold_forms
+              - cold_only
+              - keys
+              - override_keys
+              - override_state
+              - phase
+              - runtime
+              - source
+              - var
+            - path: genesis.initializer.root_input.override_state
+              subject: keys
+              within:
+              - controller.bootstrap.source_admission.carrier_state_schema.node_fields
+            - path: source_admission.carrier_state_schema.node_fields
+              subject: list
+              within:
+              - controller.bootstrap.genesis.initializer.root_input.override_state
+            - path: genesis.initializer.root_input.override_state.key
+              pattern: var_name
+            - path: genesis.initializer.root_input.override_state.words
+              subject: keys
+              within:
+              - controller.bootstrap.source_admission.carrier_state_schema.states
+            - path: source_admission.carrier_state_schema.states
+              subject: list
+              within:
+              - controller.bootstrap.genesis.initializer.root_input.override_state.words
+            - path: genesis.initializer.root_input.override_state.words
+              each: true
+              pattern: var_name
+            - path: genesis.initializer.root_input.override_state.words
+              values_distinct: true
+            - path: genesis.initializer.root_input.override_state.fields
+              subject: keys
+              within:
+              - controller.bootstrap.source_admission.carrier_state_schema.states
+            - path: source_admission.carrier_state_schema.states
+              subject: list
+              within:
+              - controller.bootstrap.genesis.initializer.root_input.override_state.fields
+            - path: genesis.initializer.root_input.override_state.fields.absent
+              equals_registry_set:
+                path: contract_admission.carrier_state.node.fields.absent
+                projection: members
+            - path: genesis.initializer.root_input.override_state.fields.present
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.root_input.override_state.fields.present
+              subject: list
+              within:
+              - controller.bootstrap.genesis.initializer.root_input.override_keys
+            - path: genesis.initializer.root_input.override_keys
+              subject: list
+              within:
+              - controller.bootstrap.genesis.initializer.root_input.override_state.fields.present
+            - path: genesis.initializer.root_input.var
+              pattern: var_name
+            - path: genesis.initializer.root_input.var
+              not_in:
+              - reserved_outputs
+              - resolver_outputs
+            - path: genesis.initializer.root_input.var
+              distinct_from:
+              - genesis.source_record.anchor.var
+              - genesis.source_record.interface.var
+            - path: genesis.initializer.root_input.source
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.input_sources
+            - path: genesis.initializer.root_input.source
+              distinct_from:
+              - genesis.source_record.anchor.source
+            - path: genesis.initializer.root_input.keys
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.root_input.override_keys
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.root_input.override_keys
+              subject: list
+              not_within:
+              - controller.bootstrap.genesis.initializer.root_input.keys
+            - path: genesis.initializer.root_input.phase
+              subject: scalar
+              within:
+              - controller.bootstrap.source_admission.resolve_phases.words
+            - path: genesis.initializer.root_input.runtime
+              subject: keys
+              within:
+              - controller.bootstrap.genesis.initializer.root_input.keys
+            - path: genesis.initializer.root_input.runtime
+              subject: keys
+              not_within:
+              - controller.bootstrap.source_admission.bootstrap_input.record_keys
+            - path: genesis.initializer.root_input.runtime
+              each: true
+              pattern: var_name
+            - path: genesis.initializer.root_input.cold_only
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.root_input.cold_only
+              each: true
+              pattern: var_name
+            - path: genesis.initializer.root_input.cold_only
+              disjoint_from:
+              - genesis.initializer.root_input.keys
+              - genesis.initializer.root_input.override_keys
+              - source_admission.bootstrap_input.record_keys
+            - path: genesis.initializer.root_input.cold_forms
+              subject: keys
+              within:
+              - controller.bootstrap.genesis.initializer.root_input.cold_only
+            - path: genesis.initializer.root_input.cold_forms
+              keys:
+              - inventory
+            - path: genesis.initializer.root_input.cold_forms.inventory
+              keys:
+              - fields
+              - form
+              - inventory_kind
+              - runtime
+            - path: genesis.initializer.root_input.cold_forms.inventory.form
+              enum:
+              - ordered_records
+            - path: genesis.initializer.root_input.cold_forms.inventory.runtime
+              pattern: var_name
+            - path: genesis.initializer.root_input.cold_forms.inventory.inventory_kind
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.inventory_kinds
+            - path: genesis.initializer.root_input.cold_forms.inventory.inventory_kind
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.initializer.custody.launch.inventory_kind
+            - path: genesis.initializer.custody.launch.flow
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.entry.selection.flows
+            - path: genesis.initializer.root_input.cold_forms.inventory.fields
+              enum:
+              - - role
+                - path
+                - sha256
+            - path: genesis.initializer.root_input.cold_forms.inventory.fields
+              subject: list
+              within:
+              - controller.bootstrap.genesis.launch.step_record.emit.keys.config.inventory
+            - path: genesis.initializer.admission
+              keys:
+              - var
+            - path: genesis.initializer.admission.var
+              pattern: var_name
+            - path: genesis.initializer.admission.var
+              distinct_from:
+              - genesis.initializer.root_input.var
+              - genesis.source_record.anchor.var
+              - genesis.source_record.interface.var
+              - genesis.initializer.custody.admission.var
+            - path: genesis.initializer.refusals
+              subject: keys
+              within:
+              - controller.bootstrap.genesis.initializer.texts
+            - path: genesis.initializer.texts
+              subject: keys
+              within:
+              - controller.bootstrap.genesis.initializer.refusals
+            - path: genesis.initializer.refusals
+              each: true
+              pattern: refusal_code
+            - path: genesis.initializer.refusals
+              values_distinct: true
+            - path: genesis.initializer.texts
+              each: true
+              pattern: text_line
+            - path: genesis.initializer.custody
+              has_keys:
+              - admission
+              - builders
+              - override_input_roles
+              - override_inputs
+              - producers
+              - record_free_launches
+              - retain_impl
+              - sed_words
+              - tool_argv
+              - tools
+            - path: genesis.initializer.custody.admission
+              keys:
+              - var
+            - path: genesis.initializer.custody.admission.var
+              pattern: var_name
+            - path: genesis.initializer.custody.override_inputs
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.custody.override_inputs
+              each: true
+              pattern: var_name
+            - path: genesis.initializer.custody.override_input_roles
+              keys:
+              - path
+              - sha256
+            - path: genesis.initializer.custody.override_input_roles
+              values_distinct: true
+            - path: genesis.initializer.custody.override_input_roles.*
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.initializer.custody.override_inputs
+            - path: genesis.initializer.custody.override_inputs
+              subject: list
+              within:
+              - controller.bootstrap.genesis.initializer.custody.override_input_roles.*
+            - path: genesis.initializer.custody.sed_words
+              keys:
+              - print
+              - step
+            - path: genesis.initializer.custody.retain_impl
+              keys:
+              - fixed
+              - params
+            - path: genesis.initializer.custody.retain_impl.params
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.custody.producers
+              keys:
+              - external_invocation
+              - genesis_entry
+              - release_artifact
+              - release_preparation
+            - path: genesis.initializer.custody.producers.external_invocation
+              enum:
+              - external_invocation
+            - path: genesis.initializer.custody.producers.genesis_entry
+              enum:
+              - genesis_entry
+            - path: genesis.initializer.custody.producers.release_artifact
+              enum:
+              - release_artifact
+            - path: genesis.initializer.custody.producers.release_preparation
+              enum:
+              - release_preparation
+            - path: genesis.initializer.custody.builders
+              keys:
+              - authoring
+            - path: genesis.initializer.custody.builders.authoring
+              enum:
+              - authoring
+            - path: genesis.initializer.custody.record_free_launches
+              key_pattern: rel_path
+            - path: genesis.initializer.custody.record_free_launches
+              subject: keys
+              within:
+              - controller.bootstrap.source_admission.resolve_phases.callers
+            - path: genesis.initializer.custody.record_free_launches.*
+              keys:
+              - admission
+              - builder
+              - inputs
+              - producer
+              - purpose
+              - purpose_class
+              - transport
+            - path: genesis.initializer.custody.record_free_launches.*.purpose_class
+              enum:
+              - stages
+              - releases
+              - initializer
+            - path: genesis.initializer.custody.record_free_launches.*.transport
+              enum:
+              - cold
+            - path: genesis.initializer.custody.record_free_launches.*.transport
+              subject: scalar
+              within:
+              - controller.bootstrap.source_admission.launch_transports.genesis
+            - path: genesis.initializer.custody.record_free_launches.*.admission
+              pattern: var_name
+            - path: genesis.initializer.custody.record_free_launches.*.admission
+              subject: scalar
+              within:
+              - controller.bootstrap.source_admission.resolve_phases.record_free_admissions
+            - path: genesis.initializer.custody.record_free_launches.*.purpose
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.builder.authoring.stages
+              - controller.bootstrap.genesis.builder.authoring.releases
+              - controller.bootstrap.genesis.builder.authoring.initializer
+            - path: genesis.initializer.custody.record_free_launches.*.producer
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.initializer.custody.producers
+            - path: genesis.initializer.custody.record_free_launches.*.builder
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.initializer.custody.builders
+            - path: genesis.initializer.custody.record_free_launches.*.inputs
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.custody.record_free_launches.*.inputs
+              each: true
+              pattern: var_name
+            - path: genesis.initializer.custody.tools
+              each: true
+              subject: scalar
+              within:
+              - controller.bootstrap.os_tools
+            - path: genesis.initializer.custody.tools
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.custody.tool_argv
+              key_pattern: var_name
+            - path: genesis.initializer.custody.tool_argv
+              has_keys:
+              - rename
+            - path: genesis.initializer.custody.tool_argv.rename
+              strings:
+                nonempty: true
+            - path: genesis.initializer.custody.acceptance
+              keys:
+              - purpose
+              - input
+              - owned
+              - deletions_rel
+              - rel_regex
+              - digest_regex
+              - new_file_mode
+              - attempt
+              - commit
+              - ref
+              - serial
+              - receipt
+              - blob_digest
+              - refusals
+              - texts
+              - running_uid
+            - path: genesis.initializer.custody.acceptance.running_uid
+              keys:
+              - argv_from
+              - regex_from
+              - var
+            - path: genesis.initializer.custody.acceptance.running_uid.var
+              enum:
+              - _rh_acc_uid
+            - path: genesis.initializer.custody.acceptance.running_uid.argv_from
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.initializer.custody.tool_argv
+            - path: genesis.initializer.custody.acceptance.running_uid.regex_from
+              enum:
+              - controller.entry_generation.uid_regex
+            - at: controller.entry_generation.uid_regex
+              ere: anchored
+            - at: controller.entry_generation.uid_regex
+              enum:
+              - ^[0-9]+$
+            - at: controller.bootstrap.path_admission.ancestry.uid_regex
+              enum:
+              - ^[0-9]+$
+            - path: genesis.initializer.custody.acceptance.purpose
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.builder.authoring.stages
+            - path: genesis.initializer.custody.acceptance.purpose
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.stages
+            - path: genesis.initializer.custody.acceptance.rel_regex
+              equals_registry:
+                path: contract_admission.patterns.rel_path.pattern
+            - path: genesis.initializer.custody.acceptance.digest_regex
+              equals_registry:
+                path: contract_admission.patterns.sha256_hex
+            - path: genesis.initializer.custody.acceptance.new_file_mode
+              subject: scalar
+              within:
+              - controller.bootstrap.source_admission.git.blob.modes
+            - path: genesis.initializer.custody.acceptance.ref.absent_value
+              matches_ere: source_admission.git.edition_regex
+            - path: genesis.initializer.custody.acceptance.ref.expect
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.initializer.custody.acceptance.ref.expect_words
+            - path: genesis.initializer.custody.acceptance.input
+              keys:
+              - from
+            - path: genesis.initializer.custody.acceptance.input.from
+              enum:
+              - s1_result
+            - path: genesis.initializer.custody.acceptance.receipt.var
+              pattern: var_name
+            - path: genesis.initializer.custody.acceptance.receipt.fields
+              enum:
+              - - owned
+                - edition
+                - staged
+                - commit
+                - tree
+                - blobs
+                - w1_blob
+                - ref
+                - deletions
+                - publication
+                - observed_at
+            - path: genesis.initializer.custody.acceptance.receipt.fields
+              each: true
+              pattern: var_name
+            - path: genesis.initializer.custody.acceptance.receipt.identity_fields
+              enum:
+              - - owned
+                - edition
+                - staged
+                - commit
+                - tree
+                - blobs
+                - w1_blob
+                - ref
+                - deletions
+            - path: genesis.initializer.custody.acceptance.receipt.words
+              keys:
+              - published
+              - recovered
+            - path: genesis.initializer.custody.acceptance.receipt.words
+              values_distinct: true
+            - path: genesis.initializer.custody.acceptance.receipt.root_sub
+              subject: scalar
+              within:
+              - controller.bootstrap.work_roots.sub_roots
+            - path: genesis.initializer.custody.acceptance.attempt.root_sub
+              subject: scalar
+              within:
+              - controller.bootstrap.work_roots.sub_roots
+            - path: work_roots.sub_roots
+              values_distinct: true
+            - path: genesis.initializer.custody.acceptance.receipt.file_suffix
+              distinct_from:
+              - genesis.initializer.custody.acceptance.attempt.index_suffix
+              - genesis.initializer.custody.acceptance.attempt.capture_suffix
+            - path: genesis.initializer.custody.acceptance.attempt.capture_suffix
+              distinct_from:
+              - genesis.initializer.custody.acceptance.attempt.index_suffix
+            - path: genesis.initializer.custody.acceptance.receipt.observation_suffix
+              pattern: dot_suffix
+            - path: genesis.initializer.custody.acceptance.receipt.file_suffix
+              pattern: dot_suffix
+            - path: genesis.initializer.custody.acceptance.attempt.capture_suffix
+              pattern: dot_suffix
+            - path: genesis.initializer.custody.acceptance.attempt.index_suffix
+              pattern: dot_suffix
+            - path: genesis.initializer.custody.acceptance.receipt.file_mode
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.step_record.files.retained.*.mode
+            - path: genesis.initializer.custody.acceptance.attempt.capture_mode
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.launch.step_record.files.retained.*.mode
+            - path: genesis.initializer.custody.acceptance.refusals
+              keys:
+              - attempt
+              - blob
+              - conflict
+              - delta
+              - input
+              - metadata
+              - mirror
+              - owned
+              - prior_receipt
+              - purpose
+              - readback
+              - ref
+              - s1_parse
+              - tool
+            - path: genesis.initializer.custody.acceptance.refusals
+              each: true
+              pattern: refusal_code
+            - path: genesis.initializer.custody.acceptance.refusals
+              values_distinct: true
+            - path: genesis.initializer.custody.acceptance.texts
+              keys:
+              - attempt
+              - blob
+              - conflict
+              - delta
+              - input
+              - metadata
+              - mirror
+              - owned
+              - prior_receipt
+              - purpose
+              - readback
+              - ref
+              - s1_parse
+              - tool
+            - path: genesis.initializer.custody.acceptance.texts
+              each: true
+              pattern: text_line
+            - path: genesis.initializer.custody.acceptance.commit.identity_pairs
+              keys:
+              - GIT_AUTHOR_EMAIL
+              - GIT_AUTHOR_NAME
+              - GIT_COMMITTER_EMAIL
+              - GIT_COMMITTER_NAME
+            - path: genesis.initializer.custody.acceptance.commit.identity_pairs
+              key_pattern: env_name
+            - path: genesis.initializer.custody.acceptance.commit.identity_pairs
+              each: true
+              pattern: text_line
+            - path: genesis.initializer.custody.acceptance.commit.date_regex
+              ere: anchored
+            - at: controller.bootstrap.genesis.initializer.custody.acceptance.commit
+              keys:
+              - date_regex
+              - identity_names
+              - identity_pair_regex
+              - identity_pairs
+              - message
+              - message_regex
+            - path: genesis.initializer.custody.acceptance.commit.identity_pair_regex
+              ere: anchored
+            - path: genesis.initializer.custody.acceptance.commit.identity_names
+              strings:
+                nonempty: true
+                distinct: true
+            - path: genesis.initializer.custody.acceptance.commit.identity_names
+              each: true
+              pattern: env_name
+            - path: genesis.initializer.custody.acceptance.commit.message_regex
+              ere: anchored
+            - path: genesis.initializer.custody.acceptance.ref.name_regex
+              ere: anchored
+            - path: genesis.initializer.custody.acceptance.commit.message
+              matches_ere: genesis.initializer.custody.acceptance.commit.message_regex
+            - path: genesis.initializer.custody.acceptance.ref.name
+              matches_ere: genesis.initializer.custody.acceptance.ref.name_regex
+            - path: genesis.initializer.custody.acceptance.owned
+              keys:
+              - records_never
+              - records_node
+              - records_staged
+              - records_when_prior
+              - roster_key
+              - roster_output_index
+              - view
+            - path: genesis.initializer.custody.acceptance.owned.records_staged
+              disjoint_from:
+              - genesis.initializer.custody.acceptance.owned.records_when_prior
+              - genesis.initializer.custody.acceptance.owned.records_never
+            - path: genesis.initializer.custody.acceptance.owned.records_when_prior
+              disjoint_from:
+              - genesis.initializer.custody.acceptance.owned.records_never
+            - path: genesis.initializer.custody.acceptance.serial
+              keys:
+              - checkout_equality
+              - consumption_kind
+              - edition_equality
+              - verdict
+            - path: genesis.initializer.custody.acceptance.serial.edition_equality.stage_input
+              subject: scalar
+              within:
+              - controller.bootstrap.genesis.s1_result.field_words
+            - at: controller.bootstrap.genesis.initializer.custody.acceptance.blob_digest
+              keys:
+              - blob_suffix
+              - capture_script
+              - digest_args
+              - digest_tool
+              - line_regex
+              - shell_tool
+            - path: genesis.initializer.custody.acceptance.blob_digest.digest_tool
+              subject: scalar
+              within:
+              - controller.bootstrap.os_tools
+            - path: genesis.initializer.custody.acceptance.blob_digest.shell_tool
+              subject: scalar
+              within:
+              - controller.bootstrap.os_tools
+            - path: genesis.initializer.custody.acceptance.blob_digest.line_regex
+              ere: anchored
+            - path: genesis.acquisition.execution
+              enum:
+              - fields:
+                  schema: schema
+                  revision: revision
+                  act: act
+                  observed_at_utc: observed_at_utc
+                  store: store
+                  store_empty_before: store_empty_before
+                  store_entries_before: store_entries_before
+                  store_foreign_entries: store_foreign_entries
+                  profile_sha256: profile_sha256
+                  lock_sha256: lock_sha256
+                  builder_uid: builder_uid
+                  rows: rows
+                  cold_qualified: cold_qualified
+                  recipes: recipes
+                  file: file
+                  url: url
+                  sha256: sha256
+                  max_bytes: max_bytes
+                  disposition: disposition
+                  binding: binding
+                  controller: controller
+                  text: text
+                  packages: packages
+                  collections: collections
+                receipt_fields:
+                - schema
+                - revision
+                - act
+                - observed_at_utc
+                - store
+                - store_empty_before
+                - store_entries_before
+                - store_foreign_entries
+                - profile_sha256
+                - lock_sha256
+                - builder_uid
+                - rows
+                - cold_qualified
+                - recipes
+                row_fields:
+                - file
+                - url
+                - sha256
+                - max_bytes
+                - disposition
+                - recipes
+                identity_fields:
+                - schema
+                - revision
+                - act
+                - store
+                - profile_sha256
+                - lock_sha256
+                - builder_uid
+                - recipes
+                artifact_fields:
+                - file
+                - url
+                - sha256
+                - max_bytes
+                recipe_fields:
+                - role
+                - leg
+                - class_key
+                - recipe_sha256
+                - lock_rel
+                - lock_sha256
+                mode: '0400'
+                timestamp_format: '%Y-%m-%dT%H:%M:%SZ'
+                yaml:
+                  explicit_start: true
+                  explicit_end: true
+                  width: 4096
+                  prefix: '---
+
+                    '
+                receipt_max_bytes: 1048576
+                lock_max_bytes: 1048576
+                file_pattern: ^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._+%-]*$
+                url_pattern: ^https://[^\s]+$
+                capture_tasks_rel: testing/remote_harness/tasks/capture_acquisition_lock.yml
+                receipt_tasks_rel: testing/remote_harness/tasks/verify_acquisition_receipt.yml
+                regex_match: fullmatch
+                checksum_separator: ':'
+                encoding: utf-8
+                case_sensitive: true
+            - path: genesis.acquisition.execution.case_sensitive
+              enum:
+              - true
+            - path: genesis.acquisition.execution.yaml.explicit_start
+              enum:
+              - true
+            - path: genesis.acquisition.execution.yaml.explicit_end
+              enum:
+              - true
+            - path: genesis.acquisition.execution.receipt_max_bytes
+              enum:
+              - 1048576
+            - path: genesis.acquisition.execution.lock_max_bytes
+              enum:
+              - 1048576
+            - path: genesis.acquisition.execution.yaml.width
+              enum:
+              - 4096
         genesis_entry:
           root: controller.bootstrap
           when_present: controller.bootstrap.genesis.launch
@@ -7391,6 +8397,8 @@ lme_config_registry:
           - path: policy_scalar_paths
             includes:
             - controller.bootstrap.work_roots.run_local.execution_context.var
+            - controller.bootstrap.work_roots.run_local.execution_context.validation.output_fact
+            - controller.bootstrap.work_roots.run_local.execution_context.validation.serialized_output_fact
           - path: preservation
             enum:
             - retain_existing_companions_and_envelope_derivation
@@ -7412,6 +8420,10 @@ lme_config_registry:
           - path: policy_glob_paths
             includes:
             - controller.bootstrap.work_roots.run_local.caller_vars.reserved_name_globs
+          - path: policy_root_prefix
+            enum:
+            - - controller
+              - bootstrap
         run_local_execution_context:
           root: controller.bootstrap.work_roots.run_local.execution_context
           checks:
@@ -8338,14 +9350,11 @@ lme_config_registry:
             - fields
             - payload
             - context
-            - ingress
           - path: validation.tasks.fields
             pattern: rel_path
           - path: validation.tasks.payload
             pattern: rel_path
           - path: validation.tasks.context
-            pattern: rel_path
-          - path: validation.tasks.ingress
             pattern: rel_path
           - path: validation.relocation
             enum:
@@ -8390,6 +9399,7 @@ lme_config_registry:
             - sequence
             - none
             - equal
+            - template
           - path: validation.jinja.select
             enum:
             - select
@@ -8429,6 +9439,9 @@ lme_config_registry:
           - path: validation.jinja.equal
             enum:
             - equalto
+          - path: validation.jinja.template
+            enum:
+            - ansible.builtin.template
           - path: validation.structural
             keys:
             - zero
@@ -8499,88 +9512,1241 @@ lme_config_registry:
             - fw_source_root
           - path: transport
             keys:
-            - task
-            - validator
-            - option
-            - request_fields
-            - protected_order
-            - downstream
-          - path: transport.task
+            - namespace
+            - seed
+            - paths
+            - names
+            - allocation_record
+            - tools
+            - structural
+            - jinja
+            - find
+            - diagnostics
+            - extra_vars
+            - workroot
+          - path: transport.namespace
             enum:
-            - testing/remote_harness/tasks/transport_execution_context.yml
-          - path: transport.validator
-            enum:
-            - testing/remote_harness/tasks/admit_execution_context.yml
-          - path: transport.option
-            enum:
-            - --execution-context-json
-          - path: transport.request_fields
-            enum:
-            - - mode
-              - context
-          - path: transport.protected_order
+            - rh_fw_transport
+          - path: transport.seed
             keys:
-            - run_local
-            - run
-            - caller_words_after_protected_context
-            - source_record_and_resolved_run_relative_order
-            - direct_context_extra_var
-            - at_file_input
-            - duplicate_typed_option
-            - budget_reexecution
-          - path: transport.protected_order.run_local
-            enum:
-            - - admitted_caller_arguments
-              - work_root_and_pinned_variables
-              - source_record_and_entry_verification
-              - execution_context
-              - resolved_run
-          - path: transport.protected_order.run
-            enum:
-            - - admitted_caller_arguments
-              - source_record_and_entry_verification
-              - execution_context
-              - run_pins
-          - path: transport.protected_order.caller_words_after_protected_context
-            enum:
-            - refused
-          - path: transport.protected_order.source_record_and_resolved_run_relative_order
-            enum:
-            - preserved
-          - path: transport.protected_order.direct_context_extra_var
-            enum:
-            - refused
-          - path: transport.protected_order.at_file_input
-            enum:
-            - refused
-          - path: transport.protected_order.duplicate_typed_option
-            enum:
-            - refused
-          - path: transport.protected_order.budget_reexecution
-            enum:
-            - preserve_exact_typed_request_separately_from_ansible_arguments
-          - path: transport.downstream
+            - parser
+            - shell
+            - runtime
+          - path: transport.seed.parser
             keys:
-            - flag_from
-            - flag_index
-            - json_key_from
-            - json_value_from
-            - metadata
-          - path: transport.downstream.flag_from
+            - request
+            - seen
+            - option_arity
+            - empty
+            - present
+            - modes
+            - mode_join
+            - option_mode_refusal
+            - option_value_refusal
+            - option_duplicate_refusal
+            - option_mode_text
+            - option_value_text
+            - option_duplicate_text
+          - path: transport.seed.parser.request
+            pattern: var_name
+          - path: transport.seed.parser.seen
+            pattern: var_name
+          - path: transport.seed.parser.option_arity
             enum:
-            - controller.bootstrap.work_roots.run_local.arg_flags
-          - path: transport.downstream.flag_index
+            - 2
+          - path: transport.seed.parser.empty
+            enum:
+            - ''
+          - path: transport.seed.parser.present
+            enum:
+            - '1'
+          - path: transport.seed.parser.modes
+            enum:
+            - - run
+              - run-local
+          - path: transport.seed.parser.mode_join
+            enum:
+            - '|'
+          - path: transport.seed.parser.option_mode_refusal
+            enum:
+            - FW09-SEED-CONTEXT-MODE
+          - path: transport.seed.parser.option_value_refusal
+            enum:
+            - FW09-SEED-CONTEXT-VALUE
+          - path: transport.seed.parser.option_duplicate_refusal
+            enum:
+            - FW09-SEED-CONTEXT-DUPLICATE
+          - path: transport.seed.parser.option_mode_text
+            enum:
+            - execution context is admitted only for a declared consumer launch
+          - path: transport.seed.parser.option_value_text
+            enum:
+            - typed execution context needs exactly one JSON argument
+          - path: transport.seed.parser.option_duplicate_text
+            enum:
+            - typed execution context may be supplied only once
+          - path: transport.seed.shell
+            keys:
+            - word_join
+            - quote_filter
+            - empty_word
+            - printf_builtin
+            - text_format
+            - line_format
+            - path_separator
+            - extra_var_flag
+            - option_separator
+            - readonly_umask
+            - success
+            - refused
+            - none
+          - path: transport.seed.shell.word_join
+            enum:
+            - ' '
+          - path: transport.seed.shell.quote_filter
+            enum:
+            - quote
+          - path: transport.seed.shell.empty_word
+            enum:
+            - ''''''
+          - path: transport.seed.shell.printf_builtin
+            enum:
+            - printf
+          - path: transport.seed.shell.text_format
+            enum:
+            - '%s'
+          - path: transport.seed.shell.line_format
+            enum:
+            - '%s\n'
+          - path: transport.seed.shell.path_separator
+            enum:
+            - /
+          - path: transport.seed.shell.extra_var_flag
+            pattern: text_line
+          - path: transport.seed.shell.option_separator
+            enum:
+            - --
+          - path: transport.seed.shell.readonly_umask
+            enum:
+            - '0377'
+          - path: transport.seed.shell.success
             enum:
             - 0
-          - path: transport.downstream.json_key_from
+          - path: transport.seed.shell.refused
             enum:
-            - var
-          - path: transport.downstream.json_value_from
+            - 1
+          - path: transport.seed.shell.none
             enum:
-            - admitted_context
-          - path: transport.downstream.metadata
+            - ''
+          - path: transport.seed.runtime
+            keys:
+            - caller_argc
+            - stage_dir
+            - request_path
+            - serialized_path
+            - serialized
+            - stage_input
+            - stage_subdir
+            - request_basename
+            - output_basename
+            - playbook_rel
+            - input_var
+            - input_fields
+            - input_format
+            - refuse_code
+            - refuse_text
+            - field_separator
+            - stage_mode
+            - file_mode
+            - tools
+            - stat_args
+            - stat_join
+            - file_permissions
+            - file_links
+          - path: transport.seed.runtime.caller_argc
+            pattern: var_name
+          - path: transport.seed.runtime.stage_dir
+            pattern: var_name
+          - path: transport.seed.runtime.request_path
+            pattern: var_name
+          - path: transport.seed.runtime.serialized_path
+            pattern: var_name
+          - path: transport.seed.runtime.serialized
+            pattern: var_name
+          - path: transport.seed.runtime.stage_input
+            pattern: var_name
+          - path: transport.seed.runtime.stage_subdir
+            pattern: rel_segment
+          - path: transport.seed.runtime.request_basename
+            pattern: rel_segment
+          - path: transport.seed.runtime.output_basename
+            pattern: rel_segment
+          - path: transport.seed.runtime.playbook_rel
+            pattern: rel_path
+          - path: transport.seed.runtime.input_var
             enum:
-            - not_forwarded
+            - rh_fw_seed_input
+          - path: transport.seed.runtime.input_fields
+            keys:
+            - request
+            - stage
+            - selected
+          - path: transport.seed.runtime.input_fields.request
+            enum:
+            - request_path
+          - path: transport.seed.runtime.input_fields.stage
+            enum:
+            - stage_directory
+          - path: transport.seed.runtime.input_fields.selected
+            enum:
+            - selected_playbook
+          - path: transport.seed.runtime.input_format
+            enum:
+            - '{"%s":{"%s":"%s","%s":"%s","%s":"%s"}}'
+          - path: transport.seed.runtime.refuse_code
+            enum:
+            - FW09-SEED-TRANSPORT
+          - path: transport.seed.runtime.refuse_text
+            enum:
+            - execution context transport admission failed before the dependent launch
+          - path: transport.seed.runtime.field_separator
+            enum:
+            - .
+          - path: transport.seed.runtime.stage_mode
+            enum:
+            - '0700'
+          - path: transport.seed.runtime.file_mode
+            enum:
+            - '0400'
+          - path: transport.seed.runtime.tools
+            keys:
+            - mkdir
+            - cat
+            - stat
+          - path: transport.seed.runtime.tools.mkdir
+            enum:
+            - mkdir
+          - path: transport.seed.runtime.tools.cat
+            enum:
+            - cat
+          - path: transport.seed.runtime.tools.stat
+            enum:
+            - stat
+          - path: transport.seed.runtime.stat_args
+            enum:
+            - - -c
+              - '%u %a %h'
+              - --
+          - path: transport.seed.runtime.stat_join
+            enum:
+            - ' '
+          - path: transport.seed.runtime.file_permissions
+            enum:
+            - '400'
+          - path: transport.seed.runtime.file_links
+            enum:
+            - '1'
+          - path: transport.paths
+            keys:
+            - allocator_root_basename
+            - context_record_basename
+            - allocation_read_task
+            - allocation_record_task
+            - publication_task_from_repository
+            - protected_context_basename
+            - admitted_context_basename
+          - path: transport.paths.allocator_root_basename
+            pattern: rel_segment
+          - path: transport.paths.context_record_basename
+            pattern: rel_segment
+          - path: transport.paths.allocation_read_task
+            pattern: rel_path
+          - path: transport.paths.allocation_record_task
+            pattern: rel_path
+          - path: transport.paths.publication_task_from_repository
+            pattern: rel_path
+          - path: transport.paths.protected_context_basename
+            pattern: rel_segment
+          - path: transport.paths.admitted_context_basename
+            pattern: rel_segment
+          - path: transport.names
+            keys:
+            - expected_cell
+            - expected_lineage
+            - admitted_record
+            - admitted_record_sha256
+            - observed_dimensions
+            - allocation_state
+          - path: transport.names.expected_cell
+            enum:
+            - fw_expected_cell
+          - path: transport.names.expected_lineage
+            enum:
+            - fw_expected_lineage
+          - path: transport.names.admitted_record
+            enum:
+            - fw_admitted_record
+          - path: transport.names.admitted_record_sha256
+            enum:
+            - fw_admitted_record_sha256
+          - path: transport.names.observed_dimensions
+            enum:
+            - fw_observed_dimensions
+          - path: transport.names.allocation_state
+            pattern: var_name
+          - path: transport.allocation_record
+            keys:
+            - schema
+            - fields
+            - f
+            - binding_fields
+            - b
+            - state_fields
+            - mode
+            - dirname_pattern
+            - refused_names
+          - path: transport.allocation_record.schema
+            enum:
+            - lme-execution-allocation/1
+          - path: transport.allocation_record.fields
+            enum:
+            - - schema
+              - context
+              - binding
+          - path: transport.allocation_record.f
+            keys:
+            - schema
+            - context
+            - binding
+          - path: transport.allocation_record.f.schema
+            enum:
+            - schema
+          - path: transport.allocation_record.f.context
+            enum:
+            - context
+          - path: transport.allocation_record.f.binding
+            enum:
+            - binding
+          - path: transport.allocation_record.binding_fields
+            enum:
+            - - cell
+              - dimensions
+              - configuration_sha256
+              - configuration_revision
+              - source_commit
+              - source_tree
+          - path: transport.allocation_record.b
+            keys:
+            - cell
+            - dimensions
+            - configuration_sha256
+            - configuration_revision
+            - source_commit
+            - source_tree
+          - path: transport.allocation_record.b.cell
+            enum:
+            - cell
+          - path: transport.allocation_record.b.dimensions
+            enum:
+            - dimensions
+          - path: transport.allocation_record.b.configuration_sha256
+            enum:
+            - configuration_sha256
+          - path: transport.allocation_record.b.configuration_revision
+            enum:
+            - configuration_revision
+          - path: transport.allocation_record.b.source_commit
+            enum:
+            - source_commit
+          - path: transport.allocation_record.b.source_tree
+            enum:
+            - source_tree
+          - path: transport.allocation_record.state_fields
+            keys:
+            - recorded
+            - recorded_binding
+            - used_identities
+          - path: transport.allocation_record.state_fields.recorded
+            pattern: var_name
+          - path: transport.allocation_record.state_fields.recorded_binding
+            pattern: var_name
+          - path: transport.allocation_record.state_fields.used_identities
+            pattern: var_name
+          - path: transport.allocation_record.mode
+            enum:
+            - '0400'
+          - path: transport.allocation_record.dirname_pattern
+            enum:
+            - ^[A-Za-z0-9._-]+$
+          - path: transport.allocation_record.refused_names
+            enum:
+            - - .
+              - ..
+          - path: transport.tools
+            keys:
+            - id_flags
+            - mkdir_flags
+            - realpath_flags
+          - path: transport.tools.id_flags
+            enum:
+            - - -u
+          - path: transport.tools.mkdir_flags
+            enum:
+            - - -m
+              - '0700'
+              - --
+          - path: transport.tools.realpath_flags
+            enum:
+            - - -e
+              - --
+          - path: transport.structural
+            keys:
+            - zero
+            - one
+            - empty_list
+            - empty_map
+            - empty_text
+            - absent
+            - accepted
+            - refused
+            - separator
+            - separator_dot
+          - path: transport.structural.zero
+            enum:
+            - 0
+          - path: transport.structural.one
+            enum:
+            - 1
+          - path: transport.structural.empty_list
+            enum:
+            - []
+          - path: transport.structural.empty_map
+            enum:
+            - {}
+          - path: transport.structural.empty_text
+            enum:
+            - ''
+          - path: transport.structural.absent
+            enum:
+            - null
+          - path: transport.structural.accepted
+            enum:
+            - true
+          - path: transport.structural.refused
+            enum:
+            - false
+          - path: transport.structural.separator
+            enum:
+            - /
+          - path: transport.structural.separator_dot
+            enum:
+            - .
+          - path: transport.jinja
+            keys:
+            - vars
+            - extract
+            - equal
+            - dirname
+            - basename
+            - stat
+            - directory
+            - template
+          - path: transport.jinja.vars
+            enum:
+            - ansible.builtin.vars
+          - path: transport.jinja.extract
+            enum:
+            - extract
+          - path: transport.jinja.equal
+            enum:
+            - equalto
+          - path: transport.jinja.dirname
+            enum:
+            - dirname
+          - path: transport.jinja.basename
+            enum:
+            - basename
+          - path: transport.jinja.stat
+            enum:
+            - stat
+          - path: transport.jinja.directory
+            enum:
+            - directory
+          - path: transport.jinja.template
+            enum:
+            - ansible.builtin.template
+          - path: transport.find
+            keys:
+            - file_type
+            - recurse
+            - hidden
+            - follow
+          - path: transport.find.file_type
+            enum:
+            - any
+          - path: transport.find.recurse
+            enum:
+            - false
+          - path: transport.find.hidden
+            enum:
+            - true
+          - path: transport.find.follow
+            enum:
+            - false
+          - path: transport.diagnostics
+            keys:
+            - allocator
+            - record
+            - incomplete
+            - binding
+            - locator
+            - stage
+            - protected
+          - path: transport.diagnostics.allocator
+            enum:
+            - FW09-ALLOCATOR-CUSTODY
+          - path: transport.diagnostics.record
+            enum:
+            - FW09-ALLOCATION-RECORD
+          - path: transport.diagnostics.incomplete
+            enum:
+            - FW09-INCOMPLETE-ALLOCATION
+          - path: transport.diagnostics.binding
+            enum:
+            - FW09-RECORDED-SOURCE-CONFIGURATION-CELL
+          - path: transport.diagnostics.locator
+            enum:
+            - FW09-INVOCATION-LOCATOR
+          - path: transport.diagnostics.stage
+            enum:
+            - FW09-SEED-TRANSPORT-STAGE
+          - path: transport.diagnostics.protected
+            enum:
+            - FW09-PROTECTED-NAME
+          - path: transport.extra_vars
+            keys:
+            - variables
+            - shell
+            - paths
+            - structural
+            - protocol
+            - diagnostics
+          - path: transport.extra_vars.variables
+            keys:
+            - directory
+            - evidence
+            - values
+            - act
+            - index
+            - ordinal
+            - pair
+            - value
+            - input
+            - pin
+            - inventory
+            - argc
+            - snapshot
+            - digest
+            - expected
+            - observed
+            - expected_stat
+            - cwd
+          - path: transport.extra_vars.variables.directory
+            pattern: var_name
+          - path: transport.extra_vars.variables.evidence
+            pattern: var_name
+          - path: transport.extra_vars.variables.values
+            pattern: var_name
+          - path: transport.extra_vars.variables.act
+            pattern: var_name
+          - path: transport.extra_vars.variables.index
+            pattern: var_name
+          - path: transport.extra_vars.variables.ordinal
+            pattern: var_name
+          - path: transport.extra_vars.variables.pair
+            pattern: var_name
+          - path: transport.extra_vars.variables.value
+            pattern: var_name
+          - path: transport.extra_vars.variables.input
+            pattern: var_name
+          - path: transport.extra_vars.variables.pin
+            pattern: var_name
+          - path: transport.extra_vars.variables.inventory
+            pattern: var_name
+          - path: transport.extra_vars.variables.argc
+            pattern: var_name
+          - path: transport.extra_vars.variables.snapshot
+            pattern: var_name
+          - path: transport.extra_vars.variables.digest
+            pattern: var_name
+          - path: transport.extra_vars.variables.expected
+            pattern: var_name
+          - path: transport.extra_vars.variables.observed
+            pattern: var_name
+          - path: transport.extra_vars.variables.expected_stat
+            pattern: var_name
+          - path: transport.extra_vars.variables.cwd
+            pattern: var_name
+          - path: transport.extra_vars.shell
+            keys:
+            - zero
+            - one
+            - caller_prefix_words
+            - empty
+            - pair_pending
+            - file_prefix
+            - file_case
+            - value_format
+            - line_format
+            - word_separator
+            - path_separator
+            - digest_separator
+            - digest_case
+            - digest_length
+            - input_format
+            - inventory_format
+            - expected_stat_format
+            - stat_flags
+            - stat_mode
+            - stat_links
+            - hash_flags
+            - mkdir_flags
+            - readonly_umask
+            - builtins
+            - tools
+            - pwd_flags
+            - stage_inventory_flag
+            - stage_connection_flag
+            - close_root_fd
+          - path: transport.extra_vars.shell.zero
+            enum:
+            - 0
+          - path: transport.extra_vars.shell.one
+            enum:
+            - 1
+          - path: transport.extra_vars.shell.caller_prefix_words
+            enum:
+            - 3
+          - path: transport.extra_vars.shell.empty
+            enum:
+            - ''
+          - path: transport.extra_vars.shell.pair_pending
+            enum:
+            - value
+          - path: transport.extra_vars.shell.file_prefix
+            enum:
+            - '@'
+          - path: transport.extra_vars.shell.file_case
+            enum:
+            - '@*'
+          - path: transport.extra_vars.shell.value_format
+            enum:
+            - '%s'
+          - path: transport.extra_vars.shell.line_format
+            enum:
+            - '%s\n'
+          - path: transport.extra_vars.shell.word_separator
+            enum:
+            - ' '
+          - path: transport.extra_vars.shell.path_separator
+            enum:
+            - /
+          - path: transport.extra_vars.shell.digest_separator
+            enum:
+            - ' '
+          - path: transport.extra_vars.shell.digest_case
+            enum:
+            - '*[!0-9a-f]*'
+          - path: transport.extra_vars.shell.digest_length
+            enum:
+            - 64
+          - path: transport.extra_vars.shell.input_format
+            enum:
+            - '{"%s":{"%s":"%s","%s":%s,"%s":"%s","%s":"%s","%s":"%s","%s":"%s","%s":%s}}'
+          - path: transport.extra_vars.shell.inventory_format
+            enum:
+            - '{"%s":"%s","%s":"%s"}'
+          - path: transport.extra_vars.shell.expected_stat_format
+            enum:
+            - '%s %s %s'
+          - path: transport.extra_vars.shell.stat_flags
+            enum:
+            - - -c
+              - '%u %a %h'
+              - --
+          - path: transport.extra_vars.shell.stat_mode
+            enum:
+            - '400'
+          - path: transport.extra_vars.shell.stat_links
+            enum:
+            - '1'
+          - path: transport.extra_vars.shell.hash_flags
+            enum:
+            - - --
+          - path: transport.extra_vars.shell.mkdir_flags
+            enum:
+            - - -m
+              - '0700'
+              - --
+          - path: transport.extra_vars.shell.readonly_umask
+            enum:
+            - '0377'
+          - path: transport.extra_vars.shell.builtins
+            keys:
+            - set
+            - shift
+            - printf
+            - umask
+            - exec
+          - path: transport.extra_vars.shell.builtins.set
+            enum:
+            - set
+          - path: transport.extra_vars.shell.builtins.shift
+            enum:
+            - shift
+          - path: transport.extra_vars.shell.builtins.printf
+            enum:
+            - printf
+          - path: transport.extra_vars.shell.builtins.umask
+            enum:
+            - umask
+          - path: transport.extra_vars.shell.builtins.exec
+            enum:
+            - exec
+          - path: transport.extra_vars.shell.tools
+            keys:
+            - mkdir
+            - cat
+            - stat
+            - sha256sum
+            - pwd
+          - path: transport.extra_vars.shell.tools.mkdir
+            enum:
+            - mkdir
+          - path: transport.extra_vars.shell.tools.cat
+            enum:
+            - cat
+          - path: transport.extra_vars.shell.tools.stat
+            enum:
+            - stat
+          - path: transport.extra_vars.shell.tools.sha256sum
+            enum:
+            - sha256sum
+          - path: transport.extra_vars.shell.tools.pwd
+            enum:
+            - pwd
+          - path: transport.extra_vars.shell.pwd_flags
+            enum:
+            - - -P
+          - path: transport.extra_vars.shell.stage_inventory_flag
+            enum:
+            - -i
+          - path: transport.extra_vars.shell.stage_connection_flag
+            enum:
+            - -c
+          - path: transport.extra_vars.shell.close_root_fd
+            enum:
+            - 9
+          - path: transport.extra_vars.paths
+            keys:
+            - stage_directory
+            - digest_rel
+            - home_rel
+            - tmp_rel
+          - path: transport.extra_vars.paths.stage_directory
+            pattern: rel_segment
+          - path: transport.extra_vars.paths.digest_rel
+            enum:
+            - '{ordinal}.sha256'
+          - path: transport.extra_vars.paths.home_rel
+            pattern: rel_segment
+          - path: transport.extra_vars.paths.tmp_rel
+            pattern: rel_segment
+          - path: transport.extra_vars.structural
+            keys:
+            - zero
+            - one
+            - accepted
+            - refused
+            - empty_list
+            - separator
+          - path: transport.extra_vars.structural.zero
+            enum:
+            - 0
+          - path: transport.extra_vars.structural.one
+            enum:
+            - 1
+          - path: transport.extra_vars.structural.accepted
+            enum:
+            - true
+          - path: transport.extra_vars.structural.refused
+            enum:
+            - false
+          - path: transport.extra_vars.structural.empty_list
+            enum:
+            - []
+          - path: transport.extra_vars.structural.separator
+            enum:
+            - /
+          - path: transport.extra_vars.protocol
+            keys:
+            - digest
+            - snapshot_fields
+            - snapshot_mode
+            - directory
+            - directory_mode
+            - vars_lookup
+          - path: transport.extra_vars.protocol.digest
+            enum:
+            - sha256
+          - path: transport.extra_vars.protocol.snapshot_fields
+            keys:
+            - ordinal
+            - path
+            - digest
+          - path: transport.extra_vars.protocol.snapshot_fields.ordinal
+            enum:
+            - ordinal
+          - path: transport.extra_vars.protocol.snapshot_fields.path
+            enum:
+            - path
+          - path: transport.extra_vars.protocol.snapshot_fields.digest
+            enum:
+            - sha256
+          - path: transport.extra_vars.protocol.snapshot_mode
+            enum:
+            - '0400'
+          - path: transport.extra_vars.protocol.directory
+            enum:
+            - directory
+          - path: transport.extra_vars.protocol.directory_mode
+            enum:
+            - '0700'
+          - path: transport.extra_vars.protocol.vars_lookup
+            enum:
+            - ansible.builtin.vars
+          - path: transport.extra_vars.diagnostics
+            keys:
+            - stage
+            - snapshot
+            - source
+          - path: transport.extra_vars.diagnostics.stage
+            enum:
+            - FW09-NORMAL-EXTRA-VAR-STAGE
+          - path: transport.extra_vars.diagnostics.snapshot
+            enum:
+            - FW09-NORMAL-EXTRA-VAR-SNAPSHOT
+          - path: transport.extra_vars.diagnostics.source
+            enum:
+            - FW09-NORMAL-EXTRA-VAR-SOURCE
+          - path: transport.workroot
+            keys:
+            - task
+            - input_var
+            - output_fact
+            - fields
+            - f
+            - origins
+            - generation_fields
+            - generation
+            - output_fields
+            - output
+            - source
+            - receipt
+            - environment
+            - custody
+            - diagnostics
+            - directory_contract
+            - task_prerequisites
+            - jinja
+            - origin_selector
+          - path: transport.workroot.task
+            pattern: rel_path
+          - path: transport.workroot.input_var
+            enum:
+            - rh_fw_seed_stage
+          - path: transport.workroot.output_fact
+            enum:
+            - rh_admitted_execution_workroot
+          - path: transport.workroot.fields
+            enum:
+            - - origin
+              - work_root
+              - generation
+              - holder
+          - path: transport.workroot.f
+            keys:
+            - origin
+            - work_root
+            - generation
+            - holder
+          - path: transport.workroot.f.origin
+            enum:
+            - origin
+          - path: transport.workroot.f.work_root
+            enum:
+            - work_root
+          - path: transport.workroot.f.generation
+            enum:
+            - generation
+          - path: transport.workroot.f.holder
+            enum:
+            - holder
+          - path: transport.workroot.origins
+            keys:
+            - normal
+            - run_local
+          - path: transport.workroot.origins.normal
+            enum:
+            - normal_seed_stage
+          - path: transport.workroot.origins.run_local
+            enum:
+            - run_local
+          - path: transport.workroot.generation_fields
+            enum:
+            - - path
+              - sha256
+          - path: transport.workroot.generation
+            keys:
+            - path
+            - sha256
+          - path: transport.workroot.generation.path
+            enum:
+            - path
+          - path: transport.workroot.generation.sha256
+            enum:
+            - sha256
+          - path: transport.workroot.output_fields
+            enum:
+            - - origin
+              - work_root
+              - records_dir
+              - source_commit
+              - generation
+              - custody
+          - path: transport.workroot.output
+            keys:
+            - origin
+            - work_root
+            - records_dir
+            - source_commit
+            - generation
+            - custody
+          - path: transport.workroot.output.origin
+            enum:
+            - origin
+          - path: transport.workroot.output.work_root
+            enum:
+            - work_root
+          - path: transport.workroot.output.records_dir
+            enum:
+            - records_dir
+          - path: transport.workroot.output.source_commit
+            enum:
+            - source_commit
+          - path: transport.workroot.output.generation
+            enum:
+            - generation
+          - path: transport.workroot.output.custody
+            enum:
+            - custody
+          - path: transport.workroot.source
+            keys:
+            - fact
+            - commit_field
+            - admission_fact
+            - root_field
+          - path: transport.workroot.source.fact
+            enum:
+            - lme_source_binding
+          - path: transport.workroot.source.commit_field
+            enum:
+            - commit
+          - path: transport.workroot.source.admission_fact
+            enum:
+            - rh_src_admission
+          - path: transport.workroot.source.root_field
+            enum:
+            - root
+          - path: transport.workroot.receipt
+            keys:
+            - admitted_fact
+            - path_field
+            - digest
+            - file_mode
+          - path: transport.workroot.receipt.admitted_fact
+            enum:
+            - rh_toolchain
+          - path: transport.workroot.receipt.path_field
+            enum:
+            - sealed_receipt
+          - path: transport.workroot.receipt.digest
+            enum:
+            - sha256
+          - path: transport.workroot.receipt.file_mode
+            enum:
+            - '0400'
+          - path: transport.workroot.environment
+            keys:
+            - lookup
+            - name
+            - sub
+            - rel
+          - path: transport.workroot.environment.lookup
+            enum:
+            - ansible.builtin.env
+          - path: transport.workroot.environment.name
+            enum:
+            - name
+          - path: transport.workroot.environment.sub
+            enum:
+            - sub
+          - path: transport.workroot.environment.rel
+            enum:
+            - rel
+          - path: transport.workroot.custody
+            keys:
+            - allocator_fd
+            - stage_fd
+            - allocator_basename_from
+            - stage_basename_from
+            - task
+            - output_fields
+            - output
+          - path: transport.workroot.custody.allocator_fd
+            enum:
+            - 7
+          - path: transport.workroot.custody.stage_fd
+            enum:
+            - 8
+          - path: transport.workroot.custody.allocator_basename_from
+            enum:
+            - transport.paths.allocator_root_basename
+          - path: transport.workroot.custody.stage_basename_from
+            enum:
+            - transport.seed.runtime.stage_subdir
+          - path: transport.workroot.custody.task
+            pattern: rel_path
+          - path: transport.workroot.custody.output_fields
+            enum:
+            - - path
+              - device
+              - inode
+              - owner
+          - path: transport.workroot.custody.output
+            keys:
+            - path
+            - device
+            - inode
+            - owner
+          - path: transport.workroot.custody.output.path
+            enum:
+            - path
+          - path: transport.workroot.custody.output.device
+            enum:
+            - device
+          - path: transport.workroot.custody.output.inode
+            enum:
+            - inode
+          - path: transport.workroot.custody.output.owner
+            enum:
+            - owner
+          - path: transport.workroot.diagnostics
+            keys:
+            - input
+            - receipt
+            - root
+            - source
+            - records
+          - path: transport.workroot.diagnostics.input
+            enum:
+            - FW09-WORKROOT-PRODUCER
+          - path: transport.workroot.diagnostics.receipt
+            enum:
+            - FW09-WORKROOT-RECEIPT
+          - path: transport.workroot.diagnostics.root
+            enum:
+            - FW09-WORKROOT-CUSTODY
+          - path: transport.workroot.diagnostics.source
+            enum:
+            - FW09-WORKROOT-SOURCE
+          - path: transport.workroot.diagnostics.records
+            enum:
+            - FW09-WORKROOT-RECORD-DIRECTORY
+          - path: transport.workroot.directory_contract
+            keys:
+            - custody
+            - tools
+            - structural
+            - diagnostics
+            - output
+          - path: transport.workroot.directory_contract.custody
+            keys:
+            - fields
+            - f
+            - proc_root
+            - fd_dir
+            - fdinfo_dir
+            - lock_pattern
+            - lock_inode_index
+            - lock_owner_rule
+            - kernel_pid_role
+          - path: transport.workroot.directory_contract.custody.fields
+            enum:
+            - - pid
+              - fd
+          - path: transport.workroot.directory_contract.custody.f
+            keys:
+            - pid
+            - fd
+          - path: transport.workroot.directory_contract.custody.f.pid
+            enum:
+            - pid
+          - path: transport.workroot.directory_contract.custody.f.fd
+            enum:
+            - fd
+          - path: transport.workroot.directory_contract.custody.proc_root
+            enum:
+            - /proc
+          - path: transport.workroot.directory_contract.custody.fd_dir
+            enum:
+            - fd
+          - path: transport.workroot.directory_contract.custody.fdinfo_dir
+            enum:
+            - fdinfo
+          - path: transport.workroot.directory_contract.custody.lock_pattern
+            enum:
+            - (?m)^lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+WRITE\s+([0-9]+)\s+[0-9a-f]+:[0-9a-f]+:([0-9]+)\s+0\s+EOF\s*$
+          - path: transport.workroot.directory_contract.custody.lock_inode_index
+            enum:
+            - 1
+          - path: transport.workroot.directory_contract.custody.lock_owner_rule
+            enum:
+            - open_file_description_reported_by_holder_fdinfo
+          - path: transport.workroot.directory_contract.custody.kernel_pid_role
+            enum:
+            - informational_acquirer_pid_may_be_zero_after_acquirer_exit_or_namespace_translation
+          - path: transport.workroot.directory_contract.tools
+            keys:
+            - realpath_flags
+            - sync_flags
+            - move_flags
+          - path: transport.workroot.directory_contract.tools.realpath_flags
+            enum:
+            - - -e
+              - --
+          - path: transport.workroot.directory_contract.tools.sync_flags
+            enum:
+            - - -f
+              - --
+          - path: transport.workroot.directory_contract.tools.move_flags
+            enum:
+            - - -T
+              - -n
+              - --
+          - path: transport.workroot.directory_contract.structural
+            keys:
+            - zero
+            - one
+            - empty_text
+            - empty_map
+            - empty_list
+            - absent
+            - accepted
+            - refused
+            - separator
+          - path: transport.workroot.directory_contract.structural.zero
+            enum:
+            - 0
+          - path: transport.workroot.directory_contract.structural.one
+            enum:
+            - 1
+          - path: transport.workroot.directory_contract.structural.empty_text
+            enum:
+            - ''
+          - path: transport.workroot.directory_contract.structural.empty_map
+            enum:
+            - {}
+          - path: transport.workroot.directory_contract.structural.empty_list
+            enum:
+            - []
+          - path: transport.workroot.directory_contract.structural.absent
+            enum:
+            - null
+          - path: transport.workroot.directory_contract.structural.accepted
+            enum:
+            - true
+          - path: transport.workroot.directory_contract.structural.refused
+            enum:
+            - false
+          - path: transport.workroot.directory_contract.structural.separator
+            enum:
+            - /
+          - path: transport.workroot.directory_contract.diagnostics
+            keys:
+            - context
+            - ownership
+            - source
+            - finalized
+            - descriptor
+            - resume
+            - reference
+            - write
+            - custody
+          - path: transport.workroot.directory_contract.diagnostics.context
+            enum:
+            - FW09-GATE-CONTEXT
+          - path: transport.workroot.directory_contract.diagnostics.ownership
+            enum:
+            - FW09-GATE-LOCATOR-OWNERSHIP
+          - path: transport.workroot.directory_contract.diagnostics.source
+            enum:
+            - FW09-GATE-RESULT-SOURCE
+          - path: transport.workroot.directory_contract.diagnostics.finalized
+            enum:
+            - FW09-GATE-FINALIZED-ARTIFACT
+          - path: transport.workroot.directory_contract.diagnostics.descriptor
+            enum:
+            - FW09-GATE-DESCRIPTOR
+          - path: transport.workroot.directory_contract.diagnostics.resume
+            enum:
+            - FW09-GATE-RESUME-CONFLICT
+          - path: transport.workroot.directory_contract.diagnostics.reference
+            enum:
+            - FW09-GATE-DESCRIPTOR-REFERENCE
+          - path: transport.workroot.directory_contract.diagnostics.write
+            enum:
+            - FW09-GATE-NO-CLOBBER-PUBLICATION
+          - path: transport.workroot.directory_contract.diagnostics.custody
+            enum:
+            - FW09-GATE-HELD-INVOCATION-CUSTODY
+          - path: transport.workroot.directory_contract.output
+            keys:
+            - directory_mode
+          - path: transport.workroot.directory_contract.output.directory_mode
+            enum:
+            - '0700'
+          - path: transport.workroot.task_prerequisites
+            keys:
+            - resolve
+            - ancestry
+          - path: transport.workroot.task_prerequisites.resolve
+            pattern: rel_path
+          - path: transport.workroot.task_prerequisites.ancestry
+            pattern: rel_path
+          - path: transport.workroot.jinja
+            keys:
+            - vars
+            - equal
+          - path: transport.workroot.jinja.vars
+            enum:
+            - ansible.builtin.vars
+          - path: transport.workroot.jinja.equal
+            enum:
+            - equalto
+          - path: transport.workroot.origin_selector
+            enum:
+            - lme_matrix_workspace_origin
           - path: validation.output_fact
             distinct_from:
             - validation.serialized_output_fact
@@ -8592,6 +10758,75 @@ lme_config_registry:
             includes:
             - lme_resolved_run
             - lme_execution_context
+            - rh_fw_*
+            - fw_*
+            - rh_admitted_execution_workroot
+            - rh_adm_*
+            - lme_matrix_workspace_origin
+            - rh_admitted_execution_context
+          - path: transport.seed.shell.extra_var_flag
+            within:
+            - controller.bootstrap.work_roots.run_local.arg_flags
+            subject: scalar
+          - path: transport.names.allocation_state
+            within:
+            - controller.bootstrap.work_roots.run_local.execution_context.allocation.state.input
+            subject: scalar
+          - path: transport.seed.runtime.output_basename
+            within:
+            - controller.bootstrap.work_roots.run_local.execution_context.transport.paths.protected_context_basename
+            subject: scalar
+          - path: transport.paths.context_record_basename
+            within:
+            - controller.bootstrap.work_roots.run_local.execution_context.result.publication.context_record_basename
+            subject: scalar
+          - path: transport.allocation_record.state_fields.recorded
+            within:
+            - controller.bootstrap.work_roots.run_local.execution_context.ingress.r.recorded
+            subject: scalar
+          - path: transport.allocation_record.state_fields.recorded_binding
+            within:
+            - controller.bootstrap.work_roots.run_local.execution_context.ingress.r.recorded_binding
+            subject: scalar
+          - path: transport.allocation_record.state_fields.used_identities
+            within:
+            - controller.bootstrap.work_roots.run_local.execution_context.ingress.r.used_identities
+            subject: scalar
+          - path: transport.allocation_record.binding_fields
+            within:
+            - controller.bootstrap.work_roots.run_local.execution_context.allocation.state.binding_fields
+            subject: list
+          - path: allocation.state.binding_fields
+            within:
+            - controller.bootstrap.work_roots.run_local.execution_context.transport.allocation_record.binding_fields
+            subject: list
+          - path: validation.runtime_task
+            distinct_from:
+            - validation.tasks.context
+            - validation.tasks.payload
+            - validation.tasks.fields
+          - path: validation.tasks.context
+            distinct_from:
+            - validation.tasks.payload
+            - validation.tasks.fields
+          - path: validation.tasks.payload
+            distinct_from:
+            - validation.tasks.fields
+          - path: result.publication.descriptor_basename
+            distinct_from:
+            - result.publication.artifact_basename
+            - result.publication.context_record_basename
+          - path: result.publication.artifact_basename
+            distinct_from:
+            - result.publication.context_record_basename
+          - path: validation.output_fact
+            distinct_from:
+            - transport.workroot.input_var
+            - transport.workroot.output_fact
+          - path: validation.serialized_output_fact
+            distinct_from:
+            - transport.workroot.input_var
+            - transport.workroot.output_fact
         extra_var_parser:
           root: controller.bootstrap.seed_launch.extra_var_admission.parser
           checks:
@@ -8791,6 +11026,19 @@ lme_config_registry:
                 path:
                 - application_roster
               missing_obligations: retain_and_block_application_activation
+        seed_render:
+          root: controller.bootstrap.seed_render
+          checks:
+          - path: ''
+            keys:
+            - plugin
+            - digest_algorithm
+          - path: plugin
+            enum:
+            - ansible.builtin.template
+          - path: digest_algorithm
+            enum:
+            - sha256
       required_values:
         genesis_act: {var_at: controller.bootstrap.genesis.launch.stage_root.act.var, pattern: rel_segment, when_present: controller.bootstrap.genesis.launch}
     # Registry-owned now; a profile copy would be a parallel field (codex-232517): refused if still present.
@@ -8891,7 +11139,7 @@ lme_config_registry:
     # outputs): lme_profile (the declared selector; its profile sha256 is revision-bound), lme_manifests_dir,
     # connection vars (inventory; admitted via connection profiles, tick134 b), clone_directory (a core-playbook var
     # from clone_dir; no route reader). rh_repo_root needs no entry: refuse_pinned_outputs guards it inline.
-    reserved_outputs: ["rh", "rh_config_revision", "rh_engine_revision", "rh_profile_sha256", "rh_seed_lock", "_rh_prof_st", "_rh_prof_raw", "_rh_prof_cap", "rh_controller_toolchain", "rh_owned_root", "rh_toolchain", "rh_tc_expected", "rh_tc_root", "rh_tc_owner", "_rh_tc_gen", "_rh_tc_anc", "_rh_tc_files", "_rh_tc_bytes", "_rh_tc_markers", "_rh_tc_list_now", "_rh_pkg_src", "_rh_pkg_dst", "rh_builder", "rh_bundle", "rh_transfer", "_rh_bld_stat", "_rh_bld_head", "_rh_bld_pkg", "_rh_src_tool", "_rh_src_git", "_rh_src_filters", "_rh_src_inputs", "_rh_pkg_sum", "_rh_acq_have", "_rh_bnd_list", "_rh_bnd_stat", "_rh_bnd_manifest", "_rh_tb_archive", "_rh_tb_uid", "_rh_tb_pre", "_rh_tb_anc", "_rh_tb_bdir", "_rh_tb_list", "_rh_tb_sum", "_rh_tb_sumfile", "_rh_tb_sumraw", "_rh_tb_apply", "_rh_tc_uid", "_rh_tc_desc", "_rh_pkg_anc", "_rh_pkg_stage", "_rh_pkg_final", "_rh_pkg_finalsum", "_rh_pkg_publish", "_rh_tb_stage", "_rh_tb_extract", "_rh_tb_publish", "_rh_tb_kat", "_rh_tb_final", "_rh_pkg_mv", "_rh_pkg_man", "_rh_tb_manfile", "lme_seed_bs", "lme_seed_ctl", "lme_seed_lock", "rh_conn", "_rh_reap_top", "_rh_reap_desc", "_rh_reap_mv", "_rh_reap_rm", "_rh_reap_after", "_rh_reap_df", "_rh_reap_sel", "rh_staging_lease", "_rh_lease_self", "_rh_acq_after", "_rh_acq_before", "_rh_acq_rcpt", "_rh_lease_ns", "_rh_lease_rec", "_rh_pkg_ident", "_rh_reap_cg", "_rh_reap_kat", "_rh_reap_own", "_rh_reap_pid", "_rh_reap_probe", "_rh_reap_pstat", "_rh_reap_quiet", "_rh_reap_recmap", "_rh_reap_recs", "_rh_reap_rmrec", "_rh_reap_sessions", "_rh_reap_tok", "_rh_tb_ident", "_acq", "_anc", "_anc_exist", "_at", "_bd", "_bdir", "_bn", "_busy", "_cmdfail", "_cr", "_d", "_decl", "_desc", "_disp", "_dst", "_empty", "_expect_members", "_f", "_fresh_seed_sha256", "_gone", "_keys", "_left", "_lock", "_lp", "_lz", "_m", "_missing_names", "_missing_paths", "_mode", "_mode_args", "_ns", "_ot", "_out", "_owner", "_ownl", "_p", "_pkgs", "_pre", "_rec", "_ret", "_root", "_rows", "_rp", "_rt", "_run_mode", "_sa", "_shape", "_skip", "_sp", "_src", "_st", "_ti", "_tok", "_tools", "_tq", "_tst", "_uid", "_want", "rh_reap_dest", "rh_reap_df", "rh_reap_flock", "rh_reap_members", "rh_reap_mv", "rh_reap_need", "rh_reap_remote", "rh_reap_reserve", "rh_reap_rm", "rh_reap_uid", "_ad", "_ep", "_rh_pkg_left", "_rh_pkg_present", "_rh_reap_cgev", "_rh_reap_katlock", "_rh_reap_sev", "_rh_reap_uslice", "_rh_tb_left", "_rh_tb_present", "_tg", "_rh_bnd_dir", "_rh_cls_sib", "rh_classes", "rh_tb_xfer", "_cls", "_pc", "_r", "_s", "rh_admit_dir", "rh_admit_key", "rh_admit_lock", "rh_admit_policy", "rh_pub_dir", "rh_pub_key", "rh_pub_lock", "rh_pub_policy", "_rh_class", "_rh_reap_lock", "_rh_reap_lock_rb", "rh_reap_sh", "_lf", "_cf", "_act", "_rh_pkg_lnch", "_act_req", "_act_ok", "_sr", "_paths", "_l", "_w", "_bad", "_chain", "_wr", "_ltmp", "_home", "_rtmp", "_u", "_above", "_within", "_wdev", "_wm", "_rh_bld_gen_stat", "rh_anc_bs", "rh_anc_repo_root", "rh_anc_path", "rh_anc_refusal", "_rh_tb_use_var", "_troot", "rh_ic_variant", "rh_fx_src", "rh_fx_dest", "rh_fx_case", "rh_fx_clone", "_rh_bnd_sum", "rh_fx_key", "rh_fx_policy", "rh_fx_lock", "rh_fx_result", "_rh_fx_pre", "_rh_fx_read", "_rh_fx_find", "_rh_fx_cp", "_rh_fx_post", "_rh_fx_srcpost", "_rh_fx_cl", "_rh_fx_st", "_rh_fx_c", "_rh_fx_lit", "_rh_fx_lsha", "_rh_fx_cfnew", "_rh_fx_text", "_o", "_n", "_b", "_names", "_li", "_ci", "_mi", "_mnew", "_nrows", "_rr", "_c", "_dirs", "_want_sha", "rh_fx_route3", "_rh_fx_head", "_rh_fx_use", "_rh_fx_canon", "_rh_fx_src0", "_rh_fx_srcfind", "_rh_fx_rfrom", "_rh_fx_rto", "_rh_fx_rfind", "_rh_fx_rst", "_rh_fx_est", "_rh_fx_eread", "_rh_fx_rprof", "_rh_fx_rufind", "_rh_fx_ruse", "_rh_fx_rpfind", "_rh_fx_rpost", "_rh_fx_i", "_h", "_s0", "_rs", "_rl", "_rx", "_prof", "_cat", "_types", "_k", "_fr", "_to", "_txt", "_cs", "_ks", "_pj", "_moved", "_refs", "_e", "_files", "_to_all", "_rh_fx_mut", "_post", "rh_fc_rel", "rh_fc_leaf", "_rh_fc_st", "_rh_fx_adm", "_rh_fx_adm_item", "_rh_fx_kpost", "_q", "_ke", "_rh_br_loc", "_rh_br_pre", "_rh_br_tc", "_rh_br_tc_raw", "_rh_br_claims", "_rh_br_st", "_rh_br_pyf", "_rh_br_bm_raw", "_rh_br_git", "_rh_br_head", "_rh_br_status", "_rh_br_prof", "_rh_br_m", "_rh_br_boot", "_rh_br_src", "_rh_br_cfg", "_rh_br_text", "_rh_br_out", "_rh_br_prov", "_rh_brr_pre", "_rh_brr_rst", "_rh_brr_rraw", "_rh_brr_r", "_rh_brr_tcst", "_rh_brr_tcraw", "_rh_brr_claims", "_rh_brr_nf", "_rh_brr_fo", "_rh_brr_seal", "_rh_brr_git", "_rh_brr_head", "_rh_brr_status", "_rh_brr_prof", "_rh_brr_now", "_rh_brr_cmp", "_rh_brr_bad", "_rh_brr_prov", "_eq", "_bs", "_gen", "_att", "_rc", "_bm", "_nf", "_fo", "_se", "_tree", "_ap_rel", "_in_rel", "_pairs", "receipt_stat", "receipt_raw", "review_raw", "review_path_stat", "exec_stat", "interp_link", "interpreter_resolved", "interpreter_declared", "resolved_run_receipt_stat", "managed_bootstrap_catalog_entry", "managed_bootstrap_catalog_rel", "managed_bootstrap_catalog_raw", "managed_bootstrap_catalog_git", "managed_bootstrap_catalog_tree", "managed_bootstrap_catalog_oid", "managed_bootstrap_review_path", "managed_bootstrap_review_components", "managed_receipt_doc", "managed_measured", "managed_measured_path", "_catalog", "_ec", "_lc", "_entry", "_anchor", "_segs", "_vc", "_a", "tr", "tr_dir", "tr_repo_root", "tp", "jk", "tp_class", "tp_ctl", "tp_j", "tp_jop", "tp_jstate", "tp_juid", "tp_mem", "tp_obs", "tp_record", "tp_ro_path", "tp_ro_refusal", "tp_ti", "_tp_anc", "_tp_base", "_tp_bus", "_tp_ge", "_tp_hs", "_tp_jd", "_tp_jraw", "_tp_jst", "_tp_kvm", "_tp_mem", "_tp_pub", "_tp_ro_st", "_tp_sr", "_tp_st", "_tp_tools", "_tp_w0", "_tp_ws", "rh_obs_jobs_sha256", "rh_obs_jobs", "rh_obs_dirs", "rh_obs_run", "rh_obs_records", "rh_obs_stop", "rh_obs_refusal", "rh_obs_identity", "rh_obs_job", "rh_obs_ot", "rh_obs_loc", "rh_obs_hin", "rh_obs_host", "rh_obs_inst", "rh_obs_new", "_rh_obs_jobs_text", "rh_obs_idraw", "rh_obs_raw", "_rh_obs_jobs_st", "_rh_obs_uid", "_rh_obs_chain_st", "_rh_obs_dirs_st", "_rh_obs_cls", "rh_obs_s", "_rh_obs_i", "_rh_obs_ob", "_rh_obs_jobid", "_rh_obs_errors", "_rh_obs_wr", "_rh_obs_sep", "_rh_obs_w", "_rh_obs_base", "_rh_obs_st", "_rh_obs_bound", "_rh_obs_r", "_rh_obs_tpl", "_rh_obs_tools", "_rh_obs_problems", "_rh_obs_ev", "_rh_obs_rec", "_rh_obs_res", "_rh_obs_named", "_rh_obs_att", "_rh_obs_pp", "_rh_pkg_oc", "_rh_pkg_used", "lme_seed_dispatch", "lme_seed_ing", "rh_entry_context", "rh_eg_ctx", "rh_eg_op", "rh_eg_plan", "rh_eg_uid", "rh_eg_rec", "rh_eg_mirror_parent", "rh_eg_edition", "rh_eg_evidence", "_rh_eg_tools", "_rh_eg_idout", "_rh_eg_obs", "_rh_eg_raw", "_rh_eg_src", "_rh_eg_src_after", "_rh_eg_obsl", "_rh_eg_mirror", "_rh_eg_staged", "_rh_eg_recstaged", "_rh_eg_list", "lme_entry_struct", "lme_entry_decl", "rh_src_admission", "_rh_sa_decl", "_rh_sa_tool", "_rh_sa_obs", "_rh_sa_obs2", "_rh_sa_use", "rh_gp_tree", "rh_gp_status", "rh_gp_tool", "rh_gp_git", "rh_gp_repo", "rh_gp_paths", "rh_gp_absent", "rh_gp_edition", "rh_gp_codes", "rh_gp_texts", "rh_gp_head", "rh_gp_oids", "_rh_gp_head", "_rh_gp_tree", "_rh_gp_index", "_rh_gp_work", "_rh_gp_status", "_rh_gp_tree_map", "_rh_gp_index_map", "_rh_gp_work_map", "rh_entry_receipt", "rh_entry_dispatch", "rh_early_view", "rh_eg_tr", "rh_eg_succ", "_rh_eg_carried", "_rh_eg_rec_oids", "_rh_eg_slurp", "_rh_eg_bytes", "_rh_eg_jslurp", "_rh_eg_jdoc", "rh_gp_env", "rh_gp_probe", "rh_gp_tracked", "_rh_gp_x", "_rh_gp_ix", "_rh_gp_pol", "_rh_sa_slurp", "_rh_sa_text", "_rh_sa_bs", "rh_eg_unchanged", "_rh_sa_ovw", "_rh_sa_cb", "_rh_sa_cbad", "rh_rp_phase", "rh_eg_adopt", "_rh_eg_aobs", "_rh_eg_aslurp", "_rh_eg_robs", "rh_gp_history", "_rh_gp_hed", "_rh_gp_hbl", "_rh_gp_hli", "_rh_gp_hco", "_rh_gp_hte", "_rh_gp_hshal", "_rh_gp_hobj", "_rh_gp_hreach", "_rh_gp_hlin", "rh_ic_paths", "_rh_ic_plan", "_rh_tb_ic1", "_rh_tb_ic2", "_rh_tb_ic3", "_rh_tb_ic4", "_rh_tb_ic_fact", "_rh_tb_ic_uid", "_rh_tb_ic_uname", "_rh_tb_ic_fst", "_rh_tb_ic_avail", "_rh_tb_ic_iavail", "_rh_tb_ic_anc", "_rh_tb_ic_fsat", "_rh_tb_ic_tools", "_rh_tb_ic_py", "_cmd", "_ex", "_fsat_want", "_full", "_gow", "_ic", "_ka", "_l4", "_lines", "_ml", "_mt", "_mt1", "_mx", "_obd", "_owr", "_pg", "_priv", "_pv", "_ro", "_sfmt", "_tv", "_v", "_wt", "rh_pg_bs", "rh_pg_repo_root", "rh_pg_facts", "rh_pg_refusal", "rh_pg_part", "_cb", "_t", "_rh_pg_tool", "_rh_pg_decision", "_rh_gsr_text", "_rh_gsr_bs", "_rh_gsr_node", "_rh_gsr_sa", "_rh_gsr_l", "_rh_gsr_stage", "_rh_gsr_b", "_rh_gsr_has_act", "_rh_gsr_g", "_rh_gsr_py", "_rh_gsr_bx", "_rh_gsr_tool", "_rh_gsr_tst", "_rh_gsr_c1", "_rh_gsr_obs1", "_rh_gsr_st", "_rh_gsr_regtext", "_rh_gsr_relre", "_rh_gsr_c2", "_rh_gsr_all", "_rh_gsr_off", "_rh_gsr_obs2", "_rh_gsr_obs3", "_rh_gsr_ev", "_rh_gsr_p", "_rh_gsr_rb", "_rh_gsr_rs", "_rh_gsr_r", "_rh_gsr_ll", "_rh_gsr_word", "_rh_gsr_out", "_rh_gsr_pre", "_rh_gsr_back", "_rh_gsr_post", "_rh_bld_m", "_rh_gsr_a", "_rh_gsr_cm", "_rh_gsr_cx", "_rh_gsr_dg", "_rh_gsr_ed", "_rh_gsr_gen", "_rh_gsr_gr", "_rh_gsr_i", "_rh_gsr_inv", "_rh_gsr_pk", "_rh_gsr_rl", "_rh_gsr_rw", "_rh_gsr_s", "_rh_gsr_store", "_rh_gsr_suf", "_rh_bld_a", "_rh_bld_auth", "rh_tc_pin", "rh_gen_stage", "rh_tc_role", "_gb", "_sep", "_gwalk", "_gpaths", "_rh_sa_ov", "_rh_sa_eff", "_rh_sa_sel", "_rh_sa_ctx", "rh_di_input", "_rh_init_adm", "_rh_init_in", "_rh_init_rec", "_rh_init_iv", "_rh_sa_rref", "_rh_sa_dst", "_rh_sa_rsel", "_rh_sa_tools", "_rh_sa_ost", "_rh_sa_oslurp", "_rh_sa_otext", "_rh_sa_odoc", "_rh_sa_ri", "_rh_sa_has", "_rh_sa_leaves", "_rh_sa_off", "_rh_sa_ovd", "_rh_sa_ovn", "_rh_sa_ovr", "_rh_sa_sub", "_rh_sa_members", "_rh_rel_in", "_rh_rel_ca", "_rh_rel_cibad", "_rh_rel_ent", "_rh_rel_inv", "_rh_rel_adm", "_rh_rel_bind", "_rh_rel_doc", "_rh_rel_fin", "_rh_rel_gr", "_rh_rel_members", "_rh_rel_n7", "_rh_rel_pin", "rh_bsi_editions", "rh_bsi_inputs", "rh_bsi_status_rel", "_rh_bsi_git", "_rh_bsi_sa", "_rh_bsi_x", "rh_ra_dest", "rh_ra_mode", "rh_ra_name", "rh_ra_refusal", "rh_ra_src", "rh_ra_vars", "_rh_ra_rendered", "_rh_ra_st", "rh_rsv_checks", "rh_rsv_copies", "rh_rsv_dir", "rh_rsv_dirs", "rh_rsv_members", "rh_rsv_need", "rh_rsv_record", "rh_rsv_refusal", "rh_rsv_renders", "rh_rsv_staged", "_rh_rsv_anc", "_rh_rsv_checked", "_rh_rsv_ckst", "_rh_rsv_copied", "_rh_rsv_cst", "_rh_rsv_dsum", "_rh_rsv_final", "_rh_rsv_left", "_rh_rsv_outcome", "_rh_rsv_publish", "_rh_rsv_published", "_rh_rsv_row", "_rh_rsv_rst", "_rh_rsv_sealed", "_rh_rsv_stage", "_rh_rsv_tmp", "_rh_rsv_tools", "rh_rp_input", "_rh_sa_in", "rh_rp_caller", "_rh_sa_phase", "_rh_sa_idt", "rh_rsv_max_bytes", "_rh_rsv_csrc", "_rh_rsv_sz", "_rh_rsv_bytes", "_rh_rsv_b64", "rh_ra_max_bytes", "_rh_ra_text", "_rh_ra_b64", "_rh_rel_bud", "_rh_sa_caller", "_rh_ggen_adm", "_rh_ggen_ca", "_rh_ggen_cibad", "_rh_ggen_in", "_rh_ggen_ent", "_rh_ggen_row", "_rh_ggen_r", "_rh_ggen_st", "_rh_ggen_cx", "rh_rsv_prepublish", "_rh_rsv_reap_attempted", "_rh_rsv_reaped", "_rh_rsv_ppg", "_rh_rsv_ppt", "_rh_rsv_ppc", "_rh_rsv_ppn", "_rh_rsv_ppx", "_rh_ggen_ovs", "_rh_rel_ovs", "_gi", "_cbad", "_rb", "_g", "_dp", "_sel", "_cli", "_sl", "_crec", "_rpath", "_ops", "_roles", "_env", "_eflags", "_argv", "_ibad", "_rh_init_inv", "_rh_init_ent", "_rh_tc_gi_impl", "_rh_tc_gi_bad", "_rh_tc_gid", "_rh_pkg_rcpt", "_rh_pkg_rcpt_out", "_rh_pkg_rcpt_word", "_rh_pkg_rcpt_pre", "_rh_pkg_rcpt_back", "_rh_pkg_rcpt_post", "_rh_pkg_rcpt_resumed", "_rh_pkg_rcpt_cdir", "_rh_pkg_rcpt_cmk", "_rh_pkg_rcpt_crec_out", "_rh_pkg_rcpt_crec_pre", "_rh_pkg_rcpt_crec_back", "_rh_pkg_rcpt_crec_word", "_rh_pkg_rcpt_crec_post", "_rh_pkg_rcpt_trusted", "_rh_pkg_rcpt_ctool", "_rh_pkg_rcpt_cls", "_rh_pkg_lraw", "_rh_pkg_lock", "_rh_pkg_alloc", "_rh_pkg_impl", "_rh_pkg_bad", "_rh_pkg_art", "_rh_pkg_lst", "rh_src_partial", "_rh_sa_admit", "_rh_sa_dfirst", "rh_src_context", "_rh_sa_reg", "rh_src_declaration", "_rh_sa_cx", "_rh_sa_regadm", "rh_ri_decl", "rh_ri_root", "rh_ri_supplied", "_rh_init_ctx", "rh_mg_members", "_rh_sa_mg", "_rh_rf_in", "_rh_rf_ovs", "_rh_rf_row", "rh_s1_path", "rh_s1_result", "_rh_s1_pre", "_rh_s1_st", "_rh_s1_rb", "_rh_s1_f", "_rh_s1_pr", "_rh_s1_w", "_rh_s1_txt", "_rh_s1", "_rh_acc_occ", "_rh_acc_s1_st", "_rh_acc_s1_rb", "_rh_acc_s1_txt", "_rh_acc_s1_doc", "_rh_acc_uid", "_rh_clr_adm", "_rh_clp_adm", "_rh_clr_art", "_rh_clr_asha", "_rh_clr_bdoc", "_rh_clr_bind", "_rh_clr_cbad", "_rh_clr_ck", "_rh_clr_cls", "_rh_clr_doc", "_rh_clr_env", "_rh_clr_fin", "_rh_clr_gr", "_rh_clr_inv", "_rh_clr_members", "_rh_clr_mk", "_rh_clr_pin", "_rh_clr_tf", "_rh_clr_walk", "_rh_clr_xr", "cl", "rh_adm_x", "rh_adm_bs", "rh_adm_sep", "rh_adm_code", "rh_adm_rf", "rh_adm_in", "rh_adm_uid", "rh_adm_vst", "rh_adm_vrd", "rh_adm_values", "rh_adm_files", "rh_adm_snaps", "rh_adm_f", "rh_adm_p", "rh_adm_s", "rh_adm_fst", "rh_adm_src", "rh_adm_pre", "rh_adm_dst", "rh_adm_rrs", "rh_adm_rra", "rh_adm_admitted", "rh_adm_stage_input", "rh_adm_cp", "_rh_s1_cp", "rh_a_receipt", "rh_adm_rr", "rh_adm_rrc", "rh_acc_receipt", "_rh_lock_st", "_rh_lock_raw", "_rh_lock_cap", "_rh_lock_rel", "_rh_brr_bm_raw", "managed_bootstrap_bundle_stat", "managed_bootstrap_bundle_raw", "_rh_x2_doc", "_rh_x2_rst", "_rh_x2_rb", "_rh_x2_ar", "_rh_x2_ei", "_rh_x2_ep", "_rh_x2_entry", "_rh_x2_rd", "_rh_x2_rc", "_rh_x2_tr", "_rh_x2_stg", "_rh_x2_act", "_rh_x2_asub", "_rh_x2_rp", "_rh_x2_arp", "_rh_x2_bad", "_rh_rf_ent", "_rh_rf_r", "_rh_rf_st", "_rh_rf_sibad", "_rh_clp_xi", "_rh_clp_xp", "_rh_clp_ini", "_rh_clp_walk", "_rh_clp_mods", "_rh_clp_sep", "_rh_clp_out", "_rh_clp_out_p", "_rh_clp_dv", "_rh_clp_pfx", "_rh_clp_own", "_rh_clp_nest", "_rh_clp_od", "_rh_clp_st", "_rh_clp_fs", "_rh_clp_caps", "_rh_clp_rt", "_rh_clp_tv", "_rh_clp_fin", "_rh_clp_txt", "_rh_clp_doc", "_rh_clp_bad", "lme_clp_bs", "lme_clp_ctl", "lme_clp_rt", "_rh_gp_toid", "_rh_x2_pj", "_rh_x2_va", "_rh_x2_tx", "_rh_x2_rg", "_rh_x2_dp", "_rh_x2_rl", "_rh_x2_est", "_rh_x2_ovf", "_rh_clp_uid", "rh_rsv_render_scope", "rh_rsv_uid", "rh_rsv_include_rel", "_rh_clp_site", "_rh_clp_iv", "_rh_clp_ivbad", "_rh_clp_dc", "_rh_clp_od0", "_rh_clp_of", "_rh_clp_ow", "_rh_clp_pa", "_rh_clp_rx_p", "_rh_clp_src", "_rh_clp_tfp", "_rh_clp_tfs", "_rh_clp_tm", "_rh_clp_ua", "_rh_clp_uid_argv", "_rh_clp_uid_r", "_rh_clp_uid_rx", "_rh_clp_uid_st", "_rh_clp_uid_tool", "_rh_ra_sk", "_rh_ra_sites", "_rh_ra_site", "_rh_ra_iv", "_rh_ra_tv", "_rh_ra_wb", "_rh_ra_rows", "_rh_ra_ep", "_rh_ra_ek", "_rh_ra_alloc", "_rh_ra_in64", "_rh_ra_inb", "_rh_ra_member", "_rh_ra_law", "_rh_ra_enc", "_rh_ra_fresh", "_rh_ra_r", "rh_ra_scope", "rh_ra_op", "rh_ra_site", "_rh_rsv_wb", "_rh_rsv_enc", "_rh_rsv_law", "_rh_x2_pending", "_rh_clp_skeys", "_rh_clp_rtk", "_rh_clp_rtbad", "_rh_rsv_site_keys", "_rh_rsv_site", "_rh_rsv_uidw", "_rh_rsv_alloc", "_rh_rsv_locs", "_rh_rsv_lst", "_rh_rsv_lpst", "_rh_rsv_meas", "_rh_rsv_dprobe", "_rh_rsv_dfree", "_rh_rsv_store", "_rh_rsv_srcs", "_rh_rsv_uw", "_rh_rsv_sw", "_rh_rsv_lm", "_rh_rsv_st", "_rh_rsv_on", "_rh_rsv_sum", "_rh_ra_mw", "_rh_ra_mf", "_rh_ra_mult", "_rh_ra_m", "xp", "cd", "xr", "cm", "_rh_rsv_auth", "_rh_rsv_aw", "_rh_rsv_fsprobe", "_rh_rsv_oa", "_rh_rsv_oadm", "_rh_rsv_ob", "_rh_rsv_od", "_rh_rsv_odf", "_rh_rsv_odp", "_rh_rsv_ods", "_rh_rsv_ofind", "_rh_rsv_ofs", "_rh_rsv_ogone", "_rh_rsv_ol", "_rh_rsv_olk", "_rh_rsv_olst", "_rh_rsv_omeas", "_rh_rsv_omv", "_rh_rsv_op", "_rh_rsv_oprb", "_rh_rsv_or", "_rh_rsv_orb", "_rh_rsv_orec", "_rh_rsv_oreleased", "_rh_rsv_orm", "_rh_rsv_oslp", "_rh_rsv_otmp", "_rh_rsv_ow", "_rh_rsv_pr", "_rh_rsv_reg", "_rh_rsv_rg", "_opg", "_app", "_rh_anc_app", "_rh_pg_app", "_ctx", "_rh_reap_app", "_bl", "_rh_lease_ns_d", "_rh_lease_ns_g", "_rh_reap_pid_d", "_rh_reap_pid_g", "_rh_reap_pstat_d", "_rh_reap_pstat_g", "_rh_reap_cg_d", "_rh_reap_cg_g", "_rh_reap_cgev_d", "_rh_reap_cgev_g", "_rh_anc_uid", "_rh_anc_st", "_rh_anc_pg", "_rh_anc_facts", "_rh_anc_fact", "rh_anc_admitted_private_groups", "_rh_reap_rg", "_rh_reap_regst", "_rh_reap_regls", "_rh_reap_regrd", "_rh_reap_reg", "_rh_reap_left", "_rh_reap_recov", "_rh_reap_regpost", "_rh_reap_keep", "_ob", "_jshape", "_wb", "_dh", "_pending_b", "_text", "_rh_reap_regst_d", "_rh_reap_regls_d", "_rh_reap_regrd_d", "_rh_reap_vw", "_rh_reap_sid", "_rh_reap_smns", "_rh_reap_sls", "_rh_reap_sv", "_rh_reap_sty", "_rh_reap_smt", "_rh_reap_sls2", "_rh_reap_otid_d", "_rh_reap_otok", "_rh_reap_oid_d", "_rh_reap_omns_d", "_rh_reap_ols_d", "_rh_reap_ov_d", "_rh_reap_oty_d", "_rh_reap_omt_d", "_rh_reap_ols2_d", "_canon", "_rh_reap_appl", "_rh_reap_regx", "_rh_reap_ouid", "_rh_reap_rcls", "_ra", "_rh_reap_regst_g", "_rh_reap_regls_g", "_rh_reap_regrd_g", "_dec", "_rh_reap_rshow", "_rh_reap_sae", "_rro", "_rrp", "_rh_reap_fid_g", "_rh_reap_lls_g", "_rh_reap_fid_d", "_rh_reap_lls_d", "_nsp", "_rh_reap_anc", "_rh_reap_ftok", "_rh_reap_pvs_g", "_rh_reap_pvs_d", "_rh_reap_pmo_g", "_rh_reap_pmo_d", "_rh_reap_aty_g", "_rh_reap_aty_d", "_rh_reap_asr_g", "_rh_reap_asr_d", "_rh_n13_phase", "_rh_n13_effect", "_rh_n13_lock_kat", "_rh_n13_create", "_rh_n13_witness", "_rh_n13_recovery", "rh_reap_operation", "rh_reap_effect", "_rh_n13_plan_stats", "_rh_n13_envelope", "_rh_n13_plan", "_rh_n13_contract", "rh_tc_recipe", "rh_tc_recipes", "rh_tc_rows", "rh_tc_lock_rows", "rh_rc_acc", "rh_rc_policy", "rh_rc_key", "_rh_rc_raw", "_rh_n13_destination_lock", "_rh_n13_destination_lock_create", "_rh_n13_destination_lock_readback", "_rh_n13_effect_readback", "_rh_n13_effect_record", "_rh_n13_effect_stat", "_rh_n13_parent_device", "_rh_n13_tool_identity", "_rh_reap_lease_rows", "_rh_reap_record_only", "_rh_reap_record_only_listing", "_rh_reap_record_only_stat", "_rh_reap_unlocked_entries", "_rh_reap_witnessmap", "rh_sc_bs", "rh_sc_wb", "rh_sc_effect", "rh_sc_operation", "rh_sc_witness", "rh_sc_source_path", "rh_sc_target_path", "rh_controller_recipe", "_lease_effect", "_lease_remove", "_bound", "_rh_n13_release_plan", "_rh_n13_release", "_rh_n13_lease_release", "_rh_reap_prepare", "_prep", "_rh_n13_pg", "_rh_n13_lp", "rh_tc_lock", "rh_capture_role", "rh_capture_binding", "rh_recipe_lock", "_rh_recipe_lock_rel", "_rh_recipe_lock_cap", "_rh_recipe_lock_st", "_rh_recipe_lock_raw", "rh_pub_controller", "rh_pub_binding", "rh_admit_controller", "rh_admit_binding", "lme_resolved_verification_source", "lme_resolved_configuration_record", "lme_resolved_configuration_record_text", "lme_resolved_configuration_record_sha256", "lme_resolved_configuration_artifact", "lme_roster_facts", "_lme_roster_projection", "_rr_sf", "_rr_pi", "_sb", "_af", "lme_roster_contract", "_roster_input_names", "_roster_fields"]
+    reserved_outputs: ["rh", "rh_config_revision", "rh_engine_revision", "rh_profile_sha256", "rh_seed_lock", "_rh_prof_st", "_rh_prof_raw", "_rh_prof_cap", "rh_controller_toolchain", "rh_owned_root", "rh_toolchain", "rh_tc_expected", "rh_tc_root", "rh_tc_owner", "_rh_tc_gen", "_rh_tc_anc", "_rh_tc_files", "_rh_tc_bytes", "_rh_tc_markers", "_rh_tc_list_now", "_rh_pkg_src", "_rh_pkg_dst", "rh_builder", "rh_bundle", "rh_transfer", "_rh_bld_stat", "_rh_bld_head", "_rh_bld_pkg", "_rh_src_tool", "_rh_src_git", "_rh_src_filters", "_rh_src_inputs", "_rh_pkg_sum", "_rh_acq_have", "_rh_bnd_list", "_rh_bnd_stat", "_rh_bnd_manifest", "_rh_tb_archive", "_rh_tb_uid", "_rh_tb_pre", "_rh_tb_anc", "_rh_tb_bdir", "_rh_tb_list", "_rh_tb_sum", "_rh_tb_sumfile", "_rh_tb_sumraw", "_rh_tb_apply", "_rh_tc_uid", "_rh_tc_desc", "_rh_pkg_anc", "_rh_pkg_stage", "_rh_pkg_final", "_rh_pkg_finalsum", "_rh_pkg_publish", "_rh_tb_stage", "_rh_tb_extract", "_rh_tb_publish", "_rh_tb_kat", "_rh_tb_final", "_rh_pkg_mv", "_rh_pkg_man", "_rh_tb_manfile", "lme_seed_bs", "lme_seed_ctl", "lme_seed_lock", "rh_conn", "_rh_reap_top", "_rh_reap_desc", "_rh_reap_mv", "_rh_reap_rm", "_rh_reap_after", "_rh_reap_df", "_rh_reap_sel", "rh_staging_lease", "_rh_lease_self", "_rh_acq_after", "_rh_acq_before", "_rh_acq_rcpt", "_rh_lease_ns", "_rh_lease_rec", "_rh_pkg_ident", "_rh_reap_cg", "_rh_reap_kat", "_rh_reap_own", "_rh_reap_pid", "_rh_reap_probe", "_rh_reap_pstat", "_rh_reap_quiet", "_rh_reap_recmap", "_rh_reap_recs", "_rh_reap_rmrec", "_rh_reap_sessions", "_rh_reap_tok", "_rh_tb_ident", "_acq", "_anc", "_anc_exist", "_at", "_bd", "_bdir", "_bn", "_busy", "_cmdfail", "_cr", "_d", "_decl", "_desc", "_disp", "_dst", "_empty", "_expect_members", "_f", "_fresh_seed_sha256", "_gone", "_keys", "_left", "_lock", "_lp", "_lz", "_m", "_missing_names", "_missing_paths", "_mode", "_mode_args", "_ns", "_ot", "_out", "_owner", "_ownl", "_p", "_pkgs", "_pre", "_rec", "_ret", "_root", "_rows", "_rp", "_rt", "_run_mode", "_sa", "_shape", "_skip", "_sp", "_src", "_st", "_ti", "_tok", "_tools", "_tq", "_tst", "_uid", "_want", "rh_reap_dest", "rh_reap_df", "rh_reap_flock", "rh_reap_members", "rh_reap_mv", "rh_reap_need", "rh_reap_remote", "rh_reap_reserve", "rh_reap_rm", "rh_reap_uid", "_ad", "_ep", "_rh_pkg_left", "_rh_pkg_present", "_rh_reap_cgev", "_rh_reap_katlock", "_rh_reap_sev", "_rh_reap_uslice", "_rh_tb_left", "_rh_tb_present", "_tg", "_rh_bnd_dir", "_rh_cls_sib", "rh_classes", "rh_tb_xfer", "_cls", "_pc", "_r", "_s", "rh_admit_dir", "rh_admit_key", "rh_admit_lock", "rh_admit_policy", "rh_pub_dir", "rh_pub_key", "rh_pub_lock", "rh_pub_policy", "_rh_class", "_rh_reap_lock", "_rh_reap_lock_rb", "rh_reap_sh", "_lf", "_cf", "_act", "_rh_pkg_lnch", "_act_req", "_act_ok", "_sr", "_paths", "_l", "_w", "_bad", "_chain", "_wr", "_ltmp", "_home", "_rtmp", "_u", "_above", "_within", "_wdev", "_wm", "_rh_bld_gen_stat", "rh_anc_bs", "rh_anc_repo_root", "rh_anc_path", "rh_anc_refusal", "_rh_tb_use_var", "_troot", "rh_ic_variant", "rh_fx_src", "rh_fx_dest", "rh_fx_case", "rh_fx_clone", "_rh_bnd_sum", "rh_fx_key", "rh_fx_policy", "rh_fx_lock", "rh_fx_result", "_rh_fx_pre", "_rh_fx_read", "_rh_fx_find", "_rh_fx_cp", "_rh_fx_post", "_rh_fx_srcpost", "_rh_fx_cl", "_rh_fx_st", "_rh_fx_c", "_rh_fx_lit", "_rh_fx_lsha", "_rh_fx_cfnew", "_rh_fx_text", "_o", "_n", "_b", "_names", "_li", "_ci", "_mi", "_mnew", "_nrows", "_rr", "_c", "_dirs", "_want_sha", "rh_fx_route3", "_rh_fx_head", "_rh_fx_use", "_rh_fx_canon", "_rh_fx_src0", "_rh_fx_srcfind", "_rh_fx_rfrom", "_rh_fx_rto", "_rh_fx_rfind", "_rh_fx_rst", "_rh_fx_est", "_rh_fx_eread", "_rh_fx_rprof", "_rh_fx_rufind", "_rh_fx_ruse", "_rh_fx_rpfind", "_rh_fx_rpost", "_rh_fx_i", "_h", "_s0", "_rs", "_rl", "_rx", "_prof", "_cat", "_types", "_k", "_fr", "_to", "_txt", "_cs", "_ks", "_pj", "_moved", "_refs", "_e", "_files", "_to_all", "_rh_fx_mut", "_post", "rh_fc_rel", "rh_fc_leaf", "_rh_fc_st", "_rh_fx_adm", "_rh_fx_adm_item", "_rh_fx_kpost", "_q", "_ke", "_rh_br_loc", "_rh_br_pre", "_rh_br_tc", "_rh_br_tc_raw", "_rh_br_claims", "_rh_br_st", "_rh_br_pyf", "_rh_br_bm_raw", "_rh_br_git", "_rh_br_head", "_rh_br_status", "_rh_br_prof", "_rh_br_m", "_rh_br_boot", "_rh_br_src", "_rh_br_cfg", "_rh_br_text", "_rh_br_out", "_rh_br_prov", "_rh_brr_pre", "_rh_brr_rst", "_rh_brr_rraw", "_rh_brr_r", "_rh_brr_tcst", "_rh_brr_tcraw", "_rh_brr_claims", "_rh_brr_nf", "_rh_brr_fo", "_rh_brr_seal", "_rh_brr_git", "_rh_brr_head", "_rh_brr_status", "_rh_brr_prof", "_rh_brr_now", "_rh_brr_cmp", "_rh_brr_bad", "_rh_brr_prov", "_eq", "_bs", "_gen", "_att", "_rc", "_bm", "_nf", "_fo", "_se", "_tree", "_ap_rel", "_in_rel", "_pairs", "receipt_stat", "receipt_raw", "review_raw", "review_path_stat", "exec_stat", "interp_link", "interpreter_resolved", "interpreter_declared", "resolved_run_receipt_stat", "managed_bootstrap_catalog_entry", "managed_bootstrap_catalog_rel", "managed_bootstrap_catalog_raw", "managed_bootstrap_catalog_git", "managed_bootstrap_catalog_tree", "managed_bootstrap_catalog_oid", "managed_bootstrap_review_path", "managed_bootstrap_review_components", "managed_receipt_doc", "managed_measured", "managed_measured_path", "_catalog", "_ec", "_lc", "_entry", "_anchor", "_segs", "_vc", "_a", "tr", "tr_dir", "tr_repo_root", "tp", "jk", "tp_class", "tp_ctl", "tp_j", "tp_jop", "tp_jstate", "tp_juid", "tp_mem", "tp_obs", "tp_record", "tp_ro_path", "tp_ro_refusal", "tp_ti", "_tp_anc", "_tp_base", "_tp_bus", "_tp_ge", "_tp_hs", "_tp_jd", "_tp_jraw", "_tp_jst", "_tp_kvm", "_tp_mem", "_tp_pub", "_tp_ro_st", "_tp_sr", "_tp_st", "_tp_tools", "_tp_w0", "_tp_ws", "rh_obs_jobs_sha256", "rh_obs_jobs", "rh_obs_dirs", "rh_obs_run", "rh_obs_records", "rh_obs_stop", "rh_obs_refusal", "rh_obs_identity", "rh_obs_job", "rh_obs_ot", "rh_obs_loc", "rh_obs_hin", "rh_obs_host", "rh_obs_inst", "rh_obs_new", "_rh_obs_jobs_text", "rh_obs_idraw", "rh_obs_raw", "_rh_obs_jobs_st", "_rh_obs_uid", "_rh_obs_chain_st", "_rh_obs_dirs_st", "_rh_obs_cls", "rh_obs_s", "_rh_obs_i", "_rh_obs_ob", "_rh_obs_jobid", "_rh_obs_errors", "_rh_obs_wr", "_rh_obs_sep", "_rh_obs_w", "_rh_obs_base", "_rh_obs_st", "_rh_obs_bound", "_rh_obs_r", "_rh_obs_tpl", "_rh_obs_tools", "_rh_obs_problems", "_rh_obs_ev", "_rh_obs_rec", "_rh_obs_res", "_rh_obs_named", "_rh_obs_att", "_rh_obs_pp", "_rh_pkg_oc", "_rh_pkg_used", "lme_seed_dispatch", "lme_seed_ing", "rh_entry_context", "rh_eg_ctx", "rh_eg_op", "rh_eg_plan", "rh_eg_uid", "rh_eg_rec", "rh_eg_mirror_parent", "rh_eg_edition", "rh_eg_evidence", "_rh_eg_tools", "_rh_eg_idout", "_rh_eg_obs", "_rh_eg_raw", "_rh_eg_src", "_rh_eg_src_after", "_rh_eg_obsl", "_rh_eg_mirror", "_rh_eg_staged", "_rh_eg_recstaged", "_rh_eg_list", "lme_entry_struct", "lme_entry_decl", "rh_src_admission", "_rh_sa_decl", "_rh_sa_tool", "_rh_sa_obs", "_rh_sa_obs2", "_rh_sa_use", "rh_gp_tree", "rh_gp_status", "rh_gp_tool", "rh_gp_git", "rh_gp_repo", "rh_gp_paths", "rh_gp_absent", "rh_gp_edition", "rh_gp_codes", "rh_gp_texts", "rh_gp_head", "rh_gp_oids", "_rh_gp_head", "_rh_gp_tree", "_rh_gp_index", "_rh_gp_work", "_rh_gp_status", "_rh_gp_tree_map", "_rh_gp_index_map", "_rh_gp_work_map", "rh_entry_receipt", "rh_entry_dispatch", "rh_early_view", "rh_eg_tr", "rh_eg_succ", "_rh_eg_carried", "_rh_eg_rec_oids", "_rh_eg_slurp", "_rh_eg_bytes", "_rh_eg_jslurp", "_rh_eg_jdoc", "rh_gp_env", "rh_gp_probe", "rh_gp_tracked", "_rh_gp_x", "_rh_gp_ix", "_rh_gp_pol", "_rh_sa_slurp", "_rh_sa_text", "_rh_sa_bs", "rh_eg_unchanged", "_rh_sa_ovw", "_rh_sa_cb", "_rh_sa_cbad", "rh_rp_phase", "rh_eg_adopt", "_rh_eg_aobs", "_rh_eg_aslurp", "_rh_eg_robs", "rh_gp_history", "_rh_gp_hed", "_rh_gp_hbl", "_rh_gp_hli", "_rh_gp_hco", "_rh_gp_hte", "_rh_gp_hshal", "_rh_gp_hobj", "_rh_gp_hreach", "_rh_gp_hlin", "rh_ic_paths", "_rh_ic_plan", "_rh_tb_ic1", "_rh_tb_ic2", "_rh_tb_ic3", "_rh_tb_ic4", "_rh_tb_ic_fact", "_rh_tb_ic_uid", "_rh_tb_ic_uname", "_rh_tb_ic_fst", "_rh_tb_ic_avail", "_rh_tb_ic_iavail", "_rh_tb_ic_anc", "_rh_tb_ic_fsat", "_rh_tb_ic_tools", "_rh_tb_ic_py", "_cmd", "_ex", "_fsat_want", "_full", "_gow", "_ic", "_ka", "_l4", "_lines", "_ml", "_mt", "_mt1", "_mx", "_obd", "_owr", "_pg", "_priv", "_pv", "_ro", "_sfmt", "_tv", "_v", "_wt", "rh_pg_bs", "rh_pg_repo_root", "rh_pg_facts", "rh_pg_refusal", "rh_pg_part", "_cb", "_t", "_rh_pg_tool", "_rh_pg_decision", "_rh_gsr_text", "_rh_gsr_bs", "_rh_gsr_node", "_rh_gsr_sa", "_rh_gsr_l", "_rh_gsr_stage", "_rh_gsr_b", "_rh_gsr_has_act", "_rh_gsr_g", "_rh_gsr_py", "_rh_gsr_bx", "_rh_gsr_tool", "_rh_gsr_tst", "_rh_gsr_c1", "_rh_gsr_obs1", "_rh_gsr_st", "_rh_gsr_regtext", "_rh_gsr_relre", "_rh_gsr_c2", "_rh_gsr_all", "_rh_gsr_off", "_rh_gsr_obs2", "_rh_gsr_obs3", "_rh_gsr_ev", "_rh_gsr_p", "_rh_gsr_rb", "_rh_gsr_rs", "_rh_gsr_r", "_rh_gsr_ll", "_rh_gsr_word", "_rh_gsr_out", "_rh_gsr_pre", "_rh_gsr_back", "_rh_gsr_post", "_rh_bld_m", "_rh_gsr_a", "_rh_gsr_cm", "_rh_gsr_cx", "_rh_gsr_dg", "_rh_gsr_ed", "_rh_gsr_gen", "_rh_gsr_gr", "_rh_gsr_i", "_rh_gsr_inv", "_rh_gsr_pk", "_rh_gsr_rl", "_rh_gsr_rw", "_rh_gsr_s", "_rh_gsr_store", "_rh_gsr_suf", "_rh_bld_a", "_rh_bld_auth", "rh_tc_pin", "rh_gen_stage", "rh_tc_role", "_gb", "_sep", "_gwalk", "_gpaths", "_rh_sa_ov", "_rh_sa_eff", "_rh_sa_sel", "_rh_sa_ctx", "rh_di_input", "_rh_init_adm", "_rh_init_in", "_rh_init_rec", "_rh_init_iv", "_rh_sa_rref", "_rh_sa_dst", "_rh_sa_rsel", "_rh_sa_tools", "_rh_sa_ost", "_rh_sa_oslurp", "_rh_sa_otext", "_rh_sa_odoc", "_rh_sa_ri", "_rh_sa_has", "_rh_sa_leaves", "_rh_sa_off", "_rh_sa_ovd", "_rh_sa_ovn", "_rh_sa_ovr", "_rh_sa_sub", "_rh_sa_members", "_rh_rel_in", "_rh_rel_ca", "_rh_rel_cibad", "_rh_rel_ent", "_rh_rel_inv", "_rh_rel_adm", "_rh_rel_bind", "_rh_rel_doc", "_rh_rel_fin", "_rh_rel_gr", "_rh_rel_members", "_rh_rel_n7", "_rh_rel_pin", "rh_bsi_editions", "rh_bsi_inputs", "rh_bsi_status_rel", "_rh_bsi_git", "_rh_bsi_sa", "_rh_bsi_x", "rh_ra_dest", "rh_ra_mode", "rh_ra_name", "rh_ra_refusal", "rh_ra_src", "rh_ra_vars", "_rh_ra_rendered", "_rh_ra_st", "rh_rsv_checks", "rh_rsv_copies", "rh_rsv_dir", "rh_rsv_dirs", "rh_rsv_members", "rh_rsv_need", "rh_rsv_record", "rh_rsv_refusal", "rh_rsv_renders", "rh_rsv_staged", "_rh_rsv_anc", "_rh_rsv_checked", "_rh_rsv_ckst", "_rh_rsv_copied", "_rh_rsv_cst", "_rh_rsv_dsum", "_rh_rsv_final", "_rh_rsv_left", "_rh_rsv_outcome", "_rh_rsv_publish", "_rh_rsv_published", "_rh_rsv_row", "_rh_rsv_rst", "_rh_rsv_sealed", "_rh_rsv_stage", "_rh_rsv_tmp", "_rh_rsv_tools", "rh_rp_input", "_rh_sa_in", "rh_rp_caller", "_rh_sa_phase", "_rh_sa_idt", "rh_rsv_max_bytes", "_rh_rsv_csrc", "_rh_rsv_sz", "_rh_rsv_bytes", "_rh_rsv_b64", "rh_ra_max_bytes", "_rh_ra_text", "_rh_ra_b64", "_rh_rel_bud", "_rh_sa_caller", "_rh_ggen_adm", "_rh_ggen_ca", "_rh_ggen_cibad", "_rh_ggen_in", "_rh_ggen_ent", "_rh_ggen_row", "_rh_ggen_r", "_rh_ggen_st", "_rh_ggen_cx", "rh_rsv_prepublish", "_rh_rsv_reap_attempted", "_rh_rsv_reaped", "_rh_rsv_ppg", "_rh_rsv_ppt", "_rh_rsv_ppc", "_rh_rsv_ppn", "_rh_rsv_ppx", "_rh_ggen_ovs", "_rh_rel_ovs", "_gi", "_cbad", "_rb", "_g", "_dp", "_sel", "_cli", "_sl", "_crec", "_rpath", "_ops", "_roles", "_env", "_eflags", "_argv", "_ibad", "_rh_init_inv", "_rh_init_ent", "_rh_tc_gi_impl", "_rh_tc_gi_bad", "_rh_tc_gid", "_rh_pkg_rcpt", "_rh_pkg_rcpt_out", "_rh_pkg_rcpt_word", "_rh_pkg_rcpt_pre", "_rh_pkg_rcpt_back", "_rh_pkg_rcpt_post", "_rh_pkg_rcpt_resumed", "_rh_pkg_rcpt_cdir", "_rh_pkg_rcpt_cmk", "_rh_pkg_rcpt_crec_out", "_rh_pkg_rcpt_crec_pre", "_rh_pkg_rcpt_crec_back", "_rh_pkg_rcpt_crec_word", "_rh_pkg_rcpt_crec_post", "_rh_pkg_rcpt_trusted", "_rh_pkg_rcpt_ctool", "_rh_pkg_rcpt_cls", "_rh_pkg_lraw", "_rh_pkg_lock", "_rh_pkg_alloc", "_rh_pkg_impl", "_rh_pkg_bad", "_rh_pkg_art", "_rh_pkg_lst", "rh_src_partial", "_rh_sa_admit", "_rh_sa_dfirst", "rh_src_context", "_rh_sa_reg", "rh_src_declaration", "_rh_sa_cx", "_rh_sa_regadm", "rh_ri_decl", "rh_ri_root", "rh_ri_supplied", "_rh_init_ctx", "rh_mg_members", "_rh_sa_mg", "_rh_rf_in", "_rh_rf_ovs", "_rh_rf_row", "rh_s1_path", "rh_s1_result", "_rh_s1_pre", "_rh_s1_st", "_rh_s1_rb", "_rh_s1_f", "_rh_s1_pr", "_rh_s1_w", "_rh_s1_txt", "_rh_s1", "_rh_acc_occ", "_rh_acc_s1_st", "_rh_acc_s1_rb", "_rh_acc_s1_txt", "_rh_acc_s1_doc", "_rh_acc_uid", "_rh_clr_adm", "_rh_clp_adm", "_rh_clr_art", "_rh_clr_asha", "_rh_clr_bdoc", "_rh_clr_bind", "_rh_clr_cbad", "_rh_clr_ck", "_rh_clr_cls", "_rh_clr_doc", "_rh_clr_env", "_rh_clr_fin", "_rh_clr_gr", "_rh_clr_inv", "_rh_clr_members", "_rh_clr_mk", "_rh_clr_pin", "_rh_clr_tf", "_rh_clr_walk", "_rh_clr_xr", "cl", "rh_adm_x", "rh_adm_bs", "rh_adm_sep", "rh_adm_code", "rh_adm_rf", "rh_adm_in", "rh_adm_uid", "rh_adm_vst", "rh_adm_vrd", "rh_adm_values", "rh_adm_files", "rh_adm_snaps", "rh_adm_f", "rh_adm_p", "rh_adm_s", "rh_adm_fst", "rh_adm_src", "rh_adm_pre", "rh_adm_dst", "rh_adm_rrs", "rh_adm_rra", "rh_adm_admitted", "rh_adm_stage_input", "rh_adm_cp", "_rh_s1_cp", "rh_a_receipt", "rh_adm_rr", "rh_adm_rrc", "rh_acc_receipt", "_rh_lock_st", "_rh_lock_raw", "_rh_lock_cap", "_rh_lock_rel", "_rh_brr_bm_raw", "managed_bootstrap_bundle_stat", "managed_bootstrap_bundle_raw", "_rh_x2_doc", "_rh_x2_rst", "_rh_x2_rb", "_rh_x2_ar", "_rh_x2_ei", "_rh_x2_ep", "_rh_x2_entry", "_rh_x2_rd", "_rh_x2_rc", "_rh_x2_tr", "_rh_x2_stg", "_rh_x2_act", "_rh_x2_asub", "_rh_x2_rp", "_rh_x2_arp", "_rh_x2_bad", "_rh_rf_ent", "_rh_rf_r", "_rh_rf_st", "_rh_rf_sibad", "_rh_clp_xi", "_rh_clp_xp", "_rh_clp_ini", "_rh_clp_walk", "_rh_clp_mods", "_rh_clp_sep", "_rh_clp_out", "_rh_clp_out_p", "_rh_clp_dv", "_rh_clp_pfx", "_rh_clp_own", "_rh_clp_nest", "_rh_clp_od", "_rh_clp_st", "_rh_clp_fs", "_rh_clp_caps", "_rh_clp_rt", "_rh_clp_tv", "_rh_clp_fin", "_rh_clp_txt", "_rh_clp_doc", "_rh_clp_bad", "lme_clp_bs", "lme_clp_ctl", "lme_clp_rt", "_rh_gp_toid", "_rh_x2_pj", "_rh_x2_va", "_rh_x2_tx", "_rh_x2_rg", "_rh_x2_dp", "_rh_x2_rl", "_rh_x2_est", "_rh_x2_ovf", "_rh_clp_uid", "rh_rsv_render_scope", "rh_rsv_uid", "rh_rsv_include_rel", "_rh_clp_site", "_rh_clp_iv", "_rh_clp_ivbad", "_rh_clp_dc", "_rh_clp_od0", "_rh_clp_of", "_rh_clp_ow", "_rh_clp_pa", "_rh_clp_rx_p", "_rh_clp_src", "_rh_clp_tfp", "_rh_clp_tfs", "_rh_clp_tm", "_rh_clp_ua", "_rh_clp_uid_argv", "_rh_clp_uid_r", "_rh_clp_uid_rx", "_rh_clp_uid_st", "_rh_clp_uid_tool", "_rh_ra_sk", "_rh_ra_sites", "_rh_ra_site", "_rh_ra_iv", "_rh_ra_tv", "_rh_ra_wb", "_rh_ra_rows", "_rh_ra_ep", "_rh_ra_ek", "_rh_ra_alloc", "_rh_ra_in64", "_rh_ra_inb", "_rh_ra_member", "_rh_ra_law", "_rh_ra_enc", "_rh_ra_fresh", "_rh_ra_r", "rh_ra_scope", "rh_ra_op", "rh_ra_site", "_rh_rsv_wb", "_rh_rsv_enc", "_rh_rsv_law", "_rh_x2_pending", "_rh_clp_skeys", "_rh_clp_rtk", "_rh_clp_rtbad", "_rh_rsv_site_keys", "_rh_rsv_site", "_rh_rsv_uidw", "_rh_rsv_alloc", "_rh_rsv_locs", "_rh_rsv_lst", "_rh_rsv_lpst", "_rh_rsv_meas", "_rh_rsv_dprobe", "_rh_rsv_dfree", "_rh_rsv_store", "_rh_rsv_srcs", "_rh_rsv_uw", "_rh_rsv_sw", "_rh_rsv_lm", "_rh_rsv_st", "_rh_rsv_on", "_rh_rsv_sum", "_rh_ra_mw", "_rh_ra_mf", "_rh_ra_mult", "_rh_ra_m", "xp", "cd", "xr", "cm", "_rh_rsv_auth", "_rh_rsv_aw", "_rh_rsv_fsprobe", "_rh_rsv_oa", "_rh_rsv_oadm", "_rh_rsv_ob", "_rh_rsv_od", "_rh_rsv_odf", "_rh_rsv_odp", "_rh_rsv_ods", "_rh_rsv_ofind", "_rh_rsv_ofs", "_rh_rsv_ogone", "_rh_rsv_ol", "_rh_rsv_olk", "_rh_rsv_olst", "_rh_rsv_omeas", "_rh_rsv_omv", "_rh_rsv_op", "_rh_rsv_oprb", "_rh_rsv_or", "_rh_rsv_orb", "_rh_rsv_orec", "_rh_rsv_oreleased", "_rh_rsv_orm", "_rh_rsv_oslp", "_rh_rsv_otmp", "_rh_rsv_ow", "_rh_rsv_pr", "_rh_rsv_reg", "_rh_rsv_rg", "_opg", "_app", "_rh_anc_app", "_rh_pg_app", "_ctx", "_rh_reap_app", "_bl", "_rh_lease_ns_d", "_rh_lease_ns_g", "_rh_reap_pid_d", "_rh_reap_pid_g", "_rh_reap_pstat_d", "_rh_reap_pstat_g", "_rh_reap_cg_d", "_rh_reap_cg_g", "_rh_reap_cgev_d", "_rh_reap_cgev_g", "_rh_anc_uid", "_rh_anc_st", "_rh_anc_pg", "_rh_anc_facts", "_rh_anc_fact", "rh_anc_admitted_private_groups", "_rh_reap_rg", "_rh_reap_regst", "_rh_reap_regls", "_rh_reap_regrd", "_rh_reap_reg", "_rh_reap_left", "_rh_reap_recov", "_rh_reap_regpost", "_rh_reap_keep", "_ob", "_jshape", "_wb", "_dh", "_pending_b", "_text", "_rh_reap_regst_d", "_rh_reap_regls_d", "_rh_reap_regrd_d", "_rh_reap_vw", "_rh_reap_sid", "_rh_reap_smns", "_rh_reap_sls", "_rh_reap_sv", "_rh_reap_sty", "_rh_reap_smt", "_rh_reap_sls2", "_rh_reap_otid_d", "_rh_reap_otok", "_rh_reap_oid_d", "_rh_reap_omns_d", "_rh_reap_ols_d", "_rh_reap_ov_d", "_rh_reap_oty_d", "_rh_reap_omt_d", "_rh_reap_ols2_d", "_canon", "_rh_reap_appl", "_rh_reap_regx", "_rh_reap_ouid", "_rh_reap_rcls", "_ra", "_rh_reap_regst_g", "_rh_reap_regls_g", "_rh_reap_regrd_g", "_dec", "_rh_reap_rshow", "_rh_reap_sae", "_rro", "_rrp", "_rh_reap_fid_g", "_rh_reap_lls_g", "_rh_reap_fid_d", "_rh_reap_lls_d", "_nsp", "_rh_reap_anc", "_rh_reap_ftok", "_rh_reap_pvs_g", "_rh_reap_pvs_d", "_rh_reap_pmo_g", "_rh_reap_pmo_d", "_rh_reap_aty_g", "_rh_reap_aty_d", "_rh_reap_asr_g", "_rh_reap_asr_d", "_rh_n13_phase", "_rh_n13_effect", "_rh_n13_lock_kat", "_rh_n13_create", "_rh_n13_witness", "_rh_n13_recovery", "rh_reap_operation", "rh_reap_effect", "_rh_n13_plan_stats", "_rh_n13_envelope", "_rh_n13_plan", "_rh_n13_contract", "rh_tc_recipe", "rh_tc_recipes", "rh_tc_rows", "rh_tc_lock_rows", "rh_rc_acc", "rh_rc_policy", "rh_rc_key", "_rh_rc_raw", "_rh_n13_destination_lock", "_rh_n13_destination_lock_create", "_rh_n13_destination_lock_readback", "_rh_n13_effect_readback", "_rh_n13_effect_record", "_rh_n13_effect_stat", "_rh_n13_parent_device", "_rh_n13_tool_identity", "_rh_reap_lease_rows", "_rh_reap_record_only", "_rh_reap_record_only_listing", "_rh_reap_record_only_stat", "_rh_reap_unlocked_entries", "_rh_reap_witnessmap", "rh_sc_bs", "rh_sc_wb", "rh_sc_effect", "rh_sc_operation", "rh_sc_witness", "rh_sc_source_path", "rh_sc_target_path", "rh_controller_recipe", "_lease_effect", "_lease_remove", "_bound", "_rh_n13_release_plan", "_rh_n13_release", "_rh_n13_lease_release", "_rh_reap_prepare", "_prep", "_rh_n13_pg", "_rh_n13_lp", "rh_tc_lock", "rh_capture_role", "rh_capture_binding", "rh_recipe_lock", "_rh_recipe_lock_rel", "_rh_recipe_lock_cap", "_rh_recipe_lock_st", "_rh_recipe_lock_raw", "rh_pub_controller", "rh_pub_binding", "rh_admit_controller", "rh_admit_binding", "lme_resolved_verification_source", "lme_resolved_configuration_record", "lme_resolved_configuration_record_text", "lme_resolved_configuration_record_sha256", "lme_resolved_configuration_artifact", "lme_roster_facts", "_lme_roster_projection", "_rr_sf", "_rr_pi", "_sb", "_af", "lme_roster_contract", "_roster_input_names", "_roster_fields", "_rh_acq_recipes", "_rh_acq_locks", "_rh_acq_lock_rel", "_rh_acq_lstat", "_rh_acq_lraw", "_rh_acq_lcap", "_rh_acq_refs", "_rh_acq_rows", "_rh_acq_identity", "_rh_acq_receipt_raw", "_rh_acq_receipt", "_rh_acq_receipt_text", "_rh_acq_readback", "_rh_acq_finalstat", "_rh_acq_store", "_pa"]
     # GRAPH-SHARED-CONTRACT (codex-tick304): reserved OUTPUT name FAMILIES, as contract_admission.patterns names. The
     # loader honours them wherever it honours reserved_outputs (not_in [reserved_outputs], declared target-input vars).
     # The route entry guard (refuse_pinned_outputs.yml) compares EXACT names only: a family's runtime -e/inventory

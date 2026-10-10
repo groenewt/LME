@@ -1354,9 +1354,136 @@ def _prov_vocab(part, vocab_key, value, where):
                          % (where, value, vocab_key, sorted(vocab)))
 
 
+def _material_local_state(catalog, catalog_kinds, distributable, producers, provision,
+                          schema, leaf_owners, non_publication, components):
+    """Admit the existing local-state ownership route before producer partitioning.
+
+    This is declaration validation only. It neither selects a database profile nor
+    creates, transports, projects or reads a persistent record.
+    """
+    policy = schema['local_state_admission']
+    constants, kinds = policy['constants'], policy['types']
+
+    def fail(reason, detail):
+        raise ValueError(policy['errors'][reason].format(detail=detail))
+
+    recs = {section: schema[key] for section, key in policy['sections'].items()}
+    present = [name for name in recs if name in provision]
+    if present and set(present) != set(recs):
+        fail('sections', present)
+    for name, rec in recs.items():
+        if (not isinstance(rec, dict) or not isinstance(rec['required'], list)
+                or not rec['required'] or len(set(rec['required'])) != len(rec['required'])
+                or not isinstance(rec['empty_allowed'], list)
+                or not set(rec['empty_allowed']) <= set(rec['required'])
+                or len(set(rec['empty_allowed'])) != len(rec['empty_allowed'])
+                or _canonical_kind(rec['empty_section_admitted']) != kinds['boolean']):
+            fail('schema', name)
+        if name in provision and (not isinstance(provision[name], dict)
+                or (not provision[name] and rec['empty_section_admitted'] is not constants['enabled'])):
+            fail('sections', name)
+
+    local_kinds = recs[policy['records_section']]['material_kinds']
+    if (not isinstance(local_kinds, list) or not local_kinds
+            or len(set(local_kinds)) != len(local_kinds)
+            or not set(local_kinds) <= set(catalog_kinds)
+            or set(local_kinds) & set(distributable)):
+        fail('schema', policy['details']['schema'])
+
+    custody = schema['local_state_custody']
+    vocab, classes = custody['vocab'], custody['classes']
+    root = custody['root_owner']
+    if (not isinstance(root, dict) or set(root) != set(policy['root_owner_fields'])
+            or root['name'] not in vocab['owner']
+            or _canonical_kind(root['uid']) != kinds['integer']
+            or root['uid'] < constants['zero']):
+        fail('schema', policy['details']['schema'])
+    stat_policy = custody['stat_flag_policy']
+    if (not isinstance(stat_policy, dict)
+            or set(stat_policy) != set(policy['stat_policy_fields'])
+            or any(not isinstance(stat_policy[field], str) or not stat_policy[field]
+                   for field in policy['stat_text_fields'])
+            or any(stat_policy[field] not in vocab[field] for field in policy['stat_vocab_fields'])):
+        fail('schema', policy['details']['schema'])
+    mode_re = re.compile(schema['mode_pattern'])
+    if not isinstance(classes, dict) or not classes:
+        fail('schema', policy['details']['schema'])
+    for name, cls in classes.items():
+        if (not isinstance(cls, dict) or set(cls) != set(custody['class_keys'])
+                or any(not any(_leaf_equal(cls[field], value) for value in vocab[field])
+                       for field in policy['class_vocab_fields'])
+                or not isinstance(cls['forbid_mode_bits'], str)
+                or not mode_re.fullmatch(cls['forbid_mode_bits'])
+                or int(cls['forbid_mode_bits'], constants['mode_radix']) == constants['zero']
+                or not isinstance(cls['forbid_stat_flags'], list) or not cls['forbid_stat_flags']
+                or any(not isinstance(flag, str) or not flag for flag in cls['forbid_stat_flags'])
+                or (not _leaf_equal(cls['parent_class'], constants['absent'])
+                    and cls['parent_class'] not in classes)):
+            fail('schema', name)
+
+    if (not isinstance(components, dict) or not isinstance(components['selected_by'], dict)
+            or not components['selected_by'] or not isinstance(components['selectors'], list)
+            or not components['selectors']
+            or any(selector not in components['selectors']
+                   for selector in components['selected_by'].values())):
+        fail('schema', policy['details']['components'])
+
+    owners = dict(policy['empty']['mapping'])
+    for section in present:
+        rec = recs[section]
+        placeholder_re = re.compile(rec['placeholder_pattern'])
+        if (placeholder_re.groups != constants['one']
+                or not isinstance(rec['placeholders'], list)
+                or len(set(rec['placeholders'])) != len(rec['placeholders'])
+                or rec['object_type'] not in vocab['object_type']):
+            fail('schema', section)
+        for identity, entry in provision[section].items():
+            if (not isinstance(entry, dict) or set(entry) != set(rec['required'])
+                    or any(_canonical_kind(entry[field]) != policy['entry_types'][field]
+                           for field in rec['required'])
+                    or any(not entry[field] for field in rec['required']
+                           if field not in rec['empty_allowed'])):
+                fail('entry', identity)
+            for field, vocabulary in policy['placement_vocab_fields'].items():
+                if entry[field] not in rec[vocabulary]:
+                    fail('entry', identity)
+            cls = (classes[entry['custody_class']] if entry['custody_class'] in classes
+                   else constants['absent'])
+            mode = entry['mode']
+            if (_leaf_equal(cls, constants['absent']) or cls['object_type'] != rec['object_type']
+                    or cls['owner'] != entry['owner_role'] or not mode_re.fullmatch(mode)
+                    or int(mode, constants['mode_radix'])
+                       & int(cls['forbid_mode_bits'], constants['mode_radix'])):
+                fail('custody', identity)
+            per, destination = entry['per'], entry['destination']
+            if (any(not isinstance(value, str) or value not in rec['placeholders'] for value in per)
+                    or len(set(per)) != len(per)
+                    or set(placeholder_re.findall(destination)) != set(per)
+                    or any(delimiter in placeholder_re.sub(policy['empty']['text'], destination)
+                           for delimiter in policy['placeholder_delimiters'])):
+                fail('entry', identity)
+            consumers = entry['consumers']
+            if (any(not isinstance(value, str) or not value for value in consumers)
+                    or len(set(consumers)) != len(consumers)
+                    or any(value not in components['selected_by'] for value in consumers)):
+                fail('consumer', identity)
+            if section == policy['records_section']:
+                material, producer = entry['material'], entry['producer']
+                if (material not in catalog or catalog[material]['kind'] not in local_kinds
+                        or material in owners or material in leaf_owners or material in non_publication
+                        or producer not in producers or material not in producers[producer]['produces_materials']
+                        or producers[producer]['host_scope'] != entry['host_scope']):
+                    fail('producer', identity)
+                for field, vocabulary in policy['record_vocab_fields'].items():
+                    if entry[field] not in rec[vocabulary]:
+                        fail('entry', identity)
+                owners[material] = producer
+    return owners
+
+
 def lme_validate_material_registries(catalog, catalog_schema, producer_registry,
                                      custody_registry, material_provision,
-                                     provision_schema, context=None):
+                                     provision_schema, context=None, *, component_registry):
     """Validate the fix_3 producer/custody registries + the private-key material provision
     (lme_global.{producer_registry,custody_registry,material_provision}) against
     lme_global.material_provision_schema, with reference closure onto the shared
@@ -1692,6 +1819,11 @@ def lme_validate_material_registries(catalog, catalog_schema, producer_registry,
                              'never widen a private-key mode' % (lwhere, mode,
                                                                  P['mode_forbidden_mask']))
 
+    local_material_owner = _material_local_state(
+        catalog, _kv, distributable, producer_registry, material_provision,
+        provision_schema, leaf_material_owner, non_publication_materials, component_registry)
+    local_policy = provision_schema['local_state_admission']
+
     # --- CA/leaf separation (retained explicit KEY-form control) + PARTITION ------
     # The identity check above already rejects any leaf REFERENCING ca_mid; retain the
     # explicit key-form control (a leaf literally KEYED as the ca material) for clarity.
@@ -1699,26 +1831,22 @@ def lme_validate_material_registries(catalog, catalog_schema, producer_registry,
         raise ValueError('lme: ca_key_rule material %r must NOT also be a leaf_key_provision '
                          'entry -- the CA-key rule is SEPARATE from every leaf delivery '
                          'contract (codex private_key_correction)' % ca_mid)
-    # PARTITION over PRODUCER RELATIONS (codex still_required): every NON-distributable
-    # (private-key) material a producer produces must be classified EXACTLY ONCE -- either
-    # delivered by a leaf (published to a channel) or declared non_publication -- never both,
-    # never neither. A produced private key that is neither is an unaccounted key; one that is
-    # both is a contradiction. This binds production to custody by material identity.
+    # Partition every non-distributable produced material across the declared ownership
+    # routes. Local-state kinds require their validated local record and producer binding;
+    # they cannot use a private-key or non-publication route instead.
     for pid, entry in producer_registry.items():
         for mid in (entry.get('produces_materials') or []):
             if (catalog[mid] or {}).get('kind') in distributable:
                 continue
-            in_leaf = mid in leaf_material_owner
-            in_np = mid in non_publication_materials
-            if in_leaf and in_np:
-                raise ValueError('lme: producer %r private key %r is BOTH a leaf delivery and '
-                                 'non_publication -- a private key cannot be both published to '
-                                 'a channel and non-publication' % (pid, mid))
-            if not in_leaf and not in_np:
-                raise ValueError('lme: producer %r produces private key %r but it is neither '
-                                 'delivered by a leaf_key_provision entry nor declared '
-                                 'non_publication -- every produced private key must be '
-                                 'classified exactly once' % (pid, mid))
+            homes = {
+                local_policy['routes']['leaf']: mid in leaf_material_owner,
+                local_policy['routes']['non_publication']: mid in non_publication_materials,
+                local_policy['routes']['local']: mid in local_material_owner}
+            local_kinds = provision_schema['local_state_provision_record']['material_kinds']
+            if (sum(homes.values()) != local_policy['constants']['one']
+                    or (catalog[mid]['kind'] in local_kinds and mid not in local_material_owner)
+                    or (mid in local_material_owner and local_material_owner[mid] != pid)):
+                raise ValueError(local_policy['errors']['partition'].format(detail=(pid, mid, homes)))
     return material_provision
 
 
