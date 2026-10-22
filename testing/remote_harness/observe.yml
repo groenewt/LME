@@ -1,0 +1,657 @@
+---
+# testing/remote_harness/observe.yml -- the GENERIC READ-ONLY OBSERVATION RUNNER (profile
+# controller.bootstrap.observation). It runs ONE declared job of the job file (observation.jobs_rel, schema
+# lme-observation-jobs/1) on EVERY host of the declared target group (inventory.target_group; no host names here), as
+# the declared NON-ROOT owner (connection_profiles.owner, no become), over the raw channel only, and writes the
+# evidence on the controller. Commands are DATA (argv templates with typed placeholders) rendered by
+# templates/observation_step.j2 (macros/observation.j2); nothing on a target is installed, written, mounted, tuned or
+# started/stopped by it.
+#
+# ENTRYPOINT (seed `run`, controller.bootstrap.seed_launcher.caller_argv; ssh_auth.run_argv):
+#   <bundle>/lme-seed-launch.sh run <controller root> <ssh auth mode> -i <inventory> \
+#       <checkout>/testing/remote_harness/observe.yml -e lme_obs_job=<JOB> -e lme_obs_attempt=<ATTEMPT>
+# (`run`, not `run-local`: run-local forces `-i localhost,` and a pinned local connection, so it cannot reach a
+# target; `run` is the declared mode of every target-contacting route playbook, like target_bootstrap.yml.)
+# No --limit (the evidence covers the whole group), no --tags / --skip-tags, no --check: each refuses.
+#
+# GUARD NAMES: seed `run` passes extra-vars through, and an extra-var outranks task vars, registers and loop vars.
+# Every name this runner derives -- facts (rh_obs_*) AND its task vars, registers and loop vars (_rh_obs_*) -- is
+# therefore REFUSED as an input at the entry of both plays that read them (^_?rh_obs_, RH-DERIVED-OUTPUT-PINNED), so
+# no guard input can be pre-empted from outside. (The shared tasks this runner includes keep their own names and
+# their own guards; that is their contract, not this file's.)
+#
+# Inventory (no defaults): localhost = the controller (lme_toolchain_root / lme_toolchain_owner, as for
+# target_bootstrap.yml); group lme_toolchain_targets, per host: lme_toolchain_root, lme_toolchain_owner,
+# lme_ssh_auth_mode, lme_toolchain_owner_key (explicit_key; a path reference, never read), optionally
+# ansible_host / ansible_port / ansible_ssh_common_args (B's ONE ProxyJump form), and the vars of the job's DECLARED
+# TARGET INPUTS (controller.bootstrap.inventory.target_inputs roles obs_paths / obs_prior_dirs / obs_unit_patterns,
+# vars lme_obs_paths / lme_obs_prior_dirs / lme_obs_unit_patterns). The runner never reads those host vars: it reads
+# the loader's typed binding lme_resolved.remote_harness.binding.deployment.target_inputs.<host>.<role>, which is part
+# of every scope_sha256 (host / path / unit selections are bound into the resolved run revision; codex-tick307 (5)).
+#
+# EVIDENCE (controller; every dir mode evidence.dir_mode, every file evidence.file_mode):
+#   <work root>/<work_roots.sub_roots.run>/<evidence.run_rel>/<job>/<attempt>/     created EXCLUSIVELY (existing refuses:
+#     an attempt identity is never reused, so a changed job definition can never inherit a prior attempt or its
+#     admission; every run re-admits the job file, the policy and each host from scratch)
+#     <evidence.host_dir>/<host>.json    one per host of the group (schema evidence.host_schema), written first
+#     <evidence.attempt_file>            written LAST (schema evidence.attempt_schema); its presence = the attempt closed
+# A host that refuses or is unreachable still gets its record; the run fails AFTER writing the evidence unless the
+# attempt is COMPLETE (jobs semantics.attempt_results). A host is COMPLETE only when every step's RECORDED instances
+# are exactly its SELECTED ones, compared case-sensitively (coverage; gaps recorded as coverage_gaps), and a job file
+# whose selected job has no steps refuses before any contact (codex-tick315).
+# ABORTED ATTEMPT: an attempt dir WITHOUT attempt.json is an aborted attempt (never a result). It arises when every
+# host of the target play fails OUTSIDE the recording block (the un-rescued entry refusals; ansible then breaks the
+# playbook and the evidence play never runs) or the controller dies. Its attempt id stays burned (never reused).
+
+- name: Observation runner -- controller side (admit the run, the job and the evidence dir)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') or '~/.ansible/tmp' }}"
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
+
+    - name: Bind the effective controller connection before any effect (local, localhost, no become; r3g)
+      ansible.builtin.include_tasks: tasks/admit_controller.yml
+
+    # the runner's own derived names (rh_obs_* facts, _rh_obs_* task vars / registers / loop vars) until C1's registry
+    # lists them in reserved_outputs (proposal). Inline: no task var of its own.
+    - name: Refuse pre-supplied observation runner names (^_?rh_obs_)
+      ansible.builtin.assert:
+        that:
+          - (vars | list) | select('match', '^_?rh_obs_') | list | length == 0
+        fail_msg: >-
+          REFUSED RH-DERIVED-OUTPUT-PINNED: observation runner names supplied from outside:
+          {{ (vars | list) | select('match', '^_?rh_obs_') | list }}
+        quiet: true
+
+    - name: Resolve the harness policy, verify the controller receipt and bind the managed executor
+      ansible.builtin.include_tasks: tasks/resolve_harness.yml
+
+    - name: Refuse an undeclared runner, run scratch dir, selection or invocation form (RH-OBSERVATION)
+      vars:
+        _rh_obs_ob: "{{ rh.controller.bootstrap.observation | default(none) }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_obs_ob is mapping
+          - _rh_obs_ob.refusal | default('') == 'RH-OBSERVATION'
+          - _rh_obs_ob.channel | default('') == 'raw'
+          - _rh_obs_ob.connect_as | default('') == 'owner'
+          # codex-tick307: the job file is BOUND (jobs_rel + jobs_sha256); no provenance-only variant, no default
+          - (_rh_obs_ob.jobs_sha256 | default('')) is match('^[0-9a-f]{64}$')
+          - playbook_dir ~ '/observe.yml' == rh_repo_root ~ '/' ~ _rh_obs_ob.playbook_rel
+          - _rh_obs_ob.macros_rel == (_rh_obs_ob.step_template_rel | dirname) ~ '/macros/observation.j2'
+          - rh.controller.bootstrap.inventory.target_group == 'lme_toolchain_targets'
+          - lookup('ansible.builtin.env', 'TMPDIR') is match('^' ~ (rh_owned_root | regex_escape) ~ '/' ~ rh.controller.bootstrap.layout.run_dir ~ '/[^/]+/tmp$')
+          - ansible_remote_tmp == lookup('ansible.builtin.env', 'TMPDIR')
+          - ansible_limit is not defined
+          - ansible_run_tags | default(['all']) == ['all']
+          - ansible_skip_tags | default([]) | length == 0
+          - not (ansible_check_mode | bool)
+          - lookup('ansible.builtin.vars', _rh_obs_ob.inputs.job_var, default='') is match('^[A-Z][A-Z0-9-]*$')
+          - lookup('ansible.builtin.vars', _rh_obs_ob.inputs.attempt_var, default='') is match(_rh_obs_ob.inputs.attempt_regex)
+          - rh.controller.bootstrap.base_env.LC_ALL is match('^[A-Za-z0-9._@-]+$')
+        fail_msg: >-
+          REFUSED RH-OBSERVATION: the runner needs the resolved controller.bootstrap.observation declaration (C1
+          admission), this playbook at its observation.playbook_rel, the declared target group, a `seed run` TMPDIR
+          (<root>/{{ rh.controller.bootstrap.layout.run_dir }}/<run>/tmp), no --limit / --tags / --skip-tags / --check,
+          and -e {{ (_rh_obs_ob | default({}, true)).inputs.job_var | default('lme_obs_job') }}=<JOB ID>
+          -e {{ (_rh_obs_ob | default({}, true)).inputs.attempt_var | default('lme_obs_attempt') }}=<attempt id>.
+        quiet: true
+
+    - name: Stat the job file (controller; regular file, no link followed; sha256; read-only)
+      ansible.builtin.stat:
+        path: "{{ rh_repo_root ~ '/' ~ rh.controller.bootstrap.observation.jobs_rel }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: _rh_obs_jobs_st
+
+    - name: Refuse a job file that is absent or not a regular file (before any read or contact)
+      ansible.builtin.assert:
+        that:
+          - _rh_obs_jobs_st.stat.exists | default(false)
+          - _rh_obs_jobs_st.stat.isreg | default(false)
+        fail_msg: >-
+          REFUSED RH-OBSERVATION: job file {{ rh.controller.bootstrap.observation.jobs_rel }} is absent or not a regular
+          file. Nothing was contacted.
+        quiet: true
+
+    # ONE read (rstrip=false: the text exactly as read); its digest is compared and the SAME text is parsed below
+    - name: Read the job file ONCE (controller; the text that is hashed is the text that is parsed)
+      ansible.builtin.set_fact:
+        _rh_obs_jobs_text: "{{ lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ rh.controller.bootstrap.observation.jobs_rel, rstrip=false) }}"
+
+    # codex-tick307 JOB BINDING: the digest of the text read above AND the file's stat digest must both equal the
+    # declared jobs_sha256 BEFORE the text is parsed, validated or used (another byte refuses here, before any target
+    # contact). Expected and observed digests are recorded in the evidence.
+    - name: Refuse a job file that is not the declared bytes (observation.jobs_sha256; before any contact)
+      ansible.builtin.assert:
+        that:
+          - (_rh_obs_jobs_text | hash('sha256')) == rh.controller.bootstrap.observation.jobs_sha256
+          - _rh_obs_jobs_st.stat.checksum | default('') == rh.controller.bootstrap.observation.jobs_sha256
+        fail_msg: >-
+          REFUSED RH-OBSERVATION: job file {{ rh.controller.bootstrap.observation.jobs_rel }} (read sha256
+          {{ _rh_obs_jobs_text | hash('sha256') }}, stat sha256 {{ _rh_obs_jobs_st.stat.checksum | default('absent') }})
+          is not the declared observation.jobs_sha256 {{ rh.controller.bootstrap.observation.jobs_sha256 }}. Nothing was
+          contacted.
+        quiet: true
+
+    - name: Parse the bound job text (derived output; the same text whose digest was admitted)
+      ansible.builtin.set_fact:
+        rh_obs_jobs_sha256: "{{ _rh_obs_jobs_text | hash('sha256') }}"
+        rh_obs_jobs: "{{ _rh_obs_jobs_text | from_yaml }}"
+
+    - name: Refuse a job file that is not valid in the closed vocabulary, or lacks the selected job
+      vars:
+        _rh_obs_ob: "{{ rh.controller.bootstrap.observation }}"
+        _rh_obs_jobid: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.observation.inputs.job_var) }}"
+        _rh_obs_errors: >-
+          {{ lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ _rh_obs_ob.step_template_rel,
+                    template_vars={'rh_obs_part': 'validate', 'rh_obs_jobs': rh_obs_jobs,
+                                   'rh_obs_ot': rh.controller.bootstrap.os_tools}) | from_json }}
+      ansible.builtin.assert:
+        that:
+          - rh_obs_jobs is mapping and rh_obs_jobs.schema | default('') == _rh_obs_ob.jobs_schema
+          - _rh_obs_errors | length == 0
+          - _rh_obs_jobid in (rh_obs_jobs.jobs | default({}))
+          # every role the job file names is a DECLARED target input of the policy (bound per target by the loader)
+          - rh.controller.bootstrap.inventory.target_inputs | default(none) is mapping
+          - (rh_obs_jobs.target_inputs | default({}) | list | reject('in', rh.controller.bootstrap.inventory.target_inputs | default({})) | list | length) == 0
+        fail_msg: >-
+          REFUSED RH-OBSERVATION: job file {{ _rh_obs_ob.jobs_rel }} (sha256 {{ rh_obs_jobs_sha256 }}), schema
+          {{ rh_obs_jobs.schema | default('?') }}, job '{{ _rh_obs_jobid }}' (declared: {{ (rh_obs_jobs.jobs | default({})) | list }}),
+          validation errors: {{ _rh_obs_errors }}; job target inputs {{ (rh_obs_jobs.target_inputs | default({})) | list }} vs
+          declared roles {{ (rh.controller.bootstrap.inventory.target_inputs | default({})) | list }}
+        quiet: true
+
+    - name: Refuse an empty target set (no target-deployment or observation credit without a target)
+      ansible.builtin.assert:
+        that:
+          - groups[rh.controller.bootstrap.inventory.target_group] | default([]) | length > 0
+        fail_msg: >-
+          REFUSED RH-OBSERVATION: the inventory's group {{ rh.controller.bootstrap.inventory.target_group }} is empty
+          or absent; nothing is observed and no evidence is written.
+        quiet: true
+
+    - name: Project each target's effective SSH common args (tasks/project_ssh_conn.yml)
+      ansible.builtin.include_tasks: tasks/project_ssh_conn.yml
+
+    - name: Derive the evidence paths (workspace anchor; work_roots)
+      vars:
+        _rh_obs_wr: "{{ rh.controller.bootstrap.work_roots }}"
+        _rh_obs_ob: "{{ rh.controller.bootstrap.observation }}"
+        _rh_obs_sep: "{{ '/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/' }}"
+        _rh_obs_w: "{{ (rh_owned_root.split(_rh_obs_sep)[:-1] | join(_rh_obs_sep)) ~ '/' ~ rh.controller.bootstrap.work_roots.root_rel }}"
+        _rh_obs_base: "{{ _rh_obs_w ~ '/' ~ rh.controller.bootstrap.work_roots.sub_roots.run ~ '/' ~ rh.controller.bootstrap.observation.evidence.run_rel }}"
+        _rh_obs_jobid: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.observation.inputs.job_var) }}"
+      ansible.builtin.set_fact:
+        rh_obs_dirs:
+          work_root: "{{ _rh_obs_w }}"
+          chain:
+            - "{{ _rh_obs_w ~ '/' ~ _rh_obs_wr.sub_roots.run }}"
+            - "{{ _rh_obs_base }}"
+            - "{{ _rh_obs_base ~ '/' ~ _rh_obs_jobid }}"
+          attempt: "{{ _rh_obs_base ~ '/' ~ _rh_obs_jobid ~ '/' ~ lookup('ansible.builtin.vars', _rh_obs_ob.inputs.attempt_var) }}"
+          hosts: "{{ _rh_obs_base ~ '/' ~ _rh_obs_jobid ~ '/' ~ lookup('ansible.builtin.vars', _rh_obs_ob.inputs.attempt_var) ~ '/' ~ _rh_obs_ob.evidence.host_dir }}"
+
+    - name: Refuse evidence paths outside this checkout's declared work root (RH-OBSERVATION)
+      ansible.builtin.assert:
+        that:
+          - (rh.controller.bootstrap.work_roots.root_rel is match('^[A-Za-z0-9._-]+$'))
+          - ('/' ~ rh.controller.bootstrap.work_roots.root_rel ~ '/') in rh_owned_root
+          - rh_obs_dirs.work_root == rh_repo_root ~ '/' ~ rh.controller.bootstrap.work_roots.root_rel
+          - (rh_obs_dirs.chain + [rh_obs_dirs.attempt, rh_obs_dirs.hosts]) | reject('match', rh.controller.bootstrap.path_admission.regex) | list | length == 0
+          - (rh_obs_dirs.chain + [rh_obs_dirs.attempt, rh_obs_dirs.hosts]) | select('search', rh.controller.bootstrap.path_admission.forbidden_segment_regex) | list | length == 0
+          - ((rh_obs_dirs.work_root | dirname) ~ '/') is not match('(' ~ (rh.controller.bootstrap.work_roots.admission.refused_prefixes | map('regex_escape') | join('|')) ~ ')')
+        fail_msg: >-
+          REFUSED RH-OBSERVATION: the evidence dir {{ rh_obs_dirs.attempt }} is not under this checkout's work root
+          {{ rh_repo_root }}/{{ rh.controller.bootstrap.work_roots.root_rel }} (controller root {{ rh_owned_root }}), is not
+          an admitted path, or the work root lies under {{ rh.controller.bootstrap.work_roots.admission.refused_prefixes }}.
+        quiet: true
+
+    - name: Admit the ancestry of the evidence dir at the use boundary (tasks/admit_ancestry.yml)
+      ansible.builtin.include_tasks: tasks/admit_ancestry.yml
+      vars:
+        rh_anc_bs: "{{ rh.controller.bootstrap }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ rh_obs_dirs.attempt }}"
+        rh_anc_refusal: RH-OBSERVATION
+
+    - name: Read the running uid (controller; declared tool)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.id.path }}", -u]
+      register: _rh_obs_uid
+      changed_when: false
+
+    - name: Stat the evidence parent chain (no link followed; read-only)
+      ansible.builtin.stat:
+        path: "{{ _rh_obs_i }}"
+        follow: false
+        get_checksum: false
+      loop: "{{ rh_obs_dirs.chain }}"
+      loop_control:
+        loop_var: _rh_obs_i
+      register: _rh_obs_chain_st
+
+    - name: Create each absent evidence parent (declared mkdir, mode evidence.dir_mode; never chmod of an existing dir)
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.mkdir.path }}", -m, "{{ rh.controller.bootstrap.observation.evidence.dir_mode }}", --, "{{ _rh_obs_i._rh_obs_i }}"]
+      loop: "{{ _rh_obs_chain_st.results }}"
+      loop_control:
+        loop_var: _rh_obs_i
+        label: "{{ _rh_obs_i._rh_obs_i }}"
+      when: not _rh_obs_i.stat.exists
+
+    - name: Create the attempt dir EXCLUSIVELY (an existing attempt refuses; never reused) and its host dir
+      ansible.builtin.command:
+        argv: ["{{ rh.controller.bootstrap.os_tools.mkdir.path }}", -m, "{{ rh.controller.bootstrap.observation.evidence.dir_mode }}", --, "{{ _rh_obs_i }}"]
+      loop: ["{{ rh_obs_dirs.attempt }}", "{{ rh_obs_dirs.hosts }}"]
+      loop_control:
+        loop_var: _rh_obs_i
+
+    - name: Read back the evidence dirs (no link followed)
+      ansible.builtin.stat:
+        path: "{{ _rh_obs_i }}"
+        follow: false
+        get_checksum: false
+      loop: "{{ rh_obs_dirs.chain + [rh_obs_dirs.attempt, rh_obs_dirs.hosts] }}"
+      loop_control:
+        loop_var: _rh_obs_i
+      register: _rh_obs_dirs_st
+
+    - name: Refuse evidence dirs that are not owned private real directories (RH-OBSERVATION)
+      vars:
+        _rh_obs_st: "{{ _rh_obs_dirs_st.results | map(attribute='stat') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_obs_st | rejectattr('exists') | list | length == 0
+          - _rh_obs_st | selectattr('islnk') | list | length == 0
+          - _rh_obs_st | rejectattr('isdir') | list | length == 0
+          - _rh_obs_st | map(attribute='uid') | reject('equalto', _rh_obs_uid.stdout | int) | list | length == 0
+          - _rh_obs_st | selectattr('wgrp') | list | length == 0
+          - _rh_obs_st | selectattr('woth') | list | length == 0
+          - (_rh_obs_st[-2:] | map(attribute='mode') | unique | list) == [rh.controller.bootstrap.observation.evidence.dir_mode]
+        fail_msg: >-
+          REFUSED RH-OBSERVATION: every evidence dir must be a real directory owned by uid {{ _rh_obs_uid.stdout }} and
+          free of group/other write, the attempt and host dirs of mode {{ rh.controller.bootstrap.observation.evidence.dir_mode }}:
+          {{ _rh_obs_st | map(attribute='path') | list }}
+        quiet: true
+
+    - name: Record the run (derived output; the target play and the evidence play read it)
+      vars:
+        _rh_obs_ob: "{{ rh.controller.bootstrap.observation }}"
+      ansible.builtin.set_fact:
+        rh_obs_run:
+          job: "{{ lookup('ansible.builtin.vars', _rh_obs_ob.inputs.job_var) }}"
+          attempt: "{{ lookup('ansible.builtin.vars', _rh_obs_ob.inputs.attempt_var) }}"
+          dir: "{{ rh_obs_dirs.attempt }}"
+          host_dir: "{{ rh_obs_dirs.hosts }}"
+          started_at_utc: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+          jobs: {rel: "{{ _rh_obs_ob.jobs_rel }}", expected_sha256: "{{ _rh_obs_ob.jobs_sha256 }}", observed_sha256: "{{ rh_obs_jobs_sha256 }}", observed_stat_sha256: "{{ _rh_obs_jobs_st.stat.checksum }}"}
+          group: "{{ rh.controller.bootstrap.inventory.target_group }}"
+          group_hosts: "{{ groups[rh.controller.bootstrap.inventory.target_group] | list }}"
+
+- name: Observation runner -- target side (read-only raw observation as the declared non-root owner)
+  hosts: lme_toolchain_targets
+  gather_facts: false
+  become: false
+  # connection profile `owner` (inventory.connection_profiles.owner) as PLAY vars, exactly as target_bootstrap.yml;
+  # admit_transport.yml re-checks the effective values (codex-tick315: the effective key selector must equal the owner
+  # profile's key reference -- and, where the policy declares target inputs, the bound owner_key -- in explicit_key,
+  # and be empty in agent / tailnet_identity), and the FIRST CONTACT reads the connected uid / account back (non-zero
+  # uid, declared owner) before any job step. ansible_ssh_use_tty false: raw would otherwise force a tty
+  # (`-tt`) and merge stderr into stdout (jobs semantics.tty); an extra-var could outrank this play var, so the
+  # effective value is asserted below before any contact.
+  vars:
+    ansible_user: "{{ lme_toolchain_owner | default('') }}"
+    ansible_ssh_private_key_file: "{{ lme_toolchain_owner_key | default('') }}"
+    ansible_ssh_common_args: "{{ hostvars['localhost'].rh_conn[inventory_hostname].ansible_ssh_common_args | default('') }}"
+    ansible_ssh_use_tty: false
+  tasks:
+    # OUTSIDE the recording block: a pinned name, or a run the controller play did not admit (e.g. a --limit that
+    # excluded localhost), FAILS the host outright -- never a rescued, exit-0 "refusal" with no evidence written.
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
+
+    - name: Refuse pre-supplied observation runner names (^_?rh_obs_)
+      ansible.builtin.assert:
+        that:
+          - (vars | list) | select('match', '^_?rh_obs_') | list | length == 0
+        fail_msg: >-
+          REFUSED RH-DERIVED-OUTPUT-PINNED on {{ inventory_hostname }}: observation runner names supplied from outside:
+          {{ (vars | list) | select('match', '^_?rh_obs_') | list }}
+        quiet: true
+
+    - name: Refuse a run the controller play did not admit (RH-OBSERVATION)
+      ansible.builtin.assert:
+        that:
+          - hostvars['localhost'].rh_obs_run is defined
+          - hostvars['localhost'].rh_obs_run.group_hosts is contains(inventory_hostname)
+        fail_msg: >-
+          REFUSED RH-OBSERVATION on {{ inventory_hostname }}: the controller play did not admit this run for this host
+          (no evidence dir exists for it). Nothing was contacted.
+        quiet: true
+
+    - name: Observe this host (every refusal from here on is recorded as this host's result, never lost)
+      block:
+        - name: Initialize this host's observation state (derived outputs)
+          ansible.builtin.set_fact:
+            rh_obs_records: []
+            rh_obs_stop: false
+            rh_obs_refusal: ''
+            rh_obs_identity: {}
+
+        # inside the block: a refusal here is RECORDED (REFUSED) and the evidence play still runs
+        - name: Refuse a tty-forcing connection (RH-OBSERVATION; before any contact)
+          ansible.builtin.assert:
+            that:
+              - ansible_ssh_use_tty is sameas false
+            fail_msg: >-
+              REFUSED RH-OBSERVATION on {{ inventory_hostname }}: ansible_ssh_use_tty is not the boolean false (a tty
+              would merge stderr into stdout). Nothing was contacted.
+            quiet: true
+
+        - name: Resolve the harness policy through the engine
+          ansible.builtin.include_tasks: tasks/resolve_policy.yml
+
+        - name: Admit transport authentication, owner connection and no-become (no contact yet)
+          ansible.builtin.include_tasks: tasks/admit_transport.yml
+
+        # PER-HOST-SCOPE-CONTRACT: the `that` list is VERBATIM target_bootstrap.yml's RH-SCOPE-BINDING assert (inline, no
+        # task vars). target_bootstrap.yml's following tasks (target input admission against the controller's admitted
+        # bundle; scope_classes.yml / artifact binding) are NOT repeated: this runner ships and consumes no bundle
+        # artifact (rh_bundle_dir), so it has no artifact binding to check (declared deviation).
+        - name: Refuse a target scope that is not this inventory identity's exact expected scope (RH-SCOPE-BINDING)
+          ansible.builtin.assert:
+            that:
+              - hostvars['localhost'].lme_resolved.remote_harness.scopes_sha256 | default('') is match('^[0-9a-f]{64}$')
+              - lme_resolved.remote_harness.scope | default({}) == dict(kind='target', id=inventory_hostname)
+              - lme_resolved.remote_harness.scope_sha256 | default('') is match('^[0-9a-f]{64}$')
+              - lme_resolved.remote_harness.scopes_sha256 | default('') == hostvars['localhost'].lme_resolved.remote_harness.scopes_sha256
+              - lme_resolved.remote_harness.binding | default({}) == hostvars['localhost'].lme_resolved.remote_harness.binding
+              - hostvars['localhost'].lme_resolved.remote_harness.scopes.targets | default(none) is mapping
+              - inventory_hostname in hostvars['localhost'].lme_resolved.remote_harness.scopes.targets
+              - hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname] is mapping
+              - lme_resolved.remote_harness.scope_sha256 == hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname].scope_sha256 | default('')
+              - lme_resolved.remote_harness.policy_sha256 | default('') is match('^[0-9a-f]{64}$')
+              - lme_resolved.remote_harness.policy_sha256 == hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname].policy_sha256 | default('')
+              - rh_config_revision == lme_resolved.remote_harness.policy_sha256
+              - lme_resolved.remote_harness.scopes.targets | default(none) is mapping
+              - lme_resolved.remote_harness.scopes.targets[inventory_hostname].scope_sha256 | default('') == lme_resolved.remote_harness.scope_sha256
+              - lme_resolved.remote_harness.binding is mapping and lme_resolved.remote_harness.binding.deployment is mapping
+              - lme_resolved.remote_harness.binding.source_edition is mapping
+              - lme_resolved.remote_harness.binding.deployment.controller == 'localhost'
+              - lme_resolved.remote_harness.binding.deployment.target_group == rh.controller.bootstrap.inventory.target_group
+              - lme_resolved.remote_harness.binding.deployment.targets == (groups[rh.controller.bootstrap.inventory.target_group] | default([]) | unique | sort)
+              - lme_resolved.remote_harness.binding.source_edition.profile_sha256 == rh_profile_sha256
+              - lme_resolved.remote_harness.binding.source_edition.global_sha256 == (lookup('ansible.builtin.file', rh_repo_root ~ '/manifests/global.yml') | hash('sha256'))
+              - lme_resolved.remote_harness.binding.operation == rh.transfer.operation
+              # ADDITIONAL compatibility check only (never identity); both sides present 64-hex, never absent == absent
+              - lme_resolved.remote_harness.scope_invariant_sha256 | default('') is match('^[0-9a-f]{64}$')
+              - hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname].scope_invariant_sha256 | default('') is match('^[0-9a-f]{64}$')
+              - lme_resolved.remote_harness.scope_invariant_sha256 == hostvars['localhost'].lme_resolved.remote_harness.scopes.targets[inventory_hostname].scope_invariant_sha256
+            fail_msg: >-
+              REFUSED RH-SCOPE-BINDING on {{ inventory_hostname }}: this host's resolved scope
+              {{ lme_resolved.remote_harness.scope | default('absent') }} (scope_sha256
+              {{ lme_resolved.remote_harness.scope_sha256 | default('absent') }}) is not the controller's expected
+              target scope for this inventory identity, or the deployment / source edition / operation binding
+              differs, or the compatibility digest differs. Nothing was contacted.
+            quiet: true
+
+        # target inputs: ONLY the loader's typed, scope-bound values (binding.deployment.target_inputs.<this host>;
+        # equal to the controller's binding by the scope assert above), restricted to the roles the job file names.
+        # A role not bound for this host is simply absent here; a step that needs it refuses below, before contact.
+        - name: Bind this host's resolved tool map, locale, job and bound target inputs (the host's OWN policy; derived outputs)
+          vars:
+            _rh_obs_bound: "{{ (lme_resolved.remote_harness.binding.deployment.target_inputs | default({}))[inventory_hostname] | default({}) }}"
+          ansible.builtin.set_fact:
+            rh_obs_jobs: "{{ hostvars['localhost'].rh_obs_jobs }}"
+            rh_obs_job: "{{ hostvars['localhost'].rh_obs_jobs.jobs[hostvars['localhost'].rh_obs_run.job] }}"
+            rh_obs_ot: "{{ rh.controller.bootstrap.os_tools }}"
+            rh_obs_loc: "{{ rh.controller.bootstrap.base_env.LC_ALL }}"
+            rh_obs_hin: "{{ _rh_obs_bound | dict2items | selectattr('key', 'in', hostvars['localhost'].rh_obs_jobs.target_inputs | default({})) | items2dict }}"
+
+        - name: Refuse a host whose policy does not admit this job (tools, locale, observation declaration)
+          vars:
+            _rh_obs_errors: >-
+              {{ lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ rh.controller.bootstrap.observation.step_template_rel,
+                        template_vars={'rh_obs_part': 'validate', 'rh_obs_jobs': rh_obs_jobs, 'rh_obs_ot': rh_obs_ot}) | from_json }}
+          ansible.builtin.assert:
+            that:
+              - rh.controller.bootstrap.observation == hostvars['localhost'].rh.controller.bootstrap.observation
+              - _rh_obs_errors | length == 0
+              - rh_obs_loc is match('^[A-Za-z0-9._@-]+$')
+            fail_msg: >-
+              REFUSED RH-OBSERVATION on {{ inventory_hostname }}: this host's resolved observation declaration differs
+              from the controller's, or its os_tools do not admit the job file: {{ _rh_obs_errors }}
+            quiet: true
+
+        # PRE-CONTACT: every target-input list of the job is typed BEFORE the first raw command
+        - name: Refuse absent or invalid target inputs before any contact (typed substitution)
+          vars:
+            _rh_obs_r: >-
+              {{ lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ rh.controller.bootstrap.observation.step_template_rel,
+                        template_vars={'rh_obs_part': 'instances', 'rh_obs_jobs': rh_obs_jobs, 'rh_obs_job': rh_obs_job,
+                                       'rh_obs_step': _rh_obs_i, 'rh_obs_ot': rh_obs_ot, 'rh_obs_hin': rh_obs_hin,
+                                       'rh_obs_prior': [], 'rh_obs_loc': rh_obs_loc}) | from_json }}
+          ansible.builtin.assert:
+            that:
+              - _rh_obs_r.errors | length == 0
+            fail_msg: >-
+              REFUSED RH-OBSERVATION on {{ inventory_hostname }}: step {{ _rh_obs_i.id }} target input
+              {{ _rh_obs_i.input.target_input }}: {{ _rh_obs_r.errors }} (a bound non-empty list of typed values; nothing was contacted)
+            quiet: true
+          loop: "{{ rh_obs_job.steps | selectattr('input.kind', 'equalto', 'host_list') | list }}"
+          loop_control:
+            loop_var: _rh_obs_i
+            label: "{{ _rh_obs_i.id }}"
+
+        - name: Derive the job's tool set and the identity command (declared tools only)
+          vars:
+            _rh_obs_tpl: "{{ rh_repo_root ~ '/' ~ rh.controller.bootstrap.observation.step_template_rel }}"
+            _rh_obs_tools: >-
+              {{ lookup('ansible.builtin.template', _rh_obs_tpl, template_vars={'rh_obs_part': 'job_tools', 'rh_obs_jobs': rh_obs_jobs,
+                        'rh_obs_job': rh_obs_job}) | from_json }}
+          ansible.builtin.set_fact:
+            rh_obs_identity:
+              tools: "{{ _rh_obs_tools }}"
+              command: >-
+                {{ (lookup('ansible.builtin.template', _rh_obs_tpl, template_vars={'rh_obs_part': 'identity_command', 'rh_obs_jobs': rh_obs_jobs,
+                          'rh_obs_tools': _rh_obs_tools, 'rh_obs_ot': rh_obs_ot, 'rh_obs_oti': rh.controller.bootstrap.os_tool_identity,
+                          'rh_obs_loc': rh_obs_loc}) | from_json).command }}
+
+        # the ONE raw contact before any job step: tool identities + followed file metadata (NOT path ancestry; see
+        # macros/observation.j2 identity_command) + the connected principal (uid| / uname| lines, initial_contact.yml's
+        # convention), admitted by the two asserts below before the first job step
+        - name: FIRST CONTACT -- the job's tool identities (raw; known answer, digests, file custody; read-only)
+          ansible.builtin.raw: "{{ rh_obs_identity.command }}"
+          register: rh_obs_idraw
+          changed_when: false
+          failed_when: false
+          ignore_unreachable: true
+
+        # codex-tick315 OBS-FAILURE-DIAGNOSTIC: the cause of an unreachable contact is result.msg (no stdout / stderr);
+        # it is kept as the bounded diagnostic (semantics.max_output_chars), stderr stays the stream
+        - name: Record an unreachable host (UNREACHABLE; no step runs)
+          when: rh_obs_idraw.unreachable | default(false)
+          ansible.builtin.set_fact:
+            rh_obs_stop: true
+            rh_obs_records:
+              - step: identity
+                instance: identity
+                argv: []
+                rc: null
+                class: UNREACHABLE
+                stdout: ''
+                stderr: "{{ (rh_obs_idraw.stderr | default('') | string)[:(rh_obs_jobs.semantics.max_output_chars | int)] }}"
+                truncated: false
+                yields: {}
+                rejected: {}
+                diagnostic: "{{ (rh_obs_idraw.msg | default('') | string)[:(rh_obs_jobs.semantics.max_output_chars | int)] }}"
+                diagnostic_chars: "{{ (rh_obs_idraw.msg | default('') | string) | length }}"
+
+        - name: Refuse tools that are absent, not their declared identity or not uid-0 custody (named with their package)
+          when: not (rh_obs_idraw.unreachable | default(false))
+          vars:
+            _rh_obs_problems: >-
+              {{ lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ rh.controller.bootstrap.observation.step_template_rel,
+                        template_vars={'rh_obs_part': 'identity_check', 'rh_obs_tools': rh_obs_identity.tools, 'rh_obs_ot': rh_obs_ot,
+                                       'rh_obs_oti': rh.controller.bootstrap.os_tool_identity, 'rh_obs_pv': rh.packages.provides,
+                                       'rh_obs_out': rh_obs_idraw.stdout | default('')}) | from_json }}
+          ansible.builtin.assert:
+            that:
+              - _rh_obs_problems | length == 0
+            fail_msg: >-
+              REFUSED RH-OBSERVATION on {{ inventory_hostname }} (identity): {{ _rh_obs_problems }}
+              (rc {{ rh_obs_idraw.rc | default('none') }}; stderr {{ (rh_obs_idraw.stderr | default(''))[:2000] }}). A missing
+              tool is supplied by the declared MAIN prerequisite tasks (packages.provides), never here.
+            quiet: true
+
+        # codex-tick315 OBS-CONNECTED-PRINCIPAL: the ACTUAL connected account, read back by the SAME raw contact with the
+        # declared semantics.principal_tool (identity-admitted just above), must be a NON-ZERO uid under the declared
+        # owner name (inventory.owner_var; admit_transport.yml already bound ansible_user to it). A uid-0 account with
+        # a non-root name refuses here, before any job step.
+        - name: Refuse a connected principal that is uid 0 or not the declared owner (RH-OBSERVATION; before any job step)
+          when: not (rh_obs_idraw.unreachable | default(false))
+          vars:
+            _rh_obs_pp: >-
+              {{ lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ rh.controller.bootstrap.observation.step_template_rel,
+                        template_vars={'rh_obs_part': 'principal_check',
+                                       'rh_obs_owner': lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.owner_var, default=''),
+                                       'rh_obs_out': rh_obs_idraw.stdout | default('')}) | from_json }}
+          ansible.builtin.assert:
+            that:
+              - _rh_obs_pp | length == 0
+            fail_msg: >-
+              REFUSED RH-OBSERVATION on {{ inventory_hostname }} (principal): {{ _rh_obs_pp }}. The observation runner
+              connects only as the declared non-root owner (uid 0 refused under any name). No job step ran.
+            quiet: true
+
+        - name: Run the job's declared steps in order (tasks/observe_step.yml)
+          ansible.builtin.include_tasks: tasks/observe_step.yml
+          loop: "{{ rh_obs_job.steps }}"
+          loop_control:
+            loop_var: rh_obs_s
+            label: "{{ rh_obs_s.id }}"
+
+      rescue:
+        - name: Record the refusal (this host's result is REFUSED; the evidence keeps the message)
+          ansible.builtin.set_fact:
+            rh_obs_refusal: >-
+              {{ ansible_failed_task.name | default('?') }}: {{ (ansible_failed_result.msg | default('refused')) | string }}
+
+      always:
+        - name: Record this host's observation result (derived output; the evidence play writes it)
+          ansible.builtin.set_fact:
+            rh_obs_host:
+              schema: "{{ hostvars['localhost'].rh.controller.bootstrap.observation.evidence.host_schema }}"
+              host: "{{ inventory_hostname }}"
+              job: "{{ hostvars['localhost'].rh_obs_run.job | default('') }}"
+              attempt: "{{ hostvars['localhost'].rh_obs_run.attempt | default('') }}"
+              jobs: "{{ hostvars['localhost'].rh_obs_run.jobs | default({}) }}"
+              policy_sha256: "{{ lme_resolved.remote_harness.policy_sha256 | default('') }}"
+              owner: "{{ ansible_user }}"
+              host_inputs: "{{ rh_obs_hin | default({}) }}"
+              host_inputs_sha256: "{{ (rh_obs_hin | default({})) | to_json(sort_keys=true) | hash('sha256') }}"
+              identity: "{{ {'tools': (rh_obs_identity | default({})).tools | default([]), 'rc': (rh_obs_idraw | default({})).rc | default(none), 'stdout': (rh_obs_idraw | default({})).stdout | default(''), 'stderr': (rh_obs_idraw | default({})).stderr | default('')} if (rh_obs_identity | default({})) | length > 0 else {} }}"
+              refusal: "{{ rh_obs_refusal | default('') }}"
+              result: >-
+                {{ lookup('ansible.builtin.template', hostvars['localhost'].rh_repo_root ~ '/' ~ hostvars['localhost'].rh.controller.bootstrap.observation.step_template_rel,
+                          template_vars={'rh_obs_part': 'host_result', 'rh_obs_jobs': hostvars['localhost'].rh_obs_jobs,
+                                         'rh_obs_job': hostvars['localhost'].rh_obs_jobs.jobs[hostvars['localhost'].rh_obs_run.job],
+                                         'rh_obs_prior': rh_obs_records | default([]), 'rh_obs_why': rh_obs_refusal | default(''),
+                                         'rh_obs_hin': rh_obs_hin | default({})}) | from_json }}
+              # codex-tick315: selected-vs-recorded instance gaps (why a host with every step run is still INCOMPLETE)
+              coverage_gaps: >-
+                {{ lookup('ansible.builtin.template', hostvars['localhost'].rh_repo_root ~ '/' ~ hostvars['localhost'].rh.controller.bootstrap.observation.step_template_rel,
+                          template_vars={'rh_obs_part': 'coverage',
+                                         'rh_obs_job': hostvars['localhost'].rh_obs_jobs.jobs[hostvars['localhost'].rh_obs_run.job],
+                                         'rh_obs_prior': rh_obs_records | default([]), 'rh_obs_hin': rh_obs_hin | default({})}) | from_json }}
+              ended_at_utc: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+              records: "{{ rh_obs_records | default([]) }}"
+
+- name: Observation runner -- evidence (controller; host records first, attempt record last)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  # the SAME controller play host as play 1 in this run (its facts are reused; refuse_pinned_outputs.yml is a
+  # first-entry guard and is NOT re-included on re-entry, and the ^_?rh_obs_ entry refusal already ran in play 1 --
+  # an extra-var is fixed for the whole run, so a name it pinned would have refused there). admit_controller.yml is
+  # re-checked (inline, idempotent).
+  vars:
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') or '~/.ansible/tmp' }}"
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: Bind the effective controller connection before any effect (local, localhost, no become; r3g)
+      ansible.builtin.include_tasks: tasks/admit_controller.yml
+
+    - name: Refuse evidence without an admitted run (the controller play did not complete)
+      ansible.builtin.assert:
+        that:
+          - rh_obs_run is defined and rh_obs_dirs is defined
+          - ansible_remote_tmp == lookup('ansible.builtin.env', 'TMPDIR')
+        fail_msg: >-
+          REFUSED RH-OBSERVATION: no admitted run in this play host (controller play 1 did not complete).
+        quiet: true
+
+    - name: Write one host record per host of the group (mode evidence.file_mode; a host without one is NOT_SELECTED)
+      vars:
+        _rh_obs_ev: "{{ rh.controller.bootstrap.observation.evidence }}"
+        _rh_obs_rec: >-
+          {{ hostvars[_rh_obs_i].rh_obs_host
+             if hostvars[_rh_obs_i].rh_obs_host is defined
+             else {'schema': _rh_obs_ev.host_schema, 'host': _rh_obs_i, 'job': rh_obs_run.job, 'attempt': rh_obs_run.attempt,
+                   'result': 'NOT_SELECTED', 'refusal': 'no result: the host was not selected or failed outside the observation block', 'records': []} }}
+      ansible.builtin.copy:
+        content: "{{ _rh_obs_rec | to_nice_json }}\n"
+        dest: "{{ rh_obs_run.host_dir ~ '/' ~ _rh_obs_i ~ '.json' }}"
+        mode: "{{ _rh_obs_ev.file_mode }}"
+        force: false
+      loop: "{{ rh_obs_run.group_hosts | select('match', rh.controller.bootstrap.observation.evidence.host_name_regex) | list }}"
+      loop_control:
+        loop_var: _rh_obs_i
+
+    - name: Write the attempt record LAST (mode evidence.file_mode)
+      vars:
+        _rh_obs_ev: "{{ rh.controller.bootstrap.observation.evidence }}"
+        _rh_obs_res: >-
+          {{ dict(rh_obs_run.group_hosts | zip(rh_obs_run.group_hosts | map('extract', hostvars)
+                  | map(attribute='rh_obs_host') | map('default', {'result': 'NOT_SELECTED'}) | map(attribute='result'))) }}
+        _rh_obs_named: "{{ rh_obs_run.group_hosts | select('match', rh.controller.bootstrap.observation.evidence.host_name_regex) | list }}"
+      ansible.builtin.copy:
+        content: >-
+          {{ {'schema': _rh_obs_ev.attempt_schema, 'job': rh_obs_run.job, 'attempt': rh_obs_run.attempt,
+              'started_at_utc': rh_obs_run.started_at_utc, 'ended_at_utc': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+              'jobs': rh_obs_run.jobs, 'profile_sha256': rh_profile_sha256, 'policy_sha256': rh_config_revision,
+              'engine_revision': rh_engine_revision,
+              'controller_toolchain': {'root': rh_owned_root, 'python': rh_controller_toolchain.python},
+              'ssh_auth_mode': lookup('ansible.builtin.env', rh.controller.bootstrap.ssh_auth.env_mode),
+              'inventory_sources': ansible_inventory_sources | default([]),
+              'group': rh_obs_run.group, 'group_hosts': rh_obs_run.group_hosts, 'host_results': _rh_obs_res,
+              'host_records_written': _rh_obs_named, 'host_names_refused': rh_obs_run.group_hosts | reject('in', _rh_obs_named) | list,
+              'result': ('COMPLETE' if (rh_obs_run.group_hosts | length > 0
+                                        and (_rh_obs_res.values() | reject('in', ['COMPLETE', 'PRECONDITION_FALSE']) | list | length == 0)
+                                        and (_rh_obs_named | length == rh_obs_run.group_hosts | length)) else 'INCOMPLETE'),
+              'evidence_validity': ('valid' if _rh_obs_named | length == rh_obs_run.group_hosts | length else 'invalid')} | to_nice_json }}
+        dest: "{{ rh_obs_run.dir ~ '/' ~ _rh_obs_ev.attempt_file }}"
+        mode: "{{ _rh_obs_ev.file_mode }}"
+        force: false
+
+    - name: Report the attempt and fail unless it is COMPLETE (evidence already written)
+      vars:
+        _rh_obs_att: "{{ lookup('ansible.builtin.file', rh_obs_run.dir ~ '/' ~ rh.controller.bootstrap.observation.evidence.attempt_file) | from_json }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_obs_att.result == 'COMPLETE'
+        fail_msg: >-
+          RH-OBSERVATION attempt {{ rh_obs_run.job }}/{{ rh_obs_run.attempt }} is {{ _rh_obs_att.result }}: {{ _rh_obs_att.host_results }}
+          (evidence {{ rh_obs_run.dir }}).
+        success_msg: >-
+          RH-OBSERVATION attempt {{ rh_obs_run.job }}/{{ rh_obs_run.attempt }} COMPLETE: {{ _rh_obs_att.host_results }}
+          (evidence {{ rh_obs_run.dir }}).

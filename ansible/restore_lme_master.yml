@@ -38,6 +38,24 @@
       set_fact:
         podman_cmd: "{{ podman_cmd_result.stdout }}"
 
+    - name: Load the canonical backup-integrity declaration
+      # Same single source the backup producer uses (roles/backup_lme/vars/integrity.yml);
+      # the bundle-certification verifier is RENDERED from it so producer and verifier
+      # cannot drift (codex-0700 D-RECOVERY-REPRESENTATION-WRAPPER).
+      include_vars: roles/backup_lme/vars/integrity.yml
+
+    - name: Validate backup-integrity path-name fields before any privileged path is built
+      # codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED: the same single-component
+      # gate the producer runs, applied on the restore side before any path is built from the
+      # declaration and before the first destructive step.
+      ansible.builtin.include_tasks: roles/backup_lme/tasks/assert_integrity_paths.yml
+
+    - name: Render the shared content-integrity library once
+      # Bare {{ lme_integrity_lib }} in the shell tasks below (not an inline lookup)
+      # keeps split_args happy in the large restore shell scalars.
+      set_fact:
+        lme_integrity_lib: "{{ lookup('template', 'roles/backup_lme/templates/content_integrity.sh.j2') }}"
+
     - name: Include SELinux variable setup
       include_role:
         name: base
@@ -237,39 +255,112 @@
             selected_backup_dir: "{{ restore_extracted_dirs.files[0].path }}"
             restore_tar_staging_cleanup: "{{ restore_tar_staging.path }}"
 
-    # Once selected_backup_dir points at bundle contents we can classify the backup using the same signals as
-    # backup_lme (cluster_recovery_note vs discovery.type in the archived elasticsearch quadlet).
+    # RESTORE-ENTRYPOINT-VERIFICATION-ORDER + BACKUP-MANIFEST-CERTIFICATION (codex-0700/0845):
+    # verify the bundle certification BEFORE the FIRST read of any bundle content that
+    # drives behaviour -- including the topology-classification reads immediately below
+    # (which steer ES volume selection) and every destructive step further down. The
+    # install/vault/quadlet trees, and each certified volume DATA dir, are proven against
+    # the certified digest FIRST. Fail-closed: missing certification (legacy bundle) is
+    # REFUSED (rc3), torn/tampered certification REFUSED (rc4), any tree/file/volume-data
+    # content mismatch REFUSED (rc5), empty certified volume digest (rc6), missing required
+    # or certified member (rc7), duplicate/extra volume member (rc8). NO fallback to
+    # listing_sha256, NO ignore-integrity switch. An uncertifiable legacy bundle is routed
+    # to LEGACY-BUNDLE qualification (recovery-semantics.contract.yaml), never force-restored.
+    # Self-consistency + complete on-disk volume-set binding; adversarial certificate
+    # under-declaration of an OPTIONAL payload stays OPEN (C1 expected-set / B ledger).
+    - name: Verify backup bundle certification before any destructive restore (fail-closed)
+      shell: |
+        set -euo pipefail
+        {{ lme_integrity_lib }}
+        lme_bundle_verify "{{ selected_backup_dir }}"
+      args:
+        executable: /bin/bash
+      register: restore_bundle_verify
+      changed_when: false
+
+    # Once selected_backup_dir points at bundle contents (and is now VERIFIED above) we can
+    # classify the backup using the same signals as backup_lme (cluster_recovery_note vs
+    # discovery.type in the archived elasticsearch quadlet).
     - name: Detect Elasticsearch topology reflected in backup bundle
       shell: |
         set -euo pipefail
-        if [ -f "{{ selected_backup_dir }}/cluster_recovery_note.txt" ]; then
-          echo "cluster"
-          exit 0
-        fi
-        # backup_lme stores quadlets under etc_containers_systemd; tarball layouts may use etc/containers/systemd
-        if [ -f "{{ selected_backup_dir }}/etc_containers_systemd/lme-elasticsearch.container" ]; then
-          f="{{ selected_backup_dir }}/etc_containers_systemd/lme-elasticsearch.container"
-        elif [ -f "{{ selected_backup_dir }}/etc/containers/systemd/lme-elasticsearch.container" ]; then
-          f="{{ selected_backup_dir }}/etc/containers/systemd/lme-elasticsearch.container"
+        {{ lme_integrity_lib }}
+        BD="{{ selected_backup_dir }}"
+        CERT="$BD/$LME_BUNDLE_CERT_FILE"
+        # codex-0930 D-RESTORE-UNCERTIFIED-CLASSIFICATION-INPUTS: this probe steers the
+        # DESTRUCTIVE ES-volume restore decision (restore_es_volumes below), so it derives
+        # topology ONLY from CERTIFIED content. etc_containers_systemd is a REQUIRED certified
+        # tree already content-verified by the pre-mutation gate above, so the archived
+        # elasticsearch quadlet is trustworthy. The former uncertified inputs are removed as
+        # authorities: (a) the root-level cluster_recovery_note.txt short-circuit and (b) the
+        # etc/containers/systemd fallback path -- either could flip ES-volume selection without
+        # changing a certified digest.
+        # codex-1015 D-RESTORE-TOPOLOGY-DECLARATION-DIVERGENCE: the quadlet payload/path, the
+        # single-node marker and the note payload id/path are DECLARED in vars/integrity.yml
+        # (topology_classification) and consumed here as LME_TOPO_* exports -- NOT hardcoded --
+        # so a portable/relocated archive changes them in one place.
+        Q="$BD/$LME_TOPO_QUADLET_PAYLOAD/$LME_TOPO_QUADLET_RELPATH"
+        if [ -f "$Q" ] && grep -qF "$LME_TOPO_SINGLE_NODE_MARKER" "$Q"; then
+          TOPO="single-node"
+        elif [ -f "$Q" ]; then
+          TOPO="cluster"
         else
-          f=""
+          # codex-1015 D-RESTORE-UNKNOWN-TOPOLOGY-ENABLES-DESTRUCTIVE-RESTORE: a certified tree
+          # need not contain the quadlet, and 'unknown' is NOT proof of single-node. We report
+          # 'unknown' here; the DESTRUCTIVE ES-volume decision ("Resolve restore_es_volumes")
+          # REFUSES on unknown rather than defaulting to restore. Never treat absent evidence
+          # as affirmative restoration permission.
+          TOPO="unknown"
         fi
-        if [ -z "$f" ] || [ ! -f "$f" ]; then
-          echo "unknown"
-        elif grep -qF 'discovery.type=single-node' "$f"; then
-          echo "single-node"
-        else
-          echo "cluster"
+        # The cluster note is a certifiable OPTIONAL payload; backup_lme writes it ONLY in
+        # cluster mode. If present it MUST be certified AND agree with the certified quadlet;
+        # a planted/uncertified note (the gate tolerates an absent OPTIONAL payload, so the
+        # gate alone does not catch this) or a disagreeing note FAILS CLOSED (exit 9). Both the
+        # note path and its certificate payload id are declaration-derived (LME_TOPO_*).
+        NOTE="$BD/$LME_TOPO_NOTE_PATH"
+        if [ -e "$NOTE" ]; then
+          if ! grep -qE "^payload=${LME_TOPO_NOTE_ID}\|kind=file\|" "$CERT"; then
+            echo "REFUSE: ${LME_TOPO_NOTE_PATH} present but NOT in the bundle certification (uncertified restore-steering input); refusing before the destructive ES-volume decision." >&2
+            exit 9
+          fi
+          if [ "$TOPO" != "cluster" ]; then
+            echo "REFUSE: certified ${LME_TOPO_NOTE_PATH} disagrees with the certified elasticsearch quadlet topology ('$TOPO'); refusing." >&2
+            exit 9
+          fi
         fi
+        echo "$TOPO"
       args:
         executable: /bin/bash
       register: restore_backup_es_mode_probe
       changed_when: false
 
-    - name: Resolve restore_es_volumes when set to automatic default
+    - name: Refuse the automatic ES-volume decision on unknown/ambiguous topology (fail-closed)
+      # codex-1015 D-RESTORE-UNKNOWN-TOPOLOGY-ENABLES-DESTRUCTIVE-RESTORE: restoring ES data
+      # volumes is DESTRUCTIVE (destroy+recreate the live ES volumes). The automatic default
+      # must act ONLY on AFFIRMATIVE certified topology. If the probe could not affirmatively
+      # classify (topology 'unknown', or the required quadlet evidence was absent), refuse
+      # rather than defaulting -- absence of evidence is never restoration permission. The
+      # operator can still set restore_es_volumes explicitly (true/false) to proceed.
+      ansible.builtin.fail:
+        msg: >-
+          Backup topology could not be affirmatively classified (probe
+          '{{ restore_backup_es_mode_probe.stdout | trim }}'). The Elasticsearch data-volume
+          restore decision is destructive; refusing to default it. Set restore_es_volumes
+          explicitly to true or false for this backup, or restore a backup whose certified
+          elasticsearch quadlet affirmatively declares its topology.
+      when:
+        - restore_es_volumes | string | lower == 'auto'
+        - (restore_backup_es_mode_probe.stdout | trim) not in ['single-node', 'cluster']
+
+    - name: Resolve restore_es_volumes from affirmative topology only
+      # single-node => ES data lives in the volumes, restore them; cluster => ES data lives in
+      # snapshots (not these volumes), skip volume restore. 'unknown' never reaches here (the
+      # fail above stops it), so the destructive default is only ever taken on positive evidence.
       set_fact:
-        restore_es_volumes: "{{ (restore_backup_es_mode_probe.stdout | trim) != 'cluster' }}"
-      when: restore_es_volumes | string | lower == 'auto'
+        restore_es_volumes: "{{ (restore_backup_es_mode_probe.stdout | trim) == 'single-node' }}"
+      when:
+        - restore_es_volumes | string | lower == 'auto'
+        - (restore_backup_es_mode_probe.stdout | trim) in ['single-node', 'cluster']
 
     - name: Display restore mode
       debug:
@@ -285,8 +376,14 @@
       ignore_errors: yes
 
     - name: Wait for containers to stop
+      # RESTORE-EARLY-DESTRUCTION-AND-STOP-SCOPE: probe RUNNING containers only. `ps -a`
+      # also lists EXITED containers, so a stopped-but-not-removed lme container would
+      # keep this loop spinning the full retry budget and then (with ignore_errors)
+      # proceed to overwrite live state anyway. We care that nothing is still RUNNING.
+      # NOTE (residual): grep "lme" also matches a co-tenant container whose name
+      # contains "lme"; tightening that name scope is a tracked residual.
       shell: |
-        {{ podman_cmd }} ps -a --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "lme" || true
+        {{ podman_cmd }} ps --filter status=running --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "lme" || true
       args:
         executable: /bin/bash
       register: running_containers
@@ -295,17 +392,46 @@
       delay: 5
       ignore_errors: yes
 
+    - name: Fail-closed if LME containers are still running before restore
+      # Do NOT overwrite /opt/lme, /etc/lme, quadlets, and secrets while containers are
+      # live. If the stop wait exhausted with containers still running, refuse the
+      # destructive restore rather than corrupting a running deployment.
+      fail:
+        msg: >-
+          LME containers still running after the stop wait
+          ({{ running_containers.stdout_lines | join(', ') }}); refusing to overwrite
+          live state (fail-closed). Stop them and re-run the restore.
+      when: running_containers.stdout_lines | default([]) | length > 0
+
+    # NOTE: the bundle certification gate now runs EARLIER, immediately after
+    # selected_backup_dir is resolved and BEFORE the topology-classification reads
+    # (cluster_recovery_note.txt / archived elasticsearch quadlet), so no uncertified
+    # bundle content -- not even a classification input that steers volume selection --
+    # is read before verification. See "Verify backup bundle certification ..." above.
+
     # Tar streaming avoids NFS "Operation not supported" on cp -a preserving metadata
     - name: Restore LME installation and system state from backup
+      # Fail-closed: set -euo pipefail + explicit per-pipeline exit-code capture so a
+      # partial /opt/lme (or /etc/lme, or quadlet) restore FAILS LOUDLY instead of
+      # being silently swallowed (a broken tar producer or consumer previously left an
+      # incomplete tree and still reported success). Best-effort host-unit copies keep
+      # their `|| true` so one absent unit never fails the whole system restore.
       shell: |
+        set -euo pipefail
         mkdir -p {{ lme_install_dir }}
         if [ -d "{{ selected_backup_dir }}/lme" ]; then
-          (cd "{{ selected_backup_dir }}/lme" && tar cf - .) | (cd "{{ lme_install_dir }}" && tar xf -)
+          if ! { (cd "{{ selected_backup_dir }}/lme" && tar cf - .) | (cd "{{ lme_install_dir }}" && tar xf -); }; then
+            echo "ERROR: failed to restore {{ lme_install_dir }} from {{ selected_backup_dir }}/lme (partial/torn restore)" >&2
+            exit 1
+          fi
         fi
 
         if [ -d "{{ selected_backup_dir }}/etc_lme" ]; then
           mkdir -p /etc/lme
-          (cd "{{ selected_backup_dir }}/etc_lme" && tar cf - .) | (cd /etc/lme && tar xf -)
+          if ! { (cd "{{ selected_backup_dir }}/etc_lme" && tar cf - .) | (cd /etc/lme && tar xf -); }; then
+            echo "ERROR: failed to restore /etc/lme from {{ selected_backup_dir }}/etc_lme (partial/torn restore)" >&2
+            exit 1
+          fi
           chmod 700 /etc/lme /etc/lme/vault 2>/dev/null || true
           chmod 600 /etc/lme/vault/* 2>/dev/null || true
           chmod 700 /etc/lme/pass.sh 2>/dev/null || true
@@ -314,7 +440,10 @@
 
         if [ -d "{{ selected_backup_dir }}/etc_containers_systemd" ]; then
           mkdir -p /etc/containers/systemd
-          (cd "{{ selected_backup_dir }}/etc_containers_systemd" && tar cf - .) | (cd /etc/containers/systemd && tar xf -)
+          if ! { (cd "{{ selected_backup_dir }}/etc_containers_systemd" && tar cf - .) | (cd /etc/containers/systemd && tar xf -); }; then
+            echo "ERROR: failed to restore /etc/containers/systemd (partial/torn restore)" >&2
+            exit 1
+          fi
           chmod 644 /etc/containers/systemd/* 2>/dev/null || true
           chown root:root /etc/containers/systemd/* 2>/dev/null || true
         fi
@@ -328,7 +457,7 @@
             esac
             SRC="$HOST_UNITS_DIR/$unit"
             if [ "$file_status" = "copied" ] && [ -f "$SRC" ]; then
-              cp -f "$SRC" "/etc/systemd/system/$unit"
+              cp -f "$SRC" "/etc/systemd/system/$unit" || true
               chmod 644 "/etc/systemd/system/$unit" 2>/dev/null || true
               chown root:root "/etc/systemd/system/$unit" 2>/dev/null || true
             fi
@@ -391,14 +520,113 @@
         export PATH=$PATH:/nix/var/nix/profiles/default/bin
         export ANSIBLE_VAULT_PASSWORD_FILE="{{ selected_backup_dir }}/etc_lme/pass.sh"
 
-        for secret_id in $(podman secret ls --format "{{ '{{' }}.ID{{ '}}' }}"); do
-          podman secret rm "$secret_id" 2>/dev/null || true
-        done
-
         BACKUP_ROOT="{{ selected_backup_dir }}"
         MANIFEST_FILE="$BACKUP_ROOT/secret_manifest.txt"
         MAPPING_FILE="$BACKUP_ROOT/secret_mapping.txt"
         BACKUP_VAULT_DIR="$BACKUP_ROOT/etc_lme/vault"
+
+        # RESTORE-EARLY-DESTRUCTION: track the names we successfully (re)create and the
+        # live names present before restore, so pruning of stale secrets happens ONLY
+        # after every create has succeeded -- never a blanket wipe up front.
+        RESTORED_NAMES="$(mktemp)"
+        LIVE_BEFORE="$(mktemp)"
+        : > "$RESTORED_NAMES"
+        : > "$LIVE_BEFORE"
+        trap 'rm -f "$RESTORED_NAMES" "$LIVE_BEFORE"' EXIT
+
+        # SECRETS-DESTROYED-BEFORE-PAYLOAD-VERIFY guard (fail-closed): verify EVERY
+        # secret recorded in the backup has a present, decryptable payload BEFORE the
+        # destructive `podman secret rm` below. `--replace` on create is NOT enough --
+        # it overwrites the live secret before proving the new value is valid. If any
+        # recorded payload is missing/undecryptable we refuse to delete the live
+        # secrets and exit non-zero (this task is not ignore_errors, so the master
+        # restore halts). Secret VALUES are never printed. C seam: which secrets are
+        # REQUIRED vs optional is a credential-contract concern; absent that contract
+        # we conservatively require every backed-up secret to be restorable.
+        preverify_payload() {
+          local name="$1" path="$2"
+          if [ -z "$path" ] || [ ! -f "$path" ]; then
+            echo "Pre-verify FAILED: no payload file for secret '$name'"
+            return 1
+          fi
+          local _pv
+          if ! _pv=$(ansible-vault view "$path" 2>/dev/null); then
+            echo "Pre-verify FAILED: payload for secret '$name' did not decrypt"
+            return 1
+          fi
+          # RESTORE-EMPTY-SECRET-PREFLIGHT: a payload that decrypts to EMPTY is not a
+          # valid secret; admitting it would pass preverify, then fail on create AFTER
+          # destruction. Reject it here, before anything is removed.
+          if [ -z "$_pv" ]; then
+            echo "Pre-verify FAILED: payload for secret '$name' decrypted EMPTY"
+            return 1
+          fi
+          return 0
+        }
+        PREVERIFY_OK=0
+        PREVERIFY_FAILURES=0
+        HAVE_CONTRACT=0
+        if [ -f "$MANIFEST_FILE" ]; then
+          HAVE_CONTRACT=1
+          while IFS='|' read -r pv_name pv_id pv_driver pv_vault_file pv_captured_file; do
+            case "$pv_name" in
+              ''|\#*) continue ;;
+            esac
+            if [ -n "$pv_vault_file" ] && [ -f "$BACKUP_VAULT_DIR/$pv_vault_file" ]; then
+              if preverify_payload "$pv_name" "$BACKUP_VAULT_DIR/$pv_vault_file"; then PREVERIFY_OK=$((PREVERIFY_OK + 1)); else PREVERIFY_FAILURES=$((PREVERIFY_FAILURES + 1)); fi
+            elif [ -n "$pv_captured_file" ] && [ -f "$BACKUP_ROOT/$pv_captured_file" ]; then
+              if preverify_payload "$pv_name" "$BACKUP_ROOT/$pv_captured_file"; then PREVERIFY_OK=$((PREVERIFY_OK + 1)); else PREVERIFY_FAILURES=$((PREVERIFY_FAILURES + 1)); fi
+            else
+              echo "Pre-verify FAILED: no payload recorded for secret '$pv_name'"
+              PREVERIFY_FAILURES=$((PREVERIFY_FAILURES + 1))
+            fi
+          done < "$MANIFEST_FILE"
+        elif [ -f "$MAPPING_FILE" ] && [ -d "$BACKUP_VAULT_DIR" ]; then
+          HAVE_CONTRACT=1
+          while IFS='=' read -r pv_name pv_vault_id; do
+            case "$pv_name" in
+              ''|\#*) continue ;;
+            esac
+            if preverify_payload "$pv_name" "$BACKUP_VAULT_DIR/$pv_vault_id"; then PREVERIFY_OK=$((PREVERIFY_OK + 1)); else PREVERIFY_FAILURES=$((PREVERIFY_FAILURES + 1)); fi
+          done < "$MAPPING_FILE"
+        fi
+
+        # Count live secrets so a degenerate/empty backup contract cannot wipe them.
+        LIVE_SECRETS=$(podman secret ls --format "{{ '{{' }}.Name{{ '}}' }}" 2>/dev/null | grep -c . || true)
+
+        if [ "$HAVE_CONTRACT" = "1" ]; then
+          if [ "${PREVERIFY_FAILURES:-0}" -gt 0 ]; then
+            echo "ERROR: ${PREVERIFY_FAILURES} backup secret payload(s) missing/undecryptable." >&2
+            echo "Refusing to delete existing Podman secrets (fail-closed); live secrets left intact." >&2
+            exit 2
+          fi
+          if [ "${PREVERIFY_OK:-0}" -eq 0 ]; then
+            if [ "${LIVE_SECRETS:-0}" -gt 0 ]; then
+              echo "ERROR: backup lists no restorable secrets but ${LIVE_SECRETS} live secret(s) exist; refusing to wipe them (fail-closed)." >&2
+              exit 2
+            fi
+            echo "No secrets recorded in backup and none live; nothing to restore."
+          else
+            # Payloads verified. Do NOT blanket-remove live secrets here: every create
+            # below uses --replace, and a create can still fail AFTER preverify (e.g. a
+            # podman driver error). Removing everything first would leave a SECRETLESS
+            # host on that failure. Snapshot the live names and prune the stale ones
+            # only AFTER every create succeeds (see the post-create prune below).
+            podman secret ls --format "{{ '{{' }}.Name{{ '}}' }}" 2>/dev/null > "$LIVE_BEFORE" || true
+          fi
+        else
+          # HAVE_CONTRACT=0. There is NO positional create path: the create block below
+          # only runs for a present manifest, or a present mapping WITH its vault dir. So
+          # if a contract FILE exists but was unusable (e.g. secret_mapping.txt present but
+          # etc_lme/vault absent), restoring nothing and exiting 0 would be "listing is not
+          # restoration". Fail closed on that; only a genuine no-manifest-and-no-mapping
+          # backup is a legitimate no-op.
+          if [ -f "$MANIFEST_FILE" ] || [ -f "$MAPPING_FILE" ]; then
+            echo "ERROR: a secret manifest/mapping is present but unusable (no decryptable vault payloads); refusing to proceed (fail-closed)." >&2
+            exit 2
+          fi
+          echo "No secret manifest or mapping present; no secrets to restore (none removed)."
+        fi
 
         create_secret_from_vault() {
           local name="$1" driver="$2" vault_path="$3"
@@ -416,6 +644,12 @@
           printf '%s' "$value" | podman secret create --driver "$podman_driver" --replace "$name" -
         }
 
+        # RESTORE-MASTER-CREATE-FAILURE (codex-0415): accumulate create failures and EXIT
+        # non-zero so the master restore HALTS before activation/destructive follow-on. A
+        # printed "Failed to create secret" that still lets `podman secret ls` return 0 is
+        # NOT successful restoration -- listing resources is not restoration.
+        CREATE_OK=0
+        CREATE_FAILURES=0
         if [ -f "$MANIFEST_FILE" ]; then
           echo "Restoring secrets using secret_manifest.txt"
           while IFS='|' read -r name id driver vault_file captured_file; do
@@ -423,15 +657,20 @@
               ''|\#*) continue ;;
             esac
             if [ -n "$vault_file" ] && [ -f "$BACKUP_VAULT_DIR/$vault_file" ]; then
-              create_secret_from_vault "$name" "$driver" "$BACKUP_VAULT_DIR/$vault_file" \
-                && echo "Successfully restored secret: $name" \
-                || echo "Failed to create secret: $name"
+              if create_secret_from_vault "$name" "$driver" "$BACKUP_VAULT_DIR/$vault_file"; then
+                echo "Successfully restored secret: $name"; CREATE_OK=$((CREATE_OK + 1)); printf '%s\n' "$name" >> "$RESTORED_NAMES"
+              else
+                echo "Failed to create secret: $name" >&2; CREATE_FAILURES=$((CREATE_FAILURES + 1))
+              fi
             elif [ -n "$captured_file" ] && [ -f "$BACKUP_ROOT/$captured_file" ]; then
-              create_secret_from_vault "$name" "$driver" "$BACKUP_ROOT/$captured_file" \
-                && echo "Successfully restored secret: $name" \
-                || echo "Failed to create secret: $name"
+              if create_secret_from_vault "$name" "$driver" "$BACKUP_ROOT/$captured_file"; then
+                echo "Successfully restored secret: $name"; CREATE_OK=$((CREATE_OK + 1)); printf '%s\n' "$name" >> "$RESTORED_NAMES"
+              else
+                echo "Failed to create secret: $name" >&2; CREATE_FAILURES=$((CREATE_FAILURES + 1))
+              fi
             else
-              echo "Warning: no payload available to restore secret '$name' (driver=$driver). Skipping."
+              echo "ERROR: no payload available to restore manifest secret '$name' (driver=$driver)." >&2
+              CREATE_FAILURES=$((CREATE_FAILURES + 1))
             fi
           done < "$MANIFEST_FILE"
         elif [ -f "$MAPPING_FILE" ] && [ -d "$BACKUP_VAULT_DIR" ]; then
@@ -444,10 +683,46 @@
             if [ -f "$BACKUP_VAULT_FILE" ]; then
               SECRET_VALUE=$(ansible-vault view "$BACKUP_VAULT_FILE")
               if [ $? -eq 0 ] && [ -n "$SECRET_VALUE" ]; then
-                echo "$SECRET_VALUE" | podman secret create --driver shell --replace "$secret_name" -
+                # Legacy value pipe keeps `echo` (matches ansible/rollback_lme.yml legacy
+                # branch + this file's prior behavior). Whether echo's trailing newline or
+                # a newline-free printf reproduces the ORIGINAL secret bytes depends on how
+                # the legacy install created each secret; changing it here would silently
+                # alter restored bytes. Byte fidelity is a LEGACY-BUNDLE residual, not fixed.
+                if echo "$SECRET_VALUE" | podman secret create --driver shell --replace "$secret_name" -; then
+                  CREATE_OK=$((CREATE_OK + 1)); printf '%s\n' "$secret_name" >> "$RESTORED_NAMES"
+                else
+                  echo "Failed to create secret: $secret_name" >&2; CREATE_FAILURES=$((CREATE_FAILURES + 1))
+                fi
+              else
+                echo "ERROR: payload for legacy secret '$secret_name' did not decrypt or was empty." >&2
+                CREATE_FAILURES=$((CREATE_FAILURES + 1))
               fi
+            else
+              echo "ERROR: no payload file for legacy secret '$secret_name'." >&2
+              CREATE_FAILURES=$((CREATE_FAILURES + 1))
             fi
           done < "$MAPPING_FILE"
+        fi
+
+        if [ "${CREATE_FAILURES:-0}" -gt 0 ]; then
+          echo "ERROR: ${CREATE_FAILURES} secret create(s) failed (OK=${CREATE_OK}); restoration incomplete." >&2
+          echo "Blocking activation/destructive follow-on (fail-closed); listing is not restoration." >&2
+          exit 3
+        fi
+
+        # RESTORE-EARLY-DESTRUCTION: every create succeeded -- NOW prune live secrets the
+        # restored set no longer includes. LIVE_BEFORE is populated only when a
+        # manifest/mapping drove the restore (positional fallback leaves it empty and
+        # prunes nothing). This is the only destructive secret step, and it runs strictly
+        # after verification + creation.
+        if [ -s "$LIVE_BEFORE" ]; then
+          while IFS= read -r live_name; do
+            [ -n "$live_name" ] || continue
+            if ! grep -qxF "$live_name" "$RESTORED_NAMES"; then
+              echo "Pruning stale secret not in restored set: $live_name"
+              podman secret rm "$live_name" 2>/dev/null || true
+            fi
+          done < "$LIVE_BEFORE"
         fi
 
         echo "Current secrets:"
@@ -500,12 +775,12 @@
 
     - name: Check whether backup includes volume directory
       stat:
-        path: "{{ selected_backup_dir }}/volumes"
+        path: "{{ selected_backup_dir }}/{{ lme_backup_integrity.volume_layout.root_dir }}"
       register: volume_backup_dir
 
     - name: Get list of backed-up volume directories
       find:
-        paths: "{{ selected_backup_dir }}/volumes"
+        paths: "{{ selected_backup_dir }}/{{ lme_backup_integrity.volume_layout.root_dir }}"
         file_type: directory
       register: volume_dirs
       when: volume_backup_dir.stat.exists
@@ -533,6 +808,121 @@
           - "Volume restore selection: {{ restore_selected_volume_names | default([]) | join(', ') if restore_selected_volume_names is defined and restore_selected_volume_names | length > 0 else 'None' }}"
       when: volume_backup_dir.stat.exists
 
+    # Pre-flight (verify-before-destroy): the next task removes and recreates each
+    # selected volume. backup_lme (single-node) and cluster_backup_lme (tarball) both
+    # always write volumes/<name>/data for every backed-up volume (empty volumes get an
+    # empty data/ dir). A missing data/ therefore means a corrupt/incomplete backup, and
+    # proceeding would silently leave that volume empty. Assert the payload exists BEFORE
+    # any destructive removal so the current volume is never wiped for an unrestorable backup.
+    - name: Verify each selected volume has restorable data in the backup
+      stat:
+        path: "{{ selected_backup_dir }}/{{ lme_backup_integrity.volume_layout.root_dir }}/{{ item }}/{{ lme_backup_integrity.volume_layout.data_dir }}"
+      loop: "{{ restore_selected_volume_names | default([]) }}"
+      register: restore_volume_data_stats
+      when:
+        - volume_backup_dir.stat.exists
+        - restore_selected_volume_names | default([]) | length > 0
+
+    - name: Fail if any selected volume is missing its backup data directory
+      assert:
+        that:
+          - item.stat.exists
+          - item.stat.isdir | default(false)
+        fail_msg: >-
+          Refusing to remove/recreate volumes: backup is missing data for volume
+          '{{ item.item }}' at {{ selected_backup_dir }}/{{ lme_backup_integrity.volume_layout.root_dir }}/{{ item.item }}/{{ lme_backup_integrity.volume_layout.data_dir }}.
+          Restoring would leave '{{ item.item }}' empty. Verify backup integrity before retrying.
+      loop: "{{ restore_volume_data_stats.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - volume_backup_dir.stat.exists
+        - restore_selected_volume_names | default([]) | length > 0
+
+    # Content-integrity verification (layered ON TOP of B's existence/type M1 above).
+    # Existence/non-empty is insufficient: a partial data/ copy is still non-empty.
+    # Recompute file_count + total_bytes + listing_sha256 over the backup's data/ with
+    # the IDENTICAL snippet the backup role used against the source, and fail closed on
+    # mismatch or a MISSING manifest -- BEFORE any destructive podman volume rm. The
+    # listing_sha256 covers relative paths and sizes (not file contents); LC_ALL=C keeps
+    # the sort host-independent so cluster tarballs restored on another host still match.
+    - name: Verify each selected volume matches its backup content manifest (fail-closed)
+      shell: |
+        set -euo pipefail
+        {{ lme_integrity_lib }}
+        MDIR="{{ selected_backup_dir }}/$LME_VOLUME_ROOT/{{ item }}"
+        # SINGLE SOURCE (codex-0845/0915 D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE):
+        # the manifest field NAMES and the recompute formulas live in the shared library
+        # (lme_verify_content_manifest) -- the same library the producer side is rendered
+        # from -- so this restore consumer no longer hand-inlines a "keep byte-identical to
+        # the producer" snippet and cannot drift from it. rc3 = missing manifest/data dir,
+        # or a pre-content-digest (LEGACY) bundle with no content field (NO listing-only
+        # fallback, no ignore-integrity switch); rc4 = a recomputed value does not match the
+        # manifest (partial/corrupt/altered payload). Runs BEFORE any destructive podman
+        # volume rm below (verify-before-destroy).
+        echo "Verifying content integrity for volume '{{ item }}' before destructive restore..."
+        lme_verify_content_manifest "$MDIR/$LME_VOLUME_MANIFEST_FILE" "$MDIR/$LME_VOLUME_DATA_DIR"
+      args:
+        executable: /bin/bash
+      loop: "{{ restore_selected_volume_names | default([]) }}"
+      register: restore_volume_manifest_check
+      changed_when: false
+      when:
+        - volume_backup_dir.stat.exists
+        - restore_selected_volume_names | default([]) | length > 0
+
+    # D4 (torn-restore guard): the file-level tar restore below rewrites each selected
+    # volume's data dir, including Elasticsearch data (lme_esdata*). A file-level
+    # restore written while an ES/data-store container is still live is torn/
+    # inconsistent. The play only stopped the umbrella 'lme' unit above; units with
+    # Restart=always/WantedBy can return. Explicitly stop every lme-* unit+container,
+    # then require AFFIRMATIVE evidence that none are running. UNKNOWN evidence (a
+    # failed probe) halts the play -- fail closed, never assume stopped.
+    - name: Explicitly stop all LME container units before destructive volume restore
+      shell: |
+        export PATH=$PATH:/nix/var/nix/profiles/default/bin
+        systemctl stop lme 2>/dev/null || true
+        for c in $({{ podman_cmd }} ps --format "{{ '{{' }}.Names{{ '}}' }}" 2>/dev/null | grep -E '^lme-' || true); do
+          systemctl stop "${c}.service" 2>/dev/null || true
+          {{ podman_cmd }} stop "$c" 2>/dev/null || true
+        done
+        for unit in lme-llm-keys.path lme-llm-keys.service lme-llama-model.path lme-llama-model.service lme-kev-sync.timer lme-kev-sync.service; do
+          systemctl stop "$unit" 2>/dev/null || true
+        done
+      args:
+        executable: /bin/bash
+      when:
+        - volume_backup_dir.stat.exists
+        - restore_selected_volume_names | default([]) | length > 0
+
+    - name: Probe for still-running LME containers (affirmative stopped-evidence)
+      shell: |
+        set -euo pipefail
+        out="$({{ podman_cmd }} ps --format "{{ '{{' }}.Names{{ '}}' }}")"
+        echo "$out" | grep -E '^lme-' || true
+      args:
+        executable: /bin/bash
+      register: restore_running_lme_probe
+      changed_when: false
+      when:
+        - volume_backup_dir.stat.exists
+        - restore_selected_volume_names | default([]) | length > 0
+
+    - name: Fail closed if any LME container is still running before volume restore
+      assert:
+        that:
+          - restore_running_lme_probe.stdout_lines is defined
+          - (restore_running_lme_probe.stdout_lines | length) == 0
+        fail_msg: >-
+          Refusing destructive volume restore: LME container(s) still running after an
+          explicit stop [{{ restore_running_lme_probe.stdout_lines | default([]) | join(', ') }}].
+          A file-level restore (especially Elasticsearch data) written under a live
+          container is torn/inconsistent. Resolve the stuck container(s) and retry.
+        success_msg: "All LME containers stopped; safe to proceed with destructive volume restore."
+      when:
+        - volume_backup_dir.stat.exists
+        - restore_selected_volume_names | default([]) | length > 0
+
     - name: Remove existing selected volumes
       shell: |
         if {{ podman_cmd }} volume exists "{{ item }}"; then
@@ -556,12 +946,28 @@
         - restore_selected_volume_names | default([]) | length > 0
 
     - name: Restore selected volume data
+      # Fail-closed: an empty/unresolved mountpoint would make `cd "$VOLUME_PATH"`
+      # a silent no-op (cd "" stays in the cwd) and extract the volume data into the
+      # task's working directory while reporting success. Require a real mountpoint and
+      # capture the tar pipeline's exit status so a partial/torn restore FAILS LOUDLY.
       shell: |
+        set -euo pipefail
         VOLUME_PATH=$({{ podman_cmd }} volume inspect "{{ item }}" --format "{{ '{{' }}.Mountpoint{{ '}}' }}")
-        BACKUP_DIR="{{ selected_backup_dir }}/volumes/{{ item }}/data"
+        BACKUP_DIR="{{ selected_backup_dir }}/{{ lme_backup_integrity.volume_layout.root_dir }}/{{ item }}/{{ lme_backup_integrity.volume_layout.data_dir }}"
+
+        if [ -z "$VOLUME_PATH" ] || [ ! -d "$VOLUME_PATH" ]; then
+          echo "ERROR: could not resolve mountpoint for volume '{{ item }}' (got '$VOLUME_PATH'); refusing restore" >&2
+          exit 1
+        fi
 
         if [ -d "$BACKUP_DIR" ]; then
-          (cd "$BACKUP_DIR" && tar cf - .) | (cd "$VOLUME_PATH" && tar xf -)
+          if ! { (cd "$BACKUP_DIR" && tar cf - .) | (cd "$VOLUME_PATH" && tar xf -); }; then
+            echo "ERROR: failed to restore volume '{{ item }}' data into $VOLUME_PATH (partial/torn restore)" >&2
+            exit 1
+          fi
+        else
+          echo "ERROR: backup data dir missing for volume '{{ item }}' at $BACKUP_DIR" >&2
+          exit 1
         fi
       args:
         executable: /bin/bash

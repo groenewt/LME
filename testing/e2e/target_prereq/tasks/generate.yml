@@ -1,0 +1,76 @@
+---
+# testing/e2e/target_prereq/tasks/generate.yml -- ONE key-pair generation with the admitted tool (localhost; non-root).
+# Called only after the journal record says 'started' for this pair (current.yml / pending.yml). Both halves must be
+# absent right before the call (re-stat; ssh-keygen is never asked to overwrite). The private half is created by the
+# tool (0600); the .pub THIS call created is set to the first declared pub mode (nothing pre-existing is chmod'ed).
+# Inputs (include vars, no defaults): _jk_g_key, _jk_g_pub, _jk_g_comment. Output: none (the caller reads back).
+
+- name: Re-stat both halves right before generation (metadata only)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: ["{{ _jk_g_key }}", "{{ _jk_g_pub }}"]
+  register: _jk_g_pre
+
+- name: Refuse generation over anything present (never overwritten)
+  ansible.builtin.assert:
+    that:
+      - _jk_g_pre.results | selectattr('stat.exists') | list | length == 0
+    fail_msg: "REFUSED JKEY-RESUME: {{ _jk_g_pre.results | selectattr('stat.exists') | map(attribute='item') | list }} appeared before generation; preserved."
+    quiet: true
+
+# The passphrase argv is the declared mode's (owner_key.decl.yml passphrase_argv[encryption].generate; checked present
+# by bind_controller.yml), never a literal here.
+- name: Generate the pair with the admitted tool (argv; the declared passphrase mode; no output kept)
+  ansible.builtin.command:
+    argv: >-
+      {{ [jk_tool.path, '-q', '-t', jk.key_type] + jk.passphrase_argv[jk.encryption].generate
+         + ['-C', _jk_g_comment, '-f', _jk_g_key] }}
+  register: _jk_g_run
+  no_log: true
+
+- name: Refuse a failed generation (rc only; the journal keeps the obligation)
+  ansible.builtin.assert:
+    that:
+      - _jk_g_run.rc == 0
+    fail_msg: "REFUSED JKEY-GENERATE: {{ jk_tool.path }} did not generate {{ _jk_g_key }}; the record stays 'started' (resume on the next run)."
+    quiet: true
+
+- name: Set the declared mode on the .pub this call created (never on a pre-existing file)
+  ansible.builtin.file:
+    path: "{{ _jk_g_pub }}"
+    mode: "{{ jk.storage.pub_modes | first }}"
+    follow: false
+
+- name: Read custody back (metadata only)
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop:
+    - {path: "{{ _jk_g_key }}", modes: ["{{ jk.storage.file_mode }}"]}
+    - {path: "{{ _jk_g_pub }}", modes: "{{ jk.storage.pub_modes }}"}
+  loop_control:
+    label: "{{ item.path }}"
+  register: _jk_g_post
+
+- name: Refuse a generated pair without the declared custody
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists and item.stat.isreg and not item.stat.islnk
+      - item.stat.uid == jk_ctl.uid | int
+      - item.stat.mode in item.item.modes
+    fail_msg: "REFUSED JKEY-GENERATE: {{ item.item.path }} did not read back as an owned regular file with mode in {{ item.item.modes }}."
+    quiet: true
+  loop: "{{ _jk_g_post.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Mark this run as changing state
+  ansible.builtin.set_fact:
+    jk_changed: true

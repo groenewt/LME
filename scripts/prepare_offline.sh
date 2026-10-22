@@ -11,11 +11,13 @@ NC='\033[0m' # No Color
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 LME_ROOT="$(dirname "$SCRIPT_DIR")"
-CONTAINERS_FILE="$LME_ROOT/config/containers.txt"
-LLM_CONTAINERS_FILE="$LME_ROOT/config/containers-llm.txt"
+GLOBAL_MANIFEST="$LME_ROOT/manifests/global.yml"
 OUTPUT_DIR="$LME_ROOT/offline_resources"
 INCLUDE_LLM="false"
 TARGET_ARCH="$(uname -m)"
+# Populated from manifests/global.yml (lme_global.image_tag) in main(), so the
+# retag sentinel is never a literal in this script.
+IMAGE_TAG=""
 
 # Load environment variables from example.env if it exists
 ENV_FILE="$LME_ROOT/config/example.env"
@@ -181,9 +183,73 @@ check_podman() {
     fi
 }
 
-# Install Nix for package preparation
+# Install Nix for package preparation.
+# Debian 13+ ships a recent nix-bin, and the single-user `curl … | sh` installer
+# fails there (it tries to create the nixbld group/users that the distro packages
+# own). download_apt_packages has already fetched nix-bin + nix-setup-systemd
+# (plus deps) into $OUTPUT_DIR/packages/debs, so install Nix from those debs and
+# bring the nix-daemon up — mirroring ansible/roles/nix/tasks/debian-13.yml.
+# Ubuntu and Debian <= 12 keep the official single-user installer.
 install_nix_for_preparation() {
     echo -e "${YELLOW}Installing Nix for package preparation...${NC}"
+
+    # Detect distro + major version. Normalize ${VERSION_ID%%.*} to an integer
+    # (unset/empty -> 0) before the numeric comparison.
+    local os_id="" version_major
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        os_id="$ID"
+    fi
+    version_major="${VERSION_ID%%.*}"
+    [[ "$version_major" =~ ^[0-9]+$ ]] || version_major=0
+
+    if [ "$os_id" = "debian" ] && [ "$version_major" -ge 13 ]; then
+        echo -e "${YELLOW}Debian ${VERSION_ID}: installing Nix from apt debs (nix-bin + nix-setup-systemd)...${NC}"
+        local debs_dir="$OUTPUT_DIR/packages/debs"
+
+        if ls "$debs_dir"/nix-bin_*.deb >/dev/null 2>&1 \
+           && ls "$debs_dir"/nix-setup-systemd_*.deb >/dev/null 2>&1; then
+            # Install the already-downloaded debs; apt-get -f resolves any deps
+            # not captured in the debs dir (check_internet guaranteed the network).
+            sudo dpkg -i "$debs_dir"/nix-bin_*.deb "$debs_dir"/nix-setup-systemd_*.deb \
+                || sudo apt-get install -f -y
+        else
+            # Either deb absent (download_apt_packages swallows per-package
+            # failures) — fall back to the online apt repo, which pulls both.
+            sudo apt-get install -y nix-bin nix-setup-systemd
+        fi
+
+        # nix-setup-systemd ships the multi-user nix-daemon unit; start it now so
+        # the unprivileged nix-build below can reach the daemon. Start the service
+        # (which owns the socket path), not the .socket unit — mirrors the
+        # "Start/enable nix-daemon" step in ansible/roles/podman/tasks/main.yml.
+        if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now nix-daemon
+        fi
+
+        # The daemon-socket dir is group-gated to nix-users (which we are not in);
+        # widen it so unprivileged nix-build (~line 891) doesn't die mid-run after
+        # the container tars are written. Reuses the repo's own helper (no-op when
+        # already reachable; exits with a usermod hint if it cannot be opened).
+        ensure_nix_daemon_access
+
+        # Mark this as an apt-managed Nix living in /nix: cleanup_temp_podman must
+        # NOT `rm -rf /nix` for it (that would destroy the operator's real Nix).
+        NIX_PREP_VIA_APT=true
+
+        hash -r 2>/dev/null || true
+        export PATH="/nix/var/nix/profiles/default/bin:$PATH"
+        if ! command -v nix-build >/dev/null 2>&1; then
+            echo -e "${RED}✗ Failed to install Nix from apt debs${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}✓ Nix installed from apt debs${NC}"
+        return 0
+    fi
+
+    # Ubuntu / Debian <= 12 / other: official single-user installer.
+    NIX_PREP_VIA_APT=false
 
     # Download and run the Nix installer
     curl -L https://nixos.org/nix/install | sh
@@ -226,8 +292,11 @@ cleanup_temp_podman() {
         echo -e "${YELLOW}Note: LME installation will use Nix-managed Podman${NC}"
     fi
 
-    # Cleanup temporary Nix installation
-    if [ "$TEMP_NIX_INSTALLED" = true ]; then
+    # Cleanup temporary Nix installation.
+    # Skip entirely when Nix was installed from apt debs (Debian 13+): that is a
+    # persistent, apt-managed install in /nix, so `rm -rf /nix` would destroy the
+    # operator's real Nix. Only the single-user `curl | sh` install is disposable.
+    if [ "$TEMP_NIX_INSTALLED" = true ] && [ "${NIX_PREP_VIA_APT:-false}" != true ]; then
         echo -e "${YELLOW}Cleaning up temporary Nix installation...${NC}"
 
         # Remove Nix installation
@@ -257,6 +326,9 @@ cleanup_temp_podman() {
         sudo rm -f /etc/bash.bashrc.backup-before-nix 2>/dev/null || true
 
         echo -e "${GREEN}✓ Temporary Nix installation cleaned up${NC}"
+    elif [ "$TEMP_NIX_INSTALLED" = true ]; then
+        # apt/deb path (Debian 13+): Nix is apt-managed and persistent — keep it.
+        echo -e "${GREEN}✓ Nix was installed from apt debs — leaving it in place (apt-managed, not removed)${NC}"
     fi
 }
 
@@ -276,13 +348,75 @@ create_output_dir() {
     fi
 }
 
-# Derive target tag localhost/<last-path-seg>:LME_LATEST from an image ref.
-# Matches container_setup.yml:116 derivation, with explicit localhost/ prefix.
+# --- manifest-driven image list ------------------------------------------------
+# The image set AND the retag targets come from manifests/global.yml (the single
+# source of truth), NOT config/containers*.txt. These helpers read it with PyYAML,
+# so this script never hard-codes an upstream ref, a local ref, or the tag.
+
+# Verify the manifest + PyYAML are present before anything relies on them.
+require_manifest_tooling() {
+    if [ ! -f "$GLOBAL_MANIFEST" ]; then
+        echo -e "${RED}✗ Manifest not found: $GLOBAL_MANIFEST${NC}"
+        exit 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${RED}✗ python3 is required to read $GLOBAL_MANIFEST${NC}"
+        exit 1
+    fi
+    if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+        echo -e "${RED}✗ Python PyYAML is required to read $GLOBAL_MANIFEST${NC}"
+        echo -e "${YELLOW}  Install it: apt-get install -y python3-yaml  (or: pip3 install pyyaml)${NC}"
+        exit 1
+    fi
+}
+
+# Print lme_global.image_tag (the retag sentinel).
+manifest_image_tag() {
+    python3 - "$GLOBAL_MANIFEST" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as fh:
+    g = yaml.safe_load(fh)["lme_global"]
+tag = g.get("image_tag")
+if not tag:
+    sys.exit("global.yml lme_global.image_tag is missing")
+print(tag)
+PY
+}
+
+# Print "<pull_ref>\t<local_ref>" for each image in <group> that has a pull source.
+manifest_pull_images() {
+    python3 - "$GLOBAL_MANIFEST" "$1" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as fh:
+    images = yaml.safe_load(fh)["lme_global"]["images"]
+group = sys.argv[2]
+for name, spec in images.items():
+    if spec.get("group", "core") == group and spec.get("pull"):
+        print("%s\t%s" % (spec["pull"], spec["local"]))
+PY
+}
+
+# Print "<dockerfile_rel>\t<local_ref>" for each image in <group> built locally.
+manifest_build_images() {
+    python3 - "$GLOBAL_MANIFEST" "$1" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as fh:
+    images = yaml.safe_load(fh)["lme_global"]["images"]
+group = sys.argv[2]
+for name, spec in images.items():
+    if spec.get("group", "core") == group and spec.get("build"):
+        print("%s\t%s" % (spec["build"], spec["local"]))
+PY
+}
+
+# Derive target tag localhost/<last-path-seg>:<image_tag> from an image ref.
+# Fallback only: the manifest-driven callers pass the manifest `local` ref
+# directly, so the tag never appears as a literal.
 derive_target_tag() {
     local image_ref="$1"
     local last_seg="${image_ref##*/}"
     local name="${last_seg%%:*}"
-    echo "localhost/${name}:LME_LATEST"
+    echo "localhost/${name}:${IMAGE_TAG}"
 }
 
 # Save a container image to a tar and append an entry to image_manifest.tsv.
@@ -332,44 +466,31 @@ pull_and_save_container() {
     echo
 }
 
-# Download and save container images from config/containers.txt
+# Download and save the CORE container images (manifests/global.yml group: core).
+# Retag target is each image's manifest `local` ref.
 download_containers() {
-    echo -e "${YELLOW}Downloading and saving container images...${NC}"
+    echo -e "${YELLOW}Downloading and saving core container images...${NC}"
 
-    if [ ! -f "$CONTAINERS_FILE" ]; then
-        echo -e "${RED}✗ Containers file not found: $CONTAINERS_FILE${NC}"
-        exit 1
-    fi
-
-    while IFS= read -r container; do
-        if [ -n "$container" ] && [[ ! "$container" =~ ^[[:space:]]*# ]]; then
-            pull_and_save_container "$container" ""
-        fi
-    done < "$CONTAINERS_FILE"
+    while IFS=$'\t' read -r pull_ref local_ref; do
+        [ -z "$pull_ref" ] && continue
+        pull_and_save_container "$pull_ref" "$local_ref"
+    done < <(manifest_pull_images core)
 }
 
 
 
-# Download and save the LLM container images listed in containers-llm.txt.
-# A small override map handles the llama.cpp dot-to-dash rename that
-# quadlet/lme-llama-cpp.container and quadlet/lme-embeddings.container expect.
+# Download and save the LLM pull-images (manifests/global.yml group: llm). The
+# manifest `local` ref is the retag target, so the old llama.cpp dot-to-dash
+# override map is gone -- global.yml already carries localhost/llama-cpp. The two
+# build-type llm images (lme-dashboard, lme-log-analyzer) have no upstream pull
+# source and are handled by build_lme_images().
 download_llm_containers() {
     echo -e "${YELLOW}Downloading LLM container images...${NC}"
 
-    if [ ! -f "$LLM_CONTAINERS_FILE" ]; then
-        echo -e "${RED}✗ LLM containers file not found: $LLM_CONTAINERS_FILE${NC}"
-        exit 1
-    fi
-
-    declare -A LLM_TAG_OVERRIDES=(
-        ["ghcr.io/ggml-org/llama.cpp:server"]="localhost/llama-cpp:LME_LATEST"
-    )
-
-    while IFS= read -r container; do
-        if [ -n "$container" ] && [[ ! "$container" =~ ^[[:space:]]*# ]]; then
-            pull_and_save_container "$container" "${LLM_TAG_OVERRIDES[$container]:-}"
-        fi
-    done < "$LLM_CONTAINERS_FILE"
+    while IFS=$'\t' read -r pull_ref local_ref; do
+        [ -z "$pull_ref" ] && continue
+        pull_and_save_container "$pull_ref" "$local_ref"
+    done < <(manifest_pull_images llm)
 }
 
 # Download the two GGUFs that llama_cpp_setup.yml would otherwise fetch
@@ -417,6 +538,10 @@ download_llm_models() {
 # Build and save the ingest image that replaces the online flow's
 # `python:3.11-slim + inline pip install` (llama_cpp_setup.yml:318-324).
 # Pin exact package versions so offline bundles are reproducible.
+# All builds use --network=host: RUN steps (pip/apt) need internet, and the
+# container network namespace can't be assumed to have working egress (e.g.
+# Tailscale/proxy/split-DNS prep machines) — the host netns is exactly what
+# check_internet already validated. Affects build-time only, not the image.
 build_ingest_image() {
     echo -e "${YELLOW}Building LME ingest image (pinned pip deps)...${NC}"
     local dockerfile_tmp
@@ -432,9 +557,9 @@ RUN pip install --no-cache-dir \
     lxml==5.3.0
 DOCKERFILE
 
-    if sudo podman build -t localhost/lme-ingest:LME_LATEST -f "$dockerfile_tmp" "$LME_ROOT"; then
+    if sudo podman build --network=host -t "localhost/lme-ingest:${IMAGE_TAG}" -f "$dockerfile_tmp" "$LME_ROOT"; then
         rm -f "$dockerfile_tmp"
-        save_container_tar "localhost/lme-ingest:LME_LATEST" "localhost/lme-ingest:LME_LATEST"
+        save_container_tar "localhost/lme-ingest:${IMAGE_TAG}" "localhost/lme-ingest:${IMAGE_TAG}"
     else
         rm -f "$dockerfile_tmp"
         echo -e "${RED}✗ Failed to build LME ingest image${NC}"
@@ -444,22 +569,24 @@ DOCKERFILE
 
 # Build and save lme-log-analyzer and lme-dashboard images locally, since the
 # online install would `podman build` these in-place — impossible offline.
+# --network=host for the same reason as build_ingest_image (see above): their
+# Dockerfiles RUN apt-get + pip install, which need the host's connectivity.
 build_lme_images() {
-    echo -e "${YELLOW}Building LME Log Analyzer image...${NC}"
-    if sudo podman build -t localhost/lme-log-analyzer:LME_LATEST "$LME_ROOT/lme-log-analyzer"; then
-        save_container_tar "localhost/lme-log-analyzer:LME_LATEST" "localhost/lme-log-analyzer:LME_LATEST"
-    else
-        echo -e "${RED}✗ Failed to build LME Log Analyzer${NC}"
-        exit 1
-    fi
-
-    echo -e "${YELLOW}Building LME Dashboard image...${NC}"
-    if sudo podman build -t localhost/lme-dashboard:LME_LATEST "$LME_ROOT/lme-dashboard"; then
-        save_container_tar "localhost/lme-dashboard:LME_LATEST" "localhost/lme-dashboard:LME_LATEST"
-    else
-        echo -e "${RED}✗ Failed to build LME Dashboard${NC}"
-        exit 1
-    fi
+    # Build the llm-group build-type images (lme-log-analyzer, lme-dashboard)
+    # straight from manifests/global.yml. Build context = the Dockerfile's dir;
+    # --network=host for the same reason as build_ingest_image (RUN needs egress).
+    while IFS=$'\t' read -r dockerfile_rel local_ref; do
+        [ -z "$dockerfile_rel" ] && continue
+        local context_dir
+        context_dir="$LME_ROOT/$(dirname "$dockerfile_rel")"
+        echo -e "${YELLOW}Building $local_ref (from $dockerfile_rel)...${NC}"
+        if sudo podman build --network=host -t "$local_ref" -f "$LME_ROOT/$dockerfile_rel" "$context_dir"; then
+            save_container_tar "$local_ref" "$local_ref"
+        else
+            echo -e "${RED}✗ Failed to build $local_ref${NC}"
+            exit 1
+        fi
+    done < <(manifest_build_images llm)
 }
 
 # Captured by scrape_lme_docs, read by write_manifest.
@@ -483,7 +610,7 @@ scrape_lme_docs() {
         -v "$scrape_out":/out:Z \
         -v "$LME_ROOT/scripts":/scripts:z \
         -v "$repo_tmp":/repo:z \
-        localhost/lme-ingest:LME_LATEST \
+        "localhost/lme-ingest:${IMAGE_TAG}" \
         python /scripts/ingest_docs.py --scrape-only --docs-repo /repo --output-dir /out; then
         sudo chown -R "$USER:$USER" "$scrape_out"
         DOCS_PAGES=$(cat "$scrape_out/count" 2>/dev/null || echo 0)
@@ -1388,6 +1515,8 @@ main() {
     check_internet
     check_podman
     ensure_nix_daemon_access
+    require_manifest_tooling
+    IMAGE_TAG="$(manifest_image_tag)"
     create_output_dir
     download_containers
     if [ "$INCLUDE_LLM" = "true" ]; then

@@ -1,0 +1,862 @@
+---
+# ansible/roles/podman/tasks/load_manifests.yml
+#
+# Loads the manifest tree into facts. The merge ORDER is provable by reading THIS
+# FILE ALONE, and the operator override always wins LAST. NB: the winning override
+# `lme_service_overrides` can come from an -e extra-var OR from host_vars (e.g.
+# host_vars/es{1,2,3}.yml) -- its SOURCE is not visible from this file alone; either
+# way it combines LAST and can clobber the legacy es_* shim (see the WARNING below):
+#
+#   lme_global      = global.yml.lme_global
+#                   | combine(<active profile>.lme_global, recursive=True)
+#                   | combine(lme_global_override | default({}), recursive=True)   # operator LAST
+#
+#   lme_services[<id>] = <service.yml>
+#                   | combine(<active profile>.services[<id>], recursive=True)
+#                   | combine((lme_service_overrides | lme_effective_service_overrides(<es_ctx>))[<id>], recursive=True)  # operator LAST
+#
+#   lme_service_kinds[<id>] = <service.yml>.kind   (feeds the svc_unit/unit_refs filters)
+#
+# LEGACY CLUSTER-INVENTORY SHIM (G6 reconciliation #9). The tree's own cluster
+# inventory generators (scripts/create_cluster_inventory.sh, the escluster CI, the
+# testing/ + docker/lib/ installers) emit per-node discovery as the FLAT legacy
+# vars es_node_name / es_publish_host / es_cluster_seed_hosts (+ es_is_initial_master
+# on the master), NOT as lme_service_overrides. install.sh forwards them with -e but
+# nothing mapped them, so a true generator-driven cluster run got no node.name /
+# seed_hosts / publish_host into the rendered ES unit. The EFFECTIVE service-override
+# map folds the shim BASE and the operator layer in ONE value-pure filter:
+#
+#   lme_service_overrides | lme_effective_service_overrides(<es_ctx>)
+#       = { elasticsearch: { environment: <es_* -> ES settings> } }   # legacy shim BASE
+#         | combine(lme_service_overrides | default({}), recursive=True)   # operator LAST
+#
+#   The filter reproduces lme-elasticsearch.container.j2's four discovery branches
+#   1:1 from identical legacy inputs (node.name<-es_node_name; discovery.seed_hosts
+#   <-es_cluster_seed_hosts normalised + comma-joined; cluster.initial_master_nodes
+#   <-es_initial_master_nodes|default('lme-elasticsearch') comma-joined, GATED on
+#   es_is_initial_master like the .j2; network.publish_host<-es_publish_host with the
+#   .j2's truthiness/omit guard). It is a BASE only: the operator's own
+#   lme_service_overrides combines OVER the shim so the operator still wins LAST. When
+#   es_node_name is absent the shim is inert: the filter returns lme_service_overrides
+#   verbatim. FAITHFUL-DERIVATION (C1-SERVICE-OVERRIDE-INTERMEDIATE-DISCARDS-DECLARATION,
+#   codex-1015): the whole derivation is folded into this filter and called INLINE (an
+#   expression, never a set_fact), so there is NO extra-var-overridable intermediate
+#   (the former _lme_service_overrides_eff / _lme_es_legacy_overrides / _lme_es_seed_join
+#   / _lme_es_masters_join) between the admitted declarations (es_* + lme_service_overrides)
+#   and the composed lme_services. An `-e _lme_service_overrides_eff={}` (or a pin one hop
+#   up) can no longer DISCARD an admitted override while the revision + read-back reuse the
+#   suppressed lme_services and agree -- those names are now inert, and the post-build
+#   faithful-application invariant (lme_service_overrides_applied) rejects any residual
+#   discard pre-mutation.
+#
+#   WARNING (R8-7 clobber): lme_service_overrides is ONE var with ordinary Ansible
+#   precedence, and host_vars is a valid SOURCE of it -- not just -e. A generator-driven
+#   cluster that inherits the example host_vars/es{1,2,3}.yml (placeholder IPs
+#   10.0.0.4/5/6) will have THOSE combine LAST over the generator's real-IP es_* shim,
+#   silently overriding real discovery -- with NO -e present. Edit/remove those host_vars
+#   overrides before a real cluster run.
+#
+#   INVOCATION SCOPE (do not over-read the warning): this clobber is real ONLY on an
+#   inventory-driven run (`-i ansible/inventory` with es{1,2,3} in the play) where those
+#   host_vars auto-load. It does NOT apply to the `install.sh --cluster` Phase-1 path,
+#   which runs site.yml on localhost (site.yml:3-4 hosts/connection local) via a BARE
+#   `ansible-playbook` with NO `-i ansible/inventory` (install.sh:1002-1006; the
+#   root-level $SCRIPT_DIR/inventory is absent in-repo and there is no ansible.cfg
+#   default) -- so host_vars/es{1,2,3}.yml never load there and the OPPOSITE defect
+#   applies (R8-2: the es_* shim is gated `when: es_node_name is defined`, which Phase-1
+#   never sets -> zero discovery keys). Fixing host_vars hygiene does NOT unblock
+#   --cluster; that needs the Phase-1/Phase-2 ordering redesign.
+#
+# G1 provides this file; G2/G3 include it. The G2 cutover is DONE: this file is now
+# wired into the live install path -- quadlet_setup.yml:19 loads it (and
+# container_setup.yml:17 loads it defensively), both reached from podman main.yml
+# (:248 / :240), so lme_global / lme_services render live (the effective overrides are
+# folded into lme_services by lme_effective_service_overrides; no bare eff fact renders).
+
+# The SHARED early-resolve entrypoint (CR-B3) loads global.yml + the active profile
+# overlay, normalizes caller inputs (lme_inputs), resolves every declared field by the
+# registry's precedence, validates (fail-closed) and publishes lme_resolved /
+# lme_resolved_origins / lme_enable_flags / lme_resolved_revision + the bare-name compat
+# bridge. upgrade_lme.yml and convert_to_cluster.yml include the SAME file (via
+# `include_role: name=podman, tasks_from=resolve`) so resolution is DRY and reusable
+# OUTSIDE site.yml. See resolve.yml for the full input/output contract; it sets
+# _lme_global_file + _lme_profile_file, which the lme_global / lme_services composition
+# below reads.
+- name: Invalidate previous record outputs before attempting shared resolution
+  ansible.builtin.set_fact: &lme_record_entry_reset
+    lme_resolved_configuration_record: null
+    lme_resolved_configuration_record_text: null
+    lme_resolved_configuration_record_sha256: null
+    lme_resolved_configuration_artifact: null
+    lme_resolved_verification_source: null
+  no_log: &lme_record_entry_quiet true
+
+- name: Refuse a pinned previous record output at loader entry
+  ansible.builtin.assert:
+    that:
+      - lme_resolved_configuration_record is none
+      - lme_resolved_configuration_record_text is none
+      - lme_resolved_configuration_record_sha256 is none
+      - lme_resolved_configuration_artifact is none
+      - lme_resolved_verification_source is none
+    fail_msg: &lme_record_entry_refusal Complete configuration record values differ from the declared actual producer inputs.
+    quiet: *lme_record_entry_quiet
+  no_log: *lme_record_entry_quiet
+
+- name: Resolve config into facts via the shared early-resolve entrypoint (CR-B3)
+  ansible.builtin.include_tasks: resolve.yml
+
+- name: Bind the explicit bootstrap reset declaration to the captured global declaration
+  vars:
+    _lme_record_entry_declaration: *lme_record_entry_reset
+    _lme_record_entry_quiet: *lme_record_entry_quiet
+    _lme_record_entry_refusal: *lme_record_entry_refusal
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_lme_record_entry_declaration | list | sort) | lme_type_aware_equal(
+        (_lme_global_file.lme_config_registry.resolved_record.outputs.values() | list + [_lme_global_file.lme_config_registry.resolved_record.source_fact]) | sort)
+      - >-
+        (_lme_record_entry_declaration.values() | list | unique | list) | lme_type_aware_equal(
+        [_lme_global_file.lme_config_registry.resolved_record.atoms.absent])
+      - _lme_record_entry_quiet | lme_type_aware_equal(_lme_global_file.lme_config_registry.resolved_record.atoms.true)
+      - _lme_record_entry_refusal | lme_type_aware_equal(_lme_global_file.lme_config_registry.resolved_record.diagnostics.record)
+    fail_msg: "{{ _lme_global_file.lme_config_registry.resolved_record.diagnostics.record }}"
+    quiet: "{{ _lme_global_file.lme_config_registry.resolved_record.atoms.true }}"
+
+- name: Refuse a pinned previous record output
+  ansible.builtin.assert:
+    that: vars[item] is none
+    fail_msg: "{{ _lme_global_file.lme_config_registry.resolved_record.diagnostics.record }}"
+    quiet: "{{ _lme_global_file.lme_config_registry.resolved_record.atoms.true }}"
+  loop: "{{ _lme_global_file.lme_config_registry.resolved_record.outputs.values() | list + [_lme_global_file.lme_config_registry.resolved_record.source_fact] }}"
+  no_log: "{{ _lme_global_file.lme_config_registry.resolved_record.atoms.true }}"
+
+# lme_global (global | profile | operator override LAST) is composed ONCE, in resolve.yml above, with an
+# inline read-back (SEED-06); this file consumes that composition and builds no second one.
+
+# POLICY IS NOT AN OVERRIDE CHANNEL (v6.1, codex-1710 C1-COMPOSED-SCHEMA-WEAKENS-ITS-OWN-SECURITY-
+# POLICY -- invalid-policy control). The two material SCHEMAS are the security policy and are sourced
+# from the DECLARED _lme_global_file, so a schema override is silently IGNORED downstream. A silently
+# ignored security input is a false success (an operator/profile believes they set a policy that has no
+# effect). We REFUSE it at the door: neither the operator override nor a profile overlay may carry
+# material_catalog_schema / material_provision_schema. Profiles compose DATA only; policy lives in the
+# declared manifest. This is a channel refusal, NOT a whole-registry equality gate, and adds no policy
+# literal to the filter. Stock profiles do not carry these keys, so it is neutral (proven by neutrality).
+- name: "C1 -- refuse a material SCHEMA supplied through the override or profile channel (policy is declared-only)"
+  ansible.builtin.assert:
+    that:
+      - "'material_catalog_schema' not in (lme_global_override | default({}))"
+      - "'material_provision_schema' not in (lme_global_override | default({}))"
+      - "'material_catalog_schema' not in ((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}))"
+      - "'material_provision_schema' not in ((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}))"
+    fail_msg: >-
+      a material_catalog_schema / material_provision_schema was supplied through lme_global_override or a
+      profile overlay -- the material SCHEMAS are the security policy and are admitted ONLY from the
+      declared manifest (_lme_global_file). Recompose the DATA registries instead; policy is not an
+      override channel (C1 fix_3 / codex-1710 invalid-policy control).
+    quiet: true
+
+- name: Require resolved consumer secret and certificate bindings
+  ansible.builtin.assert:
+    that:
+      - lme_secrets_source_host | default('') | length > 0
+      - lme_certs_source_host | default('') | length > 0
+      - lme_service_overrides.dashboard.environment.ELASTICSEARCH_URL | default('') | length > 0
+      - lme_service_overrides.dashboard.environment.LITELLM_URL | default('') | length > 0
+      # CR-E-5: log-analyzer runs on the trixie consumer and hardcodes the alias, so it
+      # needs the same topology-derived endpoints as dashboard.
+      - lme_service_overrides['log-analyzer'].environment.ELASTICSEARCH_URL | default('') | length > 0
+      - lme_service_overrides['log-analyzer'].environment.LITELLM_URL | default('') | length > 0
+    fail_msg: Consumer profile requires topology-derived secret source, certificate authority and endpoints for dashboard AND log-analyzer.
+  when: lme_resolved.lme_consumer_profile | default(false) | strict_enable_bool
+
+# GAP-3 host-scoping roster (lme_host_services): DELIBERATELY NOT assembled into a fact
+# here. It is an operator/host_vars-supplied list of service ids (host_vars/<host>.yml);
+# default UNDEFINED -> full host (backward-compat). trixie is a PLAIN client (no tailscale
+# profile), so scoping is carried in host_vars, not a profile overlay. Every consumer reads
+# it `| default`-guarded -- the empty-safe `when:` clauses in container_setup.yml /
+# tailscale_service.yml / tailscale_ingress.yml / render_units.yml, plus container.j2's
+# `| default(None)` -- so there is nothing to normalise into a fact here.
+# HAZARD-1: do NOT add `set_fact: lme_host_services: "{{ lme_host_services | default([]) }}"`.
+# An unconditional default makes the var defined-and-empty on every existing full-host run,
+# which the design forbids (defined-and-empty must mean full host, and a naive membership
+# clause would then wipe out every unit). If a set_fact is ever needed to normalise, gate it
+# `when: lme_host_services is defined` and never default to [].
+
+# FAITHFUL-DERIVATION of the effective service overrides (C1-SERVICE-OVERRIDE-INTERMEDIATE-
+# DISCARDS-DECLARATION, codex-1015). The legacy es_* elasticsearch shim BASE + the operator
+# lme_service_overrides layer are now composed by ONE value-pure filter,
+# `lme_effective_service_overrides`, called INLINE at the build loop below (and re-derived
+# INLINE by the faithful-application invariant). There is deliberately NO set_fact / task var
+# holding the effective overrides, the legacy shim base, or the seed/masters joins: every one
+# of those (_lme_service_overrides_eff, _lme_es_legacy_overrides, _lme_es_seed_join,
+# _lme_es_masters_join) was extra-var-overridable, so an `-e _lme_service_overrides_eff={}` --
+# or a pin one hop up -- DISCARDED an admitted override while the revision + read-back reused
+# the suppressed lme_services and agreed. The filter reads ONLY the admitted declarations
+# (the es_* inventory context, assembled inline below, + lme_service_overrides), so it cannot
+# be pinned. The es_ctx literal appears in the build loop AND the invariant; keep the two in
+# sync (is_initial_master is `| bool`-coerced in Ansible so the filter never diverges from
+# Ansible's bool on the string 'false').
+
+- name: Enumerate service manifests
+  ansible.builtin.find:
+    paths: "{{ lme_manifests_dir }}/services"
+    patterns: "*.yml"
+    file_type: file
+  delegate_to: localhost
+  connection: local
+  run_once: true
+  become: false
+  register: _lme_service_files
+
+# C1-OVERRIDE-MISSING-SERVICE-SKIP (codex-1100) -- BIND the enumerated manifest set to the
+# declared bytes on disk. `_lme_service_files` is a register result and an extra-var OUTRANKS
+# it: `-e _lme_service_files=<forged/subset/superset>` would otherwise let the admitted
+# CATALOG UNIVERSE (and the coverage check below) be pinned. Re-read the services dir with an
+# INLINE fileglob (an expression running on the same controller as the delegated find, so an
+# extra-var cannot pin it) and assert the enumerated FULL PATHS EQUAL the on-disk set. A subset
+# pin (drops a declared service), a superset pin (smuggles an undeclared one), OR a
+# same-basename/different-directory forgery (`-e _lme_service_files` naming external files under
+# matching basenames -- a basename-only bind would let this through; empirically confirmed) all
+# fail closed here, BEFORE the universe is derived. Fail-closed, pre-mutation.
+- name: Bind the enumerated service manifests to the declared services dir (fail-closed, pre-mutation)
+  ansible.builtin.assert:
+    that:
+      - (_lme_service_files.files | map(attribute='path') | sort)
+        == (query('ansible.builtin.fileglob', lme_manifests_dir ~ '/services/*.yml') | sort)
+    fail_msg: >-
+      the enumerated service manifest set does not match the declared services dir on disk --
+      an -e _lme_service_files (or a tampered enumeration) replaced the admitted service catalog
+      with external state (including a same-basename/different-directory forgery). The declared
+      manifest files at their on-disk paths are the sole authority for the service universe
+      (C1-OVERRIDE-MISSING-SERVICE-SKIP).
+    quiet: true
+
+# Derive the COMPLETE ADMITTED CATALOG UNIVERSE (every declared service id, BEFORE activation +
+# host filtering). This is the codex-1045 "declared universe": a declared-but-disabled or off-host
+# id is IN it (a valid override target); a misspelled/removed id is not. It is computed INLINE from
+# a NON-PINNABLE expression (`query('file', *fileglob(...))`, star-args verified under 2.19.11): the
+# fileglob runs on the controller and reads the manifests directly, so -- NON-PINNABLE RELATIVE TO
+# THE lme_manifests_dir TRUST ROOT -- an extra-var cannot repoint the SOURCE ids into that root (an
+# `-e lme_manifests_dir=<other>` relocates the whole trust root, it does not smuggle ids into the
+# declared one), and the read-back guard below rejects a pin of the RESULT variable
+# (`-e _lme_declared_service_ids`). Together these close
+# the previously-disclosed coordinated universe+lme_services double-pin residual: a lone OR double
+# pin of the universe now fails closed at the guard, and a lone pin of lme_services fails closed at
+# the coverage gate. Recomputed per load, so a prior load cannot carry a stale id.
+- name: Enumerate the declared service-id universe (inline, non-pinnable) from the declared manifests
+  ansible.builtin.set_fact:
+    _lme_declared_service_ids: >-
+      {{ query('file', *query('ansible.builtin.fileglob', lme_manifests_dir ~ '/services/*.yml'))
+         | map('from_yaml') | map(attribute='id') | list }}
+
+- name: C1 -- read-back guard the declared universe (reject -e _lme_declared_service_ids; closes the double-pin residual)
+  ansible.builtin.assert:
+    that:
+      - (_lme_declared_service_ids | sort)
+        == (query('file', *query('ansible.builtin.fileglob', lme_manifests_dir ~ '/services/*.yml'))
+            | map('from_yaml') | map(attribute='id') | sort)
+    fail_msg: >-
+      the declared service-id universe was pinned away from the disk-bound manifest ids
+      (-e _lme_declared_service_ids). The universe is derived inline from the declared service
+      manifests and is not operator-overridable; a coordinated universe+lme_services double-pin
+      that previously evaded coverage now fails closed here (C1-OVERRIDE-MISSING-SERVICE-SKIP).
+    quiet: true
+
+# ADMISSION -- SHAPE (codex-1100 #2 C1-MALFORMED-OVERRIDE-SILENT-DISCARD): reject a MALFORMED
+# lme_service_overrides at ADMISSION, BEFORE any composition/mutation, so a nonmapping is NEVER
+# silently coerced to {} (the coercion the downstream override helpers apply defensively is
+# unreachable for a nonmapping once this gate has run). A scalar/list at the top level, OR any
+# per-service value that is not a mapping, is a malformed declaration named here. This raise is
+# DISTINCT from the composition fold's 'must be a mapping' raise (message + stage) so the two
+# gates are separable: a shape violation fails HERE (pre-composition), not deep in the build loop.
+# `None` is legitimate absence and passes. Reads the OPERATOR keys, never a pinnable intermediate.
+- name: C1 -- reject malformed service overrides (nonmapping shape) at admission, before composition (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - (lme_service_overrides | default(None) | lme_service_override_shape_errors) | length == 0
+    fail_msg: >-
+      lme_service_overrides is MALFORMED and is rejected at admission before composition (never
+      coerced to {}) -- shape violation(s):
+      {{ lme_service_overrides | default(None) | lme_service_override_shape_errors }}. A scalar/list
+      lme_service_overrides, or a per-service value that is not a mapping, is a malformed declaration
+      (C1-MALFORMED-OVERRIDE-SILENT-DISCARD); fix the declaration, do not let it be discarded.
+    quiet: true
+
+# ADMISSION (codex-1045 + codex-1100 C1-OVERRIDE-MISSING-SERVICE-SKIP): reject an operator
+# service override whose id is NOT in the declared universe (a typo / removed / renamed-away
+# service), and reject a legacy_service_override_projection whose target service id is undeclared,
+# BEFORE any composition/mutation. A declared-but-inactive/off-host id stays valid (it IS in the
+# universe). Reads the OPERATOR keys, never the pinnable effective/shim map.
+- name: C1 -- reject service overrides / projection targets outside the declared catalog universe (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - (lme_service_overrides | default({}) | lme_unknown_service_override_ids(_lme_declared_service_ids)) | length == 0
+      - (_lme_global_file.legacy_service_override_projection | default({}) | list
+         | difference(_lme_declared_service_ids)) | length == 0
+    fail_msg: >-
+      service override / projection target id(s) are NOT in the declared catalog universe --
+      unknown override ids: {{ lme_service_overrides | default({}) | lme_unknown_service_override_ids(_lme_declared_service_ids) }};
+      unknown projection targets: {{ _lme_global_file.legacy_service_override_projection | default({}) | list | difference(_lme_declared_service_ids) }}.
+      A declared-but-disabled/off-host service is valid; a misspelled/removed/renamed-away id is
+      rejected before mutation (C1-OVERRIDE-MISSING-SERVICE-SKIP). Known service ids:
+      {{ _lme_declared_service_ids | sort }}.
+    quiet: true
+
+# Reset lme_services before the build loop so each load resolves the CURRENT service
+# set from scratch. Without this, `lme_services | default({})` in the build task below
+# combines into whatever a PRIOR load left behind -- so a service whose manifest was
+# removed persists as a stale entry (the service-removal retention defect). The loop
+# still accumulates within THIS load (first iteration reads {}, later ones read the
+# growing map); only the cross-load carry-over is severed.
+- name: Reset lme_services (recompute the current service set from scratch each load)
+  ansible.builtin.set_fact:
+    lme_services: {}
+
+# MULTINODE-217-TEMPLATED-PORT-TYPE (codex choice a): each composed entry passes through
+# lme_service_typed_inputs, which normalizes ONLY the registry-declared integer input fields
+# (lme_config_registry.service_input_types: publish_ports host/container/tailnet_port) -- a templated
+# profile leaf renders '9200' on 2.17 and 9200 on 2.19; a canonical decimal string becomes the int,
+# anything else (bool/float/null/non-canonical/out-of-range) refuses HERE, before any consumer and
+# before the revision is bound. Both tailscale_serve_services branches and every operator override
+# still compose exactly as before (the normalization is applied to the composed entry, not in place of
+# any layer). The faithful-application check below normalizes its re-derived overrides the same way.
+# C1-INVOCATION-CONTEXT-01 LM12-03 (codex 896 item 3; codex 900; G13-05; SR-317; SR-318-03): when the selected
+# profile requires the cluster topology (resolve.yml E12-11 published lme_cluster_topology from the INVENTORY host
+# words; null otherwise), a member's es context takes publish_host, seed_hosts and is_initial_master from it, combined
+# LAST over the legacy es_* values, so a play var (convert_to_cluster.yml es_is_initial_master) never decides them. The
+# member row is selected by the declared member_fields words; on a non-member or without a topology the added layer is
+# empty (zip over an empty row list), never a fallback. A declared seed-host value in scope must be the validated
+# inventory value of this host (L8 checked it against the derived seed set); a play or include var refuses.
+- name: LM12-03 Refuse a seed-host value in scope that is not this host's validated inventory value (topology required)
+  ansible.builtin.assert:
+    that:
+      - >-
+        query('ansible.builtin.varnames', '^' ~ _lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.declared_seed_word ~ '$') | length == 0
+        or (_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.declared_seed_word
+            in ([inventory_hostname] | map('extract', hostvars) | first)
+            and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.declared_seed_word)
+            == ([inventory_hostname] | map('extract', hostvars)
+                | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.declared_seed_word) | first))
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.refusal }}: (LM12-03)
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.declared_seed_word }} in scope on
+      {{ inventory_hostname }} is not the inventory value validated against the derived seed set
+    quiet: true
+  when: lme_cluster_topology is not none
+
+- name: Build lme_services map (service | profile.services[id] | effective override[id] LAST)
+  ansible.builtin.set_fact:
+    lme_services: >-
+      {{ lme_services | default({}) | combine({
+           (lookup('file', item.path) | from_yaml).id:
+             (lookup('file', item.path) | from_yaml)
+             | combine((_lme_profile_file.profile_overlay.services | combine(_lme_profile_composition.overlay.services, recursive=True))[(lookup('file', item.path) | from_yaml).id] | default({}), recursive=True)
+             | combine((lme_service_overrides | default({}) | lme_effective_service_overrides(({}
+                          | combine({'node_name': es_node_name} if es_node_name is defined else {})
+                          | combine({'publish_host': es_publish_host} if es_publish_host is defined else {})
+                          | combine({'seed_hosts': es_cluster_seed_hosts} if es_cluster_seed_hosts is defined else {})
+                          | combine({'initial_master_nodes': es_initial_master_nodes} if es_initial_master_nodes is defined else {})
+                          | combine({'is_initial_master': (es_is_initial_master | bool)} if es_is_initial_master is defined else {})
+                          | combine(dict(['publish_host', 'seed_hosts', 'is_initial_master']
+                                    | zip(([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields | last) | flatten(levels=1)
+                                           | selectattr(_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | first, 'eq', inventory_hostname)
+                                           | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields[1]) | list)
+                                          + (([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields[3]) | list)
+                                             * ([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields | last) | flatten(levels=1)
+                                                | selectattr(_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | first, 'eq', inventory_hostname) | list | length))
+                                          + ([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields | last) | flatten(levels=1)
+                                             | selectattr(_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | first, 'eq', inventory_hostname)
+                                             | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | last) | list))))),
+                          _lme_global_file.legacy_service_override_projection | default({})))[(lookup('file', item.path) | from_yaml).id] | default({}), recursive=True)
+         } | lme_service_typed_inputs(_lme_global_file.lme_config_registry)) }}
+  loop: "{{ _lme_service_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+# COVERAGE (codex-1100 C1-OVERRIDE-MISSING-SERVICE-SKIP). The composed lme_services must cover
+# the declared universe EXACTLY -- validated INDEPENDENTLY of the pinnable projection. A
+# `-e lme_services={}` (or any pin/subset/superset) makes the composed key set diverge from the
+# disk-bound universe, so the symmetric difference is non-empty and this FAILS CLOSED before
+# activation + host-filtering. This closes the empty-projection evasion: a changed revision from a
+# pinned lme_services is no longer accepted as faithful application, and a missing admitted service
+# is rejected rather than skipped as "unrendered".
+- name: C1 -- assert the composed service set covers the declared universe (no pinned/suppressed projection)
+  ansible.builtin.assert:
+    that:
+      - (_lme_declared_service_ids | lme_service_coverage_gap(lme_services)) | length == 0
+    fail_msg: >-
+      the composed lme_services does not match the declared service universe on id(s)
+      {{ _lme_declared_service_ids | lme_service_coverage_gap(lme_services) }} -- a declared
+      service is missing from (or an undeclared one appears in) the composed set, so a pinned or
+      suppressed lme_services could pass the faithful-application check with a discarded override
+      (C1-OVERRIDE-MISSING-SERVICE-SKIP).
+    quiet: true
+
+# FAITHFUL-APPLICATION invariant (C1-SERVICE-OVERRIDE-INTERMEDIATE-DISCARDS-DECLARATION). The
+# EFFECTIVE override map is re-derived INLINE here from the admitted declarations (the SAME
+# es_ctx literal + byte-bound projection as the build loop + lme_service_overrides) -- never from
+# a pinnable intermediate -- and lme_service_overrides_applied asserts every effective override
+# leaf is reflected (TYPED: 0 != false) in the composed lme_services. So a pin that discarded an
+# override (a now-inert `-e _lme_service_overrides_eff={}`, a pinned upstream shim var, or a
+# directly pinned lme_services) leaves a declared leaf missing/different -- or, with coverage
+# guaranteeing the id is composed, an absent override id -- and FAILS CLOSED pre-mutation, before
+# the revision is bound. A legitimate override is never weakened (it is the last composition
+# layer, so it MUST appear).
+- name: C1 -- assert admitted service overrides are faithfully applied (no intermediate discard)
+  ansible.builtin.assert:
+    that:
+      - >-
+        (lme_services | lme_service_overrides_applied(
+           lme_service_overrides | default({}) | lme_effective_service_overrides(({}
+             | combine({'node_name': es_node_name} if es_node_name is defined else {})
+             | combine({'publish_host': es_publish_host} if es_publish_host is defined else {})
+             | combine({'seed_hosts': es_cluster_seed_hosts} if es_cluster_seed_hosts is defined else {})
+             | combine({'initial_master_nodes': es_initial_master_nodes} if es_initial_master_nodes is defined else {})
+             | combine({'is_initial_master': (es_is_initial_master | bool)} if es_is_initial_master is defined else {})
+             | combine(dict(['publish_host', 'seed_hosts', 'is_initial_master']
+                       | zip(([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields | last) | flatten(levels=1)
+                              | selectattr(_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | first, 'eq', inventory_hostname)
+                              | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields[1]) | list)
+                             + (([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields[3]) | list)
+                                * ([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields | last) | flatten(levels=1)
+                                   | selectattr(_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | first, 'eq', inventory_hostname) | list | length))
+                             + ([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields | last) | flatten(levels=1)
+                                | selectattr(_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | first, 'eq', inventory_hostname)
+                                | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | last) | list))))),
+             _lme_global_file.legacy_service_override_projection | default({})) | lme_service_typed_inputs(_lme_global_file.lme_config_registry))) | length == 0
+    fail_msg: >-
+      admitted service override leaf(s)
+      {{ lme_services | lme_service_overrides_applied(lme_service_overrides | default({}) | lme_effective_service_overrides(({} | combine({'node_name': es_node_name} if es_node_name is defined else {}) | combine({'publish_host': es_publish_host} if es_publish_host is defined else {}) | combine({'seed_hosts': es_cluster_seed_hosts} if es_cluster_seed_hosts is defined else {}) | combine({'initial_master_nodes': es_initial_master_nodes} if es_initial_master_nodes is defined else {}) | combine({'is_initial_master': (es_is_initial_master | bool)} if es_is_initial_master is defined else {}) | combine(dict(['publish_host', 'seed_hosts', 'is_initial_master'] | zip(([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields | last) | flatten(levels=1) | selectattr(_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | first, 'eq', inventory_hostname) | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields[1]) | list) + (([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields[3]) | list) * ([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields | last) | flatten(levels=1) | selectattr(_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | first, 'eq', inventory_hostname) | list | length)) + ([lme_cluster_topology] | select('mapping') | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.fields | last) | flatten(levels=1) | selectattr(_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | first, 'eq', inventory_hostname) | map(attribute=_lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.member_fields | last) | list))))), _lme_global_file.legacy_service_override_projection | default({})) | lme_service_typed_inputs(_lme_global_file.lme_config_registry)) }}
+      are NOT reflected in the composed lme_services -- a service override was discarded by a
+      pinned intermediate (e.g. -e _lme_service_overrides_eff={}) or a pinned lme_services, so
+      the revision could equal a no-override control (C1-SERVICE-OVERRIDE-INTERMEDIATE-DISCARDS-DECLARATION).
+    quiet: true
+
+- name: Build lme_service_kinds map (id -> kind) for dependency-name resolution
+  ansible.builtin.set_fact:
+    lme_service_kinds: >-
+      {{ dict(lme_services.keys() | zip(lme_services.values() | map(attribute='kind'))) }}
+
+# GAP-3 typo guard (fail-loud; closes a silent no-render hole). `lme_host_services` is the
+# per-host render allow-list (host_vars). A roster id that names NO service (e.g. a typo
+# `dashbord`) makes every `item.key in lme_host_services` scope clause False for that id,
+# so it is silently pruned at rc=0 -- the exact silent-green class this host-scoping must
+# not introduce. `is_enabled` raises on an unknown enable FLAG; this mirrors that for an
+# unknown ROSTER id. Gated on a NON-EMPTY roster, so undefined/[] (full-host, backward
+# compat) skips it -- same empty-safe semantics as the scope clauses (default([])).
+- name: Assert every lme_host_services roster id names a known service (GAP-3 typo guard)
+  ansible.builtin.assert:
+    that:
+      - (lme_host_services | default([]) | difference(lme_services.keys() | list)) | length == 0
+    fail_msg: >-
+      lme_host_services names service id(s) absent from the manifest service set:
+      {{ lme_host_services | default([]) | difference(lme_services.keys() | list) }} --
+      every host-scope roster id must match a rendered service id (check for a typo).
+      Known service ids: {{ lme_services.keys() | list | sort }}.
+    quiet: true
+  when: lme_host_services | default([]) | length > 0
+
+# GAP-5: the set of service ids this host ACTUALLY renders. Same three predicates as
+# render_units.yml:34-38 (is_enabled ∧ not child-absent ∧ empty-safe host-scope), so
+# site.yml's POST-RENDER layer (ES/Kibana/Dashboards/Wazuh/Fleet post-config +
+# llama_cpp_setup) can gate each step on whether this host renders that step's BACKING
+# service. A full / no-roster host => the host-scope clause is length==0 TRUE => every
+# enabled service is a member => the post-render layer runs in full (single-host
+# byte-unchanged). Computed here (set_facts persist for the play) so it is in scope in
+# site.yml's post-render tasks, which already rely on this role's facts.
+#   SYNC CONTRACT: keep these three predicates in step with render_units.yml:34-38.
+#   NB render_units also carries a 4th predicate -- kind in [container,volume,network] --
+#   which this accumulator INTENTIONALLY omits: it tests membership of BACKING service ids
+#   (all kind=container) + the LLM anchor, for which the kind filter is a no-op, so the set
+#   is a harmless superset (also holds target/oneshot ids no consumer of this fact queries).
+#   Every current gate keys on a container-kind id; keep it that way, or a future
+#   non-{container,volume,network} backing would need the kind filter added here too.
+#   lme_child_absent_services is only set for cluster ES-only children (quadlet_setup,
+#   when lme_child_es_only), which run elasticsearch.yml -- NOT site.yml's post-render
+#   layer -- so it is undefined for every host that runs that layer => default([]) is
+#   exact here; the cluster-child case is deferred wave-wide.
+- name: GAP-5 -- reset this host's rendered-service accumulator
+  ansible.builtin.set_fact:
+    lme_host_rendered_services: []
+
+- name: GAP-5 -- accumulate the service ids this host renders (mirror render_units gate)
+  ansible.builtin.set_fact:
+    lme_host_rendered_services: "{{ lme_host_rendered_services + [item.key] }}"
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - item.key not in (lme_child_absent_services | default([]))
+    - (lme_host_services | default([]) | length == 0) or (item.key in (lme_host_services | default([])))
+
+# ---------------------------------------------------------------------------
+# C1 RESOLVED PROJECTIONS (codex-0430 canonical paths). lme_resolved is the SINGLE
+# validated artifact; these tasks derive its material/datastore/membership/identity
+# projections from the composed lme_services (a read-only view = lme_runtime_inventory).
+# Runs AFTER lme_services is built. The projection filters are value-pure (they compute
+# STRUCTURE from the manifests, read no secret byte). On the CURRENT manifest set 0/29
+# services declare material_requirements, so required_material is empty and every selected
+# container service is surfaced as required_material_status.<node>.<svc>.status=undeclared
+# (visible debt) -- NOT failed and NOT hidden as empty (codex-0615: no implicit-empty
+# hiding; missing_field arming is the later migration wave -- global.yml enforcement_status).
+- name: C1 -- validate the full dependency closure before activation (no unknown dep names)
+  ansible.builtin.assert:
+    that:
+      - (lme_services | lme_validate_dependency_closure) is mapping
+    fail_msg: >-
+      a service dependency names an id that resolves to NO declared manifest service (see
+      the raised lme: message). An unknown name would otherwise be silently relaxed to a
+      Wants= on an absent unit (C1-COMPLETE-CONFIGURATION-VALIDATION, dependency half).
+    quiet: true
+
+- name: Admit selected independent-profile services before activation
+  ansible.builtin.include_tasks: admit_profile_services.yml
+
+# C1-MATERIAL A2 -- validate the shared material_catalog THROUGH the consuming loader path
+# (not only a standalone helper), fail-closed pre-mutation, BEFORE any obligation references
+# it. Also reject a security-registry OVERRIDE: material_catalog / material_catalog_schema are
+# read from the composed lme_global (global | profile | operator override LAST), so an
+# lme_global_override could relabel a private_key kind distributable or widen distributable_kinds.
+# The declared manifest is the sole authority for the material security boundary, so the composed
+# value MUST equal the declared file value, and the DECLARED catalog must be schema-valid.
+- name: C1 -- validate the material catalog on the loader path + reject override tampering (A2)
+  ansible.builtin.assert:
+    that:
+      # C1-COMPOSED-MATERIAL-DECLARATIONS-REJECTED (codex-1625): the loader legitimately
+      # composes base | profile overlay | operator override, so an ADMITTED difference from
+      # the base file is NOT by itself unauthorized -- a profile may declare different material
+      # placement/owner/consumer. We therefore do NOT compare the composed catalog to the base
+      # file. Instead we validate the ACTUAL composed (admitted) value against the schema + the
+      # security invariants, which reject the real attacks (relabelling a kind, widening the
+      # distributable set, an undeclared field, missing payload_validity) while ADMITTING
+      # authorized composition. lme_validate_material_catalog raises on any schema/security
+      # violation of the composed value; a bare int/bool type substitution on a security field
+      # is rejected by the type-strict checks inside the validator (is-True/is-False identity,
+      # non-boolean-int hop order, forbidden mode bits), not by a whole-registry equality gate.
+      #
+      # SCHEMA AUTHORITY IS BOUND TO THE DECLARED SOURCE, NOT EQUALITY-LOCKED (v6.1, codex-1710
+      # C1-COMPOSED-SCHEMA-WEAKENS-ITS-OWN-SECURITY-POLICY): the material_catalog_schema declares
+      # the kind vocab and the distributable set -- the security policy. It composes from the SAME
+      # lme_global_override as the DATA, so validating the composed value against the composed
+      # schema would let an operator relax the policy that admits their own value. We therefore
+      # source the SCHEMA from _lme_global_file.lme_global (the raw global.yml fact, which
+      # resolve.yml:72-73 binds byte-for-byte to the on-disk manifest and an -e _lme_global_file
+      # forgery is rejected there), exactly as this projection already sources
+      # material_requirements_schema from the non-composed _lme_global_file.lme_config_registry.
+      # No whole-registry equality gate and no private policy literal in the filter -- policy
+      # authority is the declared manifest; only the material_catalog DATA stays composable.
+      - >-
+        (lme_global.material_catalog | default({})
+         | lme_validate_material_catalog(_lme_global_file.lme_global.material_catalog_schema | default({}))) is mapping
+    fail_msg: >-
+      the COMPOSED material_catalog is schema-invalid or breaks a security invariant (unknown
+      kind, missing payload_validity, undeclared field, a relabelled kind or a widened
+      distributable set). Authorized profile/operator composition is admitted; only a
+      schema/security violation of the admitted value is rejected
+      (C1-MATERIAL-CATALOG-DEFINITION-VALIDATION / A2).
+    quiet: true
+
+# C1-MATERIAL fix_3 -- validate the producer/custody registries + private-key material
+# provision THROUGH the consuming loader path (machine-validated + CONSUMED, not a descriptive
+# registry: codex C_TLS.follow_up). Same A2 shape as the catalog gate above: producer_registry /
+# custody_registry / material_provision / material_provision_schema are part of the material
+# SECURITY boundary, so the composed value MUST equal the declared file value (an override must
+# not add/relabel a producer or rebind custody), and the DECLARED provision must be schema-valid
+# (closure onto the catalog; a leaf key must be non-distributable; an all-host DESIRED custody
+# scope for a private key is rejected). loader_wired stays FALSE -- the per-service obligations
+# are NOT wired this fold; this gate consumes only the registries/provision.
+- name: C1 -- validate the producer/custody registries + material provision on the loader path (A2, fix_3)
+  ansible.builtin.assert:
+    that:
+      # C1-COMPOSED-MATERIAL-DECLARATIONS-REJECTED (codex-1625): as with the catalog gate, the
+      # producer/custody registries and the material provision are COMPOSED (base | profile |
+      # operator override), so a legitimate profile change to placement/owner/consumer must be
+      # ADMITTED. We do NOT equality-lock the composed registries to the base file. We validate
+      # the ACTUAL composed value against the schema + security invariants. The type-substitution
+      # concern that motivated C1-REGISTRY-TYPE-EQUALITY-BYPASS is closed INSIDE the validator on
+      # the composed value: ca_key_rule.non_publication is-True and .distributable is-False are
+      # identity checks (drift:1 / non_publication:1 style int/bool substitution on a security
+      # bool is rejected), custody hop order must be a non-boolean int (1.0 rejected), a private
+      # leaf mode may not grant leaf_mode_forbidden_mask bits (no widening), non-publication is
+      # enforced by REFERENCED MATERIAL IDENTITY (a renamed CA-alias leaf is rejected), and
+      # producer membership + the produced-private-key partition bind production to custody.
+      # An authorized overlay that only recomposes placement/owner/consumer passes all of these.
+      #
+      # SCHEMA AUTHORITY BOUND TO THE DECLARED SOURCE (v6.1, codex-1710 C1-COMPOSED-SCHEMA-
+      # WEAKENS-ITS-OWN-SECURITY-POLICY): the material_provision_schema IS the security policy (it
+      # declares the ceiling mask, the required CA owner, the vocabs and the typed record shapes).
+      # It composes from the SAME lme_global_override as the data, so validating the composed value
+      # against the composed schema let an operator set leaf_mode_forbidden_mask -> "0000" and then
+      # widen a mode. We do NOT equality-lock it (codex forbids restoring a whole-registry gate);
+      # instead the SCHEMA is sourced from _lme_global_file.lme_global (the raw global.yml fact,
+      # byte-bound to disk by resolve.yml:72-73), so an override cannot reach it. The DATA registries
+      # (material_catalog / producer / custody / material_provision) stay composed from lme_global.
+      - >-
+        (lme_global.material_catalog | default({})
+         | lme_validate_material_registries(
+             _lme_global_file.lme_global.material_catalog_schema | default({}),
+             lme_global.producer_registry | default({}),
+             lme_global.custody_registry | default({}),
+             lme_global.material_provision | default({}),
+             _lme_global_file.lme_global.material_provision_schema | default({}),
+             component_registry=_lme_global_file.lme_config_registry.database_views.components)) is mapping
+    fail_msg: >-
+      the COMPOSED producer/custody registries or material provision break a schema or security
+      invariant (a producer/custody/channel reference resolves to nothing, a leaf-key provision
+      references a distributable or non-publication material, a renamed leaf references a
+      non-publication material by identity, a producer does not produce the material a leaf
+      delivers, a leaf consumer is not a consumer of its terminal channel, a private-key
+      provision declares an all-host desired scope, a hop order is a bool/float, a private-key
+      mode grants forbidden bits, ca_key_rule.non_publication is not exactly true /
+      .distributable is not exactly false, or the produced-private-key partition is violated).
+      Authorized profile/operator composition is admitted; only a schema/security violation of
+      the admitted value is rejected (C1-MATERIAL fix_3 / A2).
+    quiet: true
+
+# C1 -- compose the required_material / datastore / membership projections and MERGE them
+# into the single canonical artifact lme_resolved. The three projections, the per-host node
+# id (inventory_hostname) AND the validated deployment identity are computed INLINE (as
+# expressions, NOT named set_facts). So an `-e _lme_required_material_proj={}` (and the
+# datastore/membership/node-id/deployment-identity siblings) can no longer SUPPRESS a
+# projection while the read-back below recomputes from that SAME pinned intermediate and
+# agrees -- there is no such intermediate to pin (C1-PROJECTION-READBACK-TRUSTS-PINNED-
+# INTERMEDIATES). Each projection is a FAITHFUL derivation from the admitted inputs
+# (lme_services, the material catalog, the enable flags, the host service scope, the resolved
+# membership). node-id derivation from declared inventory is D/inventory-owned (D FROZEN R2);
+# the deployment identity is shape-validated inline via lme_validated_deployment_identity, so
+# an -e-pinned intermediate cannot bypass the gate and emit null resource_ids for a real id.
+# RESIDUAL (same class, broader): lme_services / lme_host_services / lme_global / lme_host_
+# rendered_services are still set_facts -- but they are IN the revision payload, so a pin
+# MOVES the revision (not a silent desync); an anchor for those is owed.
+- name: C1 -- compose + merge the material/datastore/membership projections (inline; untamperable)
+  ansible.builtin.set_fact:
+    lme_resolved: >-
+      {{ lme_resolved
+         | combine(lme_services | lme_project_required_material(
+                     inventory_hostname, lme_global.material_catalog,
+                     _lme_global_file.lme_config_registry.material_requirements_schema,
+                     _lme_global_file.lme_global.material_catalog_schema, lme_enable_flags | default({}),
+                     lme_host_services | default([]),
+                     _lme_resolution.resolved | lme_validated_deployment_identity,
+                     lme_global.producer_registry | default(None),
+                     lme_global.custody_registry | default(None)), recursive=True)
+         | combine(lme_services | lme_project_datastore_clients(
+                     inventory_hostname, lme_enable_flags | default({}),
+                     lme_host_services | default([])), recursive=True)
+         | combine(_lme_resolution.resolved.lme_database_membership | default(None)
+                     | lme_project_database_membership, recursive=True)
+         | combine({'deployment_identity': (_lme_resolution.resolved | lme_validated_deployment_identity)}
+                   if (_lme_resolution.resolved | lme_validated_deployment_identity) else {}) }}
+
+- name: Project the declared application roster from actual postload facts
+  ansible.builtin.include_tasks: project_resolved_roster.yml
+  vars:
+    lme_roster_contract: "{{ _lme_global_file.lme_config_registry.resolved_record.roster }}"
+
+- name: Publish the application roster inside the resolved configuration
+  ansible.builtin.set_fact:
+    lme_resolved: "{{ lme_resolved | combine({_lme_global_file.lme_config_registry.resolved_record.projection_key: _lme_roster_projection}) }}"
+  no_log: "{{ _lme_global_file.lme_config_registry.resolved_record.atoms.true }}"
+
+# COMPLETE-REVISION REBIND (C1-COMPLETE-RESOLVED-REVISION, codex-0645). resolve.yml computed a
+# CONFIG-ONLY revision before lme_services / lme_global / the material+datastore+membership
+# projections existed -- so a change to a service manifest, an operator lme_service_overrides /
+# lme_global_override, a material obligation, a datastore endpoint or the membership was
+# INVISIBLE to the revision. Rebind it now, over the COMPLETE composed desired/effective state,
+# through the SAME untamperable value-pure binder (no revision-only named intermediate; the
+# profile-identity list is an inline literal). The binder EXCLUDES the stable deployment
+# identity and the identity-derived resource_ids, so a service/material/endpoint change flips
+# the revision while an identity change does NOT (three-identity binding). Deterministic +
+# pure, so E's elasticsearch.yml per-host parity gate (barrier.revision == this host's deploy
+# revision, both computed through load_manifests) still holds.
+- name: C1 -- rebind lme_resolved_revision to the COMPLETE composed revision (post-projection; untamperable)
+  ansible.builtin.set_fact:
+    lme_resolved_revision: >-
+      {{ lme_resolved | lme_bind_revision(
+           _lme_global_file.lme_config_registry,
+           [{'name': lme_profile,
+             _lme_global_file.lme_config_registry.resolved_record.profile_fields.sha256: lme_profile_loaded[_lme_global_file.lme_config_registry.resolved_record.profile_fields.sha256]}],
+           lme_services, lme_global, lme_host_rendered_services) }}
+
+# READ-BACK GUARD for the complete revision + the post-projection artifact (mirrors resolve.yml).
+# A pinned lme_resolved (post-merge) or lme_resolved_revision is a set_fact no-op that then
+# disagrees with the inline recompute here. The projections are RECOMPUTED from the admitted
+# inputs via _lme_resolution.resolved (NOT the post-merge lme_resolved, and NOT a pinnable
+# projection intermediate), so completeness is proven by FAITHFUL RECOMPUTATION, not by
+# equality between two uses of an overridable intermediate. (An -e lme_service_overrides /
+# lme_global_override is NOT a silent desync: it changes lme_services/lme_global, which are now
+# IN the revision payload, so the revision moves with the rendered units.)
+- name: C1 -- read-back guard for the complete revision + post-projection lme_resolved (reject -e pins)
+  vars:
+    lme_roster_contract: "{{ _lme_global_file.lme_config_registry.resolved_record.roster }}"
+  ansible.builtin.assert:
+    that:
+      - >-
+        lme_resolved | lme_type_aware_equal((_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}), recursive=True)) | combine(lme_global_override | default({}), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | default({}), recursive=True)), lme_global_override | default({}), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {})))
+           | combine(lme_services | lme_project_required_material(
+                       inventory_hostname, lme_global.material_catalog,
+                       _lme_global_file.lme_config_registry.material_requirements_schema,
+                       _lme_global_file.lme_global.material_catalog_schema, lme_enable_flags | default({}),
+                       lme_host_services | default([]),
+                       _lme_resolution.resolved | lme_validated_deployment_identity,
+                       lme_global.producer_registry | default(None),
+                       lme_global.custody_registry | default(None)), recursive=True)
+           | combine(lme_services | lme_project_datastore_clients(
+                       inventory_hostname, lme_enable_flags | default({}),
+                       lme_host_services | default([])), recursive=True)
+           | combine(_lme_resolution.resolved.lme_database_membership | default(None)
+                       | lme_project_database_membership, recursive=True)
+           | combine({'deployment_identity': (_lme_resolution.resolved | lme_validated_deployment_identity)}
+                     if (_lme_resolution.resolved | lme_validated_deployment_identity) else {})
+           | combine({_lme_global_file.lme_config_registry.resolved_record.projection_key:
+               lookup(_lme_global_file.lme_config_registry.resolved_record.roster.render.lookup,
+                      _lme_global_file.lme_config_registry.resolved_record.roster.render.template) | from_yaml}))
+      - >-
+        lme_resolved_revision == (lme_resolved | lme_bind_revision(
+           _lme_global_file.lme_config_registry,
+           [{'name': lme_profile,
+             _lme_global_file.lme_config_registry.resolved_record.profile_fields.sha256: lme_profile_loaded[_lme_global_file.lme_config_registry.resolved_record.profile_fields.sha256]}],
+           lme_services, lme_global, lme_host_rendered_services))
+      # C1-TYPED-OUTPUT-REVISION: the actual published artifact is schema/type-validated and self-consistent.
+      # C1-INVOCATION-CONTEXT-01 LM12-01 (SR-302-05; registry source_binding.verification): the ONE complete
+      # verification, as resolve.yml E12-10, over the post-projection lme_resolved; source carries exactly the declared
+      # source_fields keys (built from the registry words): the published binding, the consumed captures, the
+      # manifests dir and the record blocks.
+      - >-
+        lme_resolved | lme_verify_resolved(_lme_global_file.lme_config_registry, documents=_lme_rh_documents,
+        admission=_lme_rh_admission,
+        source=dict([_lme_global_file.lme_config_registry.remote_harness_schema.source_binding.verification.source_fields.binding,
+                     _lme_global_file.lme_config_registry.remote_harness_schema.source_binding.verification.source_fields.captures,
+                     _lme_global_file.lme_config_registry.remote_harness_schema.source_binding.verification.source_fields.manifests_dir,
+                     _lme_global_file.lme_config_registry.remote_harness_schema.source_binding.verification.source_fields.record_blocks]
+                    | zip([lme_source_binding,
+                           dict([_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.global_var,
+                                 _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.var]
+                                | zip([lme_global_loaded, lme_profile_loaded])),
+                           lme_manifests_dir,
+                           _lme_global_file.lme_global.record_schemas.blocks])))
+    fail_msg: >-
+      the composed lme_resolved or the complete config revision was pre-supplied / -e-pinned and
+      disagrees with its freshly recomputed value -- the canonical derived artifact must bind the
+      COMPLETE composed state (C1-COMPLETE-RESOLVED-REVISION / C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
+    quiet: true
+
+# C1 IDENTITY PROJECTION PRODUCER (codex-identity-and-authoring-correction-1500). Until now NO
+# loader set_fact derived lme_runtime_inventory -- only a test fixture set it -- so its
+# deployment_identity was an INDEPENDENTLY-supplied second source, not a projection of the
+# canonical lme_resolved.deployment_identity. Make the LOADER its single mechanical producer: a
+# STRICT projection. We PROJECT INTO an already-supplied runtime inventory (never fabricate the
+# container -- credential_materializer.yml requires run_id/hosts and would fail on a partial one)
+# and only when the canonical identity is PRESENT. When the canonical identity is ABSENT, a
+# runtime deployment_identity has NO canonical authority to project from, so it is NOT admitted:
+# the guard below REFUSES a present-but-uncanonical runtime identity (stale derived identity, or
+# an independently-supplied second source, cannot retain admission status). Only the fully
+# dormant case (no canonical AND no runtime identity supplied) passes untouched, which keeps the
+# neutral profiles neutral (C1-ABSENT-CANONICAL-IDENTITY-LEAVES-STALE-PROJECTION, codex-1625; the
+# earlier comment wrongly attributed a fallback permission to a MAIN consumer_limit -- MAIN1500
+# corrected that authority claim, so no such permission is asserted here). Config revision
+# (lme_resolved_revision) and observed native identity (e.g. cluster_uuid) stay SEPARATE -- this
+# projects ONLY deployment_identity. An inventory/host_var runtime identity is OVERRIDDEN by the
+# canonical (projection wins); an -e extra-var one cannot be overridden by set_fact, so the
+# read-back below fails closed if it disagrees. Entrypoints that run load_manifests before the
+# identity consumers get the strict projection; the credential_materializer L143-144
+# reject-on-mismatch remains the transitional guard for paths that reach a consumer without this
+# loader.
+- name: "C1 -- refuse a runtime-inventory identity with no canonical authority (absent-canonical fail-closed)"
+  ansible.builtin.assert:
+    that:
+      # A runtime deployment_identity may exist ONLY as a projection of the canonical resolved
+      # identity. If it is present while the canonical identity is ABSENT, it is stale or an
+      # independent second source and must NOT retain admission at the loader. The fully dormant
+      # case (no runtime identity supplied) is unaffected: this fires only when a runtime identity
+      # IS present. (Whether a given op is persistent/custody-selected is decided consumer-side --
+      # the loader has no persistent-op selector -- so the loader simply refuses an uncanonical
+      # runtime identity outright rather than claiming to know the op class.)
+      - lme_resolved.deployment_identity is defined
+    fail_msg: >-
+      lme_runtime_inventory.deployment_identity ({{ lme_runtime_inventory.deployment_identity | default('<undef>') }})
+      is present but the canonical lme_resolved.deployment_identity is ABSENT -- a runtime identity has no
+      canonical authority to project from and cannot retain admission at the loader (stale or
+      independently-supplied identity is refused before it reaches any consumer)
+      (C1-ABSENT-CANONICAL-IDENTITY-LEAVES-STALE-PROJECTION).
+    quiet: true
+  when:
+    - lme_runtime_inventory is defined
+    - lme_runtime_inventory is mapping
+    - lme_runtime_inventory.deployment_identity is defined
+- name: C1 -- reject a supplied runtime-inventory identity that disagrees with the canonical (pre-projection)
+  ansible.builtin.assert:
+    that:
+      # If a runtime inventory already carries a deployment_identity, it MUST agree (type-aware)
+      # with the canonical BEFORE we project -- so an inventory/host_var disagreement fails HERE
+      # rather than being silently overwritten by the set_fact below (which would blind the
+      # credential_materializer L143-144 reject-on-mismatch guard). The set_fact then only FILLS
+      # an absent key. -e extra-var disagreement is also caught here (the value is defined).
+      - (lme_runtime_inventory.deployment_identity is not defined) or ((lme_runtime_inventory.deployment_identity) | lme_type_aware_equal(lme_resolved.deployment_identity))
+    fail_msg: >-
+      a supplied lme_runtime_inventory.deployment_identity ({{ lme_runtime_inventory.deployment_identity | default('<undef>') }})
+      disagrees with the canonical lme_resolved.deployment_identity ({{ lme_resolved.deployment_identity }}) --
+      the runtime inventory is a read-only projection of the canonical resolved identity, never an
+      independent second source; fail-closed before projecting (C1 identity single-producer).
+    quiet: true
+  when:
+    - lme_resolved.deployment_identity is defined
+    - lme_runtime_inventory is defined
+    - lme_runtime_inventory is mapping
+
+- name: C1 -- produce lme_runtime_inventory.deployment_identity as a strict projection of lme_resolved (fill absent)
+  ansible.builtin.set_fact:
+    lme_runtime_inventory: >-
+      {{ lme_runtime_inventory | combine({'deployment_identity': lme_resolved.deployment_identity}) }}
+  when:
+    - lme_resolved.deployment_identity is defined
+    - lme_runtime_inventory is defined
+    - lme_runtime_inventory is mapping
+
+- name: "C1 -- read-back: the runtime-inventory identity is the canonical projection (reject -e disagreement)"
+  ansible.builtin.assert:
+    that:
+      - lme_runtime_inventory.deployment_identity is defined
+      - (lme_runtime_inventory.deployment_identity) | lme_type_aware_equal(lme_resolved.deployment_identity)
+    fail_msg: >-
+      lme_runtime_inventory.deployment_identity ({{ lme_runtime_inventory.deployment_identity | default('<undef>') }})
+      is not the canonical lme_resolved.deployment_identity ({{ lme_resolved.deployment_identity }}) -- the
+      runtime inventory is a read-only projection of the canonical resolved identity, never an
+      independent second source. An -e extra-var that disagrees with the canonical identity is
+      rejected here (set_fact cannot override it), fail-closed before any consumer reads it.
+    quiet: true
+  when:
+    - lme_resolved.deployment_identity is defined
+    - lme_runtime_inventory is defined
+    - lme_runtime_inventory is mapping
+
+# RENDER-TIME PARITY (C1-SERIAL-BARRIER-STALE-FACT-ACCEPTANCE). When the site.yml pre-mutation
+# barrier ran, it recorded _lme_prevalidated.{token,revision} for THIS host from ITS
+# load_manifests pass. The podman role re-runs load_manifests at render time; bind that render
+# to the barrier-validated config by asserting the freshly recomputed revision equals the one
+# the barrier validated -- a config that changed between the barrier and the render fails closed
+# before any unit is written. Mirrors elasticsearch.yml's Deploy-play parity. Gated on the
+# barrier fact so a caller that does not run the site.yml barrier (elasticsearch.yml uses its
+# own _lme_es_prevalidated; upgrade/convert set neither) skips this cleanly.
+- name: "C1 -- render-time parity: this load's revision matches the barrier-validated revision"
+  ansible.builtin.assert:
+    that:
+      - (_lme_prevalidated.revision | default('')) == lme_resolved_revision
+    fail_msg: >-
+      the config resolved at render time (revision {{ lme_resolved_revision }}) does not match the
+      config the pre-mutation barrier validated (revision {{ _lme_prevalidated.revision | default('UNSET') }})
+      -- the validated config is not the config being rendered; refusing to continue.
+    quiet: true
+  when: _lme_prevalidated is defined
+  tags: ['always']
+
+- name: Prepare the complete source-bound resolved-record verification inputs
+  ansible.builtin.include_tasks: prepare_resolved_record.yml
+
+- name: Publish the complete versioned record for an independently selected matrix cell
+  ansible.builtin.include_tasks: publish_resolved_record.yml
+  when: _lme_global_file.lme_config_registry.resolved_record.selection_fact in vars
+

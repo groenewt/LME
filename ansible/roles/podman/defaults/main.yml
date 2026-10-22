@@ -5,30 +5,220 @@
 nix_daemon_service: "nix-daemon"
 
 # Other podman-specific configurations
-# Note: storage paths are now defined in site.yml 
+# Note: storage paths are now defined in site.yml
 lme_child_es_only: false
-lme_quadlet_source_dir: /opt/lme/quadlet-source
 
-# Child nodes only need the ES dependency graph under /etc/containers/systemd.
-# The full source tree is still staged locally under lme_quadlet_source_dir so a
-# future promotion workflow can restore the rest of the stack without re-cloning.
+# ---------------------------------------------------------------------------
+# GAP-2 cross-host consumer CA trust (OPT-IN, OFF by default).
 #
-# Maintenance model:
-#   - `lme_child_active_quadlet_files` lists the quadlets that ARE copied onto
-#     child nodes (the minimal ES dependency graph).
-#   - `lme_child_active_extras` lists additional quadlets that must be kept on
-#     child nodes even though they are not copied by the active loop — e.g.
-#     files rendered from templates later in the play (lme-elasticsearch.container).
-#   - The set of quadlets to REMOVE on child nodes is computed at runtime from
-#     `quadlet/` minus (active + extras). See roles/podman/tasks/quadlet_setup.yml.
-#   - Adding a new file under quadlet/ therefore requires no change here unless
-#     it should be kept on child nodes.
-lme_child_active_quadlet_files:
-  - lme.network
-  - lme-backups.volume
-  - lme-esdata01.volume
-  - lme-kibanadata.volume
-  - lme-setup-certs.container
+# When true, tasks/distribute_ca.yml slurps the PRODUCER node's internal LME CA
+# public cert (ca/ca.crt) from lme_ca_source_host and OVERLAYS it onto the published
+# cert bundles named in lme_ca_consumers, so a cross-host TLS client (e.g. the
+# dashboard's Elasticsearch client) trusts the producer's ES leaf -- which is signed
+# by the PRODUCER's CA, not this consumer's own. NO-OP for every single-host install.
+#
+# Operator inputs (never hardcode a host/id list in a shipped artifact):
+#   lme_ca_source_host  -> producer host to slurp ca/ca.crt from. Defaults (in
+#                          distribute_ca.yml) to the secrets producer
+#                          lme_secrets_source_host, else localhost.
+#   lme_ca_consumers    -> list of consumer service ids whose published bundle should
+#                          trust the producer CA (e.g. [log-analyzer]). Each id is
+#                          validated as an ENABLED cert:<svc> bundle on this host.
+lme_distribute_ca: false
+lme_ca_consumers: []
 
-lme_child_active_extras:
-  - lme-elasticsearch.container
+# ---------------------------------------------------------------------------
+# GAP-4 cross-host secret distribution (OPT-IN, OFF by default).
+#
+# When true, site.yml invokes secrets_distribution post-cert-publish and before
+# lme.service. The role refuses an active or indeterminate consumer and reconciles each
+# host's authorized enabled-service requirements through tasks/distribute_secrets.yml.
+# No producer vault, containers.conf, or Podman index is copied. NO-OP for every
+# single-host install.
+#
+# Each selected producer value is created as a target-local file-driver secret, read back,
+# and compared before activation. Identical reruns do not replace it; a changed producer
+# value is replaced once and requires the caller's normal consumer recreate workflow.
+#
+# Operator inputs (never hardcode a host in a shipped artifact):
+#   lme_secrets_source_host -> producer host to read required secrets from (resolved in the
+#                              secrets_distribution role and
+#                              distribute_secrets.yml; default localhost). Set
+#                              -e lme_secrets_source_host=<producer> (e.g. the graph node).
+#
+# lme_cross_host_file_secrets is an authorization roster, not a distribution bag.
+# distribute_secrets.yml intersects it with THIS host's enabled rendered-service union;
+# unrelated names never leave the producer. The defaults cover the current ES child and
+# remote UI consumers. `llm-keys` remains excluded because its historical empty placeholder
+# is not a readable credential payload.
+lme_distribute_secrets: false
+lme_cross_host_file_secrets:
+  - elastic
+  - kibana_system
+  - pgvector
+  - litellm_master_key
+  - webui_api_key
+
+# Secret recipe classes shared by B3, extraction and distribution. Keeping these as
+# defaults makes per-host resolution explicit and avoids task-local values that cannot be
+# safely overridden by resolved inventory.
+lme_known_password_secrets:
+  - elastic
+  - kibana_system
+  - wazuh
+  - wazuh_api
+lme_secrets_deferred:
+  - pgvector
+  - llm-keys
+  - litellm_master_key
+  - webui_api_key
+
+# Rootful Podman is the current runtime. Synthetic callback tests override this only
+# inside their isolated local fixture.
+lme_secret_distribution_become: true
+
+# ---------------------------------------------------------------------------
+# Tailscale legs (OPT-IN, all OFF by default).
+#
+# Each leg is enabled independently and is orthogonal to the elastic-services
+# pack. When ANY of these is true, tailscale_install.yml installs + brings up the
+# daemon before the leg runs (see tasks/main.yml). The tailscale profile
+# (manifests/profiles/tailscale.yml) flips these on together.
+#   * ingress  -> front this node's loopback-bound ports on its ts.net name
+#   * egress   -> accept-routes (+ optional exit-node) so LME can reach out
+#   * services -> publish enabled services as tailnet VIPs (svc:<name>)
+#
+# Their DEFAULTS (all false) are DECLARED in manifests/global.yml lme_config_registry
+# and resolved by the loader (default | profile | operator), which then bridges the
+# resolved values under these bare names. They are DELIBERATELY no longer role defaults:
+# the loader's compat input-normalization reads the bare variable scope, and a role
+# default there would be captured as a false "operator selection" and wrongly outrank the
+# tailscale profile. Every reader is `| default(false)`-guarded, so absence is safe until
+# the loader bridges the resolved value.
+# Consumer-node VIP reachability probe (A1) -- armed NOT from ansible but from
+# deploy_gate.sh environment knobs, unarmed by default (there is intentionally no
+# ansible var here): LME_GATE_PROBE_FROM=<2nd inventory host> makes deploy_gate probe
+# each manifest-declared VIP endpoint FROM a consumer node (never a self-curl on the
+# advertiser), and LME_GATE_REQUIRE_VIP_REACHABLE=1 turns an unreachable VIP into a
+# typed FAIL (else a WARN). CapMap presence (see tasks/tailscale_service.yml) proves VIP
+# ALLOCATION/approval only, NOT end-to-end reachability -- that env-armed probe closes
+# the gap. (The former `tailscale_require_vip_reachable` default was removed: it had
+# zero readers; the arming lives entirely in those deploy_gate env knobs.)
+# Optional operator inputs (never hardcode secrets):
+#   tailscale_authkey       -> auth key for a non-interactive `tailscale up`
+#   tailscale_up_extra_args -> extra flags appended to `tailscale up`
+#   tailscale_exit_node     -> tailnet exit node for the egress leg (opt-in)
+
+# ---------------------------------------------------------------------------
+# Cluster child (ES-only) node service set.
+#
+# Child data nodes run ONLY the Elasticsearch dependency graph. The set is
+# expressed as LOGICAL service ids -- the `id` field of each manifest under
+# manifests/services/ -- NOT unit filenames, because the install is now
+# manifest-driven: render_units.yml renders every ENABLED service whose id is
+# not in lme_child_absent_services.
+#
+# quadlet_setup.yml derives the child prune set from the MANIFEST keys:
+#     lme_child_absent_services = lme_services.keys() - lme_child_active_services
+# Deriving from manifest keys (and NOT from globbing quadlet/) is deliberate:
+# once the legacy quadlet/ tree is deleted, a filesystem glob would go empty and
+# prune nothing, so child data nodes would wrongly keep Kibana/Fleet/Wazuh.
+# Adding a new service manifest therefore prunes it from child nodes
+# automatically unless its logical id is listed here.
+#
+# id map (unit basename -> logical id):
+#   lme.network                 -> network
+#   lme-backups.volume          -> backups
+#   lme-esdata01.volume         -> esdata01
+#   lme-kibanadata.volume       -> kibanadata
+#   lme-setup-certs.container   -> setup-certs
+#   lme-elasticsearch.container -> elasticsearch
+# The umbrella target id `lme` is intentionally NOT listed, so lme.service is
+# not rendered on child nodes (parity with the old "remove lme.service" step).
+lme_child_active_services:
+  - network
+  - backups
+  - esdata01
+  - kibanadata
+  - setup-certs
+  - elasticsearch
+
+# ---------------------------------------------------------------------------
+# GAP-5: host-scope site.yml's POST-RENDER layer (cross-host consumer).
+# ---------------------------------------------------------------------------
+# site.yml's post-config roles + llama_cpp_setup run AFTER the render and are NOT
+# gated by lme_host_services (which gates only the render). On a consumer that
+# renders only its UI apps, they hard-fail (wait on a local ES that isn't there,
+# start/exec LLM backends that weren't rendered). GAP-5 gates each post-render step
+# on whether THIS host renders that step's BACKING manifest service
+# (lme_host_rendered_services, derived in load_manifests.yml with the SAME predicate
+# render_units.yml uses). A full / no-roster host renders every enabled service, so
+# every step runs -> single-host installs are byte-unchanged.
+#
+# The backing association is DATA here, not a literal in a task. NB `dashboards`
+# imports Kibana SAVED-OBJECTS, so it backs `kibana`, NOT the `dashboard` app -- a
+# consumer running only the `dashboard` app must NOT run the producer-side Kibana
+# dashboards import. Map key = the site.yml include's role name; value = manifest id.
+lme_postconfig_backing:
+  elasticsearch: elasticsearch
+  kibana: kibana
+  dashboards: kibana          # Kibana saved-objects import -- backs kibana, NOT the dashboard app
+  wazuh: wazuh-manager
+  fleet: fleet-server
+# llama_cpp_setup backs the LLM pack; anchor on pgvector -- it `podman exec`s
+# lme-pgvector and starts pgvector/embeddings, so pgvector is the tightest single
+# marker. All LLM services are enabled_when:[install_llm], so a full host with
+# install_llm renders pgvector (=> runs) and a consumer or `--no-llm` host does not
+# (=> skips).
+lme_llm_backing_service: pgvector
+
+# ---------------------------------------------------------------------------
+# C1-INVOCATION-CONTEXT-01 D12-01 (codex 894 DEV_892_01 / Q_PI2_A / Q_PI2_C; codex 895 RP07; codex 896
+# storage_and_secrets; SR-309-02 / SR-309-05). The EARLY INVOCATION INPUTS of tasks/invocation_context.yml, read
+# before the global manifest is consumed; their names are manifests/global.yml lme_config_registry
+# .remote_harness_schema.invocation_context.inputs. Values are B-authored baseline data (B record
+# records-b-controller-binding-01, owed); C1 exposes them here as native role defaults, the lowest precedence:
+# inventory group / host vars override them and an explicit invocation (-e or an include_role var) overrides both.
+# Every caller reaches them through the podman role (roles: podman, or include_role podman; certs tasks/main.yml and
+# convert_to_cluster.yml migrate in the same set, SR-309-03). After the captured global is consumed, resolve.yml
+# requires lme_invocation_words to equal invocation_context.words there, type-aware (the text below is byte-equal),
+# so a drifted policy refuses before any target mutation. The selection inputs lme_profile / lme_manifests_dir stay
+# with the engine resolve until E12 retires its inline selection.
+# ordinary = acquire or reuse the ordinary context; leased = admit the caller-supplied supervised run, never mint one.
+lme_invocation_mode: ordinary
+# The leased run context (remote-harness resolved_run.capture, exactly words.lease_fields with the declared kinds);
+# null = not supplied (the declared absent form, invocation_context.absent.lease).
+lme_invocation_lease: null
+# Controller binding. kind implicit: the invoking controller of this ansible-playbook process through the declared
+# local connection, no inventory name; kind host: the named inventory host (must exist with a declared local
+# connection); kind group: the sole member of the named group (absent, empty or more than one member refuses). The
+# group law applies ONLY to kind group.
+lme_invocation_controller:
+  kind: implicit
+  name: null
+  connection: local
+# Capture base: anchor checkout = the source checkout clone_directory names (never the inventory location);
+# capture_rel is checkout-relative and disk-backed. lme_invocation_root (absolute, normal form) is the explicit
+# override of the capture base; null = derive it from the anchor.
+lme_invocation_anchor: checkout
+lme_invocation_capture_rel: .work/capture
+lme_invocation_root: null
+# null = the observed invoking uid; an integer pins it (an observed uid that differs refuses).
+lme_invocation_owner: null
+# The controller temporary root the generated installer exports (codex 896), relative to the same anchor.
+lme_invocation_temp_rel: .work/ansible-local
+# The declared invocation words (equal to invocation_context.words; never edited here alone). C1-SR323-907e: identity
+# and context_fields run_identity changed together with global r17 invocation_context.words and invocation_context r17.
+# C1-SR922H (codex 932 PCTX_NATIVE_DEFAULT_SUPPLIER): fs_observe.domains changed together with global r33/r34
+# invocation_context.words.fs_observe.domains (r34 :7603) and invocation_context r16d PCTX-01; this role default is the
+# supplier r16c resolve reads at PCTX (:55-56), before the global load, so the domains are carried HERE, not derived.
+lme_invocation_words: {modes: {ordinary: ordinary, leased: leased}, kinds: {implicit: implicit, host: host, group: group}, anchors: {checkout: checkout}, connections: [local, ansible.builtin.local], context_fields: [mode, kind, delegate, connection, owner, root, run, run_identity], lease_fields: [delegate, owner, root, run], identity: {field: run_identity, stat_fields: [dev, inode], separator: ':', observe_format: '%d:%i'}, capture_sub: capture, record_rel: context.yml, run_prefix: run., digest_algorithm: sha256, uid_observe: [id, -u], fs_observe: {argv: [stat, -f, -c, '%T %a %S %d'], fields: [fs_type, free_blocks, block_size, free_inodes], domains: {free_blocks: {min: 0}, block_size: {min: 1}, free_inodes: {min: 0}}}, stat_mode_digits: 3, admission: {dir_mode: '0700', file_mode: '0400', refused_fs_types: [tmpfs, ramfs], free_bytes_min: 100000000, free_inodes_min: 1000}, refusal: LME-INVOCATION-CONTEXT}
+
+# C1-INVOCATION-CONTEXT-01 D13-01 (resolves DEV-D12-01-SELECTION-INPUTS; engine r12 E12-01 retires the r10 inline
+# selection and its fallback filters): the selection inputs of tasks/resolve.yml as native role defaults, overridden by
+# inventory and by explicit invocation (-e, or an include_role var such as convert_to_cluster.yml lme_profile: cluster).
+# The manifests dir is the checkout below clone_directory joined by the shared L8 helper lme_invocation_root (its
+# relative segment is the registry source_binding.manifests_rel word; lme_source_binding refuses a manifests dir that
+# does not end with it). The profile is the develop selection value.
+lme_manifests_dir: "{{ clone_directory | lme_invocation_root('manifests', none, lme_invocation_words.refusal) }}"
+lme_profile: default

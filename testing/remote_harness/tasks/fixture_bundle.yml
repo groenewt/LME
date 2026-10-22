@@ -1,0 +1,387 @@
+---
+# testing/remote_harness/tasks/fixture_bundle.yml -- DECLARED PRODUCER of one consumer-side bundle fixture (route H1;
+# codex 211654 phase 1, codex 212700 release). CONTROLLER-local, modules only (no shell, no template rendering, no
+# second writer of a bundle): it copies ONE published, admitted class bundle and applies exactly ONE declared op of
+# tests/bundle_fixtures.yml bundle_cases, then verifies that the copy differs from the source in exactly the declared
+# way. The source is admitted first (tasks/admit_bundle.yml, the ONE admission) and is never written.
+# Requires resolve_policy.yml (rh, rh_repo_root) earlier in the play. Inputs (include params; registry-reserved):
+#   rh_fx_src     the published class bundle dir to copy (admitted here with the three below); its FULL ancestry, from /
+#                 down to rh_fx_src itself, admitted by the ONE ancestry rule (tasks/admit_ancestry.yml: no linked
+#                 component) BEFORE the disjointness check and the copy (codex 220515 H1-FIXTURE-SOURCE-POLLUTION: a
+#                 source /alias/bundle with /alias -> /real and a destination /real/bundle/fixture is lexically disjoint
+#                 but writes inside the source)
+#   rh_fx_key     its class key            rh_fx_policy  its class policy            rh_fx_lock  that policy's lock
+#   rh_fx_dest    the fixture destination: ABSENT, its parent admitted by the ONE ancestry rule; with both ancestries
+#                 link-free, the lexical check (not inside the source, nor the source inside it) is actual disjointness
+#   rh_fx_case    the bundle_cases id
+# After the op the COMPLETE source membership is re-listed (find, no link followed: exactly the declared members, nothing
+# added) and every member re-stated: type, mode and digest equal to the pre-copy source stats, modes the declared ones.
+# Output (derived fact): rh_fx_result = {schema fixture-bundle-result/1, catalog, case, lifecycle, expect, op, rebind,
+#   source {dir, class_key, seed_sha256, launcher_sha256, checksum_file_sha256, manifest_sha256, members}, dest, after
+#   {launcher_sha256, checksum_file_sha256, manifest_sha256}} -- evidence for the caller to record; nothing else is
+#   written outside rh_fx_dest.
+# Ops (closed): remove_launcher | launcher_mode {mode} | launcher_drop_last_byte | check_file {edit, join, final}.
+# rebind consistent (content ops only): bundle.sha256 names the mutated launcher digest and bundle.json names the new
+# launcher and check-file digests, re-serialized with the SAME to_nice_json the producer uses -- refused unless that
+# re-serialization reproduces the source bundle.json byte for byte first (no other field can move).
+# Every refusal: REFUSED RH-FIXTURE-UNSUPPORTED (the fixture was not produced; the destination may hold a partial
+# copy only after the copy step, which the caller discards with its run dir).
+
+- name: Admit the fixture inputs and the catalog (data only; no Jinja start delimiter; exactly one case of this id)
+  vars:
+    _rh_fx_text: "{{ lookup('ansible.builtin.file', rh_repo_root ~ '/testing/remote_harness/tests/bundle_fixtures.yml') }}"
+  ansible.builtin.assert:
+    that:
+      - rh_fx_src is defined and rh_fx_src is string and rh_fx_src is match(rh.controller.bootstrap.path_admission.regex)
+      - rh_fx_src is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+      - rh_fx_dest is defined and rh_fx_dest is string and rh_fx_dest is match(rh.controller.bootstrap.path_admission.regex)
+      - rh_fx_dest is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+      - rh_fx_dest.split('/') | length > 2
+      - rh_fx_case is defined and rh_fx_case is string
+      - rh_fx_key is defined and rh_fx_policy is defined and rh_fx_lock is defined
+      - _rh_fx_text is not search('[{][{%#]')
+      - (_rh_fx_text | from_yaml).schema == 'bundle-fixtures/1'
+      - (_rh_fx_text | from_yaml).bundle_cases | selectattr('id', 'equalto', rh_fx_case) | list | length == 1
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: fixture_bundle.yml needs rh_fx_src / rh_fx_dest (normalized absolute paths),
+      rh_fx_key / rh_fx_policy / rh_fx_lock, and rh_fx_case naming exactly ONE bundle_cases
+      entry of a delimiter-free bundle-fixtures/1 catalog (got case {{ rh_fx_case | default('absent') }}).
+    quiet: true
+
+- name: Bind the selected case and the literal separator (catalog data; asserted delimiter-free above)
+  ansible.builtin.set_fact:
+    _rh_fx_c: >-
+      {{ (lookup('ansible.builtin.file', rh_repo_root ~ '/testing/remote_harness/tests/bundle_fixtures.yml') | from_yaml).bundle_cases
+         | selectattr('id', 'equalto', rh_fx_case) | first }}
+    _rh_fx_lit: >-
+      {{ (lookup('ansible.builtin.file', rh_repo_root ~ '/testing/remote_harness/tests/bundle_fixtures.yml') | from_yaml).literal_backslash_n }}
+
+- name: Refuse an op outside the closed vocabulary
+  vars:
+    _o: "{{ _rh_fx_c.op }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_fx_c.rebind in ['none', 'consistent']
+      - _o.kind in ['remove_launcher', 'launcher_mode', 'launcher_drop_last_byte', 'check_file']
+      - _rh_fx_c.rebind == 'none' or _o.kind in ['launcher_drop_last_byte', 'check_file']
+      - _o.kind != 'launcher_mode' or (_o.mode is string and _o.mode is match('^0[0-7]{3}$') and _o.mode != rh.controller.bootstrap.bundle.launcher_mode)
+      - _o.kind != 'check_file' or (_o.join in ['terminator', 'literal_backslash_n'] and _o.final in ['terminator', 'literal_backslash_n', 'none'])
+      - _o.kind != 'check_file' or (_o.edit is mapping and (_o.edit | length) <= 1 and (_o.edit.keys() | list | difference(['swap', 'drop', 'dup', 'append', 'separator']) | length) == 0)
+      - _rh_fx_lit is string and _rh_fx_lit | length == 2
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: case {{ rh_fx_case }} declares an op outside the closed vocabulary: {{ _rh_fx_c.op | to_json }} rebind {{ _rh_fx_c.rebind }}"
+    quiet: true
+
+- name: Admit the source's full ancestry by the ONE resolved rule (every component down to rh_fx_src; no link)
+  ansible.builtin.include_tasks: admit_ancestry.yml
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ rh_fx_src }}"
+    rh_anc_refusal: RH-FIXTURE-UNSUPPORTED
+
+- name: Admit the destination parent by the ONE resolved ancestry rule
+  ansible.builtin.include_tasks: admit_ancestry.yml
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ rh_fx_dest | dirname }}"
+    rh_anc_refusal: RH-FIXTURE-UNSUPPORTED
+
+- name: Refuse a destination that is the source, inside it, or holds it (both ancestries admitted link-free above)
+  ansible.builtin.assert:
+    that:
+      - rh_fx_dest != rh_fx_src
+      - not (rh_fx_dest ~ '/').startswith(rh_fx_src ~ '/')
+      - not (rh_fx_src ~ '/').startswith(rh_fx_dest ~ '/')
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: {{ rh_fx_dest }} and {{ rh_fx_src }} are not disjoint"
+    quiet: true
+
+- name: Stat the fixture destination (it must be absent)
+  ansible.builtin.stat:
+    path: "{{ rh_fx_dest }}"
+    follow: false
+    get_checksum: false
+  register: _rh_fx_pre
+
+- name: Refuse an existing destination (never replaced)
+  ansible.builtin.assert:
+    that: not _rh_fx_pre.stat.exists
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: {{ rh_fx_dest }} exists; a fixture is produced only into an absent destination"
+    quiet: true
+
+- name: Admit the source bundle exactly (the ONE admission; publishes rh_bundle = the source identity)
+  ansible.builtin.include_tasks: admit_bundle.yml
+  vars:
+    rh_admit_dir: "{{ rh_fx_src }}"
+    rh_admit_key: "{{ rh_fx_key }}"
+    rh_admit_policy: "{{ rh_fx_policy }}"
+    rh_admit_lock: "{{ rh_fx_lock }}"
+
+- name: Read the source launcher, check file and manifest (the bytes every op starts from)
+  ansible.builtin.slurp:
+    src: "{{ rh_fx_src }}/{{ item }}"
+  loop:
+    - "{{ rh.controller.bootstrap.bundle.launcher_file }}"
+    - "{{ rh.controller.bootstrap.bundle.checksum_file }}"
+    - "{{ rh.controller.bootstrap.bundle.manifest_file }}"
+  register: _rh_fx_read
+
+- name: Refuse a source the producer cannot rebind faithfully (to_nice_json must reproduce bundle.json byte for byte)
+  ansible.builtin.assert:
+    that:
+      - (_rh_fx_read.results[2].content | b64decode | from_json | to_nice_json) == (_rh_fx_read.results[2].content | b64decode)
+      - (_rh_fx_read.results[0].content | b64decode) | length > 0
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: {{ rh_fx_src }}/{{ rh.controller.bootstrap.bundle.manifest_file }} is not reproduced by
+      to_nice_json on this toolchain (a rebind would move other fields), or the launcher is empty.
+    quiet: true
+
+- name: Stat every declared member of the source before the copy (the retained-membership baseline)
+  ansible.builtin.stat:
+    path: "{{ rh_fx_src }}/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ rh_bundle.members | map('split') | map('last') | list }}"
+  register: _rh_fx_src0
+
+- name: Copy the admitted source bundle into the absent destination (remote_src; the source is only read)
+  ansible.builtin.copy:
+    src: "{{ rh_fx_src }}/"
+    dest: "{{ rh_fx_dest }}"
+    remote_src: true
+
+- name: List the copy (no links followed)
+  ansible.builtin.find:
+    paths: "{{ rh_fx_dest }}"
+    recurse: true
+    file_type: any
+    hidden: true
+    follow: false
+  register: _rh_fx_find
+
+- name: Stat every declared member in the source and in the copy
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ (rh_bundle.members | map('split') | map('last') | map('regex_replace', '^', rh_fx_src ~ '/') | list)
+       + (rh_bundle.members | map('split') | map('last') | map('regex_replace', '^', rh_fx_dest ~ '/') | list) }}
+  register: _rh_fx_cp
+
+- name: Refuse a copy that is not the source exactly (member set, types, modes, digests)
+  vars:
+    _n: "{{ rh_bundle.members | length }}"
+    _s: "{{ _rh_fx_cp.results[:(_n | int)] | map(attribute='stat') | list }}"
+    _d: "{{ _rh_fx_cp.results[(_n | int):] | map(attribute='stat') | list }}"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_rh_fx_find.files | map(attribute='path') | map('regex_replace', '^' ~ (rh_fx_dest | regex_escape) ~ '/', '') | sort)
+        == (rh_bundle.members | map('split') | map('last') | sort)
+      - _rh_fx_find.files | selectattr('islnk') | list | length == 0
+      - _d | map(attribute='isdir') | list == _s | map(attribute='isdir') | list
+      - _d | map(attribute='mode') | list == _s | map(attribute='mode') | list
+      - _d | map(attribute='checksum', default='') | list == _s | map(attribute='checksum', default='') | list
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: the copy {{ rh_fx_dest }} does not reproduce the admitted source {{ rh_fx_src }} exactly"
+    quiet: true
+
+- name: Remove the launcher (op remove_launcher)
+  ansible.builtin.file:
+    path: "{{ rh_fx_dest }}/{{ rh.controller.bootstrap.bundle.launcher_file }}"
+    state: absent
+  when: _rh_fx_c.op.kind == 'remove_launcher'
+
+- name: Change the launcher mode (op launcher_mode)
+  ansible.builtin.file:
+    path: "{{ rh_fx_dest }}/{{ rh.controller.bootstrap.bundle.launcher_file }}"
+    mode: "{{ _rh_fx_c.op.mode }}"
+    follow: false
+  when: _rh_fx_c.op.kind == 'launcher_mode'
+
+- name: Write the launcher without its last byte (op launcher_drop_last_byte; the declared launcher mode kept)
+  ansible.builtin.copy:
+    dest: "{{ rh_fx_dest }}/{{ rh.controller.bootstrap.bundle.launcher_file }}"
+    content: "{{ (_rh_fx_read.results[0].content | b64decode)[:-1] }}"
+    mode: "{{ rh.controller.bootstrap.bundle.launcher_mode }}"
+  when: _rh_fx_c.op.kind == 'launcher_drop_last_byte'
+
+# The new check-file TEXT. The terminator is bound in a {% set %} STATEMENT whose string constant is a REAL line feed
+# (YAML double-quoted escape -> U+000A before Jinja; see tasks/admit_bundle.yml _want for the primary sources); the
+# E77 literal separator is catalog DATA (literal_backslash_n), never a template constant.
+#   check_file: the source lines (split on the terminator; the admitted source ends with one) edited by ONE of
+#     swap [a, b] (a < b) | drop i | dup i | append <line> | separator {line, to} (the declared separator of that line,
+#     first occurrence), joined by `join` and ended by `final`.
+#   launcher_drop_last_byte (rebind consistent): the launcher's line with the new launcher digest, nothing else moved.
+- name: Derive the digest of the launcher without its last byte
+  ansible.builtin.set_fact:
+    _rh_fx_lsha: "{{ ((_rh_fx_read.results[0].content | b64decode)[:-1]) | hash('sha256') }}"
+
+- name: Derive the new check-file text
+  ansible.builtin.set_fact:
+    _rh_fx_cfnew: "{% set cf = rh.controller.bootstrap.bundle.checksum_format %}{% set nl = {'newline': '\n'}[cf.terminator] %}{%
+      set t = _rh_fx_read.results[1].content | b64decode %}{% set l = t.split(nl)[:-1] %}{% set o = _rh_fx_c.op %}{%
+      set lf = rh.controller.bootstrap.bundle.launcher_file %}{%
+      if o.kind == 'launcher_drop_last_byte' %}{%
+        set old = rh_bundle.launcher_sha256 ~ cf.separator ~ lf %}{%
+        set k = l | select('equalto', old) | list | length %}{%
+        set l = l | map('regex_replace', '^' ~ (old | regex_escape) ~ '$', _rh_fx_lsha ~ cf.separator ~ lf) | list %}{{
+        (l | join(nl) ~ nl) if k == 1 else '' }}{%
+      elif o.kind == 'check_file' %}{%
+        set e = o.edit %}{%
+        if 'swap' in e %}{% set l = l[:e.swap[0]] + [l[e.swap[1]]] + l[e.swap[0] + 1:e.swap[1]] + [l[e.swap[0]]] + l[e.swap[1] + 1:] %}{%
+        elif 'drop' in e %}{% set l = l[:e.drop] + l[e.drop + 1:] %}{%
+        elif 'dup' in e %}{% set l = l[:e.dup + 1] + [l[e.dup]] + l[e.dup + 1:] %}{%
+        elif 'append' in e %}{% set l = l + [e.append] %}{%
+        elif 'separator' in e %}{% set l = l[:e.separator.line] + [l[e.separator.line] | replace(cf.separator, e.separator.to, 1)] + l[e.separator.line + 1:] %}{%
+        endif %}{%
+        set j = {'terminator': nl, 'literal_backslash_n': _rh_fx_lit} %}{%
+        set f = {'terminator': nl, 'literal_backslash_n': _rh_fx_lit, 'none': ''} %}{{ l | join(j[o.join]) ~ f[o.final] }}{%
+      else %}{{ t }}{% endif %}"
+
+- name: Refuse an edit that is not well-defined on this source (indices in range; the launcher line present exactly once)
+  vars:
+    _o: "{{ _rh_fx_c.op }}"
+    _nrows: "{{ (rh_bundle.members | length) - 3 }}"
+  ansible.builtin.assert:
+    that:
+      - _o.kind != 'launcher_drop_last_byte' or _rh_fx_cfnew | length > 0
+      - _o.kind != 'check_file' or 'swap' not in _o.edit or (_o.edit.swap | length == 2 and 0 <= _o.edit.swap[0] < _o.edit.swap[1] < (_nrows | int))
+      - _o.kind != 'check_file' or 'drop' not in _o.edit or (0 <= _o.edit.drop < (_nrows | int))
+      - _o.kind != 'check_file' or 'dup' not in _o.edit or (0 <= _o.edit.dup < (_nrows | int))
+      - _o.kind != 'check_file' or 'separator' not in _o.edit or (0 <= _o.edit.separator.line < (_nrows | int))
+      - _o.kind != 'check_file' or _rh_fx_cfnew != (_rh_fx_read.results[1].content | b64decode)
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: case {{ rh_fx_case }} is not well-defined on {{ rh_fx_src }} ({{ _rh_fx_c.op | to_json }}; {{ _nrows }} check-file lines)"
+    quiet: true
+
+- name: Write the new check file (op check_file, or the launcher rebind)
+  ansible.builtin.copy:
+    dest: "{{ rh_fx_dest }}/{{ rh.controller.bootstrap.bundle.checksum_file }}"
+    content: "{{ _rh_fx_cfnew }}"
+    mode: '0400'
+  when: _rh_fx_c.op.kind == 'check_file' or (_rh_fx_c.op.kind == 'launcher_drop_last_byte' and _rh_fx_c.rebind == 'consistent')
+
+- name: Rebind bundle.json to the mutated members (rebind consistent; only launcher_sha256 / checksum_file_sha256 move)
+  ansible.builtin.copy:
+    dest: "{{ rh_fx_dest }}/{{ rh.controller.bootstrap.bundle.manifest_file }}"
+    content: >-
+      {{ _rh_fx_read.results[2].content | b64decode | from_json
+         | combine({'checksum_file_sha256': _rh_fx_cfnew | hash('sha256')}
+                   | combine({'launcher_sha256': _rh_fx_lsha} if _rh_fx_c.op.kind == 'launcher_drop_last_byte' else {}))
+         | to_nice_json }}
+    mode: '0400'
+  when: _rh_fx_c.rebind == 'consistent'
+
+- name: Stat every declared member of the fixture after the op
+  ansible.builtin.stat:
+    path: "{{ rh_fx_dest }}/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ rh_bundle.members | map('split') | map('last') | list }}"
+  register: _rh_fx_post
+
+- name: List the COMPLETE source after the op (no links followed; the source is never written)
+  ansible.builtin.find:
+    paths: "{{ rh_fx_src }}"
+    recurse: true
+    file_type: any
+    hidden: true
+    follow: false
+  register: _rh_fx_srcfind
+
+- name: Re-stat every declared member of the source (the source is never written)
+  ansible.builtin.stat:
+    path: "{{ rh_fx_src }}/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ rh_bundle.members | map('split') | map('last') | list }}"
+  register: _rh_fx_srcpost
+
+- name: Refuse a fixture that differs from its source in any way but the declared one
+  vars:
+    _b: "{{ rh.controller.bootstrap.bundle }}"
+    _o: "{{ _rh_fx_c.op }}"
+    _n: "{{ rh_bundle.members | length }}"
+    _s: "{{ _rh_fx_cp.results[:(_n | int)] | map(attribute='stat') | list }}"
+    _p: "{{ _rh_fx_post.results | map(attribute='stat') | list }}"
+    _s0: "{{ _rh_fx_src0.results | map(attribute='stat') | list }}"
+    _sp: "{{ _rh_fx_srcpost.results | map(attribute='stat') | list }}"
+    _names: "{{ rh_bundle.members | map('split') | map('last') | list }}"
+    _li: "{{ _names.index(rh.controller.bootstrap.bundle.launcher_file) }}"
+    _ci: "{{ _names.index(rh.controller.bootstrap.bundle.checksum_file) }}"
+    _mi: "{{ _names.index(rh.controller.bootstrap.bundle.manifest_file) }}"
+    _mnew: >-
+      {{ (_rh_fx_read.results[2].content | b64decode | from_json
+          | combine({'checksum_file_sha256': _rh_fx_cfnew | hash('sha256')}
+                    | combine({'launcher_sha256': _rh_fx_lsha} if _o.kind == 'launcher_drop_last_byte' else {}))
+          | to_nice_json) | hash('sha256') }}
+  ansible.builtin.assert:
+    that:
+      # every member other than the launcher, the check file and the manifest is untouched
+      - >-
+        (range(_n | int) | reject('in', [_li | int, _ci | int, _mi | int]) | map('extract', _p) | map(attribute='checksum', default='') | list)
+        == (range(_n | int) | reject('in', [_li | int, _ci | int, _mi | int]) | map('extract', _s) | map(attribute='checksum', default='') | list)
+      - >-
+        (range(_n | int) | reject('in', [_li | int, _ci | int, _mi | int]) | map('extract', _p) | map(attribute='mode', default='') | list)
+        == (range(_n | int) | reject('in', [_li | int, _ci | int, _mi | int]) | map('extract', _s) | map(attribute='mode', default='') | list)
+      # the launcher: exactly the op
+      - _o.kind != 'remove_launcher' or not _p[_li | int].exists
+      - _o.kind != 'launcher_mode' or (_p[_li | int].mode == _o.mode and _p[_li | int].checksum == _s[_li | int].checksum)
+      - _o.kind != 'launcher_drop_last_byte' or (_p[_li | int].checksum == _rh_fx_lsha and _p[_li | int].size == _s[_li | int].size - 1 and _p[_li | int].mode == _b.launcher_mode)
+      - _o.kind != 'check_file' or (_p[_li | int].checksum == _s[_li | int].checksum and _p[_li | int].mode == _s[_li | int].mode)
+      # the check file: the derived text, or untouched
+      - >-
+        _p[_ci | int].checksum == (_rh_fx_cfnew | hash('sha256')
+        if (_o.kind == 'check_file' or (_o.kind == 'launcher_drop_last_byte' and _rh_fx_c.rebind == 'consistent')) else _s[_ci | int].checksum)
+      - _p[_ci | int].mode == '0400'
+      # the manifest: rebound (only launcher_sha256 / checksum_file_sha256 moved), or untouched
+      - _p[_mi | int].checksum == (_mnew if _rh_fx_c.rebind == 'consistent' else _s[_mi | int].checksum)
+      - _p[_mi | int].mode == '0400'
+      # the source is untouched: its COMPLETE membership is exactly the declared members (nothing added inside it, no
+      # link), each with its pre-copy type, mode and digest, the declared type and mode, and the admitted digests
+      - >-
+        (_rh_fx_srcfind.files | map(attribute='path') | map('regex_replace', '^' ~ (rh_fx_src | regex_escape) ~ '/', '') | sort)
+        == (_names | sort)
+      - _rh_fx_srcfind.files | selectattr('islnk') | list | length == 0
+      - _sp | selectattr('exists') | rejectattr('islnk') | list | length == _n | int
+      - _sp | map(attribute='isdir') | list == _s0 | map(attribute='isdir') | list
+      - _sp | map(attribute='mode') | list == _s0 | map(attribute='mode') | list
+      - _sp | map(attribute='checksum', default='') | list == _s0 | map(attribute='checksum', default='') | list
+      - (_s0 | map(attribute='mode') | list) == (rh_bundle.members | map('split') | map(attribute=1) | map('regex_replace', '^', '0') | list)
+      - (_s0 | map(attribute='isdir') | map('ternary', 'd', 'f') | list) == (rh_bundle.members | map('split') | map('first') | list)
+      - >-
+        [_sp[_li | int].checksum, _sp[_ci | int].checksum, _sp[_mi | int].checksum]
+        == [rh_bundle.launcher_sha256, rh_bundle.checksum_file_sha256, rh_bundle.manifest_sha256]
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: the fixture {{ rh_fx_dest }} of case {{ rh_fx_case }} does not differ from its source in
+      exactly the declared way ({{ _rh_fx_c.op | to_json }}, rebind {{ _rh_fx_c.rebind }}), or the source changed.
+    quiet: true
+
+- name: Publish the fixture evidence (derived output; the caller records it)
+  ansible.builtin.set_fact:
+    rh_fx_result:
+      schema: fixture-bundle-result/1
+      catalog: bundle-fixtures/1
+      case: "{{ rh_fx_case }}"
+      lifecycle: "{{ _rh_fx_c.lifecycle }}"
+      expect: "{{ _rh_fx_c.expect }}"
+      op: "{{ _rh_fx_c.op }}"
+      rebind: "{{ _rh_fx_c.rebind }}"
+      source:
+        dir: "{{ rh_fx_src }}"
+        class_key: "{{ rh_bundle.class_key }}"
+        seed_sha256: "{{ rh_bundle.seed_sha256 }}"
+        launcher_sha256: "{{ rh_bundle.launcher_sha256 }}"
+        checksum_file_sha256: "{{ rh_bundle.checksum_file_sha256 }}"
+        manifest_sha256: "{{ rh_bundle.manifest_sha256 }}"
+        # the declared members, re-verified after the op (complete membership, types, modes, digests unchanged)
+        members: "{{ rh_bundle.members }}"
+      dest: "{{ rh_fx_dest }}"
+      after:
+        launcher_sha256: "{{ _rh_fx_post.results | selectattr('item', 'equalto', rh.controller.bootstrap.bundle.launcher_file) | map(attribute='stat.checksum', default='absent') | first }}"
+        checksum_file_sha256: "{{ _rh_fx_post.results | selectattr('item', 'equalto', rh.controller.bootstrap.bundle.checksum_file) | map(attribute='stat.checksum') | first }}"
+        manifest_sha256: "{{ _rh_fx_post.results | selectattr('item', 'equalto', rh.controller.bootstrap.bundle.manifest_file) | map(attribute='stat.checksum') | first }}"

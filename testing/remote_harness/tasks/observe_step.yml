@@ -1,0 +1,68 @@
+---
+# testing/remote_harness/tasks/observe_step.yml -- ONE declared step of the selected observation job on ONE target
+# (included by observe.yml's target play, loop_var rh_obs_s over the job's steps, AFTER the host's identity check).
+# Every command is rendered from the job DATA by templates/observation_step.j2 (macros/observation.j2) and sent over
+# the raw channel only (no module, no remote temp, no target Python); nothing is written on the target. The block's
+# `when` is evaluated per task at run time, so a step that set rh_obs_stop ends the job on this host.
+# Inputs (facts of this host, set by observe.yml): rh_obs_jobs, rh_obs_job, rh_obs_ot, rh_obs_hin, rh_obs_loc,
+# rh_obs_records, rh_obs_stop; rh_obs_s (the step); rh_repo_root.
+# GUARD NAMES: every task var, register and loop var here carries the _rh_obs_ prefix, which both plays of
+# observe.yml REFUSE as an input (^_?rh_obs_), so an extra-var cannot pre-empt a guard input (extra-vars outrank
+# task vars and registers).
+- name: Observation step (skipped once a precondition is false, the host is unreachable or a stop step failed)
+  when: not (rh_obs_stop | bool)
+  vars:
+    _rh_obs_tpl: "{{ rh_repo_root ~ '/' ~ rh.controller.bootstrap.observation.step_template_rel }}"
+  block:
+    - name: Render the step's command instances (typed substitution; nothing runs yet)
+      ansible.builtin.set_fact:
+        rh_obs_inst: >-
+          {{ lookup('ansible.builtin.template', _rh_obs_tpl, template_vars={'rh_obs_part': 'instances', 'rh_obs_jobs': rh_obs_jobs,
+                    'rh_obs_job': rh_obs_job, 'rh_obs_step': rh_obs_s, 'rh_obs_ot': rh_obs_ot, 'rh_obs_hin': rh_obs_hin,
+                    'rh_obs_prior': rh_obs_records, 'rh_obs_loc': rh_obs_loc}) | from_json }}
+
+    - name: Refuse a step whose inputs or substitutions are not admitted (nothing was sent for it)
+      ansible.builtin.assert:
+        that:
+          - rh_obs_inst.errors | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.observation.refusal }} on {{ inventory_hostname }}: step {{ rh_obs_s.id }}:
+          {{ rh_obs_inst.errors }}
+        quiet: true
+
+    - name: Run the step's instances over the raw channel (read-only; each under the declared timeout)
+      ansible.builtin.raw: "{{ _rh_obs_i.command }}"
+      loop: "{{ rh_obs_inst.instances }}"
+      loop_control:
+        loop_var: _rh_obs_i
+        label: "{{ _rh_obs_i.key }}"
+      register: rh_obs_raw
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+
+    - name: Classify the step's results and extract its declared yields
+      ansible.builtin.set_fact:
+        rh_obs_new: >-
+          {{ lookup('ansible.builtin.template', _rh_obs_tpl, template_vars={'rh_obs_part': 'classify', 'rh_obs_jobs': rh_obs_jobs,
+                    'rh_obs_step': rh_obs_s, 'rh_obs_insts': rh_obs_inst.instances, 'rh_obs_results': rh_obs_raw.results | default([]),
+                    'rh_obs_prior': rh_obs_records, 'rh_obs_extract': true}) | from_json }}
+      register: _rh_obs_cls
+      ignore_errors: true
+
+    # Jinja has no try: a JSON extraction of malformed output fails the render above. The step is then classified
+    # again WITHOUT extraction, which records EXTRACT_INVALID for its OK instances (output kept, no yield).
+    - name: Classify the step without extraction after a failed extraction (EXTRACT_INVALID; output kept)
+      when: _rh_obs_cls is failed
+      ansible.builtin.set_fact:
+        rh_obs_new: >-
+          {{ lookup('ansible.builtin.template', _rh_obs_tpl, template_vars={'rh_obs_part': 'classify', 'rh_obs_jobs': rh_obs_jobs,
+                    'rh_obs_step': rh_obs_s, 'rh_obs_insts': rh_obs_inst.instances, 'rh_obs_results': rh_obs_raw.results | default([]),
+                    'rh_obs_prior': rh_obs_records, 'rh_obs_extract': false}) | from_json }}
+
+    - name: Append the step's records and decide whether the job continues on this host
+      ansible.builtin.set_fact:
+        rh_obs_records: "{{ rh_obs_records + rh_obs_new }}"
+        rh_obs_stop: >-
+          {{ lookup('ansible.builtin.template', _rh_obs_tpl, template_vars={'rh_obs_part': 'stop', 'rh_obs_jobs': rh_obs_jobs,
+                    'rh_obs_step': rh_obs_s, 'rh_obs_recs': rh_obs_new}) | from_json }}

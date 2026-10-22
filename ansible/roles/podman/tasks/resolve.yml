@@ -1,0 +1,1465 @@
+---
+# ansible/roles/podman/tasks/resolve.yml
+#
+# The SHARED early-resolve entrypoint (CR-B3). This is the ONE place the declared-
+# precedence config engine is driven; load_manifests.yml includes it, and the
+# standalone playbooks (upgrade_lme.yml, convert_to_cluster.yml) include it too --
+# via `include_role: name=podman, tasks_from=resolve` -- BEFORE their earliest
+# resolved-key consumer, so they read lme_resolved.* / lme_enable_flags instead of
+# re-deriving flags with their own set_facts. Re-running it (each load, or each
+# include) is safe: the engine is a pure function of its explicit inputs.
+#
+# INPUT CONTRACT (a caller sets these BEFORE including this file):
+#   clone_directory      -- repo root (the role-declared manifests dir is derived from it in the role declaration).
+#   lme_manifests_dir    -- REQUIRED in scope: a podman role declaration (D13-01) unless inventory or the include
+#                           overrides it; refused below (E12-01) when absent or not a non-empty string.
+#   lme_profile          -- REQUIRED in scope, the same way (D13-01). An EXPLICIT profile
+#                           selection (convert_to_cluster passes lme_profile=cluster,
+#                           install.sh passes -e lme_profile=<name>) enters the
+#                           resolution as the selected overlay here.
+#   lme_inputs           -- OPTIONAL by declaration (registry caller_inputs.lme_inputs: var, members, absent,
+#                           member_absent; C1-SR922D) namespaced caller inputs:
+#                             { selections: {<field>: <value>, ...},   # operator -e / inventory / role vars
+#                               observations: {<field>: <value>, ...}, # DETECTED state, origin observation
+#                               origins: {<field>: extra_var|inventory} }  # caller-VERIFIED finer origin
+#                           A NORMALIZED caller (site.yml pre_tasks, or upgrade/convert
+#                           building their own lme_inputs with observations kept SEPARATE
+#                           from operator selections and origin-tagged) sets this. An
+#                           UN-NORMALIZED caller omits it: membership of the declared var selects the declared
+#                           absent form (never a filter fallback), and the operator scope is captured once from
+#                           the bare variable scope (compat bridge; see below). A present value must be a mapping
+#                           over the declared members, each a mapping (typed refusal before the first read).
+#   lme_global_override  -- OPTIONAL by declaration (registry caller_inputs.lme_global_override: var, absent), on
+#                           this host and, for the remote-harness scope, on every scoped inventory host; a present
+#                           value must be a mapping (typed refusal before the first read).
+#
+# OUTPUT CONTRACT (facts this file publishes, in scope for the rest of the play):
+#   _lme_global_file     -- the loaded global.yml (carries lme_config_registry etc.).
+#   _lme_profile_file    -- the loaded active profile overlay.
+#   lme_resolved         -- {<field>: <canonical value>} for every declared field.
+#   lme_resolved_origins -- {<field>: extra_var|inventory|operator|profile|observation|default}.
+#   lme_enable_flags     -- the enable-flag subset (is_enabled()'s input).
+#   lme_resolved_revision-- content-addressed CONFIG-ONLY revision (OUTPUT-ONLY). NOTE:
+#                           load_manifests.yml REBINDS this to the COMPLETE composed
+#                           revision (config + lme_services + lme_global + projections)
+#                           after it builds them; a resolve-only caller keeps the
+#                           config-only value (it derives no projections).
+#   <bare field names>   -- resolved values bridged under their bare names (OPEN debt).
+#
+# codex-manager-caller-contract-decisions-20260923-0200 / resolution_lifetime.
+
+# C1-INVOCATION-CONTEXT-01 E12-01 (codex 894 DEV_892_01; SR-309-02/05; DEV-D12-01 resolved by D13-01): the shared
+# early invocation context is acquired or reused BEFORE the global manifest is consumed. lme_manifests_dir and
+# lme_profile are podman role defaults (D13-01), overridden by inventory and by explicit invocation (an include var
+# such as convert_to_cluster.yml lme_profile: cluster); no fallback filter selects them here.
+- name: E12-01 Acquire or reuse the invocation context (shared early producer; before the global manifest is consumed)
+  ansible.builtin.include_tasks: invocation_context.yml
+
+- name: E12-01 Refuse an absent or mistyped manifests dir or profile selection (texts.inputs)
+  ansible.builtin.assert:
+    that:
+      - query('ansible.builtin.varnames', '^lme_manifests_dir$') | length == 1
+      - query('ansible.builtin.varnames', '^lme_profile$') | length == 1
+      - lme_manifests_dir is string
+      - lme_manifests_dir | length > 0
+      - lme_profile is string
+      - lme_profile | length > 0
+    fail_msg: "{{ lme_invocation_words.refusal }}: texts.inputs (E12-01) lme_manifests_dir / lme_profile"
+    quiet: true
+
+# C1-INVOCATION-CONTEXT-01 E12-02..04 (codex 894 bootstrap_order, capture_root; codex 896; SR-309-05; registry
+# remote_harness_schema.profile_identity): CAPTURE FIRST. Each source member (the global manifest, then the selected
+# profile) is stat-ed on the bound controller with the declared digest algorithm and copied once into a
+# content-addressed directory below the invocation context root (<root>/<digest>/<source basename>; force false, so
+# repeated resolves, hosts and plays reuse one file). The capture must be a regular file owned by the invoking uid
+# with the declared file mode and the source digest: a source edited between the stat and the copy refuses. The
+# engine then loads the retained copies natively; nothing below reads the live manifest files again. Every capture
+# and load register is cleared to two distinct sentinels first, so a caller pin of any of them refuses (extra vars
+# and include params outrank set_fact and register).
+- name: E12-02 Clear the capture and load registers to the first sentinel
+  ansible.builtin.set_fact:
+    _lme_pcap_src_st: []
+    _lme_pcap_copy: []
+    _lme_pcap_cap_st: []
+    _lme_global_load: []
+    _lme_profile_load: []
+
+- name: E12-02 Refuse a pinned capture or load register (first sentinel; texts.reuse)
+  ansible.builtin.assert:
+    that:
+      - >-
+        [_lme_pcap_src_st, _lme_pcap_copy, _lme_pcap_cap_st, _lme_global_load, _lme_profile_load]
+        == [[], [], [], [], []]
+    fail_msg: "{{ lme_invocation_words.refusal }}: texts.reuse (E12-02) a capture or load register is pinned"
+    quiet: true
+
+- name: E12-02 Clear the capture and load registers to the second sentinel
+  ansible.builtin.set_fact:
+    _lme_pcap_src_st: {}
+    _lme_pcap_copy: {}
+    _lme_pcap_cap_st: {}
+    _lme_global_load: {}
+    _lme_profile_load: {}
+
+- name: E12-02 Refuse a pinned capture or load register (second sentinel; texts.reuse)
+  ansible.builtin.assert:
+    that:
+      - >-
+        [_lme_pcap_src_st, _lme_pcap_copy, _lme_pcap_cap_st, _lme_global_load, _lme_profile_load]
+        == [{}, {}, {}, {}, {}]
+    fail_msg: "{{ lme_invocation_words.refusal }}: texts.reuse (E12-02) a capture or load register is pinned"
+    quiet: true
+
+- name: E12-02 Capture the global and profile bytes on the bound controller (once per run, unprivileged)
+  run_once: true
+  become: false
+  delegate_to: "{{ lme_invocation_context.delegate if lme_invocation_context.delegate is not none else inventory_hostname }}"
+  vars:
+    ansible_connection: "{{ lme_invocation_context.connection }}"
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    ansible_become: false
+  block:
+    - name: E12-02 Stat each source member without following links (the declared digest algorithm)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: "{{ lme_invocation_words.digest_algorithm }}"
+      loop:
+        - "{{ lme_manifests_dir ~ '/global.yml' }}"
+        - "{{ lme_manifests_dir ~ '/profiles/' ~ lme_profile ~ '.yml' }}"
+      register: _lme_pcap_src_st
+
+    - name: E12-02 Refuse a source member that is absent, a link or not a regular file (texts.storage)
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not item.stat.islnk
+        fail_msg: "{{ lme_invocation_words.refusal }}: texts.storage (E12-02) {{ item.item }}"
+        quiet: true
+      loop: "{{ _lme_pcap_src_st.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: E12-02 Create each content-addressed capture directory below the context root
+      ansible.builtin.file:
+        # Paths are joined by the shared L8 helper lme_invocation_root (plain-segment relative path under an absolute
+        # anchor; refusal = words.refusal), never by a literal separator (SR-319-01).
+        path: >-
+          {{ lme_invocation_context.root | lme_invocation_root(item.stat.checksum, none, lme_invocation_words.refusal) }}
+        state: directory
+        mode: "{{ lme_invocation_words.admission.dir_mode }}"
+        follow: false
+      loop: "{{ _lme_pcap_src_st.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: E12-02 Copy each source member into its capture directory once (never over an existing capture)
+      ansible.builtin.copy:
+        src: "{{ item.item }}"
+        dest: >-
+          {{ lme_invocation_context.root | lme_invocation_root(item.stat.checksum, none, lme_invocation_words.refusal)
+             | lme_invocation_root(item.item | basename, none, lme_invocation_words.refusal) }}
+        remote_src: true
+        mode: "{{ lme_invocation_words.admission.file_mode }}"
+        force: false
+      loop: "{{ _lme_pcap_src_st.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      register: _lme_pcap_copy
+
+    - name: E12-02 Stat each capture without following links (the declared digest algorithm)
+      ansible.builtin.stat:
+        path: >-
+          {{ lme_invocation_context.root | lme_invocation_root(item.stat.checksum, none, lme_invocation_words.refusal)
+             | lme_invocation_root(item.item | basename, none, lme_invocation_words.refusal) }}
+        follow: false
+        get_checksum: true
+        checksum_algorithm: "{{ lme_invocation_words.digest_algorithm }}"
+      loop: "{{ _lme_pcap_src_st.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      register: _lme_pcap_cap_st
+
+    - name: E12-02 Refuse a capture that is a link, foreign, wrongly moded or not the source digest (texts.owner, texts.storage)
+      ansible.builtin.assert:
+        that:
+          - item.1.stat.exists
+          - item.1.stat.isreg
+          - not item.1.stat.islnk
+          - item.1.stat.uid == lme_invocation_context.owner
+          - item.1.stat.mode == lme_invocation_words.admission.file_mode
+          - item.1.stat.checksum == item.0.stat.checksum
+          - >-
+            item.1.stat.path
+            == (lme_invocation_context.root | lme_invocation_root(item.0.stat.checksum, none, lme_invocation_words.refusal)
+            | lme_invocation_root(item.0.item | basename, none, lme_invocation_words.refusal))
+        fail_msg: >-
+          {{ lme_invocation_words.refusal }}: texts.owner / texts.storage (E12-02) {{ item.0.item }} -> {{ item.1.stat }}
+        quiet: true
+      loop: "{{ _lme_pcap_src_st.results | zip(_lme_pcap_cap_st.results) | list }}"
+      loop_control:
+        label: "{{ item.0.item }}"
+
+- name: E12-03 Load the global manifest natively from its capture
+  ansible.builtin.include_vars:
+    file: "{{ (_lme_pcap_cap_st.results | first).stat.path }}"
+    name: _lme_global_file
+  register: _lme_global_load
+
+# SR-320-05 / SR-320-06 (MAIN 944 / 945) + codex 902 D: the E12-04 global invariant, run BEFORE the recursive
+# equality below. The RAW strict parse of the captured global bytes (lme_manifest_strict; the scan evaluates no loaded
+# value) carries no value and no mapping key that the declared detection rule detects (lme_template_positions over
+# registry remote_harness_schema.template_detection read from that raw parse; words in split-character form; G14-01),
+# and the captured exact text carries no declared start string and does not begin with the declared override header.
+# The declaration node is part of the scanned data, so it must pass its own invariant. The parse declaration is read
+# from the include_vars register, as the E12-04 binding assert below reads it.
+- name: E12-04 Refuse a global capture that the admitted core would treat as a possible template (template_detection)
+  # SR-321-01: every reference to _lme_g04_text is ONE read of the capture bound, inside lme_capture_text_bound, to the
+  # capture stat checksum (the stat algorithm lme_invocation_words.digest_algorithm; the declared profile_identity
+  # encoding and refusal read from the include_vars register, as the parse declaration is) before any parse or scan.
+  vars:
+    _lme_g04_text: >-
+      {{ lookup('ansible.builtin.file', (_lme_pcap_cap_st.results | first).stat.path, rstrip=false)
+      | lme_capture_text_bound((_lme_pcap_cap_st.results | first).stat.checksum, lme_invocation_words.digest_algorithm,
+      _lme_global_load.ansible_facts._lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.encoding,
+      _lme_global_load.ansible_facts._lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal) }}
+    _lme_g04_raw: >-
+      {{ _lme_g04_text
+      | lme_manifest_strict((_lme_pcap_cap_st.results | first).stat.path,
+      _lme_global_load.ansible_facts._lme_global_file.lme_config_registry.remote_harness_schema.document_channel.parse) }}
+    # SR-321-04 / Codex 905: the declared decoding separator, by pointer (the node template_detection.word_form names,
+    # remote_harness_schema.split_character_form), read from the same strict parse; passed explicitly to every decode
+    _lme_g04_sep: >-
+      {{ _lme_g04_raw.lme_config_registry.remote_harness_schema[_lme_g04_raw.lme_config_registry.remote_harness_schema.template_detection.word_form].separator }}
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_lme_g04_raw | lme_template_positions(_lme_g04_raw.lme_config_registry.remote_harness_schema.template_detection,
+        _lme_g04_sep, _lme_g04_raw.lme_config_registry.remote_harness_schema.profile_identity.refusal)) == []
+      - >-
+        _lme_g04_raw.lme_config_registry.remote_harness_schema.template_detection.start_strings.values()
+        | map('join', _lme_g04_sep)
+        | select('in', _lme_g04_text)
+        | list == []
+      - >-
+        not (_lme_g04_text
+        .startswith(_lme_g04_raw.lme_config_registry.remote_harness_schema.template_detection.override_header
+        | join(_lme_g04_sep)))
+    fail_msg: >-
+      {{ _lme_global_load.ansible_facts._lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal }}:
+      (E12-04 template_detection) the global capture {{ (_lme_pcap_cap_st.results | first).stat.path }} carries a
+      declared template start string or override header; the global must be Jinja-free
+    quiet: true
+
+# E12-04 (retires the r10 YAML-parse filter re-read): the native load is bound to the capture it read. The register
+# names exactly the capture file and carries the loaded data (a pinned _lme_global_file disagrees with it); the data
+# equals the strict unique-key construction of the capture's exact text (lme_manifest_strict, the registry
+# document_channel.parse); the capture text digests to the content-addressed name.
+- name: E12-04 Refuse a global fact not bound to its capture (texts of profile_identity; fail-closed, pre-mutation)
+  ansible.builtin.assert:
+    that:
+      - _lme_global_load.ansible_included_var_files == [(_lme_pcap_cap_st.results | first).stat.path]
+      - _lme_global_load.ansible_facts._lme_global_file | lme_type_aware_equal(_lme_global_file)
+      # SR-321-01: the equality consumes ONE read, bound to the capture stat checksum inside lme_capture_text_bound before
+      # the strict parse (this replaces the separate-read digest comparison, whose obligation the filter now carries).
+      - >-
+        _lme_global_file | lme_type_aware_equal(lookup('ansible.builtin.file', (_lme_pcap_cap_st.results | first).stat.path,
+        rstrip=false)
+        | lme_capture_text_bound((_lme_pcap_cap_st.results | first).stat.checksum, lme_invocation_words.digest_algorithm,
+        _lme_global_load.ansible_facts._lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.encoding,
+        _lme_global_load.ansible_facts._lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal)
+        | lme_manifest_strict((_lme_pcap_cap_st.results | first).stat.path,
+        _lme_global_load.ansible_facts._lme_global_file.lme_config_registry.remote_harness_schema.document_channel.parse))
+    fail_msg: >-
+      {{ _lme_global_load.ansible_facts._lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal }}:
+      (E12-04) the global fact is not the native load of its capture {{ (_lme_pcap_cap_st.results | first).stat.path }}
+    quiet: true
+
+# (the E12-04 template_detection invariant runs BEFORE the E12-04 recursive equality above; codex 902 D)
+
+# E12-05: the invocation words the producer used (podman role defaults D12-01 / D13-01) must equal the declared words
+# of the consumed global, type-aware; the capture digest algorithm must be the profile_identity algorithm.
+- name: E12-05 Refuse invocation words that differ from the captured global declaration (texts.inputs)
+  ansible.builtin.assert:
+    that:
+      - >-
+        lme_invocation_words
+        | lme_type_aware_equal(_lme_global_file.lme_config_registry.remote_harness_schema.invocation_context.words)
+      - >-
+        lme_invocation_words.digest_algorithm
+        == _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.digest_algorithm
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.invocation_context.refusal }}:
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.invocation_context.texts.inputs }} (E12-05
+      lme_invocation_words)
+    quiet: true
+
+# E12-06 (retires the two r10 YAML-parse filter re-reads): the profile fact is bound by PROVING THE LOAD TOOK EFFECT
+# (a profile may carry Jinja that include_vars renders lazily, C1-MULTINODE-REAL-PATH, so no rendered equality is
+# required of it): the global capture is loaded into the name as a sentinel and must equal the global load; the
+# profile capture is then loaded and the register must name exactly that capture, carry the fact, and the sentinel
+# must be gone. The capture text must also pass the strict unique-key construction.
+- name: E12-06 Load the global capture into the profile fact name as a sentinel
+  ansible.builtin.include_vars:
+    file: "{{ (_lme_pcap_cap_st.results | first).stat.path }}"
+    name: _lme_profile_file
+  register: _lme_profile_load
+
+- name: E12-06 Refuse a profile fact the loader cannot write (the sentinel must be the global load)
+  ansible.builtin.assert:
+    that:
+      - _lme_profile_file | lme_type_aware_equal(_lme_global_load.ansible_facts._lme_global_file)
+      - _lme_profile_load.ansible_facts._lme_profile_file | lme_type_aware_equal(_lme_profile_file)
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal }}: (E12-06)
+      _lme_profile_file is bound outside the loader (C1-CATALOG-BOUND-TO-DECLARED-BYTES, C1-MULTINODE-REAL-PATH)
+    quiet: true
+
+- name: E12-06 Load the selected profile natively from its capture
+  ansible.builtin.include_vars:
+    file: "{{ (_lme_pcap_cap_st.results | last).stat.path }}"
+    name: _lme_profile_file
+  register: _lme_profile_load
+
+- name: E12-06 Refuse a profile fact the capture load did not replace (fail-closed, pre-mutation)
+  ansible.builtin.assert:
+    that:
+      - _lme_profile_load.ansible_included_var_files == [(_lme_pcap_cap_st.results | last).stat.path]
+      # SR-320-09 (codex 903; F944): no full recursive walk of the PROFILE fact runs here (it may hold possible-template
+      # leaves, the s28 bare start strings); the register / fact and sentinel-gone obligations are checked on the
+      # top-level key sets only (iterating keys evaluates no value), and carried in depth by the SR-320-07 PARTIAL guard
+      # below, run on the fact AND on the register with equal excluded positions required.
+      - (_lme_profile_load.ansible_facts._lme_profile_file | list | sort) == (_lme_profile_file | list | sort)
+      - (_lme_profile_file | list | sort) != (_lme_global_load.ansible_facts._lme_global_file | list | sort)
+      - "'profile_overlay' in _lme_profile_file"
+      # SR-321-01: the strict parse consumes ONE read bound to the profile capture stat checksum before it parses
+      - >-
+        (lookup('ansible.builtin.file', (_lme_pcap_cap_st.results | last).stat.path, rstrip=false)
+        | lme_capture_text_bound((_lme_pcap_cap_st.results | last).stat.checksum, lme_invocation_words.digest_algorithm,
+        _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.encoding,
+        _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal)
+        | lme_manifest_strict((_lme_pcap_cap_st.results | last).stat.path,
+        _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.parse)) is mapping
+      - >-
+        (_lme_pcap_cap_st.results | last).stat.checksum == (_lme_pcap_src_st.results | last).stat.checksum
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal }}: (E12-06) the profile
+      fact is not the native load of its capture {{ (_lme_pcap_cap_st.results | last).stat.path }}
+    quiet: true
+
+# SR-320-07 (codex 902 SR-320-01; SR-320-09 / codex 903: E12-06 keeps its obligations, its full profile walks are
+# refactored onto this guard and the key-set checks above): a raw-guided PARTIAL
+# correspondence guard (DEV-E12-06-PROFILE-RAW stays PARTIAL; NOT a full binding, OW-C1-FULL-BYTE-BINDING). Traversal
+# is driven by the strict parse of the consumed profile capture bytes: exact mapping key sets, sequence length and
+# order, and type-aware values at every inspected position of the loaded fact; ONLY a position whose raw value the
+# declared detection rule detects (template_detection, G14-01) is skipped and its fact value is never read. The
+# excluded positions are published as typed path components with their detection reasons (never a joined string).
+- name: SR-320-07 Compare the profile fact with the raw parse of its capture (raw-guided PARTIAL guard; excluded paths)
+  ansible.builtin.set_fact:
+    _lme_profile_raw_partial: >-
+      {{ lookup('ansible.builtin.file', (_lme_pcap_cap_st.results | last).stat.path, rstrip=false)
+      | lme_capture_text_bound((_lme_pcap_cap_st.results | last).stat.checksum, lme_invocation_words.digest_algorithm,
+      _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.encoding,
+      _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal)
+      | lme_manifest_strict((_lme_pcap_cap_st.results | last).stat.path,
+      _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.parse)
+      | lme_raw_partial_correspondence(_lme_profile_file,
+      _lme_global_file.lme_config_registry.remote_harness_schema.template_detection,
+      _lme_global_file.lme_config_registry.remote_harness_schema[_lme_global_file.lme_config_registry.remote_harness_schema.template_detection.word_form].separator,
+      _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal) }}
+
+# SR-320-09 (codex 903): the register carries the same fact -- the PARTIAL guard over the include_vars register's own
+# fact must succeed with exactly the excluded positions of the fact (replaces the full register / fact equality walk).
+- name: SR-320-09 Refuse a load register whose fact is not the guarded profile fact (raw-guided PARTIAL; texts of profile_identity)
+  ansible.builtin.assert:
+    that:
+      - >-
+        (lookup('ansible.builtin.file', (_lme_pcap_cap_st.results | last).stat.path, rstrip=false)
+        | lme_capture_text_bound((_lme_pcap_cap_st.results | last).stat.checksum, lme_invocation_words.digest_algorithm,
+        _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.encoding,
+        _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal)
+        | lme_manifest_strict((_lme_pcap_cap_st.results | last).stat.path,
+        _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.parse)
+        | lme_raw_partial_correspondence(_lme_profile_load.ansible_facts._lme_profile_file,
+        _lme_global_file.lme_config_registry.remote_harness_schema.template_detection,
+        _lme_global_file.lme_config_registry.remote_harness_schema[_lme_global_file.lme_config_registry.remote_harness_schema.template_detection.word_form].separator,
+        _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal))
+        == _lme_profile_raw_partial
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal }}: (SR-320-09) the
+      include_vars register fact is not the guarded profile fact of {{ (_lme_pcap_cap_st.results | last).stat.path }}
+    quiet: true
+
+# E12-07 (retires lme_profile_load_identity; LC-01): the published identities are exactly profile_identity.fields:
+# the source path, the digest of the consumed capture's exact bytes and the capture path. An extra-var outranks
+# set_fact, so the read-back recomputes them inline (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
+# SR-320-04 (MAIN 944): the identity digest is the registered capture stat checksum (computed by
+# lme_invocation_words.digest_algorithm at the E12-02 stat), reused with no second read of the capture; the declared
+# profile_identity algorithm must be that same word, both read by pointer.
+- name: SR-320-04 Refuse a profile identity digest algorithm that is not the capture stat algorithm
+  ansible.builtin.assert:
+    that:
+      - >-
+        _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.digest_algorithm
+        == lme_invocation_words.digest_algorithm
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal }}: (SR-320-04)
+      profile_identity.digest_algorithm is not the capture stat algorithm lme_invocation_words.digest_algorithm
+    quiet: true
+
+- name: E12-07 Publish the consumed global and profile identities (profile_identity.fields; OUTPUT names)
+  ansible.builtin.set_fact:
+    lme_global_loaded: >-
+      {{ dict(_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields
+         | zip([(_lme_pcap_src_st.results | first).item,
+                (_lme_pcap_cap_st.results | first).stat.checksum,
+                (_lme_pcap_cap_st.results | first).stat.path])) }}
+    lme_profile_loaded: >-
+      {{ dict(_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields
+         | zip([(_lme_pcap_src_st.results | last).item,
+                (_lme_pcap_cap_st.results | last).stat.checksum,
+                (_lme_pcap_cap_st.results | last).stat.path])) }}
+
+- name: E12-07 Read-back guard -- the published identities are the recomputed values (type-aware; untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        lme_global_loaded | lme_type_aware_equal(dict(_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields
+        | zip([(_lme_pcap_src_st.results | first).item,
+               (_lme_pcap_cap_st.results | first).stat.checksum,
+               (_lme_pcap_cap_st.results | first).stat.path])))
+      - >-
+        lme_profile_loaded | lme_type_aware_equal(dict(_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields
+        | zip([(_lme_pcap_src_st.results | last).item,
+               (_lme_pcap_cap_st.results | last).stat.checksum,
+               (_lme_pcap_cap_st.results | last).stat.path])))
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal }}: (E12-07)
+      lme_global_loaded / lme_profile_loaded was pre-supplied / -e-pinned; the consumed identities are resolver outputs
+    quiet: true
+
+# E12-11 (codex 896 item 3; G13-05; SR-317; SR-318-03): the cluster topology derived natively from the INVENTORY host
+# words of the declared group (hostvars and groups; never a play var, never a first-host fallback). When the selected
+# profile is in required_by_profiles a missing, ambiguous or disagreeing topology refuses here, before any mutation;
+# otherwise it is the declared absent form.
+- name: E12-11 Derive the cluster topology from the inventory host words (OUTPUT name)
+  ansible.builtin.set_fact:
+    lme_cluster_topology: >-
+      {{ hostvars | lme_cluster_topology(groups, _lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology,
+         lme_profile) }}
+
+- name: E12-11 Read-back guard -- the cluster topology is the recomputed value (type-aware; untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        lme_cluster_topology | lme_type_aware_equal(hostvars | lme_cluster_topology(groups,
+        _lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology, lme_profile))
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.cluster_topology.refusal }}: (E12-11)
+      lme_cluster_topology was pre-supplied / -e-pinned; the topology is a resolver output
+    quiet: true
+
+# --- C1 caller-input contract: capture pristine operator selections, compose, resolve ---
+# codex-manager-caller-contract-decisions-20260923-0200 + advisor split-brain correction.
+#
+# Inputs arrive namespaced in `lme_inputs` (selections + observations + origins). A
+# NORMALIZED entrypoint (site.yml pre_tasks) sets it from hostvars before the first load;
+# an UN-NORMALIZED entrypoint (upgrade_lme / elasticsearch / convert_to_cluster / the
+# golden harness) leaves it undefined.
+#
+# SPLIT-BRAIN FIX: the previous auto-normalize was ALL-OR-NOTHING (`when: lme_inputs is
+# not defined`). A caller that supplied ONLY observations (B's CR-B1 upgrade-fallback
+# path passes `lme_inputs: {observations: {...}}`) SKIPPED the whole capture, so
+# `selections` collapsed to {} and an operator `-e install_llm=false` DROPPED OUT of the
+# resolution (lme_enable_flags.install_llm went true) while the bare `install_llm` fact
+# stayed false (-e outranks set_fact) -- split-brain rendering. We now capture the
+# operator selection scope into a C1-PRIVATE fact (NEVER the caller-input name
+# lme_inputs) and COMPOSE it with any caller-supplied lme_inputs parts every load, so
+# observations and operator selections coexist.
+#
+# PRISTINE capture: read the bare variable scope for declared registry fields ONCE, on
+# the FIRST load -- BEFORE the bare-name bridge below writes any fact -- so it captures
+# the genuine operator -e / inventory / include_role `vars:` selections and is immune to
+# later bridge pollution. (This is WHY bare `vars` cannot simply be re-read each load:
+# this file's own compat bridge set_facts them, so a later re-read would see resolved
+# OUTPUTS masquerading as operator inputs.) Guarded once; a later load reuses the pristine
+# capture rather than re-reading the now-polluted bare scope. Its removal condition is
+# B/E normalizing their entrypoints to set lme_inputs.selections themselves.
+- name: Capture pristine operator selections once (C1-private fact; never lme_inputs)
+  ansible.builtin.set_fact:
+    # Registry field list + present-in-scope subset are computed INLINE (not task `vars:`):
+    # an extra-var outranks a task var, so `-e _lme_sel_keys=[]` / `-e _lme_reg_keys=[]`
+    # would otherwise empty the capture and discard every admitted selection while a
+    # read-back recomputed from the same pinned object agreed (C1-DERIVED-EFFECTIVE-INPUTS-
+    # PIN, one hop up). The split-brain invariant at the end of this file is the backstop.
+    _lme_operator_selections: >-
+      {{ dict((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list)
+              | zip((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list)
+                    | map('extract', vars) | list)) }}
+  # C1-SR922D: capture-once by MEMBERSHIP of the C1-private name (absent on the first load of a play, present after)
+  when: query('ansible.builtin.varnames', '^_lme_operator_selections$') | length == 0
+
+# C1-SR922D (codex 924; no-exemption fallback removal): every input the composition, the resolver, the scope context and
+# the read-back guards below read is admitted here by MEMBERSHIP and type, parent before child (asserts stop at the
+# first false), BEFORE its first read. REQUIRED: profile_overlay.vars and profile_overlay.lme_global (every profile
+# declares both; the overlay lme_global rule of F05-S4 below), the pristine capture (a mapping), and the two registry
+# caller_inputs declarations. OPTIONAL by declaration: lme_inputs (caller_inputs.lme_inputs) -- when its declared var is
+# in vars it must be a mapping whose keys are declared members and whose members are mappings. The message renders
+# no input value, only type names of values proven present.
+- name: Refuse an absent or mistyped overlay, pristine capture or caller-input declaration (typed, before any read)
+  ansible.builtin.assert:
+    that:
+      - "'profile_overlay' in _lme_profile_file and _lme_profile_file.profile_overlay is mapping"
+      - "'vars' in _lme_profile_file.profile_overlay and _lme_profile_file.profile_overlay.vars is mapping"
+      - "'lme_global' in _lme_profile_file.profile_overlay and _lme_profile_file.profile_overlay.lme_global is mapping"
+      - "query('ansible.builtin.varnames', '^_lme_operator_selections$') | length == 1 and _lme_operator_selections is mapping"
+      - "'caller_inputs' in _lme_global_file.lme_config_registry and _lme_global_file.lme_config_registry.caller_inputs is mapping"
+      - "'lme_global_override' in _lme_global_file.lme_config_registry.caller_inputs and _lme_global_file.lme_config_registry.caller_inputs.lme_global_override is mapping"
+      - "'var' in _lme_global_file.lme_config_registry.caller_inputs.lme_global_override and _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var is string"
+      - "'absent' in _lme_global_file.lme_config_registry.caller_inputs.lme_global_override and _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent is mapping"
+      - "'lme_inputs' in _lme_global_file.lme_config_registry.caller_inputs and _lme_global_file.lme_config_registry.caller_inputs.lme_inputs is mapping"
+      - "['var', 'members', 'absent', 'member_absent', 'refusal'] | reject('in', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs) | list | length == 0"
+      - _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var is string
+      - _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.members is sequence
+      - _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.absent is mapping
+      - _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.member_absent is mapping
+      - _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.refusal is string
+    fail_msg: >-
+      lme: profile {{ lme_profile }} or the registry caller_inputs declaration is not admitted (C1-SR922D): the profile
+      must declare profile_overlay.vars and profile_overlay.lme_global as mappings, the pristine operator capture must
+      be a mapping, and lme_config_registry.caller_inputs must declare lme_global_override {var, absent} and lme_inputs
+      {var, members, absent, member_absent, refusal}; nothing was resolved.
+    quiet: true
+
+- name: Refuse a supplied lme_inputs that is not a mapping over its declared members (typed, before any read)
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var) is mapping
+      - >-
+        lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var) | list
+        | reject('in', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.members) | list | length == 0
+      - >-
+        _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.members
+        | select('in', lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var))
+        | map('extract', lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var))
+        | reject('mapping') | list | length == 0
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.refusal }}: a supplied
+      {{ _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var }} must be a mapping whose keys are among
+      {{ _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.members | to_json }}, each a mapping (got type
+      {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var) | type_debug }}); nothing was resolved.
+    quiet: true
+  when: _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var in vars
+
+# C1-CONFLICTING-INPUT-PRECEDENCE. Before composing, REJECT the ambiguous case where the
+# pristine operator capture (native extra-var/inventory precedence already chose this
+# winner) and a caller-normalized lme_inputs.selections DISAGREE on a key. Previously the
+# caller value combined ON TOP, so a lower-tier namespaced install_llm=true silently
+# overwrote a captured extra-var install_llm=false in the resolver while Ansible's bare
+# extra-var stayed false -- split-brain. Agreeing keys are fine; only a genuine value
+# disagreement (unestablishable provenance) fails here. Removal condition: B/E normalize
+# their entrypoints to set lme_inputs.selections themselves (then the pristine capture is
+# redundant, not conflicting).
+- name: Reject conflicting operator vs namespaced selection (C1-CONFLICTING-INPUT-PRECEDENCE)
+  ansible.builtin.assert:
+    that:
+      - (_lme_operator_selections | lme_selection_conflicts(((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.absent).selections if ('selections' in (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.absent)) else _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.member_absent), _lme_global_file.lme_config_registry)) | length == 0
+    fail_msg: >-
+      config selection conflict on {{ _lme_operator_selections | lme_selection_conflicts(((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.absent).selections if ('selections' in (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.absent)) else _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.member_absent), _lme_global_file.lme_config_registry) }}
+      -- given BOTH as a native operator selection (extra-var/inventory) AND as a differing
+      lme_inputs.selections value. Native precedence already chose the operator value; a
+      lower-tier namespaced selection may not silently override it. Normalize the caller to
+      one precedence contract or drop the conflicting namespaced key.
+    quiet: true
+
+# Resolve every declared field from the ADMITTED inputs, by ITERATING registry.precedence
+# into a NAMESPACED result (resolved + origins + enable_flags). The effective-input
+# COMPOSITION (pristine operator capture + caller lme_inputs: caller selections combine per
+# key over the operator capture -- a genuine disagreement was already rejected above; caller
+# observations + caller-verified finer origins are honoured; each operator key carries the
+# honest `operator` origin) is folded INTO the value-pure lme_resolve_from_admitted filter
+# and called INLINE here -- an expression, NOT a named `_lme_eff_inputs` set_fact. So an
+# `-e _lme_eff_inputs={selections:{},...}` can no longer DISCARD an admitted selection while
+# a read-back recomputed from the SAME pinned object agrees: there is no such intermediate
+# to pin (C1-DERIVED-EFFECTIVE-INPUTS-PIN). The resolver reads ONLY the registry, the
+# profile overlay, the pristine operator capture and the caller inputs, so re-running it
+# each load is self-capture-free (a profile switch / explicit lme_inputs change on a later
+# load is reflected -- codex resolution_lifetime / Q2.7). Required-missing / undeclared-key /
+# type violations RAISE here, before any mutation.
+- name: Compose independent selectors before the existing resolver and operator override
+  ansible.builtin.include_tasks: compose_profile_selectors.yml
+
+- name: Resolve config from admitted inputs (pure engine; faithful derivation; re-run each load)
+  ansible.builtin.set_fact:
+    _lme_resolution: >-
+      {{ _lme_global_file.lme_config_registry
+         | lme_resolve_from_admitted(
+             (_lme_profile_file.profile_overlay.vars | combine(_lme_profile_composition.overlay.vars, recursive=True)),
+             _lme_operator_selections,
+             (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.absent)) }}
+
+# VALIDATE via the LITERAL shared task (also run by the C1 A1 regression case) BEFORE any
+# mutation. registry-FIRST pipe; the engine's shape gate makes a reversed argument fail
+# closed. This is the fail-open bug's fix (codex C1-VALIDATE-CALL / A1).
+- name: Admit normalized independent-profile derived fields
+  ansible.builtin.include_tasks: admit_derived_profile_fields.yml
+
+- name: Validate the resolved config against the declared schema (fail-closed, pre-mutation)
+  ansible.builtin.include_tasks: validate_resolved_config.yml
+  vars:
+    _lme_validate_registry: "{{ _lme_global_file.lme_config_registry }}"
+    _lme_validate_resolved: "{{ _lme_resolution.resolved }}"
+
+# PER-HOST-SCOPE-CONTRACT (codex 023332): the remote-harness SCOPE CONTEXT -- this host's inventory identity, the
+# inventory groups, and for the declared controller plus every inventory host its own lme_global_override and
+# the ONE composition (global | profile | that override, recursive -- the same combine as lme_global below; the
+# projection only validates and digests) -- and the source edition (profile name + the global/profile content
+# digests, SR-320-03: the registered capture stat checksums by the declared digest algorithm, never a second read
+# of the capture) -- and the source of every template the registry's
+# host_scope.shared_artifacts declares (C1-ARTIFACT-REUSE-INPUT-COVERAGE: the projection proves the declared
+# artifact inputs against them) -- and, per host, the inventory values the ONE declared connection rule names
+# (C1-EFFECTIVE-ENDPOINT-BINDING: a selection; the projection derives each target's endpoint and binds it).
+# Empty when no remote-harness policy is declared. A named fact so the
+# many inline projection calls share it; an -e pin is a set_fact no-op that the type-aware read-back below
+# refuses against the inline recompute (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN pattern).
+# C1-SR922D (codex 924): the scope context reads every scoped host's caller override (the declared controller id plus
+# every inventory host). Each scoped id must be an inventory host (the old per-host fallback admitted an undeclared
+# controller id with an empty override), and an override a host supplies (membership of the declared var in that
+# host's vars) must be a mapping; a host that supplies none takes the declared absent form inside the expression.
+# Only when a remote-harness policy is declared (the condition the scope context itself branches on).
+- name: Refuse an unknown scoped host or a mistyped per-host caller override (typed, before the scope context)
+  ansible.builtin.assert:
+    that:
+      - (([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | reject('in', hostvars) | list) == []
+      - >-
+        (([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list)
+        | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list)
+        | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0')
+        | map('extract', hostvars, _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var)
+        | reject('mapping') | list | length == 0
+    fail_msg: >-
+      lme: (C1-SR922D) every remote-harness scoped id (host_scope.controller_id plus the inventory hosts) must be an
+      inventory host, and a per-host {{ _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var }}
+      must be a mapping; unknown ids
+      {{ ([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | reject('in', hostvars) | list | to_json }};
+      nothing was projected.
+    quiet: true
+  when: >-
+    _lme_global_file.lme_config_registry.remote_harness_schema.policy_key
+    in (_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True))
+
+- name: Resolve the remote-harness scope context (controller + inventory scopes; one composition each)
+  ansible.builtin.set_fact:
+    _lme_rh_scope: >-
+      {{ {} if (_lme_global_file.lme_config_registry.remote_harness_schema.policy_key not in (_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True))) else
+         {'self': inventory_hostname,
+          _lme_global_file.lme_config_registry.remote_harness_schema.authoring_location.checkout_context: clone_directory,
+          'groups': groups,
+          'overrides': dict(([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list
+                            | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', dict(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | reject('in', ((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list)) | list) | product([_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent])) | combine(dict(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list) | zip(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list) | map('extract', hostvars, _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | list)))) | list)),
+          'composed': dict(([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list
+                            | zip([(_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True))]
+                                  | product((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', dict(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | reject('in', ((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list)) | list) | product([_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent])) | combine(dict(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list) | zip(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list) | map('extract', hostvars, _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | list)))) | list)
+                                  | map('list') | map('combine', recursive=True) | list)),
+          'edition': {'profile': lme_profile,
+                      'global_sha256': (_lme_pcap_cap_st.results | first).stat.checksum,
+                      'profile_sha256': (_lme_pcap_cap_st.results | last).stat.checksum},
+          'artifact_sources': dict(_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.shared_artifacts | dict2items | map(attribute='value.templates') | flatten | unique | list
+                                   | zip(query('ansible.builtin.file', *(_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.shared_artifacts | dict2items | map(attribute='value.templates') | flatten | unique | map('regex_replace', '^', lme_manifests_dir ~ '/../') | list)))),
+          'connections': hostvars | lme_rh_connection_values(([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list,
+                                                            (_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)),
+                                                            _lme_global_file.lme_config_registry.remote_harness_schema)} }}
+
+- name: Read-back guard -- the remote-harness scope context is the recomputed value (type-aware; untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        _lme_rh_scope | lme_type_aware_equal(
+        {} if (_lme_global_file.lme_config_registry.remote_harness_schema.policy_key not in (_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True))) else
+         {'self': inventory_hostname,
+          _lme_global_file.lme_config_registry.remote_harness_schema.authoring_location.checkout_context: clone_directory,
+          'groups': groups,
+          'overrides': dict(([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list
+                            | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', dict(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | reject('in', ((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list)) | list) | product([_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent])) | combine(dict(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list) | zip(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list) | map('extract', hostvars, _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | list)))) | list)),
+          'composed': dict(([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list
+                            | zip([(_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True))]
+                                  | product((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', dict(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | reject('in', ((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list)) | list) | product([_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent])) | combine(dict(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list) | zip(((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | zip((([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list) | map('extract', hostvars) | list) | selectattr('1', 'contains', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | map(attribute='0') | list) | map('extract', hostvars, _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | list)))) | list)
+                                  | map('list') | map('combine', recursive=True) | list)),
+          'edition': {'profile': lme_profile,
+                      'global_sha256': (_lme_pcap_cap_st.results | first).stat.checksum,
+                      'profile_sha256': (_lme_pcap_cap_st.results | last).stat.checksum},
+          'artifact_sources': dict(_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.shared_artifacts | dict2items | map(attribute='value.templates') | flatten | unique | list
+                                   | zip(query('ansible.builtin.file', *(_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.shared_artifacts | dict2items | map(attribute='value.templates') | flatten | unique | map('regex_replace', '^', lme_manifests_dir ~ '/../') | list)))),
+          'connections': hostvars | lme_rh_connection_values(([_lme_global_file.lme_config_registry.remote_harness_schema.host_scope.controller_id] + groups['all']) | unique | list,
+                                                            (_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)),
+                                                            _lme_global_file.lme_config_registry.remote_harness_schema)})
+    fail_msg: >-
+      _lme_rh_scope was pre-supplied / -e-pinned and disagrees with its freshly recomputed value; the remote-harness
+      scope context is a resolver output (PER-HOST-SCOPE-CONTRACT, C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
+    quiet: true
+
+# SR-320-03 (MAIN 943): the source-edition field names (L8 _rh_scoped edition shape) and the revision profile-identity
+# key name a digest algorithm; the digests they carry are the registered capture stat checksums, computed by
+# lme_invocation_words.digest_algorithm (E12-02 stat), which E12-05 binds to profile_identity.digest_algorithm. So
+# every edition digest field must end with that declared word (an absent edition -- no remote-harness policy -- is
+# an empty selection), and the revision key word (profile_identity.fields, second word) must be that declared word.
+- name: SR-320-03 Refuse an edition or revision digest name whose algorithm is not the declared capture digest algorithm
+  ansible.builtin.assert:
+    that:
+      - >-
+        _lme_rh_scope | dict2items | selectattr('key', 'eq', 'edition') | map(attribute='value') | map('dict2items')
+        | flatten | map(attribute='key') | reject('eq', 'profile')
+        | reject('search', (_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.digest_algorithm
+        | regex_escape) ~ '$') | list == []
+      - >-
+        _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields[1]
+        == _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.digest_algorithm
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.refusal }}: (SR-320-03) an edition
+      or revision digest name does not carry the declared capture digest algorithm
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.digest_algorithm }}
+    quiet: true
+
+# F05-S3 DOCUMENT READER (LR-14; registry remote_harness_schema.document_channel), STAGED (records-staged-reader-01;
+# codex-tick740 single_engine_document_reader, codex-tick747, codex-tick751). Authority while the channel is active: the
+# explicit executable_closure PARTIAL admission rh_src_partial (admit_loader_source.yml; source_admission.members_rel
+# only; reserved, refused pre-supplied by refuse_pinned_outputs.yml), re-keyed under the single_engine_document_reader
+# word and passed to the loader SEPARATELY as _lme_rh_admission. The document relation is ONE level (OI-05), so the
+# reader runs at most two LEVEL rounds (below). The completed receipt rh_src_admission is bound HERE after the last
+# level and BEFORE the projection; it is never the partial admission. Inactive / no policy: nothing is read,
+# _lme_rh_admission is null, _lme_rh_documents is the empty set started below.
+- name: Refuse an active document channel without the explicit executable_closure partial admission (typed, before any read)
+  ansible.builtin.assert:
+    that:
+      # C1 s07 RS-01 (seat ruling CONFLICT-FW24-RS-ISDEFINED (a)): staged-reader-01:279 -- both presence tests
+      # (rh_src_partial, _rh_sa_decl) re-spelled as key membership; presence form per ALS ea00724b; type checks kept.
+      # C1 s10 R10-01 (records-c1-framework-27; codex-tick821 item 5): HOMED -- both presence names are the DECLARED
+      # registry values document_channel.admission.partial / .declaration (GL-27-03; loader s10 L10 admits them), read
+      # through the registry node this task already reads; membership is tested on those declared values. early_names is
+      # not widened and no name is sourced from the fact being tested (closes the s08 UNHOMED debt; ERR-FW24-01 stands).
+      # C1 s11 R11-01 (records-c1-framework-29; codex-tick823 OPEN-NOTE-R10-BARE-VALUE-READS): presence, type, value,
+      # construction and readback all use the declared names (lookup by name); no read of a fixed input name remains.
+      - >-
+        not (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema))
+        or (_lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial in vars and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial) is mapping
+            and _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration in vars and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration) is mapping
+            and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages is mapping and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words is mapping
+            and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure is string
+            and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.single_engine_document_reader is string
+            and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure in lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)
+            and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial) | dict2items | rejectattr('key', 'equalto', lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure) | list | length == 0
+            and lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure] is mapping)
+    # C1 s07 RS-01 (seat ruling CONFLICT-FW24-RS-ISDEFINED (a)): staged-reader-01:289 -- the presence test in the
+    # to_json list re-spelled as key membership; presence form per ALS ea00724b.
+    # C1 s10 R10-02 (records-c1-framework-27): HOMED -- the presence name is the declared document_channel.admission.partial.
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.refusal }}:
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.message }}
+      {{ [_lme_global_file.lme_config_registry.remote_harness_schema.document_channel.when, _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial in vars] | to_json }}
+    quiet: true
+
+- name: Bind the reading-stage admission authority (the executable_closure partial admission under the single_engine_document_reader word while active, null otherwise)
+  ansible.builtin.set_fact:
+    _lme_rh_admission: >-
+      {{ {lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.single_engine_document_reader: lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure]}
+         if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)) else none }}
+
+- name: Read-back guard -- the reading-stage admission authority is the recomputed value (type-aware; untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        _lme_rh_admission | lme_type_aware_equal({lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.single_engine_document_reader: lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure]}
+        if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)) else none)
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.refusal }}:
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.message }}
+      {{ [_lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.fact] | to_json }}
+    quiet: true
+
+# records-staged-reader-01 (codex-tick740 "preserve executable hash checks before first Git use"; codex-tick747 RF-GIT
+# "retain include membership checks and tool hashing before Git"): the reader's Git use runs the RECORD's executables
+# and the RECORD's Git-path include, re-hashed here (bytes at use) against the partial admission before the first round.
+- name: Re-hash the record's Git and env executables before the reader's first Git use (links followed)
+  when: _lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)
+  ansible.builtin.stat:
+    path: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.tool][item][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).tool_fields.path] }}"
+    follow: true
+    get_checksum: true
+    checksum_algorithm: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).digest_algorithm }}"
+    get_mime: false
+    get_attributes: false
+  loop: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).tool_roles.keys() | list }}"
+  register: _lme_rh_tobs
+
+- name: Refuse a missing, non-executable or changed Git / env executable (digest == the partial admission's; before the reader's first Git use)
+  when: _lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)
+  ansible.builtin.assert:
+    that:
+      - _lme_rh_tobs.results | rejectattr('stat.exists') | list | length == 0
+      - _lme_rh_tobs.results | map(attribute='stat') | rejectattr('executable') | list | length == 0
+      - _lme_rh_tobs.results | map(attribute='stat') | map(attribute='checksum') | list
+        == lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).tool_roles.keys() | map('extract', lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.tool]) | map(attribute=lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).tool_fields.sha256) | list
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.tool }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.tool }}
+      {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).tool_roles.keys() | list | zip(_lme_rh_tobs.results | map(attribute='stat') | map(attribute='exists')) | list | to_json }}
+    quiet: true
+
+- name: Observe the record's Git-path include before the reader includes it (no link followed)
+  when: _lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root ~ _rh_sa_bs.path_admission.separator ~ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.git].include_rel }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).digest_algorithm }}"
+    get_mime: false
+    get_attributes: false
+  register: _lme_rh_iobs
+
+- name: Refuse a Git-path include that is not an admitted executable_closure member with its admitted bytes
+  when: _lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.git].include_rel
+        in lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members]
+      - _lme_rh_iobs.stat.exists and _lme_rh_iobs.stat.isreg and not _lme_rh_iobs.stat.islnk
+      - _lme_rh_iobs.stat.checksum
+        == lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.git].include_rel][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).member_fields.observed]
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.member }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.member }}
+      {{ [lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.git].include_rel] | to_json }}
+    quiet: true
+
+- name: Start the admitted document set (nothing read yet; a pinned value is re-admitted name by name below and by the loader)
+  ansible.builtin.set_fact:
+    _lme_rh_documents: {}
+
+# records-staged-reader-01: LEVEL ROUND 1 (the primaries; rels from the composed policy). An empty level (inactive or no policy: the plan's own engine-returned
+# read mapping, never a literal; or every name already carried) skips every task of the round.
+- name: Derive the next document level (round 1) -- every rel derived and full-matched by the engine before any path use
+  ansible.builtin.set_fact:
+    _lme_rh_level: >-
+      {{ (_lme_rh_documents | lme_rh_document_next_rel(_lme_rh_scope, _lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission))
+         if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema))
+         else (_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read }}
+
+- name: Read-back guard -- the document level is the engine's recomputed value (round 1; type-aware; untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        _lme_rh_level | lme_type_aware_equal((_lme_rh_documents | lme_rh_document_next_rel(_lme_rh_scope, _lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission))
+        if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema))
+        else (_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read)
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.refusal }}:
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.message }}
+      {{ _lme_rh_documents | list | sort | to_json }}
+    quiet: true
+
+# codex-tick747 747-FULL-PHASE-DOCUMENT-PREACCESS: on the full phase each engine-derived name -> rel must equal its
+# admitted launch-map entry (_rh_sa_dfirst, C1-DKJ2-ALS-04R, full phase only) BEFORE this round stats, Git-admits or
+# reads it. Record-free callers derive from admitted parents and fabricate no launch map.
+- name: Refuse a derived document rel that is not the admitted launch-map entry (round 1; full phase; before any stat, Git admission or read)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.assert:
+    that:
+      # C1 s08 RS-02 round 1 (codex-tick820 FW24-RS-PRESENCE-NAMES-UNSOURCED; records-c1-framework-25 presence_sourcing;
+      # corrects s07 / records-24 S07-RS-PRESENCE by ERR-FW24-02): staged-reader-01:424 -- the presence name is the DECLARED
+      # registry value contract_admission.early_names.rh_rp_input.var (global c5fbb125 :2469), read through the registry
+      # node this file already reads (document_channel sites above); membership is tested on that declared value (ALS
+      # 04ddb641 :94 form). No quoted name.
+      - >-
+        _lme_global_file.lme_config_registry.remote_harness_schema.contract_admission.early_names.rh_rp_input.var in vars
+        or (_rh_sa_dfirst is mapping
+            and _lme_rh_level.keys() | difference(_rh_sa_dfirst.keys() | list) | list | length == 0
+            and (_lme_rh_level | to_json(sort_keys=true))
+                == (_rh_sa_dfirst | dict2items | selectattr('key', 'in', _lme_rh_level.keys() | list) | items2dict | to_json(sort_keys=true)))
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.document }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.document }}
+      {{ _lme_rh_level | list | sort | to_json }}
+    quiet: true
+
+- name: Observe every rel of the level (round 1; stat; exists, regular, not a link) before its Git admission
+  when: _lme_rh_level | length > 0
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root ~ _rh_sa_bs.path_admission.separator ~ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).digest_algorithm }}"
+    get_mime: false
+    get_attributes: false
+  loop: "{{ _lme_rh_level.values() | list }}"
+  register: _lme_rh_dobs
+
+- name: Refuse a missing, linked, non-regular or already admitted level rel (round 1)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.assert:
+    that:
+      - _lme_rh_dobs.results | map(attribute='stat') | selectattr('exists') | list | length == _lme_rh_level | length
+      - _lme_rh_dobs.results | map(attribute='stat') | selectattr('islnk') | list | length == 0
+      - _lme_rh_dobs.results | map(attribute='stat') | rejectattr('isreg') | list | length == 0
+      - _lme_rh_level.values() | select('in', _lme_rh_admission[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.single_engine_document_reader][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members]) | list | length == 0
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.member }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.member }}
+      {{ _lme_rh_level | list | sort | to_json }}
+    quiet: true
+
+- name: Admit every rel of the level against the record's edition (round 1; the record's admitted Git-path include; before any read)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.include_tasks: "{{ rh_repo_root ~ _rh_sa_bs.path_admission.separator ~ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.git].include_rel }}"
+  vars:
+    rh_gp_tool: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.tool].git[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).tool_fields.path] }}"
+    rh_gp_env: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.tool].env[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).tool_fields.path] }}"
+    rh_gp_git: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.git] }}"
+    rh_gp_repo: "{{ rh_repo_root }}"
+    rh_gp_paths: "{{ _lme_rh_level.values() | list }}"
+    rh_gp_absent: []
+    rh_gp_probe: []
+    rh_gp_edition: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.edition] }}"
+    rh_gp_codes: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.git }}"
+    rh_gp_texts: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.git }}"
+    rh_gp_history: null
+
+- name: Re-observe every rel of the level after its Git admission (round 1; observation race)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root ~ _rh_sa_bs.path_admission.separator ~ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).digest_algorithm }}"
+    get_mime: false
+    get_attributes: false
+  loop: "{{ _lme_rh_level.values() | list }}"
+  register: _lme_rh_dobs2
+
+- name: Refuse an observation race (round 1; observed digest before and after the Git admission differ)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.assert:
+    that:
+      - _lme_rh_dobs2.results | map(attribute='stat') | map(attribute='checksum') | list
+        == _lme_rh_dobs.results | map(attribute='stat') | map(attribute='checksum') | list
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.member }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.race }}
+      {{ _lme_rh_level | list | sort | to_json }}
+    quiet: true
+
+- name: Refuse an unjoined trusted blob or another edition (round 1; distinct provenance joined)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.assert:
+    that:
+      - _lme_rh_level.values() | reject('in', rh_gp_oids) | list | length == 0
+      - rh_gp_head == lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.edition]
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.member }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.member }}
+      {{ _lme_rh_level | list | sort | to_json }}
+    quiet: true
+
+- name: Extend the reading-stage partial admission by each Git-admitted rel of the level (round 1; observed and trusted kept distinct)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.set_fact:
+    _lme_rh_admission: >-
+      {{ _lme_rh_admission | combine({lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.single_engine_document_reader:
+           {lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members: {_lme_rh_dob.item: {lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).member_fields.observed: _lme_rh_dob.stat.checksum,
+                                                                 lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).member_fields.trusted: rh_gp_oids[_lme_rh_dob.item]}}}}, recursive=True) }}
+  loop: "{{ _lme_rh_dobs.results }}"
+  loop_control:
+    loop_var: _lme_rh_dob
+
+- name: Read every document of the level once, exact bytes, in level order (round 1; Git-admitted rel; membership and digest before the strict parse)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.set_fact:
+    _lme_rh_documents: >-
+      {{ _lme_rh_documents | lme_rh_document_append(
+           lookup('ansible.builtin.file',
+                  rh_repo_root ~ _rh_sa_bs.path_admission.separator ~ _lme_rh_level[_lme_rh_doc_name],
+                  lstrip=(_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read.lstrip,
+                  rstrip=(_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read.rstrip),
+           _lme_rh_doc_name, _lme_rh_scope, _lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission) }}
+  loop: "{{ _lme_rh_level.keys() | list }}"
+  loop_control:
+    loop_var: _lme_rh_doc_name
+
+# records-staged-reader-01: LEVEL ROUND 2 (the dependents; rels from the admitted, strictly parsed parents). An empty level (inactive or no policy: the plan's own engine-returned
+# read mapping, never a literal; or every name already carried) skips every task of the round.
+- name: Derive the next document level (round 2) -- every rel derived and full-matched by the engine before any path use
+  ansible.builtin.set_fact:
+    _lme_rh_level: >-
+      {{ (_lme_rh_documents | lme_rh_document_next_rel(_lme_rh_scope, _lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission))
+         if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema))
+         else (_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read }}
+
+- name: Read-back guard -- the document level is the engine's recomputed value (round 2; type-aware; untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        _lme_rh_level | lme_type_aware_equal((_lme_rh_documents | lme_rh_document_next_rel(_lme_rh_scope, _lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission))
+        if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema))
+        else (_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read)
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.refusal }}:
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.message }}
+      {{ _lme_rh_documents | list | sort | to_json }}
+    quiet: true
+
+# codex-tick747 747-FULL-PHASE-DOCUMENT-PREACCESS: on the full phase each engine-derived name -> rel must equal its
+# admitted launch-map entry (_rh_sa_dfirst, C1-DKJ2-ALS-04R, full phase only) BEFORE this round stats, Git-admits or
+# reads it. Record-free callers derive from admitted parents and fabricate no launch map.
+- name: Refuse a derived document rel that is not the admitted launch-map entry (round 2; full phase; before any stat, Git admission or read)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.assert:
+    that:
+      # C1 s08 RS-02 round 2 (codex-tick820 FW24-RS-PRESENCE-NAMES-UNSOURCED; records-c1-framework-25 presence_sourcing;
+      # corrects s07 / records-24 S07-RS-PRESENCE by ERR-FW24-02): staged-reader-01:424 -- the presence name is the DECLARED
+      # registry value contract_admission.early_names.rh_rp_input.var (global c5fbb125 :2469), as round 1. No quoted name.
+      - >-
+        _lme_global_file.lme_config_registry.remote_harness_schema.contract_admission.early_names.rh_rp_input.var in vars
+        or (_rh_sa_dfirst is mapping
+            and _lme_rh_level.keys() | difference(_rh_sa_dfirst.keys() | list) | list | length == 0
+            and (_lme_rh_level | to_json(sort_keys=true))
+                == (_rh_sa_dfirst | dict2items | selectattr('key', 'in', _lme_rh_level.keys() | list) | items2dict | to_json(sort_keys=true)))
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.document }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.document }}
+      {{ _lme_rh_level | list | sort | to_json }}
+    quiet: true
+
+- name: Observe every rel of the level (round 2; stat; exists, regular, not a link) before its Git admission
+  when: _lme_rh_level | length > 0
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root ~ _rh_sa_bs.path_admission.separator ~ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).digest_algorithm }}"
+    get_mime: false
+    get_attributes: false
+  loop: "{{ _lme_rh_level.values() | list }}"
+  register: _lme_rh_dobs
+
+- name: Refuse a missing, linked, non-regular or already admitted level rel (round 2)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.assert:
+    that:
+      - _lme_rh_dobs.results | map(attribute='stat') | selectattr('exists') | list | length == _lme_rh_level | length
+      - _lme_rh_dobs.results | map(attribute='stat') | selectattr('islnk') | list | length == 0
+      - _lme_rh_dobs.results | map(attribute='stat') | rejectattr('isreg') | list | length == 0
+      - _lme_rh_level.values() | select('in', _lme_rh_admission[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.single_engine_document_reader][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members]) | list | length == 0
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.member }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.member }}
+      {{ _lme_rh_level | list | sort | to_json }}
+    quiet: true
+
+- name: Admit every rel of the level against the record's edition (round 2; the record's admitted Git-path include; before any read)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.include_tasks: "{{ rh_repo_root ~ _rh_sa_bs.path_admission.separator ~ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.git].include_rel }}"
+  vars:
+    rh_gp_tool: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.tool].git[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).tool_fields.path] }}"
+    rh_gp_env: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.tool].env[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).tool_fields.path] }}"
+    rh_gp_git: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.git] }}"
+    rh_gp_repo: "{{ rh_repo_root }}"
+    rh_gp_paths: "{{ _lme_rh_level.values() | list }}"
+    rh_gp_absent: []
+    rh_gp_probe: []
+    rh_gp_edition: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.edition] }}"
+    rh_gp_codes: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.git }}"
+    rh_gp_texts: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.git }}"
+    rh_gp_history: null
+
+- name: Re-observe every rel of the level after its Git admission (round 2; observation race)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root ~ _rh_sa_bs.path_admission.separator ~ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: "{{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).digest_algorithm }}"
+    get_mime: false
+    get_attributes: false
+  loop: "{{ _lme_rh_level.values() | list }}"
+  register: _lme_rh_dobs2
+
+- name: Refuse an observation race (round 2; observed digest before and after the Git admission differ)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.assert:
+    that:
+      - _lme_rh_dobs2.results | map(attribute='stat') | map(attribute='checksum') | list
+        == _lme_rh_dobs.results | map(attribute='stat') | map(attribute='checksum') | list
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.member }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.race }}
+      {{ _lme_rh_level | list | sort | to_json }}
+    quiet: true
+
+- name: Refuse an unjoined trusted blob or another edition (round 2; distinct provenance joined)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.assert:
+    that:
+      - _lme_rh_level.values() | reject('in', rh_gp_oids) | list | length == 0
+      - rh_gp_head == lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.edition]
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.member }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.member }}
+      {{ _lme_rh_level | list | sort | to_json }}
+    quiet: true
+
+- name: Extend the reading-stage partial admission by each Git-admitted rel of the level (round 2; observed and trusted kept distinct)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.set_fact:
+    _lme_rh_admission: >-
+      {{ _lme_rh_admission | combine({lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.single_engine_document_reader:
+           {lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members: {_lme_rh_dob.item: {lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).member_fields.observed: _lme_rh_dob.stat.checksum,
+                                                                 lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).member_fields.trusted: rh_gp_oids[_lme_rh_dob.item]}}}}, recursive=True) }}
+  loop: "{{ _lme_rh_dobs.results }}"
+  loop_control:
+    loop_var: _lme_rh_dob
+
+- name: Read every document of the level once, exact bytes, in level order (round 2; Git-admitted rel; membership and digest before the strict parse)
+  when: _lme_rh_level | length > 0
+  ansible.builtin.set_fact:
+    _lme_rh_documents: >-
+      {{ _lme_rh_documents | lme_rh_document_append(
+           lookup('ansible.builtin.file',
+                  rh_repo_root ~ _rh_sa_bs.path_admission.separator ~ _lme_rh_level[_lme_rh_doc_name],
+                  lstrip=(_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read.lstrip,
+                  rstrip=(_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).read.rstrip),
+           _lme_rh_doc_name, _lme_rh_scope, _lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission) }}
+  loop: "{{ _lme_rh_level.keys() | list }}"
+  loop_control:
+    loop_var: _lme_rh_doc_name
+
+# records-staged-reader-01 (codex-tick740 empty_prefix; codex-tick747 RECEIPT-BINDER / ordinary_profile_semantics): the
+# declared set is complete before any receipt exists; the receipt is bound HERE, after the last level and before the
+# projection below. A guarded harness source operation whose channel is inactive completes its executable-source
+# receipt (the partial record, members_rel only) without counting an empty document map as active success. Ordinary
+# (non-harness) runs bind nothing and keep admission null.
+- name: Refuse an active channel whose declared document set is not completely read (no receipt from a prefix)
+  ansible.builtin.assert:
+    that:
+      - (_lme_rh_documents | list | sort) == ((_lme_rh_scope | lme_rh_document_plan(_lme_global_file.lme_config_registry.remote_harness_schema, admission=_lme_rh_admission)).names | sort)
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.refusal }}:
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.message }}
+      {{ _lme_rh_documents | list | sort | to_json }}
+    quiet: true
+
+- name: Bind the completed source-admission receipt (complete_projection_and_carrier; before the projection below)
+  # C1 s07 RS-02 (seat ruling CONFLICT-FW24-RS-ISDEFINED (a)): staged-reader-01:551 -- the rh_src_partial presence
+  # test re-spelled as key membership; presence form per ALS ea00724b.
+  # C1 s10 R10-03 (records-c1-framework-27): HOMED -- the presence name is the declared document_channel.admission.partial.
+  # C1 s11 R11-05 (records-c1-framework-29): the value is read by the same declared name as the presence test.
+  when: _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial in vars
+  ansible.builtin.set_fact:
+    rh_src_admission: >-
+      {{ _lme_rh_admission[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.single_engine_document_reader]
+         if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema))
+         else lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure] }}
+
+- name: Read-back guard -- the visible receipt is this reader's completion of the partial admission (type-aware; untamperable)
+  # C1 s07 RS-02 (seat ruling CONFLICT-FW24-RS-ISDEFINED (a)): staged-reader-01:559 -- the rh_src_partial presence
+  # test re-spelled as key membership; presence form per ALS ea00724b.
+  # C1 s10 R10-04 (records-c1-framework-27): HOMED -- the presence name is the declared document_channel.admission.partial.
+  # C1 s11 R11-06 (records-c1-framework-29): the readback compares against the value under the declared names only.
+  when: _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial in vars
+  ansible.builtin.assert:
+    that:
+      - >-
+        rh_src_admission | lme_type_aware_equal(_lme_rh_admission[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.single_engine_document_reader]
+        if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema))
+        else lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure])
+      - (rh_src_admission | dict2items | rejectattr('key', 'equalto', lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members) | items2dict | to_json(sort_keys=true))
+        == (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure] | dict2items | rejectattr('key', 'equalto', lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members) | items2dict | to_json(sort_keys=true))
+      - (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members] | to_json(sort_keys=true))
+        == (rh_src_admission[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members] | dict2items | selectattr('key', 'in', lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members].keys() | list) | items2dict | to_json(sort_keys=true))
+      - (rh_src_admission[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members].keys() | difference(lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.partial)[lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).admission_stages.words.executable_closure][lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).record_fields.members].keys() | list) | sort)
+        == (_lme_rh_documents.values() | map(attribute='rel') | sort)
+    fail_msg: >-
+      REFUSED {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).refusals.replaced }}: {{ lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.declaration).texts.replaced }}
+      {{ _lme_rh_documents | list | sort | to_json }}
+    quiet: true
+
+- name: Bind the document admission authority for the projection (the completed receipt while active, null otherwise; a resolver output)
+  ansible.builtin.set_fact:
+    _lme_rh_admission: >-
+      {{ rh_src_admission if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)) else none }}
+
+- name: Read-back guard -- the projection's admission authority is the recomputed value (type-aware; untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        _lme_rh_admission | lme_type_aware_equal(rh_src_admission if (_lme_rh_scope | lme_rh_documents_active(_lme_global_file.lme_config_registry.remote_harness_schema)) else none)
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.refusal }}:
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.message }}
+      {{ [_lme_global_file.lme_config_registry.remote_harness_schema.document_channel.admission.fact] | to_json }}
+    quiet: true
+
+# F05-S4 MAIN ruling 4: the publish / read-back / override-audit expressions below carry no fallback filter. The
+# profile overlay is REQUIRED (every profile declares profile_overlay.lme_global; admitted by membership and type at
+# the C1-SR922D caller-input assert above); the optional caller input lme_global_override has ONE declared absent form
+# (registry lme_config_registry.caller_inputs.lme_global_override.absent), selected only when its declared var
+# (caller_inputs.lme_global_override.var) is not in vars (C1-SR922D: membership, not defined-ness). A present value of
+# the wrong type refuses typed here, before use; the message renders a type name only under membership.
+- name: Refuse a malformed profile overlay or operator override (typed, before the remote-harness projection)
+  ansible.builtin.assert:
+    that:
+      - "'lme_global' in _lme_profile_composition.overlay"
+      - (_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) is mapping
+      - >-
+        (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var not in vars)
+        or (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) is mapping)
+      - _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent is mapping
+    fail_msg: >-
+      lme: profile {{ lme_profile }} profile_overlay.lme_global must be a declared mapping and
+      {{ _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var }}, when supplied, a mapping (registry
+      lme_config_registry.caller_inputs.lme_global_override.absent is its declared absent form); got overlay
+      {{ ((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)) | type_debug) if ('lme_global' in _lme_profile_composition.overlay) else '<absent>' }}
+      / override {{ (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) | type_debug) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else '<absent>' }}.
+    quiet: true
+
+# Publish the NAMESPACED outputs. lme_enable_flags comes straight from the engine (already
+# strict-bool-coerced) -- it is is_enabled()'s input, an OUTPUT name never read back as
+# operator input, so this is self-capture-free. lme_resolved_origins carries honest
+# provenance (a natively-selected value is labelled `operator`, never falsely extra_var).
+- name: Publish namespaced resolved config, origins and enable flags (OUTPUT names)
+  ansible.builtin.set_fact:
+    # SEED-06 (codex-232517): the effective remote-harness policy is a typed section of the authoritative
+    # resolved configuration (absent when no policy is declared), so the revision below binds it.
+    lme_resolved: "{{ (_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {}))) }}"
+    lme_resolved_origins: "{{ _lme_resolution.origins }}"
+    lme_enable_flags: "{{ _lme_resolution.enable_flags }}"
+
+# C1-INVOCATION-CONTEXT-01 E12-09 (C1-SOURCE-BINDING-01; codex 892 source_edition_join; SR-301-02): the ONE
+# source-admission binding of this resolve, published beside (never inside) lme_resolved, over the consumed captures
+# (profile_identity global_var / var), the document admission authority, the manifests dir and the record blocks.
+# An extra-var outranks set_fact, so the read-back recomputes it inline; E12-10 re-derives it inside the complete
+# verification.
+- name: E12-09 Publish the source-admission binding beside lme_resolved (OUTPUT name)
+  ansible.builtin.set_fact:
+    lme_source_binding: >-
+      {{ lme_resolved | lme_source_binding(_lme_global_file.lme_config_registry,
+         captures=dict([_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.global_var,
+                        _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.var]
+                       | zip([lme_global_loaded, lme_profile_loaded])),
+         admission=_lme_rh_admission, manifests_dir=lme_manifests_dir,
+         record_blocks=_lme_global_file.lme_global.record_schemas.blocks) }}
+
+- name: E12-09 Read-back guard -- the source-admission binding is the recomputed value (type-aware; untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        lme_source_binding | lme_type_aware_equal(lme_resolved | lme_source_binding(_lme_global_file.lme_config_registry,
+        captures=dict([_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.global_var,
+                       _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.var]
+                      | zip([lme_global_loaded, lme_profile_loaded])),
+        admission=_lme_rh_admission, manifests_dir=lme_manifests_dir,
+        record_blocks=_lme_global_file.lme_global.record_schemas.blocks))
+    fail_msg: >-
+      {{ _lme_global_file.lme_config_registry.remote_harness_schema.source_binding.refusal }}: (E12-09)
+      lme_source_binding was pre-supplied / -e-pinned; the binding is a resolver output
+    quiet: true
+
+# CONFIGURATION revision (codex revision_identity (b)): content-addressed over the
+# canonical declared/resolved config -- the resolved VALUES (minus registry
+# exclude_from_revision identity fields), the ordered profile identities and the schema
+# version. It is deterministic from the CONFIG ALONE: it EXCLUDES wall-clock, volatile
+# observation timestamps, unrelated commits AND provenance (origins). Origins are
+# deliberately NOT hashed -- the same values reached two ways MUST yield the SAME revision,
+# so an unchanged config never rewrites or restarts a healthy consumer. OUTPUT-ONLY.
+#
+# UNTAMPERABLE DERIVATION (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN, codex-0815 HIGH). The
+# previous form computed the hash from NAMED `vars:` intermediates (_lme_revision_resolved,
+# _lme_revision_excluded, _lme_profile_identities). An extra-var OUTRANKS a task `vars:`, so
+# `-e _lme_revision_resolved={}` pinned the hash input to an empty mapping while the real
+# resolver still flipped install_otel false->true -- the recorded revision stayed identical
+# and both peers reached deployment markers. There is now NO revision-only named
+# intermediate: the whole payload is assembled INSIDE the value-pure lme_bind_revision filter
+# (which reads the exclude set from the registry), and the profile-identity list is an INLINE
+# literal (not a variable, so -e cannot pin it). The immediately-following read-back guard
+# re-runs the SAME inline call and rejects any state where a pinned fact disagrees with the
+# freshly recomputed value -- so checking the final variable is not the only defence.
+# NB this is the CONFIG-ONLY revision (resolve.yml has no lme_services/projections yet);
+# load_manifests.yml REBINDS lme_resolved_revision to the COMPLETE composed revision after
+# the material/datastore/membership projections + lme_services/lme_global are built.
+- name: Compute the content-addressed configuration revision (config-only; deterministic; OUTPUT-ONLY; untamperable)
+  ansible.builtin.set_fact:
+    lme_resolved_revision: >-
+      {{ (_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {}))) | lme_bind_revision(
+           _lme_global_file.lme_config_registry,
+           [{'name': lme_profile,
+             _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields[1]: (_lme_pcap_cap_st.results | last).stat.checksum}]) }}
+
+# READ-BACK GUARD (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN). Extra-vars outrank set_fact, so
+# ANY C1 fact name is pinnable -- not just the final revision. A pinned fact makes its
+# set_fact a no-op, so the fact then DISAGREES with the value recomputed inline here (the
+# inline filter calls are expressions, not variables, so they cannot be pinned). This closes
+# the narrow-desync class (a downstream fact pinned while the real resolver diverges):
+#   * _lme_resolution pinned  -> disagrees with the re-run of lme_resolve_from_admitted
+#     (which recomputes from the pristine operator capture + lme_inputs, NOT from a pinnable
+#     _lme_eff_inputs intermediate)
+#   * lme_resolved / lme_resolved_origins / lme_enable_flags pinned -> disagree with
+#     _lme_resolution.* (origins is now checked too -- a pinned origin read 'default' where
+#     the admitted selection was 'operator')
+#   * lme_resolved_revision pinned -> disagrees with the re-run of lme_bind_revision
+# A wholesale pin of an upstream INPUT (e.g. the registry) changes every recompute
+# consistently AND the deploy that follows it, so it is not a silent desync and is out of
+# scope here (and _lme_global_file / _lme_profile_file are separately bound to the declared
+# manifest bytes above). Runs on the supported path BEFORE any mutation (the site.yml /
+# elasticsearch.yml pre-mutation barriers include this file), so a pin fails closed.
+- name: Read-back guard -- reject an -e-pinned resolution / resolved config / origins / revision (untamperable)
+  ansible.builtin.assert:
+    that:
+      - _lme_resolution | lme_type_aware_equal(_lme_global_file.lme_config_registry | lme_resolve_from_admitted((_lme_profile_file.profile_overlay.vars | combine(_lme_profile_composition.overlay.vars, recursive=True)), _lme_operator_selections, (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_inputs.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_inputs.absent)))
+      - >-
+        lme_resolved | lme_type_aware_equal(_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {})))
+      - lme_resolved_origins | lme_type_aware_equal(_lme_resolution.origins)
+      - lme_enable_flags | lme_type_aware_equal(_lme_resolution.enable_flags)
+      - >-
+        lme_resolved_revision == ((_lme_resolution.resolved | combine(({_lme_global_file.lme_config_registry.remote_harness_schema.policy_key: (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission))} if (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_project_remote_harness((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, _lme_rh_scope, documents=_lme_rh_documents, admission=_lme_rh_admission)) is not none else {}))) | lme_bind_revision(
+           _lme_global_file.lme_config_registry,
+           [{'name': lme_profile,
+             _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields[1]: (_lme_pcap_cap_st.results | last).stat.checksum}]))
+      # C1-TYPED-OUTPUT-REVISION (codex 022716): bind the ACTUAL published content, not only a recompute it
+      # compares equal to -- the published section is schema/type-validated and every digest in it re-derives
+      # from its own content, and the revision is the binder over the actual lme_resolved.
+      # C1-INVOCATION-CONTEXT-01 E12-10 (SR-302-05; codex 896 DEV-L7-03 join; registry source_binding.verification):
+      # the ONE complete verification. source carries exactly the declared source_fields keys (built from the
+      # registry words, never literal keys): the published binding, the consumed captures, the manifests dir and
+      # the record blocks; the source binding is re-derived inside the same call.
+      - >-
+        lme_resolved | lme_verify_resolved(_lme_global_file.lme_config_registry, documents=_lme_rh_documents,
+        admission=_lme_rh_admission,
+        source=dict([_lme_global_file.lme_config_registry.remote_harness_schema.source_binding.verification.source_fields.binding,
+                     _lme_global_file.lme_config_registry.remote_harness_schema.source_binding.verification.source_fields.captures,
+                     _lme_global_file.lme_config_registry.remote_harness_schema.source_binding.verification.source_fields.manifests_dir,
+                     _lme_global_file.lme_config_registry.remote_harness_schema.source_binding.verification.source_fields.record_blocks]
+                    | zip([lme_source_binding,
+                           dict([_lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.global_var,
+                                 _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.var]
+                                | zip([lme_global_loaded, lme_profile_loaded])),
+                           lme_manifests_dir,
+                           _lme_global_file.lme_global.record_schemas.blocks])))
+      - >-
+        lme_resolved_revision == (lme_resolved | lme_bind_revision(
+           _lme_global_file.lme_config_registry,
+           [{'name': lme_profile,
+             _lme_global_file.lme_config_registry.remote_harness_schema.profile_identity.fields[1]: (_lme_pcap_cap_st.results | last).stat.checksum}]))
+    fail_msg: >-
+      a resolver output fact (resolution, resolved config, origins, enable flags or config
+      revision) was pre-supplied / -e-pinned and disagrees with its freshly recomputed value --
+      the canonical derived artifact and its revision inputs must not be overridden by external
+      state (C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN / C1-DERIVED-EFFECTIVE-INPUTS-PIN).
+    quiet: true
+
+# OPEN DEBT (codex resolution_lifetime -- explicitly transitional, removed as consumer
+# migrations land; no parallel legacy backend at acceptance): materialize the resolved
+# values under their BARE names for consumers not yet migrated to read lme_resolved.*
+# (tailscale_serve_* in podman/tasks/main.yml + tailscale_*.yml; offline_mode in the
+# offline load tasks; install_llm / install_elastic_services in container_setup / main.yml
+# + site.yml:179/188; lme_consumer_profile). The loader NEVER reads a bare name as input
+# (it reads lme_inputs), so this cannot self-capture. Optional fields absent from
+# lme_resolved are NOT bridged (their bare-name readers outside this file still carry a fallback filter:
+# coupling CPL-SR922D-BARE-READERS, not changed here).
+#
+# codex-1045 decision B (C1-OBSERVATION-FIELD-REPEATED-LOAD-STALE-BRIDGE): fields DECLARED
+# observation_only are EXCLUDED from this compatibility bridge, selected GENERICALLY by the
+# property (lme_observation_only_keys). Their canonical value lives ONLY in lme_resolved.* --
+# no bare alias is manufactured -- so a repeated load without the observation leaves no stale
+# alias, and no bridge_absent sentinel is needed. Operator/inventory/profile injection of such
+# a bare name is still rejected by the observation-only channel guard, and an UNEXPECTED bare
+# fact in scope is still caught by the split-brain invariant below (B does NOT silence it).
+- name: Bridge resolved values to bare facts for un-migrated consumers (OPEN debt)
+  ansible.builtin.set_fact:
+    "{{ item.key }}": "{{ item.value }}"
+  loop: >-
+    {{ _lme_resolution.resolved | dict2items
+       | rejectattr('key', 'in', _lme_global_file.lme_config_registry | lme_observation_only_keys)
+       | list }}
+  loop_control:
+    label: "{{ item.key }}"
+
+# OPTIONAL-VALUE-RESET (C1-OPTIONAL-VALUE-RESET; advisor step 2). A declared OPTIONAL
+# field that resolves to ABSENT (no value at any tier) is legitimately missing from
+# lme_resolved -- the tested optional-absent contract (test_optional_absent_when_unset).
+# But its BARE compat fact, once written true under a PRIOR profile (e.g.
+# tailscale_require_vip_live under the tailscale profile), would SURVIVE a switch to a
+# profile that omits it: the bridge above only writes keys PRESENT in resolved, so it
+# cannot clear a now-absent optional -- a LIVE profile-switch stale-carry regression.
+# We reset each such absent optional's bare fact to its schema-declared `bridge_absent`
+# value. That value is the declared "unset" representation: every current bare-name reader
+# (outside this file) of a field that declares bridge_absent (today only
+# tailscale_require_vip_live, 4 readers) applies a false-valued fallback filter, so `false` is
+# byte-identical in EFFECT to absence while clearing the stale carry (CPL-SR922D-BARE-READERS).
+# C1-SR922G: readers of other optionals differ (install_llm readers fall back to true,
+# load_manifests :118 to an empty string); those fields declare no bridge_absent and are
+# never reset here. lme_resolved
+# itself stays ABSENT (contract + unit tests preserved);
+# ONLY the bare compat fact is reset. A field that declares no `bridge_absent` is left
+# untouched (this reset is opt-in per field, so it never fabricates a value the schema
+# did not sanction). Not null: such a fallback filter does not fire on None.
+# C1-SR922D: the opt-in is MEMBERSHIP of bridge_absent in the field declaration (the ansible.builtin.contains test is
+# `value in seq`), not defined-ness of an attribute.
+- name: Reset stale bare facts for declared optionals now absent (profile-switch carry)
+  ansible.builtin.set_fact:
+    "{{ item.key }}": "{{ item.value.bridge_absent }}"
+  loop: >-
+    {{ _lme_global_file.lme_config_registry.fields | dict2items
+       | selectattr('value', 'contains', 'bridge_absent')
+       | rejectattr('key', 'in', _lme_resolution.resolved.keys() | list) | list }}
+  loop_control:
+    label: "{{ item.key }}"
+
+# POST-BRIDGE SPLIT-BRAIN INVARIANT (C1-DERIVED-EFFECTIVE-INPUTS-PIN closure). Inert-ing the
+# _lme_eff_inputs intermediate above defeats the exact `-e _lme_eff_inputs={}` counterexample,
+# but a pin can move ONE HOP UP (`-e _lme_operator_selections={}`, or a future derived
+# intermediate) and again DISCARD an admitted selection with an internally-consistent
+# read-back. This is the un-forgeable backstop: for EVERY registry field whose bare compat
+# fact is in scope, the bare value MUST agree (by DECLARED TYPE, so a valid equivalent
+# representation like the string 'false' is not a disagreement) with the canonical
+# lme_resolved value. A bare-name fact is a set_fact (Ansible var precedence 19), overwritten
+# by role/include params and extra-vars (20-22) -- so a bare != resolved key can ONLY come
+# from a higher-precedence operator input the resolution dropped, exactly the split-brain
+# (inventory/play/role-default values <=15 are overwritten by the bridge and can never
+# false-trip it). Runs on the supported path BEFORE any mutation (site.yml / elasticsearch.yml
+# barriers include this file), so a discarded declaration fails closed pre-mutation. The
+# registry-key subset of `vars` is built INLINE (no pinnable task var). NB an entrypoint that
+# passes a registry field as a BARE include_role var whose value the resolver then ignores
+# would trip this (correct behaviour: an entrypoint declares selections via lme_inputs, never
+# a bare role var); upgrade_lme's two resolve includes both build identical lme_inputs, so
+# they pass.
+- name: Read-back guard -- no split-brain between the bare compat facts and lme_resolved (untamperable)
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_lme_global_file.lme_config_registry
+         | lme_split_brain_keys(
+             dict((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list)
+                  | zip((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list)
+                        | map('extract', vars) | list)),
+             lme_resolved)) | length == 0
+    fail_msg: >-
+      a bare config fact in scope disagrees with the canonical lme_resolved value for registry
+      field(s) {{ _lme_global_file.lme_config_registry | lme_split_brain_keys(dict((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list) | zip((_lme_global_file.lme_config_registry.fields.keys() | list | select('in', vars) | list) | map('extract', vars) | list)), lme_resolved) }}
+      -- a higher-precedence operator input (or a pinned derived intermediate) was admitted
+      into scope but DISCARDED from resolution (split-brain). The canonical artifact must
+      faithfully reflect every admitted declaration (C1-DERIVED-EFFECTIVE-INPUTS-PIN).
+    quiet: true
+
+
+# --- lme_global: the ONE composition (moved here from load_manifests.yml; SEED-06) ------------------
+# lme_global = global.yml lme_global | active profile lme_global | lme_global_override (operator LAST),
+# recursive. It lives in the shared resolve entrypoint so every caller of `tasks_from: resolve` (the
+# remote-harness route included) consumes the SAME composition; load_manifests.yml includes this file and
+# composes nothing itself. The remote-harness section above is projected from the same inline expression.
+- name: Compose lme_global (global | profile | operator override LAST) -- the one composition
+  ansible.builtin.set_fact:
+    lme_global: >-
+      {{ (_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True) }}
+    # Audit only (override provenance; NOT revision-bound, codex-232517): the leaf paths the operator set.
+    lme_remote_harness_overridden_paths: >-
+      {{ (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_remote_harness_overridden_paths((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, documents=_lme_rh_documents, admission=_lme_rh_admission)) }}
+
+- name: Read-back guard -- lme_global and the remote-harness audit are the recomputed values (untamperable)
+  ansible.builtin.assert:
+    that:
+      - lme_global == ((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True))
+      - lme_remote_harness_overridden_paths == (((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)) | combine((lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), recursive=True)) | lme_remote_harness_overridden_paths((_lme_global_file.lme_global | combine((_lme_profile_file.profile_overlay.lme_global | combine(_lme_profile_composition.overlay.lme_global, recursive=True)), recursive=True)), (lookup('ansible.builtin.vars', _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var) if (_lme_global_file.lme_config_registry.caller_inputs.lme_global_override.var in vars) else _lme_global_file.lme_config_registry.caller_inputs.lme_global_override.absent), _lme_global_file.lme_config_registry.remote_harness_schema, documents=_lme_rh_documents, admission=_lme_rh_admission))
+    fail_msg: >-
+      lme_global or lme_remote_harness_overridden_paths was pre-supplied / -e-pinned and disagrees with its
+      freshly recomputed value; the composition is a resolver output (SEED-06, C1-REVISION-INTERMEDIATE-EXTRAVAR-PIN).
+    quiet: true

@@ -1,0 +1,185 @@
+---
+# testing/e2e/transfer/controls/scope_case.yml -- the `scope` control kind (B-PER-HOST-POLICY-BINDING). SYNTHETIC:
+# it feeds the declared schema-3 projections of CASES.yml harness.scope_fixture (data, not a resolver), patched per
+# case, through B's REAL task files: scope_expect.yml (controller), scope_admit.yml (target), for contract cases
+# record_contract.yml + check_recorded_contract.yml, for endpoint cases endpoint_bind.yml, and for receipt cases
+# record_transfer.yml. No resolver, no route include, no transport, no target state:
+# every host is a local connection and nothing outside the case directory is written.
+# Extra-vars (controls/run_one_case.yml): transfer_dir, sc_fixture, sc (the case's `scope` data), sc_out (case dir).
+#   sc.target                 the transfer target (a fixture target, or an undeclared name for a non-member)
+#   sc.controller_patch       recursive patch of the controller projection
+#   sc.controller_drop        top-level keys removed from the controller projection
+#   sc.controller_entry_drop  keys removed from the controller's scopes.targets[sc.target] entry
+#   sc.target_patch           recursive patch of the target's OWN projection
+#   sc.target_drop            top-level keys removed from the target's own projection
+#   sc.record_patch           when defined: the contract is first RECORDED under the controller projection patched
+#                             by it, then re-checked under the current one (check_recorded_contract.yml)
+#   sc.contract_endpoint      when defined: {address, port, proxy} as resolve_contract.yml resolves them, plus the
+#                             target's owner inventory value (`owner`, omitted = absent), bound by endpoint_bind.yml
+#                             against binding.deployment.endpoints[sc.target] under sc_fixture.bootstrap's rules
+#   sc.bootstrap_patch        recursive patch of those bootstrap rules (tr_bs), e.g. a hostile inventory.owner
+#   sc.receipt_patch          when defined: the target's edition record (composed as target_place.yml does, from the
+#                             admitted tr_scope) patched by it is consumed by record_transfer.yml (the receipt)
+- name: scope-case controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  vars: &sc_vars
+    tr_dir: "{{ transfer_dir }}"
+    tr: "{{ (lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer }}"
+    lme_transfer_target: "{{ sc.target }}"
+    # r5f: endpoint_bind.yml reads the contract peer (tasks/bind_controller.yml sets it the same way for the transfer target)
+    tr_peer: {alias: "{{ sc.target }}", kind: "{{ tr.contract.prelude_peer_kind }}"}
+    lme_transfer_remote_dir: /srv/lme
+    tr_contract: {alias: "{{ sc.target }}", address: 192.0.2.10, user: root, auth_mode: explicit_key, key_source: fixture,
+                  proxy: '', profile: fixture}
+    tr_ssh_argv: [ssh, -o, BatchMode=yes, "root@{{ sc.target }}"]
+    tr_out:
+      contract_json: "{{ sc_out }}/gate.sc.contract.json"
+      ssh_argv: "{{ sc_out }}/gate.sc.ssh-argv"
+      machine_id: "{{ sc_out }}/gate.sc.machine-id"
+      transfer_receipt: "{{ sc_out }}/gate.sc.transfer.json"
+    tr_bs: "{{ sc_fixture.bootstrap | combine(sc.bootstrap_patch | default({}), recursive=true) }}"
+    tr_ctl_token: "{{ 'e' * 64 }}"
+    rh_engine_revision: fixture-engine
+    tr_edition:
+      op: 20260924T000000Z-00000000
+      kind: commit
+      history: fixture
+      commit: 0000000000000000000000000000000000000000
+      member_count: 1
+      archive_sha256: "{{ 'f' * 64 }}"
+      sha256_text: "{{ ('0' * 64) ~ '  fixture' }}"
+  tasks:
+    - name: Record the contract under an earlier resolution (contract cases only)
+      when: sc.record_patch is defined
+      block:
+        - name: The recording-time controller projection
+          ansible.builtin.set_fact:
+            lme_resolved: {remote_harness: "{{ sc_fixture.controller | combine(sc.record_patch, recursive=true) }}"}
+
+        - name: Expect the target's scope at recording time
+          ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/scope_expect.yml"
+          vars:
+            tr_scope_target: "{{ sc.target }}"
+
+        - name: The observed endpoint identity (synthetic)
+          ansible.builtin.set_fact:
+            tr_target: {identity: "{{ sc_fixture.identity }}"}
+          delegate_to: "{{ sc.target }}"
+          delegate_facts: true
+
+        - name: Record the contract
+          ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/record_contract.yml"
+
+    - name: The current controller projection (patched, keys dropped)
+      vars:
+        _c0: >-
+          {{ sc_fixture.controller | combine(sc.controller_patch | default({}), recursive=true)
+             | dict2items | rejectattr('key', 'in', sc.controller_drop | default([])) | items2dict }}
+      ansible.builtin.set_fact:
+        lme_resolved:
+          remote_harness: >-
+            {{ _c0 if (sc.controller_entry_drop | default([]) | length == 0)
+               else _c0 | combine({'scopes': _c0.scopes | combine({'targets': _c0.scopes.targets | combine({sc.target:
+                    _c0.scopes.targets[sc.target] | dict2items | rejectattr('key', 'in', sc.controller_entry_drop) | items2dict})})}) }}
+
+    - name: Expect the target's controller-resolved scope
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/scope_expect.yml"
+      vars:
+        tr_scope_target: "{{ sc.target }}"
+
+    - name: Endpoint cases only -- B's contract endpoint against the scope's bound endpoint
+      when: sc.contract_endpoint is defined
+      block:
+        - name: The contract fields the endpoint derives from (as resolve_contract.yml resolves them)
+          ansible.builtin.set_fact:
+            tr_contract: "{{ tr_contract | combine(sc.contract_endpoint | dict2items | rejectattr('key', 'equalto', 'owner') | items2dict) }}"
+
+        - name: The target's owner inventory variable (only when the case declares one; absent otherwise)
+          ansible.builtin.set_fact:
+            "{{ sc_fixture.bootstrap.inventory.owner_var }}": "{{ sc.contract_endpoint.owner }}"
+          delegate_to: "{{ sc.target }}"
+          delegate_facts: true
+          when: "'owner' in sc.contract_endpoint"
+
+        - name: Bind the endpoint
+          ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/endpoint_bind.yml"
+
+        - name: Report
+          ansible.builtin.debug:
+            msg: "ENDPOINT-OK {{ tr_endpoint | join('|') }}"
+
+    - name: Re-check the recorded contract (contract cases only)
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/check_recorded_contract.yml"
+      when: sc.record_patch is defined
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "SCOPE-EXPECT-OK {{ tr_scope_expect.target.id }} {{ tr_scope_expect.target.scope_sha256 }}"
+
+- name: scope-case target
+  hosts: "{{ sc.target }}"
+  gather_facts: false
+  any_errors_fatal: true
+  vars: *sc_vars
+  tasks:
+    - name: This target's OWN projection (patched, keys dropped) and its policy revision
+      vars:
+        _t0: >-
+          {{ sc_fixture.targets[inventory_hostname] | combine(sc.target_patch | default({}), recursive=true)
+             | dict2items | rejectattr('key', 'in', sc.target_drop | default([])) | items2dict }}
+      ansible.builtin.set_fact:
+        lme_resolved: {remote_harness: "{{ _t0 }}"}
+        rh_config_revision: "{{ _t0.policy_sha256 | default('') }}"
+
+    - name: Admit only the controller-resolved policy of THIS target's scope
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/scope_admit.yml"
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "SCOPE-ADMIT-OK {{ tr_scope.id }} {{ tr_scope.scope_sha256 }} {{ tr_scope.policy_sha256 }}"
+
+- name: scope-case receipt
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  vars: *sc_vars
+  tasks:
+    - name: Receipt cases only
+      when: sc.receipt_patch is defined
+      block:
+        - name: The controller's own policy revision
+          ansible.builtin.set_fact:
+            rh_config_revision: "{{ sc_fixture.controller.policy_sha256 }}"
+
+        - name: The target's placement result -- its edition record as target_place.yml composes it, patched by the case
+          ansible.builtin.set_fact:
+            rh_engine_revision: fixture-engine
+            tr_placed:
+              identity: "{{ sc_fixture.identity }}"
+              adopted: false
+              pruned: 0
+              abandoned: []
+              reaped: []
+              edition: >-
+                {{ {'schema': tr.edition.record_schema, 'op': tr_edition.op, 'commit': tr_edition.commit,
+                    'edition_kind': tr_edition.kind, 'decl_sha256': 'fixture',
+                    'policy_sha256': hostvars[sc.target].rh_config_revision,
+                    'scope_id': hostvars[sc.target].tr_scope.id,
+                    'scope_sha256': hostvars[sc.target].tr_scope.scope_sha256,
+                    'scopes_sha256': hostvars[sc.target].tr_scope.scopes_sha256,
+                    'owned_sha256_digest': tr_edition.sha256_text | hash('sha256'),
+                    'member_count': tr_edition.member_count, 'completed_by': tr_ctl_token}
+                   | combine(sc.receipt_patch, recursive=true) }}
+          delegate_to: "{{ sc.target }}"
+          delegate_facts: true
+
+        - name: Write the transfer receipt (B's real consumer of the target's record)
+          ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/record_transfer.yml"
+
+        - name: Report
+          ansible.builtin.debug:
+            msg: "RECEIPT-OK {{ hostvars[sc.target].tr_placed.edition.scope_id }} {{ hostvars[sc.target].tr_placed.edition.scope_sha256 }}"

@@ -1,0 +1,503 @@
+---
+# Host-facing Tailscale ingress (OPT-IN, additive) — the "IPC/SVCS" layer.
+#
+# This task set is included from main.yml ONLY when `tailscale_serve_ingress` is
+# true (enable at deploy time with `-e tailscale_serve_ingress=true`, or via the
+# tailscale profile). It is orthogonal to the elastic-services pack — it is NOT
+# gated on install_elastic_services and runs whenever the ingress var is on, after
+# the tailscale daemon install (tailscale_install.yml). It is disabled by default
+# and changes nothing about the internal service mesh. (The daemon install
+# guarantees tailscaled is up; the status check below only reports/fails.)
+#
+# EVERYTHING IS DERIVED FROM THE MANIFESTS — no service name or port is hardcoded
+# here (mirrors the VIP leg in tailscale_service.yml). A host-facing published port
+# is fronted on the tailnet IFF its `publish_ports` entry carries the opt-in marker
+# `tailnet_ingress: <mode>`, AND the owning service is enabled in this install
+# (enabled_when | is_enabled(lme_enable_flags)). The marker VALUE is the serve mode:
+#   * `tailnet_ingress: https`   -> HTTPS service; tailscale TERMINATES TLS with the
+#     node's ts.net LE cert (auto-obtained/renewed) and re-encrypts to the local
+#     self-signed backend (https+insecure://127.0.0.1:<port>).
+#   * `tailnet_ingress: raw-tcp` -> raw TCP passthrough (`--tcp`), NOT TLS-terminated:
+#     the backend terminates TLS itself.
+# The set the base manifests mark TODAY is apm-server :8200 (https), litellm :4000
+# (https) and logstash beats :5044 (raw-tcp) — but that is DATA in the manifests, not
+# a literal list in this file; add/remove a marker to change what is fronted.
+#
+# WHY THIS EXISTS — the internal-CA vs ts.net split:
+#   * The internal container<->container mesh uses the Elasticsearch
+#     `elasticsearch-certutil` CA with container-alias SANs (lme-elasticsearch,
+#     lme-logstash, lme-litellm, ...). That CA is CORRECT and REQUIRED for the
+#     mesh and is left completely untouched here.
+#   * A `tailscale cert` / `tailscale serve` LE leaf has SAN = this node's
+#     `*.ts.net` MagicDNS name ONLY. It can therefore serve host-facing
+#     published ports but CANNOT stand in for the internal alias SANs.
+#
+# So we front only the host-facing, loopback-bound published ports the manifests
+# mark, and only the ones whose service is enabled:
+#   * An HTTPS-marked port (e.g. apm-server :8200, litellm :4000): tailscale
+#     TERMINATES TLS with the node's ts.net LE cert (auto-obtained, auto-renewed)
+#     and re-encrypts to the local self-signed backend (https+insecure://127.0.0.1:<port>).
+#   * A raw-tcp-marked port (e.g. logstash beats :5044) is a raw TCP passthrough
+#     (`--tcp`), NOT TLS-terminated: the backend terminates the TLS itself.
+#     CONSEQUENCE for operators wiring external beats: the beat receives logstash's
+#     INTERNAL-CA leaf (SAN: lme-logstash, logstash, localhost, 127.0.0.1 — NO ts.net
+#     SAN), so the beat must trust the LME CA and must NOT do ts.net hostname
+#     verification for the 5044 endpoint (e.g. ssl.verification_mode: certificate).
+#     Terminating at tailscale here would hand plaintext to a TLS listener, so
+#     `--tcp` (passthrough) is used deliberately instead of `--tls-terminated-tcp`.
+#
+# Idempotent: each `tailscale serve` line is added only when its exact
+# frontend->backend signature is not already among the root-only routes parsed
+# from `tailscale serve status --json` (see the exact-signature rationale below);
+# routes this leg previously owned but no longer desires are cleared first (drift
+# repair). A whole-config substring of `tailscale serve status` is deliberately
+# NOT the idempotency key -- it cannot bind a frontend to its backend.
+
+- name: Read current tailscale node status
+  command: tailscale status --json
+  register: ts_status
+  changed_when: false
+  failed_when: false
+  become: yes
+
+# `tailscale status --json` returns rc 0 whenever tailscaled is reachable --
+# INCLUDING when logged out (BackendState "NeedsLogin"/"Stopped"), so rc alone
+# does NOT prove the node is on the tailnet. Also require BackendState ==
+# "Running" (mirrors ts_backend_running in tailscale_install.yml and the egress
+# guard). Without it, a re-deploy after auth-key expiry passes this guard, and
+# because the persisted ServeConfig still matches every desired exact signature
+# NO `tailscale serve` command runs to surface the logout -- the leg would go
+# GREEN and rewrite the ownership ledger on a node that is not actually serving.
+- name: Fail clearly if tailscale is unavailable or the node is not logged in / Running
+  fail:
+    msg: >-
+      tailscale_serve_ingress is enabled but this node is not Running on the
+      tailnet (rc={{ ts_status.rc }}). Ensure tailscaled is running and this node
+      is logged in (BackendState "Running") with MagicDNS + HTTPS certs enabled.
+  when: >-
+    ts_status.rc != 0
+    or (('"BackendState": "Running"' not in (ts_status.stdout | default('')))
+        and ('"BackendState":"Running"' not in (ts_status.stdout | default(''))))
+
+# Discover the node's MagicDNS name from status rather than hardcoding it; the
+# trailing dot from the FQDN is stripped for display.
+- name: Determine this node's MagicDNS (ts.net) name
+  set_fact:
+    ts_magicdns_name: "{{ (ts_status.stdout | from_json).Self.DNSName | regex_replace('\\.$', '') }}"
+
+- name: Read current tailscale serve config (for idempotency)
+  ansible.builtin.command: tailscale serve status
+  register: ts_serve_status
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Read full tailscale serve config (for frontend/backend drift detection)
+  ansible.builtin.command: tailscale serve status --json
+  register: ts_serve_cfg
+  changed_when: false
+  failed_when: false
+  become: yes
+
+# --- Derive the host ingress targets purely from the manifests --------------------
+# One (name, frontend, backend, mode) target per `tailnet_ingress`-marked
+# publish_ports entry on an ENABLED service. subelements(..., skip_missing=True) walks service x
+# publish_ports and SKIPS services with no publish_ports key (so they never raise).
+# The marker lives on the PORT entry (unlike the VIP leg's top-level
+# `tailnet_service`). The backend is the entry's host port; optional tailnet_port
+# selects a distinct frontend and otherwise defaults to that backend. Initialise
+# first so the fact always exists.
+- name: Initialise the derived host ingress target list
+  ansible.builtin.set_fact:
+    ts_ingress_targets: []
+
+- name: Initialise enabled wildcard TCP publication ports
+  ansible.builtin.set_fact:
+    ts_wildcard_tcp_fronts: []
+
+- name: Derive enabled wildcard TCP publication ports across all services
+  ansible.builtin.set_fact:
+    ts_wildcard_tcp_fronts: "{{ ts_wildcard_tcp_fronts + [item.1.host] }}"
+  loop: "{{ lme_services | dict2items | subelements('value.publish_ports', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.value.id }} (:{{ item.1.host | default('?') }})"
+  when:
+    - item.1.bind | default('') in ['0.0.0.0', '::']
+    - item.1.protocol | default('tcp') != 'udp'
+    - item.0.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - (lme_host_services | default([]) | length == 0) or (item.0.key in (lme_host_services | default([])))
+
+- name: Assert tailnet ingress markers use loopback backends
+  ansible.builtin.assert:
+    that:
+      - item.1.bind is defined
+      - item.1.bind == '127.0.0.1'
+    fail_msg: >-
+      Service '{{ item.0.value.id }}' marks host port {{ item.1.host | default('missing') }}
+      for tailnet ingress but its backend bind is '{{ item.1.bind | default('missing') }}'.
+      Tailnet ingress backends must bind only to 127.0.0.1.
+    quiet: true
+  loop: "{{ lme_services | dict2items | subelements('value.publish_ports', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.value.id }} (:{{ item.1.host | default('?') }})"
+  when:
+    - item.1.tailnet_ingress is defined
+    - item.0.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    - (lme_host_services | default([]) | length == 0) or (item.0.key in (lme_host_services | default([])))
+
+- name: Derive one host ingress target per tailnet_ingress-marked publish_port (enabled services only)
+  ansible.builtin.set_fact:
+    ts_ingress_targets: >-
+      {{ ts_ingress_targets + [ {
+           'name':         item.0.value.id,
+           'front_port':   (item.1.tailnet_port | default(item.1.host)),
+           'backend_port': item.1.host,
+           'mode':         item.1.tailnet_ingress,
+         } ] }}
+  loop: "{{ lme_services | dict2items | subelements('value.publish_ports', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.value.id }} (:{{ item.1.host | default('?') }})"
+  when:
+    # OPT-IN gate: the port entry is marked for host ingress ...
+    - item.1.tailnet_ingress is defined
+    # ... AND its service is enabled in this install's flag set (mirrors the VIP leg;
+    # the old hardcoded list fronted ports regardless of the enabled roster -- B1).
+    - item.0.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    # GAP-3 host-scope: front on THIS host only when the owning service is in the roster
+    # (empty/undefined roster -> full host, backward-compat). subelements loop -> item.0.key.
+    - (lme_host_services | default([]) | length == 0) or (item.0.key in (lme_host_services | default([])))
+
+# Fail-closed on a malformed marker. A hardcoded list could not carry a typo; a
+# per-entry marker can (`tailnet_ingress: htps`), and such a value matches NEITHER
+# serve selector below -> the port would be SILENTLY never served (green rc=0).
+# Reject it loudly instead (the same fail-closed stance is_enabled takes on a
+# misspelled enable flag). Only `https` and `raw-tcp` are valid ingress modes.
+- name: Assert every derived ingress target declares a valid serve mode
+  ansible.builtin.assert:
+    that:
+      - item.mode in ['https', 'raw-tcp']
+    fail_msg: >-
+      Service '{{ item.name }}' publishes tailnet port {{ item.front_port }} with an invalid
+      tailnet_ingress mode '{{ item.mode }}'. Valid modes: https, raw-tcp. Fix the
+      marker on that publish_ports entry in the service manifest.
+    quiet: true
+  loop: "{{ ts_ingress_targets }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.front_port }} -> 127.0.0.1:{{ item.backend_port }} {{ item.mode }})"
+
+- name: Assert derived ingress frontend and backend ports are valid and unique
+  ansible.builtin.assert:
+    that:
+      - (item.front_port | type_debug) == 'int'
+      - item.front_port >= 1
+      - item.front_port <= 65535
+      - (item.backend_port | type_debug) == 'int'
+      - item.backend_port >= 1
+      - item.backend_port <= 65535
+      - (ts_ingress_targets | selectattr('front_port', 'equalto', item.front_port) | list | length) == 1
+      - (ts_ingress_targets | selectattr('name', 'equalto', item.name) | list | length) == 1
+      - item.front_port not in (ts_wildcard_tcp_fronts | default([]))
+    fail_msg: >-
+      Tailnet ingress '{{ item.name }}' has invalid or conflicting port metadata:
+      frontend={{ item.front_port | default('missing') }},
+      backend={{ item.backend_port | default('missing') }}. Ports must be integers
+      in 1..65535, service names and node-scoped tailnet frontends must be unique, and no
+      frontend may overlap an enabled wildcard TCP publication.
+    quiet: true
+  loop: "{{ ts_ingress_targets }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.front_port | default('?') }} -> 127.0.0.1:{{ item.backend_port | default('?') }})"
+
+# Parse the daemon's persisted route graph.  Whole-config substring tests cannot
+# associate a frontend with its backend and leave an old frontend active when a
+# route moves.  Exact signatures make that association explicit while leaving
+# unrelated Serve routes untouched.
+- name: Require a readable full tailscale serve configuration
+  ansible.builtin.assert:
+    that:
+      - ts_serve_cfg.rc | default(1) == 0
+      - ts_serve_cfg.stdout | default('') | length > 0
+    fail_msg: >-
+      `tailscale serve status --json` failed, so host ingress ownership and
+      drift cannot be reconciled safely.
+    quiet: true
+
+- name: Parse full tailscale serve configuration
+  ansible.builtin.set_fact:
+    ts_serve_config_object: >-
+      {{ {} if (ts_serve_cfg.stdout | from_json) is none
+         else (ts_serve_cfg.stdout | from_json) }}
+    ts_ingress_current_routes: []
+    ts_ingress_desired_signatures: []
+    ts_ingress_desired_fronts: []
+    ts_ingress_desired_ownership: {}
+    ts_ingress_exact_current_signatures: []
+
+- name: Derive exact desired host ingress signatures
+  ansible.builtin.set_fact:
+    ts_ingress_desired_signatures: >-
+      {{ ts_ingress_desired_signatures
+         + [item.mode ~ '|' ~ item.front_port ~ '|'
+            ~ ((item.mode == 'https')
+               | ternary('https+insecure://127.0.0.1:', 'tcp://127.0.0.1:'))
+            ~ item.backend_port] }}
+    ts_ingress_desired_fronts: "{{ ts_ingress_desired_fronts + [item.front_port] }}"
+    ts_ingress_desired_ownership: >-
+      {{ ts_ingress_desired_ownership | combine({item.name: {
+           'front_port': item.front_port,
+           'mode': item.mode,
+           'target': ((item.mode == 'https')
+                      | ternary('https+insecure://127.0.0.1:', 'tcp://127.0.0.1:'))
+                     ~ item.backend_port,
+         }}) }}
+  loop: "{{ ts_ingress_targets }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.front_port }} -> 127.0.0.1:{{ item.backend_port }})"
+
+- name: Inspect the protected host ingress ownership ledger
+  ansible.builtin.stat:
+    path: /var/lib/lme/tailscale-ingress-owned.json
+  register: ts_ingress_ownership_stat
+  become: true
+
+- name: Require protected ownership ledger permissions
+  ansible.builtin.assert:
+    that:
+      - not ts_ingress_ownership_stat.stat.exists or ts_ingress_ownership_stat.stat.isreg
+      - not ts_ingress_ownership_stat.stat.exists or not ts_ingress_ownership_stat.stat.islnk
+      - not ts_ingress_ownership_stat.stat.exists or ts_ingress_ownership_stat.stat.pw_name == 'root'
+      - not ts_ingress_ownership_stat.stat.exists or ts_ingress_ownership_stat.stat.mode == '0600'
+    fail_msg: The Tailscale ingress ownership ledger must be a root-owned 0600 regular file.
+    quiet: true
+
+- name: Read the host ingress ownership ledger
+  ansible.builtin.slurp:
+    src: /var/lib/lme/tailscale-ingress-owned.json
+  register: ts_ingress_ownership_raw
+  become: true
+  when: ts_ingress_ownership_stat.stat.exists
+
+- name: Parse the host ingress ownership ledger
+  ansible.builtin.set_fact:
+    ts_ingress_ownership: >-
+      {{ (ts_ingress_ownership_raw.content | b64decode | from_json)
+         if not (ts_ingress_ownership_raw.skipped | default(false)) else {} }}
+    ts_ingress_owned_signatures: []
+
+- name: Validate and derive owned host ingress signatures
+  ansible.builtin.set_fact:
+    ts_ingress_owned_signatures: >-
+      {{ ts_ingress_owned_signatures
+         + [item.value.mode ~ '|' ~ item.value.front_port ~ '|' ~ item.value.target] }}
+  loop: "{{ ts_ingress_ownership | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  failed_when: >-
+    item.value is not mapping
+    or (item.value.keys() | list | sort) != ['front_port', 'mode', 'target']
+    or (item.value.front_port | type_debug) != 'int'
+    or item.value.front_port < 1 or item.value.front_port > 65535
+    or item.value.mode not in ['https', 'raw-tcp']
+    or (item.value.target | type_debug) != 'str'
+
+- name: Derive persisted HTTPS host ingress listeners and all handler occupancy
+  ansible.builtin.set_fact:
+    ts_ingress_current_routes: >-
+      {{ ts_ingress_current_routes + [{
+           'front_port': (item.key | regex_replace('^.*:', '') | int),
+           'mode': 'https',
+           'target': item.value.Handlers.get('/', {}).get('Proxy', ''),
+           'signature': ('https|' ~ (item.key | regex_replace('^.*:', '') | int)
+                         ~ '|' ~ item.value.Handlers.get('/', {}).get('Proxy', '')),
+           'root_only': ((item.value.Handlers.keys() | list) == ['/']
+                         and (item.value.Handlers.get('/', {}).get('Proxy', '') | length > 0)
+                         and (ts_serve_config_object.TCP
+                              | default({})).get(item.key | regex_replace('^.*:', ''), {}).get('HTTPS', false)),
+         }] }}
+  loop: "{{ (ts_serve_config_object.Web | default({})) | dict2items }}"
+  loop_control:
+    label: "https {{ item.key }}"
+  when: item.value.Handlers is defined
+
+- name: Derive persisted raw TCP routes and orphaned TCP listener occupancy
+  ansible.builtin.set_fact:
+    ts_ingress_current_routes: >-
+      {{ ts_ingress_current_routes + [{
+           'front_port': (item.key | int),
+           'mode': ('raw-tcp' if item.value.TCPForward is defined else 'https'),
+           'target': (('tcp://' ~ item.value.TCPForward)
+                      if item.value.TCPForward is defined else ''),
+           'signature': ((('raw-tcp|' ~ (item.key | int) ~ '|tcp://' ~ item.value.TCPForward)
+                          if item.value.TCPForward is defined
+                          else ('https|' ~ (item.key | int) ~ '|'))),
+           'root_only': (item.value.TCPForward is defined
+                         and not (item.value.TerminateTLS | default(''))
+                         and (item.value.ProxyProtocol | default(0) | int) == 0),
+         }] }}
+  loop: "{{ (ts_serve_config_object.TCP | default({})) | dict2items }}"
+  loop_control:
+    label: "tcp :{{ item.key }}"
+  when:
+    - item.value.TCPForward is defined or item.value.HTTPS | default(false) or item.value.HTTP | default(false)
+    - item.value.TCPForward is defined or not (ts_ingress_current_routes | selectattr('front_port', 'equalto', item.key | int) | list)
+
+- name: Derive exact current host ingress signatures
+  ansible.builtin.set_fact:
+    ts_ingress_exact_current_signatures: >-
+      {{ ts_ingress_exact_current_signatures + [item.signature] }}
+  loop: "{{ ts_ingress_current_routes }}"
+  loop_control:
+    label: "{{ item.signature }}"
+  when: item.root_only
+
+- name: Refuse to replace a cross-owner route on a desired frontend
+  ansible.builtin.assert:
+    that:
+      - >-
+        item.front_port not in ts_ingress_desired_fronts
+        or (item.root_only and item.signature in ts_ingress_desired_signatures)
+        or (item.root_only and item.signature in ts_ingress_owned_signatures)
+    fail_msg: >-
+      Tailnet frontend :{{ item.front_port }} is occupied by an unowned Serve
+      route. Refusing to clear or replace target {{ item.target }}.
+    quiet: true
+  loop: "{{ ts_ingress_current_routes }}"
+  loop_control:
+    label: "{{ item.signature }}"
+
+# A route is mutable only when its complete prior signature is in the protected
+# ownership ledger. This permits backend/frontend migration without claiming an
+# unrelated loopback route that happens to use the new target.
+- name: Detect drift in configured host ingress routes
+  ansible.builtin.command: >-
+    tailscale serve
+    {{ (item.mode == 'https') | ternary('--https=', '--tcp=') }}{{ item.front_port }}
+    off
+  register: ts_ingress_drift_clear
+  loop: "{{ ts_ingress_current_routes }}"
+  loop_control:
+    label: "stale {{ item.signature }}"
+  when:
+    - item.root_only
+    - item.signature in ts_ingress_owned_signatures
+    - item.signature not in ts_ingress_desired_signatures
+  changed_when: true
+  become: yes
+
+- name: Re-read tailscale serve status after host ingress drift repair
+  ansible.builtin.command: tailscale serve status
+  register: ts_serve_status_after_drift
+  changed_when: false
+  failed_when: false
+  become: yes
+  when: ts_ingress_drift_clear.changed | default(false)
+
+- name: Re-read full tailscale serve config after host ingress drift repair
+  ansible.builtin.command: tailscale serve status --json
+  register: ts_serve_cfg_after_drift
+  changed_when: false
+  failed_when: false
+  become: yes
+  when: ts_ingress_drift_clear.changed | default(false)
+
+- name: Select effective tailscale serve snapshots
+  ansible.builtin.set_fact:
+    ts_serve_status_effective: >-
+      {{ ts_serve_status_after_drift
+         if not (ts_serve_status_after_drift.skipped | default(false))
+         else ts_serve_status }}
+    ts_serve_cfg_effective: >-
+      {{ ts_serve_cfg_after_drift
+         if not (ts_serve_cfg_after_drift.skipped | default(false))
+         else ts_serve_cfg }}
+
+- name: Front host-facing HTTPS ingress services with the node's ts.net cert
+  ansible.builtin.command: "tailscale serve --bg --https={{ item.front_port }} https+insecure://127.0.0.1:{{ item.backend_port }}"
+  loop: "{{ ts_ingress_targets | selectattr('mode', 'equalto', 'https') | list }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.front_port }} -> 127.0.0.1:{{ item.backend_port }})"
+  when: >-
+    ('https|' ~ item.front_port ~ '|https+insecure://127.0.0.1:' ~ item.backend_port)
+    not in ts_ingress_exact_current_signatures
+  changed_when: true
+  become: yes
+
+- name: Front host-facing raw-TLS ingress ports as a raw TCP passthrough
+  ansible.builtin.command: "tailscale serve --bg --tcp={{ item.front_port }} tcp://127.0.0.1:{{ item.backend_port }}"
+  loop: "{{ ts_ingress_targets | selectattr('mode', 'equalto', 'raw-tcp') | list }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.front_port }} -> 127.0.0.1:{{ item.backend_port }})"
+  when: >-
+    ('raw-tcp|' ~ item.front_port ~ '|tcp://127.0.0.1:' ~ item.backend_port)
+    not in ts_ingress_exact_current_signatures
+  changed_when: true
+  become: yes
+
+- name: Read back final tailscale node serve configuration
+  ansible.builtin.command: tailscale serve status --json
+  register: ts_ingress_final_cfg
+  changed_when: false
+  become: yes
+
+- name: Parse final tailscale node serve configuration
+  ansible.builtin.set_fact:
+    ts_ingress_final_object: >-
+      {{ {} if (ts_ingress_final_cfg.stdout | from_json) is none
+         else (ts_ingress_final_cfg.stdout | from_json) }}
+
+- name: Assert every managed host ingress route matches its exact persisted mapping
+  ansible.builtin.assert:
+    that:
+      - >-
+        (item.mode == 'raw-tcp'
+         and _ts_tcp.get('TCPForward', '') == '127.0.0.1:' ~ item.backend_port
+         and not _ts_tcp.get('TerminateTLS', '')
+         and (_ts_tcp.get('ProxyProtocol', 0) | int) == 0)
+        or
+        (item.mode == 'https'
+         and _ts_tcp.get('HTTPS', false)
+         and (_ts_web.get('Handlers', {}).keys() | list) == ['/']
+         and _ts_web.get('Handlers', {}).get('/', {}).get('Proxy', '')
+             == 'https+insecure://127.0.0.1:' ~ item.backend_port)
+    fail_msg: >-
+      Persisted Tailscale Serve route for '{{ item.name }}' differs from the exact
+      frontend :{{ item.front_port }} -> backend 127.0.0.1:{{ item.backend_port }}
+      {{ item.mode }} contract.
+    quiet: true
+  vars:
+    _ts_tcp: "{{ (ts_ingress_final_object.TCP | default({})).get(item.front_port | string, {}) }}"
+    _ts_web: >-
+      {{ (ts_ingress_final_object.Web | default({})).get(
+           ts_magicdns_name ~ ':' ~ (item.front_port | string), {}) }}
+  loop: "{{ ts_ingress_targets }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.front_port }})"
+
+- name: Create the protected LME state directory for ingress ownership
+  ansible.builtin.file:
+    path: /var/lib/lme
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  become: true
+
+- name: Persist exact host ingress ownership after verified readback
+  ansible.builtin.copy:
+    dest: /var/lib/lme/tailscale-ingress-owned.json
+    content: "{{ ts_ingress_desired_ownership | to_nice_json }}\n"
+    owner: root
+    group: root
+    mode: '0600'
+  become: true
+
+- name: Show the host-facing tailscale ingress endpoints
+  debug:
+    msg: >-
+      {{ item.name }} -> {{ ts_magicdns_name | default('this node') }}:{{ item.front_port }}
+      [{{ item.mode }}]
+      {{ (item.mode == 'https') | ternary('(ts.net LE cert; proxies 127.0.0.1:' ~ item.backend_port ~ ')',
+         '(raw TCP passthrough; backend terminates TLS, client sees the LME internal-CA leaf)') }}
+  loop: "{{ ts_ingress_targets }}"
+  loop_control:
+    label: "{{ item.name }} (:{{ item.front_port }} -> 127.0.0.1:{{ item.backend_port }})"

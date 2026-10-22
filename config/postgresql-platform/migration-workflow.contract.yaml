@@ -1,0 +1,192 @@
+---
+# =============================================================================
+# PostgreSQL authority MIGRATION + scoped-retirement WORKFLOW CONTRACT
+# =============================================================================
+# Owner: D_database (leaf F4). Status: DECLARATIVE CONTRACT ONLY -- it states rules
+# and NAMES seams; it implements nothing. Source: codex-manager-check-0300 + D
+# contract-deltas (initialized_storage clause).
+#
+# WHY THIS EXISTS -----------------------------------------------------------------
+# A database profile change is an AUTHORITY change: which single service is the sole
+# home of the lme_vectors + litellm databases (see the `authority` block in
+# manifests/services/lme-pgvector.yml). An ORDINARY apply that would change the
+# authority of ALREADY-INITIALIZED storage is REJECTED, fail-closed, and routed here.
+# This workflow is the ONLY sanctioned path that may move authority, and it does so
+# WITHOUT ever silently dropping, orphaning or initializing over existing data.
+# Fail-closed is mandatory at every step.
+
+schema_version: 1
+contract: postgresql-authority-migration
+status: proposed          # no executor is wired yet; this file is the spec the seams bind to
+
+# --- REJECTION GUARD (an ordinary apply must not change initialized authority) -----
+rejection_guard:
+  rule: >-
+    An ordinary apply (site.yml / role postgresql_platform / the LLM out-of-band
+    database path) that would change the authority of an ALREADY-INITIALIZED database
+    is REJECTED, fail-closed, and routed to this migration workflow. Only this
+    workflow may move authority.
+  triggers_rejection:
+    - resolved database authority (the C1-derived owner) differs from the authority
+      currently recorded for the initialized storage
+    - the derived authority resolves to `none` (e.g. install_llm flipped off) while
+      initialized storage still exists -- disabling the owner must PRESERVE and route
+      here, NEVER orphan the volume (see manifests/services/lme-pgvector.yml authority)
+    - a bootstrap identity change on initialized storage (see bootstrap_identity)
+    - the exchange target is not proven never-initialized (see never_initialized_target)
+    - initialized-storage state is UNKNOWN (see unknown_state_is_reject)
+  unknown_state_is_reject:
+    rule: >-
+      UNKNOWN initialized-storage state REJECTS. Absence of evidence is NOT an empty
+      volume and is NEVER treated as an empty default. The initialized-storage fact
+      is an OBSERVATION-tier input (a verified read-only readback), never a declared
+      default.
+  bootstrap_identity:
+    rule: >-
+      The container env POSTGRES_DB / POSTGRES_USER are initdb-ONLY: on an already
+      initialized data volume the Postgres entrypoint SILENTLY IGNORES them. A change
+      to either on initialized storage is therefore an invisible authority/identity
+      change; it is treated as a rejected change routed here, never applied.
+  never_initialized_target:
+    rule: >-
+      RECONCILED (codex-0445 D-INCOMPLETE-CONTRACT-TENSIONS: the resume distinction now lives IN the
+      rule, not as a trailing caveat after an unconditional statement). The exchange TARGET (the store
+      that will become authoritative) admits a load ONLY in one of two proven states, and REFUSES
+      otherwise (it must never initialize over, nor merge into, foreign data):
+        (a) proven NEVER-INITIALIZED -- no prior initialization of any kind; or
+        (b) proven PARTIALLY INITIALIZED BY THE SAME RECORDED MIGRATION -- an in-flight resumable run,
+            established by the checkpoint/resume contract (exact resource identities + generation +
+            verified progress + source/target lineage all matching the recorded migration).
+      A target initialized by ANYTHING ELSE (an unrelated / foreign initialization) REFUSES. UNKNOWN
+      target state REFUSES (never treated as never-initialized). A legitimate retry of the SAME
+      migration is (b) and is NOT refused; a fresh run is NEVER required to bypass retained state.
+    resume_contract:
+      status: >-
+        INCOMPLETE executable checkpoint/resume (codex-0400 D-MIGRATION-RESUME). The (a)/(b)
+        distinction above is the SETTLED rule; the executable checkpoint that PROVES (b) binds each
+        step to exact resource identities, generation, verified progress and source/target lineage.
+      proves: [same_deployment_identity, same_persistent_resource_identity, same_generation, recorded_verified_progress, source_target_lineage_match]
+      d_g_deliverable: >-
+        D+G prove interruption+retry around load / retirement / ownership-record publication WITHOUT
+        reinit, data loss, or an unowned half-cutover. Open D+G deliverable; runtime acceptance OPEN.
+
+# --- STORAGE + CREDENTIAL IDENTITY (codex-0330 d_contract_precision) ----------------
+identity:
+  rule: >-
+    Persistent storage and credentials bind to the STABLE deployment identity PLUS the
+    declared PERSISTENT-RESOURCE identity (e.g. volume_name lme_pgvectordata, the owner
+    identity) -- NOT to the changing configuration revision or evidence run.
+  provenance_only: [config_revision, evidence_run]   # recorded for lineage; NEVER a storage/credential key
+  reapply_rule: >-
+    A reapply (new config revision / new evidence run) MUST NOT IMPLICITLY REPLACE the existing
+    persistent identity, allocate new storage, or regenerate credentials for an existing stable
+    deployment.
+  reapply_rule_status: >-
+    CORRECTED (codex-0400 D-MIGRATION-IDENTITY-SCOPE; coordinator reconcile claude-reconcile-codex0345-0400).
+    The earlier wording "new storage/credentials arise ONLY through migration" OVERREACHED: authorized
+    INITIAL PROVISIONING, ADDED RESOURCES, and EXPLICIT CREDENTIAL ROTATION ALSO need supported paths.
+    Distinguish: (a) authorized creation (never-initialized target), (b) explicit rotation, (c)
+    initialized-authority MIGRATION. Reject only the IMPLICIT replacement of an existing persistent
+    identity on an ordinary reapply; keep unrelated resources unchanged. This section is INCOMPLETE until
+    the three paths are declared with their guards.
+
+# --- TARGET SELECTION vs OBSERVATION (codex-0330 d_contract_precision) --------------
+target_selection:
+  rule: >-
+    The desired target authority/profile comes from the DECLARED selection
+    (lme_database_profile + install_llm). The initialized-storage OBSERVATION only feeds
+    the GATE that decides whether an ordinary apply is rejected and routed to migration;
+    an observation MUST NEVER silently redefine the declared target.
+
+# --- C1-REGISTRY SEAM the rejection guard consumes ---------------------------------
+# The guard reads current-vs-target authority + initialized-storage state from C1.
+# These registry fields are PROPOSED: manifests/global.yml lme_config_registry has
+# NONE of them today; C1 must add them. They are NOT declared with defaults (an
+# observation-tier field must not carry a default; see global.yml registry rules).
+registry_seam:
+  location: manifests/global.yml lme_config_registry + filter_plugins/lme_manifests.py resolver
+  proposed_fields:
+    lme_database_profile:
+      note: >-
+        the authority selector; today load_manifests.yml hard-asserts it EMPTY
+        (the failure boundary that keeps POC and HA from both being authoritative).
+    database_authority_target:
+      origin: derived           # from lme_database_profile + install_llm; non-overridable
+      note: the C1-derived sole owner of lme_vectors + litellm for the selected profile.
+    database_authority_current:
+      origin: observation       # verified readback of who is authoritative now
+      note: recorded authority of the initialized storage; NEVER a default.
+    database_storage_initialized:
+      origin: observation       # verified readback; UNKNOWN -> reject
+      nullable: false
+      note: whether source/target stores are initialized; absence -> UNKNOWN -> reject.
+  consumed_by: the rejection guard and this workflow's preconditions.
+
+# --- GUARD / EXECUTOR IMPLEMENTATION SEAM (named, NOT implemented here) -------------
+implementation_seam:
+  guard_and_executor: scripts/postgresql_platform      # F1/C1-dependent
+  note: >-
+    The rejection guard and each workflow step are implemented in
+    scripts/postgresql_platform (platform.py / provision.py / rejoin.py and the
+    retirement helper described in config/postgresql-platform/README.md, section
+    "Exact backup retirement"). This contract implements NONE of them.
+  ordinary_apply_initialize_paths_the_guard_must_cover:
+    - path: "ansible/roles/podman/tasks/llama_cpp_setup.yml:200-205"
+      action: "CREATE DATABASE litellm (as superuser lme, over a local podman exec)"
+      current_idempotency: >-
+        Guards DATABASE EXISTENCE only (SELECT 1 FROM pg_database WHERE
+        datname='litellm' || CREATE DATABASE litellm). It does NOT check whether this
+        pgvector store is the derived authority, does NOT create the litellm_app role,
+        and would create litellm on whatever store lme-pgvector currently resolves to.
+        The guard must gate this path on the derived authority + initialized-storage
+        state before it runs.
+
+# --- MIGRATION WORKFLOW (declarative, ordered; each step fail-closed) ---------------
+invariants:
+  - PRESERVE existing storage AND the exact ownership records (uid/gid, volume names,
+    owner identities) unchanged across the migration.
+  - NEVER silently drop, orphan, or initialize over existing data.
+  - Any abort BEFORE cutover leaves the OLD authority fully intact and authoritative.
+  - No deletion of any archive, certificate, config, image, volume or filesystem
+    happens INSIDE this workflow (retirement stops/masks; it never deletes).
+workflow:
+  - step: freeze
+    intent: >-
+      FENCE writes on the OLD authority BEFORE any snapshot, so nothing written after
+      the snapshot can be lost. Uses the fencing/inhibitor mechanism in
+      scripts/postgresql_platform (README "Guardian contract").
+  - step: verify_source_content
+    intent: >-
+      Read-only verification of source content + lineage (row / slot / catalog
+      readback) AFTER the freeze -- the evidence baseline the exchange must reproduce.
+  - step: exchange
+    intent: >-
+      Logical or physical exchange from source into the target authority.
+      PRECONDITION: the target is proven never-initialized (never_initialized_target).
+      Load into the target, then re-verify the target reproduces the source baseline
+      BEFORE cutover.
+  - step: scoped_retirement
+    intent: >-
+      Retire ONLY the OLD authority, mirroring README "Exact backup retirement":
+      stop + mask the recorded service, write a persistent root-owned inhibitor, and
+      RETAIN all storage (data volume, lme_backups evidence, certs, config, image).
+      No deletion. Scope is strictly the named old-authority resources.
+  - step: ownership_record_update
+    intent: >-
+      LAST step: update the authority ownership record (database_authority_current)
+      to the new owner, ONLY after retirement of the old authority is proven. Until
+      this step commits, the old authority remains the recorded authority.
+
+# --- PRESERVATION TARGETS (never pruned by retirement) -----------------------------
+preserved_resources:
+  - lme_pgvectordata     # authoritative initialized storage (manifests/services/lme-pgvectordata.volume.yml)
+  - lme_backups          # pre-migration evidence store (manifests/services/lme-backups.volume.yml)
+  - "pgvector + llm-keys podman secrets (captured into lme_backups by ansible/roles/backup_lme)"
+  - all server and client certificates plus CA material
+  - the exact ownership records (uid/gid, volume names, owner identities)
+
+# --- RELATED SEAMS (for reference; NOT edited by D) --------------------------------
+related_seams:
+  client_trust_contract: manifests/services/lme-pgvector.yml (client_trust + authority)
+  e_clients: [manifests/services/lme-litellm.yml, manifests/services/lme-dashboard.yml]
+  e_client_pin: testing/tests/unit/test_application_postgresql_tls.py

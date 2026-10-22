@@ -8,9 +8,22 @@
     clone_directory: "{{ clone_dir | default(playbook_dir + '/..') }}"
     install_user: "{{ ansible_user_id }}"
     debug_mode: false  # Default debug mode to false
-    offline_mode: false  # Default offline mode to false
-    install_llm: true  # Default LLM install on; install.sh overrides to false for --offline without --llm
-    install_elastic_services: false  # Default off; install.sh sets true only for --elastic-services without --offline
+
+    # --- Enable-flag defaults live in the loader, NOT as play vars ---------------
+    # install_llm / install_elastic_services / offline_mode are DELIBERATELY not play
+    # vars. A play var outranks inventory/host_vars AND (being always-defined) is
+    # indistinguishable from an operator override, so declaring these here shadows a
+    # per-host inventory selection and lets the DEFAULT beat the manifest profile --
+    # violating the resolved precedence extra-var > inventory/host_var > profile >
+    # default. This is the same reasoning that keeps `lme_profile` out of play vars
+    # (see the note below). Their defaults now live once in the DECLARED registry
+    # (manifests/global.yml lme_config_registry.fields: install_llm default true,
+    # install_elastic_services/offline_mode default false). load_manifests.yml resolves
+    # every declared field by the registry's declared precedence (lme_resolve_config)
+    # into lme_resolved.*, derives lme_enable_flags, and bridges the resolved values
+    # under their bare names for un-migrated readers. install.sh still passes each as
+    # `-e` (extra-vars win), and the pre-podman base/nix readers all use `| default(...)`
+    # matching those defaults, so behaviour is unchanged on every install.sh path.
 
     # Storage configuration
     storage_runroot: "/run/containers/storage"
@@ -33,33 +46,33 @@
     kibana_port: 5601
     fleet_port: 8220
     
-    # Cluster mode configuration (default: false for single-node deployment)
-    # Set to true when deploying a multi-node Elasticsearch cluster
-    # Can be enabled via: -e lme_cluster_mode=true
-    lme_cluster_mode: false
-    
-    # Elasticsearch replicas: 0 for single-node (default), 1+ for cluster
+    # --- Deployment profile (manifest overlay selector) --------------------
+    # The active manifest profile is the SINGLE SOURCE of the Elasticsearch
+    # cluster settings (discovery mode, transport port 9300, JVM heap + cgroup
+    # memory caps). The playbook only SELECTS the profile here; the values live
+    # in manifests/profiles/<name>.yml, and the per-node discovery keys
+    # (node.name, discovery.seed_hosts, cluster.initial_master_nodes,
+    # network.publish_host) live in host_vars via lme_service_overrides -- see
+    # ansible/inventory/host_vars/*.yml.
+    #
+    # `lme_profile` is deliberately NOT defined as a play var here: the form
+    # `lme_profile: "{{ lme_profile | default('default') }}"` self-references
+    # (recursive-loop template error when no -e is given) AND play vars outrank
+    # host_vars/group_vars, which would shadow a per-group/per-host profile
+    # selection. It is instead supplied by install.sh as `-e lme_profile=<name>`
+    # (or an inventory group_var) and defaulted to 'default' by
+    # load_manifests.yml's set_fact.
+
+    # Cluster mode is DERIVED from the selected profile so the profile stays the
+    # single source of truth. An explicit `-e lme_cluster_mode=true` still wins
+    # (extra-vars precedence). This flag is consumed OUTSIDE the unit render --
+    # by the cleanup/fleet roles (index replica counts) and the
+    # elasticsearch.yml config template (snapshot repo path), not by the ES
+    # quadlet (that now comes from the profile + host_vars overlay).
+    lme_cluster_mode: "{{ (lme_profile | default('default')) == 'cluster' }}"
+
+    # Elasticsearch replicas: 0 for single-node (default), 1+ for cluster.
     elasticsearch_number_of_replicas: "{{ 1 if lme_cluster_mode | default(false) else 0 }}"
-    
-    # Cluster discovery settings (only used when lme_cluster_mode=true)
-    # es_discovery_type: 'single-node' for standalone, 'cluster' for multi-node
-    es_discovery_type: "{{ 'cluster' if lme_cluster_mode | default(false) else 'single-node' }}"
-    
-    # Seed hosts for cluster discovery (used when lme_cluster_mode=true)
-    # Should include all nodes that will be part of the cluster
-    es_seed_hosts: "{{ es_cluster_seed_hosts | default([]) }}"
-    
-    # Initial master nodes for cluster bootstrap (used when lme_cluster_mode=true)
-    # Only needed for first-time cluster setup
-    es_initial_masters: "{{ es_initial_master_nodes | default(['lme-elasticsearch']) }}"
-    
-    # Whether this is the initial master node (sets cluster.initial_master_nodes)
-    es_is_initial_master: "{{ lme_cluster_mode | default(false) }}"
-    
-    # Network publish host for cluster mode - the address other nodes can reach this node at
-    # For cluster mode, should be set to the external hostname/IP of this node
-    # Can be set via: -e es_publish_host=node1
-    es_publish_host: "{{ es_master_publish_host | default(omit) }}"
     
     # Kibana version
     kibana_version: "8.18.8"
@@ -68,6 +81,142 @@
     timezone_area: "Etc"  # Change to your area: America, Europe, Asia, etc.
     timezone_zone: "UTC"  # Change to your timezone: New_York, London, Tokyo, etc.
     nix_profile_symlink_path: /nix/var/nix/profiles/default
+
+    # --- Cert-publish ordering (B0/B4 single-node + cluster-master fix) ----------
+    # The four ALWAYS-ON core services (kibana, fleet-server, fleet-distribution,
+    # wazuh-manager) mount per-service host-tree cert bundles under
+    # /opt/lme/certs/<svc>. Those bundles are PUBLISHED only by the `certs` role
+    # (real host-root chown to the manifest-derived subuid; init-setup.sh runs under
+    # UserNS=auto and cannot chown to host subuids). The `certs` role never ran in
+    # site.yml before, so on single-node AND on the cluster master the bundles were
+    # never published and those four units failed to start.
+    #
+    # Fix (mirrors ansible/elasticsearch.yml): keep the podman role from
+    # auto-starting the umbrella (lme_autostart:false -> it still renders quadlets +
+    # creates secrets), run the `certs` role to generate the workspace certs AND
+    # publish the per-service bundles, THEN start lme.service ONCE and run each app
+    # role's post-install config against the now-running, cert-published stack.
+    lme_autostart: false
+
+    # --- GAP-4: cross-host secret distribution ordering (opt-in; default no-op) ---
+    # When lme_distribute_secrets is armed (operator -e, cross-host consumer install),
+    # skip LOCAL shell-secret minting in the podman role's container_setup so the
+    # shell-driver credentials (e.g. elastic) arrive via the secrets_distribution bundle
+    # instead of being minted here with DIFFERENT values. Mirrors the cluster path
+    # (elasticsearch.yml:92). Default false -> container_setup mints locally as before, so
+    # every single-host install is byte-unchanged. (Consequence when armed: setup_secrets.yml
+    # runs before the bundle, so global_secrets.elastic is empty for the ES/Kibana post-config
+    # roles. GAP-5 host-scopes those post-config roles (+ llama_cpp_setup) OFF a consumer via
+    # lme_host_rendered_services, so a consumer never runs them against the empty password;
+    # a full/producer host renders the ES stack and runs them exactly as before.)
+    lme_skip_secret_creation: "{{ lme_distribute_secrets | default(false) | bool }}"
+
+  # --- GLOBAL pre-mutation resolution + validation barrier (C1-GLOBAL-PREFLIGHT) ----
+  # The declared-config engine's fail-closed validation must run BEFORE the first host
+  # mutation. Without this, the base role (base/tasks/debian.yml package/repo work) and
+  # the podman role's sysctl/package steps run BEFORE load_manifests resolves+validates,
+  # so an invalid / undeclared / type-broken selection -- or a required-missing field --
+  # would mutate the host and only fail LATER. Running the FULL load_manifests here (not
+  # just resolve) also composes lme_global / lme_services and runs the host-scope +
+  # membership asserts, so the service/trust projections -- not only the enable flags --
+  # are validated pre-mutation (codex site_and_shared_resolution). The engine is a pure,
+  # idempotent function of its inputs, so the podman role re-running load_manifests later
+  # is safe and byte-identical. It also makes the first operator-selection capture
+  # (resolve.yml) reliably PRISTINE, before any role sets a bare fact. Tagged `always`
+  # with apply-tagged nested tasks so the barrier also fronts a tag-limited run (e.g.
+  # --tags certs) before any base/nix task. This is the FIRST leg of the C1
+  # site_and_shared_resolution caller migration; the per-play artifact-identity +
+  # repeated-invocation/changed-profile qualification is the coordinated follow-on (see
+  # the C1 sitrep). Dependency-closure NOTE (was unsupported, now accurate --
+  # C1-COMPLETE-CONFIGURATION-VALIDATION): load_manifests runs
+  # lme_validate_dependency_closure, so a dependency naming an id that resolves to NO
+  # declared manifest service (a typo) FAILS here, before mutation. A legitimate
+  # cross-host dependency (relaxed to Wants= by GAP-3 host-scoping) is separate and stays
+  # valid -- only unresolvable names fail.
+  #
+  # ALL-HOST BARRIER (C1-ALL-HOST-VALIDATION-BARRIER): per-host validation alone is NOT a
+  # global pre-mutation barrier -- with the default linear strategy a host that FAILS
+  # validation is dropped and its valid peers would still enter the mutating roles. The
+  # block sets any_errors_fatal so a validation failure on ANY targeted host aborts the
+  # play before ANY host mutates, and a run_once barrier assert confirms the COMPLETE
+  # target set validated (no host silently removed). SCOPE: this covers the single-batch
+  # linear play (install.sh runs site.yml on localhost; a multi-host `-i inventory` run is
+  # one batch). A serial/batched run validates only within a batch -- a dedicated
+  # validation-only pre-play across the full inventory is the declared residual (see the
+  # C1 sitrep); G exercises one-invalid-peer with zero mutations on every peer.
+  pre_tasks:
+    - name: GLOBAL pre-mutation resolve+validate ALL-HOST barrier (fail-closed before any mutation)
+      any_errors_fatal: true
+      block:
+        # INVOCATION-BOUND EVIDENCE (C1-SERIAL-BARRIER-STALE-FACT-ACCEPTANCE, codex-0645 HIGH).
+        # Previously the barrier marked `_lme_prevalidated: true` (an UNVERSIONED boolean) and
+        # the all-host assert read every host's flag. A `true` carried from a PRIOR play in the
+        # same process satisfied the gate without THIS play having validated, and (in a serial
+        # batch) a valid peer could reach post-barrier tasks on stale evidence before an invalid
+        # peer validated. This mirrors E's elasticsearch.yml run-token gate: refuse any
+        # pre-supplied evidence, mint a per-invocation token, and record {token, revision} so a
+        # historical/injected/-e-pinned fact cannot satisfy the gate. NB the SERIAL/BATCHED
+        # ordering half (a valid batch mutating before a later batch validates) needs a separate
+        # validation-only pre-play across the FULL inventory -- that remains a declared C1
+        # residual (owner C1; G covers batching/reentry). The token closes the stale-FACT half.
+        - name: Barrier -- refuse pre-supplied / carried validation evidence (must be minted THIS run)
+          ansible.builtin.assert:
+            that:
+              - _lme_prevalidated is not defined
+              - _lme_site_barrier_run_token is not defined
+              # lme_resolved_revision + the operator-selection capture are OUTPUT facts the
+              # barrier's own load_manifests mints; an -e-pinned/carried value would forge the
+              # evidence AND (revision) the render-time parity comparison. Reject both here.
+              - lme_resolved_revision is not defined
+              - _lme_operator_selections is not defined
+            fail_msg: >-
+              _lme_prevalidated / _lme_site_barrier_run_token / lme_resolved_revision /
+              _lme_operator_selections must NOT be pre-supplied (-e) or carried from a prior play
+              -- the barrier mints its own per-invocation evidence and resolves its own revision.
+            quiet: true
+          tags: ['always']
+        - name: Barrier -- mint this invocation's validation token (run_once; shared to every host)
+          ansible.builtin.set_fact:
+            _lme_site_barrier_run_token: "site-barrier-{{ lookup('pipe', 'date +%s%N') }}-{{ 999999999 | random }}"
+          run_once: true
+          tags: ['always']
+        - name: Resolve+validate declared config + service/trust projections (per host)
+          ansible.builtin.include_role:
+            name: podman
+            tasks_from: load_manifests
+            apply:
+              tags: ['always']
+          tags: ['always']
+        - name: Mark this host's pre-mutation validation complete (bound to token + resolved revision)
+          ansible.builtin.set_fact:
+            _lme_prevalidated:
+              token: "{{ _lme_site_barrier_run_token }}"
+              revision: "{{ lme_resolved_revision }}"
+          tags: ['always']
+        - name: ALL-HOST BARRIER -- every targeted host validated THIS invocation before any peer mutates
+          ansible.builtin.assert:
+            that:
+              # no targeted host was dropped by a validation failure ...
+              - (ansible_play_hosts_all | difference(ansible_play_hosts)) | length == 0
+              # ... and EVERY surviving targeted host recorded evidence bound to THIS run's token
+              # AND carrying a resolved revision (a host that errored has no fact -> {} -> drops).
+              - >-
+                (ansible_play_hosts | map('extract', hostvars)
+                 | map(attribute='_lme_prevalidated', default={})
+                 | selectattr('token', 'defined')
+                 | selectattr('token', 'equalto', _lme_site_barrier_run_token)
+                 | selectattr('revision', 'defined')
+                 | list | length) == (ansible_play_hosts | length)
+            fail_msg: >-
+              pre-mutation validation did not succeed on every targeted host for THIS invocation
+              (token {{ _lme_site_barrier_run_token }}; failed/removed:
+              {{ ansible_play_hosts_all | difference(ansible_play_hosts) }}). No host proceeds
+              into a mutating role until the COMPLETE target set validates this run.
+            quiet: true
+          run_once: true
+          tags: ['always']
+      tags: ['always']
+
   roles:
     - role: base
       tags: ['base', 'all']
@@ -75,16 +224,123 @@
       tags: ['base', 'system', 'all']
     - role: podman
       tags: ['system', 'all']
-    - role: elasticsearch
+    # Generate the workspace certs (starts lme-setup-certs) AND publish the
+    # per-service host-tree bundles to /opt/lme/certs/<svc> BEFORE any core service
+    # starts. Consumes the same shared role as the cluster data-node path.
+    - role: certs
+      tags: ['certs']
+
+  # Post-role stack bring-up. With lme_autostart:false the podman role did NOT start
+  # the umbrella, so this is the SOLE start point -- and it runs only after `certs`
+  # has published the per-service bundles that the core units bind-mount.
+  tasks:
+    # --- GAP-2: cross-host consumer CA trust (opt-in; default no-op) ------------
+    # Overlay the PRODUCER node's internal LME CA (ca/ca.crt) onto THIS consumer
+    # node's published cert bundles so a cross-host TLS client (e.g. the dashboard's
+    # Elasticsearch client) trusts the producer's ES leaf. Gated OFF by default
+    # (lme_distribute_ca=false) -> NO-OP for every single-host deploy. Runs HERE --
+    # after the `certs` role published this node's own bundles and BEFORE lme.service
+    # starts -- so the producer CA is in place before any consumer container connects.
+    # The 'certs' tag is intentional: a `--tags certs` run re-publishes the LOCAL CA
+    # (roles/certs) and would otherwise silently revert this overlay.
+    - name: Distribute producer CA to consumer cert bundles (GAP-2; opt-in)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: distribute_ca
+      when: lme_distribute_ca | default(false) | bool
+      tags: ['system', 'all', 'certs']
+    # --- end GAP-2 CA distribution ---------------------------------------------
+
+    # Scope cross-host secrets to this consumer's enabled services. The role
+    # rejects active consumers, distributes individual required payloads and
+    # verifies their readability before activation. It publishes the verified
+    # values needed by post-install configuration into global_secrets.
+    - name: Distribute required secrets to this consumer (GAP-4; opt-in)
+      ansible.builtin.include_role:
+        name: secrets_distribution
+      when: lme_distribute_secrets | default(false) | bool
+      tags: ['system', 'all', 'secrets']
+
+    # --- end GAP-4 cross-host secret distribution -------------------------------
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start the LME stack (sole start point; certs published by now)
+      ansible.builtin.systemd:
+        name: lme.service
+        state: started
+        enabled: true
+
+    # B4 ordering: the Elastic-services (beats) and LLM packs were DEFERRED out of
+    # the podman role (gated on lme_autostart) because their units bind-mount per-svc
+    # cert bundles that the certs role only just published. Run them now -- after the
+    # core stack is up and /opt/lme/certs/<svc> exists -- via the same podman role
+    # task files (facts from the earlier podman role run are still in scope). Order
+    # (core -> elastic -> llm -> app-config) matches the pre-restructure roles: list.
+    - name: Setup Elastic services pack (deferred; post cert-publish + start)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: elastic_services_setup
+      when:
+        - install_elastic_services | default(false) | bool
+        - not (lme_child_es_only | default(false) | bool)
       tags: ['system', 'all']
-    - role: kibana
+
+    - name: Setup llama.cpp / LLM pack (deferred; post cert-publish + start)
+      ansible.builtin.include_role:
+        name: podman
+        tasks_from: llama_cpp_setup
+      when:
+        - install_llm | default(true) | bool
+        - not (lme_child_es_only | default(false) | bool)
+        # GAP-5: only where the LLM pack actually renders on THIS host. pgvector is the
+        # tightest single marker -- llama_cpp_setup `podman exec`s lme-pgvector and starts
+        # pgvector/embeddings, so a consumer that scopes the LLM backends out of its render
+        # must not run their setup/exec. Full host (install_llm) renders pgvector -> runs.
+        - lme_llm_backing_service in (lme_host_rendered_services | default([]))
       tags: ['system', 'all']
-    - role: dashboards
+
+    # Each app role's post-install config expects a RUNNING, cert-published stack
+    # (uri/wait_for against :9200, kibana/fleet APIs, etc.). GAP-5: each runs ONLY where
+    # this host renders that role's BACKING manifest service (lme_postconfig_backing ->
+    # lme_host_rendered_services). A full / no-roster host renders every backer, so all
+    # run in the original order (single-host byte-unchanged); a consumer that renders
+    # only its UI apps runs NONE (no local ES/Kibana to configure). NB `dashboards` backs
+    # `kibana` (saved-objects import), NOT the `dashboard` app -- see lme_postconfig_backing.
+    - name: Run Elasticsearch post-install configuration
+      ansible.builtin.include_role:
+        name: elasticsearch
+      when: lme_postconfig_backing['elasticsearch'] in (lme_host_rendered_services | default([]))
       tags: ['system', 'all']
-    - role: wazuh
+
+    - name: Run Kibana post-install configuration
+      ansible.builtin.include_role:
+        name: kibana
+      when: lme_postconfig_backing['kibana'] in (lme_host_rendered_services | default([]))
       tags: ['system', 'all']
-    - role: fleet
+
+    - name: Run Dashboards post-install configuration
+      ansible.builtin.include_role:
+        name: dashboards
+      when: lme_postconfig_backing['dashboards'] in (lme_host_rendered_services | default([]))
       tags: ['system', 'all']
-    - role: cleanup
+
+    - name: Run Wazuh post-install configuration
+      ansible.builtin.include_role:
+        name: wazuh
+      when: lme_postconfig_backing['wazuh'] in (lme_host_rendered_services | default([]))
+      tags: ['system', 'all']
+
+    - name: Run Fleet post-install configuration
+      ansible.builtin.include_role:
+        name: fleet
+      when: lme_postconfig_backing['fleet'] in (lme_host_rendered_services | default([]))
+      tags: ['system', 'all']
+
+    - name: Run cleanup
+      ansible.builtin.include_role:
+        name: cleanup
       tags: ['cleanup', 'all']
     

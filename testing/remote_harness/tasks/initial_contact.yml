@@ -1,0 +1,689 @@
+---
+# testing/remote_harness/tasks/initial_contact.yml -- the ONE target INITIAL CONTACT (target_bootstrap.initial_contact;
+# codex 143844 RH-TARGET-FIRST-STAGING; codex 152001 B question; codex 155203 B-PRIVILEGED-LEG-VS-OWNER-ONLY-CONTACT).
+# Raw only: no module staged, no remote temp created, read-only. ONE engine, two DECLARED principals
+# (rh_ic_variant; the actual uid is admitted, so a variant can never be claimed by the wrong account):
+#   owner       (target_bootstrap.yml): the declared initial-contact tools (known answer + digests), the ancestry of
+#               the bundle dir, the root and the module temp (owner rule: uid 0 or the owner, group-writable only
+#               owner-owned and proven by owner_private_group -- decided on the controller by
+#               tasks/decide_private_group.yml with the CONTROLLER's admitted tool), the work-root storage, the module
+#               temp chain's custody and device. uid 0 refuses (owner_trust unchanged).
+#   privileged  (B's privileged target plays; initial_contact.privileged): the actual uid IS the declared privileged
+#               principal (uid + account of inventory.connection_profiles.<profile>); the privileged tools incl. the
+#               target SYSTEM interpreter (known answer + digests; the observation tools execute on that bootstrap
+#               observation basis, the interpreter is only READ until admitted); the CUSTODY of every selected tool
+#               (tool_custody: every entry traversed by its declared path and by every link hop reached from it, the
+#               complete physical chain of each entry's holding directory, and the resolved regular file's chain -- all
+#               uid 0, never group/other-writable, links only uid-0 owned, bounded by max_paths); the
+#               ancestry of the DEDICATED root module temp and of every caller path (rh_ic_paths) under the ROOT-ONLY
+#               rule (path_admission.ancestry.root_only: every existing component a real directory owned by uid 0, never
+#               group- or other-writable: nothing the unprivileged toolchain owner can control, no private-group
+#               exception); the module temp is never inside the owner's work root or bundle dir; storage by
+#               work_roots.admission of the ACTUAL staging filesystem (the existing module temp itself, else its
+#               root-only parent where it is created; an existing module temp on another device than its parent -- a
+#               nested mount of another filesystem, e.g. a tmpfs -- refuses; device equality does NOT detect a bind
+#               mount from the same filesystem, whose storage is then the measured one). ONLY THEN is the admitted interpreter executed, once (-I -V; PRIVILEGED
+#               INITIAL CONTACT 4), and its version admitted (codex rev8 RH-PRIVILEGED-PYTHON-BEFORE-CUSTODY,
+#               RH-PRIVILEGED-TOOL-ANCESTRY, RH-PRIVILEGED-TEMP-FILESYSTEM). Then, BEFORE any
+#               module, it SETS ansible_python_interpreter = the admitted system interpreter and ansible_remote_tmp =
+#               the declared root module temp, and refuses unless those are the EFFECTIVE values (an extra-var or include
+#               parameter outranking them refuses). The owner toolchain is never read, verified or executed here
+#               (owner_trust: privileged_verification / privileged_execution_of_toolchain forbidden). A missing
+#               required path or tool refuses naming the declared bootstrap (MAIN's root package/setup step); nothing
+#               is repaired here.
+# EVERY play that stages a module on a target includes this FIRST in that play, before any module task -- an earlier
+# play's or run's admission is not carried over. The admission covers MODULE STAGING only; a later write re-admits its
+# path at its own use boundary (owner: tasks/admit_ancestry.yml; privileged: this file again, or the caller's own
+# fresh check at the use boundary).
+# Inputs (no defaults):
+#   rh_ic_variant   'owner' (target_bootstrap.initial_contact itself) | 'privileged' (target_bootstrap.initial_contact.privileged)
+#   rh_ic_paths     privileged only: the absolute paths the play will write as root (e.g. B's REMOTE_DIR and its
+#                   staging dir); each existing component is admitted by the root-only rule (absent components are
+#                   reported, never created here)
+# Requires: a target play with gather_facts false and nothing module-backed before this include; rh (this target's
+# resolved policy, resolve_policy.yml); rh_repo_root; owner: the inventory root_var / bundle_var of this target and
+# ansible_remote_tmp derived from the target's work root (asserted by the caller's pre-contact declaration check);
+# hostvars['localhost'].rh (the controller's resolved policy, for the decision tool). Every caller includes
+# tasks/refuse_pinned_outputs.yml as the FIRST task of the host's FIRST play in the run (never again on that host): it
+# refuses a pre-supplied rh_ic_paths and every derived name of this file (registry reserved_outputs), while
+# rh_ic_variant / rh_ic_paths delivered as include params of this include stay legitimate (here and in later plays).
+# Outputs (records, not authority): _rh_tb_ic_uid, _rh_tb_ic_fst, _rh_tb_ic_avail, _rh_tb_ic_iavail, _rh_tb_ic_anc;
+# privileged also _rh_tb_ic_uname, _rh_tb_ic_fsat (where storage was measured), _rh_tb_ic_tools (tool -> {path,
+# resolved, lx, rs, bad}), _rh_tb_ic_py {path, resolved, version} (version set only after custody admission) and the
+# SET play-host facts ansible_python_interpreter and ansible_remote_tmp.
+- name: Admit the initial-contact variant and its inputs (no default; controller-side)
+  vars:
+    _ic: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact }}"
+  ansible.builtin.assert:
+    that:
+      - rh_ic_variant is defined and rh_ic_variant is string and rh_ic_variant in ['owner', 'privileged']
+      - >-
+        rh_ic_variant != 'privileged'
+        or (rh_ic_paths is defined and rh_ic_paths is sequence and rh_ic_paths is not string
+            and (rh_ic_paths | reject('string') | list | length) == 0
+            and (rh_ic_paths | reject('match', rh.controller.bootstrap.path_admission.regex) | list | length) == 0
+            and (rh_ic_paths | select('search', rh.controller.bootstrap.path_admission.forbidden_segment_regex) | list | length) == 0)
+    fail_msg: >-
+      REFUSED {{ _ic.refusal }} on {{ inventory_hostname }} (before initial contact): rh_ic_variant must be one of
+      ['owner', 'privileged'] (got '{{ rh_ic_variant | default('') }}'); the privileged variant needs rh_ic_paths, a
+      list of admitted absolute paths (got {{ rh_ic_paths | default('undefined') }}).
+    quiet: true
+
+# codex R2 INITIAL-CONTACT-UNMEASURED-BEFORE-REFUSAL (+ codex-tick392 R2-DERIVED-KINDS-EXTRAVAR,
+# R2-OWNER-FACTS-SELECTION-COMPLETENESS, R2-PRIVATE-ABSENCE-SENTINELS). An admitted os_tools.<tool>.identity override may
+# carry the registry kind `unmeasured` (sha256 UNMEASURED); INITIAL CONTACT 1-4 would then EXECUTE that tool before any
+# digest compare. INITIAL CONTACT ADMISSION 1-4 admit, controller-side, BEFORE the contact plan is derived and before
+# the first raw task, the ACTUAL selected set of this variant -- initial_contact.tools (owner) or
+# initial_contact.privileged.tools (privileged, the system interpreter included) -- plus, for the owner, the
+# owner-facts selectors the INITIAL CONTACT 3 facts macro executes (path_admission.ancestry.owner_private_group
+# .identity_provider.enumeration_tool and .acl_tool, the same references macros/controller_seed.j2
+# private_group_facts consumes), which must be members of that selection. Every selected entry must be declared in
+# os_tools with an identity whose kind is the declared initial_contact.identity_kind. Every expression is INLINE over
+# rh (reserved) and rh_ic_variant (reserved, admitted above): no task var, fact or register is read, so no extra-var
+# can stand in for a derived intermediate. Each admission asserts its declarations in order (an assert stops at the
+# first false condition) and its fail_msg reads only what the earlier admissions established -- no default, no
+# substituted container. Dormant non-selected entries (preparation / guest tools) are not judged. The known answer,
+# the reported digests, custody and the later stat re-hash are unchanged and still follow.
+# codex-tick395 R2 actual-tool coverage: every executable INITIAL CONTACT 1-4 runs is named by a DECLARED role --
+# initial_contact.roles (both variants: shell, digest, principal, stat, storage, filter), initial_contact.privileged
+# .roles (resolve) and, for the owner facts program, owner_private_group.facts_tools (principal, stat, read, filter)
+# beside enumeration_tool / acl_tool -- and the raw commands below and macros/controller_seed.j2 private_group_facts
+# read os_tools[<that same role value>]; no tool name is spelled in a command. ADMISSION 2 requires the roles the
+# commands read, ADMISSION 3 requires every role value inside the selection it executes from (owner: tools;
+# privileged: observation_tools, themselves selected), so ADMISSION 4 judges each executed tool's kind. Derived state
+# (this file's task vars, registers, facts and the include params it reads) is refused at each caller's FIRST host
+# entry by refuse_pinned_outputs.yml (registry reserved_outputs; C1): the admissions do not by themselves stop an
+# extra-var from replacing a later command, plan or custody result.
+- name: INITIAL CONTACT ADMISSION 1 -- refuse an undeclared refusal for this variant (controller-side; before any contact)
+  ansible.builtin.assert:
+    that:
+      - rh.controller.bootstrap.target_bootstrap.initial_contact is mapping
+      - >-
+        'refusal' in rh.controller.bootstrap.target_bootstrap.initial_contact
+        and rh.controller.bootstrap.target_bootstrap.initial_contact.refusal is string
+      - >-
+        rh_ic_variant == 'owner'
+        or ('privileged' in rh.controller.bootstrap.target_bootstrap.initial_contact
+            and rh.controller.bootstrap.target_bootstrap.initial_contact.privileged is mapping
+            and 'refusal' in rh.controller.bootstrap.target_bootstrap.initial_contact.privileged
+            and rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.refusal is string)
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.target_bootstrap.refusal }} on {{ inventory_hostname }} (initial contact
+      {{ rh_ic_variant }}, before any contact, nothing executed on the target): the declared mapping
+      controller.bootstrap.target_bootstrap.initial_contact{{ '' if rh_ic_variant == 'owner' else '.privileged' }}
+      must carry its refusal code.
+    quiet: true
+
+- name: INITIAL CONTACT ADMISSION 2 -- refuse an undeclared selection or measured identity kind (controller-side; before any contact)
+  ansible.builtin.assert:
+    that:
+      - >-
+        'identity_kind' in rh.controller.bootstrap.target_bootstrap.initial_contact
+        and rh.controller.bootstrap.target_bootstrap.initial_contact.identity_kind is string
+        and rh.controller.bootstrap.target_bootstrap.initial_contact.identity_kind | length > 0
+      - rh.controller.bootstrap.os_tools is mapping
+      - >-
+        'tools' in (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+                    else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged)
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools is sequence
+        and (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+             else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools is not string
+        and (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+             else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools is not mapping
+        and (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+             else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools | length > 0
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools | reject('string') | list | length == 0
+      # privileged: the system interpreter the plan dereferences is itself a selected tool
+      - >-
+        rh_ic_variant == 'owner'
+        or ('system_python' in rh.controller.bootstrap.target_bootstrap.initial_contact.privileged
+            and rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.system_python is string
+            and rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.system_python
+                in rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.tools)
+      # owner: the facts selectors the INITIAL CONTACT 3 macro executes are declared names
+      - >-
+        rh_ic_variant != 'owner'
+        or ('ancestry' in rh.controller.bootstrap.path_admission
+            and rh.controller.bootstrap.path_admission.ancestry is mapping
+            and 'owner_private_group' in rh.controller.bootstrap.path_admission.ancestry
+            and rh.controller.bootstrap.path_admission.ancestry.owner_private_group is mapping
+            and 'identity_provider' in rh.controller.bootstrap.path_admission.ancestry.owner_private_group
+            and rh.controller.bootstrap.path_admission.ancestry.owner_private_group.identity_provider is mapping
+            and 'enumeration_tool' in rh.controller.bootstrap.path_admission.ancestry.owner_private_group.identity_provider
+            and rh.controller.bootstrap.path_admission.ancestry.owner_private_group.identity_provider.enumeration_tool is string
+            and 'acl_tool' in rh.controller.bootstrap.path_admission.ancestry.owner_private_group
+            and rh.controller.bootstrap.path_admission.ancestry.owner_private_group.acl_tool is string)
+      # codex-tick395: the raw command roles INITIAL CONTACT 1-4 read (both variants), each naming a tool
+      - >-
+        'roles' in rh.controller.bootstrap.target_bootstrap.initial_contact
+        and rh.controller.bootstrap.target_bootstrap.initial_contact.roles is mapping
+        and (['shell', 'digest', 'principal', 'stat', 'storage', 'filter']
+             | reject('in', rh.controller.bootstrap.target_bootstrap.initial_contact.roles) | list | length) == 0
+        and (rh.controller.bootstrap.target_bootstrap.initial_contact.roles.values() | reject('string') | list | length) == 0
+      # the declared known answer of the digest role's tool (INITIAL CONTACT 1 runs it), exactly one
+      - >-
+        rh.controller.bootstrap.os_tool_identity is mapping
+        and 'known_answers' in rh.controller.bootstrap.os_tool_identity
+        and rh.controller.bootstrap.os_tool_identity.known_answers is sequence
+        and rh.controller.bootstrap.os_tool_identity.known_answers is not string
+        and (rh.controller.bootstrap.os_tool_identity.known_answers | reject('mapping') | list | length) == 0
+        and (rh.controller.bootstrap.os_tool_identity.known_answers | selectattr('tool', 'defined')
+             | selectattr('tool', 'equalto', rh.controller.bootstrap.target_bootstrap.initial_contact.roles.digest)
+             | list | length) == 1
+      # privileged: the custody walk's resolve role, and the observation tools the roles execute from
+      - >-
+        rh_ic_variant == 'owner'
+        or ('roles' in rh.controller.bootstrap.target_bootstrap.initial_contact.privileged
+            and rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.roles is mapping
+            and 'resolve' in rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.roles
+            and (rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.roles.values() | reject('string') | list | length) == 0
+            and 'observation_tools' in rh.controller.bootstrap.target_bootstrap.initial_contact.privileged
+            and rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.observation_tools is sequence
+            and rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.observation_tools is not string
+            and (rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.observation_tools | reject('string') | list | length) == 0)
+      # owner: the roles the INITIAL CONTACT 3 facts program executes besides enumeration_tool / acl_tool
+      - >-
+        rh_ic_variant != 'owner'
+        or ('facts_tools' in rh.controller.bootstrap.path_admission.ancestry.owner_private_group
+            and rh.controller.bootstrap.path_admission.ancestry.owner_private_group.facts_tools is mapping
+            and (['principal', 'stat', 'read', 'filter']
+                 | reject('in', rh.controller.bootstrap.path_admission.ancestry.owner_private_group.facts_tools) | list | length) == 0
+            and (rh.controller.bootstrap.path_admission.ancestry.owner_private_group.facts_tools.values() | reject('string') | list | length) == 0)
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.target_bootstrap.initial_contact.refusal if rh_ic_variant == 'owner'
+      else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.refusal }} on {{ inventory_hostname }}
+      (initial contact {{ rh_ic_variant }}, before any contact, nothing executed on the target): required declarations
+      are initial_contact.identity_kind (a non-empty kind name), os_tools (a mapping), the variant's selection
+      initial_contact{{ '' if rh_ic_variant == 'owner' else '.privileged' }}.tools (a non-empty list of names), for the
+      privileged variant system_python among privileged.tools, and for the owner variant
+      path_admission.ancestry.owner_private_group.identity_provider.enumeration_tool and .acl_tool (names);
+      initial_contact.roles (names for shell, digest, principal, stat, storage, filter) with exactly one
+      os_tool_identity.known_answers entry for the digest role's tool; privileged: privileged.roles.resolve and
+      privileged.observation_tools (names); owner: owner_private_group.facts_tools (names for principal, stat, read,
+      filter).
+    quiet: true
+
+- name: INITIAL CONTACT ADMISSION 3 -- refuse a selected tool or owner-facts selector outside the declared selection (controller-side; before any contact)
+  ansible.builtin.assert:
+    that:
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+        | reject('in', rh.controller.bootstrap.os_tools) | list | length == 0
+      - >-
+        rh_ic_variant != 'owner'
+        or ([rh.controller.bootstrap.path_admission.ancestry.owner_private_group.identity_provider.enumeration_tool,
+             rh.controller.bootstrap.path_admission.ancestry.owner_private_group.acl_tool]
+            | reject('in', rh.controller.bootstrap.target_bootstrap.initial_contact.tools) | list | length == 0)
+      # codex-tick395: every executed role inside the selection it executes from (owner: tools; privileged: the
+      # observation tools, themselves selected) -- so ADMISSION 4 judges each executed tool
+      - >-
+        rh_ic_variant != 'privileged'
+        or (rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.observation_tools
+            | reject('in', rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.tools) | list | length == 0)
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact.roles.values() | list)
+        | reject('in', rh.controller.bootstrap.target_bootstrap.initial_contact.tools if rh_ic_variant == 'owner'
+                       else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.observation_tools)
+        | list | length == 0
+      - >-
+        rh_ic_variant != 'privileged'
+        or ((rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.roles.values() | list)
+            | reject('in', rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.observation_tools) | list | length == 0)
+      - >-
+        rh_ic_variant != 'owner'
+        or ((rh.controller.bootstrap.path_admission.ancestry.owner_private_group.facts_tools.values() | list)
+            | reject('in', rh.controller.bootstrap.target_bootstrap.initial_contact.tools) | list | length == 0)
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.target_bootstrap.initial_contact.refusal if rh_ic_variant == 'owner'
+      else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.refusal }} on {{ inventory_hostname }}
+      (initial contact {{ rh_ic_variant }}, before any contact, nothing executed on the target): selected names not
+      declared in os_tools {{ (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+      else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+      | reject('in', rh.controller.bootstrap.os_tools) | list }}; executed roles (initial_contact.roles{{ '' if
+      rh_ic_variant == 'owner' else ', privileged.roles' }}) outside {{ 'initial_contact.tools' if rh_ic_variant == 'owner'
+      else 'privileged.observation_tools (itself inside privileged.tools)' }}
+      {{ ((rh.controller.bootstrap.target_bootstrap.initial_contact.roles | dict2items)
+          + ([] if rh_ic_variant == 'owner'
+             else (rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.roles | dict2items)))
+         | rejectattr('value', 'in', rh.controller.bootstrap.target_bootstrap.initial_contact.tools if rh_ic_variant == 'owner'
+                      else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.observation_tools)
+         | items2dict }}{% if rh_ic_variant == 'privileged' %}; observation_tools outside privileged.tools
+      {{ rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.observation_tools
+         | reject('in', rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.tools) | list }}{% endif %}{% if rh_ic_variant == 'owner' %}; owner-facts selectors
+      (owner_private_group.identity_provider.enumeration_tool / .acl_tool) outside initial_contact.tools
+      {{ [rh.controller.bootstrap.path_admission.ancestry.owner_private_group.identity_provider.enumeration_tool,
+          rh.controller.bootstrap.path_admission.ancestry.owner_private_group.acl_tool]
+         | reject('in', rh.controller.bootstrap.target_bootstrap.initial_contact.tools) | list }}; owner-facts roles
+      (owner_private_group.facts_tools) outside initial_contact.tools
+      {{ rh.controller.bootstrap.path_admission.ancestry.owner_private_group.facts_tools | dict2items
+         | rejectattr('value', 'in', rh.controller.bootstrap.target_bootstrap.initial_contact.tools) | items2dict }}{% endif %}.
+    quiet: true
+
+- name: INITIAL CONTACT ADMISSION 4 -- refuse a selected tool without the declared measured identity kind (controller-side; before any contact)
+  ansible.builtin.assert:
+    that:
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+        | map('extract', rh.controller.bootstrap.os_tools) | reject('mapping') | list | length == 0
+      # the declared path the plan and INITIAL CONTACT 1-4 read (the resolve refuses a present non-path, not an absent key)
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+        | map('extract', rh.controller.bootstrap.os_tools) | selectattr('path', 'undefined') | list | length == 0
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+        | map('extract', rh.controller.bootstrap.os_tools) | map(attribute='path') | reject('string') | list | length == 0
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+        | map('extract', rh.controller.bootstrap.os_tools) | selectattr('identity', 'undefined') | list | length == 0
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+        | map('extract', rh.controller.bootstrap.os_tools) | map(attribute='identity') | reject('mapping') | list | length == 0
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+        | map('extract', rh.controller.bootstrap.os_tools) | map(attribute='identity') | selectattr('kind', 'undefined') | list | length == 0
+      - >-
+        (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+        | map('extract', rh.controller.bootstrap.os_tools) | map(attribute='identity.kind')
+        | reject('equalto', rh.controller.bootstrap.target_bootstrap.initial_contact.identity_kind) | list | length == 0
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.target_bootstrap.initial_contact.refusal if rh_ic_variant == 'owner'
+      else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.refusal }} on {{ inventory_hostname }}
+      (initial contact {{ rh_ic_variant }}, before any contact, nothing executed on the target): every selected tool must
+      declare os_tools.<tool>.path and os_tools.<tool>.identity.kind
+      {{ rh.controller.bootstrap.target_bootstrap.initial_contact.identity_kind }} (initial_contact.identity_kind);
+      declared entries refused:
+      {% for t in (rh.controller.bootstrap.target_bootstrap.initial_contact if rh_ic_variant == 'owner'
+         else rh.controller.bootstrap.target_bootstrap.initial_contact.privileged).tools
+         if not (rh.controller.bootstrap.os_tools[t] is mapping
+                 and rh.controller.bootstrap.os_tools[t].path is defined
+                 and rh.controller.bootstrap.os_tools[t].path is string
+                 and rh.controller.bootstrap.os_tools[t].identity is defined
+                 and rh.controller.bootstrap.os_tools[t].identity is mapping
+                 and rh.controller.bootstrap.os_tools[t].identity.kind is defined
+                 and rh.controller.bootstrap.os_tools[t].identity.kind
+                     == rh.controller.bootstrap.target_bootstrap.initial_contact.identity_kind) %}{{ t }}={{ rh.controller.bootstrap.os_tools[t] }} {% endfor %}
+    quiet: true
+
+- name: Derive this variant's contact plan (controller-side; from the resolved policy only)
+  vars:
+    _bs: "{{ rh.controller.bootstrap }}"
+    _ic: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact }}"
+    _pv: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.privileged }}"
+    _full: >-
+      {% if rh_ic_variant == 'owner' %}{{ [lookup('ansible.builtin.vars', _bs.inventory.bundle_var), lookup('ansible.builtin.vars', _bs.inventory.root_var), ansible_remote_tmp] }}{% else %}{{ [_pv.module_tmp] + rh_ic_paths }}{% endif %}
+  ansible.builtin.set_fact:
+    _rh_ic_plan:
+      variant: "{{ rh_ic_variant }}"
+      refusal: "{{ _ic.refusal if rh_ic_variant == 'owner' else _pv.refusal }}"
+      tools: "{{ _ic.tools if rh_ic_variant == 'owner' else _pv.tools }}"
+      paths: >-
+        {% set ns = namespace(p=[]) %}{% for full in _full %}{% for i in range(1, (full.split('/') | length) + 1) %}{% set ns.p = ns.p + ['/' ~ (full.split('/')[1:i] | join('/'))] %}{% endfor %}{% endfor %}{{ ns.p | unique | list }}
+      anchor: >-
+        {{ (lookup('ansible.builtin.vars', _bs.inventory.root_var) | dirname) if rh_ic_variant == 'owner' else (_pv.module_tmp | dirname) }}
+      module_tmp: >-
+        {{ [(lookup('ansible.builtin.vars', _bs.inventory.root_var) | dirname) ~ '/' ~ _bs.work_roots.sub_roots.tmp, ansible_remote_tmp]
+           if rh_ic_variant == 'owner' else [_pv.module_tmp] }}
+      python: "{{ '' if rh_ic_variant == 'owner' else _bs.os_tools[_pv.system_python].path }}"
+      # privileged: every selected tool's declared path (tool custody, rev8 RH-PRIVILEGED-TOOL-ANCESTRY)
+      tool_paths: >-
+        {% set ns = namespace(m={}) %}{% if rh_ic_variant == 'privileged' %}{% for t in _pv.tools %}{% set ns.m = ns.m | combine({t: {'path': _bs.os_tools[t].path}}) %}{% endfor %}{% endif %}{{ ns.m }}
+
+- name: Refuse a privileged tool declaration whose trust basis is not the declared partition (controller-side; before contact)
+  vars:
+    _pv: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.privileged }}"
+  ansible.builtin.assert:
+    that:
+      - _pv.observation_tools is sequence and _pv.executed_after_custody is sequence
+      - (_pv.observation_tools + _pv.executed_after_custody) | sort == _pv.tools | sort
+      - _pv.observation_tools | intersect(_pv.executed_after_custody) | length == 0
+      - _pv.system_python in _pv.executed_after_custody
+      # the tools INITIAL CONTACT 1-2 execute to observe are the DECLARED roles (codex-tick395; no roster here)
+      - >-
+        ((rh.controller.bootstrap.target_bootstrap.initial_contact.roles.values() | list) + (_pv.roles.values() | list))
+        | difference(_pv.observation_tools) | length == 0
+      - _pv.tool_custody.max_paths | int >= 1
+      - _pv.temp_storage.measure_at == 'existing_leaf_else_parent' and _pv.temp_storage.nested_mount == 'refuse_other_device'
+      - rh.controller.bootstrap.path_admission.ancestry.root_only.allow_owner_uids == [0]
+    fail_msg: >-
+      REFUSED {{ _pv.refusal }} on {{ inventory_hostname }} (before privileged contact): observation_tools
+      {{ _pv.observation_tools | default('?') }} and executed_after_custody {{ _pv.executed_after_custody | default('?') }}
+      must partition tools {{ _pv.tools }}, the system interpreter {{ _pv.system_python }} is executed only after custody,
+      every tool the raw observation executes (initial_contact.roles + privileged.roles:
+      {{ (rh.controller.bootstrap.target_bootstrap.initial_contact.roles.values() | list) + (_pv.roles.values() | list) }})
+      must be an observation tool, tool_custody.max_paths >= 1,
+      temp_storage {existing_leaf_else_parent, refuse_other_device} and path_admission.ancestry.root_only.allow_owner_uids [0].
+    quiet: true
+  when: rh_ic_variant == 'privileged'
+
+- name: INITIAL CONTACT 1 (raw, read-only) -- known answer and digests of the initial-contact tools by their declared paths
+  vars:
+    _ot: "{{ rh.controller.bootstrap.os_tools }}"
+    # the declared raw command roles (initial_contact.roles; admitted by ADMISSION 2-4)
+    _rl: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.roles }}"
+    _ka: "{{ rh.controller.bootstrap.os_tool_identity.known_answers | selectattr('tool', 'equalto', _rl.digest) | first }}"
+    # run by the DECLARED shell role (never the login shell's syntax); it is among the digested tools
+    _cmd: >-
+      printf 'KAT|%s\n' "$(printf '%s' {{ _ka.stdin | quote }} | {{ _ot[_rl.digest].path | quote }})";
+      {{ _ot[_rl.digest].path | quote }} -- {{ _rh_ic_plan.tools | map('extract', _ot) | map(attribute='path') | map('quote') | join(' ') }}
+  ansible.builtin.raw: "{{ _ot[_rl.shell].path | quote }} -c {{ _cmd | quote }}"
+  register: _rh_tb_ic1
+  changed_when: false
+  failed_when: false
+
+- name: Refuse an initial-contact tool whose known answer or reported digest is not its declared identity (nothing staged)
+  vars:
+    _ot: "{{ rh.controller.bootstrap.os_tools }}"
+    _ka: >-
+      {{ rh.controller.bootstrap.os_tool_identity.known_answers
+         | selectattr('tool', 'equalto', rh.controller.bootstrap.target_bootstrap.initial_contact.roles.digest) | first }}
+    _lines: "{{ _rh_tb_ic1.stdout | default('') | replace('\r', '') | split('\n') | map('trim') | select | list }}"
+    _want: "{{ _rh_ic_plan.tools | map('extract', _ot) | map(attribute='identity.sha256') | zip(_rh_ic_plan.tools | map('extract', _ot) | map(attribute='path')) | map('join', '  ') | list }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_tb_ic1.rc | default(1) == 0
+      - ('KAT|' ~ _ka.stdout) in _lines
+      - _want | reject('in', _lines) | list | length == 0
+    fail_msg: >-
+      REFUSED {{ _rh_ic_plan.refusal }} on {{ inventory_hostname }} (initial contact {{ _rh_ic_plan.variant }}, raw, nothing
+      staged): the declared digest role's ({{ rh.controller.bootstrap.target_bootstrap.initial_contact.roles.digest }}) known answer or a reported digest differs from os_tools.<tool>.identity (an absent
+      tool is installed only by the declared bootstrap: packages.provides); expected
+      {{ _want | reject('in', _lines) | list }} and 'KAT|{{ _ka.stdout }}'; got {{ _lines }} (rc {{ _rh_tb_ic1.rc | default('none') }}).
+    quiet: true
+
+- name: INITIAL CONTACT 2 (raw, read-only) -- the staging boundary facts (ancestry of bundle dir, root and module temp; work-root storage)
+  vars:
+    _ot: "{{ rh.controller.bootstrap.os_tools }}"
+    _wt: "{{ _rh_ic_plan.anchor }}"
+    _priv: "{{ _rh_ic_plan.variant == 'privileged' }}"
+    _mt1: "{{ _rh_ic_plan.module_tmp[0] }}"
+    _sfmt: "'%n|%F|%u|%g|%a|%d'"
+    # the declared raw command roles (initial_contact.roles; privileged.roles.resolve), admitted by ADMISSION 2-4
+    _rl: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.roles }}"
+    _rp: "{{ rh.controller.bootstrap.os_tools[rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.roles.resolve].path | quote }}"
+    _st: "{{ rh.controller.bootstrap.os_tools[rh.controller.bootstrap.target_bootstrap.initial_contact.roles.stat].path | quote }}"
+    _mx: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.tool_custody.max_paths | int }}"
+    # privileged: NO selected tool other than the observation tools is executed here (rev8
+    # RH-PRIVILEGED-PYTHON-BEFORE-CUSTODY): the interpreter is only named as a path. Storage is measured at the EXISTING
+    # module temp itself, else at its parent (rev8 RH-PRIVILEGED-TEMP-FILESYSTEM). For every selected tool
+    # (tool_custody; rev8 RH-PRIVILEGED-TOOL-ANCESTRY): `tool|` its realpath and `rs|` that file's complete chain; then
+    # a bounded walk (max_paths) of the declared path and every link hop reached from it (`hop|`): for each traversed
+    # entry `lx|` its lstat and `rs|` the complete physical chain of the directory holding it; a link's target
+    # (stat %N, literal quoting) is admitted only when plain, then queued. Anything unexpected is a `bad|` line.
+    _cmd: >-
+      printf 'uid|%s\n' "$({{ _ot[_rl.principal].path | quote }} -u)";
+      {% if _priv %}printf 'uname|%s\n' "$({{ _ot[_rl.principal].path | quote }} -un)";
+      {% endif %}{% for p in _rh_ic_plan.paths %}if [ -e {{ p | quote }} ] || [ -L {{ p | quote }} ]; then printf 'anc|%s\n' "$({{ _ot[_rl.stat].path | quote }} -c '%n|%F|%u|%g|%a|%d' -- {{ p | quote }})"; else printf 'anc|%s|absent\n' {{ p | quote }}; fi;
+      {% endfor %}{% if _priv %}if [ -d {{ _mt1 | quote }} ] && [ ! -L {{ _mt1 | quote }} ]; then _m={{ _mt1 | quote }}; else _m={{ _wt | quote }}; fi;
+      {% else %}_m={{ _wt | quote }};
+      {% endif %}printf 'fsat|%s\n' "$_m";
+      printf 'fst|%s\n' "$({{ _ot[_rl.stat].path | quote }} -f -c %T -- "$_m")";
+      printf 'avail|%s\n' "$({{ _ot[_rl.storage].path | quote }} -B1 --output=avail -- "$_m" | {{ _ot[_rl.filter].path | quote }} -n '2s/ //gp')";
+      printf 'iavail|%s\n' "$({{ _ot[_rl.storage].path | quote }} --output=iavail -- "$_m" | {{ _ot[_rl.filter].path | quote }} -n '2s/ //gp')"{% if _priv %}{% for t, d in _rh_ic_plan.tool_paths.items() %};
+      _t0={{ t | quote }};
+      _x=$({{ _rp }} -e -- {{ d.path | quote }}) || _x='';
+      printf 'tool|%s|%s\n' "$_t0" "$_x";
+      if [ -n "$_x" ]; then _w=$_x; while :; do printf 'rs|%s|%s\n' "$_t0" "$({{ _st }} -c {{ _sfmt }} -- "${_w:-/}")"; [ -z "$_w" ] && break; _w=${_w%/*}; done; fi;
+      _q={{ d.path | quote }}; _n=0;
+      while [ -n "$_q" ]; do
+      _p=${_q%%:*}; case "$_q" in *:*) _q=${_q#*:};; *) _q='';; esac;
+      _n=$((_n+1)); if [ "$_n" -gt {{ _mx }} ]; then printf 'bad|%s|more than {{ _mx }} walked paths\n' "$_t0"; break; fi;
+      printf 'hop|%s|%s\n' "$_t0" "$_p";
+      _r=''; _s=${_p#/};
+      while [ -n "$_s" ]; do
+      _e=${_s%%/*}; case "$_s" in */*) _s=${_s#*/};; *) _s='';; esac;
+      [ -z "$_e" ] && continue;
+      _c=$_r/$_e;
+      _d=$({{ _rp }} -e -- "${_r:-/}") || _d='';
+      if [ -n "$_d" ]; then _w=$_d; [ "$_w" = / ] && _w=''; while :; do printf 'rs|%s|%s\n' "$_t0" "$({{ _st }} -c {{ _sfmt }} -- "${_w:-/}")"; [ -z "$_w" ] && break; _w=${_w%/*}; done; else printf 'bad|%s|container of %s unresolved\n' "$_t0" "$_c"; fi;
+      if [ -L "$_c" ]; then
+      printf 'lx|%s|%s\n' "$_t0" "$({{ _st }} -c {{ _sfmt }} -- "$_c")";
+      _l=$(QUOTING_STYLE=literal {{ _st }} -c %N -- "$_c"); _h=${_l#"$_c -> "};
+      case "$_h" in ''|*[!A-Za-z0-9._/+-]*|..|../*|*/../*|*/..) printf 'bad|%s|link %s target not admitted\n' "$_t0" "$_c"; _h='';; esac;
+      if [ -n "$_h" ]; then case "$_h" in /*) ;; *) _h=$_r/$_h;; esac; _q=${_q:+$_q:}$_h; fi;
+      elif [ -e "$_c" ]; then printf 'lx|%s|%s\n' "$_t0" "$({{ _st }} -c {{ _sfmt }} -- "$_c")";
+      else printf 'lx|%s|%s|absent\n' "$_t0" "$_c"; fi;
+      _r=$_c;
+      done;
+      done{% endfor %}{% endif %}
+  ansible.builtin.raw: "{{ _ot[rh.controller.bootstrap.target_bootstrap.initial_contact.roles.shell].path | quote }} -c {{ _cmd | quote }}"
+  register: _rh_tb_ic2
+  changed_when: false
+  failed_when: false
+
+- name: Parse the staging boundary facts (controller; derived output)
+  vars:
+    _lines: "{{ _rh_tb_ic2.stdout | default('') | replace('\r', '') | split('\n') | map('trim') | select | list }}"
+  ansible.builtin.set_fact:
+    _rh_tb_ic_uid: "{{ (_lines | select('match', '^uid[|]') | first | default('uid|')).split('|')[1] }}"
+    _rh_tb_ic_uname: "{{ (_lines | select('match', '^uname[|]') | first | default('uname|')).split('|')[1] }}"
+    _rh_tb_ic_fst: "{{ (_lines | select('match', '^fst[|]') | first | default('fst|')).split('|')[1] }}"
+    _rh_tb_ic_avail: "{{ (_lines | select('match', '^avail[|]') | first | default('avail|')).split('|')[1] }}"
+    _rh_tb_ic_iavail: "{{ (_lines | select('match', '^iavail[|]') | first | default('iavail|')).split('|')[1] }}"
+    # path -> {type, uid, gid, mode, dev} of every EXISTING component; absent components are not listed
+    _rh_tb_ic_anc: >-
+      {% set ns = namespace(m={}, bad=[]) %}{% for l in _lines | select('match', '^anc[|]') %}{% set f = l.split('|') %}{% if f | length == 3 and f[2] == 'absent' %}{% elif f | length == 7 %}{% set ns.m = ns.m | combine({f[1]: {'type': f[2], 'uid': f[3] | int, 'gid': f[4] | int, 'mode': f[5], 'dev': f[6]}}) %}{% else %}{% set ns.m = ns.m | combine({'__malformed__': {'line': l}}) %}{% endif %}{% endfor %}{{ ns.m }}
+    # where fs type / bytes / inodes were measured (privileged: the existing module temp itself, else its parent)
+    _rh_tb_ic_fsat: "{{ (_lines | select('match', '^fsat[|]') | first | default('fsat|')).split('|', 1)[1] }}"
+    # privileged: tool -> {path, resolved, hops: [walked paths], lx: {entry: rec}, rs: {physical dir or resolved file:
+    # rec}, bad: [lines]}; an absent entry, an unresolved container, an unadmitted link target, the walk cap and any
+    # malformed line land in bad (refused)
+    _rh_tb_ic_tools: >-
+      {% set ns = namespace(m={}) %}{% for t, d in _rh_ic_plan.tool_paths.items() %}{% set ns.m = ns.m | combine({t: {'path': d.path, 'resolved': '', 'hops': [], 'lx': {}, 'rs': {}, 'bad': []}}) %}{% endfor %}{% for l in _lines | select('match', '^(tool|lx|rs|hop|bad)[|]') %}{% set f = l.split('|') %}{% if f[1] not in ns.m %}{% elif f[0] == 'hop' and f | length == 3 %}{% set ns.m = ns.m | combine({f[1]: {'hops': ns.m[f[1]].hops + [f[2]]}}, recursive=true) %}{% elif f[0] == 'tool' and f | length == 3 %}{% set ns.m = ns.m | combine({f[1]: {'resolved': f[2]}}, recursive=true) %}{% elif f[0] != 'tool' and f | length == 8 %}{% set ns.m = ns.m | combine({f[1]: {f[0]: {f[2]: {'type': f[3], 'uid': f[4] | int, 'gid': f[5] | int, 'mode': f[6], 'dev': f[7]}}}}, recursive=true) %}{% else %}{% set ns.m = ns.m | combine({f[1]: {'bad': ns.m[f[1]].bad + [l]}}, recursive=true) %}{% endif %}{% endfor %}{{ ns.m }}
+    # privileged: the system interpreter (version is observed only AFTER custody admission, PRIVILEGED INITIAL CONTACT 4)
+    _rh_tb_ic_py:
+      path: "{{ _rh_ic_plan.python }}"
+      resolved: >-
+        {% set sp = rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.system_python %}{{ ((_lines | select('match', '^tool[|]' ~ (sp | regex_escape) ~ '[|]') | first | default('tool|' ~ sp ~ '|')).split('|', 2)[2]) if _rh_ic_plan.python | length > 0 else '' }}
+      version: ''
+
+- name: Refuse an unadmitted staging boundary before any module staging (ancestry, work-root storage, module temp custody)
+  vars:
+    _wr: "{{ rh.controller.bootstrap.work_roots }}"
+    _u: "{{ _rh_tb_ic_uid | int }}"
+    _wt: "{{ _rh_ic_plan.anchor }}"
+    _mt: "{{ _rh_ic_plan.module_tmp }}"
+    _ex: "{{ _rh_tb_ic_anc | dict2items }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_tb_ic2.rc | default(1) == 0
+      - _rh_tb_ic_uid is match('^[0-9]+$') and _u | int != 0
+      - "'__malformed__' not in _rh_tb_ic_anc"
+      - _wt in _rh_tb_ic_anc and _rh_tb_ic_anc[_wt].type == 'directory'
+      - _ex | rejectattr('value.type', 'equalto', 'directory') | list | length == 0
+      - _ex | map(attribute='value.uid') | reject('in', [0, _u | int]) | list | length == 0
+      - _ex | selectattr('value.mode', 'match', '.*[2367]$') | list | length == 0
+      - _ex | selectattr('value.mode', 'match', '.*[2367].$') | rejectattr('value.uid', 'equalto', _u | int) | list | length == 0
+      - _rh_tb_ic_fst | length > 0 and _rh_tb_ic_fst not in _wr.admission.refused_fs_types
+      - _rh_tb_ic_avail is match('^[0-9]+$') and _rh_tb_ic_avail | int >= _wr.admission.free_bytes_min | int
+      - _rh_tb_ic_iavail is match('^[0-9]+$') and _rh_tb_ic_iavail | int >= _wr.admission.free_inodes_min | int
+      - _mt | select('in', _rh_tb_ic_anc) | map('extract', _rh_tb_ic_anc) | rejectattr('uid', 'equalto', _u | int) | list | length == 0
+      - _mt | select('in', _rh_tb_ic_anc) | map('extract', _rh_tb_ic_anc) | selectattr('mode', 'match', '.*[2367].?$') | list | length == 0
+      - _mt | select('in', _rh_tb_ic_anc) | map('extract', _rh_tb_ic_anc) | rejectattr('dev', 'equalto', _rh_tb_ic_anc[_wt].dev) | list | length == 0
+    fail_msg: >-
+      REFUSED {{ _rh_ic_plan.refusal }} on {{ inventory_hostname }} (initial contact, raw, nothing staged): uid {{ _rh_tb_ic_uid }}
+      (root refused); every existing component of the bundle dir, the root and the module temp must be a real
+      directory owned by 0 or the owner, never other-writable, group-writable only when owner-owned (then proven by
+      owner_private_group next); the work root {{ _wt }} must exist on an admitted filesystem ({{ _rh_tb_ic_fst }};
+      refused {{ _wr.admission.refused_fs_types }}) with >= {{ _wr.admission.free_bytes_min }} free bytes (got
+      {{ _rh_tb_ic_avail }}) and >= {{ _wr.admission.free_inodes_min }} free inodes (got {{ _rh_tb_ic_iavail }}); the
+      module temp chain {{ _mt }} must be absent or owned, not group/other-writable and on the work root's device
+      (no mount of another filesystem). Components: {{ _rh_tb_ic_anc }}.
+    quiet: true
+  when: _rh_ic_plan.variant == 'owner'
+
+- name: Refuse an unadmitted PRIVILEGED staging boundary before any module staging (principal, system interpreter, root-only ancestry, root module temp, storage)
+  vars:
+    _wr: "{{ rh.controller.bootstrap.work_roots }}"
+    _pv: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.privileged }}"
+    _prof: "{{ rh.controller.bootstrap.inventory.connection_profiles[rh.controller.bootstrap.target_bootstrap.initial_contact.privileged.connection_profile] }}"
+    _wt: "{{ _rh_ic_plan.anchor }}"
+    _mt: "{{ _pv.module_tmp }}"
+    _ex: "{{ _rh_tb_ic_anc | dict2items }}"
+    # the owner's work root and bundle dir on this host (when declared): the root module temp is never inside them
+    _owr: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.root_var, default='') | dirname }}"
+    _obd: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.bundle_var, default='') }}"
+    # the declared ROOT-ONLY variant of the ONE ancestry rule (path_admission.ancestry.root_only)
+    _ro: "{{ rh.controller.bootstrap.path_admission.ancestry.root_only }}"
+    _gow: '.*[2367].?$'
+    # the existing module temp is measured itself; an absent one at its (root_only) parent -- where it will be created
+    _fsat_want: "{{ _mt if _mt in _rh_tb_ic_anc else _wt }}"
+    # every selected tool's custody (rev8 RH-PRIVILEGED-TOOL-ANCESTRY): violations as text (empty = admitted)
+    _tv: >-
+      {% set ns = namespace(v=[]) %}{% for t in _pv.tools %}{% set r = _rh_tb_ic_tools[t] | default({'path': '?', 'resolved': '', 'hops': [], 'lx': {}, 'rs': {}, 'bad': ['not observed']}) %}{% if r.bad | length > 0 or r.hops | length == 0 or r.hops[0] != r.path or r.lx | length == 0 or r.resolved is not match('^/') or r.resolved not in r.rs %}{% set ns.v = ns.v + [t ~ ': unresolved, absent, unwalked or malformed ' ~ r.bad ~ ' resolved=' ~ r.resolved ~ ' walked=' ~ r.hops] %}{% endif %}{% for p, s in r.lx.items() %}{% if s.type == 'symbolic link' %}{% if s.uid not in _ro.allow_owner_uids %}{% set ns.v = ns.v + [t ~ ': link ' ~ p ~ ' owned by uid ' ~ s.uid] %}{% endif %}{% elif s.type in ['directory', 'regular file'] %}{% if s.uid not in _ro.allow_owner_uids or s.mode is match(_gow) %}{% set ns.v = ns.v + [t ~ ': ' ~ p ~ ' (traversed entry) uid ' ~ s.uid ~ ' mode ' ~ s.mode] %}{% endif %}{% else %}{% set ns.v = ns.v + [t ~ ': ' ~ p ~ ' is a ' ~ s.type] %}{% endif %}{% endfor %}{% for p, s in r.rs.items() %}{% set want = 'regular file' if p == r.resolved else 'directory' %}{% if s.type != want or s.uid not in _ro.allow_owner_uids or s.mode is match(_gow) %}{% set ns.v = ns.v + [t ~ ': ' ~ p ~ ' (resolved chain) ' ~ s.type ~ ' uid ' ~ s.uid ~ ' mode ' ~ s.mode] %}{% endif %}{% endfor %}{% endfor %}{{ ns.v }}
+  ansible.builtin.assert:
+    that:
+      - _rh_tb_ic2.rc | default(1) == 0
+      # the ACTUAL principal is the declared privileged one (uid and account)
+      - _rh_tb_ic_uid is match('^[0-9]+$') and _rh_tb_ic_uid | int == _pv.uid | int
+      - _rh_tb_ic_uname == _prof.user
+      - "'__malformed__' not in _rh_tb_ic_anc"
+      # ROOT-ONLY ancestry (path_admission.ancestry.root_only): every existing component a real directory, uid 0,
+      # never group- or other-writable
+      - _ro.refuse_links | bool and _ro.refuse_group_other_writable | bool
+      - _ex | rejectattr('value.type', 'equalto', 'directory') | list | length == 0
+      - _ex | map(attribute='value.uid') | reject('in', _ro.allow_owner_uids) | list | length == 0
+      - _ex | selectattr('value.mode', 'match', _gow) | list | length == 0
+      # the dedicated root module temp: absent (created 0700 by the connection as root) or a uid-0 0700 directory,
+      # its parent present, never inside the owner's work root or bundle dir
+      - _wt in _rh_tb_ic_anc
+      - _mt not in _rh_tb_ic_anc or (_rh_tb_ic_anc[_mt].uid == 0 and _rh_tb_ic_anc[_mt].mode == '700')
+      - _owr in ['', '.', '/'] or not ((_mt ~ '/').startswith(_owr ~ '/'))
+      - _obd == '' or not ((_mt ~ '/').startswith(_obd ~ '/'))
+      # storage (work_roots.admission) of the ACTUAL staging filesystem (rev8 RH-PRIVILEGED-TEMP-FILESYSTEM): measured at
+      # the existing module temp (else its root_only parent, where the connection creates it); an existing module temp
+      # on another device than its parent (a nested mount of another filesystem, any mode) refuses; a same-filesystem
+      # bind mount is not detected by device equality (its storage is the measured one)
+      - _rh_tb_ic_fsat == _fsat_want
+      - _mt not in _rh_tb_ic_anc or _rh_tb_ic_anc[_mt].dev == _rh_tb_ic_anc[_wt].dev
+      - _rh_tb_ic_fst | length > 0 and _rh_tb_ic_fst not in _wr.admission.refused_fs_types
+      - _rh_tb_ic_avail is match('^[0-9]+$') and _rh_tb_ic_avail | int >= _wr.admission.free_bytes_min | int
+      - _rh_tb_ic_iavail is match('^[0-9]+$') and _rh_tb_ic_iavail | int >= _wr.admission.free_inodes_min | int
+      # every selected tool incl. the system interpreter: declared chain, complete resolved chains, resolved file
+      - _tv | length == 0
+      - _rh_tb_ic_py.resolved is match('^/')
+    fail_msg: >-
+      REFUSED {{ _rh_ic_plan.refusal }} on {{ inventory_hostname }} (privileged initial contact, raw, nothing staged, the
+      system interpreter NOT executed): the connected principal must be uid {{ _pv.uid }} / {{ _prof.user }} (got
+      {{ _rh_tb_ic_uid }} / {{ _rh_tb_ic_uname }}); every existing component of {{ _mt }} and {{ rh_ic_paths }} must be a
+      real directory owned by uid {{ _ro.allow_owner_uids }} and not group/other-writable (nothing the toolchain owner
+      controls); the module temp {{ _mt }} must be absent or uid 0 mode 0700 on its parent's device (no mount of another filesystem),
+      with an existing parent, never inside the owner work root '{{ _owr }}' or bundle dir '{{ _obd }}'; the staging
+      filesystem measured at {{ _rh_tb_ic_fsat }} (expected {{ _fsat_want }}: {{ _rh_tb_ic_fst }}, {{ _rh_tb_ic_avail }}
+      bytes, {{ _rh_tb_ic_iavail }} inodes; admission {{ _wr.admission.refused_fs_types }} / {{ _wr.admission.free_bytes_min }}
+      / {{ _wr.admission.free_inodes_min }}); every selected tool {{ _pv.tools }} must resolve through uid-0,
+      non-group/other-writable directories only (declared chain; complete chain of every resolved prefix) to a uid-0
+      regular file, links only uid-0 owned -- violations: {{ _tv }}. A missing path or package is supplied only by the
+      declared bootstrap (MAIN's root setup / packages.provides), never here. Components: {{ _rh_tb_ic_anc }}.
+    quiet: true
+  when: _rh_ic_plan.variant == 'privileged'
+
+- name: PRIVILEGED INITIAL CONTACT 4 (raw) -- execute the ADMITTED system interpreter once (-I -V), only after principal, custody and complete ancestry passed
+  vars:
+    _ot: "{{ rh.controller.bootstrap.os_tools }}"
+    # RH-PRIVILEGED-PYTHON-PROBE-EXIT: the interpreter's OWN exit status is captured immediately (the status of the
+    # assignment is the command substitution's), recorded FIRST as `pyrc|`, then whether its merged output spans more
+    # than one line (`pyml|` 1/0 -- so no output line can pose as a record), then that output as `pyv|`, and the raw
+    # task exits WITH that status -- never printf's.
+    _cmd: >-
+      _o=$({{ _rh_ic_plan.python | quote }} -I -V 2>&1); _s=$?;
+      _nl=$(printf '\n_'); _nl=${_nl%_};
+      case "$_o" in *"$_nl"*) _ml=1;; *) _ml=0;; esac;
+      printf 'pyrc|%s\n' "$_s";
+      printf 'pyml|%s\n' "$_ml";
+      printf 'pyv|%s\n' "$_o";
+      exit "$_s"
+  ansible.builtin.raw: "{{ _ot[rh.controller.bootstrap.target_bootstrap.initial_contact.roles.shell].path | quote }} -c {{ _cmd | quote }}"
+  register: _rh_tb_ic4
+  changed_when: false
+  failed_when: false
+  when: _rh_ic_plan.variant == 'privileged'
+
+- name: Refuse a system interpreter whose reported version is not the declared one (PRIVILEGED; nothing staged)
+  vars:
+    _pv: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.privileged }}"
+    # the records in order: pyrc|<status>, pyml|0, pyv|<one-line version>; a multi-line interpreter output refuses
+    _l4: "{{ _rh_tb_ic4.stdout | default('') | replace('\r', '') | split('\n') | map('trim') | select('match', '^py(rc|ml|v)[|]') | list }}"
+    _rc: "{{ (_l4[0] | default('pyrc|')).split('|', 1)[1] if (_l4[0] | default('')) is match('^pyrc[|]') else '' }}"
+    _ml: "{{ (_l4[1] | default('pyml|')).split('|', 1)[1] if (_l4[1] | default('')) is match('^pyml[|]') else '' }}"
+    _v: "{{ (_l4[2] | default('pyv|')).split('|', 1)[1] if (_l4[2] | default('')) is match('^pyv[|]') else '' }}"
+  ansible.builtin.assert:
+    that:
+      - _l4 | length == 3
+      - _rc == '0'
+      - _ml == '0'
+      - _rh_tb_ic4.rc | default(1) == 0
+      - _v is match(_pv.python_version_regex)
+    fail_msg: >-
+      REFUSED {{ _rh_ic_plan.refusal }} on {{ inventory_hostname }} (privileged initial contact, nothing staged): the
+      admitted system interpreter {{ _rh_ic_plan.python }} -> {{ _rh_tb_ic_py.resolved }} must exit 0 (interpreter
+      status '{{ _rc }}', raw rc {{ _rh_tb_ic4.rc | default('none') }}) and report exactly one line matching
+      {{ _pv.python_version_regex }} (got '{{ _v }}'; multi-line {{ _ml }}; records {{ _l4 }}). Matching version text with a nonzero exit refuses.
+    quiet: true
+  when: _rh_ic_plan.variant == 'privileged'
+
+- name: Record the admitted system interpreter's version (PRIVILEGED; derived output)
+  ansible.builtin.set_fact:
+    _rh_tb_ic_py: "{{ _rh_tb_ic_py | combine({'version': ((_rh_tb_ic4.stdout | default('') | replace('\r', '') | split('\n') | map('trim') | select('match', '^pyv[|]') | first | default('pyv|')).split('|', 1)[1])}) }}"
+  when: _rh_ic_plan.variant == 'privileged'
+
+- name: INITIAL CONTACT 3 (raw, read-only) -- owner_private_group facts of each owner-owned group-writable component
+  vars:
+    _pg: "{{ rh.controller.bootstrap.path_admission.ancestry.owner_private_group }}"
+    _cmd: >-
+      _pgdir={{ item | quote }};
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ _pg.program_template_rel,
+                template_vars={'rh_pg_bs': rh.controller.bootstrap, 'rh_pg_part': 'facts'}) }}
+  ansible.builtin.raw: "{{ rh.controller.bootstrap.os_tools[rh.controller.bootstrap.target_bootstrap.initial_contact.roles.shell].path | quote }} -c {{ _cmd | quote }}"
+  loop: "{{ (_rh_tb_ic_anc | dict2items | selectattr('value.mode', 'match', '.*[2367].$') | map(attribute='key') | list) if _rh_ic_plan.variant == 'owner' else [] }}"
+  register: _rh_tb_ic3
+  changed_when: false
+  failed_when: false
+
+- name: Decide each owner-owned group-writable component with the ONE generated program (controller's admitted tool)
+  ansible.builtin.include_tasks: decide_private_group.yml
+  vars:
+    rh_pg_bs: "{{ rh.controller.bootstrap }}"
+    rh_pg_repo_root: "{{ rh_repo_root }}"
+    rh_pg_facts: "{{ _rh_tb_ic_fact.stdout | default('') }}"
+    rh_pg_refusal: "{{ _rh_ic_plan.refusal }}"
+  loop: "{{ _rh_tb_ic3.results | default([]) }}"
+  loop_control:
+    loop_var: _rh_tb_ic_fact
+    label: "{{ _rh_tb_ic_fact.item }}"
+
+- name: PRIVILEGED -- set the admitted system interpreter and the root module temp for this host (before any module)
+  vars:
+    _pv: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.privileged }}"
+  ansible.builtin.set_fact:
+    ansible_python_interpreter: "{{ rh.controller.bootstrap.os_tools[_pv.system_python].path }}"
+    ansible_remote_tmp: "{{ _pv.module_tmp }}"
+  when: _rh_ic_plan.variant == 'privileged'
+
+- name: PRIVILEGED -- refuse unless the admitted interpreter, root module temp and no-become are the EFFECTIVE values (nothing staged yet)
+  vars:
+    _pv: "{{ rh.controller.bootstrap.target_bootstrap.initial_contact.privileged }}"
+  ansible.builtin.assert:
+    that:
+      - ansible_python_interpreter == rh.controller.bootstrap.os_tools[_pv.system_python].path
+      - ansible_remote_tmp == _pv.module_tmp
+      - not (ansible_become | default(false) | bool)
+    fail_msg: >-
+      REFUSED {{ _rh_ic_plan.refusal }} on {{ inventory_hostname }} (privileged initial contact, nothing staged): the
+      effective ansible_python_interpreter '{{ ansible_python_interpreter | default('') }}' / ansible_remote_tmp
+      '{{ ansible_remote_tmp | default('') }}' are not the admitted system interpreter
+      {{ rh.controller.bootstrap.os_tools[_pv.system_python].path }} / root module temp {{ _pv.module_tmp }} (an extra-var
+      or include parameter outranks the admission), or become is set. The owner toolchain interpreter never runs as root.
+    quiet: true
+  when: _rh_ic_plan.variant == 'privileged'

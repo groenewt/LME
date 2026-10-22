@@ -1,0 +1,2042 @@
+{#- testing/remote_harness/tests/controls/templates/macros/controls.j2 -- the lifecycle-control engine's pure functions
+    (owner: G). Every macro returns JSON text; tasks call them through templates/call.j2 and `from_json`.
+    No macro touches the filesystem or executes anything: tasks gather observations, macros plan and judge.
+
+    ctx (built by tasks/prepare.yml and tasks/one_control.yml):
+      t          token map for {name} expansion (strings; `envelope_memory_plus_1` is an int)
+      rh         the resolved harness policy (controller ...)
+      refusals   controller.bootstrap.refusals
+      vocab      controls.yml vocabulary
+      env        {HOME, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS} carried from the runner
+      tools      declared absolute tools the runner itself uses (strace, timeout, env, sh ...)
+      repo       candidate repository root; variant_repo: admitted variant root or ''
+      receipt    {ansible_config, collections_path} read from the shared root's published receipt (or {})
+      bundles    {a: path, b: path}
+      override   lme_global_override value for a declaration variant routed through SEED-06, or {} -#}
+
+{#- ---------------------------------------------------------------- tokens ---------------------------------- -#}
+{%- macro expand(s, t) -%}
+{%- set ns = namespace(v = s | string) -%}
+{%- for k in t -%}{%- set ns.v = ns.v | replace('{' ~ k ~ '}', t[k] | string) -%}{%- endfor -%}
+{{- ns.v -}}
+{%- endmacro -%}
+
+{%- macro xjson(o, t) -%}
+{%- if o is mapping -%}
+{{ '{' }}{%- for k in o -%}{{ k | to_json }}: {{ xjson(o[k], t) }}{{ ', ' if not loop.last else '' }}{%- endfor -%}{{ '}' }}
+{%- elif o is string -%}
+{%- set m = o | regex_search('^\\{([a-z0-9_]+)\\}$', '\\1') -%}
+{%- if m and (m[0] in t) and (t[m[0]] is number) -%}{{ t[m[0]] | to_json }}{%- else -%}{{ expand(o, t) | to_json }}{%- endif -%}
+{%- elif o is iterable -%}
+[{%- for v in o -%}{{ xjson(v, t) }}{{ ', ' if not loop.last else '' }}{%- endfor -%}]
+{%- else -%}{{ o | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- tokens that survived expansion: a declaration error, never silently passed to an entrypoint -#}
+{%- macro residual(text) -%}
+{{ text | regex_findall('\\{[a-z][a-z0-9_]*\\}') | unique | list | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ vocabulary --------------------------------- -#}
+{#- keys a control uses that the runner does not implement -> UNIMPLEMENTED (fails acceptance, never QUEUED) -#}
+{#- ops: a list of op maps; returns reasons -#}
+{%- macro _ops_unimpl(ops, vocab) -%}
+{%- set ni = vocab.not_implemented | default({}) -%}
+{%- set ns = namespace(u = []) -%}
+{#- an op map's FIRST key is its kind; the other keys (mode, content, target) are its options -#}
+{%- for o in ops -%}
+{%- set k = o | list | first -%}
+{%- if k not in vocab.ops or k in (ni.ops | default([])) -%}{%- set ns.u = ns.u + ['op ' ~ k] -%}{%- endif -%}
+{%- for opt in (o | list)[1:] if opt not in vocab.op_options -%}{%- set ns.u = ns.u + ['op option ' ~ k ~ '.' ~ opt] -%}{%- endfor -%}
+{%- if o[k] is mapping -%}{%- for opt in o[k] if opt in (ni.op_options | default([])) -%}{%- set ns.u = ns.u + ['op option ' ~ k ~ '.' ~ opt] -%}{%- endfor -%}{%- endif -%}
+{%- endfor -%}
+{{ ns.u | to_json }}
+{%- endmacro -%}
+
+{%- macro _preds_unimpl(preds, vocab) -%}
+{%- set ni = vocab.not_implemented | default({}) -%}
+{%- set ns = namespace(u = []) -%}
+{%- for p in preds -%}
+{%- set k = p | list | reject('in', ['exists', 'equal', 'contains', 'lacks', 'regex', 'json_equal', 'json_all', 'kind', 'size', 'mode', 'uid', 'private_write']) | first -%}
+{%- if k not in vocab.predicates or k in (ni.predicates | default([])) -%}{%- set ns.u = ns.u + ['predicate ' ~ k] -%}{%- endif -%}
+{%- endfor -%}
+{{ ns.u | to_json }}
+{%- endmacro -%}
+
+{%- macro _steps_unimpl(steps, vocab) -%}
+{%- set ni = vocab.not_implemented | default({}) -%}
+{%- set ns = namespace(u = []) -%}
+{%- for s in steps -%}
+{%- set kinds = s | list | reject('in', vocab.step_common) | list -%}
+{%- if kinds | length != 1 or kinds[0] not in vocab.steps or kinds[0] in (ni.steps | default([])) -%}{%- set ns.u = ns.u + ['step ' ~ (s.id | default('?')) ~ ' kinds ' ~ (kinds | join(','))] -%}{%- endif -%}
+{%- for k in (s.expect | default({})) if k not in vocab.expect -%}{%- set ns.u = ns.u + ['expect ' ~ k] -%}{%- endfor -%}
+{%- set ns.u = ns.u + (_preds_unimpl((s.state | default([])) + (s.post_state | default([])), vocab) | from_json) -%}
+{%- set ns.u = ns.u + (_ops_unimpl(s.ops | default([]), vocab) | from_json) -%}
+{%- if s.act is defined and s.act.kind not in vocab.acts -%}{%- set ns.u = ns.u + ['act ' ~ s.act.kind] -%}{%- endif -%}
+{%- if s.wait is defined -%}{%- for k in s.wait if k not in vocab.waits + ['step'] + (vocab.wait_options | default([])) -%}{%- set ns.u = ns.u + ['wait ' ~ k] -%}{%- endfor -%}
+{%- if (s.wait | list | select('in', vocab.waits) | list | length) != 1 -%}{%- set ns.u = ns.u + ['wait names ' ~ (s.wait | list | select('in', vocab.waits) | list | length) ~ ' observables (exactly one)'] -%}{%- endif -%}
+{%- if s.wait.poll_hold is defined and not (s.wait.phase is defined or s.wait.file_regex is defined) -%}{%- set ns.u = ns.u + ['wait poll_hold needs a phase or file_regex observable'] -%}{%- endif -%}{%- endif -%}
+{%- if s.kill is defined -%}{%- for k in s.kill if k not in vocab.kill_options -%}{%- set ns.u = ns.u + ['kill ' ~ k] -%}{%- endfor -%}{%- endif -%}
+{%- if s.act is defined -%}{%- for k in s.act if k not in vocab.act_keys -%}{%- set ns.u = ns.u + ['act key ' ~ k] -%}{%- endfor -%}{%- endif -%}
+{#- G never reaches hosts: every declared target (and every address-valued host/extra var) is an RFC 5737 TEST-NET-1 address
+    (vocab.target_address_regex); anything else is a declaration error -> UNIMPLEMENTED, never executed -#}
+{%- if s.act is defined and s.act.inventory_targets is defined -%}
+{%- for h in s.act.inventory_targets -%}
+{%- set hv = s.act.inventory_targets[h] | default({}, true) -%}
+{%- if not ((hv.ansible_host | default('') | string) is match(vocab.target_address_regex)) -%}{%- set ns.u = ns.u + ['inventory_targets ' ~ h ~ ' ansible_host is not a TEST-NET-1 address'] -%}{%- endif -%}
+{%- for k in ['ansible_ssh_host'] if k in hv and not ((hv[k] | string) is match(vocab.target_address_regex)) -%}{%- set ns.u = ns.u + ['inventory_targets ' ~ h ~ ' ' ~ k ~ ' is not a TEST-NET-1 address'] -%}{%- endfor -%}
+{%- endfor -%}
+{%- endif -%}
+{%- if s.act is defined -%}{%- for k in ['ansible_host', 'ansible_ssh_host'] if k in (s.act.extra_vars | default({})) and not ((s.act.extra_vars[k] | string) is match(vocab.target_address_regex)) -%}{%- set ns.u = ns.u + ['extra var ' ~ k ~ ' is not a TEST-NET-1 address'] -%}{%- endfor -%}{%- endif -%}
+{%- if s.repeat is defined -%}{%- set ns.u = ns.u + (_steps_unimpl(s.repeat.steps, vocab) | from_json) -%}{%- endif -%}
+{#- increment 2 (codex 230249 (a), 231744 option (a), 234857): produce / tree / fixture_ops shapes (tasks/produce.yml, tree.yml,
+    fixture_ops.yml re-assert them at run time; a malformed one is a declaration error here, never executed) -#}
+{%- if s.produce is defined -%}
+{%- set pk = {'bundle': ['case', 'dest', 'src', 'task'], 'checkout': ['case', 'clone', 'ctl', 'task'], 'admit': ['dir', 'task']} -%}
+{%- set pt = s.produce.task | default('') if s.produce is mapping else '' -%}
+{%- if pt not in (vocab.producer_tasks | default({})) or pt not in pk or (s.produce | list | sort) != pk[pt] -%}{%- set ns.u = ns.u + ['produce ' ~ (s.produce | to_json)] -%}{%- endif -%}
+{%- set ex = s.expect | default({}) -%}
+{%- if (ex.produced | default(false)) == (ex.produce_refused is defined) -%}{%- set ns.u = ns.u + ['produce ' ~ (s.id | default('?')) ~ ' expects exactly one of produced / produce_refused'] -%}{%- endif -%}
+{%- if ex.produce_refused is defined and ex.produce_task is not defined -%}{%- set ns.u = ns.u + ['produce ' ~ (s.id | default('?')) ~ ' refusal without produce_task (the exact leaf)'] -%}{%- endif -%}
+{%- endif -%}
+{%- if s.tree is defined and not (s.tree is mapping and (s.tree | list | sort) == ['name', 'of']) -%}{%- set ns.u = ns.u + ['tree ' ~ (s.tree | to_json)] -%}{%- endif -%}
+{%- for o in s.fixture_ops | default([]) if not (o is mapping and (o | list | first) in ['mkdir', 'copy_tree', 'move', 'symlink']) -%}{%- set ns.u = ns.u + ['fixture_op ' ~ (o | to_json)] -%}{%- endfor -%}
+{#- 003441 (G-STAGING-*): a declared staging outcome (controls.j2 judge_staging) belongs to a fixture_ops step and names exactly
+    one of staging_refused CODE / staging_failed true, the exact leaf staging_task and a staging_index inside its list -#}
+{%- set sx = s.expect | default({}) -%}
+{%- if sx is mapping and (sx | list | select('match', '^staging_') | list | length) > 0 -%}
+{%- set sref = sx.staging_refused is defined -%}
+{%- set sfail = sx.staging_failed is defined -%}
+{%- if s.fixture_ops is not defined or sref == sfail or (sfail and sx.staging_failed is not sameas true)
+      or (sref and not (sx.staging_refused is string and sx.staging_refused | length > 0))
+      or sx.staging_task is not defined or sx.staging_index is not defined or not ((sx.staging_index | string) is match('^[0-9]+$'))
+      or (sx.staging_index | int) >= (s.fixture_ops | default([]) | length) -%}
+{%- set ns.u = ns.u + ['fixture_ops ' ~ (s.id | default('?')) ~ ' staging expectation needs a fixture_ops step, exactly one of staging_refused CODE / staging_failed true, staging_task and a staging_index inside its list'] -%}
+{#- G-FIXTURE-ITEM-STOP-CONTROL (codex tick330): every action after the declared outcome is declared in staging_skipped
+    (exactly the later indexes; judged at run time by judge_staging_skipped against the per-item skip records) -#}
+{%- elif ((sx.staging_skipped | default([])) is not sequence) or (sx.staging_skipped | default([])) is string
+      or (sx.staging_skipped | default([]) | map('string') | list) != (range((sx.staging_index | int) + 1, s.fixture_ops | length) | map('string') | list) -%}
+{%- set ns.u = ns.u + ['fixture_ops ' ~ (s.id | default('?')) ~ ' staging_skipped must list exactly the actions after staging_index ' ~ (sx.staging_index | string) ~ ' (' ~ (range((sx.staging_index | int) + 1, s.fixture_ops | length) | list | to_json) ~ '); got ' ~ (sx.staging_skipped | default([]) | to_json)] -%}
+{%- endif -%}
+{%- endif -%}
+{#- G-OP-PER-ITEM-GUARD (codex tick330 item 2): a declared op outcome (judge_op_outcome / judge_op_skipped, tasks/op.yml)
+    belongs to an ops step and names op_failed true, an op_index inside its list and at least one op_msg_has string; its
+    op_skipped lists exactly the later indexes -#}
+{%- if sx is mapping and (sx | list | select('match', '^op_') | list | length) > 0 -%}
+{%- if s.ops is not defined or sx.op_failed is not sameas true
+      or sx.op_index is not defined or not ((sx.op_index | string) is match('^[0-9]+$')) or (sx.op_index | int) >= (s.ops | default([]) | length)
+      or sx.op_msg_has is not defined or sx.op_msg_has is string or sx.op_msg_has is not sequence or (sx.op_msg_has | length) == 0 -%}
+{%- set ns.u = ns.u + ['ops ' ~ (s.id | default('?')) ~ ' op outcome needs an ops step, op_failed true, an op_index inside its list and at least one op_msg_has string'] -%}
+{%- elif ((sx.op_skipped | default([])) is not sequence) or (sx.op_skipped | default([])) is string
+      or (sx.op_skipped | default([]) | map('string') | list) != (range((sx.op_index | int) + 1, s.ops | length) | map('string') | list) -%}
+{%- set ns.u = ns.u + ['ops ' ~ (s.id | default('?')) ~ ' op_skipped must list exactly the ops after op_index ' ~ (sx.op_index | string) ~ ' (' ~ (range((sx.op_index | int) + 1, s.ops | length) | list | to_json) ~ '); got ' ~ (sx.op_skipped | default([]) | to_json)] -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ ns.u | to_json }}
+{%- endmacro -%}
+
+{#- keys a control uses that the runner does not implement -> UNIMPLEMENTED (fails acceptance, never QUEUED).
+    Per variant: returns {variant id: [reasons]} ('base' when the control has no variants). -#}
+{%- macro unimplemented(c, vocab) -%}
+{%- set ni = vocab.not_implemented | default({}) -%}
+{%- set ns = namespace(common = [], out = {}) -%}
+{%- for k in c if k not in vocab.control_keys -%}{%- set ns.common = ns.common + ['control key ' ~ k] -%}{%- endfor -%}
+{%- set ns.common = ns.common + (_ops_unimpl((c.setup | default([])) + (c.undo | default([])), vocab) | from_json)
+                  + (_steps_unimpl(c.steps | default([]), vocab) | from_json) -%}
+{%- if c.sweep is defined and (c.sweep.kind not in vocab.sweeps or c.sweep.kind in (ni.sweeps | default([]))) -%}{%- set ns.common = ns.common + ['sweep ' ~ c.sweep.kind] -%}{%- endif -%}
+{%- for sc in c.static_checks | default([]) -%}
+{%- for k in sc if k not in vocab.static_checks or k in (ni.static_checks | default([])) -%}{%- set ns.common = ns.common + ['static check ' ~ k] -%}{%- endfor -%}
+{%- for k in sc -%}
+{%- for n in (sc[k].negative_controls | default([])) if n.kind not in ((vocab.static_check_mutations | default({}))[k] | default([])) -%}{%- set ns.common = ns.common + ['static check ' ~ k ~ ' mutation ' ~ n.kind] -%}{%- endfor -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- if c.declared_only is defined -%}{%- set ns.common = ns.common + ['declared_only (no executable steps in this runner)'] -%}{%- endif -%}
+{%- for v in (c.variants | default([{'id': 'base'}])) -%}
+{%- set ns.v = [] -%}
+{%- for k in v if k not in vocab.variant_keys -%}{%- set ns.v = ns.v + ['variant key ' ~ k] -%}{%- endfor -%}
+{#- G-STEP-LIVE-FAIL-GUARD: a declared stop names a string step id and carries its non-empty after_stop predicates -#}
+{%- if (v.expect_stop_at is defined or v.after_stop is defined) and not (v.expect_stop_at is string and v.after_stop is sequence and v.after_stop is not string and v.after_stop | length > 0) -%}{%- set ns.v = ns.v + ['expect_stop_at needs a step id and non-empty after_stop predicates'] -%}{%- endif -%}
+{%- set ns.v = ns.v + (_preds_unimpl(v.after_stop | default([]), vocab) | from_json) -%}
+{#- expect_stop_failure_has (the undeclared-failure negative): only with expect_stop_at, a non-empty list of strings -#}
+{%- if v.expect_stop_failure_has is defined and not (v.expect_stop_at is defined and v.expect_stop_failure_has is sequence and v.expect_stop_failure_has is not string
+      and v.expect_stop_failure_has is not mapping and v.expect_stop_failure_has | length > 0 and (v.expect_stop_failure_has | reject('string') | list | length == 0)) -%}
+{%- set ns.v = ns.v + ['expect_stop_failure_has needs expect_stop_at and a non-empty list of strings'] -%}{%- endif -%}
+{%- set ns.v = ns.v + (_ops_unimpl((v.ops | default([])) + (v.undo | default([])), vocab) | from_json) -%}
+{%- for sid in (v.expect | default({})) -%}{%- for k in v.expect[sid] if k not in vocab.expect -%}{%- set ns.v = ns.v + ['expect ' ~ k] -%}{%- endfor -%}{%- endfor -%}
+{#- cleanup_purge (the cleanup race control): only the declared keys, a barrier of a declared kind at out / err, known
+    expectations and predicates; a root: fresh control (the purge runs only there) -#}
+{%- if v.cleanup_purge is defined -%}
+{%- set cp = v.cleanup_purge -%}
+{%- for k in cp if k not in (vocab.cleanup_purge_keys | default([])) -%}{%- set ns.v = ns.v + ['cleanup_purge key ' ~ k] -%}{%- endfor -%}
+{%- for b in cp.record_barrier | default([]) -%}
+{%- if not (b is mapping and b | length == 1 and (b | list | first) in ['fifo', 'regular'] and b[b | list | first] in ['out', 'err']) -%}{%- set ns.v = ns.v + ['cleanup_purge record_barrier ' ~ (b | to_json)] -%}{%- endif -%}
+{%- endfor -%}
+{%- for k in (cp.expect | default({})) if k not in vocab.expect -%}{%- set ns.v = ns.v + ['cleanup_purge expect ' ~ k] -%}{%- endfor -%}
+{%- set ns.v = ns.v + (_preds_unimpl(cp.post_state | default([]), vocab) | from_json) -%}
+{%- if (c.root | default('')) != 'fresh' -%}{%- set ns.v = ns.v + ['cleanup_purge on a control whose root is not fresh (the purge never runs)'] -%}{%- endif -%}
+{%- endif -%}
+{#- 003441 (G-STAGING-*): after_undo names non-empty predicates checked after the undo ops and the staging reversal (tasks/variant.yml) -#}
+{%- if v.after_undo is defined and not (v.after_undo is sequence and v.after_undo is not string and v.after_undo | length > 0) -%}{%- set ns.v = ns.v + ['after_undo needs non-empty predicates'] -%}{%- endif -%}
+{%- set ns.v = ns.v + (_preds_unimpl(v.after_undo | default([]), vocab) | from_json) -%}
+{#- tick330 G-UNDO-PROTECTION-PROPAGATION: after_cleanup names non-empty predicates checked after the WHOLE undo and cleanup
+    sequence (finish_variant + the fixture control dir removal; tasks/variant.yml); expect_undo_findings is a non-empty list of
+    {path, why} (path exact, why a regex; controls.j2 judge_undo_findings) -#}
+{%- if v.after_cleanup is defined and not (v.after_cleanup is sequence and v.after_cleanup is not string and v.after_cleanup | length > 0) -%}{%- set ns.v = ns.v + ['after_cleanup needs non-empty predicates'] -%}{%- endif -%}
+{%- set ns.v = ns.v + (_preds_unimpl(v.after_cleanup | default([]), vocab) | from_json) -%}
+{%- if v.expect_undo_findings is defined and not (v.expect_undo_findings is sequence and v.expect_undo_findings is not string and v.expect_undo_findings | length > 0
+      and (v.expect_undo_findings | reject('mapping') | list | length == 0)
+      and (v.expect_undo_findings | selectattr('path', 'string') | selectattr('why', 'string') | list | length == v.expect_undo_findings | length)
+      and (v.expect_undo_findings | map('list') | map('sort') | map('join', ',') | unique | list == ['path,why'])) -%}
+{%- set ns.v = ns.v + ['expect_undo_findings needs a non-empty list of {path, why} strings'] -%}{%- endif -%}
+{%- set ns.out = ns.out | combine({v.id: (ns.common + ns.v) | unique | list}) -%}
+{%- endfor -%}
+{{ ns.out | to_json }}
+{%- endmacro -%}
+
+{#- status before execution. deps: {name: {met: bool, kind, why}}; unimpl: [reasons] for this variant.
+    applies_when {ruling: <dependency of kind ruling>, options: [...]}: unruled -> QUEUED; ruled another option -> NOT-APPLICABLE.
+    retire_when <dependency>: once it is met the control is RETIRED -> NOT-APPLICABLE (recorded, never coverage).
+    A requirement of kind main_only -> MAIN-ONLY (MAIN's run population; G never runs it; never PASS/coverage on G).
+    Returns {status: QUEUED|MAIN-ONLY|UNIMPLEMENTED|RESIDUAL|OPEN-REGRESSION|NOT-APPLICABLE|READY, why: [...]} -#}
+{%- macro plan_status(c, variant, deps, unimpl) -%}
+{#- a declaration variant requires its route: variant_checkout: clone -> the declared clone fixture (always that route,
+    tasks/variant_admit.yml); otherwise variant:<id> (override or MAIN-staged copy, as that declaration permits) -#}
+{%- set req = (c.requires | default([])) + (variant.requires | default([]))
+              + (((['variant_clone_fixture'] if (c.variant_checkout | default('')) == 'clone' else ['variant:' ~ (variant.declaration | default(c.declaration))]))
+                 if (variant.declaration | default(c.declaration | default(''))) else []) -%}
+{#- codex 212700 dependency scope + codex 220515 G-EXPORT-CONSUMER-COVERAGE: a control/variant with ANY launcher-consuming
+    path (launcher_consumers below: seed acts, playbook acts via seed_run, repeat-nested and sweep-generated steps, and the
+    cleanup seed launches of finish_variant.yml, including the {vroot} purge a step's install makes necessary)
+    IMPLICITLY requires route_launch_params_export (its launch parameters come only from the route export
+    seed_launcher.params_rel), so without it the control is visibly QUEUED on that dependency, naming the consuming paths
+    -- never dropped from coverage, never a PASS; every other control keeps its own binding -#}
+{%- set lc = launcher_consumers(c, variant) | from_json -%}
+{%- set req = req + (['route_launch_params_export'] if lc else []) -%}
+{%- set ns = namespace(queued = [], after = [], main = false) -%}
+{%- for r in req -%}
+{%- set d = deps[r] | default({'met': false, 'kind': 'undeclared', 'why': 'undeclared dependency'}) -%}
+{%- if d.kind == 'main_only' -%}{%- set ns.main = true -%}{%- endif -%}
+{%- if d.kind == 'control' and not d.met -%}{%- set ns.after = ns.after + ['after ' ~ d.control] -%}
+{%- elif not d.met -%}{%- set ns.queued = ns.queued + [r ~ ': ' ~ d.why
+      ~ ((' [launcher consumers: ' ~ (lc | join('; ')) ~ ']') if r == 'route_launch_params_export' else '')] -%}{%- endif -%}
+{%- endfor -%}
+{%- set aw = c.applies_when | default(none) -%}
+{%- set ad = (deps[aw.ruling] | default({'met': false, 'kind': 'undeclared', 'why': 'undeclared ruling'})) if aw else none -%}
+{%- set rw = c.retire_when | default(none) -%}
+{%- set rd = (deps[rw] | default({'met': false, 'kind': 'undeclared', 'why': 'undeclared dependency'})) if rw else none -%}
+{#- P04/P06: a control is planned only against the bytes it was authored for. bound_bytes_current (prepare.yml) digests every
+    bound_bytes_at_authoring path; any mismatch or absence re-queues EVERY control before any other rule (also retire/applies_when,
+    whose probes read the changed bytes). codex 023332 G-CURRENT-BINDING: a MISSING bound_bytes_current (binding never evaluated)
+    is the same as an unmet one -- no older-harness fallback; an absent/empty/non-digest binding is refused in prepare.yml. -#}
+{%- set bb = deps['bound_bytes_current'] | default({'met': false, 'why': 'binding not evaluated (no bound_bytes_current dependency; no older-harness fallback)'}) -%}
+{%- if not bb.met -%}{{ {'status': 'QUEUED', 'why': ['stale-binding: ' ~ bb.why] + ns.queued} | to_json }}
+{%- elif rw and rd.met -%}{{ {'status': 'NOT-APPLICABLE', 'why': ['retired: ' ~ rw ~ ' is met (' ~ rd.why ~ ')']} | to_json }}
+{%- elif aw and ad.met and ad.value not in aw.options -%}{{ {'status': 'NOT-APPLICABLE', 'why': [aw.ruling ~ ' ruled ' ~ ad.value ~ '; this control declares option ' ~ (aw.options | join('|'))]} | to_json }}
+{%- elif aw and not ad.met -%}{{ {'status': 'QUEUED', 'why': [aw.ruling ~ ': ' ~ ad.why] + ns.queued} | to_json }}
+{#- a variant requiring a main_only dependency is MAIN's run population (root / another uid / a real target, or a codex
+    ruling that made it MAIN's): never QUEUED on G, never NOT-APPLICABLE, never coverage here; its other unmet deps are listed -#}
+{%- elif ns.main -%}{{ {'status': 'MAIN-ONLY', 'why': ns.queued} | to_json }}
+{%- elif c.result_class is defined -%}{{ {'status': c.result_class, 'why': [c.declared_only | default(c.note | default(''))] + ns.queued} | to_json }}
+{%- elif ns.queued -%}{{ {'status': 'QUEUED', 'why': ns.queued} | to_json }}
+{%- elif unimpl -%}{{ {'status': 'UNIMPLEMENTED', 'why': unimpl} | to_json }}
+{%- else -%}{{ {'status': 'READY', 'why': ns.after} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ launcher consumers + route export ------------ -#}
+{#- G-EXPORT-CONSUMER-COVERAGE (codex 220515 / 220352; the same macros as m1-1g): every path of a control/variant that
+    launches the seed through the bundle's generated launcher (plan_act -> seed_launch) and therefore consumes
+    ctx.launch_params. Derived from the SAME shapes the runner executes, never from a list of control ids:
+      steps       c.steps (compile executes c.steps only, and none when a sweep generates them), and every repeat.steps
+                  nested at any depth, each step whose act is kind seed (any op / invoke) OR a playbook-shaped act with via
+                  seed_run (plan_act: `seed run`) -- AFTER the SAME effective variant filtering execution applies
+                  (G-EXPORT-VARIANT-SELECTION, codex 223100: step_selected below is the ONE predicate compile uses; a
+                  repeat's only_variants / skip_variants override its sub-steps' as flatten combines them), so a variant
+                  whose selected steps launch nothing is not queued because a sibling-only step does
+      generated   sweep phases / declared_points (sweep_phases / sweep_points generate seed apply / verify / purge steps);
+                  sweep pins: each per_point_expect.entrypoints entry with via seed_run (sweep_pins)
+      cleanup     finish_variant.yml: root fresh -> the cleanup purge of {root}; root shared -> the cleanup re-verify of
+                  {shared}; variant cleanup_purge -> that purge (a declared deviation of the same launch). The {vroot} purge
+                  (cleanup-purge-vroot) runs only for a clone root a step installed -- that step is itself a consumer
+    Returns the consuming paths (strings, stable order); [] = the control consumes no launcher. -#}
+{#- G-EXPORT-VARIANT-SELECTION (codex 223100): the ONE effective step-selection predicate, used by compile (execution) and
+    by launcher_consumers (planning). s: a (flattened) step; vid: the variant id. Returns JSON true / false. -#}
+{%- macro step_selected(s, vid) -%}
+{{ ((s.only_variants is not defined or vid in s.only_variants) and (vid not in (s.skip_variants | default([])))) | to_json }}
+{%- endmacro -%}
+
+{%- macro _step_launches(steps, prefix, vid, inherit) -%}
+{%- set ns = namespace(r = []) -%}
+{%- for s0 in steps | default([]) -%}
+{%- if s0 is mapping -%}
+{#- flatten: a repeat's own only_variants / skip_variants are combined OVER each sub-step's -#}
+{%- set s = s0 | combine(inherit) -%}
+{%- if s.repeat is defined -%}
+{%- set ns.r = ns.r + (_step_launches(s.repeat.steps | default([]), prefix ~ s.id ~ ' > ', vid,
+      s | dict2items | selectattr('key', 'in', ['only_variants', 'skip_variants']) | items2dict) | from_json) -%}
+{%- elif step_selected(s, vid) | from_json -%}
+{%- set a = s.act | default({}) -%}
+{%- if a is mapping and (a.kind | default('')) == 'seed' -%}{%- set ns.r = ns.r + ['step ' ~ prefix ~ s.id ~ ' (seed ' ~ (a.op | default('?')) ~ ')'] -%}
+{%- elif a is mapping and (a.via | default('')) == 'seed_run' -%}{%- set ns.r = ns.r + ['step ' ~ prefix ~ s.id ~ ' (' ~ (a.playbook | default(a.kind | default('?'))) ~ ' via seed_run)'] -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{%- macro launcher_consumers(c, variant) -%}
+{%- set v = variant if variant is mapping else {} -%}
+{%- set sw = (c.sweep | default({})).kind | default('') -%}
+{%- set ns = namespace(r = [] if sw in ['phases', 'declared_points', 'pins']
+                            else (_step_launches(c.steps | default([]), '', v.id | default('base'), {}) | from_json)) -%}
+{%- if sw in ['phases', 'declared_points'] -%}{%- set ns.r = ns.r + ['sweep ' ~ sw ~ ' (generated seed apply / verify / purge steps)'] -%}{%- endif -%}
+{%- if sw == 'pins' -%}
+{%- for e in (c.per_point_expect | default({})).entrypoints | default([]) if (e.via | default('')) == 'seed_run' -%}
+{%- set ns.r = ns.r + ['sweep pins entrypoint ' ~ e.playbook ~ ' via seed_run'] -%}
+{%- endfor -%}
+{%- endif -%}
+{%- if (c.root | default('')) == 'fresh' -%}{%- set ns.r = ns.r + ['cleanup purge of the fresh root (finish_variant)'] -%}{%- endif -%}
+{%- if (c.root | default('')) == 'shared' -%}{%- set ns.r = ns.r + ['cleanup re-verify of the shared root (finish_variant)'] -%}{%- endif -%}
+{%- if v.cleanup_purge is defined and (c.root | default('')) != 'fresh' -%}{%- set ns.r = ns.r + ['variant cleanup_purge (finish_variant)'] -%}{%- endif -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- G-EXPORT-AVAILABILITY-ORDER (codex 220515 / 220352): the route export's availability, decided BEFORE anything renders
+    it (tasks/export_availability.yml gathers the stat; this judges it). rel = the resolved seed_launcher.params_rel;
+    st = the registered stat result of <checkout>/<rel> (follow false; skipped or {} when not stat-ed). A repository-relative
+    path is required for the stat to be confined to the checkout (an absolute or '..' path is never stat-ed); the loader's
+    own admission of params_rel (C1 contract_admission) is not restated or relaxed here.
+    Returns {state: undeclared | declared-unconfined | declared-missing | declared-not-regular | available, met, why}. -#}
+{%- macro export_availability(rel, st) -%}
+{%- set r = rel if (rel is string) else '' -%}
+{%- set s = (st.stat | default({})) if (st is mapping) else {} -%}
+{%- set k = 'controller.bootstrap.seed_launcher.params_rel' -%}
+{%- if r | length == 0 -%}{{ {'state': 'undeclared', 'met': false, 'why': k ~ ' undeclared in the resolved profile'} | to_json }}
+{%- elif r.startswith('/') or ('..' in r.split('/')) -%}{{ {'state': 'declared-unconfined', 'met': false,
+      'why': k ~ ' = ' ~ r ~ ' is not a repository-relative path (never stat-ed or rendered)'} | to_json }}
+{%- elif not (s.exists | default(false)) -%}{{ {'state': 'declared-missing', 'met': false,
+      'why': k ~ ' = ' ~ r ~ ' is declared but absent from this checkout (route defect; no guessed export, no default parameter list)'} | to_json }}
+{%- elif (s.islnk | default(false)) or not (s.isreg | default(false)) -%}{{ {'state': 'declared-not-regular', 'met': false,
+      'why': k ~ ' = ' ~ r ~ ' is not a regular file (link or other type; never followed or rendered)'} | to_json }}
+{%- else -%}{{ {'state': 'available', 'met': true, 'why': k ~ ' = ' ~ r ~ ' declared and present'} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- the rendered export is consumed only in its declared shape: a mapping whose keys are EXACTLY the resolved
+    seed_launch.mode_args modes, each value a list of non-empty strings (the mode's positional parameter names, in order).
+    Returns {met, why}; anything else is shape-invalid (a route defect; nothing is defaulted or repaired). -#}
+{%- macro export_shape(params, modes) -%}
+{%- set ns = namespace(bad = []) -%}
+{%- if params is not mapping -%}{%- set ns.bad = ['not a mapping'] -%}
+{%- else -%}
+{%- set pk = params | list | sort -%}
+{%- set mk = modes | list | sort -%}
+{%- if pk != mk -%}{%- set ns.bad = ns.bad + ['modes ' ~ (pk | to_json) ~ ' != seed_launch.mode_args modes ' ~ (mk | to_json)] -%}{%- endif -%}
+{%- for m in pk -%}
+{%- set v = params[m] -%}
+{%- if v is string or v is mapping or v is not iterable -%}{%- set ns.bad = ns.bad + [m ~ ': not a list'] -%}
+{%- elif (v | reject('string') | list | length > 0) or (v | select('string') | reject('match', '.') | list | length > 0) -%}{%- set ns.bad = ns.bad + [m ~ ': an entry is not a non-empty string'] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{ {'met': ns.bad | length == 0, 'why': ('shape-invalid: ' ~ (ns.bad | join('; '))) if ns.bad else 'shape as declared'} | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------ Route 3 clone fixtures (codex 220953 / 223100) ---------- -#}
+{#- the controller.bootstrap-relative patch of a route catalog profile_cases entry (tests/bundle_fixtures.yml): either
+    patch_bootstrap (a mapping, recursively combined under controller.bootstrap) or patch {path, value} with a dotted
+    path that starts controller.bootstrap. (one field). Returns {patch, why}; why != '' is a declaration error. -#}
+{%- macro profile_case_patch(pc) -%}
+{%- set pre = 'controller.bootstrap.' -%}
+{%- if pc is not mapping -%}{{ {'patch': {}, 'why': 'profile case is not a mapping'} | to_json }}
+{%- elif pc.patch_bootstrap is defined and pc.patch is defined -%}{{ {'patch': {}, 'why': 'profile case ' ~ (pc.id | default('?')) ~ ' declares both patch_bootstrap and patch'} | to_json }}
+{%- elif pc.patch_bootstrap is defined -%}
+{%- if pc.patch_bootstrap is mapping and pc.patch_bootstrap | length > 0 -%}{{ {'patch': pc.patch_bootstrap, 'why': ''} | to_json }}
+{%- else -%}{{ {'patch': {}, 'why': 'profile case ' ~ (pc.id | default('?')) ~ ' patch_bootstrap is not a non-empty mapping'} | to_json }}{%- endif -%}
+{%- elif pc.patch is defined and pc.patch is mapping and (pc.patch.keys() | list | sort) == ['path', 'value'] and pc.patch.path is string
+      and pc.patch.path.startswith(pre) and (pc.patch.path[pre | length:].split('.') | reject('match', '^[A-Za-z0-9_]+$') | list | length == 0) -%}
+{%- set ns = namespace(d = pc.patch.value) -%}
+{%- for k in pc.patch.path[pre | length:].split('.') | reverse -%}{%- set ns.d = {k: ns.d} -%}{%- endfor -%}
+{{ {'patch': ns.d, 'why': ''} | to_json }}
+{%- else -%}{{ {'patch': {}, 'why': 'profile case ' ~ (pc.id | default('?')) ~ ' has neither patch_bootstrap nor patch {path: ' ~ pre ~ '<dotted>, value}'} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- the porcelain v1 (--untracked-files=all) lines a fixture-checkout-result/1 mutation list produces against its head,
+    sorted: modify ' M <path>', add '?? <path>', delete ' D <path>', rename ' D <from>' + '?? <path>' (a copy then a
+    removal, nothing staged: never an 'R' line). Returns {lines, failures}. -#}
+{%- macro fixture_status_lines(mutations) -%}
+{%- set ns = namespace(l = [], f = []) -%}
+{%- if mutations is string or mutations is mapping or mutations is not iterable -%}{%- set ns.f = ['mutations is not a list'] -%}
+{%- else -%}
+{%- for m in mutations -%}
+{%- set p = (m.path | default('')) if m is mapping else '' -%}
+{%- set op = (m.op | default('')) if m is mapping else '' -%}
+{%- set fr = (m.from | default('')) if m is mapping else '' -%}
+{%- if p is not string or p | length == 0 -%}{%- set ns.f = ns.f + ['mutation ' ~ loop.index0 ~ ' has no path'] -%}
+{%- elif op == 'modify' -%}{%- set ns.l = ns.l + [' M ' ~ p] -%}
+{%- elif op == 'add' -%}{%- set ns.l = ns.l + ['?? ' ~ p] -%}
+{%- elif op == 'delete' -%}{%- set ns.l = ns.l + [' D ' ~ p] -%}
+{%- elif op == 'rename' and fr is string and fr | length > 0 -%}{%- set ns.l = ns.l + [' D ' ~ fr, '?? ' ~ p] -%}
+{%- else -%}{%- set ns.f = ns.f + ['mutation ' ~ loop.index0 ~ ' op ' ~ (op or 'absent') ~ ' outside modify | add | delete | rename (with from)'] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{ {'lines': ns.l | sort, 'failures': ns.f} | to_json }}
+{%- endmacro -%}
+
+{#- REPAIR 5 (codex 223100): the clone admission's status is the DECLARED mutation set -- G's own profile line plus every
+    applied fixture's expected_status -- compared with the actual porcelain as a SORTED EXACT set. fx = the G-owned copies
+    of the producer results (fixture-checkout-result/1) applied to this clone; head = the clone's Route 3 head. A fixture
+    result is admitted only when it names that head, its expected_status agrees with its own mutations
+    (fixture_status_lines) and it does not touch the profile. Any 'R' entry, any duplicate and any difference fails.
+    Returns {ok, want, got, failures}. -#}
+{%- macro clone_status(actual, profile_rel, fx, head) -%}
+{%- set ns = namespace(w = [' M ' ~ profile_rel], f = []) -%}
+{%- for r in fx -%}
+{%- set ms = r.mutations if (r.mutations is defined and r.mutations is not string and r.mutations is not mapping and r.mutations is iterable) else [] -%}
+{%- set d = fixture_status_lines(r.mutations | default(none)) | from_json -%}
+{%- set es = r.expected_status | default(none) -%}
+{%- if (r.schema | default('')) != 'fixture-checkout-result/1' -%}{%- set ns.f = ns.f + ['fixture ' ~ loop.index0 ~ ': schema ' ~ (r.schema | default('absent'))] -%}{%- endif -%}
+{%- if (r.head | default('') | string) != (head | string) -%}{%- set ns.f = ns.f + ['fixture ' ~ (r.case | default(loop.index0)) ~ ': head ' ~ (r.head | default('absent')) ~ ' != clone head ' ~ head] -%}{%- endif -%}
+{%- set ns.f = ns.f + (d.failures | map('regex_replace', '^', 'fixture ' ~ (r.case | default(loop.index0)) ~ ': ') | list) -%}
+{%- if es is string or es is mapping or es is not iterable -%}{%- set ns.f = ns.f + ['fixture ' ~ (r.case | default(loop.index0)) ~ ': expected_status is not a list'] -%}
+{%- else -%}
+{%- if (es | sort) != d.lines -%}{%- set ns.f = ns.f + ['fixture ' ~ (r.case | default(loop.index0)) ~ ': expected_status ' ~ (es | sort | to_json) ~ ' != its mutations ' ~ (d.lines | to_json)] -%}{%- endif -%}
+{%- if profile_rel in (ms | select('mapping') | map(attribute='path', default='') | list)
+      or profile_rel in (ms | select('mapping') | map(attribute='from', default='') | list) -%}{%- set ns.f = ns.f + ['fixture ' ~ (r.case | default(loop.index0)) ~ ': touches the profile (the profile is G''s patch only)'] -%}{%- endif -%}
+{%- set ns.w = ns.w + es -%}
+{%- endif -%}
+{%- endfor -%}
+{%- set got = actual | sort -%}
+{%- set want = ns.w | sort -%}
+{%- if want | length != want | unique | list | length -%}{%- set ns.f = ns.f + ['declared mutation set has duplicate lines'] -%}{%- endif -%}
+{%- if got | select('match', '^(R.|.R) ') | list | length > 0 -%}{%- set ns.f = ns.f + ['rename entries in the status: ' ~ (got | select('match', '^(R.|.R) ') | list | to_json)] -%}{%- endif -%}
+{%- if got != want -%}{%- set ns.f = ns.f + ['status ' ~ (got | to_json) ~ ' != declared ' ~ (want | to_json)] -%}{%- endif -%}
+{{ {'ok': ns.f | length == 0, 'want': want, 'got': got, 'failures': ns.f} | to_json }}
+{%- endmacro -%}
+
+{#- REPAIR 5 input map (codex 223100): where each render input bundle A recorded (source.inputs, [path, sha256]) must be
+    found in the clone, and with which digest. The profile is excluded (G's patch; admitted by parsed equality). A rename
+    whose from is the input: the input lives at its new path with the recorded digest, which the producer's before /
+    after digests must both equal (mode preserved). A modify of the input: sha256_before must be the recorded digest and
+    the clone must hold sha256_after. A delete of an input, two mutations of one input, or a mutation landing on another
+    input's path fails. Every other input: byte-identical at its own path. Mutations of non-input paths are not mapped
+    (the clone status set still covers them). Returns {checks: [{input, at, want}], failures}. -#}
+{%- macro input_map(inputs, profile_rel, mutations) -%}
+{%- set ns = namespace(c = [], f = [], ms = []) -%}
+{%- set paths = inputs | map(attribute='0') | list -%}
+{%- for m0 in mutations -%}
+{%- set m = m0 if m0 is mapping else {} -%}
+{%- set ns.ms = ns.ms + [{'op': m.op | default(''), 'path': m.path | default(''), 'from': m.from | default(''),
+                          'sha256_before': m.sha256_before | default('ABSENT'), 'sha256_after': m.sha256_after | default('ABSENT'),
+                          'mode_before': m.mode_before | default('ABSENT'), 'mode_after': m.mode_after | default('ABSENT')}] -%}
+{%- endfor -%}
+{%- set mutations = ns.ms -%}
+{%- for m in mutations -%}
+{%- if m.op not in ['modify', 'add', 'delete', 'rename'] -%}{%- set ns.f = ns.f + ['mutation op ' ~ (m.op or 'absent') ~ ' outside the schema'] -%}{%- endif -%}
+{%- if m.op in ['add', 'rename'] and m.path in paths -%}{%- set ns.f = ns.f + [m.op ~ ' lands on the input path ' ~ m.path] -%}{%- endif -%}
+{%- endfor -%}
+{%- for i in inputs if i[0] != profile_rel -%}
+{%- set rn = mutations | selectattr('op', 'equalto', 'rename') | selectattr('from', 'equalto', i[0]) | list -%}
+{%- set mo = mutations | selectattr('op', 'equalto', 'modify') | selectattr('path', 'equalto', i[0]) | list -%}
+{%- set de = mutations | selectattr('op', 'equalto', 'delete') | selectattr('path', 'equalto', i[0]) | list -%}
+{%- if (rn | length) + (mo | length) + (de | length) > 1 -%}{%- set ns.f = ns.f + ['input ' ~ i[0] ~ ' has more than one mutation'] -%}
+{%- elif de -%}{%- set ns.f = ns.f + ['input ' ~ i[0] ~ ' deleted'] -%}
+{%- elif rn -%}
+{%- set m = rn | first -%}
+{%- if m.sha256_before != i[1] or m.sha256_after != i[1] -%}{%- set ns.f = ns.f + ['rename ' ~ i[0] ~ ' -> ' ~ m.path ~ ': digest ' ~ m.sha256_before ~ ' -> ' ~ m.sha256_after ~ ' != recorded ' ~ i[1]] -%}{%- endif -%}
+{%- if m.mode_before != m.mode_after -%}{%- set ns.f = ns.f + ['rename ' ~ i[0] ~ ' -> ' ~ m.path ~ ': mode ' ~ m.mode_before ~ ' -> ' ~ m.mode_after] -%}{%- endif -%}
+{%- set ns.c = ns.c + [{'input': i[0], 'at': m.path, 'want': i[1]}] -%}
+{%- elif mo -%}
+{%- set m = mo | first -%}
+{%- if m.sha256_before != i[1] -%}{%- set ns.f = ns.f + ['modify ' ~ i[0] ~ ': sha256_before ' ~ m.sha256_before ~ ' != recorded ' ~ i[1]] -%}{%- endif -%}
+{%- set ns.c = ns.c + [{'input': i[0], 'at': i[0], 'want': m.sha256_after}] -%}
+{%- else -%}{%- set ns.c = ns.c + [{'input': i[0], 'at': i[0], 'want': i[1]}] -%}
+{%- endif -%}
+{%- endfor -%}
+{{ {'checks': ns.c, 'failures': ns.f} | to_json }}
+{%- endmacro -%}
+
+{#- variant:<id> dependency (tasks/prepare.yml): met only when a route that declaration may ACTUALLY take is available
+    (tasks/variant_admit.yml). The override (SEED-06 projection) never carries a profile_bytes_differ declaration; such a
+    declaration is reachable ONLY by a variant_checkout: clone control (Route 3, which requires variant_clone_fixture, not
+    variant:<id>). ROUTE 2 RETIRED (codex 220352 / 212700): copy_ids (keys of a supplied rhc_variants) NEVER meet the
+    dependency; a supplied copy is only named in `why` as refused. decl = rhc_decl.declarations[id].
+    Returns {kind: variant, met, why}. (codex-rev8-route-B-G-source-audits-20260924-163642: selftested bytes-only rule) -#}
+{%- macro variant_dep(id, decl, seed06_met, copy_ids) -%}
+{%- set bytes = decl.profile_bytes_differ | default(false) | bool -%}
+{{- {'kind': 'variant',
+     'met': (seed06_met | bool) and not bytes,
+     'why': 'declaration variant ' ~ id ~ ' needs '
+            ~ ('a variant_checkout: clone control (profile_bytes_differ: the override cannot carry it)'
+               if bytes else 'the SEED-06 projection or a variant_checkout: clone control')
+            ~ (('; rhc_variants.' ~ id ~ ' supplied but REFUSED: Route 2 (MAIN-staged copy) is retired') if id in copy_ids else '')} | to_json -}}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ installed-set gate fixtures (G1) --------- -#}
+{#- isg_listing(lock, case) / isg_lock_pins(lock): the FIXTURE macros of control seed.wheels.installed-set-gate (codex
+    tick313 G1; the route fragment installed_set_gate(bs, lock) is rendered separately -- this builds only G's inputs).
+    lock = [{name, version}] read from the lock the profile names; case = one declared vector of rhc_isg_cases:
+      id        [a-z0-9][a-z0-9-]*
+      spell     locked (the lock's names) | dots ('-' -> '.') | mixed (row i%3: 0 '-' -> '_' + upper, 1 '-' -> '.' +
+                capitalize, 2 as locked)
+      version   {at: i, suffix: s} appends s (non-empty) to row i's version | {at: i, form: mangled} row i's version with
+                '.' -> '-' (row i must carry a '.': a mangling that changes nothing is a declaration error)
+      replace   {at: i, form: f} row i's line becomes f (%N = the spelled name, %V = the locked version)
+      insert    [{at: i, line: l}] a raw line inserted before row i (0 <= i <= rows), after the rows are built
+      drop      i: row i omitted (-rows <= i < rows; negative counts from the end)
+      empty     true: the listing is EMPTY (no other listing key allowed)
+      grep_exit n (0..255): the gate's grep is the declared stub exiting n (used by the render, not here)
+    isg_listing returns {text: the freeze listing (rows joined by '\n'), errors: [..]}; any error leaves text ''.
+    isg_lock_pins returns {pins: the lock-side installed set (name lower-cased, '_' / '.' -> '-', '==' version VERBATIM,
+    sorted case-sensitively, joined by ' ' -- independent of the seed's pins literal), errors: [..]}; an empty lock, a lock
+    without a dotted version or without a '-' name (the mangling / spelling vectors would be vacuous) is an error. -#}
+{%- macro isg_listing(lock, case) -%}
+{%- set ns = namespace(l = [], e = [], v = '', line = '') -%}
+{%- set rows = lock | length -%}
+{%- set cid = (case.id | default('?')) | string -%}
+{%- for k in case if k not in ['id', 'spell', 'version', 'replace', 'insert', 'drop', 'empty', 'grep_exit'] -%}{%- set ns.e = ns.e + [cid ~ ': unknown case key ' ~ k] -%}{%- endfor -%}
+{%- if not (case.id is defined and case.id is string and case.id is match('^[a-z0-9][a-z0-9-]*$')) -%}{%- set ns.e = ns.e + [cid ~ ': id is not [a-z0-9][a-z0-9-]*'] -%}{%- endif -%}
+{%- if rows == 0 -%}{%- set ns.e = ns.e + [cid ~ ': empty lock'] -%}{%- endif -%}
+{%- set sp = case.spell | default('locked') -%}
+{%- if sp not in ['locked', 'dots', 'mixed'] -%}{%- set ns.e = ns.e + [cid ~ ': spell ' ~ sp ~ ' is not locked | dots | mixed'] -%}{%- endif -%}
+{%- set vr = case.version | default(none) -%}
+{%- if vr is not none -%}
+{%- if not (vr is mapping and vr.at is defined and vr.at is integer and 0 <= vr.at < rows
+            and ((vr.suffix is defined and vr.suffix is string and vr.suffix | length > 0 and vr.form is not defined)
+                 or (vr.form is defined and vr.form == 'mangled' and vr.suffix is not defined))) -%}
+{%- set ns.e = ns.e + [cid ~ ': version ' ~ (vr | to_json) ~ ' is not {at: 0..' ~ (rows - 1) ~ ', suffix: <non-empty>} | {at, form: mangled}'] -%}
+{%- elif vr.form is defined and '.' not in (lock[vr.at].version | string) -%}
+{%- set ns.e = ns.e + [cid ~ ': version form mangled on row ' ~ vr.at ~ ' (' ~ lock[vr.at].version ~ ') changes nothing'] -%}
+{%- endif -%}
+{%- endif -%}
+{%- set rp = case.replace | default(none) -%}
+{%- if rp is not none and not (rp is mapping and (rp | list | sort) == ['at', 'form'] and rp.at is integer and 0 <= rp.at < rows and rp.form is string and rp.form | length > 0) -%}
+{%- set ns.e = ns.e + [cid ~ ': replace ' ~ (rp | to_json) ~ ' is not {at: 0..' ~ (rows - 1) ~ ', form: <non-empty>}'] -%}
+{%- endif -%}
+{%- for x in case.insert | default([]) if not (x is mapping and (x | list | sort) == ['at', 'line'] and x.at is integer and 0 <= x.at <= rows and x.line is string) -%}
+{%- set ns.e = ns.e + [cid ~ ': insert ' ~ (x | to_json) ~ ' is not {at: 0..' ~ rows ~ ', line: <string>}'] -%}
+{%- endfor -%}
+{%- if case.insert is defined and (case.insert is string or case.insert is not sequence) -%}{%- set ns.e = ns.e + [cid ~ ': insert is not a list'] -%}{%- endif -%}
+{%- if case.drop is defined and not (case.drop is integer and (0 - rows) <= case.drop < rows) -%}{%- set ns.e = ns.e + [cid ~ ': drop ' ~ case.drop ~ ' is not in ' ~ (0 - rows) ~ '..' ~ (rows - 1)] -%}{%- endif -%}
+{%- if case.grep_exit is defined and not (case.grep_exit is integer and 0 <= case.grep_exit <= 255) -%}{%- set ns.e = ns.e + [cid ~ ': grep_exit ' ~ case.grep_exit ~ ' is not 0..255'] -%}{%- endif -%}
+{%- if case.empty is defined -%}
+{%- if case.empty is not sameas true -%}{%- set ns.e = ns.e + [cid ~ ': empty is not true'] -%}
+{%- elif ['spell', 'version', 'replace', 'insert', 'drop'] | select('in', case | list) | list | length > 0 -%}{%- set ns.e = ns.e + [cid ~ ': empty with a listing key'] -%}{%- endif -%}
+{%- endif -%}
+{%- if ns.e | length == 0 and not (case.empty | default(false)) -%}
+{%- for p in lock -%}
+{%- set k = loop.index0 % 3 -%}
+{%- set nm = p.name | string -%}
+{%- set n = nm if sp == 'locked' else ((nm | replace('-', '.')) if sp == 'dots'
+           else ((nm | replace('-', '_') | upper) if k == 0 else ((nm | replace('-', '.') | capitalize) if k == 1 else nm))) -%}
+{%- set ns.v = p.version | string -%}
+{%- if vr is not none and vr.at == loop.index0 -%}{%- set ns.v = (ns.v | replace('.', '-')) if vr.form is defined else (ns.v ~ vr.suffix) -%}{%- endif -%}
+{%- set ns.line = n ~ '==' ~ ns.v -%}
+{%- if rp is not none and rp.at == loop.index0 -%}{%- set ns.line = rp.form | replace('%N', n) | replace('%V', p.version | string) -%}{%- endif -%}
+{%- if not (case.drop is defined and (case.drop % rows) == loop.index0) -%}{%- set ns.l = ns.l + [ns.line] -%}{%- endif -%}
+{%- endfor -%}
+{%- for x in case.insert | default([]) -%}{%- set ns.l = ns.l[:x.at] + [x.line] + ns.l[x.at:] -%}{%- endfor -%}
+{%- endif -%}
+{{ {'text': ('' if ns.e | length > 0 else ns.l | join('\n')), 'errors': ns.e} | to_json }}
+{%- endmacro -%}
+
+{%- macro isg_lock_pins(lock) -%}
+{%- set ns = namespace(p = [], e = []) -%}
+{%- if lock is string or lock is not sequence or lock | length == 0 -%}{%- set ns.e = ['empty lock'] -%}
+{%- else -%}
+{%- for p in lock -%}
+{%- if not (p is mapping and p.name is defined and p.version is defined and (p.name | string) | length > 0 and (p.version | string) | length > 0) -%}{%- set ns.e = ns.e + ['lock row ' ~ loop.index0 ~ ' is not {name, version}'] -%}
+{%- else -%}{%- set ns.p = ns.p + [((p.name | string) | lower | replace('_', '-') | replace('.', '-')) ~ '==' ~ (p.version | string)] -%}{%- endif -%}
+{%- endfor -%}
+{%- if lock | map(attribute='version') | map('string') | select('search', '\\.') | list | length == 0 -%}{%- set ns.e = ns.e + ['no dotted version in the lock (the mangling vector would be vacuous)'] -%}{%- endif -%}
+{%- if lock | map(attribute='name') | map('string') | select('search', '-') | list | length == 0 -%}{%- set ns.e = ns.e + ['no - name in the lock (the spelling vectors would be vacuous)'] -%}{%- endif -%}
+{%- endif -%}
+{{ {'pins': ('' if ns.e | length > 0 else ns.p | sort(case_sensitive=true) | join(' ')), 'errors': ns.e} | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ route producers (produce step) ------------ -#}
+{#- judge_produce(exp, prod, want): judge ONE in-process call of a route producer (tasks/produce.yml; codex 230249 (a),
+    codex 231744 option (a)). prod = {ok, task, msg, before, after}: ok false = the producer (or its include) failed, task
+    = ansible_failed_task.name (the LEAF task that failed, never the include's name), msg = its fail_msg; before / after =
+    the producer's shared result fact (rh_fx_result; rh_bundle for kind admit) read right before and right after the call;
+    sentinel = the runner-owned INVALID value (schema rhc-produce-sentinel/1, step, nonce) produce.yml planted in that fact
+    right before the call (G-ADMIT-FRESHNESS, codex tick297 003441): the call PUBLISHED iff after != sentinel. A missing or
+    malformed sentinel is itself a reason (freshness unprovable).
+    want = {kind: bundle | checkout | admit, case, dest, clone, head, dir}: what THIS step asked for.
+    exp (exactly one of):
+      produced: true           ok, the call published during THIS call (the sentinel is gone: a stale fact from an earlier
+                               call is never evidence, while an identical fresh re-publication -- e.g. re-admitting the same
+                               bundle -- is), and the result names this step's own call: kind bundle -> schema
+                               fixture-bundle-result/1, case and dest; kind checkout -> schema fixture-checkout-result/1,
+                               case, clone and head; kind admit -> the admitted identity's dir
+      produce_refused: CODE    NOT ok; the message starts 'REFUSED CODE'; the leaf task is EXACTLY produce_task; every
+                               produce_msg_has string is in the message; produce_only_component (admit_ancestry refusals):
+                               the offending-component list of the message names that ONE path only (a link stats as link,
+                               non-directory and other-writable, so repeats of it are allowed; any other component, e.g. a
+                               destination parent, fails); and the call published NOTHING (the sentinel remained).
+    Returns reasons (empty = met). An unrelated early failure never meets a refusal expectation. -#}
+{%- macro judge_produce(exp, prod, want) -%}
+{%- set ns = namespace(r = []) -%}
+{%- set msg = prod.msg | default('') | string -%}
+{%- set snt = prod.sentinel | default(none) -%}
+{%- set snt_ok = snt is mapping and (snt.schema | default('')) == 'rhc-produce-sentinel/1' and (snt.nonce | default('') | string) | length > 0 -%}
+{%- set changed = snt_ok and (prod.after | default(none)) != snt -%}
+{%- set a = prod.after | default(none) -%}
+{%- if (exp.produced | default(false)) and (exp.produce_refused is defined) -%}{%- set ns.r = ['the expectation names both produced and produce_refused'] -%}
+{%- elif not (exp.produced | default(false)) and (exp.produce_refused is not defined) -%}{%- set ns.r = ['the expectation names neither produced nor produce_refused'] -%}
+{%- elif not snt_ok -%}{%- set ns.r = ['no runner sentinel was planted in the result fact before the call (freshness unprovable)'] -%}
+{%- elif exp.produced | default(false) -%}
+{%- if not (prod.ok | default(false)) -%}{%- set ns.r = ns.r + ['the producer failed at "' ~ (prod.task | default('?')) ~ '": ' ~ msg[:300] ~ ' (expected produced)'] -%}
+{%- elif not changed -%}{%- set ns.r = ns.r + ['the producer returned without publishing a result during this call (the runner sentinel remained; the prior fact ' ~ ((prod.before | default(none)) | to_json)[:200] ~ ' is never evidence)'] -%}
+{%- elif a is not mapping -%}{%- set ns.r = ns.r + ['the producer published no result'] -%}
+{%- elif want.kind == 'bundle' -%}
+{%- if (a.schema | default('')) != 'fixture-bundle-result/1' or (a.case | default('')) != want.case or (a.dest | default('')) != want.dest -%}{%- set ns.r = ns.r + ['result ' ~ (a.schema | default('?')) ~ ' ' ~ (a.case | default('?')) ~ ' -> ' ~ (a.dest | default('?')) ~ ' is not case ' ~ want.case ~ ' -> ' ~ want.dest] -%}{%- endif -%}
+{%- elif want.kind == 'checkout' -%}
+{%- if (a.schema | default('')) != 'fixture-checkout-result/1' or (a.case | default('')) != want.case or (a.clone | default('')) != want.clone or ((a.head | default('')) | string) != (want.head | string) -%}{%- set ns.r = ns.r + ['result ' ~ (a.schema | default('?')) ~ ' ' ~ (a.case | default('?')) ~ ' on ' ~ (a.clone | default('?')) ~ ' is not case ' ~ want.case ~ ' on ' ~ want.clone ~ ' at ' ~ want.head] -%}{%- endif -%}
+{%- elif want.kind == 'admit' -%}
+{%- if (a.dir | default('')) != want.dir -%}{%- set ns.r = ns.r + ['admitted ' ~ (a.dir | default('?')) ~ ', not ' ~ want.dir] -%}{%- endif -%}
+{%- else -%}{%- set ns.r = ns.r + ['unknown producer kind ' ~ (want.kind | default('?'))] -%}
+{%- endif -%}
+{%- else -%}
+{%- if prod.ok | default(false) -%}{%- set ns.r = ns.r + ['the producer succeeded; expected REFUSED ' ~ exp.produce_refused ~ ' at "' ~ (exp.produce_task | default('?')) ~ '"'] -%}
+{%- else -%}
+{%- if not msg.startswith('REFUSED ' ~ exp.produce_refused) -%}{%- set ns.r = ns.r + ['message is not REFUSED ' ~ exp.produce_refused ~ ': ' ~ msg[:300]] -%}{%- endif -%}
+{%- if exp.produce_task is not defined or (prod.task | default('')) != exp.produce_task -%}{%- set ns.r = ns.r + ['failed task "' ~ (prod.task | default('')) ~ '" is not "' ~ (exp.produce_task | default('<undeclared>')) ~ '"'] -%}{%- endif -%}
+{%- for s in exp.produce_msg_has | default([]) if s not in msg -%}{%- set ns.r = ns.r + ['message lacks "' ~ s ~ '"'] -%}{%- endfor -%}
+{%- if exp.produce_only_component is defined -%}
+{%- set m = msg | regex_search(': \\[([^\\]]*)\\]\\s*\\(path_admission', '\\1') -%}
+{%- set items = ((m[0] if m else '') | regex_findall("'([^']*)'")) | unique | list -%}
+{%- if items != [exp.produce_only_component] -%}{%- set ns.r = ns.r + ['offending components ' ~ (items | to_json) ~ ' are not exactly [' ~ exp.produce_only_component ~ ']'] -%}{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- if changed -%}{%- set ns.r = ns.r + ['a refusal was expected but the result fact changed (the producer published during this call)'] -%}{%- endif -%}
+{%- endif -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- tree_lines(root, files, sums): the DIGEST-BEARING tree record (tasks/tree.yml; codex 234857 content readback): one
+    line '<relpath> <type> <mode> <sha256|->' per entry below root (type f / d / l / o; the sha256 of every regular file,
+    '-' for anything else), sorted. root = the stat of the tree root (never followed): an absent root records
+    ['ABSENT'], a root that is a link or not a directory ['NOT-A-REAL-DIR'] (a tree is never listed through a link).
+    files = the find entries (no link followed), sums = the sha256 stats of the regular files. mtime, uid and size are
+    NOT part of it: equal records mean equal paths, types, modes and bytes. -#}
+{%- macro tree_lines(root, files, sums) -%}
+{%- if not (root.exists | default(false)) -%}{{ ['ABSENT'] | to_json }}
+{%- elif (root.islnk | default(false)) or not (root.isdir | default(false)) -%}{{ ['NOT-A-REAL-DIR'] | to_json }}
+{%- else -%}
+{%- set ns = namespace(l = [], d = {}) -%}
+{%- for s in sums -%}{%- set ns.d = ns.d | combine({s.path: s.checksum | default('UNREAD')}) -%}{%- endfor -%}
+{%- for f in files -%}
+{%- set rel = f.path[(root.path | length) + 1:] -%}
+{%- set t = 'l' if f.islnk | default(false) else ('d' if f.isdir | default(false) else ('f' if f.isreg | default(false) else 'o')) -%}
+{%- set ns.l = ns.l + [rel ~ ' ' ~ t ~ ' ' ~ (f.mode | default('?')) ~ ' ' ~ ((ns.d[f.path] | default('UNREAD')) if t == 'f' else '-')] -%}
+{%- endfor -%}
+{{ ns.l | sort | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ case binding ------------------------------ -#}
+{#- sources: [{prefix, ids, variants}] ; returns unknown ids per control and source ids no control names -#}
+{#- COMPONENT COVERAGE (G-E77-PARTIAL-COVERAGE, codex review 190358; ported from m1-1g, codex 200213 point 7): a control
+    naming a case row covers the WHOLE row unless it declares case_components {<case id>: [<row variant ids>]} -- then it
+    covers only those variants, which must be keys of that row's own `variants` mapping (sources[].variants, read by
+    prepare.yml; an unknown key, a component of a case the control does not name, or components of a row without variants
+    are declaration errors -> unknown). A row is covered only when some control names it whole, or the union of its
+    components over the counted controls equals the row's declared variant set; otherwise it is PARTIAL {covered, missing}.
+    Rows without variants stay whole-row. -#}
+{%- macro row_variants(sources, id) -%}
+{%- set ns = namespace(v = none) -%}
+{%- for s in sources -%}
+{%- set bare = id | replace(s.prefix, '', 1) if (s.prefix and id.startswith(s.prefix)) else (id if not s.prefix else '') -%}
+{%- if ns.v is none and bare and bare in (s.variants | default({})) -%}{%- set ns.v = s.variants[bare] -%}{%- endif -%}
+{%- endfor -%}
+{{ ns.v | to_json }}
+{%- endmacro -%}
+
+{#- entries: [{control, variant, cases, case_components}] counted as covering; returns
+    {whole, partial {case: {covered, missing[, pending_variants]}}}.
+    G-E84-PARTIAL-WHOLE-CREDIT (codex 231744): case_components {<case id>: []} is the EXPLICIT no-credit form -- the entry
+    names the row but credits no component (the row is reported PARTIAL, covered []). With `controls` (the declared controls;
+    summary.yml passes them for execute PASS evidence) a row an entry names WHOLE (no case_components entry) is credited
+    whole only when EVERY declared variant of that entry's control that names the row whole is among the entries (PASSED);
+    otherwise it is PARTIAL with pending_variants {<control>: [<variant not passed>]} -- one passing leg of a multi-leg
+    control never completes the row. Without `controls` (plan: every declared variant is an entry) a whole naming counts
+    whole as before. G-COMPONENT-MULTI-LEG (increment 2): with `controls`, a COMPONENT (case_components entry) counts only
+    when every declared variant of that control crediting that component is among the entries (PASSED); otherwise the row
+    is PARTIAL with pending_components {<component>: {<control>: [<variant not passed>]}} (e.g. E77 consumer-copies is
+    seven catalog copies: one passing copy never credits it). -#}
+{%- macro coverage_of(entries, sources, controls = none) -%}
+{%- set ns = namespace(whole = [], comp = {}, claim = {}, cclaim = {}) -%}
+{%- for e in entries -%}
+{%- for id in e.cases | default([]) -%}
+{%- if id in (e.case_components | default({})) and controls is not none and e.control is defined -%}
+{#- G-COMPONENT-MULTI-LEG (increment 2): with `controls`, a component counts only when EVERY declared variant of that
+    control crediting it has PASSED (one cf-* leg never completes E77 consumer-copies); collected here, decided below -#}
+{%- for k in e.case_components[id] -%}
+{%- set cur = (ns.cclaim[id] | default({}))[k] | default({}) -%}
+{%- set ns.cclaim = ns.cclaim | combine({id: (ns.cclaim[id] | default({})) | combine({k: cur | combine({e.control: ((cur[e.control] | default([])) + [e.variant | default('base')]) | unique | list})})}) -%}
+{%- endfor -%}
+{%- if e.case_components[id] | length == 0 -%}{%- set ns.comp = ns.comp | combine({id: ns.comp[id] | default([])}) -%}{%- endif -%}
+{%- elif id in (e.case_components | default({})) -%}
+{%- set ns.comp = ns.comp | combine({id: ((ns.comp[id] | default([])) + e.case_components[id]) | unique | list}) -%}
+{%- elif controls is not none and e.control is defined -%}
+{%- set cur = ns.claim[id] | default({}) -%}
+{%- set ns.claim = ns.claim | combine({id: cur | combine({e.control: ((cur[e.control] | default([])) + [e.variant | default('base')]) | unique | list})}) -%}
+{%- else -%}{%- set ns.whole = ns.whole + [id] -%}{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- set pend = namespace(p = {}) -%}
+{%- for id, byc in ns.claim.items() -%}
+{%- for cid, passed in byc.items() -%}
+{%- set cs = controls | selectattr('id', 'equalto', cid) | list -%}
+{%- set need = namespace(l = ['<undeclared control>']) -%}
+{%- if cs -%}{%- set need.l = [] -%}
+{%- for v in cs[0].variants | default([{'id': 'base'}]) if id not in (v.case_components | default(cs[0].case_components | default({}))) -%}{%- set need.l = need.l + [v.id] -%}{%- endfor -%}
+{%- endif -%}
+{%- set miss = need.l | reject('in', passed) | list -%}
+{%- if miss -%}{%- set pend.p = pend.p | combine({id: (pend.p[id] | default({})) | combine({cid: miss})}) -%}
+{%- else -%}{%- set ns.whole = ns.whole + [id] -%}{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- set pc = namespace(p = {}) -%}
+{%- for id, byk in ns.cclaim.items() -%}
+{%- for k, byc in byk.items() -%}
+{%- set kc = namespace(done = true) -%}
+{%- for cid, passed in byc.items() -%}
+{%- set cs = controls | selectattr('id', 'equalto', cid) | list -%}
+{%- set need = namespace(l = ['<undeclared control>']) -%}
+{%- if cs -%}{%- set need.l = [] -%}
+{%- for v in cs[0].variants | default([{'id': 'base'}]) if k in ((v.case_components | default(cs[0].case_components | default({})))[id] | default([])) -%}{%- set need.l = need.l + [v.id] -%}{%- endfor -%}
+{%- endif -%}
+{%- set miss = need.l | reject('in', passed) | list -%}
+{%- if miss -%}{%- set kc.done = false -%}{%- set pc.p = pc.p | combine({id: (pc.p[id] | default({})) | combine({k: ((pc.p[id] | default({}))[k] | default({})) | combine({cid: miss})})}) -%}{%- endif -%}
+{%- endfor -%}
+{%- if kc.done -%}{%- set ns.comp = ns.comp | combine({id: ((ns.comp[id] | default([])) + [k]) | unique | list}) -%}
+{%- else -%}{%- set ns.comp = ns.comp | combine({id: ns.comp[id] | default([])}) -%}{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- set pv = namespace(partial = {}, whole = ns.whole) -%}
+{%- for id in ((ns.comp | list) + (pend.p | list)) | unique | sort if id not in ns.whole -%}
+{%- set rv = row_variants(sources, id) | from_json -%}
+{%- set got = ns.comp[id] | default([]) -%}
+{%- set miss = (rv or []) | reject('in', got) | list -%}
+{%- if id in ns.comp and rv and not miss -%}{%- set pv.whole = pv.whole + [id] -%}
+{%- else -%}{%- set pv.partial = pv.partial | combine({id: {'covered': got | sort, 'missing': miss} | combine({'pending_variants': pend.p[id]} if id in pend.p else {})
+                                                                                            | combine({'pending_components': pc.p[id]} if id in pc.p else {})}) -%}{%- endif -%}
+{%- endfor -%}
+{{ {'whole': pv.whole | unique | sort, 'partial': pv.partial} | to_json }}
+{%- endmacro -%}
+
+{%- macro coverage(controls, sources) -%}
+{%- set ns = namespace(known = [], unknown = [], named = []) -%}
+{%- for s in sources -%}{%- set ns.known = ns.known + (s.ids | map('regex_replace', '^', s.prefix) | list) -%}{%- endfor -%}
+{%- for c in controls -%}
+{%- for id in c.cases | default([]) -%}
+{%- set ns.named = ns.named + [id] -%}
+{%- if id not in ns.known -%}{%- set ns.unknown = ns.unknown + [c.id ~ ' -> ' ~ id] -%}{%- endif -%}
+{%- endfor -%}
+{#- case_components may be declared on the control and/or on a variant (a variant's replaces the control's for that
+    variant's result) -- each declaration is validated alike -#}
+{%- set vcc = namespace(l = [{'at': c.id, 'm': c.case_components | default({})}]) -%}
+{%- for v in c.variants | default([]) if v.case_components is defined -%}{%- set vcc.l = vcc.l + [{'at': c.id ~ '/' ~ v.id, 'm': v.case_components}] -%}{%- endfor -%}
+{%- for cc in vcc.l -%}
+{%- for id, comps in cc.m.items() -%}
+{%- set rv = row_variants(sources, id) | from_json -%}
+{%- if id not in (c.cases | default([])) -%}{%- set ns.unknown = ns.unknown + [cc.at ~ ' -> case_components ' ~ id ~ ' (not a case the control names)'] -%}
+{%- elif not rv -%}{%- set ns.unknown = ns.unknown + [cc.at ~ ' -> case_components ' ~ id ~ ' (the row declares no variants)'] -%}
+{%- else -%}{%- for k in comps if k not in rv -%}{%- set ns.unknown = ns.unknown + [cc.at ~ ' -> case_components ' ~ id ~ '/' ~ k ~ ' (not a variant of the row)'] -%}{%- endfor -%}{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{#- G-E84-PARTIAL-WHOLE-CREDIT: MIXED CREDIT is a declaration error -- when some variants of a control credit a row by
+    component (explicitly, [] included) and others omit it, the omission would silently credit the whole row -#}
+{%- for id in c.cases | default([]) if (c.variants | default([])) and (row_variants(sources, id) | from_json) -%}
+{%- set mx = namespace(has = [], omit = []) -%}
+{%- for v in c.variants -%}
+{%- if id in (v.case_components | default(c.case_components | default({}))) -%}{%- set mx.has = mx.has + [v.id] -%}{%- else -%}{%- set mx.omit = mx.omit + [v.id] -%}{%- endif -%}
+{%- endfor -%}
+{%- if mx.has and mx.omit -%}{%- set ns.unknown = ns.unknown + [c.id ~ ' -> case_components ' ~ id ~ ' (mixed credit: variants ' ~ (mx.omit | join(', ')) ~ ' omit it while ' ~ (mx.has | join(', ')) ~ ' credit by component; declare [] for no credit)'] -%}{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{#- declared coverage (plan): what the controls name, components folded in per variant (never evidence) -#}
+{%- set ent = namespace(e = []) -%}
+{%- for c in controls if c.declared_only is not defined -%}
+{%- for v in c.variants | default([{'id': 'base'}]) -%}
+{%- set ent.e = ent.e + [{'cases': c.cases | default([]), 'case_components': v.case_components | default(c.case_components | default({}))}] -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- set cov = coverage_of(ent.e, sources) | from_json -%}
+{{ {'unknown': ns.unknown, 'uncovered': ns.known | reject('in', ns.named) | list, 'partial': cov.partial,
+    'declared_whole': cov.whole, 'known_count': ns.known | length} | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ argv ------------------------------------- -#}
+{%- macro envp(ctx, extra, unset) -%}
+{%- set bs = ctx.rh.controller.bootstrap -%}
+{#- TMPDIR = <run dir>/act-tmp (created by execute.yml): a direct entrypoint (package/acquire via the builder, command acts)
+    never falls back to /tmp under env -i; a seed sets its own TMPDIR for what it runs; an act's env may still override it -#}
+{%- set ns = namespace(e = {'HOME': ctx.env.HOME, 'XDG_RUNTIME_DIR': ctx.env.XDG_RUNTIME_DIR, 'DBUS_SESSION_BUS_ADDRESS': ctx.env.DBUS_SESSION_BUS_ADDRESS,
+                            'TMPDIR': (ctx.t.run ~ '/act-tmp') if (ctx.t.run | default('')) else ''}) -%}
+{%- set ns.e = ns.e | combine(bs.base_env) | combine(extra | default({})) -%}
+{%- set ns.a = [ctx.tools.env, '-i'] -%}
+{%- for k in ns.e | sort if k not in (unset | default([])) and (ns.e[k] | string | length) > 0 -%}{%- set ns.a = ns.a + [k ~ '=' ~ ns.e[k]] -%}{%- endfor -%}
+{{ ns.a | to_json }}
+{%- endmacro -%}
+
+{#- strace prefix: record (network / exec) or inject a delay at a syscall set, optionally restricted to a path. The trace
+    record <base>.strace is created and verified by the writer (writer_cmd) and handed over as descriptor 5: strace -o
+    /proc/self/fd/5 reopens that SAME inode, never the record path -#}
+{%- macro stracep(ctx, act, base) -%}
+{%- set ns = namespace(a = []) -%}
+{%- if act.strace is defined -%}
+{%- set i = act.strace.inject -%}
+{%- set sc = i.syscalls if i.syscalls is string else (i.syscalls | join(',')) -%}
+{%- set ns.a = [ctx.tools.strace, '-f'] + ([] if act.strace.detach_on_tracer_kill | default(false) else ['--kill-on-exit'])
+               + ['-qq', '-ttt', '-o', '/proc/self/fd/5', '-e', 'trace=' ~ sc, '-e', 'inject=' ~ sc ~ ':delay_' ~ i.when ~ '=' ~ i.hold] -%}
+{%- for p in ([act.strace.trace_path] if act.strace.trace_path is defined else []) -%}{%- set ns.a = ns.a + ['-P', p] -%}{%- endfor -%}
+{%- elif act.trace_network | default(false) or act.trace_exec | default(false) -%}
+{%- set sc = (['connect'] if act.trace_network | default(false) else []) + (['execve'] if act.trace_exec | default(false) else []) -%}
+{%- set ns.a = [ctx.tools.strace, '-f', '-qq', '-s', '256', '-o', '/proc/self/fd/5', '-e', 'trace=' ~ (sc | join(','))] -%}
+{%- endif -%}
+{{ ns.a | to_json }}
+{%- endmacro -%}
+
+{#- SEED LAUNCH (R1 LAUNCHER CONSUMPTION, codex 192321 / codex-tick217; lifecycle E82-E85; ported from m1-1g): EVERY G
+    launch of the generated seed (kind seed, via seed_run, finish_variant's cleanup purge / verify) invokes the bundle's
+    GENERATED launcher <abs bundle>/<bundle.launcher_file> by controller.bootstrap.seed_launcher.caller_argv, positional, no
+    `--` of G's:
+      [<bundle_dir>/<bundle.launcher_file>, <mode>, <root>, <mode params...>, <args...>]
+    <mode params> = each placeholder of seed_launch.mode_args.<mode> that is neither a FIXED name nor {args}, in order
+    (the fixed names are the placeholders of seed_launch.argv other than {env_pairs} / {mode_args} -- the same set as
+    controller_seed.j2 launch_fixed; mode_params: mode_args_placeholders): run -> the ssh auth mode, run-local -> the
+    runner, apply / verify / purge -> none (purge's `--confirm <root>` and every mode's `--` are the LAUNCHER's words).
+    G constructs NO environment vector: the launcher ignores the ambient environment and derives HOME from passwd; the
+    socket variable (env.carried) is the CALLER's own, carried by the launcher only for mode env.carried.when.mode with an
+    ssh auth mode whose agent is env.carried.when.ssh_auth_agent -- `carried` names it (returned for the log only).
+    DECLARED DEVIATIONS of a control (never defaults), launcher form:
+      act.env / act.unset_env   the CALLER's ambient environment for this act only: `<runner_tools.env> -u NAME ...
+                                NAME=value ...` right before the launcher (no -i: everything else stays the runner's)
+                                -- E83 hostile ambient, E84 socket set / unset / replaced
+      act.raw_args              words inserted after <root>, before the mode params (E83 count)
+      act.no_ssh_auth           drops the ssh auth mode param (E83 count: run without it)
+      act.launcher_path         argv[0] replaced VERBATIM (E83 relative: a path with a slash, relative to the act's cwd)
+    DIRECT FORM (act.invoke seed_direct | declared_sh): the seed itself is started by the seed_launch vector, env -i with
+    the declared pairs (seed_direct below). Only for a control testing the SEED's own refusals, which the launcher cannot
+    reach because it clears the ambient environment (E78 negatives; E82's "the seed started directly by the seed_launch
+    vector (env -i ...)" layer; a staged copy that holds no launcher, through os_tools.sh). Flagged for codex: G keeps
+    this one declared-vector renderer as a TEST DEVIATION, never a default.
+    words: the {args} words; runner: the {runner} word (run-local). Returns {argv, unresolved, carried, form}. -#}
+{#- G-LAUNCHER-CARRIED-PARAM-RENAME (codex 210509) / G-LAUNCH-PARAMS-FROM-USAGE-TEXT (codex 211754): ctx.launch_params is
+    the ROUTE's own machine export of each mode's positional parameters -- {mode: [names]} rendered by the route file
+    seed_launcher.params_rel, which calls controller_seed.j2 launch_params(words) over seed_launch.mode_args (the SAME
+    macro the launcher itself splits at :246/:259); read by tasks/prepare.yml. G parses no usage text and restates no
+    parameter name. A G template cannot import macros_rel itself: the template lookup's search path is dirname(lookupfile)
+    + ansible_search_path (lookup/template.py 2.19.11:144-154, 2.17.14:132-142), which the executor overwrites
+    (task_executor.py 2.19.11:184-188, 2.17.14:217-221), and Jinja refuses '..'. Until the route export lands,
+    ctx.launch_params is null and every seed act is unresolved below (never a default). -#}
+
+{#- the VALUES of <mode>'s positional parameters (shared by seed_launch and seed_direct; codex 210509): names and order =
+    ctx.launch_params[mode] (the route's export above; an ABSENT key is unresolved, an empty list is zero parameters); the carried mode's seed_launcher.carried_param (whatever
+    its name -- C1 admits a consistent rename, e.g. auth_mode) takes the act's ssh auth mode (dropped by act.no_ssh_auth);
+    every OTHER parameter takes, in order, the act's declared mode_params or else the run-local runner word. A parameter
+    without a value, a surplus value, or a carried mode whose carried_param is not one of its parameters is unresolved.
+    Returns {order, values, carried_param, unresolved}. -#}
+{%- macro launch_values(ctx, act, mode, runner) -%}
+{%- set bs = ctx.rh.controller.bootstrap -%}
+{%- set cw = ((bs.seed_launch | default({})).env | default({})).carried | default({}) -%}
+{%- set cm = (cw.when | default({})).mode | default('') -%}
+{%- set cp = (bs.seed_launcher | default({})).carried_param | default('') -%}
+{%- set am = act.ssh_auth | default(ctx.seed_run_auth_mode) -%}
+{%- set lpm = ctx.launch_params | default(none) -%}
+{%- set ns = namespace(values = {}, order = [], unresolved = [], rest = act.mode_params | default([runner] if runner else [])) -%}
+{%- if lpm is none or mode not in lpm -%}{%- set ns.unresolved = ns.unresolved + ['launch_params.' ~ mode ~ ' absent (route export seed_launcher.params_rel)'] -%}
+{%- else -%}
+{%- if mode == cm and cp not in lpm[mode] -%}{%- set ns.unresolved = ns.unresolved + ['seed_launcher.carried_param ' ~ cp ~ ' is not a parameter of ' ~ mode] -%}{%- endif -%}
+{%- for n in lpm[mode] -%}
+{%- set ns.order = ns.order + [n] -%}
+{%- if mode == cm and n == cp -%}{%- if not (act.no_ssh_auth | default(false)) -%}{%- set ns.values = ns.values | combine({n: am}) -%}{%- endif -%}
+{%- elif ns.rest | length > 0 -%}{%- set ns.values = ns.values | combine({n: ns.rest[0]}) -%}{%- set ns.rest = ns.rest[1:] -%}
+{%- else -%}{%- set ns.unresolved = ns.unresolved + ['mode param {' ~ n ~ '} has no value'] -%}{%- endif -%}
+{%- endfor -%}
+{%- if ns.rest | length > 0 -%}{%- set ns.unresolved = ns.unresolved + ['surplus mode param values ' ~ (ns.rest | to_json)] -%}{%- endif -%}
+{%- endif -%}
+{{ {'order': ns.order, 'values': ns.values, 'carried_param': cp if mode == cm else '', 'unresolved': ns.unresolved} | to_json }}
+{%- endmacro -%}
+
+{%- macro seed_launch(ctx, act, bdir, mode, root, words, runner) -%}
+{%- set bs = ctx.rh.controller.bootstrap -%}
+{%- set sl = bs.seed_launch | default(none) -%}
+{%- set ln = bs.seed_launcher | default(none) -%}
+{%- if (act.invoke | default('')) in ['seed_direct', 'declared_sh'] -%}{{ seed_direct(ctx, act, bdir, mode, root, words, runner) }}
+{%- elif sl is none or ln is none or not (bs.bundle.launcher_file | default('')) -%}{{ {'argv': [], 'unresolved': ['controller.bootstrap.seed_launch / seed_launcher / bundle.launcher_file undeclared'], 'carried': '', 'form': 'launcher'} | to_json }}
+{%- else -%}
+{%- set am = act.ssh_auth | default(ctx.seed_run_auth_mode) -%}
+{%- set mdef = bs.ssh_auth.modes[am] if (bs.ssh_auth is defined and am in bs.ssh_auth.modes) else {} -%}
+{%- set cw = sl.env.carried.when | default({}) -%}
+{%- set lv = launch_values(ctx, act, mode, runner) | from_json -%}
+{%- set ns = namespace(params = [], unresolved = lv.unresolved, pre = [], argv = []) -%}
+{%- if ln.caller_argv != ['{bundle_dir}/{bundle.launcher_file}', '{mode}', '{root}', '{mode_params}', '{args}'] or ln.mode_params != 'mode_args_placeholders' -%}
+{%- set ns.unresolved = ns.unresolved + ['seed_launcher.caller_argv / mode_params shape ' ~ (ln.caller_argv | to_json)] -%}{%- endif -%}
+{%- if mode not in (sl.mode_args | default({})) -%}{%- set ns.unresolved = ns.unresolved + ['mode_args.' ~ mode] -%}{%- endif -%}
+{%- for n in lv.order if n in lv['values'] -%}{%- set ns.params = ns.params + [lv['values'][n]] -%}{%- endfor -%}
+{%- set amb = act.env | default({}) -%}
+{%- if amb or (act.unset_env | default([])) -%}
+{%- set ns.pre = [ctx.tools.env] -%}
+{%- for k in act.unset_env | default([]) -%}{%- set ns.pre = ns.pre + ['-u', k] -%}{%- endfor -%}
+{%- for k in amb | sort -%}{%- set ns.pre = ns.pre + [k ~ '=' ~ amb[k]] -%}{%- endfor -%}
+{%- endif -%}
+{%- set carried = (mdef.socket_env | default('')) if (mode == cw.mode | default('') and (mdef.agent | default('')) == cw.ssh_auth_agent | default('-')) else '' -%}
+{%- set lp = act.launcher_path | default(bdir ~ '/' ~ bs.bundle.launcher_file) -%}
+{%- if act.launcher_path is not defined and not lp.startswith('/') -%}{%- set ns.unresolved = ns.unresolved + ['launcher path not absolute: ' ~ lp] -%}{%- endif -%}
+{%- set ns.argv = ns.pre + [lp, mode, root] + (act.raw_args | default([])) + ns.params + (words | default([])) -%}
+{{ {'argv': ns.argv, 'unresolved': ns.unresolved, 'carried': carried, 'form': 'launcher'} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- SEED DIRECT (declared test deviation only; act.invoke seed_direct | declared_sh -- see seed_launch): the seed_launch
+    vector itself (codex 183510, RH-SEED-LAUNCH; lifecycle E78), no table of G's:
+      argv   seed_launch.argv with {os_tools.env.path}, {bundle_dir}, {bundle.seed_file}, {mode}, {root} substituted,
+             {env_pairs} = env -i pairs and {mode_args} = seed_launch.mode_args[mode] ({root}, {ssh_auth_mode}, {runner}
+             substituted; {args} = the caller's words after `--`). A leftover placeholder is unresolved (no launch).
+      env    EXACTLY seed_launch.env.order: base_env values, HOME = the invoker's passwd home (ctx.passwd_home, the ONE
+             passwd row execute.yml admitted); then env.carried ONLY for mode env.carried.when.mode whose ssh_auth mode has
+             agent == when.ssh_auth_agent: its socket_env with the runner's own value. NO XDG_RUNTIME_DIR /
+             DBUS_SESSION_BUS_ADDRESS / USER / TMPDIR: the seed derives them and refuses a differing caller value.
+    DECLARED DEVIATIONS of a control, never defaults: act.env replaces a declared pair in place or appends NAME=value
+    (sorted), act.unset_env drops a pair, act.raw_args go before the mode words, act.no_ssh_auth drops the carried-parameter
+    word and the option word before it, act.invoke declared_sh runs the seed file through os_tools.sh. LABEL (codex
+    210509): act.direct_purpose (vocabulary.direct_purposes) is required, the step must expect a refusal (act.yml
+    RHC-SEED-DIRECT), and the result proves only the DIRECT SEED boundary. Returns {argv, unresolved, carried, form}. -#}
+{%- macro seed_direct(ctx, act, bdir, mode, root, words, runner) -%}
+{%- set bs = ctx.rh.controller.bootstrap -%}
+{%- set sl = bs.seed_launch | default(none) -%}
+{%- if sl is none -%}{{ {'argv': [], 'unresolved': ['controller.bootstrap.seed_launch undeclared'], 'carried': '', 'form': 'seed_direct'} | to_json }}
+{%- else -%}
+{%- set dev = act.env | default({}) -%}
+{%- set drop = act.unset_env | default([]) -%}
+{%- set am = act.ssh_auth | default(ctx.seed_run_auth_mode) -%}
+{%- set mdef = bs.ssh_auth.modes[am] if (bs.ssh_auth is defined and am in bs.ssh_auth.modes) else {} -%}
+{%- set ns = namespace(pairs = [], unresolved = [], argv = [], mw = [], sock = '') -%}
+{%- for k in sl.env.order -%}
+{%- set pv = namespace(v = none) -%}
+{%- if k in (sl.env.inherited | default({})) -%}{%- set pv.v = (ctx.passwd_home | default('')) if sl.env.inherited[k] == 'invoker_passwd_home' else none -%}
+{%- elif k in (bs[sl.env.base] | default({})) -%}{%- set pv.v = bs[sl.env.base][k] -%}{%- endif -%}
+{%- if k in dev -%}{%- set pv.v = dev[k] -%}{%- endif -%}
+{%- if k in drop -%}
+{%- elif pv.v is none or (pv.v | string | length) == 0 -%}{%- set ns.unresolved = ns.unresolved + [k] -%}
+{%- else -%}{%- set ns.pairs = ns.pairs + [k ~ '=' ~ pv.v] -%}{%- endif -%}
+{%- endfor -%}
+{%- set cw = sl.env.carried | default({}) -%}
+{%- if mode == (cw.when | default({})).mode | default('') and (mdef.agent | default('')) == (cw.when | default({})).ssh_auth_agent | default('-') and not (act.no_ssh_auth | default(false)) -%}
+{%- set ns.sock = mdef.socket_env | default('') -%}
+{%- set sv = dev[ns.sock] if ns.sock in dev else (ctx.env[ns.sock] | default('')) -%}
+{%- if ns.sock and sv and ns.sock not in drop -%}{%- set ns.pairs = ns.pairs + [ns.sock ~ '=' ~ sv] -%}{%- endif -%}
+{%- endif -%}
+{%- for k in dev | sort if k not in sl.env.order and k != ns.sock and k not in drop -%}{%- set ns.pairs = ns.pairs + [k ~ '=' ~ dev[k]] -%}{%- endfor -%}
+{%- if mode not in (sl.mode_args | default({})) -%}{%- set ns.unresolved = ns.unresolved + ['mode_args.' ~ mode] -%}{%- endif -%}
+{#- codex 210509: the direct vector is a LABELLED fault-injection path only -- act.direct_purpose must be one of
+    vocabulary.direct_purposes (seed_refusal: a refusal of the seed the launcher deliberately prevents; launcher_member: the
+    launcher examined as a bundle member); its mode parameters are the SAME launch_values as the launcher's (the route's
+    classification + seed_launcher.carried_param; no parameter name of G's) -#}
+{%- if (act.direct_purpose | default('')) not in ((ctx.vocab | default({})).direct_purposes | default([])) -%}
+{%- set ns.unresolved = ns.unresolved + ['seed_direct without a declared direct_purpose (' ~ (((ctx.vocab | default({})).direct_purposes | default([])) | join(' | ')) ~ ')'] -%}{%- endif -%}
+{%- set lv = launch_values(ctx, act, mode, runner) | from_json -%}
+{%- set ns.unresolved = ns.unresolved + lv.unresolved -%}
+{%- set mws = (sl.mode_args | default({}))[mode] | default([]) -%}
+{%- set cword = ('{' ~ lv.carried_param ~ '}') if lv.carried_param else '' -%}
+{%- for w in mws -%}
+{%- if w == '{args}' -%}{%- set ns.mw = ns.mw + (words | default([])) -%}
+{#- act.no_ssh_auth: the word holding the carried parameter is dropped, and so is the literal word just before it (its
+    option name, no placeholder) -- structure only, no option name of G's -#}
+{%- elif (act.no_ssh_auth | default(false)) and cword and (cword in w or (loop.index < (mws | length) and cword in mws[loop.index] and '{' not in w)) -%}
+{%- else -%}
+{%- set t = namespace(w = w | replace('{root}', root)) -%}
+{%- for n in lv.order if n in lv['values'] -%}{%- set t.w = t.w | replace('{' ~ n ~ '}', lv['values'][n]) -%}{%- endfor -%}
+{%- if '{' in t.w -%}{%- set ns.unresolved = ns.unresolved + ['mode_args ' ~ w] -%}{%- else -%}{%- set ns.mw = ns.mw + [t.w] -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- for w in sl.argv -%}
+{%- if w == '{env_pairs}' -%}{%- set ns.argv = ns.argv + ns.pairs -%}
+{%- elif w == '{mode_args}' -%}{%- set ns.argv = ns.argv + (act.raw_args | default([])) + ns.mw -%}
+{%- else -%}
+{%- set t = namespace(w = w | replace('{os_tools.env.path}', bs.os_tools.env.path) | replace('{bundle_dir}', bdir)
+                          | replace('{bundle.seed_file}', bs.bundle.seed_file) | replace('{mode}', mode) | replace('{root}', root)) -%}
+{%- if '{bundle_dir}' in w and (act.invoke | default('')) == 'declared_sh' -%}{%- set ns.argv = ns.argv + [bs.os_tools.sh.path] -%}{%- endif -%}
+{%- if '{' in t.w -%}{%- set ns.unresolved = ns.unresolved + ['argv ' ~ w] -%}{%- else -%}{%- set ns.argv = ns.argv + [t.w] -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ {'argv': ns.argv, 'unresolved': ns.unresolved, 'carried': ns.sock, 'form': 'seed_direct'} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- the {args} words of a seed act's declared `args`: a leading `--` is the declared separator of seed_launch.mode_args
+    (never repeated); run-local's `--runner <key>` pair is its {runner} (returned apart) -#}
+{%- macro seed_words(op, args) -%}
+{%- set a = args | default([]) -%}
+{%- set runner = a[1] if (op == 'run-local' and a | length > 1 and a[0] == '--runner') else '' -%}
+{%- set rest = a[2:] if runner else a -%}
+{{ {'runner': runner, 'words': rest[1:] if (rest[:1] == ['--']) else rest} | to_json }}
+{%- endmacro -%}
+
+{#- RECORD WRITER CONTRACT (G-PRIVATE-PREPARE-CUSTODY 190358; G-RECORD-OPEN-BEFORE-TIMEOUT 195110/200213; ported from
+    m1-1g, codex 200213 point 7): the ONE writer of an action's records. Returns the shell line of the act (and of a
+    cleanup launch -- finish_variant.yml uses the same macro).
+    BOUND FIRST: the line is `exec <plan.bound> <os_tools.sh> -c <writer body> rhc-writer <plan.inner...>`. plan.bound is the
+    act's own transient scope + `timeout --kill-after=10 <timeout_s>s` (plan_act); the writer body runs as the declared sh
+    CHILD of that timeout, so every record precheck, barrier, create, open and verification below happens inside the act's
+    own scope and bound -- nothing touches a record path before the bound is active. The entrypoint argv is the sh's
+    positional parameters (`exec "$@"`), never re-quoted into the body; plan.argv (bound + inner) is unchanged for the log.
+    The body, in order:
+      1. PRECHECK -- an absence test of every record (any object, a dangling link included): present -> REFUSED
+         RHC-ACT-RECORD stage=precheck; the object is preserved and not opened by the writer.
+      2. BARRIER (a control's declared deviation only; act.record_barrier / cleanup_purge.record_barrier): after the precheck
+         and before the create, the writer itself plants the declared object at a record path -- {fifo: <role>} via
+         runner_tools.mkfifo -m 0600, {regular: <role>} via runner_tools.dd if=/dev/null conv=excl (an EMPTY regular file).
+         A barrier that cannot be planted exits record_refusal.barrier_rc (never the refusal status) with BARRIER-FAILED.
+      3. CREATE -- ONE redirection of a brace group under `set -C` and umask 0177. Noclobber (dash and bash, source-level
+         reading, NOT verified here): the shell stat()s the name; ABSENT -> open(O_WRONLY|O_CREAT|O_EXCL) -- the descriptor
+         IS the object that open created (a name appearing after the stat fails EEXIST: refused); an existing REGULAR file
+         -> EEXIST, never opened (refused stage=open); an existing NON-REGULAR object (a FIFO, a device, a link to either)
+         -> the shell DOES open it O_WRONLY without O_EXCL: a FIFO without a reader BLOCKS inside open(2) until the act's
+         bound ends the writer (rc 124 / 137, no ADMITTED line), a device or a FIFO with a reader IS opened -- and then
+         refused at step 4, never written. That opening is stated, never denied.
+      4. IDENTITY -- before any byte is written, every descriptor must be the SAME object its path names now: path not a
+         link, `stat` of the path == `stat -L` of /proc/$$/fd/<n> (device, inode, owner, links, size, type) and that is an
+         owned (ctx uid), single-link, EMPTY regular file -- else REFUSED stage=identity (nothing written).
+      5. ADMISSION -- only after every record passed step 4: one line per record on the writer's OWN stderr (the ansible
+         task's, never a record), `ADMITTED RHC-ACT-RECORD <role> <dev>:<ino>:<uid>:<links>:<size>:<type>`, then the umask
+         and noclobber are restored and the entrypoint is exec'd with stdout >&3, stderr >&4. collect.yml reads a record
+         ONLY through that admitted identity (writer_admitted / record_readback below).
+    Stated limits (not closed): another process of THIS uid can rename the admitted inode away and back, open it and write
+    it, or forge later ADMITTED lines on the task's stderr via /proc (collect takes the FIRST line per role; lines printed
+    before the exec come first); a traced act's strace reopens /proc/self/fd/5 (the admitted trace inode) -- fd 5 itself
+    STAYS OPEN, writable, at offset 0 in the traced entrypoint, so the trace is DIAGNOSTIC only and never independent
+    custody evidence; that fd 5 survives systemd-run, timeout and strace is verified only when the declared runner runs.
+    The refusal is exit record_refusal.rc AND the stderr marker `REFUSED RHC-ACT-RECORD: stage=<precheck|open|identity>`
+    -- collect.yml needs both. -#}
+{%- macro writer_cmd(plan, ctx) -%}
+{%- set bs = ctx.rh.controller.bootstrap -%}
+{%- set rr = ctx.record_refusal -%}
+{%- set st = bs.os_tools.stat.path -%}
+{%- set nlf = '%s\\n' | quote -%}
+{%- set recs = [['3', 'out', plan.out], ['4', 'err', plan.err]] + ([['5', 'strace', plan.strace]] if plan.strace else []) -%}
+{%- set rpath = {'out': plan.out, 'err': plan.err, 'strace': plan.strace} -%}
+{%- set ns = namespace(pre = [], bar = [], chk = [], adm = [], redir = []) -%}
+{%- for r in recs -%}
+{%- set q = r[2] | quote -%}
+{%- set ns.pre = ns.pre + ['if [ -e ' ~ q ~ ' ] || [ -h ' ~ q ~ ' ]; then printf ' ~ nlf ~ ' ' ~ (('REFUSED ' ~ rr.code ~ ': stage=precheck ' ~ r[1] ~ ' ' ~ r[2] ~ ' exists before its writer created it (preserved, not opened by the writer)') | quote) ~ ' >&2; exit ' ~ rr.rc ~ '; fi'] -%}
+{%- set ns.redir = ns.redir + [r[0] ~ '>' ~ q] -%}
+{%- set ns.chk = ns.chk + ['_a=$(' ~ st ~ ' -c %d:%i:%u:%h:%s:%F -- ' ~ q ~ ') && _b=$(' ~ st ~ ' -L -c %d:%i:%u:%h:%s:%F /proc/$$/fd/' ~ r[0] ~ ')'
+                           ~ ' && [ ! -h ' ~ q ~ ' ] && [ "$_a" = "$_b" ] && case "$_b" in *:*:' ~ ctx.t.uid ~ ":1:0:'regular empty file') true ;; *) false ;; esac"
+                           ~ ' || { printf ' ~ nlf ~ ' ' ~ (('REFUSED ' ~ rr.code ~ ': stage=identity ' ~ r[1] ~ ' ' ~ r[2] ~ ' is not the fresh owned empty regular file its writer created (opened, never written)') | quote) ~ ' >&2; exit ' ~ rr.rc ~ '; }; _r' ~ r[0] ~ '=$_b'] -%}
+{%- set ns.adm = ns.adm + ['printf ' ~ (('ADMITTED ' ~ rr.code ~ ' ' ~ r[1] ~ ' %s\\n') | quote) ~ ' "$_r' ~ r[0] ~ '" >&2'] -%}
+{%- endfor -%}
+{%- for b in plan.record_barrier | default([]) -%}
+{%- set k = b | list | first -%}
+{%- set q = rpath[b[k]] | quote -%}
+{%- set w = ([ctx.tools.mkfifo, '-m', '0600', '--', rpath[b[k]]] if k == 'fifo' else [ctx.tools.dd, 'if=/dev/null', 'of=' ~ rpath[b[k]], 'conv=excl', 'status=none']) | map('quote') | join(' ') -%}
+{%- set ns.bar = ns.bar + [w ~ ' || { printf ' ~ nlf ~ ' ' ~ (('BARRIER-FAILED ' ~ rr.code ~ ': ' ~ k ~ ' at ' ~ b[k] ~ ' ' ~ rpath[b[k]]) | quote) ~ ' >&2; exit ' ~ rr.barrier_rc ~ '; }'] -%}
+{%- endfor -%}
+{%- set body = (ns.pre + ns.bar) | join('; ') ~ '; _m=$(umask); umask 0177; set -C; { ' ~ (ns.chk | join('; ')) ~ '; ' ~ (ns.adm | join('; '))
+               ~ '; umask "$_m"; set +C; exec "$@" </dev/null >&3 2>&4 3>&- 4>&-; } ' ~ (ns.redir | join(' '))
+               ~ ' || { printf ' ~ nlf ~ ' ' ~ (('REFUSED ' ~ rr.code ~ ': stage=open a record of ' ~ plan.out ~ ' could not be created exclusively (an object appeared after the precheck; an existing regular file is never opened)') | quote) ~ ' >&2; exit ' ~ rr.rc ~ '; }' -%}
+{{- 'exec ' ~ ((plan.bound + [bs.os_tools.sh.path, '-c', body, 'rhc-writer'] + plan.inner) | map('quote') | join(' ')) -}}
+{%- endmacro -%}
+
+{#- the identities the writer ADMITTED (its own stderr: writer_cmd step 5) and the stage of its refusal. Only the FIRST
+    admitted line per role counts. Returns {records: [{role, path, dev, ino, uid}], missing: [roles never admitted],
+    stage: <precheck|open|identity|''>}. -#}
+{%- macro writer_admitted(stderr, plan, ctx) -%}
+{%- set code = ctx.record_refusal.code | regex_escape -%}
+{%- set roles = ['out', 'err'] + (['strace'] if plan.strace else []) -%}
+{%- set rpath = {'out': plan.out, 'err': plan.err, 'strace': plan.strace} -%}
+{%- set ns = namespace(adm = {}, stage = '') -%}
+{%- for l in (stderr | default('')).splitlines() -%}
+{%- set m = l | regex_search('^ADMITTED ' ~ code ~ ' (out|err|strace) ([0-9]+):([0-9]+):([0-9]+):', '\\1', '\\2', '\\3', '\\4') -%}
+{%- if m and m[0] in roles and m[0] not in ns.adm -%}
+{%- set ns.adm = ns.adm | combine({m[0]: {'role': m[0], 'path': rpath[m[0]], 'dev': m[1] | int, 'ino': m[2] | int, 'uid': m[3] | int}}) -%}
+{%- endif -%}
+{%- set s = l | regex_search('^REFUSED ' ~ code ~ ': stage=([a-z]+) ', '\\1') -%}
+{%- if s and not ns.stage -%}{%- set ns.stage = s[0] -%}{%- endif -%}
+{%- endfor -%}
+{{ {'records': roles | select('in', ns.adm) | map('extract', ns.adm) | list, 'missing': roles | reject('in', ns.adm) | list, 'stage': ns.stage} | to_json }}
+{%- endmacro -%}
+
+{#- READBACK ADMISSION (collect.yml): a record is read only when its path still names the ADMITTED object. pre: the
+    ansible.builtin.stat results (follow false; mime / attributes / checksum off -- nothing opened) aligned with
+    adm.records. reads: none -> returns the roles whose pre-stat admits a read; otherwise the bounded read results (declared
+    timeout + dd iflag=nofollow,nonblock: a link refuses, a FIFO never blocks) and post: the stat results after the read.
+    A role is accepted when its pre-stat is a regular non-link single-link file with the admitted dev / inode / uid, the
+    read exited 0, and the post-stat is the SAME object unchanged (dev, inode, links, size, mtime, ctime). Returns
+    {text: {role: content}, rejected: [role: reason]}. Stated limit: a same-uid swap and swap-back between the two stats. -#}
+{%- macro readback_ok(r, p) -%}
+{{ (p.exists | default(false)) and (p.isreg | default(false)) and not (p.islnk | default(true)) and (p.nlink | default(0)) == 1
+   and (p.dev | default(-1)) == r.dev and (p.inode | default(-1)) == r.ino and (p.uid | default(-1)) == r.uid }}
+{%- endmacro -%}
+{%- macro record_readback(adm, pre, reads, post) -%}
+{%- set ns = namespace(ok = [], text = {}, rej = []) -%}
+{%- for r in adm.records -%}
+{%- set p = (pre[loop.index0] | default({})).stat | default({}) -%}
+{%- set pok = (readback_ok(r, p) | trim) == 'True' -%}
+{%- if reads is none -%}{%- if pok -%}{%- set ns.ok = ns.ok + [r.role] -%}{%- endif -%}
+{%- else -%}
+{%- set d = reads[loop.index0] | default({}) -%}
+{%- set q = (post[loop.index0] | default({})).stat | default({}) -%}
+{%- set same = pok and (q.exists | default(false)) and (q.isreg | default(false)) and not (q.islnk | default(true))
+               and ['dev', 'inode', 'nlink', 'size', 'mtime', 'ctime'] | map('extract', q) | list == ['dev', 'inode', 'nlink', 'size', 'mtime', 'ctime'] | map('extract', p) | list -%}
+{%- if not pok -%}{%- set ns.rej = ns.rej + [r.role ~ ': path no longer names the admitted object (not read)'] -%}
+{%- elif (d.rc | default(-1)) != 0 -%}{%- set ns.rej = ns.rej + [r.role ~ ': bounded read rc ' ~ (d.rc | default('not run'))] -%}
+{%- elif not same -%}{%- set ns.rej = ns.rej + [r.role ~ ': changed or replaced during the read (discarded)'] -%}
+{%- else -%}{%- set ns.text = ns.text | combine({r.role: d.stdout | default('')}) -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ (ns.ok if reads is none else {'text': ns.text, 'rejected': ns.rej}) | to_json }}
+{%- endmacro -%}
+
+{#- G-PASSWD-RESULT-KEY (codex; ported from m1-1g): ansible.builtin.getent keys getent_passwd by the RETURNED row's field 0
+    (the account NAME), never by the query key. rows: that mapping; uid: the queried uid. Admitted only when exactly ONE
+    row is returned, its uid field (value[1]) equals uid, and its home (value[4]) is absolute. Returns {account, home,
+    failures}. Used by tasks/execute.yml. -#}
+{%- macro passwd_row(rows, uid) -%}
+{%- set items = (rows | default({}, true)) | dict2items -%}
+{%- set hit = items | selectattr('value.1', 'defined') | selectattr('value.1', 'equalto', uid | string) | list -%}
+{%- set ns = namespace(f = []) -%}
+{%- if items | length != 1 -%}{%- set ns.f = ns.f + [(items | length | string) ~ ' passwd rows returned for uid ' ~ uid ~ ' (exactly one required)'] -%}{%- endif -%}
+{%- if hit | length != 1 -%}{%- set ns.f = ns.f + [(hit | length | string) ~ ' returned rows carry uid ' ~ uid ~ ' in the uid field (keys: ' ~ (items | map(attribute='key') | join(' ')) ~ ')'] -%}{%- endif -%}
+{%- set home = ((hit | first).value[4] | default('')) if hit else '' -%}
+{%- if hit and not (home is string and home.startswith('/')) -%}{%- set ns.f = ns.f + ['home of ' ~ (hit | first).key ~ ' is not absolute: ' ~ home] -%}{%- endif -%}
+{{ {'account': (hit | first).key if hit else '', 'home': home, 'failures': ns.f} | to_json }}
+{%- endmacro -%}
+
+{#- one action -> {argv, bound, inner, record_barrier, unit, cwd, out, err, strace, inventory, kill_token, timeout_s, async,
+    seed_launch, records} -#}
+{%- macro plan_act(step, ctx) -%}
+{%- set act = step.act -%}
+{%- set bs = ctx.rh.controller.bootstrap -%}
+{%- set base = ctx.t.ctl ~ '/' ~ step.id -%}
+{%- set repo = ctx.variant_repo if ((act.repo | default('candidate')) == 'variant' and ctx.variant_repo) else ctx.repo -%}
+{%- set tkey = act.kind ~ ('_' ~ act.op if act.op is defined else '') -%}
+{%- set to = act.timeout_s | default(ctx.timeouts[tkey] | default(ctx.timeouts.playbook)) -%}
+{%- set ns = namespace(argv = [], inv = none, invvars = {}, kill = none, pbargs = [], sl = {}) -%}
+{%- if act.kind == 'seed' -%}
+{%- set bdir = ctx.bundles[act.bundle] if act.bundle in ctx.bundles else act.bundle -%}
+{#- the seed launch (seed_launch above: the bundle's generated launcher by caller_argv, or the declared seed_direct
+    deviation); run / run-local words from the declared args; any other mode's args are appended after the positional
+    words as a declared deviation (the launcher's word count refuses them, E83 count) -#}
+{%- set sw = seed_words(act.op, act.args) | from_json -%}
+{%- set consumed = act.op in ['run', 'run-local'] -%}
+{%- set ns.sl = seed_launch(ctx, act, bdir, act.op, act.root, sw.words if consumed else [], sw.runner) | from_json -%}
+{%- set ns.argv = ns.sl.argv + ([] if consumed else (act.args | default([]))) -%}
+{%- set ns.kill = ' --root ' ~ act.root -%}
+{%- elif act.kind == 'command' -%}
+{%- set ns.argv = (envp(ctx, act.env | default({}), act.unset_env | default([])) | from_json) + act.argv -%}
+{%- set ns.kill = base ~ '.stdout' -%}
+{%- else -%}
+{#- playbook-shaped: package / acquire / controller / rendered control playbooks -#}
+{%- set pb_key = act.playbook | default(act.kind) -%}
+{%- set pb = (ctx.t.ctl ~ '/playbooks/' ~ pb_key ~ '.yml') if pb_key in ctx.rendered_playbooks else (repo ~ '/' ~ ctx.entry[pb_key]) -%}
+{%- set via = act.via | default('builder') -%}
+{%- set ns.inv = base ~ '.inventory.yml' -%}
+{%- set iv = {'ansible_connection': 'local',
+              'ansible_python_interpreter': ctx.t.builder_python if via in ['builder', 'builder_ambient'] else '{{ ansible_playbook_python }}'} -%}
+{%- if pb_key in ['package', 'acquire'] -%}
+{%- set iv = iv | combine({'rh_artifact_source': act.source | default(ctx.t.src), 'rh_bundle_dir': act.dest | default(ctx.t.ctl ~ '/bundle')}) -%}
+{%- elif not (act.inventory_omit_root | default(false)) -%}
+{%- set iv = iv | combine({bs.inventory.root_var: act.inventory_root | default(act.root | default(ctx.t.shared)),
+                           bs.inventory.owner_var: act.inventory_owner | default(ctx.t.user)}) -%}
+{%- endif -%}
+{%- set ns.invvars = iv | combine(act.inventory_extra | default({})) | combine((ctx.override_inventory | default({})) if (act.repo | default('candidate')) == 'variant' else {}) -%}
+{#- brr-follow-s2 (codex-tick558 (1)): act.inventory_mode (controls.yml inventory_modes) -- absent: the written inventory
+    (unchanged); missing_source: -i <base>.inventory-absent.yml, never written; none: no -i word. In both declared modes
+    the plan's inventory payload is EMPTY, so act.yml writes no inventory. An undeclared value fails the render. -#}
+{%- set ns.ipre = ['-i', ns.inv] -%}
+{%- if 'inventory_mode' in act -%}
+{%- if act.inventory_mode == ctx.vocab.inventory_modes.missing_source -%}{%- set ns.ipre = ['-i', base ~ '.inventory-absent.yml'] -%}{%- set ns.inv = '' -%}
+{%- elif act.inventory_mode == ctx.vocab.inventory_modes.none -%}{%- set ns.ipre = [] -%}{%- set ns.inv = '' -%}
+{%- else -%}{{ ctx['RHC-ACT-INVENTORY-MODE: an undeclared act inventory_mode'].refused }}{%- endif -%}
+{%- endif -%}
+{%- set ns.pbargs = ns.ipre + [pb] + (['--limit', act.limit] if act.limit is defined else []) -%}
+{%- for k in (act.extra_vars | default({})) -%}{%- set ns.pbargs = ns.pbargs + ['-e', k ~ '=' ~ act.extra_vars[k]] -%}{%- endfor -%}
+{#- extra_vars_json: ONE structured -e (JSON), after the k=v pairs -- e.g. the lme_resolved_run mapping a runner requires -#}
+{%- if act.extra_vars_json is defined -%}{%- set ns.pbargs = ns.pbargs + ['-e', act.extra_vars_json | to_json] -%}{%- endif -%}
+{%- if via == 'seed_run' -%}
+{%- set b = act.bundle | default('a') -%}
+{%- set bdir = ctx.bundles[b] if b in ctx.bundles else b -%}
+{#- `seed run` is a seed launch: the generated launcher (seed_launch above), run <root> <ssh auth mode> <playbook words> -#}
+{%- set ns.sl = seed_launch(ctx, act, bdir, 'run', act.root | default(ctx.t.shared), ns.pbargs, '') | from_json -%}
+{%- set ns.argv = ns.sl.argv -%}
+{%- elif via == 'generation' -%}
+{%- set ns.argv = (envp(ctx, {'ANSIBLE_CONFIG': ctx.receipt.ansible_config, 'ANSIBLE_COLLECTIONS_PATH': ctx.receipt.collections_path} | combine(act.env | default({})), act.unset_env | default([])) | from_json)
+                  + [ctx.receipt.ansible_playbook] + ns.pbargs -%}
+{%- else -%}
+{%- set ns.argv = (envp(ctx, {'ANSIBLE_NOCOLOR': '1'} | combine(act.env | default({})), act.unset_env | default([])) | from_json)
+                  + [act.executor if 'executor' in act else ctx.t.builder] + ns.pbargs -%}
+{%- endif -%}
+{%- set ns.kill = ns.inv if (ns.inv | length > 0) else pb -%}
+{%- endif -%}
+{%- set pre = stracep(ctx, act, base) | from_json -%}
+{%- set wrap = ctx.wraps[act.wrap | default('none')] -%}
+{#- every act runs in its OWN transient user scope (r3e E30: a killed run is quiescent only once its recorded cgroup is
+    empty; an act sharing the runner's session scope would stay LIVE forever). act.scope: shared opts out (E30 control). -#}
+{%- set unit = (ctx.act_scope.unit_prefix ~ (base | hash('sha1'))[:20] ~ '.scope') if (act.scope | default(ctx.act_scope.default)) == 'own' else '' -%}
+{%- set scope = [ctx.tools.systemd_run, '--user', '--scope', '--quiet', '--collect', '--unit=' ~ unit] if unit else [] -%}
+{#- bound: the act's own scope + timeout, which writer_cmd puts AROUND the record writer itself; inner: what the writer
+    exec's; argv = bound + inner (unchanged, for the log and the plan_act self-tests) -#}
+{%- set bound = scope + [ctx.tools.timeout, '--kill-after=10', (to | string) ~ 's'] -%}
+{{ {'argv': bound + pre + wrap + ns.argv, 'bound': bound, 'inner': pre + wrap + ns.argv, 'unit': unit,
+    'record_barrier': act.record_barrier | default([]),
+    'cwd': act.cwd | default(ctx.t.ctl ~ '/cwd'), 'out': base ~ '.stdout', 'err': base ~ '.stderr',
+    'strace': (base ~ '.strace') if pre else '', 'inventory': ns.inv, 'inventory_vars': ns.invvars,
+    'inventory_targets': act.inventory_targets | default({}), 'target_group': (bs.inventory | default({})).target_group | default(''),
+    'kill_token': ns.kill, 'timeout_s': to | int, 'async': act.async | default(false),
+    'kind': act.kind, 'op': act.op | default(''), 'seed_launch': ns.sl,
+    'records': [base ~ '.stdout', base ~ '.stderr'] + ([base ~ '.strace'] if pre else [])} | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ parsing ---------------------------------- -#}
+{#- the task that failed: the last `TASK [..]` header before the first fatal:/failed: line -#}
+{%- macro failed_task(stdout) -%}
+{%- set ns = namespace(cur = '', hit = none) -%}
+{%- for l in stdout.splitlines() if ns.hit is none -%}
+{%- set h = l | regex_search('^TASK \\[(.*)\\] \\**$', '\\1') -%}
+{%- if h -%}{%- set ns.cur = h[0] -%}{%- elif l is match('^(fatal|failed): ') -%}{%- set ns.hit = ns.cur -%}{%- endif -%}
+{%- endfor -%}
+{{ (ns.hit if ns.hit is not none else '') | to_json }}
+{%- endmacro -%}
+
+{%- macro outcome(stdout) -%}
+{%- set ns = namespace(o = none) -%}
+{%- for l in stdout.splitlines() -%}
+{%- set m = l | regex_search('^(INSTALLED|UNCHANGED|VERIFIED|PURGED|ABSENT) (\\S+)(?: (\\S+))?$', '\\1', '\\2') -%}
+{%- if m -%}{%- set ns.o = {'word': m[0], 'arg': m[1]} -%}{%- endif -%}
+{%- endfor -%}
+{{ ns.o | to_json }}
+{%- endmacro -%}
+
+{%- macro refusal(stderr) -%}
+{%- set ns = namespace(r = none) -%}
+{%- for l in stderr.splitlines() if ns.r is none -%}
+{%- set m = l | regex_search('^REFUSED (\\S+)', '\\1') -%}
+{%- if m -%}{%- set ns.r = m[0] -%}{%- endif -%}
+{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- strace connect lines to anything but loopback -#}
+{%- macro network_lines(trace) -%}
+{{ trace.splitlines() | select('search', 'connect\\(') | select('search', 'AF_INET6?') | reject('search', 'inet_addr\\("127\\.') | reject('search', 'inet_pton\\(AF_INET6, "::1"') | list | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ judging ---------------------------------- -#}
+{#- res: {rc, stdout, stderr, trace, killed_by_runner}; returns a list of failure reasons (empty = met) -#}
+{%- macro judge(exp, res, ctx) -%}
+{%- set ns = namespace(r = []) -%}
+{%- set code = refusal(res.stderr | default('')) | from_json -%}
+{%- set oc = outcome(res.stdout | default('')) | from_json -%}
+{%- set ft = failed_task(res.stdout | default('')) | from_json -%}
+{%- set rc = res.rc | default(-1) | int -%}
+{%- set busy = ctx.rh.controller.bootstrap.lock.busy -%}
+{#- G-PRIVATE-PREPARE-CUSTODY (ported from m1-1g): a record the writer refused (res.record_refused, collect.yml: the refusal
+    status AND the stderr marker) is judged FIRST -- before record_only and inside every any_of alternative: only a step
+    declaring record_refused is met by it; nothing else (no rc / refusal / output expectation) ever is -#}
+{#- exp.record_refused: true (any stage) | <stage> (precheck | open | identity: the refusal must come from THAT stage, so a
+    barrier planted at the open cannot pass vacuously on the precheck). G-RECORD-OPEN-BEFORE-TIMEOUT: a record the writer
+    never ADMITTED (res.record_unadmitted, collect.yml) was never read and is never evidence -- judged right after, also
+    before record_only / any_of: only exp.record_unadmitted meets it, and only when the act's own bound ended the writer
+    (rc in record_readback.bound_rcs), e.g. a FIFO barrier blocking the noclobber open. -#}
+{%- set rrc = (ctx.record_refusal | default({})).code | default('RHC-ACT-RECORD') -%}
+{%- set unadm = res.record_unadmitted | default([]) -%}
+{%- if res.record_refused | default(false) or exp.record_refused | default(false) -%}
+{%- if (res.record_refused | default(false)) and (exp.record_refused | default(false)) -%}
+{%- if exp.record_refused is string and exp.record_refused != (res.record_refused_stage | default('')) -%}{{ ['the writer refused at stage ' ~ (res.record_refused_stage | default('?')) ~ ', expected stage ' ~ exp.record_refused] | to_json }}
+{%- else -%}{{ [] | to_json }}{%- endif -%}
+{%- elif exp.record_refused | default(false) -%}{{ ['expected the writer to refuse an appeared record (' ~ rrc ~ '), rc ' ~ rc ~ ((', unadmitted ' ~ (unadm | join(' '))) if unadm else '')] | to_json }}
+{%- else -%}{{ ['the writer refused an appeared record (' ~ rrc ~ ' stage ' ~ (res.record_refused_stage | default('?')) ~ '): the entrypoint never ran'] | to_json }}{%- endif -%}
+{%- elif unadm | length > 0 or exp.record_unadmitted | default(false) -%}
+{%- set brc = (ctx.record_readback | default({})).bound_rcs | default([124, 137]) | map('int') | list -%}
+{%- if unadm | length > 0 and (exp.record_unadmitted | default(false)) -%}
+{%- if rc in brc -%}{{ [] | to_json }}{%- else -%}{{ ['records never admitted (' ~ (unadm | join('; ')) ~ ') but rc ' ~ rc ~ ' is not the bound (' ~ (brc | join('|')) ~ ')'] | to_json }}{%- endif -%}
+{%- elif exp.record_unadmitted | default(false) -%}{{ ['expected the writer never to admit its records (bounded), but every record was admitted and read, rc ' ~ rc] | to_json }}
+{%- else -%}{{ ['records not admitted by the writer (' ~ (unadm | join('; ')) ~ '), rc ' ~ rc ~ ': never read, never evidence'] | to_json }}{%- endif -%}
+{%- elif exp.record_only | default(false) -%}{{ [] | to_json }}
+{%- elif exp.any_of is defined -%}
+{#- met when ANY alternative is met (each judged alone, BUSY rule included); otherwise every alternative's reasons -#}
+{%- set ns.alts = [] -%}
+{%- for e in exp.any_of -%}{%- set ns.alts = ns.alts + [judge(e, res, ctx) | from_json] -%}{%- endfor -%}
+{%- if ns.alts | select('equalto', []) | list | length > 0 -%}{{ [] | to_json }}
+{%- else -%}{{ ['none of ' ~ (exp.any_of | length) ~ ' alternatives met: ' ~ (ns.alts | map('join', '; ') | join(' || '))] | to_json }}{%- endif -%}
+{%- else -%}
+{%- if code == busy and not (exp.busy_expected | default(false)) -%}{%- set ns.r = ns.r + ['BUSY-not-coverage: a step refused ' ~ busy ~ ' that did not expect it'] -%}{%- endif -%}
+{#- r3e publish fence: a playbook refusing the staging busy code (RH-STAGING-BUSY) is never coverage unless the step expects BUSY -#}
+{%- set pbusy = ctx.rh.controller.bootstrap.bundle.staging_retention.lease.busy_refusal | default('') if (ctx.rh.controller.bootstrap.bundle.staging_retention.lease is defined) else '' -%}
+{%- if pbusy and ('REFUSED ' ~ pbusy) in (res.stdout | default('')) and not (exp.busy_expected | default(false)) -%}{%- set ns.r = ns.r + ['BUSY-not-coverage: the playbook refused ' ~ pbusy ~ ' and the step did not expect it'] -%}{%- endif -%}
+{%- if (rc == 124 or rc == 137) and not (exp.killed | default(false)) -%}{%- set ns.r = ns.r + ['timed out or killed (rc ' ~ rc ~ ')'] -%}{%- endif -%}
+{%- if exp.killed | default(false) and not (rc < 0 or rc >= 128) -%}{%- set ns.r = ns.r + ['expected to be killed by the runner, rc ' ~ rc] -%}{%- endif -%}
+{%- if exp.rc is defined and rc != exp.rc | int -%}{%- set ns.r = ns.r + ['rc ' ~ rc ~ ' != ' ~ exp.rc] -%}{%- endif -%}
+{%- if exp.rc_nonzero | default(false) and rc == 0 -%}{%- set ns.r = ns.r + ['rc 0, a refusal was expected'] -%}{%- endif -%}
+{%- for want in ([exp.refusal] if exp.refusal is defined else []) -%}
+{%- if code != want -%}{%- set ns.r = ns.r + ['refusal ' ~ (code | string) ~ ' != ' ~ want] -%}{%- endif -%}
+{%- if rc != ctx.refusals[want] | default(-99) | int -%}{%- set ns.r = ns.r + ['exit ' ~ rc ~ ' != declared ' ~ want ~ ' status ' ~ (ctx.refusals[want] | default('undeclared'))] -%}{%- endif -%}
+{%- endfor -%}
+{%- if exp.refusal_any is defined -%}
+{%- if code not in exp.refusal_any -%}{%- set ns.r = ns.r + ['refusal ' ~ (code | string) ~ ' not in ' ~ (exp.refusal_any | join('|'))] -%}
+{%- elif rc != ctx.refusals[code] | int -%}{%- set ns.r = ns.r + ['exit ' ~ rc ~ ' != declared status of ' ~ code] -%}{%- endif -%}
+{%- endif -%}
+{%- if exp.outcome is defined and (oc is none or oc.word != exp.outcome) -%}{%- set ns.r = ns.r + ['outcome ' ~ ((oc.word if oc else 'none') | string) ~ ' != ' ~ exp.outcome] -%}{%- endif -%}
+{%- if exp.outcome_any is defined and (oc is none or oc.word not in exp.outcome_any) -%}{%- set ns.r = ns.r + ['outcome ' ~ ((oc.word if oc else 'none') | string) ~ ' not in ' ~ (exp.outcome_any | join('|'))] -%}{%- endif -%}
+{%- if exp.gen is defined and oc -%}
+{%- if exp.gen == 'expected_a' and oc.arg != ctx.t.gen_id -%}{%- set ns.r = ns.r + ['generation ' ~ oc.arg ~ ' != bundle A ' ~ ctx.t.gen_id] -%}{%- endif -%}
+{%- if exp.gen == 'new' and oc.arg == ctx.t.gen_id -%}{%- set ns.r = ns.r + ['generation did not change: ' ~ oc.arg] -%}{%- endif -%}
+{%- endif -%}
+{%- if exp.refused_at is defined and exp.refused_at is not none and not (ft is string and ft.startswith(exp.refused_at)) -%}{%- set ns.r = ns.r + ['failed task "' ~ ft ~ '" is not "' ~ exp.refused_at ~ '"'] -%}{%- endif -%}
+{%- if exp.refused_at is defined and exp.refused_at is none and ft -%}{%- set ns.r = ns.r + ['unexpected failed task "' ~ ft ~ '"'] -%}{%- endif -%}
+{%- if exp.refused_at_any is defined -%}
+{%- set ns.ok = false -%}
+{%- for n in exp.refused_at_any if ft and ft.startswith(n) -%}{%- set ns.ok = true -%}{%- endfor -%}
+{%- if not ns.ok -%}{%- set ns.r = ns.r + ['failed task "' ~ ft ~ '" not among the expected'] -%}{%- endif -%}
+{%- endif -%}
+{%- if exp.failed_before_task is defined and (res.stdout | default('')) is search('TASK \\[' ~ (exp.failed_before_task | regex_escape)) -%}{%- set ns.r = ns.r + ['reached "' ~ exp.failed_before_task ~ '"'] -%}{%- endif -%}
+{%- if exp.playbook_refusal is defined and ('REFUSED ' ~ exp.playbook_refusal) not in (res.stdout | default('')) -%}{%- set ns.r = ns.r + ['no "REFUSED ' ~ exp.playbook_refusal ~ '" in the playbook output'] -%}{%- endif -%}
+{%- for s in exp.stdout_has | default([]) if s not in (res.stdout | default('')) -%}{%- set ns.r = ns.r + ['stdout lacks "' ~ s ~ '"'] -%}{%- endfor -%}
+{%- for s in exp.stderr_has | default([]) if s not in (res.stderr | default('')) -%}{%- set ns.r = ns.r + ['stderr lacks "' ~ s ~ '"'] -%}{%- endfor -%}
+{%- for s in exp.stdout_or_stderr_has | default([]) if s not in ((res.stdout | default('')) ~ (res.stderr | default(''))) -%}{%- set ns.r = ns.r + ['output lacks "' ~ s ~ '"'] -%}{%- endfor -%}
+{%- if exp.stderr_regex is defined and not ((res.stderr | default('')) is search(exp.stderr_regex, multiline=true)) -%}{%- set ns.r = ns.r + ['stderr does not match ' ~ exp.stderr_regex] -%}{%- endif -%}
+{%- if exp.stdout_regex is defined and not ((res.stdout | default('')) is search(exp.stdout_regex, multiline=true)) -%}{%- set ns.r = ns.r + ['stdout does not match ' ~ exp.stdout_regex] -%}{%- endif -%}
+{#- stdout_not_regex is a LIST of regexes; a bare string (or mapping) is a declaration error, never iterated character by character -#}
+{%- if exp.stdout_not_regex is defined and (exp.stdout_not_regex is string or exp.stdout_not_regex is mapping or exp.stdout_not_regex is not iterable) -%}{%- set ns.r = ns.r + ['stdout_not_regex must be a list of regexes, got ' ~ (exp.stdout_not_regex | to_json)] -%}
+{%- else -%}
+{%- for x in exp.stdout_not_regex | default([]) if (res.stdout | default('')) is search(x, multiline=true) -%}{%- set ns.r = ns.r + ['stdout matches forbidden ' ~ x] -%}{%- endfor -%}
+{%- endif -%}
+{%- if exp.no_network | default(false) -%}
+{%- set nl = network_lines(res.trace | default('')) | from_json -%}
+{%- if nl | length > 0 -%}{%- set ns.r = ns.r + ['network connect: ' ~ (nl[:3] | join(' | '))] -%}{%- endif -%}
+{%- if not res.trace | default('') and not res.trace_empty_ok | default(false) -%}{%- set ns.r = ns.r + ['no network trace recorded'] -%}{%- endif -%}
+{%- endif -%}
+{%- for x in exp.exec_seen | default([]) if ('execve("' ~ x ~ '"') not in (res.trace | default('')) -%}{%- set ns.r = ns.r + ['no execve of ' ~ x] -%}{%- endfor -%}
+{%- for x in exp.no_exec_regex | default([]) -%}
+{%- if (res.trace | default('')) is search('execve\\("' ~ x) -%}{%- set ns.r = ns.r + ['execve matching ' ~ x] -%}{%- endif -%}
+{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- judge_stop(stop_at, fails, log, ids, has=[]) (G-STEP-LIVE-FAIL-GUARD, codex tick313): a variant that DECLARES the step it
+    must stop at (variant expect_stop_at; tasks/variant.yml) meets it only when: the step is one of this variant's compiled
+    steps (ids, in order); at least one failure was recorded and EVERY failure is that step's own (prefix '<id>:', '<id>[',
+    '<id> op[' -- an UNDECLARED op failure of that step's ops list, tasks/op.yml -- or '<id> post_state'); every string of
+    has (variant expect_stop_failure_has; the retained undeclared-failure negative) occurs in at least one recorded cause
+    of the stop: a failure string, or -- STRUCTURED and UNTRUNCATED (codex tick358-359 known limit: judge_op_outcome
+    truncates the failure string's message to 300 characters for DISPLAY only) -- the full cause of an undeclared op
+    outcome the stop step logged (tasks/op.yml rescue record {step, op_index, outcome {phase, task, msg}, declared: false}),
+    rendered as 'op <i> failed (<phase>) at <task>: <msg>' with the whole msg; every later step has a log record and every one of its records is a skip (step.yml / act.yml live guard) --
+    a later step that ran, or one without any record, fails; no earlier step was skipped. Returns reasons (empty = met);
+    the after_stop predicates are judged separately (variant.yml). -#}
+{%- macro judge_stop(stop_at, fails, log, ids, has=[]) -%}
+{%- set ns = namespace(r = [], seen = false) -%}
+{%- if stop_at not in ids -%}{%- set ns.r = ['declared stop step ' ~ stop_at ~ ' is not a step of this variant (' ~ (ids | join(', ')) ~ ')'] -%}
+{%- elif fails | length == 0 -%}{%- set ns.r = ['expected the variant to stop at ' ~ stop_at ~ ', but no step failed'] -%}
+{%- else -%}
+{%- for f in fails if not ((f | string).startswith(stop_at ~ ':') or (f | string).startswith(stop_at ~ '[') or (f | string).startswith(stop_at ~ ' op[')
+                          or (f | string).startswith(stop_at ~ ' post_state')) -%}
+{%- set ns.r = ns.r + ['failure outside the declared stop step ' ~ stop_at ~ ': ' ~ (f | string)[:200]] -%}
+{%- endfor -%}
+{%- set cz = namespace(l = fails | map('string') | list) -%}
+{%- for r in log if r is mapping and r.step is defined and r.step == stop_at and r.op_index is defined and r.outcome is defined
+                    and r.outcome is mapping and r.declared is defined and r.declared is sameas false -%}
+{%- set cz.l = cz.l + ['op ' ~ r.op_index ~ ' failed (' ~ (r.outcome.phase | default('?') | string) ~ ') at ' ~ (r.outcome.task | default('?') | string)
+                       ~ ': ' ~ (r.outcome.msg | default('') | string)] -%}
+{%- endfor -%}
+{%- for h in ([has] if has is string else (has if (has is sequence and has is not mapping) else [])) -%}
+{%- set hit = namespace(v = false) -%}
+{%- for f in cz.l if (h | string) in f -%}{%- set hit.v = true -%}{%- endfor -%}
+{%- if not hit.v -%}{%- set ns.r = ns.r + ['no recorded failure of the declared stop step ' ~ stop_at ~ ' carries ' ~ (h | string)] -%}{%- endif -%}
+{%- endfor -%}
+{%- for sid in ids -%}
+{%- set recs = log | selectattr('step', 'defined') | selectattr('step', 'equalto', sid) | list -%}
+{%- if ns.seen -%}
+{%- if recs | length == 0 -%}{%- set ns.r = ns.r + ['step ' ~ sid ~ ' after the stop has no record (the live guard did not log a skip)'] -%}
+{%- elif recs | rejectattr('skipped', 'defined') | list | length > 0 -%}{%- set ns.r = ns.r + ['step ' ~ sid ~ ' ran after the stop at ' ~ stop_at] -%}{%- endif -%}
+{%- elif recs | selectattr('skipped', 'defined') | list | length > 0 -%}{%- set ns.r = ns.r + ['step ' ~ sid ~ ' before the stop was skipped'] -%}
+{%- endif -%}
+{%- if sid == stop_at -%}{%- set ns.seen = true -%}{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- judge_staging(ex, i, out) (codex tick297 003441 G-STAGING-ANCESTRY / G-STAGING-PARTIAL; tasks/fixture_ops.yml): one
+    staging action's outcome against its step's declared staging expectation. out.phase: done (completed, post-state the
+    declared kind) | admit (refused BEFORE any mutation: closed set, ancestry of every mutated / linked path, pre-state) |
+    mutate (the action or its post-state check failed after the mutation began: partial output possible). Only the action
+    at ex.staging_index may end otherwise than done, and only as declared: staging_refused CODE = phase admit with a message
+    starting 'REFUSED CODE'; staging_failed true = phase mutate; both need the exact LEAF task staging_task and every
+    staging_msg_has string. Returns reasons (empty = as declared). -#}
+{%- macro judge_staging(ex, i, out) -%}
+{%- set ns = namespace(r = []) -%}
+{%- set x = ex if ex is mapping else {} -%}
+{%- set o = out if out is mapping else {} -%}
+{%- set ph = o.phase | default('?') -%}
+{%- set msg = o.msg | default('') | string -%}
+{%- set refd = x.staging_refused is defined -%}
+{%- set faild = (x.staging_failed | default(false)) is sameas true -%}
+{%- set at = (refd or faild) and x.staging_index is defined and (x.staging_index | int) == (i | int) -%}
+{%- if not at -%}
+{%- if ph != 'done' -%}{%- set ns.r = ['staging action ' ~ i ~ ' failed (' ~ ph ~ ') at ' ~ (o.task | default('?')) ~ ': ' ~ msg[:300]] -%}{%- endif -%}
+{%- elif ph == 'done' -%}
+{%- set ns.r = ['staging action ' ~ i ~ ' was declared ' ~ (('refused ' ~ x.staging_refused) if refd else 'failed') ~ ' but completed'] -%}
+{%- else -%}
+{%- if refd and ph != 'admit' -%}{%- set ns.r = ns.r + ['staging action ' ~ i ~ ' was declared refused ' ~ x.staging_refused ~ ' before any mutation, but failed after its mutation began'] -%}{%- endif -%}
+{%- if refd and not msg.startswith('REFUSED ' ~ x.staging_refused) -%}{%- set ns.r = ns.r + ['staging action ' ~ i ~ ' message does not start with REFUSED ' ~ x.staging_refused ~ ': ' ~ msg[:300]] -%}{%- endif -%}
+{%- if faild and ph != 'mutate' -%}{%- set ns.r = ns.r + ['staging action ' ~ i ~ ' was declared failed after its mutation began, but was refused before it (' ~ ph ~ ')'] -%}{%- endif -%}
+{%- if (o.task | default('')) != (x.staging_task | default('')) -%}{%- set ns.r = ns.r + ['staging action ' ~ i ~ ' ended at task "' ~ (o.task | default('?')) ~ '", declared "' ~ (x.staging_task | default('?')) ~ '"'] -%}{%- endif -%}
+{%- for h in x.staging_msg_has | default([]) if (h | string) not in msg -%}{%- set ns.r = ns.r + ['staging action ' ~ i ~ ' message lacks ' ~ (h | string)] -%}{%- endfor -%}
+{%- endif -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- judge_staging_skipped(ex, skipped) (codex tick330 G-FIXTURE-ITEM-STOP-CONTROL; tasks/fixture_ops.yml, at the list's last
+    action): the step's declared staging_skipped [indexes] -- the actions after the declared outcome that must NOT run --
+    against the indexes this step logged as staging_skipped (the per-item guard's record). Every declared index must be
+    logged skipped (else it ran), and no undeclared index may be. Returns reasons (empty = as declared). -#}
+{%- macro judge_staging_skipped(ex, skipped) -%}
+{%- set ns = namespace(r = []) -%}
+{%- set x = ex if ex is mapping else {} -%}
+{%- set d = (x.staging_skipped if (x.staging_skipped is defined and x.staging_skipped is sequence and x.staging_skipped is not string) else []) | map('int') | list -%}
+{%- set s = (skipped if (skipped is sequence and skipped is not string) else []) | map('int') | list -%}
+{%- for i in d if i not in s -%}{%- set ns.r = ns.r + ['staging action ' ~ i ~ ' was declared skipped after the declared outcome but has no staging_skipped record (it ran)'] -%}{%- endfor -%}
+{%- for i in s if i not in d -%}{%- set ns.r = ns.r + ['staging action ' ~ i ~ ' was skipped but not declared in staging_skipped'] -%}{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- judge_op_outcome(ex, i, out) (codex tick330 item 2 G-OP-PER-ITEM-GUARD; tasks/op.yml, a step's ops list only; distinct
+    from judge_staging): out = {phase, task, msg} of op i -- phase done (completed), failed (failed after it was admitted)
+    or refused (the residual / confinement / unimplemented refusal: a declaration error). Only the op at ex.op_index may
+    end otherwise than done, and only as declared: op_failed true = phase failed with every op_msg_has string in its
+    message. A refused op never meets a declared outcome. Returns reasons (empty = as declared). -#}
+{%- macro judge_op_outcome(ex, i, out) -%}
+{%- set ns = namespace(r = []) -%}
+{%- set x = ex if ex is mapping else {} -%}
+{%- set o = out if out is mapping else {} -%}
+{%- set ph = o.phase | default('?') -%}
+{%- set msg = o.msg | default('') | string -%}
+{%- set at = (x.op_failed | default(false)) is sameas true and x.op_index is defined and (x.op_index | int) == (i | int) -%}
+{%- if not at -%}
+{%- if ph != 'done' -%}{%- set ns.r = ['op ' ~ i ~ ' failed (' ~ ph ~ ') at ' ~ (o.task | default('?')) ~ ': ' ~ msg[:300]] -%}{%- endif -%}
+{%- elif ph == 'done' -%}
+{%- set ns.r = ['op ' ~ i ~ ' was declared failed but completed'] -%}
+{%- else -%}
+{%- if ph != 'failed' -%}{%- set ns.r = ns.r + ['op ' ~ i ~ ' was declared failed but was refused before it ran (' ~ ph ~ ', a declaration error) at ' ~ (o.task | default('?')) ~ ': ' ~ msg[:300]] -%}{%- endif -%}
+{%- for h in x.op_msg_has | default([]) if (h | string) not in msg -%}{%- set ns.r = ns.r + ['op ' ~ i ~ ' message lacks ' ~ (h | string)] -%}{%- endfor -%}
+{%- endif -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- judge_op_skipped(ex, skipped) (codex tick330 item 2; tasks/op.yml, at the ops list's last op; separate from
+    judge_staging_skipped): the step's declared op_skipped [indexes] -- the ops after the declared op outcome that must NOT
+    run -- against the indexes this step logged as op_skipped (op.yml's per-op guard record). Every declared index must be
+    logged skipped (else it ran), and no undeclared index may be. Returns reasons (empty = as declared). -#}
+{%- macro judge_op_skipped(ex, skipped) -%}
+{%- set ns = namespace(r = []) -%}
+{%- set x = ex if ex is mapping else {} -%}
+{%- set d = (x.op_skipped if (x.op_skipped is defined and x.op_skipped is sequence and x.op_skipped is not string) else []) | map('int') | list -%}
+{%- set s = (skipped if (skipped is sequence and skipped is not string) else []) | map('int') | list -%}
+{%- for i in d if i not in s -%}{%- set ns.r = ns.r + ['op ' ~ i ~ ' was declared skipped after the declared op outcome but has no op_skipped record (it ran)'] -%}{%- endfor -%}
+{%- for i in s if i not in d -%}{%- set ns.r = ns.r + ['op ' ~ i ~ ' was skipped but not declared in op_skipped'] -%}{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- outside_of(ctl) (codex tick330 item 3; tasks/variant.yml token {outside}): a path OUTSIDE the control dir and inside the
+    same run dir, derived from {ctl} alone -- its sibling <ctl>.outside (never lexically under <ctl>/, so {ctl}-prefix
+    confinement never admits it). No control or variant name is written anywhere: renaming the control / variant or
+    relocating the run dir moves it with {ctl}. An inadmissible ctl (not absolute, an empty / . / .. segment, a trailing
+    slash) yields ''. -#}
+{%- macro outside_of(ctl) -%}
+{%- set c = ctl if ctl is string else '' -%}
+{%- set segs = c.split('/')[1:] -%}
+{%- if not c.startswith('/') or (segs | length) == 0 or ('' in segs) or ('.' in segs) or ('..' in segs) -%}{{ '' | to_json }}
+{%- else -%}{{ (c ~ '.outside') | to_json }}{%- endif -%}
+{%- endmacro -%}
+
+{#- op_writes(op, ctl) (codex tick334 G-UNDO-STASH-PATH-UNBOUND; tasks/op.yml): the FULL actual mutation set of one expanded
+    op -- the declared string path, `to`, a move's `from`, an edit's `file`, a glob / dir op's `dir`, `files`, AND the
+    DERIVED stash entry <ctl>/stash/<sha1(path)> of stash / stash_copy (destination) and unstash (source) -- the exact name
+    op.yml's stash / stash_copy / unstash argv uses. Built before any confinement or protection check reads it. -#}
+{%- macro op_writes(op, ctl) -%}
+{%- set k = (op | list | first) if (op is mapping and op | length > 0) else '' -%}
+{%- set v = op[k] if k else none -%}
+{%- set w = ([v] if v is string else [])
+     + ([v.to] if v is mapping and v.to is defined else [])
+     + ([v.from] if v is mapping and k in ['move'] else [])
+     + ([v.file] if v is mapping and v.file is defined else [])
+     + ([v.dir] if v is mapping and v.dir is defined else [])
+     + (v.files if v is mapping and v.files is defined and v.files is sequence and v.files is not string else [])
+     + ([ctl ~ '/stash/' ~ (v | hash('sha1'))] if (k in ['stash', 'stash_copy', 'unstash'] and v is string) else []) -%}
+{{ w | to_json }}
+{%- endmacro -%}
+
+{#- protected_overlap(paths, protected) (codex tick330 G-UNDO-PROTECTION-PROPAGATION): the protected paths -- left in place
+    by a refused or failed undo of this variant (tasks/fixture_undo.yml, tasks/op.yml) -- that ARE, lie BELOW or lie ABOVE any
+    of `paths`, compared component-wise (/c/A never covers /c/AB). An unlink, move, recursive removal or mode change of such a
+    path would reach, displace or alter preserved evidence, so every undo and cleanup removal asks this first. -#}
+{%- macro protected_overlap(paths, protected) -%}
+{%- set ns = namespace(r = []) -%}
+{%- set P = (paths if (paths is sequence and paths is not string) else [paths]) | select('string') | reject('equalto', '') | list -%}
+{%- for q in (protected if (protected is sequence and protected is not string) else []) | select('string') | reject('equalto', '') -%}
+{%- for m in P -%}
+{%- if (q == m or q.startswith(m ~ '/') or m.startswith(q ~ '/')) and q not in ns.r -%}{%- set ns.r = ns.r + [q] -%}{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- judge_undo_findings(expected, found) (codex tick330 G-UNDO-PROTECTION-PROPAGATION; tasks/variant.yml): routes a variant's
+    undo FINDINGS. found: the decision findings of this variant's undo, [{path, why}] (fixture_undo.yml decisions and op.yml
+    declared-undo protection refusals; a failed or erroring undo is never here -- it always FAILs); expected: the variant's
+    expect_undo_findings [{path, why}] (path EXACT, why a regex searched in the reason). A finding is expected only when a
+    declaration names its exact path and its reason matches; every declaration must match at least one finding. Returns
+    {expected, unexpected, missing}: unexpected FAIL the variant and are cleanup findings, missing FAIL it. -#}
+{%- macro judge_undo_findings(expected, found) -%}
+{%- set ns = namespace(exp = [], unexp = [], missing = []) -%}
+{%- set E = (expected if (expected is sequence and expected is not string) else []) | select('mapping') | list -%}
+{%- set F = (found if (found is sequence and found is not string) else []) | select('mapping') | list -%}
+{%- for f in F -%}
+{%- set h = namespace(v = false) -%}
+{%- for e in E if e.path is string and e.why is string and f.path is defined and e.path == f.path and ((f.why | default('')) | string) is search(e.why) -%}{%- set h.v = true -%}{%- endfor -%}
+{%- if h.v -%}{%- set ns.exp = ns.exp + [f] -%}{%- else -%}{%- set ns.unexp = ns.unexp + [f] -%}{%- endif -%}
+{%- endfor -%}
+{%- for e in E -%}
+{%- set h = namespace(v = false) -%}
+{%- for f in F if e.path is string and e.why is string and f.path is defined and e.path == f.path and ((f.why | default('')) | string) is search(e.why) -%}{%- set h.v = true -%}{%- endfor -%}
+{%- if not h.v -%}{%- set ns.missing = ns.missing + [e] -%}{%- endif -%}
+{%- endfor -%}
+{%- set ns.missing = ns.missing + ((expected if (expected is sequence and expected is not string) else []) | reject('mapping') | list) -%}
+{{ {'expected': ns.exp, 'unexpected': ns.unexp, 'missing': ns.missing} | to_json }}
+{%- endmacro -%}
+
+{#- fixture_undo_decide(rec, a, b) (codex tick297 003441 G-UNDO-IDENTITY / G-STAGING-PARTIAL; tasks/fixture_undo.yml): the ONE
+    decision of how a recorded staging action is reversed. rec: the _rhc_staged record (op, state intent | done | failed,
+    path / from / to / target, post = the identity observed right after the action {exists, isdir, islnk, dev, inode,
+    lnk_target}); a: the stat (never followed) of the written object (symlink / mkdir path, copy_tree / move to); b: the stat
+    of a move's from ({} otherwise). A resource is touched ONLY while it still has the recorded identity (dev + inode; a link
+    also its recorded target text, which must be the declared target): a replaced directory, a re-targeted or replaced link,
+    an occupied move source, an intent without a recorded outcome that left something, or a missing identity is a FINDING
+    (left in place, never forced). Returns {do: unlink | move-back | remove-dir | none | finding, why}.
+    G-UNDO-PARTIAL-BINDING (codex tick330 item 4): a FAILED record is NOT reversed like a completed one. Its post
+    identity (observed right after the failure) is identity EVIDENCE only, never proof of who made the object. Nothing at
+    the name -> none. A failed mkdir / symlink / move that left something -> finding (ambiguous: e.g. a name taken by a
+    racing writer; never removed). A failed copy_tree's partial output -> remove-dir only when EVERY binding holds, else a
+    finding naming each unmet one:
+      outcome     rec.failed_in == action (the copy itself failed; a post-state check failure is ambiguous)
+      intent      rec.pre_absent and rec.parents_admitted are true, from and to declared (non-empty)
+      pre-state   rec.pre = the destination parent's identity observed before the action: parent == dirname(to), dev,
+                  inode, uid recorded
+      exclusive   that parent was then a real directory (exists, not a link), neither group- nor other-writable
+      ancestry    pa (5th argument: the parent's stat now, never followed) is still that real directory: same dev, inode,
+                  uid, and still neither group- nor other-writable
+      identity    a is a real directory with the post-failure dev / inode, owned by the recorded parent's uid
+    "Exclusive" is owner-private: another process of the same uid is not excluded (declared residual). A completed (done)
+    record is decided as before; pa is not read for it.
+    protected (codex tick330 G-UNDO-PROTECTION-PROPAGATION; default none): the paths an EARLIER record's refused or failed
+    undo left in place (fixture_undo.yml, in reverse order). An unlink, move-back or remove-dir whose path(s) are, contain or
+    lie inside a protected path (protected_overlap) is REFUSED as a finding -- a recorded parent whose own identity still
+    holds is never removed recursively over a refused child; the refused parent is then protected in turn. -#}
+{%- macro fixture_undo_decide(rec, a, b, protected=[], pa={}) -%}
+{%- set r = rec if rec is mapping else {} -%}
+{%- set p = r.post if (r.post is defined and r.post is mapping) else {} -%}
+{%- set a = a if a is mapping else {} -%}
+{%- set b = b if b is mapping else {} -%}
+{%- set pa = pa if pa is mapping else {} -%}
+{%- set name = r.path if r.op in ['symlink', 'mkdir'] else r.to | default('?') -%}
+{%- set has_id = p.dev is defined and p.inode is defined and p.dev is not none and p.inode is not none -%}
+{%- set a_id = has_id and (a.exists | default(false)) and a.dev is defined and a.inode is defined and a.dev == p.dev and a.inode == p.inode -%}
+{%- set a_realdir = (a.exists | default(false)) and (a.isdir | default(false)) and not (a.islnk | default(false)) -%}
+{%- if r.state | default('') not in ['done', 'failed'] -%}
+{%- if a.exists | default(false) -%}{%- set d = {'do': 'finding', 'why': 'intent without a recorded outcome: ' ~ name ~ ' exists, ownership unproven; left in place'} -%}
+{%- else -%}{%- set d = {'do': 'none', 'why': 'intent without a recorded outcome: nothing at ' ~ name} -%}{%- endif -%}
+{%- elif not (p.exists | default(false)) -%}
+{%- if a.exists | default(false) -%}{%- set d = {'do': 'finding', 'why': name ~ ' appeared after an action that created nothing (not owned); left in place'} -%}
+{%- else -%}{%- set d = {'do': 'none', 'why': 'the action created nothing at ' ~ name} -%}{%- endif -%}
+{%- elif not has_id -%}
+{%- set d = {'do': 'finding', 'why': name ~ ': no recorded identity (dev / inode); unverifiable, left in place'} -%}
+{%- elif r.state == 'failed' -%}
+{%- if not (a.exists | default(false)) -%}{%- set d = {'do': 'none', 'why': 'the partial output of the failed ' ~ (r.op | default('?')) ~ ' at ' ~ name ~ ' is already gone'} -%}
+{%- elif r.op != 'copy_tree' -%}{%- set d = {'do': 'finding', 'why': name ~ ': a failed ' ~ (r.op | default('?')) ~ ' left something whose origin is ambiguous (the post-failure identity is evidence only); left in place'} -%}
+{%- else -%}
+{%- set q = r.pre if (r.pre is defined and r.pre is mapping) else {} -%}
+{%- set dst = r.to if (r.to is defined and r.to is string) else '' -%}
+{%- set src = r.from if (r.from is defined and r.from is string) else '' -%}
+{%- set un = namespace(v = []) -%}
+{%- if (r.failed_in | default('')) != 'action' -%}{%- set un.v = un.v + ['outcome: failed in ' ~ (r.failed_in | default('?')) ~ ', not in the copy'] -%}{%- endif -%}
+{%- if not ((r.pre_absent | default(false)) is sameas true and (r.parents_admitted | default(false)) is sameas true and dst | length > 0 and src | length > 0) -%}{%- set un.v = un.v + ['intent: no admitted absent pre-state of a declared copy'] -%}{%- endif -%}
+{%- set q_id = q.parent is defined and dst | length > 0 and q.parent == (dst | dirname) and q.dev is defined and q.inode is defined and q.uid is defined and q.dev is not none and q.inode is not none and q.uid is not none -%}
+{%- if not q_id -%}{%- set un.v = un.v + ['pre-state: no recorded identity of the destination parent ' ~ (dst | dirname)] -%}
+{%- elif not ((q.exists | default(false)) is sameas true and (q.isdir | default(false)) is sameas true and (q.islnk | default(true)) is sameas false and (q.wgrp | default(true)) is sameas false and (q.woth | default(true)) is sameas false) -%}{%- set un.v = un.v + ['exclusive destination: the recorded parent was not a real owner-private directory'] -%}{%- endif -%}
+{%- if not (q_id and (pa.exists | default(false)) and (pa.isdir | default(false)) and (pa.islnk | default(true)) is sameas false and pa.dev is defined and pa.inode is defined and pa.uid is defined and pa.dev == q.dev and pa.inode == q.inode and pa.uid == q.uid and (pa.wgrp | default(true)) is sameas false and (pa.woth | default(true)) is sameas false) -%}{%- set un.v = un.v + ['current ancestry: the parent is no longer the recorded owner-private directory'] -%}{%- endif -%}
+{%- if not (a_realdir and a_id) -%}{%- set un.v = un.v + ['current identity: not the real directory observed right after the failure'] -%}{%- endif -%}
+{%- if not (q_id and a.uid is defined and a.uid == q.uid) -%}{%- set un.v = un.v + ['owner: not owned by the recorded parent owner'] -%}{%- endif -%}
+{%- if un.v | length == 0 -%}{%- set d = {'do': 'remove-dir', 'why': 'the partial output of the failed copy_tree: absent before under the recorded owner-private parent; post-failure identity, owner and ancestry unchanged'} -%}
+{%- else -%}{%- set d = {'do': 'finding', 'why': name ~ ': partial output of a failed copy_tree not bound (' ~ (un.v | join('; ')) ~ '); left in place'} -%}{%- endif -%}
+{%- endif -%}
+{%- elif r.op == 'symlink' -%}
+{%- if not (a.exists | default(false)) -%}{%- set d = {'do': 'none', 'why': 'the recorded link ' ~ name ~ ' is already gone'} -%}
+{%- elif (a.islnk | default(false)) and a_id and (a.lnk_target | default(none)) == p.lnk_target and p.lnk_target == r.target -%}{%- set d = {'do': 'unlink', 'why': 'the recorded link, recorded target'} -%}
+{%- elif (a.islnk | default(false)) and a_id -%}{%- set d = {'do': 'finding', 'why': 'link ' ~ name ~ ' re-targeted (' ~ (a.lnk_target | default('?')) ~ ', recorded ' ~ (p.lnk_target | default('?')) ~ '); left in place'} -%}
+{%- else -%}{%- set d = {'do': 'finding', 'why': name ~ ' is no longer the recorded link (replaced); left in place'} -%}{%- endif -%}
+{%- elif r.op in ['mkdir', 'copy_tree'] -%}
+{%- if not (a.exists | default(false)) -%}{%- set d = {'do': 'none', 'why': 'the recorded directory ' ~ name ~ ' is already gone'} -%}
+{%- elif a_realdir and a_id -%}{%- set d = {'do': 'remove-dir', 'why': 'the recorded directory, recorded identity'} -%}
+{%- else -%}{%- set d = {'do': 'finding', 'why': name ~ ' is not the recorded directory (replaced: identity or kind differs); left in place'} -%}{%- endif -%}
+{%- elif r.op == 'move' -%}
+{%- set b_id = (b.exists | default(false)) and (b.isdir | default(false)) and not (b.islnk | default(false)) and b.dev is defined and b.inode is defined and b.dev == p.dev and b.inode == p.inode -%}
+{%- if a_realdir and a_id and not (b.exists | default(true)) -%}{%- set d = {'do': 'move-back', 'why': 'the recorded directory, recorded identity, source name free'} -%}
+{%- elif not (a.exists | default(false)) and b_id -%}{%- set d = {'do': 'none', 'why': 'already moved back (recorded identity at ' ~ (r.from | default('?')) ~ ')'} -%}
+{%- else -%}{%- set d = {'do': 'finding', 'why': 'move ' ~ name ~ ' -> ' ~ (r.from | default('?')) ~ ': not the recorded identity or the source name is occupied; left in place'} -%}{%- endif -%}
+{%- else -%}
+{%- set d = {'do': 'finding', 'why': 'unknown staging op ' ~ (r.op | default('?'))} -%}
+{%- endif -%}
+{%- set muts = ([r.path] if r.op in ['symlink', 'mkdir'] else ([r.to, r.from] if r.op == 'move' else [r.to])) | select('string') | reject('equalto', '') | list -%}
+{%- set hit = protected_overlap(muts, protected) | from_json -%}
+{%- if d.do in ['unlink', 'move-back', 'remove-dir'] and hit | length > 0 -%}
+{%- set d = {'do': 'finding', 'why': name ~ ': ' ~ d.do ~ ' refused: the protected ' ~ (hit | join(', ')) ~ ' is at, below or above it (left in place by a refused undo); left in place'} -%}
+{%- endif -%}
+{{ d | to_json }}
+{%- endmacro -%}
+
+{#- two recorded results: exactly one meets `one_of`; the other meets one of `other_any` -#}
+{%- macro judge_pair(spec, results, ctx) -%}
+{%- set a = results[spec.steps[0]] -%}
+{%- set b = results[spec.steps[1]] -%}
+{%- set a1 = (judge(spec.one_of, a, ctx) | from_json) | length == 0 -%}
+{%- set b1 = (judge(spec.one_of, b, ctx) | from_json) | length == 0 -%}
+{%- set ns = namespace(r = []) -%}
+{%- if a1 == b1 -%}{%- set ns.r = ['exactly one of ' ~ (spec.steps | join(', ')) ~ ' must meet ' ~ (spec.one_of | to_json) ~ '; both ' ~ ('did' if a1 else 'did not')] -%}
+{%- else -%}
+{%- set other = b if a1 else a -%}
+{%- set ns.ok = false -%}
+{%- for e in spec.other_any if (judge(e | combine({'busy_expected': true}), other, ctx) | from_json) | length == 0 -%}{%- set ns.ok = true -%}{%- endfor -%}
+{%- if not ns.ok -%}{%- set ns.r = ['the other result meets none of ' ~ (spec.other_any | to_json)] -%}{%- endif -%}
+{%- endif -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ state ------------------------------------ -#}
+{#- obs: observations gathered by tasks/state.yml keyed by predicate index -#}
+{%- macro judge_state(preds, obs, snaps) -%}
+{%- set ns = namespace(r = []) -%}
+{%- for p in preds -%}
+{%- set o = obs[loop.index0] | default({}) -%}
+{%- if p.path is defined and p.exists is defined and (o.exists | default(false)) != p.exists -%}{%- set ns.r = ns.r + [p.path ~ (' missing' if p.exists else ' exists')] -%}{%- endif -%}
+{#- path kind (fifo | regular | link | dir | other; observed by stat, follow false, nothing opened) and size (bytes) -#}
+{%- if p.path is defined and p.kind is defined and (o.kind | default('absent')) != p.kind -%}{%- set ns.r = ns.r + [p.path ~ ' is ' ~ (o.kind | default('absent')) ~ ', expected ' ~ p.kind] -%}{%- endif -%}
+{%- if p.path is defined and p.size is defined and (o.size | default(-1) | int) != p.size | int -%}{%- set ns.r = ns.r + [p.path ~ ' size ' ~ (o.size | default('?')) ~ ' != ' ~ p.size] -%}{%- endif -%}
+{#- path mode (octal permission string as stat reports it, e.g. '0600'; codex 225207: the probe_env evidence is 0600) -#}
+{%- if p.path is defined and p.mode is defined and (o.mode | default('absent') | string) != (p.mode | string) -%}{%- set ns.r = ns.r + [p.path ~ ' mode ' ~ (o.mode | default('absent')) ~ ' != ' ~ p.mode] -%}{%- endif -%}
+{#- custody (codex tick338 G-UV-ELSEWHERE-FIXTURE-LOCATION): uid = the entry's own owner uid (stat, follow false; e.g. the
+    {uid} token); private_write true = neither group nor other may write it. An absent entry meets neither. -#}
+{%- if p.path is defined and p.uid is defined and (o.uid | default('absent') | string) != (p.uid | string) -%}{%- set ns.r = ns.r + [p.path ~ ' owner uid ' ~ (o.uid | default('absent')) ~ ' != ' ~ p.uid] -%}{%- endif -%}
+{%- if p.path is defined and (p.private_write | default(false)) is sameas true and (not (o.exists | default(false)) or (o.wgrp | default(true) | bool) or (o.woth | default(true) | bool)) -%}{%- set ns.r = ns.r + [p.path ~ ' is absent or group / other-writable'] -%}{%- endif -%}
+{%- if p.glob is defined and (o.count | default(-1)) != p.glob.count | int -%}{%- set ns.r = ns.r + [p.glob.dir ~ '/' ~ p.glob.pattern ~ ': ' ~ (o.count | default('?')) ~ ' entries, expected ' ~ p.glob.count] -%}{%- endif -%}
+{%- if p.file is defined -%}
+{%- set text = o.text | default(none) -%}
+{%- if text is none -%}{%- set ns.r = ns.r + [p.file ~ ' unreadable or missing'] -%}
+{%- else -%}
+{%- if p.contains is defined and p.contains not in text -%}{%- set ns.r = ns.r + [p.file ~ ' lacks "' ~ p.contains ~ '"'] -%}{%- endif -%}
+{%- if p.lacks is defined and p.lacks in text -%}{%- set ns.r = ns.r + [p.file ~ ' contains "' ~ p.lacks ~ '"'] -%}{%- endif -%}
+{%- if p.regex is defined and not (text is search(p.regex, multiline=true)) -%}{%- set ns.r = ns.r + [p.file ~ ' does not match ' ~ p.regex] -%}{%- endif -%}
+{%- if p.json_equal is defined -%}
+{%- set ns.v = text | from_json -%}
+{%- for k in p.json_equal.path.split('.') -%}{%- set ns.v = ns.v[k] | default(none) if ns.v is mapping else none -%}{%- endfor -%}
+{%- if ns.v != p.json_equal.value -%}{%- set ns.r = ns.r + [p.file ~ ' ' ~ p.json_equal.path ~ ' = ' ~ (ns.v | string) ~ ' != ' ~ p.json_equal.value] -%}{%- endif -%}
+{%- endif -%}
+{#- json_all {path, key, value}: the list at path is NON-EMPTY and every element's key equals value (e.g. every receipt row fetched) -#}
+{%- if p.json_all is defined -%}
+{%- set ns.v = text | from_json -%}
+{%- for k in p.json_all.path.split('.') -%}{%- set ns.v = ns.v[k] | default(none) if ns.v is mapping else none -%}{%- endfor -%}
+{%- if ns.v is string or ns.v is mapping or ns.v is not iterable or ns.v | length == 0 -%}{%- set ns.r = ns.r + [p.file ~ ' ' ~ p.json_all.path ~ ' is not a non-empty list'] -%}
+{%- else -%}
+{%- set bad = ns.v | rejectattr(p.json_all.key, 'defined') | list + (ns.v | selectattr(p.json_all.key, 'defined') | rejectattr(p.json_all.key, 'equalto', p.json_all.value) | list) -%}
+{%- if bad -%}{%- set ns.r = ns.r + [p.file ~ ' ' ~ (bad | length) ~ ' of ' ~ (ns.v | length) ~ ' ' ~ p.json_all.path ~ ' entries have ' ~ p.json_all.key ~ ' != ' ~ p.json_all.value] -%}{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{#- same_bytes: exactly two digests, BOTH present, equal. An ABSENT digest (absent, unreadable, a link or not a regular file:
+    stat follow false yields no checksum) is a typed obstruction, never equality -- ABSENT == ABSENT is not "same bytes" -#}
+{%- if p.same_bytes is defined -%}
+{%- set cs = o.checksums | default([]) -%}
+{%- if (cs | length) != 2 or 'ABSENT' in cs -%}
+{%- set sb = namespace(a = []) -%}
+{%- for f in p.same_bytes -%}{%- if (cs[loop.index0] | default('ABSENT')) == 'ABSENT' -%}{%- set sb.a = sb.a + [f] -%}{%- endif -%}{%- endfor -%}
+{%- set ns.r = ns.r + ['same_bytes ABSENT: ' ~ (sb.a | join(', ')) ~ ' (absent, unreadable or not a regular file; ' ~ (cs | length)
+                       ~ ' of 2 digests observed) -- no byte equality credit'] -%}
+{%- elif cs[0] != cs[1] -%}{%- set ns.r = ns.r + ['bytes differ: ' ~ (p.same_bytes | join(' vs '))] -%}{%- endif -%}
+{%- endif -%}
+{%- if p.implies is defined and p.implies.then_exists is defined and (o.if_exists | default(false)) and not (o.then_exists | default(false)) -%}{%- set ns.r = ns.r + [p.implies.if_exists ~ ' visible without ' ~ p.implies.then_exists] -%}{%- endif -%}
+{%- if p.implies is defined and p.implies.then_snapshot_equal is defined and (o.if_exists | default(false)) -%}
+{%- set before = snaps[p.implies.then_snapshot_equal] | default(none) -%}
+{%- if before is none or before.lines != (o.lines | default([])) -%}{%- set ns.r = ns.r + [p.implies.if_exists ~ ' exists but is not whole (snapshot ' ~ p.implies.then_snapshot_equal ~ ')'] -%}{%- endif -%}
+{%- endif -%}
+{%- if p.snapshot is defined -%}
+{%- set before = snaps[p.snapshot] | default(none) -%}
+{%- if before is none -%}{%- set ns.r = ns.r + ['no snapshot ' ~ p.snapshot] -%}
+{%- elif (before.lines != (o.lines | default([]))) == p.equal -%}
+{%- set ns.r = ns.r + ['snapshot ' ~ p.snapshot ~ (' changed: ' ~ ((before.lines | symmetric_difference(o.lines | default([])))[:6] | join(' | ')) if p.equal else ' unchanged')] -%}
+{%- endif -%}
+{%- endif -%}
+{#- trees [a, b] (codex 234857 content readback): two DIGEST-BEARING tree records (tree_lines; tasks/tree.yml) compared
+    line for line -- relpath, type, mode and the sha256 of every regular file. equal (default true): equal records are
+    required, and an absent, non-directory or EMPTY record never meets equality (no vacuous pass); equal false: they
+    must differ. Metadata snapshots (snapshot) never prove bytes. -#}
+{%- if p.trees is defined -%}
+{%- set ta = (o.trees | default([none, none]))[0] -%}
+{%- set tb = (o.trees | default([none, none]))[1] -%}
+{%- set want_eq = p.equal | default(true) -%}
+{%- if ta is none or tb is none -%}{%- set ns.r = ns.r + ['no tree record ' ~ (p.trees | join(' / '))] -%}
+{%- elif want_eq and (ta | length == 0 or ta[0] in ['ABSENT', 'NOT-A-REAL-DIR'] or tb | length == 0 or tb[0] in ['ABSENT', 'NOT-A-REAL-DIR']) -%}
+{%- set ns.r = ns.r + ['tree ' ~ (p.trees | join(' / ')) ~ ' is empty, absent or not a real directory (' ~ ((ta[:1] + tb[:1]) | join(' | ')) ~ '): equality would be vacuous'] -%}
+{%- elif (ta == tb) != want_eq -%}
+{%- set ns.r = ns.r + ['trees ' ~ (p.trees | join(' / ')) ~ (' differ: ' ~ ((ta | symmetric_difference(tb))[:6] | join(' | ')) if want_eq else ' are equal')] -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- listing lines for a snapshot, with the declared exclusions -#}
+{%- macro snapshot_lines(text, excl, incl) -%}
+{%- set ns = namespace(l = text.splitlines() | sort) -%}
+{%- for e in excl | default([]) -%}{%- set ns.l = ns.l | reject('search', e) | list -%}{%- endfor -%}
+{%- if incl | default([]) -%}{%- set ns.l = ns.l | select('search', '(' ~ (incl | join(')|(')) ~ ')') | list -%}{%- endif -%}
+{{ ns.l | to_json }}
+{%- endmacro -%}
+
+{#- the budget scope of a running seed must carry the declared limits (T22) -#}
+{%- macro scope_check(vals, bs) -%}
+{%- set ns = namespace(r = []) -%}
+{%- if (vals['memory.max'] | trim) != (bs.budget.memory_max_bytes | int | string) -%}{%- set ns.r = ns.r + ['memory.max ' ~ vals['memory.max'] | trim ~ ' != ' ~ bs.budget.memory_max_bytes] -%}{%- endif -%}
+{%- if (vals['pids.max'] | trim) != (bs.budget.tasks_max | int | string) -%}{%- set ns.r = ns.r + ['pids.max ' ~ vals['pids.max'] | trim ~ ' != ' ~ bs.budget.tasks_max] -%}{%- endif -%}
+{%- set cpu = (vals['cpu.max'] | trim).split(' ') -%}
+{%- if cpu | length != 2 or cpu[0] == 'max' or ((cpu[0] | int) * 100 // (cpu[1] | int)) != bs.budget.cpu_quota_percent | int -%}{%- set ns.r = ns.r + ['cpu.max ' ~ vals['cpu.max'] | trim ~ ' != ' ~ bs.budget.cpu_quota_percent ~ '%'] -%}{%- endif -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ compile ---------------------------------- -#}
+{#- control -> [{variant, declaration, requires, ops, steps(flat)}]. Sweeps are generated here into ordinary steps. -#}
+{#- repeat: {count_token, steps} -> the sub-steps count times; ids, step references and '/<id>.' file names get -<n> -#}
+{%- macro flatten(steps, t) -%}
+{%- set ns = namespace(out = []) -%}
+{%- for s in steps -%}
+{%- if s.repeat is defined -%}
+{%- set ids = s.repeat.steps | map(attribute='id') | list -%}
+{%- for n in range(1, (t[s.repeat.count_token] | int) + 1) -%}
+{%- set ns.j = s.repeat.steps | to_json -%}
+{%- for i in ids -%}{%- set ns.j = ns.j | replace('"' ~ i ~ '"', '"' ~ s.id ~ '-' ~ i ~ '-' ~ n ~ '"') | replace('/' ~ i ~ '.', '/' ~ s.id ~ '-' ~ i ~ '-' ~ n ~ '.') -%}{%- endfor -%}
+{%- set ns.out = ns.out + (ns.j | from_json | map('combine', s | dict2items | selectattr('key', 'in', ['only_variants', 'skip_variants']) | items2dict) | list) -%}
+{%- endfor -%}
+{%- else -%}{%- set ns.out = ns.out + [s] -%}{%- endif -%}
+{%- endfor -%}
+{{ ns.out | to_json }}
+{%- endmacro -%}
+
+{%- macro compile(c, ctx) -%}
+{%- set ns = namespace(out = []) -%}
+{%- for v in c.variants | default([{'id': 'base'}]) -%}
+{%- set steps = c.steps | default([]) -%}
+{%- if c.sweep is defined and c.sweep.kind == 'phases' -%}{%- set steps = sweep_phases(c, ctx) | from_json -%}{%- endif -%}
+{%- if c.sweep is defined and c.sweep.kind == 'declared_points' -%}{%- set steps = sweep_points(c, ctx) | from_json -%}{%- endif -%}
+{%- if c.sweep is defined and c.sweep.kind == 'pins' -%}{%- set steps = sweep_pins(c, ctx) | from_json -%}{%- endif -%}
+{%- set steps = flatten(steps, ctx.t) | from_json -%}
+{%- set ns.flat = [] -%}
+{#- G-EXPORT-VARIANT-SELECTION: the SAME predicate launcher_consumers uses -#}
+{%- for s in steps if step_selected(s, v.id) | from_json -%}
+{%- set ns.flat = ns.flat + [s | combine({'expect': (s.expect | default({})) | combine((v.expect | default({}))[s.id] | default({}))}) if (s.expect is defined or ((v.expect | default({}))[s.id] is defined)) else s] -%}
+{%- endfor -%}
+{%- set ns.out = ns.out + [{'variant': v.id, 'declaration': v.declaration | default(c.declaration | default('')),
+                           'requires': (c.requires | default([])) + (v.requires | default([])),
+                           'ops': (c.setup | default([])) + (v.ops | default([])), 'steps': ns.flat,
+                           'undo': (v.undo | default([])) + (c.undo | default([])), 'tokens': v.tokens | default({})}] -%}
+{%- endfor -%}
+{{ ns.out | to_json }}
+{%- endmacro -%}
+
+{%- macro sweep_phases(c, ctx) -%}
+{%- set ns = namespace(s = []) -%}
+{%- set pe = c.per_point_expect -%}
+{%- for p in ctx.phases -%}
+{%- set k = 'ph-' ~ p -%}
+{%- set late = p in (pe.late_phases | default([])) -%}
+{%- set ns.s = ns.s + [
+  {'id': k ~ '-apply', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'apply', 'root': '{root}', 'async': true}},
+  {'id': k ~ '-at', 'wait': {'phase': p, 'step': k ~ '-apply'}, 'timeout_s': ctx.timeouts.wait_phase},
+  {'id': k ~ '-kill', 'kill': {'step': k ~ '-apply'}},
+  {'id': k ~ '-join', 'join': k ~ '-apply', 'expect': {'record_only': true}},
+  {'id': k ~ '-held', 'state': pe.interrupted_state | default([])},
+  {'id': k ~ '-rerun', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'apply', 'root': '{root}'}, 'expect': (pe.rerun_late if late else pe.rerun)},
+  {'id': k ~ '-after', 'state': pe.state | default([])},
+  {'id': k ~ '-verify', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'verify', 'root': '{root}'}, 'expect': {'rc': 0, 'outcome': 'VERIFIED'}},
+  {'id': k ~ '-reset', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'purge', 'root': '{root}'}, 'expect': {'rc': 0} | combine(pe.reset | default({'outcome_any': ['PURGED', 'ABSENT']}))},
+  {'id': k ~ '-clear', 'ops': [{'remove_glob': {'dir': '{parent}', 'pattern': '.{rootname}.creating.*'}}]}] -%}
+{%- endfor -%}
+{{ ns.s | to_json }}
+{%- endmacro -%}
+
+{#- pins: every reserved name x channel x entrypoint -> one refused step (ctx.pin_names = C1 registry reserved_outputs + rh_repo_root + must_include) -#}
+{%- macro sweep_pins(c, ctx) -%}
+{%- set ns = namespace(s = []) -%}
+{%- set pe = c.per_point_expect -%}
+{%- for name in ctx.pin_names -%}
+{%- for ch in pe.channels -%}
+{%- for e in pe.entrypoints -%}
+{%- set k = 'pin-' ~ e.playbook ~ '-' ~ ch ~ '-' ~ (name | regex_replace('[^A-Za-z0-9]', '_')) -%}
+{%- set act = {'kind': 'playbook', 'playbook': e.playbook, 'via': e.via, 'dest': '{ctl}/bundle', 'root': '{shared}', 'bundle': 'a',
+               'env': e.env | default({}), 'trace_network': e.trace_network | default(false)}
+              | combine({'extra_vars': {name: 'rhc-pinned'}} if ch == 'extra_var' else {'inventory_extra': {name: 'rhc-pinned'}}) -%}
+{%- set ns.s = ns.s + [{'id': k, 'act': act, 'expect': pe.expect | combine({'no_network': true} if e.trace_network | default(false) else {}),
+                        'post_state': e.post_state | default([])}] -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- endfor -%}
+{{ ns.s | to_json }}
+{%- endmacro -%}
+
+{%- macro sweep_points(c, ctx) -%}
+{%- set ns = namespace(s = []) -%}
+{%- set pe = c.per_point_expect -%}
+{%- for p in ctx.points -%}
+{%- set k = 'pt-' ~ p.id -%}
+{%- set inj = {'inject': {'syscalls': p.syscalls, 'when': p.when, 'hold': ctx.hold}} | combine({'trace_path': p.trace_path} if p.trace_path is defined else {}) -%}
+{%- set ns.s = ns.s + [
+  {'id': k ~ '-apply', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'apply', 'root': '{root}', 'async': true, 'strace': inj}},
+  {'id': k ~ '-at', 'wait': p.wait | combine({'step': k ~ '-apply'}), 'timeout_s': 900},
+  {'id': k ~ '-valid', 'state': p.valid},
+  {'id': k ~ '-kill', 'kill': {'step': k ~ '-apply'}},
+  {'id': k ~ '-join', 'join': k ~ '-apply', 'expect': {'killed': true}},
+  {'id': k ~ '-held', 'state': pe.interrupted_state | default([])}]
+  + ([{'id': k ~ '-verify-held', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'verify', 'root': '{root}'}, 'expect': pe.publication_points_verify}] if p.publication | default(false) else [])
+  + [{'id': k ~ '-rerun', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'apply', 'root': '{root}'}, 'expect': pe.rerun | combine(p.rerun | default({}))},
+  {'id': k ~ '-after', 'state': pe.state | default([]) + (p.after | default([]))},
+  {'id': k ~ '-verify', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'verify', 'root': '{root}'}, 'expect': {'rc': 0, 'outcome': 'VERIFIED'}},
+  {'id': k ~ '-reset', 'act': {'kind': 'seed', 'bundle': 'a', 'op': 'purge', 'root': '{root}'}, 'expect': {'rc': 0, 'outcome_any': ['PURGED', 'ABSENT']}},
+  {'id': k ~ '-clear', 'ops': [{'remove_glob': {'dir': '{parent}', 'pattern': '.{rootname}.creating.*'}}]}] -%}
+{%- endfor -%}
+{{ ns.s | to_json }}
+{%- endmacro -%}
+
+{#- the path and each ancestor strictly below stop (e.g. $HOME), deepest first -#}
+{%- macro ancestry(path, stop) -%}
+{%- set p = path.split('/') -%}
+{%- set ns = namespace(l = []) -%}
+{%- for i in range((stop.split('/') | length) + 1, (p | length) + 1) -%}{%- set ns.l = [p[:i] | join('/')] + ns.l -%}{%- endfor -%}
+{{ ns.l | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ static checks ----------------------------- -#}
+{#- Pure judges of the independent static checks (X03, TR01). tasks/static_check.yml gathers the inputs (a template
+    render, a repository-scoped file list, parsed declarations) and calls sc_<kind>(inp, spec, mut) once with
+    mut = {} (the check itself: must return no failures) and once per declared negative control (mut = the mutation:
+    must return at least one failure, matching `expect_failure` when declared). A negative control the judge accepts
+    is a FAIL of the control: the check could not have caught that defect.
+    Every sc_* returns {failures: [...], observations: [...]}. -#}
+
+{#- a dotted path into a mapping; returns {found, value} -#}
+{%- macro dig(o, dotted) -%}
+{%- set ns = namespace(v = o, ok = true) -%}
+{%- for k in dotted.split('.') if ns.ok -%}
+{%- if ns.v is mapping and k in ns.v -%}{%- set ns.v = ns.v[k] -%}{%- else -%}{%- set ns.ok = false -%}{%- endif -%}
+{%- endfor -%}
+{{ {'found': ns.ok, 'value': ns.v if ns.ok else none} | to_json }}
+{%- endmacro -%}
+
+{#- C19: render with os_tools.<tool>.path changed. inp {base, patched, old}; spec {tool, path, min_sites}.
+    Every line carrying the old path (path-boundary match) must carry the new one with nothing else changed, every
+    other line must be byte-identical, and no line may keep the old path. mut.kind: unchanged | presence_only |
+    stray_line (mut.line, '{old}' replaced) -#}
+{%- macro sc_render_tool_path(inp, spec, mut) -%}
+{%- set old = inp.old -%}
+{%- set new = spec.path -%}
+{%- set m = mut.kind | default('none') -%}
+{%- if m == 'unchanged' -%}{%- set pt = inp.base -%}
+{%- elif m == 'presence_only' -%}{%- set pt = inp.base | replace(old, new, 1) -%}
+{%- elif m == 'stray_line' -%}{%- set pt = inp.patched ~ '\n' ~ (mut.line | replace('{old}', old)) -%}
+{%- else -%}{%- set pt = inp.patched -%}{%- endif -%}
+{%- set bl = inp.base.split('\n') -%}
+{%- set pl = pt.split('\n') -%}
+{%- set bre = '(^|[^A-Za-z0-9_./+-])' ~ (old | regex_escape) ~ '($|[^A-Za-z0-9_./+-])' -%}
+{%- set ns = namespace(f = [], sites = 0, bad = [], other = []) -%}
+{%- if old == new -%}{%- set ns.f = ns.f + ['declared path ' ~ new ~ ' equals the current path: nothing to observe'] -%}{%- endif -%}
+{%- if bl | length != pl | length -%}
+{%- set ns.f = ns.f + ['line count ' ~ (bl | length) ~ ' -> ' ~ (pl | length) ~ ': the render changed beyond the tool path'] -%}
+{%- else -%}
+{%- for b in bl -%}
+{%- set p = pl[loop.index0] -%}
+{%- if b is search(bre) -%}
+{%- set ns.sites = ns.sites + 1 -%}
+{%- if p != (b | replace(old, new)) -%}{%- set ns.bad = ns.bad + [loop.index] -%}{%- endif -%}
+{%- elif p != b -%}{%- set ns.other = ns.other + [loop.index] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if ns.bad -%}{%- set ns.f = ns.f + [(ns.bad | length) ~ ' line(s) carrying ' ~ old ~ ' did not change to ' ~ new ~ ' (lines ' ~ (ns.bad[:8] | join(',')) ~ ')'] -%}{%- endif -%}
+{%- if ns.other -%}{%- set ns.f = ns.f + [(ns.other | length) ~ ' line(s) without the tool path changed (lines ' ~ (ns.other[:8] | join(',')) ~ ')'] -%}{%- endif -%}
+{%- endif -%}
+{%- set left = pl | select('search', bre) | list -%}
+{%- if left -%}{%- set ns.f = ns.f + [(left | length) ~ ' line(s) still carry ' ~ old] -%}{%- endif -%}
+{%- if ns.sites < spec.min_sites | default(2) | int -%}{%- set ns.f = ns.f + ['only ' ~ ns.sites ~ ' line(s) carry ' ~ old ~ ' (declared minimum ' ~ spec.min_sites | default(2) ~ ')'] -%}{%- endif -%}
+{{ {'failures': ns.f, 'observations': [spec.tool ~ ': ' ~ ns.sites ~ ' line(s) carry the declared path; every one follows os_tools.' ~ spec.tool ~ '.path']} | to_json }}
+{%- endmacro -%}
+
+{#- C20: inp {files: repository-relative paths that would be committed under spec.under}; spec {under,
+    allow_suffixes, forbid_basenames}. mut.kind: add_file (mut.path) | empty -#}
+{%- macro sc_representation(inp, spec, mut) -%}
+{%- set m = mut.kind | default('none') -%}
+{%- set files = [] if m == 'empty' else (inp.files + ([mut.path] if m == 'add_file' else [])) -%}
+{%- set sre = '(' ~ (spec.allow_suffixes | map('regex_escape') | join('|')) ~ ')$' -%}
+{%- set ns = namespace(f = []) -%}
+{%- if not files -%}{%- set ns.f = ['no file observed under ' ~ spec.under ~ ' (an empty observation is never a pass)'] -%}{%- endif -%}
+{%- set bad = files | reject('search', sre) | list -%}
+{%- if bad -%}{%- set ns.f = ns.f + ['not ' ~ (spec.allow_suffixes | join('/')) ~ ': ' ~ (bad[:10] | join(' '))] -%}{%- endif -%}
+{%- set gen = files | map('basename') | select('in', spec.forbid_basenames | default([])) | list -%}
+{%- if gen -%}{%- set ns.f = ns.f + ['generated output present: ' ~ (gen | join(' '))] -%}{%- endif -%}
+{{ {'failures': ns.f, 'observations': [(files | length) ~ ' committable file(s) under ' ~ spec.under]} | to_json }}
+{%- endmacro -%}
+
+{#- D20: inp {rh}; spec {required_uses}. The selected adapter is admitted; its target tools cover the required uses;
+    every os_tools name, adapter target tool and adapter controller tool is in packages.provides; every adapter target
+    package is mapped for every declared os family. Observation (not a failure): target tools whose providing package
+    is not in the adapter's target.packages. mut.kind: drop_provides (mut.tool) | drop_use (mut.use) | add_os_tool
+    (mut.name) | drop_family_mapping (mut.package) -#}
+{%- macro sc_adapter_closure(inp, spec, mut) -%}
+{%- set m = mut.kind | default('none') -%}
+{%- set rh = inp.rh -%}
+{%- set sel = rh.transfer.adapter -%}
+{%- set ad = rh.transfer.adapters[sel] | default({}) -%}
+{%- set ns = namespace(f = [], o = [], prov = {}, tools = {}, fam = {}) -%}
+{%- for k, v in (rh.packages.provides | default({})).items() -%}{%- set ns.prov = ns.prov | combine({k: (v | reject('equalto', mut.tool) | list) if m == 'drop_provides' else v}) -%}{%- endfor -%}
+{%- for k, v in (ad.target.tools | default({})).items() -%}{%- set ns.tools = ns.tools | combine({k: v | combine({'used_by': (v.used_by | default([]) | reject('equalto', mut.use) | list) if m == 'drop_use' else v.used_by | default([])})}) -%}{%- endfor -%}
+{%- for k, v in (rh.packages.by_os_family | default({})).items() -%}{%- set ns.fam = ns.fam | combine({k: (v | dict2items | rejectattr('key', 'equalto', mut.package) | items2dict) if m == 'drop_family_mapping' else v}) -%}{%- endfor -%}
+{%- set os_names = (rh.controller.bootstrap.os_tools | default({})).keys() | list + ([mut.name] if m == 'add_os_tool' else []) -%}
+{%- if not ad -%}{%- set ns.f = ns.f + ['selected adapter ' ~ sel ~ ' is not declared'] -%}{%- endif -%}
+{%- if (ad.status | default('admitted')) == 'not_admitted' -%}{%- set ns.f = ns.f + ['selected adapter ' ~ sel ~ ' is not_admitted'] -%}{%- endif -%}
+{%- set uses = ns.tools.values() | map(attribute='used_by') | flatten | unique | list -%}
+{%- set mu = spec.required_uses | reject('in', uses) | list -%}
+{%- if mu -%}{%- set ns.f = ns.f + ['adapter ' ~ sel ~ ' target tools cover no ' ~ (mu | join('/')) ~ ' use'] -%}{%- endif -%}
+{%- set provided = ns.prov.values() | flatten | unique | list -%}
+{%- set names = (os_names + (ns.tools.keys() | list) + (ad.controller.os_tools | default([]))) | unique | list -%}
+{%- set up = names | reject('in', provided) | list -%}
+{%- if up -%}{%- set ns.f = ns.f + ['not in packages.provides: ' ~ (up | sort | join(' '))] -%}{%- endif -%}
+{%- if not ns.fam -%}{%- set ns.f = ns.f + ['packages.by_os_family declares no family'] -%}{%- endif -%}
+{%- for fam, mp in ns.fam.items() -%}
+{%- set um = (ad.target.packages | default([])) | reject('in', mp.keys() | list) | list -%}
+{%- if um -%}{%- set ns.f = ns.f + ['adapter ' ~ sel ~ ' target package(s) ' ~ (um | join(' ')) ~ ' unmapped for ' ~ fam] -%}{%- endif -%}
+{%- endfor -%}
+{%- for t in ns.tools.keys() | sort -%}
+{%- set pk = ns.prov | dict2items | selectattr('value', 'contains', t) | map(attribute='key') | list -%}
+{%- if pk and (pk | select('in', ad.target.packages | default([])) | list | length == 0) -%}{%- set ns.o = ns.o + ['target tool ' ~ t ~ ' is provided by ' ~ (pk | join('/')) ~ ', not among adapter ' ~ sel ~ ' target.packages'] -%}{%- endif -%}
+{%- endfor -%}
+{{ {'failures': ns.f, 'observations': ns.o} | to_json }}
+{%- endmacro -%}
+
+{#- TR01 / M1-TRANSPORT-COMPOSITION: no supported case reclassified as covered because it refuses.
+    inp {bcases: B's case rows, lids: lifecycle case ids, rh, bdecl: B's transfer declaration, controls, self_id};
+    spec {cases (B-supported, prefixed), refused_cases, prefix, b_supported {expect_rc, kinds}, route_declaration,
+    route_form_key, b_form_path, form_var, route_case, coverage_classes}.
+    Failures: a listed B case missing or no longer supported (expects a refusal); the route case missing; a declared
+    route form that differs from B's contract form, does not admit a B-supported form, or admits a B-refused form;
+    another control naming a supported case outside the coverage classes. An undeclared route composition is an
+    observation (the case stays OPEN). mut.kind: b_case_expect (mut.case, mut.rc) | drop_b_case (mut.case) |
+    route_form (mut.regex) | drop_route_case | claim_coverage (mut.control, mut.case) -#}
+{%- macro sc_transport_disposition(inp, spec, mut) -%}
+{%- set m = mut.kind | default('none') -%}
+{%- set pre = spec.prefix | default('transfer:') -%}
+{%- set ns = namespace(f = [], o = [], rows = {}) -%}
+{%- for r in inp.bcases -%}
+{%- if m == 'drop_b_case' and (pre ~ r.id) == mut.case -%}
+{%- elif m == 'b_case_expect' and (pre ~ r.id) == mut.case -%}{%- set ns.rows = ns.rows | combine({pre ~ r.id: r | combine({'kind': 'phase', 'expect': (r.expect | default({})) | combine({'rc': mut.rc})})}) -%}
+{%- else -%}{%- set ns.rows = ns.rows | combine({pre ~ r.id: r}) -%}{%- endif -%}
+{%- endfor -%}
+{%- set lids = inp.lids | reject('equalto', spec.route_case) | list if m == 'drop_route_case' else inp.lids -%}
+{%- set controls = inp.controls + ([{'id': mut.control, 'cases': [mut.case]}] if m == 'claim_coverage' else []) -%}
+{%- for id in spec.cases -%}
+{%- set r = ns.rows[id] | default(none) -%}
+{%- if r is none -%}{%- set ns.f = ns.f + ['B row ' ~ id ~ ' is missing (a supported case may not disappear)'] -%}
+{%- elif not ((r.expect.rc | default('none') | string) == (spec.b_supported.expect_rc | string) or (r.kind | default('')) in spec.b_supported.kinds) -%}
+{%- set ns.f = ns.f + ['LOST SUPPORTED CASE ' ~ id ~ ': B now expects rc ' ~ (r.expect.rc | default('none') | string) ~ ' (a refusal is never coverage)'] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if spec.route_case not in lids -%}{%- set ns.f = ns.f + ['route case ' ~ spec.route_case ~ ' is missing'] -%}{%- endif -%}
+{%- set d = dig(inp.rh, spec.route_declaration) | from_json -%}
+{%- if not d.found -%}{%- set ns.o = ns.o + ['route declares no ' ~ spec.route_declaration ~ ' (OPEN)'] -%}
+{%- else -%}
+{%- set rform = mut.regex if m == 'route_form' else d.value[spec.route_form_key] | default('') -%}
+{%- set bform = (dig(inp.bdecl, spec.b_form_path) | from_json).value -%}
+{%- if rform != bform -%}{%- set ns.f = ns.f + ['route form ' ~ rform ~ ' != B contract form ' ~ (bform | string)] -%}{%- endif -%}
+{%- for id in spec.cases + spec.refused_cases -%}
+{%- set r = ns.rows[id] | default({}) -%}
+{%- set v = (r.phase.k_vars | default({}))[spec.form_var] | default(none) if r.phase is defined else none -%}
+{%- if v is not none and rform -%}
+{%- if id in spec.cases and not (v is match(rform)) -%}{%- set ns.f = ns.f + ['route form does not admit B-supported ' ~ id ~ ' (' ~ v ~ ')'] -%}{%- endif -%}
+{%- if id in spec.refused_cases and (v is match(rform)) -%}{%- set ns.f = ns.f + ['route form admits B-refused ' ~ id ~ ' (' ~ v ~ ')'] -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- set ns.o = ns.o + ['route composition declared; ' ~ (spec.cases | join(', ')) ~ ' stay OPEN until the joined controls execute ' ~ spec.route_case ~ ' on a real target'] -%}
+{%- endif -%}
+{%- for c in controls if c.id != inp.self_id -%}
+{%- for id in spec.cases if id in (c.cases | default([])) and (c.result_class | default('')) not in spec.coverage_classes and c.declared_only is not defined -%}
+{%- set ns.f = ns.f + [c.id ~ ' names supported ' ~ id ~ ' as executable coverage (only ' ~ (spec.coverage_classes | join('/')) ~ ' or declared_only may)'] -%}
+{%- endfor -%}
+{%- endfor -%}
+{{ {'failures': ns.f, 'observations': ns.o} | to_json }}
+{%- endmacro -%}
+
+{#- ------------------------------------------------------------ neutrality (Y03 helper) --------------------- -#}
+{#- the dotted JSON paths where a and b differ (lists of equal length compared per index as path[i]) -#}
+{%- macro diff_paths(a, b, path) -%}
+{%- if a is mapping and b is mapping -%}
+{%- set ns = namespace(o = []) -%}
+{%- for k in ((a.keys() | list) + (b.keys() | list)) | map('string') | unique | sort -%}
+{%- set p = (path ~ '.' ~ k) if path else k -%}
+{%- if k not in a or k not in b -%}{%- set ns.o = ns.o + [p] -%}
+{%- else -%}{%- set ns.o = ns.o + (diff_paths(a[k], b[k], p) | from_json) -%}{%- endif -%}
+{%- endfor -%}
+{{ ns.o | to_json }}
+{%- elif a is sequence and a is not string and b is sequence and b is not string and (a | length) == (b | length) -%}
+{%- set ns = namespace(o = []) -%}
+{%- for i in range(a | length) -%}{%- set ns.o = ns.o + (diff_paths(a[i], b[i], path ~ '[' ~ i ~ ']') | from_json) -%}{%- endfor -%}
+{{ ns.o | to_json }}
+{%- else -%}{{ ([path if path else '$'] if a != b else []) | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- C1 Q-C1-NEUTRALITY predicate for ONE profile. base/cand: {refused: <refusal text or none>, facts: {<compared fact>:
+    value}}; intended: dotted path prefixes the change under test may alter. Returns {class, paths, outside}:
+    NEUTRAL-EXCEPT-INTENDED (every differing path inside intended), NOT-REACHED-PARITY (both refused before
+    resolution with the same refusal), DIFFERENT (anything else: never neutral). -#}
+{%- macro neutrality(base, cand, intended) -%}
+{%- if base.refused or cand.refused -%}
+{%- if base.refused and cand.refused and base.refused == cand.refused -%}{{ {'class': 'NOT-REACHED-PARITY', 'paths': [], 'outside': []} | to_json }}
+{%- else -%}{{ {'class': 'DIFFERENT', 'paths': [], 'outside': ['refusal: ' ~ (base.refused | string) ~ ' vs ' ~ (cand.refused | string)]} | to_json }}{%- endif -%}
+{%- else -%}
+{%- set paths = diff_paths(base.facts, cand.facts, '') | from_json -%}
+{%- set ns = namespace(out = []) -%}
+{%- for p in paths -%}
+{%- set ns.hit = false -%}
+{%- for i in intended if p == i or p.startswith(i ~ '.') or p.startswith(i ~ '[') -%}{%- set ns.hit = true -%}{%- endfor -%}
+{%- if not ns.hit -%}{%- set ns.out = ns.out + [p] -%}{%- endif -%}
+{%- endfor -%}
+{{ {'class': 'NEUTRAL-EXCEPT-INTENDED' if not ns.out else 'DIFFERENT', 'paths': paths, 'outside': ns.out} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- negative controls rejected for ANOTHER reason than declared: neg = [{mutation, failures}] -#}
+{%- macro sc_negative_reasons(kind, neg) -%}
+{%- set ns = namespace(r = []) -%}
+{%- for n in neg if n.failures and n.mutation.expect_failure is defined -%}
+{%- if n.failures | select('search', n.mutation.expect_failure) | list | length == 0 -%}
+{%- set ns.r = ns.r + ['negative control ' ~ kind ~ '/' ~ n.mutation.kind ~ ' rejected, but not for "' ~ n.mutation.expect_failure ~ '": ' ~ (n.failures | join('; '))] -%}
+{%- endif -%}
+{%- endfor -%}
+{{ ns.r | to_json }}
+{%- endmacro -%}

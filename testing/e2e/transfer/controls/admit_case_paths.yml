@@ -1,0 +1,126 @@
+---
+# testing/e2e/transfer/controls/admit_case_paths.yml -- NEW (r5r; codex-tick461 R5P-GENERATION-PATH-ADMISSION). The
+# scoped fixture fence of run_one_case.yml: admits each case-supplied fixture-relative path BEFORE the read or the
+# mutation that uses it. Not a filesystem engine: it only applies the EXISTING declared path policy of the resolved
+# bootstrap (path_admission: separator, regex, forbidden_segment_regex, case_sensitive) and the route's ONE ancestry
+# rule (testing/remote_harness/tasks/admit_ancestry.yml: every existing component a real directory -- links refuse --
+# with the declared owner / writability policy), plus a no-follow stat of the leaf (replace / slurp / copy follow links).
+# Read-only. AUTHORED, NEVER EXECUTED (controls UNRUN).
+#
+# For each item {rel, need}:
+#   shape        <separator><rel> matches path_admission.regex (the declared grammar; the regex is absolute-form, so a
+#                relative path is admitted as its separator-prefixed form) and rel has no forbidden segment (. / ..)
+#   containment  <ap_root><separator><rel>, normalized, is itself (no traversal survives) and lies under ap_root
+#   ancestry     EVERY distinct parent directory, through admit_ancestry.yml (existing components only). r5s
+#                (codex-tick480 R5R-CASE-SENSITIVE-ANCESTRY): parents are deduplicated by EXACT, case-sensitive
+#                identity -- Ansible's `unique` folds case unless told otherwise, so r5r merged src/a (real) and src/A
+#                (a link outside) into one check. The identity semantics are the shared declaration
+#                path_admission.case_sensitive (C1-R5S-1, declared true there): B consumes that ONE declared identity
+#                policy (shared with R2) and holds no private `true` literal as policy (codex-tick482
+#                R2L-SHARED-IDENTITY-AND-RECORD-VALUES); a non-boolean or absent policy refuses.
+#   leaf         by `need` (a declared class of C.harness.case_path_classes): file = an existing regular file, not a
+#                link; tree = an existing regular file or directory, not a link; absent = nothing (not even a link);
+#                replaceable = an existing regular non-link file OR nothing (a placement target that may be overwritten)
+# All items of ONE invocation are admitted (shape, every parent, every leaf) before the caller's first effect.
+# Inputs (no defaults): ap_root (absolute admitted root: the case clone / the check fixture repository), ap_items,
+# ap_case (case id, diagnostics). Refusal: C.harness.refusals.case_path with C.harness.texts.case_path, through the
+# shared refusal grammar entry (r5u-rf2 RF-OD-9 a: the canonical declared-root expression repo_root ~
+# _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel, inline at each lookup) with the
+# grammar _hrf_grammar bound by run_controls.yml.
+# r5s (codex-tick480 R5R-ASSERT-TASK-SHAPE): every assert's fail_msg / quiet are ARGUMENTS of ansible.builtin.assert
+# (r5r placed them as task-level siblings, so the helper could not load).
+
+- name: "CASE-PATH -- refuse malformed inputs, an undeclared presence class or an undeclared identity policy (before any stat)"
+  vars:
+    _apc: "{{ C.harness.case_path_classes }}"
+    _apcs: "{{ _wrp.bootstrap.path_admission.case_sensitive }}"
+  ansible.builtin.assert:
+    that:
+      # evaluated in order: presence first, so an absent policy REFUSES (never an undefined-variable error)
+      - _wrp.bootstrap.path_admission.case_sensitive is defined
+      - _apcs is boolean
+      - _apc is mapping
+      - _apc.file is string and _apc.tree is string and _apc.absent is string and _apc.replaceable is string
+      - (_apc.values() | list | unique(case_sensitive=_apcs) | length) == (_apc | length)
+      - ap_root is string and ap_root is match(_wrp.bootstrap.path_admission.regex)
+      - ap_root is not search(_wrp.bootstrap.path_admission.forbidden_segment_regex)
+      - ap_items is sequence and ap_items is not string
+      - ap_items | reject('mapping') | list | length == 0
+      - ap_items | map(attribute='rel') | reject('string') | list | length == 0
+      - ap_items | map(attribute='need') | reject('in', _apc.values() | list) | list | length == 0
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.case_path,
+                               'rh_rf_detail': [C.harness.texts.case_path, ap_case, ap_root, ap_items | to_json]}) | trim }}
+    quiet: true
+
+- name: "CASE-PATH -- the shape and containment of every item; the exact-identity parent set (declared grammar; pure, no I/O)"
+  vars:
+    _sep: "{{ _wrp.bootstrap.path_admission.separator }}"
+  ansible.builtin.set_fact:
+    _ap_bad: >-
+      {%- set ns = namespace(o=[]) -%}
+      {%- for it in ap_items -%}
+      {%- set full = ap_root ~ _sep ~ it.rel -%}
+      {%- if not ((_sep ~ it.rel) is match(_wrp.bootstrap.path_admission.regex)
+                  and it.rel is not search(_wrp.bootstrap.path_admission.forbidden_segment_regex)
+                  and (full | normpath) == full
+                  and full.startswith(ap_root ~ _sep)) -%}
+      {%- set ns.o = ns.o + [it.rel] -%}{%- endif -%}
+      {%- endfor -%}{{ ns.o }}
+    _ap_abs: "{{ ap_items | map(attribute='rel') | map('regex_replace', '^', ap_root ~ _sep) | list }}"
+    _ap_parents: >-
+      {{ ap_items | map(attribute='rel') | map('regex_replace', '^', ap_root ~ _sep) | map('dirname')
+         | unique(case_sensitive=_wrp.bootstrap.path_admission.case_sensitive) | list }}
+
+- name: "CASE-PATH -- refuse a path outside the declared grammar or the admitted root"
+  ansible.builtin.assert:
+    that:
+      - _ap_bad | length == 0
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.case_path,
+                               'rh_rf_detail': [C.harness.texts.case_path, ap_case, ap_root, _ap_bad | to_json]}) | trim }}
+    quiet: true
+
+- name: "CASE-PATH -- each distinct parent directory (exact identity) through the route's ONE ancestry rule (links refuse)"
+  ansible.builtin.include_tasks: "{{ repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+  loop: "{{ _ap_parents }}"
+  loop_control:
+    loop_var: _ap_parent
+  vars:
+    rh_anc_bs: "{{ _wrp.bootstrap }}"
+    rh_anc_repo_root: "{{ _wrp.repo_root }}"
+    rh_anc_path: "{{ _ap_parent }}"
+    rh_anc_refusal: "{{ C.harness.refusals.case_path }}"
+
+- name: "CASE-PATH -- stat each leaf (no link followed)"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ _ap_abs }}"
+  register: _ap_leaf
+
+- name: "CASE-PATH -- refuse a leaf of the wrong presence class or a link"
+  vars:
+    _apc: "{{ C.harness.case_path_classes }}"
+    _ap_wrong: >-
+      {%- set ns = namespace(o=[]) -%}
+      {%- for it, r in ap_items | zip(_ap_leaf.results) -%}
+      {%- set s = r.stat -%}
+      {%- set ok = ((it.need == _apc.file and s.exists and s.isreg and not s.islnk)
+                    or (it.need == _apc.tree and s.exists and not s.islnk and (s.isreg or s.isdir))
+                    or (it.need == _apc.absent and not s.exists)
+                    or (it.need == _apc.replaceable and (not s.exists or (s.isreg and not s.islnk)))) -%}
+      {%- if not ok -%}{%- set ns.o = ns.o + [[it.rel, it.need]] -%}{%- endif -%}
+      {%- endfor -%}{{ ns.o }}
+  ansible.builtin.assert:
+    that:
+      - _ap_leaf.results | length == ap_items | length
+      - _ap_wrong | length == 0
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.case_path,
+                               'rh_rf_detail': [C.harness.texts.case_path, ap_case, ap_root, _ap_wrong | to_json]}) | trim }}
+    quiet: true

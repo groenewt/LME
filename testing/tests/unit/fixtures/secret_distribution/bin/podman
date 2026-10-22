@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Tiny Podman-secret boundary used only by the Ansible integration fixture."""
+
+import hashlib
+import os
+from pathlib import Path
+import sys
+
+
+def fail(message, code=125):
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+root = Path(os.environ["LME_FAKE_PODMAN_ROOT"])
+host = os.environ.get("LME_SECRET_SCOPE_HOST", "unscoped")
+error_canary_path = root / "error-canary"
+error_canary = (
+    error_canary_path.read_text(encoding="utf-8")
+    if error_canary_path.exists()
+    else "synthetic-error"
+)
+args = sys.argv[1:]
+if len(args) < 2 or args[:2] != ["secret", "inspect"] and args[:2] != ["secret", "create"]:
+    fail("unsupported synthetic podman invocation")
+
+if args[:2] == ["secret", "inspect"]:
+    names = [arg for arg in args[2:] if not arg.startswith("-")]
+    names = [arg for arg in names if arg not in ("{{.SecretData}}",)]
+    if not names:
+        fail("missing secret reference")
+    name = names[0]
+    path = root / host / name
+    marker = root / host / (name + ".error")
+    if marker.exists():
+        category = marker.read_text(encoding="utf-8").strip()
+        fail(f"{category}: {error_canary}", 126 if category == "permission-denied" else 125)
+    if not path.exists():
+        fail(f"absent: {error_canary}", 125)
+    if "--showsecret" in args:
+        sys.stdout.write(path.read_text(encoding="utf-8"))
+    else:
+        print('{"Spec":{"Name":"%s"}}' % name)
+    raise SystemExit(0)
+
+name = args[-2]
+payload = sys.stdin.read()
+target = root / host / name
+target.parent.mkdir(parents=True, exist_ok=True)
+stored_payload = payload + "-corrupt" if (root / host / (name + ".corrupt-create")).exists() else payload
+target.write_text(stored_payload, encoding="utf-8")
+with open(root / "operations.log", "a", encoding="utf-8") as stream:
+    stream.write(
+        "create|%s|%s|%s\n"
+        % (host, name, hashlib.sha256(payload.encode("utf-8")).hexdigest())
+    )

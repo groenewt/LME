@@ -1,0 +1,1242 @@
+---
+# testing/remote_harness/package.yml -- artifact admission + seed packaging (SEED-07 / SEED-08). Local, offline.
+#
+#   ansible-playbook -i <operator inventory> testing/remote_harness/package.yml
+# with localhost host vars (inputs, no defaults):
+#   rh_artifact_source  directory holding the declared artifact files (controller.bootstrap.artifacts + the lock's
+#                       wheels and collections), e.g. an acquisition directory; never fetched, never downloaded
+#   rh_bundle_dir       the bundle destination (its parent owned by the invoking account; absent, or already holding
+#                       the byte-identical bundle -> UNCHANGED). It becomes:
+#                         <bundle>/lme-controller-seed.sh   rendered seed (build output, mode 0500)
+#                         <bundle>/artifacts/<file>         admitted copies, sha256-verified, mode 0400
+#                         <bundle>/bundle.json              schema, seed/profile/lock digests, artifact rows, renderer
+# Then: <bundle>/lme-controller-seed.sh apply --root <owned root>   and
+#       <bundle>/lme-controller-seed.sh run --root <owned root> --ssh-auth <mode> -- -i <inventory> testing/remote_harness/controller.yml
+#
+# Offline behaviour: every declared file must already be in rh_artifact_source with its declared sha256; ALL
+# missing and ALL mismatched files are named in one refusal before anything is written.
+# SEED2-PACKAGE-RESERVATION: every component of the destination's ancestry is admitted (real dirs, owned by 0 or the
+# builder, not group/other-writable; the parent owned by the builder) and the destination, if present, is an owned real
+# dir -- all BEFORE any write. The bundle is built ONLY inside an exclusively reserved sibling staging dir
+# (ansible.builtin.tempfile = mkdtemp, `.<name>.<bundle.staging_infix>.<holder lease>.<random>`) and published by ONE
+# declared `mv -T` rename; concurrent builders at one destination each own a private staging dir, and exactly one
+# rename can land (a rename onto a non-empty directory fails), so mixed identities can never be published. A destination
+# already holding the byte-identical bundle.sha256 AND bundle.json (same provenance: profile, lock, class key,
+# builder, source) is UNCHANGED; any other content refuses and is preserved. A failed or interrupted run leaves only
+# its staging dir and lease record; the NEXT attempt reaps them only when that run's writers are PROVABLY QUIESCENT
+# (tasks/reap_staging.yml, bundle.staging_retention: owned-manifest admission + lease record + the recorded holder
+# absent AND its cgroup gone/empty in an admitted namespace view; every reap mutation under `flock -x -n` on the
+# destination lock; a LIVE, busy or unprovable entry is never touched, it is preserved, reported and charged; free
+# space checked after the reap, before reserving), so no quiescent staging accumulates and rerunning at the SAME
+# destination resumes. PUBLISH FENCE: the one publish rename runs under `flock -x -w` on the SAME destination lock,
+# so a staging path a reaper moved away can never be published (mv finds no source), and a lock held past
+# lease.publish_wait_seconds refuses RH-STAGING-BUSY. PUBLICATION AUTHORITY (r3f, lease.authority): the token-named
+# staging path is the authority, checked atomically by the NO-REPLACE rename while the lock is held; a revoker renames
+# it away under the lock only after proving quiescence, so a resumed old writer refuses RH-STAGING-REVOKED and never
+# touches the revoker's staging; a destination that appeared (even empty) is never replaced; a present different
+# bundle is refused with its recorded class_key reported. A concurrent builder at the same destination keeps its
+# staging: one PUBLISHED, the other UNCHANGED (same bundle) or REFUSED (different bundle), each releasing only its own.
+# bundle.json is written last inside the staging dir; the
+# seed's `apply` independently refuses an incomplete bundle (SEED2-BUNDLE-COMPLETION).
+# GENESIS (codex-tick127, controller.bootstrap.genesis): this playbook IS the declared package-builder stage. Before
+# any write it admits EXACTLY the declared builder (tasks/admit_builder.yml: executable + shebang, python, core,
+# ansible package dir, no config file, no stray ANSIBLE_* env, non-root; no search/fallback), and binds the source
+# edition with the declared git (os_tools.git, conditional prerequisite of package_source_binding). bundle.json
+# records builder, source, input and output identities. The bundle is the distributable bootstrap artifact: a fresh
+# consumer needs NO Ansible -- `sha256sum --check bundle.sha256` inside it, then the seed. controller.yml's managed
+# re-render is a SECOND check, not retroactive authorization.
+# Missing artifacts: testing/remote_harness/acquire.yml (MAIN, network stage, sha256-pinned, declared sources only).
+# The per-destination body (input admission -> reap -> reserve -> render -> readback -> publish -> admit_bundle) lives
+# in tasks/package_bundle.yml (r3g step 1, a pure move) and runs ONCE PER ARTIFACT CLASS (r3g step 2,
+# controller.bootstrap.bundle.per_class): tasks/scope_classes.yml binds the controller scope and partitions the
+# deployment's scopes by C1's published class key; the controller's class publishes at rh_bundle_dir, every other class
+# at its declared sibling. Run package.yml with the SAME inventory as target_bootstrap.yml so every class exists.
+# bundle.json records class_key (identity = class key + artifact digests), not a policy digest (r3g change: the former
+# config_revision field is replaced; seed, artifacts and bundle.sha256 of a homogeneous deployment are unchanged).
+# MR03 PKG-CALLER optb-after-01 (successor of b6bcfef5; codex711 option B, codex714 BASE-01 / LOCK-01 / REC-01, codex716
+# ROWCAP (a); design pkg-optb-02 / -02a; AUTHORED, NEVER EXECUTED, UNRUN): (a) FBC-R-PKG-HANDLIST: the literal source
+# hand list is gone; every item is recorded from members_rel / importers (C1-FBC-P-01 / -02). MIGRATION-PKG-SRCINPUTS-01:
+# bundle.json source.inputs bytes change (each item once, no hand-list prefix); a destination published earlier is
+# refused by N13's exact comparison, never overwritten, never credited UNCHANGED. (b) PREFLIGHT of EVERY class before any
+# class publication: each class lock is read ONCE, captured, digested, verified against its admitted source digest and
+# parsed (controller.bootstrap.package_publish.lock_capture), every cap (artifact rows, lock rows, fixed members) is
+# admitted, the per-class allocations are bound and their exact coverage checked, and the bundle.json record roles and
+# generation-id sources are admitted. (c) the class loop no longer parses the lock (base :384); package_bundle reads the
+# captured class lock and allocation by class key. BLOCKED-ON-GENESIS-GL: _rh_pkg_lraw, _rh_pkg_lock, _rh_pkg_alloc,
+# _rh_pkg_impl, _rh_pkg_bad (GL-REQ-PKG-03 / -04 / -06). Change record: proposals/mr03-pkg-caller/optb-package-01.change.yml.
+# MR03 PKG-CALLER optb-after-02 (successor of optb-after-01 620e5742; records-pkg-optb-03 9340f4dd, codex717 (a); UNRUN):
+# preflight P10 walks the policy roles from the declared manifest_record.policy_scope (fact, path) instead of the literal
+# rh.controller, and refuses unless each roles node's {policy} roles equal its policy_scope members (a node without a
+# members entry has none). Change record: proposals/mr03-pkg-caller/optb-package-02.change.yml.
+# MR03 PKG-CALLER optb-after-03 (successor of optb-after-02 d63442c2; codex721 PREFLIGHT-ARTIFACTS = yes; UNRUN): preflight
+# P11-P17 admit the artifact store and every class's selected artifact inputs (store var, store ancestry, store root,
+# flat names, no-follow regular files, presence, declared digests) before the first bundle publication mutation;
+# package_bundle no longer repeats them per class; N13 keeps the immediate copy-source and staged-digest checks.
+# Preflight discipline, not a transactional multi-bundle claim. BLOCKED-ON-GENESIS-GL: _rh_pkg_art (loop var; new) and
+# the move of _rh_pkg_anc / _rh_pkg_src from package_bundle into this play (GL-REQ-PKG-09). Change record:
+# proposals/mr03-pkg-caller/optb-package-03v.change.yml.
+# MR03 PKG-CALLER optb-after-04 (successor of optb-after-03 95ced23e; records-pkg-optb-04 5148502e policy_segment_separator;
+# UNRUN): preflight P10's two policy-node walks split on rh.controller.bootstrap.source_admission.early_view.override.
+# audit_join (the executing controller's declared policy-segment join, pinned by C1-OPTB4-GL-02), never on a literal and
+# never on the filesystem separator path_admission.separator. Atomic unit: lands with C1-OPTB4-GL-02 and the
+# OWED-OPTB4-SEED-RULE / -DERIVE-RULE update. Change record: proposals/mr03-pkg-caller/optb-package-04v.change.yml.
+# MR03 PKG-CALLER optb-after-05 (successor of optb-after-04 8ca27f48; records-pkg-optb-05 85255302 OWED-OPTB5-PKG; UNRUN):
+# every lock-capture read names the ONE law rh.controller.bootstrap.lock_capture (package_publish.lock_capture retired
+# in the same unit); the P5 lookup in _rh_src_inputs (which never carries lock_file_rel and so refused every class) is
+# replaced by an explicit per-class stat of the joined lock path under lock_capture.verify (P1b) before the one read,
+# with every verify.require field true and stat[verify.digest_field] == the captured sha256, else refuse. Trust level
+# (a) stat, OPEN-LOCKCAP-TRUST with Codex. BLOCKED-ON-GENESIS-GL: _rh_pkg_lst (GL-REQ-PKG-12). Atomic unit: optb-05 +
+# optb-02 + LOCKSHA migration + RP-02R / NP-01. Change record: proposals/mr03-pkg-caller/optb-package-05v.change.yml.
+# MR03 PKG-CALLER optb-after-06 (successor of optb-after-05 1e51da07; MAIN F1 PARITY-PARSE; UNRUN): preflight P6 parses
+# each class capture with lme_manifest_strict (the ONE lock parse law, as resolve_policy NP-01); from_yaml is retired.
+# Change record: proposals/mr03-pkg-caller/optb-package-06v.change.yml.
+# MR03 PKG-CALLER optb-after-07 (successor of optb-after-06 dcad0ee3; C1 records-lock-trust-01 319738f0 LT-CLASS B-CLS-1..3;
+# C1-PKG records-pkg-optb-06 3a36464c lock_capture.refusal; C1-PKG records-pubrcpt-01 2183f0fa consumers_owed row 2;
+# codex-tick728 lock_capture_trust option (b); codex726 OPEN_N6_PUB_READBACK; UNRUN): (a) LOCK TRUST, git / source
+# admission IN ADDITION to the stat: preflight P1a binds the selected class lock rels (derived from the admitted class
+# policies, unique, sorted; never credited from the controller lock) to the ONE admitted source record rh_src_admission
+# before the P1b stat (B-CLS-2 algorithm equality, B-CLS-1 membership), and P5b binds each class capture to its own rel's
+# member observed digest after P5, before the P6 parse (B-CLS-3); refusal source_admission.refusals.member
+# (RH-SOURCE-MEMBER). P1b, P1c, P5 and the porcelain status stay. (b) P1c, P5, P6 and P6b refuse with lock_capture.refusal
+# (RH-LOCK-CAPTURE) instead of genesis.builder.refusal. (c) PUBLICATION RECEIPT: _rh_pkg_rcpt is initialized before the
+# class loop (package_bundle optb-after-05 adds each admitted class); after the loop the coverage partition is checked and
+# ONE receipt is written in this launch's own act dir, read back and stat'ed (RH-PACKAGE-RECEIPT). PENDING B-CLS-4
+# (trusted_oid in the receipt class row): records-pubrcpt-01 pins class_fields exactly [bundle, lock_sha256, outcome];
+# a C1-PKG successor must extend it first. BLOCKED-ON-GENESIS-GL: _rh_pkg_rcpt, _rh_pkg_rcpt_out, _rh_pkg_rcpt_word,
+# _rh_pkg_rcpt_pre, _rh_pkg_rcpt_back, _rh_pkg_rcpt_post (GL-REQ-PKG-10). ATOMIC with package_bundle optb-after-05.
+# Change record: proposals/mr03-pkg-caller/optb-package-07v.change.yml.
+# MR03 PKG-CALLER optb-after-08 (successor of optb-after-07 0b3bcd81; C1-PKG records-pubrcpt-02 89c8ade7 consumers_owed row 2;
+# records-recovery-vocab-02 e8695ade PKG-CALLER consumer row; records-n1-03 c37222b7 + supp-01 dd60fbaa S1_P10_SITE;
+# codex729 729-RECOVERY-RECEIPT-REUSE; UNRUN): (a) the optb-after-07 refuse-if-present receipt branch is WITHDRAWN (pubrcpt-02
+# supersedes REQ-PUBRCPT-02 no_overwrite): a present receipt is RE-ADMITTED, never refused for presence alone and never
+# rewritten. (b) RESUME DETECTION from state this stage owns (vocab-02 identity.binding; no attempt marker in argv or
+# extra_vars): before the class loop the class-records dir <act dir>/<receipt.class_records.dir_rel> is stat'ed without
+# following links; absent -> ONE declared mkdir without -p at class_records.dir_mode (the tool admitted first, the
+# reserve_publish RESERVE tool pattern), resumed false; present -> resumed true, admitted only as a real builder-owned dir
+# of dir_mode whose entries are only partition <class key> record names, each a regular file of class_records.mode and
+# owner (no link). (c) the receipt word carries resumed; absent -> written once, present -> admitted only when its bytes
+# equal the word rebuilt with its OWN resumed value; one read either way, then mode / owner / digest. (d) preflight P10
+# (C-OPTB4-RULE-CLASS-EQ): each class's generation rule nodes equal rh.controller.bootstrap's, typed generation_rule rows.
+# Per-class records, trusted_oid (B-CLS-4) and observed_on_resume are package_bundle optb-after-06. BLOCKED-ON-GENESIS-GL:
+# _rh_pkg_rcpt_resumed, _rh_pkg_rcpt_cdir, _rh_pkg_rcpt_cmk (C1-PKG pubrcpt-02 names) and _rh_pkg_rcpt_ctool,
+# _rh_pkg_rcpt_cls (PKG-CALLER additions) (GL-REQ-PKG-10). ATOMIC with package_bundle optb-after-06 and records-pubrcpt-02.
+# Change record: proposals/mr03-pkg-caller/optb-package-08v.change.yml.
+- name: Package the managed-controller bundle (admit artifacts, render the seed)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
+
+    - name: Bind the effective controller connection before any effect (local, localhost, no become; r3g)
+      ansible.builtin.include_tasks: tasks/admit_controller.yml
+
+    - name: Resolve the harness policy through the engine
+      ansible.builtin.include_tasks: tasks/resolve_policy.yml
+      vars:
+        rh_rp_caller: testing/remote_harness/package.yml
+        rh_invocation_requirement: "{{ _rh_sa_decl.invocation.requirements.ordinary_permitted }}"
+
+    - name: Admit exactly the declared builder before any write (GENESIS)
+      ansible.builtin.include_tasks: tasks/admit_builder.yml
+      vars:
+        rh_gen_stage: package     # genesis.launch.stages key: env and temps under <work root>/tmp/genesis/package/<act>
+
+    # r2i ENTRY GENERATION (codex-tick417 option B; route node controller.entry_generation): the generated entries are
+    # rendered into an owned mirror and gated against the ACCEPTED generation record BEFORE any packaging; a genuinely
+    # inactive generation contract (C1 projection active: false) skips it, an absent contract refuses (typed, no
+    # default). The source/loader closure was admitted against the intended commit by resolve_policy.yml's FIRST task.
+    - name: Refuse a resolution without the entry-generation contract (C1 projection; typed, no default)
+      ansible.builtin.assert:
+        that:
+          - lme_resolved.remote_harness.entry_generation_contract is defined
+          - lme_resolved.remote_harness.entry_generation_contract is mapping
+          - lme_resolved.remote_harness.entry_generation_contract.active is boolean
+        fail_msg: >-
+          REFUSED RH-POLICY-UNRESOLVED: the engine resolve produced no lme_resolved.remote_harness.entry_generation_contract
+          {active} (C1 projection); entry generation is never assumed inactive.
+        quiet: true
+
+    - name: Generate / verify the generated entries in the genesis context (tasks/generate_entries.yml)
+      ansible.builtin.include_tasks: tasks/generate_entries.yml
+      vars:
+        rh_entry_context: genesis
+      when: lme_resolved.remote_harness.entry_generation_contract.active
+
+    - name: End the act after an authoring (generate) or verify-only operation (no bundle is published)
+      ansible.builtin.meta: end_play
+      when:
+        - lme_resolved.remote_harness.entry_generation_contract.active
+        - rh_eg_op != rh.controller.entry_generation.operation.modes.package
+
+    # OS-TOOL CONSUMER PARTITION (codex-tick328-329; controller.bootstrap.os_tool_consumers, registry-owned, not tunable):
+    # every required_by name is EXACTLY one controller or one target consumer. An entry with ANY controller consumer stays
+    # a controller precondition (hashed and admitted below); only entries used exclusively by target consumers are
+    # skipped here -- target execution admits those in its own namespace. An undeclared name refuses (never silently
+    # skipped or hashed). The identity, missing-tool and source-binding guards below are unchanged.
+    - name: Refuse an os_tools consumer outside the declared controller/target partition (before any hash)
+      vars:
+        _rh_pkg_oc: "{{ rh.controller.bootstrap.os_tool_consumers | default({}) }}"
+        _rh_pkg_used: "{{ rh.controller.bootstrap.os_tools | dict2items | map(attribute='value.required_by', default=[]) | flatten | unique | list }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_oc.controller | default([]) | length > 0
+          - _rh_pkg_oc.target is defined
+          - _rh_pkg_oc.controller | intersect(_rh_pkg_oc.target) | length == 0
+          - rh.controller.bootstrap.os_tools | dict2items | rejectattr('value.required_by', 'defined') | list | length == 0
+          - rh.controller.bootstrap.os_tools | dict2items | selectattr('value.required_by', 'equalto', []) | list | length == 0
+          - _rh_pkg_used | reject('in', _rh_pkg_oc.controller + _rh_pkg_oc.target) | list | length == 0
+        fail_msg: >-
+          REFUSED RH-OS-TOOL-CONSUMER: every os_tools required_by name must be exactly one declared consumer of
+          controller.bootstrap.os_tool_consumers (controller {{ _rh_pkg_oc.controller | default([]) }}, target
+          {{ _rh_pkg_oc.target | default([]) }}); undeclared: {{ _rh_pkg_used | reject('in', (_rh_pkg_oc.controller | default([])) + (_rh_pkg_oc.target | default([]))) | list }}.
+        quiet: true
+
+    - name: Hash every declared executable this controller runs, independently of the tools (stat sha256, links followed)
+      ansible.builtin.stat:
+        path: "{{ item.value.path }}"
+        follow: true
+        get_checksum: true
+        checksum_algorithm: sha256
+      # target-only entries (required_by names only target consumers: adapter tools, the privileged contact's interpreter,
+      # target_prereq / guest / observation tools) are not controller preconditions; with the partition admitted above,
+      # "not a subset of target" == "names at least one controller consumer". PREPARATION-only entries (required_by a
+      # subset of target + [preparation.tool_label]: gpgv, dpkg-deb, xz) are likewise skipped: they are admitted at their
+      # own use boundary (tasks/admit_prep_tools.yml, acquire stage) and are no precondition of packaging (a controller
+      # without dpkg-deb -- e.g. RedHat -- still packages); an entry that ALSO serves seed/uv_installer (tar) stays hashed
+      loop: >-
+        {{ rh.controller.bootstrap.os_tools | dict2items
+           | rejectattr('value.required_by', 'subset', rh.controller.bootstrap.os_tool_consumers.target
+                        + ([rh.controller.bootstrap.preparation.tool_label] if rh.controller.bootstrap.preparation is defined else []))
+           | list }}
+      loop_control:
+        label: "{{ item.key }}"
+      register: _rh_pkg_ident
+
+    # r3f (G D05): identity is judged on PRESENT files only; an absent tool is a MISSING tool (git: the source-binding
+    # refusal below, D05; any other: RH-OS-TOOL-MISSING), never an identity refusal. All still before any tool runs.
+    - name: Refuse any declared executable whose content is not its declared identity (SEED-06 file_sha256; before any tool runs)
+      vars:
+        _tst: "{{ _rh_pkg_ident.results | selectattr('stat.exists') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_ident.results | map(attribute='item.value.identity.kind') | unique | list == ['file_sha256']
+          - >-
+            _tst | map(attribute='stat') | map(attribute='checksum', default='') | list
+            == _tst | map(attribute='item.value.identity.sha256') | list
+        fail_msg: >-
+          REFUSED RH-OS-TOOL-IDENTITY: declared executables whose resolved content differs from the declared file_sha256
+          (or is unreadable):
+          {% for r in _tst if (r.stat.checksum | default('')) != r.item.value.identity.sha256 %}{{ r.item.key }}={{ r.item.value.path }}({{ r.stat.checksum | default('unreadable') }}) {% endfor %}.
+          Nothing was written; re-hash the declaration only after MAIN verifies the new file.
+        quiet: true
+
+    - name: Check the conditional source-binding prerequisite (os_tools.git, package_source_binding)
+      ansible.builtin.stat:
+        path: "{{ rh.controller.bootstrap.os_tools.git.path }}"
+      register: _rh_src_tool
+
+    - name: Refuse a missing source-binding tool (never installed ad hoc)
+      ansible.builtin.assert:
+        that:
+          - "'package_source_binding' in rh.controller.bootstrap.os_tools.git.required_by"
+          - _rh_src_tool.stat.exists and _rh_src_tool.stat.executable
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: package_source_binding needs
+          {{ rh.controller.bootstrap.os_tools.git.path }} (packages.by_os_family.<family>.git; installed by MAIN).
+        quiet: true
+
+    - name: Refuse missing or non-executable controller tools, named with their packages, before any of them runs (read-only)
+      vars:
+        _missing_names: >-
+          {{ _rh_pkg_ident.results | rejectattr('stat.exists') | map(attribute='item.key') | list
+             + (_rh_pkg_ident.results | selectattr('stat.exists') | rejectattr('stat.executable') | map(attribute='item.key') | list) }}
+        _pkgs: >-
+          {% set ns = namespace(p=[]) %}{% for kv in rh.packages.provides | dict2items %}{% if kv.value | intersect(_missing_names) | length > 0 %}{% set ns.p = ns.p + [kv.key] %}{% endif %}{% endfor %}{{ ns.p }}
+      ansible.builtin.assert:
+        that:
+          - _missing_names | length == 0
+        fail_msg: >-
+          REFUSED RH-OS-TOOL-MISSING: missing or non-executable controller tools {{ _missing_names }} at
+          {{ _missing_names | map('extract', rh.controller.bootstrap.os_tools) | map(attribute='path') | list }} -> logical
+          packages {{ _pkgs }} = Debian {{ _pkgs | map('extract', rh.packages.by_os_family.Debian) | list }} / RedHat
+          {{ _pkgs | map('extract', rh.packages.by_os_family.RedHat) | list }} (MAIN installs them; never ad hoc; an
+          admitted os_tools path override names its own location). Nothing was written.
+        quiet: true
+
+    # PREPARATION ADMISSION (codex-tick369; C1 proposal controller.bootstrap.preparation): the guest tool identities and
+    # a hypervisor's base image are admitted only as the candidate of the preparation record whose digest the profile
+    # declares (tasks/admit_preparation.yml; before any write). Absent section -> skipped (the pre-guest profile).
+    - name: Admit the preparation candidates the declarations carry (tasks/admit_preparation.yml; declared only)
+      ansible.builtin.include_tasks: tasks/admit_preparation.yml
+      when: rh.controller.bootstrap.preparation is defined
+
+    # r2k R2J-PACKAGING-GIT-CLOSURE (codex-tick454; r2j ran bare `git -C`): every packaging git call uses the SAME admitted
+    # invocation policy as tasks/admit_git_paths.yml -- `<env> -i <git.env_pairs...> <git> <git.global...> <repo>` from
+    # the admitted env / git identities of rh_src_admission and the ONE bootstrap git node; head = git.head; status =
+    # git.package_status + git.end_of_options + the exact pathspec (the r2i literal path list moved to the declared
+    # source_admission.package_status_rel, C1-R2K-GIT). failed_when false + a classified tool refusal (no ambient
+    # GIT_* / HOME / config steers it). The recorded worktree_status digest keeps the porcelain form of r2j.
+    - name: Bind the source edition (read-only git, admitted invocation)
+      vars:
+        _rh_pk_sa: "{{ lme_resolved.remote_harness.source_admission }}"
+        _rh_pk_git: "{{ rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.git] }}"
+        _rh_pk_x: >-
+          {{ [rh_src_admission[_rh_pk_sa.record_fields.tool].env[_rh_pk_sa.tool_fields.path], _rh_pk_git.env_clear] + _rh_pk_git.env_pairs
+             + [rh_src_admission[_rh_pk_sa.record_fields.tool].git[_rh_pk_sa.tool_fields.path]] + _rh_pk_git.global + [rh_repo_root] }}
+      ansible.builtin.command:
+        argv: "{{ _rh_pk_x + item }}"
+      # r2i: the generation's admission inputs + outputs (incl. roster authority, accepted / retained records), the
+      # verifier closure and the source-admission members join the porcelain pathspec (exact paths)
+      # r2j (R2I-BOOTSTRAP-TRUST-ORDER): the bootstrap members (controller.bootstrap.source_admission.members_rel) and
+      # every declared importer closure (source_admission.importers keys + values) are UNCONDITIONAL, so the seed's
+      # source_admit always finds their bundle.json source.inputs lines (dispatch.source_members_rel WITHDRAWN)
+      loop: >-
+        {{ [_rh_pk_git.head,
+            _rh_pk_git.package_status + [_rh_pk_git.end_of_options]
+            + rh.controller.bootstrap.source_admission.package_status_rel
+            + ((rh_eg_evidence[rh.controller.entry_generation.evidence.paths_field]
+                + rh.controller.entry_generation.dispatch.closure_rel)
+               if lme_resolved.remote_harness.entry_generation_contract.active else [])
+            + rh.controller.bootstrap.source_admission.members_rel
+            + ((rh.controller.bootstrap.source_admission.document_rels | dictsort | map('last') | list)
+               if lme_resolved.remote_harness.entry_generation_contract.active else [])
+            + (rh.controller.bootstrap.source_admission.importers | dict2items | map(attribute='key') | list)
+            + (rh.controller.bootstrap.source_admission.importers.values() | flatten | list)
+            + ((rh.controller.bootstrap.source_admission.importer_obligations.values() | map('dict2items') | flatten(levels=1) | map(attribute='value') | flatten(levels=1) | map('first') | list)
+               if lme_resolved.remote_harness.entry_generation_contract.active else [])] }}
+      register: _rh_src_git
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse a git tool failure while binding the packaged source (tool cause; nothing continues)
+      ansible.builtin.assert:
+        that:
+          - _rh_src_git.results | map(attribute='rc') | reject('equalto', 0) | list | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}:
+          {{ rh.controller.bootstrap.genesis.builder.messages.source_git }}
+          {{ _rh_src_git.results | map(attribute='rc') | zip(_rh_src_git.results | map(attribute='stderr')) | list | to_json }}
+        quiet: true
+
+    - name: Refuse a packaged source edition that is not the admitted intended commit (loader admission + entry generation)
+      ansible.builtin.assert:
+        that:
+          - _rh_src_git.results[0].rc == 0
+          - _rh_src_git.results[0].stdout == rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.edition]
+          - not lme_resolved.remote_harness.entry_generation_contract.active
+            or _rh_src_git.results[0].stdout == rh_eg_edition
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: the packaged source edition
+          {{ _rh_src_git.results[0].stdout }} is not the admitted intended commit
+          {{ rh_src_admission[lme_resolved.remote_harness.source_admission.record_fields.edition] }}.
+        quiet: true
+
+    - name: List the engine filter plugins the builder loads (filter closure)
+      ansible.builtin.find:
+        paths: "{{ rh.controller.bootstrap.genesis.builder.filter_plugins_rel | map('regex_replace', '^', rh_repo_root ~ '/') | list }}"
+        patterns: ['*.py']
+        file_type: file
+      register: _rh_src_filters
+
+    # r2k X-R1-S9-5: every declared generated-play body (importer_obligations body rels) is a packaged input -- the seed admits it
+    # pre-launch (raw digest == body_sha256, controller_seed source_admit)
+    - name: Digest every source input of the render (profile, lock, templates, playbook, tasks, filter plugins)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: >-
+        {{ (_rh_src_filters.files | map(attribute='path') | sort)
+           + ((((rh_eg_evidence[rh.controller.entry_generation.evidence.paths_field]
+                 + rh.controller.entry_generation.dispatch.closure_rel)
+                if lme_resolved.remote_harness.entry_generation_contract.active else [])
+               + rh.controller.bootstrap.source_admission.members_rel
+               + ((rh.controller.bootstrap.source_admission.document_rels | dictsort | map('last') | list)
+                  if lme_resolved.remote_harness.entry_generation_contract.active else [])
+               + (rh.controller.bootstrap.source_admission.importers | dict2items | map(attribute='key') | list)
+               + (rh.controller.bootstrap.source_admission.importers.values() | flatten | list)
+               + ((rh.controller.bootstrap.source_admission.importer_obligations.values() | map('dict2items') | flatten(levels=1) | map(attribute='value') | flatten(levels=1) | map('first') | list)
+                  if lme_resolved.remote_harness.entry_generation_contract.active else [])) | unique | sort
+              | map('regex_replace', '^', rh_repo_root ~ rh.controller.bootstrap.path_admission.separator) | list) }}
+      register: _rh_src_inputs
+
+    # brr-follow (codex-tick522 F05S2-RELATIVE-PATH-GRAMMAR; f05-s3 S3-SEAM-03 / S3-SEAM-05): every generated-play body
+    # rel and every admitted document rel is REPOSITORY-RELATIVE and is admitted by the registry rel_path grammar
+    # projected as source_admission.rel_path_grammar (the same value the launch record carries) -- before any digest or
+    # join. brr-follow-s2 J-GEN3-01 (F05-S4 F05-GEN3-01; the single-regex key is RETIRED): exactly {pattern,
+    # refused_components, separator, terminator} (F05-S4 groups-summary 36865155 grammar_final_shape); the declared
+    # terminator refused first, then the pattern fullmatch, then a refused component of the split on the grammar's
+    # separator (no literal). Generation projections only (RR-06): inactive reads neither key.
+    - name: Refuse a body or document rel outside the registry rel_path grammar (generation projections; before any digest)
+      vars:
+        _rh_pk_g: "{{ rh.controller.bootstrap.source_admission.rel_path_grammar }}"
+        _rh_pk_rels: >-
+          {{ (rh.controller.bootstrap.source_admission.importer_obligations.values() | map('dict2items') | flatten(levels=1) | map(attribute='value') | flatten(levels=1) | map('first') | list)
+             + (rh.controller.bootstrap.source_admission.document_rels | dictsort | map('last') | list) }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pk_g is mapping and (_rh_pk_g.keys() | list | sort) == ['pattern', 'refused_components', 'separator', 'terminator']
+          - _rh_pk_g.pattern is string and _rh_pk_g.pattern | length > 0
+          - _rh_pk_g.separator is string and _rh_pk_g.separator | length > 0
+          - _rh_pk_g.terminator is string and _rh_pk_g.terminator | length > 0
+          - _rh_pk_g.refused_components is sequence and _rh_pk_g.refused_components is not string
+          - _rh_pk_g.refused_components | reject('string') | list | length == 0
+          - _rh_pk_rels | select('search', _rh_pk_g.terminator | regex_escape) | list | length == 0
+          - _rh_pk_rels | reject('match', '(?:' ~ _rh_pk_g.pattern ~ ')\Z') | list | length == 0
+          - _rh_pk_rels | map('split', _rh_pk_g.separator) | map('intersect', _rh_pk_g.refused_components) | reject('equalto', []) | list | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.source_admission.refusals.member }}: a generated-play body or document rel
+          is not admitted by source_admission.rel_path_grammar (registry contract_admission.path_law + patterns.rel_path:
+          terminator, pattern fullmatch, refused component):
+          {{ ((_rh_pk_rels | select('search', _rh_pk_g.terminator | regex_escape) | list) + (_rh_pk_rels | reject('match', '(?:' ~ _rh_pk_g.pattern ~ ')\Z') | list))
+             | to_json if (_rh_pk_g is mapping and _rh_pk_g.pattern is defined and _rh_pk_g.pattern is string
+                          and _rh_pk_g.terminator is defined and _rh_pk_g.terminator is string) else ([_rh_pk_g] | to_json) }}
+        quiet: true
+      when: lme_resolved.remote_harness.entry_generation_contract.active
+
+    # r2k X-R1-S9-5: a packaged body whose raw digest is not its declared body_sha256 refuses at packaging (before the
+    # seed could ever admit it)
+    - name: Digest every declared generated-play body (no link followed)
+      ansible.builtin.stat:
+        path: "{{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ item[0] }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: >-
+        {{ (rh.controller.bootstrap.source_admission.importer_obligations.values() | map('dict2items') | flatten(levels=1) | map(attribute='value') | flatten(levels=1) | list)
+           if lme_resolved.remote_harness.entry_generation_contract.active else [] }}
+      register: _rh_pk_bodies
+
+    - name: Refuse a generated-play body whose packaged raw digest is not its declared body_sha256
+      vars:
+        _rh_pk_bad: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for r in _rh_pk_bodies.results -%}
+          {%- if not r.stat.exists or r.stat.islnk or not r.stat.isreg or r.stat.checksum != r.item[1] -%}{%- set ns.o = ns.o + [r.item] -%}{%- endif -%}
+          {%- endfor -%}{{ ns.o }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pk_bad | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}:
+          {{ rh.controller.bootstrap.genesis.builder.messages.body_digest }}
+          {{ _rh_pk_bad | to_json }}
+        quiet: true
+
+    - name: Bind the controller scope and derive the deployment's artifact classes (RH-SCOPE-BINDING; tasks/scope_classes.yml)
+      ansible.builtin.include_tasks: tasks/scope_classes.yml
+
+    # PREFLIGHT (codex716 OPEN_OPTB_ROWCAP_TYPE (a); codex714 LOCK-01 / REC-01; pkg-optb-02a): EVERY selected class is
+    # admitted here before ANY class publication begins, so a malformed later class can never leave a partly published
+    # set. Each step is its own task (dependent values are never sibling set_fact entries). Nothing below writes a file.
+    # N13 reserve_publish s03 stays the final admission inside each publication. This is runtime admission, not load-time
+    # type-check credit. BLOCKED-ON-GENESIS-GL: the names _rh_pkg_lraw, _rh_pkg_lock, _rh_pkg_alloc, _rh_pkg_impl and
+    # _rh_pkg_bad are proposed (GL-REQ-PKG-03 / -04 / -06) and not yet reserved in GL-02Z.
+    - name: Refuse a class set whose class keys are not distinct (preflight P1; every preflight map is keyed by class key)
+      ansible.builtin.assert:
+        that:
+          - (rh_classes | map(attribute='key') | unique | list | length) == (rh_classes | length)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.bundle.per_class.refusal,
+                                   'rh_rf_detail': [rh_classes | map(attribute='key') | list | to_json]}) }}
+        quiet: true
+
+    # optb-after-07 LOCK TRUST (C1 records-lock-trust-01 LT-CLASS; codex-tick728 option (b)): the selected lock rel set is
+    # derived from the ADMITTED class policies (rh_classes[].renderer.lock_file_rel, unique, sorted), never read
+    # from or credited by the controller lock. Each rel must be a key of the ONE admitted source record
+    # rh_src_admission[source_admission.record_fields.members]: that IS the existing rel grammar, ancestry inside the
+    # admitted checkout and admit_git_paths admission under the same edition / tool / argv contract (admit_loader_source.yml,
+    # resolve_policy's first task), applied through the one admitted record rather than a second include. B-CLS-2 is a
+    # leaf-equals-leaf check the registry cannot state (enforced here). Refusal source_admission.refusals.member.
+    - name: Refuse unless lock_capture.digest_algorithm is source_admission.digest_algorithm (preflight P1a; B-CLS-2; once; before any digest comparison)
+      ansible.builtin.assert:
+        that:
+          - rh.controller.bootstrap.lock_capture.digest_algorithm == rh.controller.bootstrap.source_admission.digest_algorithm
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.source_admission.refusals.member,
+                                   'rh_rf_detail': [rh.controller.bootstrap.lock_capture.digest_algorithm,
+                                                    rh.controller.bootstrap.source_admission.digest_algorithm]}) }}
+        quiet: true
+
+    - name: Refuse a selected class lock rel that is not an admitted source member (preflight P1a; B-CLS-1; before the P1b stat and the one read)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set mm = rh_src_admission[rh.controller.bootstrap.source_admission.record_fields.members] -%}
+          {%- set ns = namespace(l=[]) -%}
+          {%- for rel in rh_classes | map(attribute='renderer') | map(attribute='lock_file_rel') | unique | sort -%}
+          {%- if rel not in mm -%}
+          {%- set ns.l = ns.l + [[rh_classes | selectattr('renderer.lock_file_rel', 'equalto', rel) | map(attribute='key') | list, rel]] -%}{%- endif -%}
+          {%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.source_admission.refusals.member,
+                                   'rh_rf_detail': [_rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    # LOCK-01 (controller.bootstrap.lock_capture; optb-after-05: the ONE lock-capture law, records-pkg-optb-05, which
+    # retires package_publish.lock_capture): per class, a stat of the joined lock path under lock_capture.verify
+    # (P1b), then ONE read of each class lock (exact bytes), then capture, digest, verify (P5: every verify.require
+    # field true and stat[verify.digest_field] == the captured sha256), then ONE parse; every later reader (caps,
+    # copies, check lines, the record) uses the capture, none re-reads the file. Replaces base :384. The lock is not a
+    # _rh_src_inputs item (no declaration names lock_file_rel), so P5 never looks there (OWED-OPTB5-PKG FINDING).
+    - name: Stat each class lock under lock_capture.verify before the one read (preflight P1b; BLOCKED-ON-GENESIS-GL _rh_pkg_lst)
+      ansible.builtin.stat:
+        path: "{{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ _rh_class.renderer.lock_file_rel }}"
+        follow: "{{ rh.controller.bootstrap.lock_capture.verify.follow }}"
+        get_checksum: true
+        checksum_algorithm: "{{ rh.controller.bootstrap.lock_capture.digest_algorithm }}"
+      loop: "{{ rh_classes }}"
+      loop_control:
+        loop_var: _rh_class
+        label: "{{ _rh_class.key }} {{ _rh_class.renderer.lock_file_rel }}"
+      register: _rh_pkg_lst
+
+    # A missing, linked or non-regular class lock refuses typed here, before the read (the slurp never meets it);
+    # P5 repeats the require fields together with the digest comparison against the capture.
+    - name: Refuse a class lock that fails a lock_capture.verify require field before the one read (preflight P1c)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set lv = rh.controller.bootstrap.lock_capture.verify -%}
+          {%- set ns = namespace(l=[]) -%}
+          {%- for r in _rh_pkg_lst.results -%}
+          {%- for f in lv.require -%}
+          {%- if f not in r.stat or r.stat[f] is not sameas true -%}
+          {%- set ns.l = ns.l + [[r._rh_class.key, r._rh_class.renderer.lock_file_rel, f]] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.lock_capture.refusal,
+                                   'rh_rf_detail': [_rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    - name: Read each class lock ONCE (preflight P2; exact bytes; BLOCKED-ON-GENESIS-GL _rh_pkg_lraw)
+      ansible.builtin.slurp:
+        src: "{{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ _rh_class.renderer.lock_file_rel }}"
+      loop: "{{ rh_classes }}"
+      loop_control:
+        loop_var: _rh_class
+        label: "{{ _rh_class.key }} {{ _rh_class.renderer.lock_file_rel }}"
+      register: _rh_pkg_lraw
+
+    - name: Capture each class lock text (preflight P3; lock_capture text; BLOCKED-ON-GENESIS-GL _rh_pkg_lock)
+      ansible.builtin.set_fact:
+        _rh_pkg_lock: >-
+          {%- set ns = namespace(m={}) -%}
+          {%- for r in _rh_pkg_lraw.results -%}
+          {%- set ns.m = ns.m | combine({r._rh_class.key: {'text': r.content | b64decode}}) -%}
+          {%- endfor -%}{{ ns.m }}
+
+    - name: Digest each captured class lock text (preflight P4, after P3; lock_capture sha256 by lock_capture.digest_algorithm)
+      ansible.builtin.set_fact:
+        _rh_pkg_lock: >-
+          {%- set lc = rh.controller.bootstrap.lock_capture -%}
+          {%- set ns = namespace(m={}) -%}
+          {%- for k in _rh_pkg_lock -%}
+          {%- set ns.m = ns.m | combine({k: _rh_pkg_lock[k] | combine({'sha256': _rh_pkg_lock[k].text | hash(lc.digest_algorithm)})}) -%}
+          {%- endfor -%}{{ ns.m }}
+
+    - name: Refuse a class lock whose captured bytes are not the regular file stat'ed at its path (preflight P5, after P4; lock_capture.verify; before any write)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set lv = rh.controller.bootstrap.lock_capture.verify -%}
+          {%- set ns = namespace(l=[]) -%}
+          {%- for r in _rh_pkg_lst.results -%}
+          {%- set k = r._rh_class.key -%}
+          {%- set ok = namespace(v=true) -%}
+          {%- for f in lv.require -%}
+          {%- if f not in r.stat or r.stat[f] is not sameas true -%}{%- set ok.v = false -%}{%- endif -%}
+          {%- endfor -%}
+          {%- if not ok.v or lv.digest_field not in r.stat or r.stat[lv.digest_field] != _rh_pkg_lock[k].sha256 -%}
+          {%- set ns.l = ns.l + [[k, r._rh_class.renderer.lock_file_rel, _rh_pkg_lock[k].sha256,
+                                  r.stat | dict2items | selectattr('key', 'in', lv.require + [lv.digest_field]) | items2dict]] -%}
+          {%- endif -%}
+          {%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - (_rh_pkg_lst.results | map(attribute='_rh_class') | map(attribute='key') | list | sort) == (_rh_pkg_lock | list | sort)
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.lock_capture.refusal,
+                                   'rh_rf_detail': [_rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    # optb-after-07 B-CLS-3 (records-lock-trust-01 LT-CLASS): P5 proves each capture is the regular file at its path in this
+    # flow; this row proves it is the bytes the loader admitted at the admitted edition (its own rel's member observed
+    # digest == the committed blob). Judged per class against its OWN rel (two classes with differing valid locks each
+    # bind to their own member; classes on one rel bind to that one). P1a made every member index defined.
+    - name: Refuse a class capture whose digest is not its own lock rel's admitted member digest (preflight P5b; B-CLS-3; after P5, before the P6 parse)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set sa = rh.controller.bootstrap.source_admission -%}
+          {%- set mm = rh_src_admission[sa.record_fields.members] -%}
+          {%- set ns = namespace(l=[]) -%}
+          {%- for c in rh_classes -%}
+          {%- set rel = c.renderer.lock_file_rel -%}
+          {%- if _rh_pkg_lock[c.key].sha256 != mm[rel][sa.member_fields.observed] -%}
+          {%- set ns.l = ns.l + [[c.key, rel, _rh_pkg_lock[c.key].sha256, mm[rel][sa.member_fields.observed]]] -%}{%- endif -%}
+          {%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.source_admission.refusals.member,
+                                   'rh_rf_detail': [_rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    # optb-after-06 (MAIN F1 PARITY-PARSE): ONE parse law for the lock -- the engine's strict construction
+    # lme_manifest_strict with the registry parse words (the same call as resolve_policy NP-01), labelled by the class
+    # lock rel; from_yaml is retired here. Walked by rh_classes (P5 bound its key set to the capture's).
+    - name: Require every captured class lock to equal its engine generation binding
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_lock[item.key].sha256 == item.generation_binding.lock_sha256
+          - item.generation_binding.class_key == item.key
+          - item.generation_binding.role == item.policy.controller.bootstrap.bundle.payload_role
+        fail_msg: >-
+          {{ lookup(rh.controller.bootstrap.refusal_grammar.plugin,
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.lock_capture.refusal,
+                                   'rh_rf_detail': [item.key]}) }}
+        quiet: true
+      loop: "{{ rh_classes }}"
+
+    - name: Parse each verified class lock ONCE (preflight P6, after P5; lme_manifest_strict; lock_capture packages / collections)
+      ansible.builtin.set_fact:
+        _rh_pkg_lock: >-
+          {%- set ns = namespace(m={}) -%}
+          {%- for c in rh_classes -%}
+          {%- set k = c.key -%}
+          {%- set y = _rh_pkg_lock[k].text | lme_manifest_strict(c.renderer.lock_file_rel, _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.parse) -%}
+          {%- set m = lookup('ansible.builtin.template',
+                             rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                             template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                            'rh_rf_code': rh.controller.bootstrap.lock_capture.refusal,
+                                            'rh_rf_detail': [k, rh.controller.bootstrap.lock_capture.fields | to_json]}) -%}
+          {%- set ns.m = ns.m | combine({k: _rh_pkg_lock[k] | combine({'packages': y.packages | mandatory(m), 'collections': y.collections | mandatory(m)})}) -%}
+          {%- endfor -%}{{ ns.m }}
+
+    - name: Refuse a class lock capture that is not exactly the declared capture (preflight P6b)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set lc = rh.controller.bootstrap.lock_capture -%}
+          {%- set ns = namespace(l=[]) -%}
+          {%- for k in _rh_pkg_lock -%}
+          {%- set c = _rh_pkg_lock[k] -%}
+          {%- if (c | list | sort) != (lc.fields | sort)
+                 or not (c.packages is sequence and c.packages is not string and c.packages is not mapping)
+                 or not (c.collections is sequence and c.collections is not string and c.collections is not mapping) -%}
+          {%- set ns.l = ns.l + [k] -%}{%- endif -%}
+          {%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.lock_capture.refusal,
+                                   'rh_rf_detail': [_rh_pkg_bad | to_json, rh.controller.bootstrap.lock_capture.fields | to_json]}) }}
+        quiet: true
+
+    # codex716 (a): every allocation of every class is admitted before any is consumed. Artifact rows (class policy), lock
+    # packages / collections rows (the class capture) and the fixed members (class policy bundle.member_max_bytes) follow
+    # the same value semantics: max_bytes present, an integer that is NOT a boolean (Jinja tests integer and boolean), > 0;
+    # row file names distinct. The fixed keys are not restated (C1-OPTB-GL-02 pins them exactly at resolve).
+    - name: Refuse a class whose allocations are not positive non-boolean integers with distinct row names (preflight P7)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set ns = namespace(l=[]) -%}
+          {%- for c in rh_classes -%}
+          {%- set rows = c.renderer.bootstrap.artifacts + _rh_pkg_lock[c.key].packages + _rh_pkg_lock[c.key].collections -%}
+          {%- set fixed = c.renderer.bootstrap.bundle.member_max_bytes -%}
+          {%- set cl = namespace(rowbad=false) -%}
+          {%- for r in rows -%}
+          {%- if r is not mapping or 'file' not in r or 'max_bytes' not in r
+                 or r.max_bytes is boolean or r.max_bytes is not integer or r.max_bytes <= 0 -%}
+          {%- set cl.rowbad = true -%}{%- set ns.l = ns.l + [[c.key, r]] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- if not cl.rowbad and (rows | map(attribute='file') | unique | list | length) != (rows | length) -%}
+          {%- set ns.l = ns.l + [[c.key, rows | map(attribute='file') | list]] -%}{%- endif -%}
+          {%- if fixed is not mapping -%}{%- set ns.l = ns.l + [[c.key, fixed]] -%}
+          {%- else -%}
+          {%- for k in fixed -%}
+          {%- if fixed[k] is boolean or fixed[k] is not integer or fixed[k] <= 0 -%}{%- set ns.l = ns.l + [[c.key, k, fixed[k]]] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.bundle.refusals.artifacts,
+                                   'rh_rf_detail': [_rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    # option B binder (codex711): each class's allocation from its OWN rows, row by row (each row's own file and cap; no
+    # positional pairing), plus the fixed members by role (role word -> declared file name of that role). The {rows, total}
+    # keys are the N13 rh_rsv_max_bytes interface (erratum-02 binder_interface_for_MAIN; GL-02Z), carried.
+    - name: Bind each class's allocation (preflight P8, after P7; BLOCKED-ON-GENESIS-GL _rh_pkg_alloc)
+      ansible.builtin.set_fact:
+        _rh_pkg_alloc: >-
+          {%- set bn = rh.controller.bootstrap.bundle -%}
+          {%- set sep = rh.controller.bootstrap.path_admission.separator -%}
+          {%- set ns = namespace(m={}) -%}
+          {%- for c in rh_classes -%}
+          {%- set fixed = c.renderer.bootstrap.bundle.member_max_bytes -%}
+          {%- set r = namespace(m={}) -%}
+          {%- for a in c.renderer.bootstrap.artifacts + _rh_pkg_lock[c.key].packages + _rh_pkg_lock[c.key].collections -%}
+          {%- set r.m = r.m | combine({bn.artifacts_dir ~ sep ~ a.file: a.max_bytes}) -%}
+          {%- endfor -%}
+          {%- for role in fixed -%}{%- set r.m = r.m | combine({bn[role]: fixed[role]}) -%}{%- endfor -%}
+          {%- set ns.m = ns.m | combine({c.key: {'rows': r.m, 'total': r.m.values() | sum}}) -%}
+          {%- endfor -%}{{ ns.m }}
+
+    - name: Refuse an allocation that does not cover exactly this class's staged files (preflight P9, after P8; exact coverage against the captured class lock)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set bn = rh.controller.bootstrap.bundle -%}
+          {%- set sep = rh.controller.bootstrap.path_admission.separator -%}
+          {%- set ns = namespace(l=[]) -%}
+          {%- for c in rh_classes -%}
+          {%- set want = [bn.seed_file, bn.launcher_file, bn.manifest_file, bn.checksum_file]
+                         + ((c.renderer.bootstrap.artifacts + _rh_pkg_lock[c.key].packages + _rh_pkg_lock[c.key].collections)
+                            | map(attribute='file') | map('regex_replace', '^', bn.artifacts_dir ~ sep) | list) -%}
+          {%- if (_rh_pkg_alloc[c.key].rows | list | sort) != (want | sort) or (_rh_pkg_alloc[c.key].rows | length) != (want | length) -%}
+          {%- set ns.l = ns.l + [[c.key, _rh_pkg_alloc[c.key].rows | list | sort, want | sort]] -%}{%- endif -%}
+          {%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.bundle.refusals.artifacts,
+                                   'rh_rf_detail': [_rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    # codex714 REC-01 (R1): the bundle.json record is built in package_bundle field by field from
+    # controller.bootstrap.bundle.manifest_record roles (never a positional zip). Admitted here for every class before any
+    # publication: each field list distinct; each roles node's key set == its field list (the nested pairing source_roles
+    # <-> source_fields, genesis_roles <-> genesis_fields is by those declared names: C1PKG-REQ-NESTED-LINK); every role one
+    # kind this producer implements; the declared derived words == the words this producer implements (_rh_pkg_impl:
+    # the visible residual of VS-PKG-REC-ORDER, OPEN-REQUIRED); every policy path resolves from the declared policy scope
+    # root (records-pkg-optb-03 manifest_record.policy_scope: fact rh, path [controller] = the EXECUTING CONTROLLER
+    # PUBLICATION POLICY, codex717 (a); walked from the declared fact and path, no literal root); the {policy} roles of
+    # every roles node are exactly that node's policy_scope members and no other role is one (optb-03 consumer_owed: the
+    # cross-row equality no engine kind states); class content stays rh_pub_policy; and every generation_id source
+    # resolves in every class policy controller (class content, class-bound).
+    - name: Refuse a record or generation-id declaration this producer cannot build by role (preflight P10)
+      vars:
+        _rh_pkg_impl:
+          record_kinds: [policy, derived, nested]
+          derived: [seed_render_sha256, launcher_render_sha256, generation_id, profile_sha256, class_lock_sha256, class_key,
+                    artifact_rows, checksum_file_sha256, builder, repo_root, repo_head, worktree_status_sha256, worktree_dirty,
+                    source_input_rows, recipe_provenance, class_allocation]
+          generation_kinds: [policy, digest]
+          generation_digests: [seed_sha256]
+        _rh_pkg_bad: >-
+          {%- set mr = rh.controller.bootstrap.bundle.manifest_record -%}
+          {%- set gi = rh.controller.bootstrap.layout.generation_id -%}
+          {%- set ps = mr.policy_scope -%}
+          {%- set ns = namespace(l=[], d=[]) -%}
+          {#- optb-after-02 (records-pkg-optb-03): the policy-role scope root is the declared fact walked by the declared path -#}
+          {%- set root = namespace(n=lookup('ansible.builtin.vars', ps.fact), ok=true) -%}
+          {%- for s in ps.path -%}
+          {%- if root.ok and root.n is mapping and s in root.n -%}{%- set root.n = root.n[s] -%}{%- else -%}{%- set root.ok = false -%}{%- endif -%}
+          {%- endfor -%}
+          {%- if not root.ok -%}{%- set ns.l = ns.l + [['policy_scope', ps.fact, ps.path]] -%}{%- endif -%}
+          {%- set nodes = [['roles', mr.fields], ['source_roles', mr.source_fields], ['genesis_roles', mr.genesis_fields]] -%}
+          {%- if ps.members | list | reject('in', nodes | map('first') | list) | list | length > 0 -%}{%- set ns.l = ns.l + [['policy_scope', ps.members | list]] -%}{%- endif -%}
+          {%- for nn, fl in nodes -%}
+          {%- set rn = mr[nn] -%}
+          {%- if (fl | unique | list | length) != (fl | length) -%}{%- set ns.l = ns.l + [['fields', fl]] -%}{%- endif -%}
+          {%- if rn is not mapping or (rn | list | sort) != (fl | sort) -%}{%- set ns.l = ns.l + [['roles', fl, rn]] -%}
+          {%- else -%}
+          {%- set pf = namespace(l=[]) -%}
+          {%- for f in fl -%}
+          {%- set r = rn[f] -%}
+          {%- if r is not mapping or (r | length) != 1 or (r | list | first) not in _rh_pkg_impl.record_kinds -%}{%- set ns.l = ns.l + [['kind', f, r]] -%}
+          {%- elif 'derived' in r -%}{%- set ns.d = ns.d + [r.derived] -%}
+          {%- elif 'nested' in r -%}
+          {%- if r.nested not in mr or mr[r.nested] is not mapping -%}{%- set ns.l = ns.l + [['nested', f, r.nested]] -%}{%- endif -%}
+          {%- elif 'policy' in r -%}
+          {%- set pf.l = pf.l + [f] -%}
+          {%- if root.ok -%}
+          {#- optb-after-04: policy segments split on the declared audit_join (records-pkg-optb-04; C1-OPTB4-GL-02) -#}
+          {%- set w = namespace(n=root.n, ok=true) -%}
+          {%- for s in r.policy.split(rh.controller.bootstrap.source_admission.early_view.override.audit_join) -%}
+          {%- if w.ok and w.n is mapping and s in w.n -%}{%- set w.n = w.n[s] -%}{%- else -%}{%- set w.ok = false -%}{%- endif -%}
+          {%- endfor -%}
+          {%- if not w.ok -%}{%- set ns.l = ns.l + [['policy', f, r.policy]] -%}{%- endif -%}
+          {%- endif -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {#- optb-after-02 (records-pkg-optb-03 consumer_owed): the {policy} roles of this node are EXACTLY its policy_scope
+              members; a node without a members entry has no policy role (the cross-row equality no engine kind states) -#}
+          {%- if nn in ps.members -%}
+          {%- if (pf.l | sort) != (ps.members[nn] | sort) or (pf.l | length) != (ps.members[nn] | length) -%}{%- set ns.l = ns.l + [['policy_scope', nn, pf.l, ps.members[nn]]] -%}{%- endif -%}
+          {%- elif pf.l | length > 0 -%}{%- set ns.l = ns.l + [['policy_scope', nn, pf.l]] -%}
+          {%- endif -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if (ns.d | unique | sort) != (_rh_pkg_impl.derived | sort) or (ns.d | unique | list | length) != (ns.d | length) -%}
+          {%- set ns.l = ns.l + [['derived', ns.d, _rh_pkg_impl.derived]] -%}{%- endif -%}
+          {%- for o in gi.order -%}
+          {%- if o not in gi.sources or o not in gi.prefixes or gi.sources[o] is not mapping or (gi.sources[o] | length) != 1
+                 or (gi.sources[o] | list | first) not in _rh_pkg_impl.generation_kinds -%}{%- set ns.l = ns.l + [['generation', o]] -%}
+          {%- elif 'digest' in gi.sources[o] -%}
+          {%- if gi.sources[o].digest not in _rh_pkg_impl.generation_digests -%}{%- set ns.l = ns.l + [['generation', o, gi.sources[o]]] -%}{%- endif -%}
+          {%- else -%}
+          {%- for c in rh_classes -%}
+          {#- optb-after-04: policy segments split on the declared audit_join (records-pkg-optb-04; C1-OPTB4-GL-02) -#}
+          {%- set w = namespace(n=c.renderer, ok=true) -%}
+          {%- for s in gi.sources[o].policy.split(rh.controller.bootstrap.source_admission.early_view.override.audit_join) -%}
+          {%- if w.ok and w.n is mapping and s in w.n -%}{%- set w.n = w.n[s] -%}{%- else -%}{%- set w.ok = false -%}{%- endif -%}
+          {%- endfor -%}
+          {%- if not w.ok -%}{%- set ns.l = ns.l + [['generation', o, c.key, gi.sources[o].policy]] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {#- optb-after-08 (records-n1-03 OPEN-OPTB4-RULE-CLASS-EQ-SITE, supp-01 N1-03-S1-P10-SITE; C-OPTB4-RULE-CLASS-EQ): every
+              bootstrap node the seed generation_id macro reads must be equal in each class and in rh.controller (node list
+              literal here: OPEN-PKG08-RULE-NODES asks for a declared node list) -#}
+          {%- for c in rh_classes -%}{%- for p in [['layout', 'generation_id'], ['layout', 'generations_dir'], ['path_admission', 'separator'], ['source_admission', 'early_view', 'override', 'audit_join']] -%}
+          {%- set a = namespace(n=c.renderer.bootstrap, ok=true) -%}{%- set b = namespace(n=rh.controller.bootstrap, ok=true) -%}
+          {%- for s in p -%}
+          {%- if a.ok and a.n is mapping and s in a.n -%}{%- set a.n = a.n[s] -%}{%- else -%}{%- set a.ok = false -%}{%- endif -%}
+          {%- if b.ok and b.n is mapping and s in b.n -%}{%- set b.n = b.n[s] -%}{%- else -%}{%- set b.ok = false -%}{%- endif -%}
+          {%- endfor -%}
+          {%- if not a.ok or not b.ok or (a.n | to_json(sort_keys=true)) != (b.n | to_json(sort_keys=true)) -%}{%- set ns.l = ns.l + [['generation_rule', c.key, p]] -%}{%- endif -%}
+          {%- endfor -%}{%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.genesis.builder.refusal,
+                                   'rh_rf_detail': [_rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    # optb-after-03 (codex721 PREFLIGHT-ARTIFACTS = yes): the artifact store custody and the selected artifact inputs of
+    # EVERY class are admitted here, before the first bundle publication mutation (moved from package_bundle optb-after-02
+    # :81-174, which admitted only the current class just before its N13 include). Preflight discipline, NOT a
+    # transactional multi-bundle claim: the immediate checks stay inside N13 (each artifact a no-follow regular file at
+    # the copy source with its size cap, the STAGED copy digest-bound to the declared sha256 before publication).
+    # codex-tick702 OPEN-PKG-01-GAP-A (ancestors), PROTECTIONS STATED, NOT OVERCLAIMED: (1) the ONE ancestry rule admits
+    # every existing component of the store path (real directories, owned by uid 0 or the running uid, never
+    # other-writable, group-writable only when owner-owned AND admitted by owner_private_group), so apart from uid 0 and
+    # the builder account itself no principal can rename or replace a component; (2) the store root is the builder's own
+    # real directory; (3) every declared artifact of every class is a flat name directly under it, so the admitted
+    # ancestry is each artifact's whole ancestry; (4) each artifact is a no-follow regular file here, again at the N13 copy
+    # source. NOT PROTECTED: these are separate lstat observations in this controller's mount namespace (local
+    # connection, no become), not one atomic open: no openat / no-follow descriptor chain and no lock on the store, so
+    # uid 0 or the builder account can replace a component between this preflight and N13's read by path (a window that
+    # now spans earlier classes' publications). A changed ancestor at consumption is caught only when the bytes read
+    # differ from the declaration (digest refusal); identical declared bytes read through a replaced path are admitted,
+    # their path provenance qualified to the store as admitted here, modulo uid 0 and the builder account.
+    - name: Refuse an artifact store host var that is not a normalized absolute path (preflight P11; before the store is read)
+      ansible.builtin.assert:
+        that:
+          - rh.controller.bootstrap.genesis.acquisition.source_var is string and rh.controller.bootstrap.genesis.acquisition.source_var in vars
+          - lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) is string
+          - lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) is match(rh.controller.bootstrap.path_admission.regex)
+          - lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.bundle.refusals.artifacts,
+                                   'rh_rf_detail': [rh.controller.bootstrap.genesis.acquisition.source_var]}) }}
+        quiet: true
+
+    - name: Admit the artifact store path by the ONE ancestry rule (preflight P12; store custody; tasks/admit_ancestry.yml)
+      ansible.builtin.include_tasks: tasks/admit_ancestry.yml
+      vars:
+        rh_anc_bs: "{{ rh.controller.bootstrap }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) }}"
+        rh_anc_refusal: "{{ rh.controller.bootstrap.bundle.refusals.artifacts }}"
+
+    - name: Stat the artifact store root itself (preflight P13; no link followed; read-only)
+      ansible.builtin.stat:
+        path: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: _rh_pkg_anc
+
+    - name: Refuse a store root that is not the builder's own real directory, or any class artifact that is not a flat name in it (preflight P14)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set sep = rh.controller.bootstrap.path_admission.separator -%}
+          {%- set ns = namespace(l=[]) -%}
+          {%- for c in rh_classes -%}
+          {%- for a in c.renderer.bootstrap.artifacts + _rh_pkg_lock[c.key].packages + _rh_pkg_lock[c.key].collections -%}
+          {%- if a.file is search(sep | regex_escape) -%}{%- set ns.l = ns.l + [[c.key, a.file]] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_anc.stat.exists
+          - _rh_pkg_anc.stat.isdir
+          - not _rh_pkg_anc.stat.islnk
+          - _rh_pkg_anc.stat.uid == rh_builder.uid | int
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.bundle.refusals.artifacts,
+                                   'rh_rf_detail': [lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var),
+                                                    rh.controller.bootstrap.path_admission.admission_texts.components,
+                                                    rh_builder.uid,
+                                                    _rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    # One row per (class, declared artifact row), in class order then declared row order; each row carries its class key,
+    # file, store path and declared sha256, so every refusal names the class (rows shared by classes are stat'ed per class).
+    - name: Stat every declared artifact of every class in the store (preflight P15; no link followed; a link or non-regular file refuses below)
+      ansible.builtin.stat:
+        path: "{{ _rh_pkg_art.path }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: >-
+        {%- set st = lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) -%}
+        {%- set sep = rh.controller.bootstrap.path_admission.separator -%}
+        {%- set ns = namespace(l=[]) -%}
+        {%- for c in rh_classes -%}
+        {%- for a in c.renderer.bootstrap.artifacts + _rh_pkg_lock[c.key].packages + _rh_pkg_lock[c.key].collections -%}
+        {%- set ns.l = ns.l + [{'key': c.key, 'file': a.file, 'path': st ~ sep ~ a.file, 'sha256': a.sha256}] -%}
+        {%- endfor -%}
+        {%- endfor -%}{{ ns.l }}
+      loop_control:
+        loop_var: _rh_pkg_art
+        label: "{{ _rh_pkg_art.key }} {{ _rh_pkg_art.file }}"
+      register: _rh_pkg_src
+
+    - name: Refuse a present declared artifact of any class that is a link or not a regular file (preflight P16; OPEN-PKG-01 kept; no fallback)
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_src.results | map(attribute='stat') | selectattr('exists') | selectattr('islnk') | list | length == 0
+          - _rh_pkg_src.results | map(attribute='stat') | selectattr('exists') | rejectattr('isreg') | list | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.bundle.refusals.artifacts,
+                                   'rh_rf_detail': [rh.controller.bootstrap.path_admission.admission_texts.components,
+                                                    _rh_pkg_src.results | selectattr('stat.exists') | rejectattr('stat.isreg')
+                                                    | map(attribute='_rh_pkg_art') | list | to_json]}) }}
+        quiet: true
+
+    - name: Refuse a missing or mismatched declared artifact of any class (preflight P17; offline admission; before any publication)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set ns = namespace(l=[]) -%}
+          {%- for r in _rh_pkg_src.results -%}
+          {%- if not r.stat.exists or r.stat.checksum != r._rh_pkg_art.sha256 -%}{%- set ns.l = ns.l + [r._rh_pkg_art] -%}{%- endif -%}
+          {%- endfor -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.bundle.refusals.artifacts,
+                                   'rh_rf_detail': [lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var),
+                                                    rh.controller.bootstrap.genesis.acquisition.source_var,
+                                                    _rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    # optb-after-07 (C1-PKG records-pubrcpt-01 consumers_owed rows 1 / 2): the receipt accumulator starts EMPTY here, once,
+    # before the class loop; package_bundle optb-after-05 adds each admitted class (keys exactly receipt.class_fields; a class
+    # already present refuses). An initialization, not a fallback: no reader defaults it.
+    - name: Start the publication receipt accumulator before the class loop (BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt)
+      ansible.builtin.set_fact:
+        _rh_pkg_rcpt: {}
+
+    # optb-after-08 CLASS RECORDS DIR (C1-PKG records-pubrcpt-02 rulings.class_records.dir; records-recovery-vocab-02 PKG-CALLER
+    # consumer row: resume detection from state this stage owns, never an attempt marker). The dir is <act dir>/
+    # <receipt.class_records.dir_rel> (the receipt's act dir join, genesis_source_record_emit :202-209). Observed without
+    # following links BEFORE the class loop. Absent -> ONE mkdir without -p at class_records.dir_mode by the declared
+    # os_tools.mkdir (admitted first: exists, regular, executable, os_tool_identity.owner_uid, not group / other-writable,
+    # as reserve_publish RESERVE :109-148), resumed false; a mkdir that fails (the dir appeared) refuses. Present -> resumed
+    # true, admitted only as a real dir owned by the builder at exactly dir_mode whose entries (hidden ones included, no
+    # recursion, no link followed) are only class_records.name of a partition class key, each a regular file (no link) of
+    # class_records.mode owned by the builder. Every refusal is receipt.refusal (RH-PACKAGE-RECEIPT); nothing is removed.
+    # OPEN-PKG08-NAME-PLACEHOLDER: the {class_key} placeholder token of class_records.name is substituted literally.
+    - name: Observe the class-records dir before the class loop (no link followed; BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt_cdir)
+      ansible.builtin.stat:
+        path: >-
+          {{ [rh_repo_root, rh.controller.bootstrap.work_roots.root_rel,
+              rh.controller.bootstrap.work_roots.sub_roots[rh.controller.bootstrap.genesis.launch.stage_root.sub],
+              rh.controller.bootstrap.genesis.launch.stage_root.rel,
+              rh.controller.bootstrap.genesis.initializer.dispatch.evidence.publication.stage,
+              lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.launch.stage_root.act.var),
+              rh.controller.bootstrap.package_publish.receipt.class_records.dir_rel] | join(rh.controller.bootstrap.path_admission.separator) }}
+        follow: false
+        get_checksum: false
+      register: _rh_pkg_rcpt_cdir
+
+    - name: Stat the declared mkdir tool before any use (links followed, as RESERVE; BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt_ctool)
+      ansible.builtin.stat:
+        path: "{{ rh.controller.bootstrap.os_tools.mkdir.path }}"
+        follow: true
+        get_checksum: false
+      register: _rh_pkg_rcpt_ctool
+
+    - name: Refuse a declared mkdir tool that is not a root-owned, non-writable regular executable (before the class-records mkdir)
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_rcpt_ctool.stat.exists and _rh_pkg_rcpt_ctool.stat.isreg and _rh_pkg_rcpt_ctool.stat.executable
+          - _rh_pkg_rcpt_ctool.stat.uid == rh.controller.bootstrap.os_tool_identity.owner_uid
+          - not _rh_pkg_rcpt_ctool.stat.wgrp and not _rh_pkg_rcpt_ctool.stat.woth
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.package_publish.receipt.refusal,
+                                   'rh_rf_detail': [rh.controller.bootstrap.os_tools.mkdir.path]}) }}
+        quiet: true
+
+    - name: Create the class-records dir once when absent (declared mkdir, no -p, class_records.dir_mode)
+      when: not _rh_pkg_rcpt_cdir.stat.exists
+      block:
+        - name: Create the class-records dir (BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt_cmk)
+          ansible.builtin.command:
+            argv:
+              - "{{ rh.controller.bootstrap.os_tools.mkdir.path }}"
+              - -m
+              - "{{ rh.controller.bootstrap.package_publish.receipt.class_records.dir_mode }}"
+              - --
+              - >-
+                {{ [rh_repo_root, rh.controller.bootstrap.work_roots.root_rel,
+                    rh.controller.bootstrap.work_roots.sub_roots[rh.controller.bootstrap.genesis.launch.stage_root.sub],
+                    rh.controller.bootstrap.genesis.launch.stage_root.rel,
+                    rh.controller.bootstrap.genesis.initializer.dispatch.evidence.publication.stage,
+                    lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.launch.stage_root.act.var),
+                    rh.controller.bootstrap.package_publish.receipt.class_records.dir_rel] | join(rh.controller.bootstrap.path_admission.separator) }}
+          register: _rh_pkg_rcpt_cmk
+      rescue:
+        - name: Refuse a failed class-records mkdir (the dir appeared or could not be made; nothing is removed)
+          ansible.builtin.fail:
+            msg: >-
+              {{ lookup('ansible.builtin.template',
+                        rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                        template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                       'rh_rf_code': rh.controller.bootstrap.package_publish.receipt.refusal,
+                                       'rh_rf_detail': [rh.controller.bootstrap.package_publish.receipt.class_records.dir_rel, ansible_failed_result.msg]}) }}
+
+    - name: List a present class-records dir (hidden entries, any type, no recursion, no link followed; BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt_cls)
+      ansible.builtin.find:
+        paths: "{{ _rh_pkg_rcpt_cdir.stat.path }}"
+        file_type: any
+        hidden: true
+        recurse: false
+        follow: false
+      when: _rh_pkg_rcpt_cdir.stat.exists
+      register: _rh_pkg_rcpt_cls
+
+    - name: Bind whether this run resumes this act's publication (the class-records dir was present; BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt_resumed)
+      ansible.builtin.set_fact:
+        _rh_pkg_rcpt_resumed: "{{ _rh_pkg_rcpt_cdir.stat.exists }}"
+
+    - name: Refuse a class-records dir or entry of another kind, owner, mode or name (before the class loop)
+      vars:
+        _rh_pkg_bad: >-
+          {%- set cr = rh.controller.bootstrap.package_publish.receipt.class_records -%}
+          {%- set ns = namespace(l=[]) -%}
+          {%- if _rh_pkg_rcpt_cdir.stat.exists -%}
+          {%- set st = _rh_pkg_rcpt_cdir.stat -%}
+          {%- if not st.isdir or st.islnk or st.uid != rh_builder.uid | int or st.mode != cr.dir_mode -%}{%- set ns.l = ns.l + [[st.path, st.mode, st.uid]] -%}{%- endif -%}
+          {%- set nm = namespace(l=[]) -%}
+          {%- for c in rh_classes -%}{%- set nm.l = nm.l + [cr.name | replace('{class_key}', c.key)] -%}{%- endfor -%}
+          {%- for f in _rh_pkg_rcpt_cls.files -%}
+          {%- if (f.path | basename) not in nm.l or not f.isreg or f.islnk or f.mode != cr.mode or f.uid != rh_builder.uid | int -%}
+          {%- set ns.l = ns.l + [[f.path, f.mode, f.uid]] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- elif _rh_pkg_rcpt_cmk.rc != 0 -%}{%- set ns.l = ns.l + [[_rh_pkg_rcpt_cmk.cmd, _rh_pkg_rcpt_cmk.rc]] -%}
+          {%- endif -%}{{ ns.l }}
+      ansible.builtin.assert:
+        that:
+          - _rh_pkg_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.package_publish.receipt.refusal,
+                                   'rh_rf_detail': [_rh_pkg_bad | to_json]}) }}
+        quiet: true
+
+    # r3g per-class publication: ONE full publication destination per class (bundle.per_class); the controller's class
+    # at rh_bundle_dir. The CONTENT view is the class scope's own policy and lock; the EXECUTION view (tools, path
+    # admission, staging/lease policy) stays this controller's rh. Include params are registry-reserved names.
+    - name: Publish each class's bundle destination (input admission, reap, reserve, render, readback, publish, admission)
+      ansible.builtin.include_tasks: tasks/package_bundle.yml
+      loop: "{{ rh_classes }}"
+      loop_control:
+        loop_var: _rh_class
+        label: "{{ _rh_class.key }} {{ _rh_class.dir }} controller={{ _rh_class.controller }} targets={{ _rh_class.targets }}"
+      vars:
+        rh_pub_dir: "{{ _rh_class.dir }}"
+        rh_pub_key: "{{ _rh_class.key }}"
+        rh_pub_policy: "{{ _rh_class.policy }}"
+        rh_pub_controller: "{{ _rh_class.renderer }}"
+        rh_pub_binding: "{{ _rh_class.generation_binding }}"
+
+    # optb-after-07 PUBLICATION RECEIPT (C1-PKG records-pubrcpt-01 REQ-PUBRCPT-01..03; consumers_owed row 2; codex726
+    # OPEN_N6_PUB_READBACK). Reached only when every class was PUBLISHED or UNCHANGED and admitted by admit_bundle (a
+    # refused class stops the loop first: no receipt, never a partial one). Every word is read from the EXECUTING
+    # controller policy rh.controller.bootstrap.package_publish.receipt, never a class policy. Order: coverage partition
+    # (receipt.coverage, pinned [partition] at resolve by C1-RCPT-GL-02) -> the word (keys exactly receipt.fields; source
+    # = the receipt.source_fields values of the admitted source record, the var named by source_admission.bootstrap_input
+    # .var, never re-measured) -> the path (this launch's own exclusively created act dir under the publication stage,
+    # the genesis_source_record_emit :202-209 join) -> stat without following links -> ONE write (force false) at
+    # receipt.mode -> ONE read back equal to the word -> stat mode, owner and digest (:211-259 pattern).
+    # Every refusal is receipt.refusal (RH-PACKAGE-RECEIPT). A written receipt that fails readback is never deleted.
+    # optb-after-08 (C1-PKG records-pubrcpt-02 rulings.receipt; codex729 729-RECOVERY-RECEIPT-REUSE): the word carries
+    # resumed (_rh_pkg_rcpt_resumed, the class-records dir observation above). The refuse-if-present branch is WITHDRAWN:
+    # absent -> written once as above; present (an earlier attempt of THIS act wrote it) -> never rewritten, admitted only
+    # when its bytes are EXACTLY the word rebuilt from this run's entries with resumed = its OWN resumed value (the two
+    # candidates differ only in resumed; the present bytes must equal one of them, so their resumed is a bool and act,
+    # stage, source, schema and every class entry are byte-equal). One read either way (the readback of a write, or the
+    # read of the present receipt), then the post stat. The class entries are package_bundle optb-after-06's (record
+    # values, trusted_oid included: B-CLS-4).
+    - name: Refuse a publication receipt whose classes are not exactly the deployment partition (receipt.coverage partition)
+      ansible.builtin.assert:
+        that:
+          - (_rh_pkg_rcpt | list | sort) == (rh_classes | map(attribute='key') | list | sort)
+          - (_rh_pkg_rcpt | length) == (rh_classes | length)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.package_publish.receipt.refusal,
+                                   'rh_rf_detail': [_rh_pkg_rcpt | list | sort | to_json, rh_classes | map(attribute='key') | list | sort | to_json]}) }}
+        quiet: true
+
+    - name: Bind the publication receipt word and its path (keys exactly receipt.fields; BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt_word / _rh_pkg_rcpt_out)
+      ansible.builtin.set_fact:
+        _rh_pkg_rcpt_word: >-
+          {%- set rc = rh.controller.bootstrap.package_publish.receipt -%}
+          {%- set sr = lookup('ansible.builtin.vars', rh.controller.bootstrap.source_admission.bootstrap_input.var) -%}
+          {%- set src = namespace(m={}) -%}
+          {%- for f in rc.source_fields -%}{%- set src.m = src.m | combine({f: sr[f]}) -%}{%- endfor -%}
+          {%- set v = {'act': lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.launch.stage_root.act.var),
+                       'classes': _rh_pkg_rcpt, 'resumed': _rh_pkg_rcpt_resumed, 'schema': rc.schema, 'source': src.m,
+                       'stage': rh.controller.bootstrap.genesis.initializer.dispatch.evidence.publication.stage} -%}
+          {%- if (v | list | sort) == (rc.fields | sort) and (v | length) == (rc.fields | length) -%}
+          {{ {'json': v | to_json(sort_keys=true)}[rc.format] }}
+          {%- else -%}
+          {{ undef() | mandatory(lookup('ansible.builtin.template',
+                                        rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                                        template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                                       'rh_rf_code': rc.refusal,
+                                                       'rh_rf_detail': [rc.fields | to_json, v | list | sort | to_json]})) }}
+          {%- endif -%}
+        _rh_pkg_rcpt_out: >-
+          {{ [rh_repo_root, rh.controller.bootstrap.work_roots.root_rel,
+              rh.controller.bootstrap.work_roots.sub_roots[rh.controller.bootstrap.genesis.launch.stage_root.sub],
+              rh.controller.bootstrap.genesis.launch.stage_root.rel,
+              rh.controller.bootstrap.genesis.initializer.dispatch.evidence.publication.stage,
+              lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.launch.stage_root.act.var),
+              rh.controller.bootstrap.package_publish.receipt.record_rel] | join(rh.controller.bootstrap.path_admission.separator) }}
+
+    - name: Observe the publication receipt path before the write (no link followed; BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt_pre)
+      ansible.builtin.stat:
+        path: "{{ _rh_pkg_rcpt_out }}"
+        follow: false
+        get_checksum: false
+      register: _rh_pkg_rcpt_pre
+
+    - name: Write the publication receipt once when absent (receipt.mode; force false; a present receipt is re-admitted below, never rewritten)
+      when: not _rh_pkg_rcpt_pre.stat.exists
+      block:
+        - name: Write the publication receipt
+          ansible.builtin.copy:
+            content: "{{ _rh_pkg_rcpt_word }}"
+            dest: "{{ _rh_pkg_rcpt_out }}"
+            mode: "{{ rh.controller.bootstrap.package_publish.receipt.mode }}"
+            force: false
+      rescue:
+        - name: Refuse a failed publication receipt write
+          ansible.builtin.fail:
+            msg: >-
+              {{ lookup('ansible.builtin.template',
+                        rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                        template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                       'rh_rf_code': rh.controller.bootstrap.package_publish.receipt.refusal,
+                                       'rh_rf_detail': [_rh_pkg_rcpt_out, ansible_failed_result.msg]}) }}
+
+    - name: Read the publication receipt once (the readback of this write, or the present receipt; BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt_back)
+      ansible.builtin.slurp:
+        src: "{{ _rh_pkg_rcpt_out }}"
+      register: _rh_pkg_rcpt_back
+
+    - name: Observe the written publication receipt (mode, owner, digest; no link followed; BLOCKED-ON-GENESIS-GL _rh_pkg_rcpt_post)
+      ansible.builtin.stat:
+        path: "{{ _rh_pkg_rcpt_out }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: "{{ rh.controller.bootstrap.source_admission.digest_algorithm }}"
+      register: _rh_pkg_rcpt_post
+
+    # optb-after-08: written -> the bytes equal this run's word; present -> the bytes equal this run's word OR the same word
+    # with resumed negated (its own resumed value; nothing else may differ). The digest is checked against the bytes read.
+    - name: Refuse a publication receipt file that is not exactly the written or re-admitted word (bytes, regular file, mode, owner, digest)
+      ansible.builtin.assert:
+        that:
+          - >-
+            (_rh_pkg_rcpt_back.content | b64decode) == _rh_pkg_rcpt_word
+            or (_rh_pkg_rcpt_pre.stat.exists
+                and (_rh_pkg_rcpt_back.content | b64decode)
+                    == {'json': _rh_pkg_rcpt_word | from_json | combine({'resumed': not _rh_pkg_rcpt_resumed}) | to_json(sort_keys=true)}[rh.controller.bootstrap.package_publish.receipt.format])
+          - _rh_pkg_rcpt_post.stat.isreg and not _rh_pkg_rcpt_post.stat.islnk
+          - _rh_pkg_rcpt_post.stat.mode == rh.controller.bootstrap.package_publish.receipt.mode
+          - _rh_pkg_rcpt_post.stat.uid == rh_builder.uid | int
+          - _rh_pkg_rcpt_post.stat.checksum == (_rh_pkg_rcpt_back.content | b64decode | hash(rh.controller.bootstrap.source_admission.digest_algorithm))
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.package_publish.receipt.refusal,
+                                   'rh_rf_detail': [_rh_pkg_rcpt_out, _rh_pkg_rcpt_post.stat.checksum]}) }}
+        quiet: true
+# FROZEN, no further writes

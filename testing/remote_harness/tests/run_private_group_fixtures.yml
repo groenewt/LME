@@ -1,0 +1,97 @@
+---
+# testing/remote_harness/tests/run_private_group_fixtures.yml -- runs the SYNTHETIC owner-private-group fixtures
+# (tests/private_group_fixtures.yml; lifecycle case E51) through the ONE generated decision program with the declared
+# awk, on the controller, reading and changing NO real account, group, ACL or directory. Pure: facts in, verdict out.
+# Launched ONLY by the declared seed, started by the bundle's generated launcher:
+#   <bundle>/lme-seed-launch.sh run-local <checkout>/.work/toolchain private_group_fixtures
+#   (controller.bootstrap.seed_launcher.caller_argv; it execs seed_launch: env -i PATH=<base_env.PATH>
+#   LC_ALL=<base_env.LC_ALL> HOME=<passwd home> <bundle>/lme-controller-seed.sh run-local --root <root> --runner <key> --;
+#   an ambient shell launch of the seed refuses RH-SEED-USAGE)
+# which supplies pgf_work_root and, LAST, lme_resolved_run (work_roots.run_local.resolved_run); there is no default work
+# root and the raw profile is never read for one (RH-RUNNER-RESOLVED-WORKROOT). Evidence: <pgf_work_root>/results.json.
+# Acceptance: the play fails unless every fixture's verdict (and every declared reason) matches.
+- name: Owner-private-group decision fixtures (synthetic; route-owned)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: ../tasks/refuse_pinned_outputs.yml
+
+    - name: Resolve the harness policy through the engine
+      ansible.builtin.include_tasks: ../tasks/resolve_policy.yml
+
+    - name: Admit the resolved run (launched by the declared seed run-local; no default work root)
+      vars:
+        _rs: "{{ rh.controller.bootstrap.work_roots.run_local.resolved_run }}"
+      ansible.builtin.assert:
+        that:
+          - lme_resolved_run is defined and lme_resolved_run is mapping
+          - (lme_resolved_run.keys() | map('string') | sort | list) == (_rs.fields | sort | list)
+          - lme_resolved_run.runner == 'private_group_fixtures'
+          - pgf_work_root is defined and pgf_work_root is string and pgf_work_root == lme_resolved_run.work_root
+          - pgf_work_root is match(rh.controller.bootstrap.path_admission.regex)
+          - "'TMPDIR' in lme_resolved_run.env"
+          - ansible_playbook_python == lme_resolved_run.python
+        fail_msg: >-
+          REFUSED RH-SEED-USAGE: run_private_group_fixtures.yml runs only under the declared seed run-local
+          (--runner private_group_fixtures), which passes pgf_work_root and {{ _rs.var }} (fields {{ _rs.fields }}).
+        quiet: true
+
+    - name: Load the synthetic fixtures (declared file)
+      ansible.builtin.set_fact:
+        _pgf: >-
+          {{ lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ rh.controller.bootstrap.path_admission.ancestry.owner_private_group.fixtures_rel) | from_yaml }}
+
+    - name: Refuse fixtures of another schema
+      ansible.builtin.assert:
+        that:
+          - _pgf.schema == 'private-group-fixtures/1'
+          - _pgf.facts_schema == rh.controller.bootstrap.path_admission.ancestry.owner_private_group.facts_schema
+          - _pgf.fixtures | map(attribute='id') | unique | list | length == _pgf.fixtures | length
+          - _pgf.fixtures | map(attribute='expect') | reject('in', ['ADMIT', 'REFUSE']) | list | length == 0
+        quiet: true
+
+    - name: Compose each fixture's facts stream (base with replace / drop / add applied)
+      ansible.builtin.set_fact:
+        _pgf_cases: >-
+          {% set out = [] %}{% for f in _pgf.fixtures %}{% set ns = namespace(rows=[]) %}{% for r in _pgf.base %}{% set ns2 = namespace(v=r[1], keep=true) %}{% for rp in f.replace | default([]) %}{% if rp[0] == r[0] and rp[1] == r[1] %}{% set ns2.v = rp[2] %}{% endif %}{% endfor %}{% for d in f.drop | default([]) %}{% if d[0] == r[0] and d[1] == r[1] %}{% set ns2.keep = false %}{% endif %}{% endfor %}{% if ns2.keep %}{% set ns.rows = ns.rows + [r[0] ~ '\t' ~ ns2.v] %}{% endif %}{% endfor %}{% for a in f.add | default([]) %}{% set ns.rows = ns.rows + [a[0] ~ '\t' ~ a[1]] %}{% endfor %}{% set _ = out.append({'id': f.id, 'expect': f.expect, 'reasons': f.reasons | default([]), 'facts': ns.rows | join('\n') ~ '\n', 'path': (_pgf.base | map('join', '\t') | select('match', '^path\t') | first).split('\t', 1)[1]}) %}{% endfor %}{{ out }}
+
+    - name: Decide every fixture with the ONE generated program (declared awk; pure; controller)
+      vars:
+        _pg: "{{ rh.controller.bootstrap.path_admission.ancestry.owner_private_group }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ rh.controller.bootstrap.os_tools[_pg.decision_tool].path }}"
+          - >-
+            {{ lookup('ansible.builtin.template', rh_repo_root ~ '/' ~ _pg.program_template_rel,
+                      template_vars={'rh_pg_bs': rh.controller.bootstrap, 'rh_pg_part': 'program'}) }}
+        stdin: "{{ item.facts }}"
+        stdin_add_newline: false
+      loop: "{{ _pgf_cases }}"
+      loop_control:
+        label: "{{ item.id }}"
+      register: _pgf_run
+      changed_when: false
+      failed_when: false
+
+    - name: Judge every verdict (expected ADMIT / REFUSE and every declared reason)
+      ansible.builtin.set_fact:
+        _pgf_results: >-
+          {% set out = [] %}{% for r in _pgf_run.results %}{% set c = r.item %}{% set ok = (c.expect == 'ADMIT' and r.rc == 0 and r.stdout == 'ADMIT ' ~ c.path)
+             or (c.expect == 'REFUSE' and r.rc == 1 and r.stdout.startswith('REFUSE ' ~ c.path ~ ':') and (c.reasons | reject('in', r.stdout) | list | length == 0)) %}{% set _ = out.append({'id': c.id, 'expect': c.expect, 'rc': r.rc, 'stdout': r.stdout, 'stderr': r.stderr, 'result': 'PASS' if ok else 'FAIL'}) %}{% endfor %}{{ out }}
+
+    - name: Write the evidence under the admitted runner work root (results.json)
+      ansible.builtin.copy:
+        dest: "{{ pgf_work_root }}/results.json"
+        mode: '0600'
+        content: "{{ {'schema': 'private-group-fixture-results/1', 'resolved_run': lme_resolved_run, 'profile_sha256': rh_profile_sha256, 'results': _pgf_results} | to_nice_json }}\n"
+
+    - name: Accept only when every fixture passes
+      ansible.builtin.assert:
+        that:
+          - _pgf_results | length == _pgf.fixtures | length
+          - _pgf_results | selectattr('result', 'equalto', 'FAIL') | list | length == 0
+        fail_msg: "owner-private-group fixtures FAILED: {{ _pgf_results | selectattr('result', 'equalto', 'FAIL') | list }}"
+        success_msg: "owner-private-group fixtures: {{ _pgf_results | length }} PASS"

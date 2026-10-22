@@ -1,0 +1,57 @@
+---
+# testing/e2e/guest/tasks/observe_run.yml -- READ-ONLY observation of this run_id's owned state. Included by admit.yml
+# (before any effect) and AGAIN under the lease by provision/retire (codex GUEST-LIFECYCLE-SERIALIZATION: every
+# decision made before the lease is re-made under it). Outputs: _g_run (run dir, record, preserved dir, preserved
+# record), _g_runfiles (every declared run file incl. partials), _g_claims (leftover claim stagings of this run_id).
+# Refuses (GUEST-STORAGE-ANCESTRY, dir/link/owner of already-existing entries): a run dir / preserved dir that is a
+# link, not a directory or not owned; any existing run entry that is a link or not owned.
+
+- name: Stat the run dir, its record, the preserved run and its record (no link followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ gp.run }}", "{{ gp.files.record }}", "{{ gp.preserved_run }}", "{{ gp.preserved_run }}/{{ gd.layout.run_files.record }}"]
+  register: _g_run
+
+- name: Stat every declared run file that may already exist (no link followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ gp.files.values() | list }}"
+  register: _g_runfiles
+
+- name: List leftover claim stagings of this run_id (runs/<claim_prefix><run_id>-*; never adopted, only reported)
+  ansible.builtin.find:
+    paths: ["{{ gp.runs }}"]
+    patterns: ["{{ gd.layout.claim_prefix }}{{ gg.run_id }}-*"]
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _g_claims
+
+- name: Refuse an existing run / preserved entry that is a link, not a directory or not owned (preserved as found)
+  vars:
+    _g_dirs: "{{ [_g_run.results[0].stat, _g_run.results[2].stat] | selectattr('exists') | list }}"
+    _g_recs: "{{ [_g_run.results[1].stat, _g_run.results[3].stat] | selectattr('exists') | list }}"
+  ansible.builtin.assert:
+    that:
+      - _g_dirs | selectattr('islnk') | list | length == 0
+      - _g_dirs | rejectattr('isdir') | list | length == 0
+      - _g_dirs | map(attribute='uid') | reject('equalto', g_owner_uid | int) | list | length == 0
+      - _g_recs | selectattr('islnk') | list | length == 0
+      - _g_recs | rejectattr('isreg') | list | length == 0
+      - _g_recs | map(attribute='uid') | reject('equalto', g_owner_uid | int) | list | length == 0
+      - _g_runfiles.results | map(attribute='stat') | selectattr('exists') | selectattr('islnk') | list | length == 0
+      - _g_runfiles.results | map(attribute='stat') | selectattr('exists') | map(attribute='uid') | reject('equalto', g_owner_uid | int) | list | length == 0
+    fail_msg: >-
+      REFUSED {{ gd.refusals.storage }} on {{ inventory_hostname }}: {{ gp.run }} / {{ gp.preserved_run }} or one of their
+      existing entries is a link, not the expected type, or not owned by uid {{ g_owner_uid }}
+      ({{ _g_runfiles.results | selectattr('stat.exists') | selectattr('stat.islnk') | map(attribute='item') | list }}).
+      Nothing is changed; the entries are preserved as found.
+    quiet: true
+
+- name: Bind which declared run files exist (derived; path -> exists)
+  ansible.builtin.set_fact:
+    _g_have: "{{ dict(_g_runfiles.results | map(attribute='item') | zip(_g_runfiles.results | map(attribute='stat.exists'))) }}"

@@ -1,0 +1,331 @@
+---
+# testing/tests/loader_integration/run_integration.yml
+#
+# Ansible RUNNER for the LME resolved-config INTEGRATION acceptance tier.
+# Reads CASE-SCHEMA.yml + contract_binding.yml + every cases/*.yml (data), then for
+# each case either (a) runs it read-only NOW (static_scan) or (b) fail-closes to
+# QUEUED until C1's resolved-config contract is bound. When bound, contract cases
+# render a probe from macros/probe.j2 and run the REAL loader through the actual
+# entrypoint context. No hand-authored Python. Mirrors C1's runner shape but at the
+# INTEGRATION scope (all four entrypoints, cross-consumer agreement, evidence matrix).
+#
+# Declared launcher -- the ONLY supported start (work roots; manifests/profiles/remote-harness.yml
+# controller.bootstrap.work_roots.run_local); design mode by default, acceptance AFTER contract_binding.status == bound:
+#   <checkout>/.work/bundle/lme-controller-seed.sh run-local --root <checkout>/.work/toolchain \
+#       --runner loader_integration [-- -e mode=acceptance]
+# The bundle is a SIBLING of the toolchain root (codex-tick184-launch-disposition-20260924-163452), never inside it: the
+# owned root admits only its declared layout entries and refuses an unknown one (profile purge inventory).
+# The launcher passes lme_resolved_run {runner, work_root, ansible_playbook, python, env, receipt {path, sha256}} as its
+# final JSON -e (and work_root=<same>). RH-RUNNER-RESOLVED-WORKROOT (codex 144541): work_root IS
+# lme_resolved_run.work_root; there is NO raw-profile fallback (absent or differing -> REFUSED before any read or write).
+# RH-NESTED-PROBE-EXECUTOR (codex 143844): the play binds itself and every nested probe to lme_resolved_run
+# (testing/remote_harness/tests/tasks/bind_probe_executor.yml): nested probes run lme_resolved_run.ansible_playbook
+# under every lme_resolved_run.env item (+ per-case HOME/ANSIBLE_HOME/TMPDIR/TMP/TEMP/ANSIBLE_LOCAL_TEMP/ANSIBLE_REMOTE_TMP under
+# the work root and a fixed PATH <resolved bin dir>:/usr/bin:/bin -- tests/tasks/probe_argv.yml); a direct
+# /usr/bin/ansible-playbook start or an ambient env value that differs is REFUSED.
+#
+# mode=design (default): QUEUED cases are EXPECTED and reported; the gate fails only
+#                        on hard FAIL/ERROR/OFF-EXPECTATION.
+# mode=acceptance:       ANY QUEUED case FAILS the gate (codex-check-0015: xfail/queue
+#                        bookkeeping must never turn unresolved behavior into a pass).
+- name: LME resolved-config integration acceptance tier
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    repo_root: "{{ playbook_dir | dirname | dirname | dirname }}"
+    cases_glob: "{{ playbook_dir }}/cases/*.yml"
+    work_root: "{{ lme_resolved_run.work_root }}"   # the resolved run's; no raw-profile fallback (asserted first)
+    resolver_rel: ansible/roles/podman/filter_plugins/lme_manifests.py
+    mode: design
+    expected_bound_verdicts: [PASS, XFAIL-as-expected, REJECTED-as-expected]
+    hard_fail_verdicts: [FAIL, ERROR, OFF-EXPECTATION]
+    results: []
+    scan_findings: []
+  tasks:
+    # --- Resolved run + nested-probe executor binding (FIRST; before any read or write) ---
+    - name: Require the resolved run and bind work_root to it (RH-RUNNER-RESOLVED-WORKROOT; no raw-profile fallback)
+      ansible.builtin.assert:
+        that:
+          - lme_resolved_run is defined
+          - lme_resolved_run is mapping
+          - lme_resolved_run.work_root is defined
+          - work_root is string and work_root == lme_resolved_run.work_root
+          - query('ansible.builtin.varnames', '^bpe_runner$') | length == 0
+        fail_msg: >-
+          REFUSED RH-RUNNER-RESOLVED-WORKROOT: lme_resolved_run is absent or not a mapping
+          (defined={{ lme_resolved_run is defined }}), or the work_root extra var differs from lme_resolved_run.work_root,
+          or bpe_runner was pre-supplied. (The message deliberately templates no work_root: its play default IS
+          lme_resolved_run.work_root, so it has no value to print when the record is absent.)
+          This runner never derives a work root from the profile; start it with
+          `lme-controller-seed.sh run-local --root <checkout>/.work/toolchain --runner loader_integration`.
+        quiet: true
+
+    - name: Bind this play and every nested probe to the resolved run (RH-NESTED-PROBE-EXECUTOR)
+      ansible.builtin.include_tasks: "{{ repo_root }}/testing/remote_harness/tests/tasks/bind_probe_executor.yml"
+      vars:
+        bpe_runner: loader_integration
+
+    - name: Load pinned case schema
+      ansible.builtin.include_vars:
+        file: CASE-SCHEMA.yml
+        name: case_schema
+
+    - name: Load C1 contract binding
+      ansible.builtin.include_vars:
+        file: contract_binding.yml
+        name: contract_binding
+
+    - name: Determine whether the C1 resolved-config contract is bound
+      ansible.builtin.set_fact:
+        contract_bound: "{{ (contract_binding.status | default('pending_c1_sitrep')) == 'bound' }}"
+
+    - name: Discover case files (disjoint, one writer per file; NN orders execution)
+      ansible.builtin.set_fact:
+        case_files: "{{ query('ansible.builtin.fileglob', cases_glob) | sort }}"
+
+    - name: Fail if no case files are present
+      ansible.builtin.assert:
+        that: "case_files | length > 0"
+        fail_msg: "no cases/*.yml found under {{ playbook_dir }}/cases -- nothing to run"
+
+    - name: Load and merge cases from every case file
+      ansible.builtin.set_fact:
+        cases: >-
+          {{ cases | default([])
+             + ((lookup('ansible.builtin.file', item) | from_yaml).cases | default([])) }}
+      loop: "{{ case_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+
+    - name: Fail on off-schema cases (missing name/kind/invariant_task, or unknown kind)
+      ansible.builtin.assert:
+        that:
+          - "cases | rejectattr('name', 'defined') | list | length == 0"
+          - "cases | rejectattr('kind', 'defined') | list | length == 0"
+          - "cases | rejectattr('invariant_task', 'defined') | list | length == 0"
+          - "cases | selectattr('kind', 'defined') | rejectattr('kind', 'in', case_schema.case_fields.kind.enum) | list | length == 0"
+          - "(cases | map(attribute='name') | list | length) == (cases | map(attribute='name') | list | unique | length)"
+        fail_msg: >-
+          off-schema or duplicate-named cases present:
+          {{ cases | selectattr('kind', 'defined') | rejectattr('kind', 'in', case_schema.case_fields.kind.enum) | map(attribute='name') | list }}
+
+    # --- Evidence identity (source-bound; test #8 infrastructure) ------------------
+    - name: Record HEAD under test (never a fabricated SHA)
+      ansible.builtin.command: git rev-parse HEAD
+      args: {chdir: "{{ repo_root }}"}
+      register: head_rev
+      changed_when: false
+
+    - name: Record worktree dirtiness
+      ansible.builtin.command: git status --porcelain
+      args: {chdir: "{{ repo_root }}"}
+      register: git_porcelain
+      changed_when: false
+
+    - name: Record run timestamp (UTC)
+      ansible.builtin.command: date -u +%Y%m%dT%H%M%SZ
+      register: run_ts
+      changed_when: false
+
+    - name: Compute source-bound run_id + per-run work dir (prior runs preserved)
+      ansible.builtin.set_fact:
+        run_id: "{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
+        work: "{{ work_root }}/{{ head_rev.stdout[:12] }}-{{ run_ts.stdout }}{{ '-dirty' if (git_porcelain.stdout_lines | length > 0) else '' }}"
+
+    - name: sha256 of the four real entrypoints (evidence identity)
+      ansible.builtin.stat:
+        path: "{{ repo_root }}/{{ item.value }}"
+        checksum_algorithm: sha256
+      register: entrypoint_stat
+      loop: "{{ contract_binding.entrypoints | dict2items }}"
+      loop_control: {label: "{{ item.key }}"}
+
+    - name: sha256 of authored case files + macros + runner + task files (evidence identity)
+      # T8 requires runner/macro hashes: the engine_probe.yml.j2 macro produces every runnable
+      # engine verdict, and one_case.yml / scan_target.yml / run_integration.yml are the runner
+      # logic -- all must be bound to the receipt, not only the case data + the contract-probe macro.
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      register: authored_stat
+      loop: >-
+        {{ case_files + [
+             playbook_dir ~ '/macros/probe.j2',
+             playbook_dir ~ '/engine_probe.yml.j2',
+             playbook_dir ~ '/one_case.yml',
+             playbook_dir ~ '/scan_target.yml',
+             playbook_dir ~ '/run_integration.yml',
+             repo_root ~ '/testing/remote_harness/tests/tasks/bind_probe_executor.yml',
+             repo_root ~ '/testing/remote_harness/tests/tasks/probe_argv.yml'
+           ] }}
+      loop_control: {label: "{{ item | basename }}"}
+
+    # Read the entrypoints from the COMMITTED HEAD blob, NOT the working tree: this tier runs in a
+    # SHARED worktree with concurrent editors (B/E migrate entrypoints in-flight), so a working-tree
+    # read makes the static_scan non-deterministic and lets a peer's UNCOMMITTED mid-edit contaminate
+    # the before-baseline. Binding to `git show HEAD:<path>` makes the scan judge COMMITTED state only
+    # (the real acceptance/migration-landing signal) and bound to a ref -- broken lineage is rejected,
+    # never a fabricated identity (T8). worktree_dirty is still recorded for provenance.
+    - name: Read entrypoint lines from the committed HEAD blob (ref-bound; immune to uncommitted peer edits)
+      ansible.builtin.command: "git show HEAD:{{ item.value }}"
+      args: {chdir: "{{ repo_root }}"}
+      register: head_entrypoint_show
+      changed_when: false
+      loop: "{{ contract_binding.entrypoints | dict2items }}"
+      loop_control: {label: "{{ item.key }}"}
+
+    - name: Record the HEAD blob id of each entrypoint (content identity bound to the ref)
+      ansible.builtin.command: "git rev-parse HEAD:{{ item.value }}"
+      args: {chdir: "{{ repo_root }}"}
+      register: head_entrypoint_blob
+      changed_when: false
+      loop: "{{ contract_binding.entrypoints | dict2items }}"
+      loop_control: {label: "{{ item.key }}"}
+
+    - name: Build entrypoint_lines (from the HEAD blob) + head_entrypoint_blobs map keyed by short name
+      ansible.builtin.set_fact:
+        entrypoint_lines: >-
+          {{ dict(head_entrypoint_show.results | map(attribute='item.key') | list
+                  | zip(head_entrypoint_show.results | map(attribute='stdout_lines') | list)) }}
+        head_entrypoint_blobs: >-
+          {{ dict(head_entrypoint_blob.results | map(attribute='item.key') | list
+                  | zip(head_entrypoint_blob.results | map(attribute='stdout') | list)) }}
+
+    - name: Publish evidence facts
+      ansible.builtin.set_fact:
+        toolchain:
+          # the nested-probe executor proven by the binding's identity act (no python3 -c, no ambient /usr/bin/ansible)
+          python: "{{ bpe_identity.python_version }}"
+          python_executable: "{{ bpe_identity.python }}"
+          jinja2: "{{ bpe_identity.jinja }}"
+          pyyaml: "{{ bpe_identity.pyyaml }}"
+          ansible: "{{ bpe_identity.version_line }}"
+          executable: "{{ bpe_identity.executable }}"
+          config_file: "{{ bpe_identity.config_file }}"
+          receipt: "{{ {'path': lme_resolved_run.receipt.path, 'sha256': lme_resolved_run.receipt.sha256, 'generation': bpe_receipt.generation | default(''), 'ansible_playbook_sha256': bpe_receipt.ansible_playbook_sha256} }}"
+          resolved_run: "{{ {'runner': lme_resolved_run.runner, 'work_root': lme_resolved_run.work_root, 'ansible_playbook': lme_resolved_run.ansible_playbook, 'python': lme_resolved_run.python, 'env_names': lme_resolved_run.env | list | sort} }}"
+        entrypoints_sha256: "{{ dict(entrypoint_stat.results | map(attribute='item.key') | list | zip(entrypoint_stat.results | map(attribute='stat.checksum') | list)) }}"
+        authored_sha256: "{{ dict(authored_stat.results | map(attribute='item') | map('basename') | list | zip(authored_stat.results | map(attribute='stat.checksum') | list)) }}"
+
+    - name: Create the per-run work dir
+      ansible.builtin.file:
+        path: "{{ work }}"
+        state: directory
+        mode: "0755"
+
+    - name: Refuse to reuse a prior run's evidence (fresh-by-construction guard)
+      ansible.builtin.find:
+        paths: "{{ work }}"
+        patterns: "results.yml"
+      register: preexisting
+      failed_when: "preexisting.files | length > 0"
+
+    # --- Immutable resolver copy for the RUNNABLE-NOW engine_regression probes --------
+    # engine_regression cases invoke the REAL resolver filters through ansible-playbook
+    # Jinja against THIS copy (ANSIBLE_FILTER_PLUGINS -> here), so the engine under test is
+    # provenance-pinned and cannot be mutated mid-run. No C1 loader cutover is needed.
+    - name: Create the per-run engine filter_plugins dir
+      ansible.builtin.file:
+        path: "{{ work }}/_engine/filter_plugins"
+        state: directory
+        mode: "0755"
+
+    - name: Copy the resolver into the immutable per-run engine dir
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/{{ resolver_rel }}"
+        dest: "{{ work }}/_engine/filter_plugins/lme_manifests.py"
+        mode: "0644"
+        remote_src: true
+
+    - name: sha256 of the copied resolver (engine evidence identity)
+      ansible.builtin.stat:
+        path: "{{ work }}/_engine/filter_plugins/lme_manifests.py"
+        checksum_algorithm: sha256
+      register: resolver_stat
+
+    - name: Publish engine evidence facts
+      ansible.builtin.set_fact:
+        engine_filter_dir: "{{ work }}/_engine/filter_plugins"
+        engine_resolver_sha256: "{{ resolver_stat.stat.checksum }}"
+
+    - name: Run each case
+      ansible.builtin.include_tasks: one_case.yml
+      loop: "{{ cases }}"
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }} ({{ case.kind }})"
+
+    - name: Vanish-guard -- every case appended EXACTLY one result (no silent drop)
+      # A case that matches no dispatch branch (e.g. requires_contract:false + kind !=
+      # static_scan) would append nothing and silently disappear from the gate. That is a
+      # fail-OPEN hole (codex-check-0015). This assert makes a missing verdict a hard error.
+      ansible.builtin.assert:
+        that:
+          - "(results | length) == (cases | length)"
+        fail_msg: >-
+          {{ (cases | length) - (results | length) }} case(s) produced NO verdict (silent vanish);
+          cases without a result:
+          {{ cases | map(attribute='name') | difference(results | map(attribute='case') | list) | list }}
+        success_msg: "vanish-guard: all {{ cases | length }} cases produced exactly one verdict"
+
+    - name: Compute verdict tallies
+      ansible.builtin.set_fact:
+        n_total: "{{ results | length }}"
+        n_pass: "{{ results | selectattr('verdict', 'equalto', 'PASS') | list | length }}"
+        n_queued: "{{ results | selectattr('verdict', 'equalto', 'QUEUED') | list | length }}"
+        n_hardfail: "{{ results | selectattr('verdict', 'in', hard_fail_verdicts) | list | length }}"
+
+    - name: Write results.yml (source-bound evidence identity)
+      ansible.builtin.copy:
+        dest: "{{ work }}/results.yml"
+        mode: "0644"
+        content: >-
+          {{ {'run_id': run_id, 'mode': mode, 'head': head_rev.stdout,
+              'worktree_dirty': (git_porcelain.stdout_lines | length > 0),
+              'contract_binding_status': contract_binding.status,
+              'contract_bound': contract_bound,
+              'toolchain': toolchain,
+              'entrypoints_sha256': entrypoints_sha256,
+              'head_entrypoint_blobs': head_entrypoint_blobs,
+              'engine_resolver_sha256': engine_resolver_sha256,
+              'authored_sha256': authored_sha256,
+              'tally': {'total': n_total, 'pass': n_pass, 'queued': n_queued, 'hard_fail': n_hardfail},
+              'results': results} | to_nice_yaml }}
+
+    - name: Update runs/LATEST pointer
+      ansible.builtin.copy:
+        dest: "{{ work_root }}/LATEST"
+        content: "{{ run_id }}\n"
+        mode: "0644"
+
+    - name: Summary line per case
+      ansible.builtin.debug:
+        msg: "{{ '%-44s %-18s %s' | format(item.case, item.kind, item.verdict) }}{{ (' queued_on=' ~ (item.queued_on | join(','))) if item.verdict == 'QUEUED' else '' }}"
+      loop: "{{ results }}"
+      loop_control: {label: "{{ item.case }}"}
+
+    - name: Tally line
+      ansible.builtin.debug:
+        msg: "mode={{ mode }} total={{ n_total }} pass={{ n_pass }} QUEUED={{ n_queued }} hard_fail={{ n_hardfail }} (results under {{ work }})"
+
+    - name: ACCEPTANCE gate -- zero QUEUED, every case at an expected-bound verdict
+      ansible.builtin.assert:
+        that:
+          - "results | rejectattr('verdict', 'in', expected_bound_verdicts) | list | length == 0"
+        fail_msg: >-
+          acceptance gate NOT satisfied; still-unresolved/off-expectation cases:
+          {{ results | rejectattr('verdict', 'in', expected_bound_verdicts) | map(attribute='case') | list }}
+        success_msg: "acceptance: all {{ n_total }} cases at expected verdict, 0 QUEUED"
+      when: mode == 'acceptance'
+
+    - name: DESIGN gate -- no hard failures (QUEUED tolerated + reported, never counted pass)
+      ansible.builtin.assert:
+        that:
+          - "n_hardfail | int == 0"
+        fail_msg: >-
+          design run has hard failures:
+          {{ results | selectattr('verdict', 'in', hard_fail_verdicts) | map(attribute='case') | list }}
+        success_msg: "design: {{ n_pass }} runnable-now PASS, {{ n_queued }} QUEUED on implementations, 0 hard failures"
+      when: mode != 'acceptance'

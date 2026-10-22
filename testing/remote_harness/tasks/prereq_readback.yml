@@ -1,0 +1,111 @@
+---
+# testing/remote_harness/tasks/prereq_readback.yml -- the ONE read-back predicate set of target_prereq.yml
+# (codex tick320 (2) PREREQ-DONE-READBACK; decl target_prereq.resume.done_ops). For every op named in tp_rb_ops the
+# ACTUAL target state is observed (no link followed) and compared with that op's exact end state; any drift REFUSES
+# and is preserved (never repaired, never re-marked, the journal is never trusted alone). Read-only. Used three ways:
+#   resume  after classifying a bound journal: its `done` ops, before any effect
+#   adopt   a journal-less campaign account: every op but storage_root (replaces the separate adoption assert)
+#   end     after the last op: every op of this member
+# End state per op (u / g = the journal-bound uid and the account's primary gid; COMPLETE metadata incl. gid):
+#   account         passwd entry: uid == u, the campaign GECOS / home / shell; a same-named group with gid == g;
+#                   hypervisor members: listed in the kvm group
+#   ssh_dir         the home: a real directory, uid u, mode home_mode_regex; <home>/.ssh: a real directory u:g dir_mode
+#   authorized_key  <home>/.ssh as above; authorized_keys: a regular file u:g file_mode, sha256 == the owner key line
+#   linger          <marker_dir>/<owner>: a regular root-owned file (no link)
+#   work_root       a real directory, mode owner_dir_mode, 0:0 until work_handover is done, u:g after
+#   work_children   every child: a real directory u:g owner_dir_mode
+#   work_handover   the work root u:g owner_dir_mode
+#   storage_root    a real directory u:g storage_mode (hypervisor members)
+# Inputs: tp, tp_ctl, tp_j (binding.uid), rh (this host), tp_rb_ops (list of op names), tp_rb_stage (resume | adopt |
+# end). Output: tp_rb {stage, ops, drift, observed}. tp_rb / tp_rb_ops / tp_rb_stage / _tp_rb_* join reserved_outputs
+# (C1 hunk).
+- name: Admit the read-back inputs (declared ops only; no default)
+  ansible.builtin.assert:
+    that:
+      - tp_rb_ops is sequence and tp_rb_ops is not string
+      - tp_rb_ops | reject('in', tp.journal.ops) | list | length == 0
+      - tp_rb_stage in ['resume', 'adopt', 'end']
+      - tp_j.binding.uid is not none
+    fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: prereq_readback.yml needs declared ops (got {{ tp_rb_ops | default('undefined') }}), a stage and a journal-bound uid."
+    quiet: true
+
+- name: Read back the account, its primary group and the kvm group
+  ansible.builtin.getent:
+    database: "{{ item.db }}"
+    key: "{{ item.key }}"
+    fail_key: false
+  loop:
+    - {db: passwd, key: "{{ tp_ctl.owner }}"}
+    - {db: group, key: "{{ tp_ctl.owner }}"}
+    - {db: group, key: "{{ tp.hypervisor.kvm_group }}"}
+  register: _tp_rb_ge
+
+- name: Read back every path an op owns (no link followed; the authorized_keys digest)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: "{{ item == tp_ctl.home ~ '/' ~ tp.authorized_keys.file_rel }}"
+    checksum_algorithm: sha256
+  loop: >-
+    {{ [tp_ctl.home, tp_ctl.home ~ '/' ~ tp.authorized_keys.dir_rel, tp_ctl.home ~ '/' ~ tp.authorized_keys.file_rel,
+        tp.linger.marker_dir ~ '/' ~ tp_ctl.owner, tp_ctl.work_root,
+        (rh.guest.allocation.storage_root if tp_ctl.hypervisor else tp_ctl.work_root)]
+       + (tp_ctl.children | map('regex_replace', '^', tp_ctl.work_root ~ '/') | list) }}
+  register: _tp_rb_st
+
+- name: Decide each named op against its exact end state (derived output)
+  ansible.builtin.set_fact:
+    tp_rb: >-
+      {%- set pw = _tp_rb_ge.results[0].ansible_facts.getent_passwd[tp_ctl.owner] -%}
+      {%- set gr = _tp_rb_ge.results[1].ansible_facts.getent_group[tp_ctl.owner] -%}
+      {%- set kv = _tp_rb_ge.results[2].ansible_facts.getent_group[tp.hypervisor.kvm_group] -%}
+      {%- set s = _tp_rb_st.results | map(attribute='stat') | list -%}
+      {%- set u = tp_j.binding.uid | int -%}
+      {%- set g = (pw[2] | int) if pw is not none else -1 -%}
+      {%- set home = s[0] -%}{%- set sd = s[1] -%}{%- set ak = s[2] -%}{%- set lg = s[3] -%}{%- set wr = s[4] -%}
+      {%- set sr = s[5] -%}{%- set ch = s[6:] -%}
+      {%- set ho = 'work_handover' in tp_rb_ops or (tp_j.ops.work_handover | default('pending')) == 'done' -%}
+      {%- set obs = namespace(m={}) -%}
+      {%- for r in _tp_rb_st.results -%}
+      {%- set obs.m = obs.m | combine({r.item: {'exists': r.stat.exists, 'isdir': r.stat.isdir | default(none),
+            'isreg': r.stat.isreg | default(none), 'islnk': r.stat.islnk | default(none), 'uid': r.stat.uid | default(none),
+            'gid': r.stat.gid | default(none), 'mode': r.stat.mode | default(none), 'checksum': r.stat.checksum | default(none)}}) -%}
+      {%- endfor -%}
+      {%- set a_ok = pw is not none and (pw[1] | int) == u and pw[tp.owner_account.passwd_fields.gecos] == tp.owner_account.gecos
+            and pw[tp.owner_account.passwd_fields.home] == tp_ctl.home and pw[tp.owner_account.passwd_fields.shell] == tp_ctl.shell
+            and gr is not none and (gr[1] | int) == g
+            and (not tp_ctl.hypervisor or (kv is not none and tp_ctl.owner in (kv[2] | default('')).split(','))) -%}
+      {%- set h_ok = home.exists and home.isdir and not home.islnk and home.uid == u and (home.mode is match(tp.owner_account.home_mode_regex)) -%}
+      {%- set sd_ok = h_ok and sd.exists and sd.isdir and not sd.islnk and sd.uid == u and sd.gid == g and sd.mode == tp.authorized_keys.dir_mode -%}
+      {%- set ak_ok = sd_ok and ak.exists and ak.isreg and not ak.islnk and ak.uid == u and ak.gid == g
+            and ak.mode == tp.authorized_keys.file_mode and ak.checksum == tp_ctl.authorized_sha256 -%}
+      {%- set lg_ok = lg.exists and lg.isreg and not lg.islnk and lg.uid == 0 -%}
+      {#- work_root: 0:0 before the handover, u:g after it; while the handover is STARTED (interrupted after the chown,
+          before its journal write) either is its exact end state -#}
+      {%- set hs = (tp_j.ops.work_handover | default('pending')) == 'started' and 'work_handover' not in tp_rb_ops -%}
+      {%- set wr_ok = wr.exists and wr.isdir and not wr.islnk and wr.mode == tp.layout.owner_dir_mode
+            and ((wr.uid == u and wr.gid == g) if ho
+                 else ((wr.uid == 0 and wr.gid == 0) or (hs and wr.uid == u and wr.gid == g))) -%}
+      {%- set ch_ok = (ch | rejectattr('exists') | list | length == 0) and (ch | selectattr('islnk') | list | length == 0)
+            and (ch | rejectattr('isdir') | list | length == 0) and (ch | rejectattr('uid', 'equalto', u) | list | length == 0)
+            and (ch | rejectattr('gid', 'equalto', g) | list | length == 0)
+            and (ch | rejectattr('mode', 'equalto', tp.layout.owner_dir_mode) | list | length == 0) -%}
+      {%- set hv_ok = wr.exists and wr.isdir and not wr.islnk and wr.uid == u and wr.gid == g and wr.mode == tp.layout.owner_dir_mode -%}
+      {%- set sr_ok = tp_ctl.hypervisor and sr.exists and sr.isdir and not sr.islnk and sr.uid == u and sr.gid == g
+            and sr.mode == tp.hypervisor.storage_mode -%}
+      {%- set res = {'account': a_ok, 'ssh_dir': sd_ok, 'authorized_key': ak_ok, 'linger': lg_ok, 'work_root': wr_ok,
+                     'work_children': ch_ok, 'work_handover': hv_ok, 'storage_root': sr_ok} -%}
+      {{ {'stage': tp_rb_stage, 'ops': tp_rb_ops,
+          'drift': tp_rb_ops | reject('in', res | dict2items | selectattr('value') | map(attribute='key') | list) | list,
+          'observed': {'passwd': pw, 'group': gr, 'kvm_member': (kv is not none and tp_ctl.owner in (kv[2] | default('')).split(',')),
+                       'paths': obs.m}} }}
+
+- name: Refuse drift of a done op (preserved; never repaired or re-marked)
+  ansible.builtin.assert:
+    that:
+      - tp_rb.drift | length == 0
+    fail_msg: >-
+      REFUSED {{ tp.refusal }}-DRIFT on {{ inventory_hostname }} ({{ tp_rb_stage }}): ops {{ tp_rb.drift }} are not in
+      their exact end state (observed {{ tp_rb.observed }}). The journal is not trusted over the target; nothing was
+      repaired or changed.
+    quiet: true

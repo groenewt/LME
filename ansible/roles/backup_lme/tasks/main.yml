@@ -1,6 +1,27 @@
 ---
 # Main tasks file for backup_lme role
 
+- name: Load the canonical backup-integrity declaration
+  # Single source (roles/backup_lme/vars/integrity.yml) shared with the restore
+  # verifier; the content-digest + bundle-certification shell is RENDERED from it
+  # via templates/content_integrity.sh.j2 (codex-0700 D-RECOVERY-REPRESENTATION-WRAPPER).
+  include_vars: integrity.yml
+
+- name: Validate backup-integrity path-name fields before any privileged path is built
+  # codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED: fail closed if any declared
+  # path-name field (root_dir/data_dir/manifest_file/bundle_file/payload paths) is not a
+  # single component. Runs before the library render and before any become:yes mutation.
+  # This is the module-reachable gate for the `file: state=absent` stale-cert deletion,
+  # which no shell library guard can cover.
+  ansible.builtin.include_tasks: assert_integrity_paths.yml
+
+- name: Render the shared content-integrity library once
+  # Render the macro ONCE into a fact; shell tasks then reference {{ lme_integrity_lib }}
+  # (a bare var) rather than inlining lookup('template', ...). Keeping the lookup out of
+  # the large shell scalars avoids Ansible split_args quote/jinja balance trips.
+  set_fact:
+    lme_integrity_lib: "{{ lookup('template', 'templates/content_integrity.sh.j2') }}"
+
 - name: Set backup timestamp
   set_fact:
     backup_timestamp: "{{ ansible_date_time.year }}-{{ ansible_date_time.month }}-{{ ansible_date_time.day }}_{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"
@@ -136,6 +157,42 @@
       when: (not lme_dir_check.stat.exists or not containers_file_check.stat.exists or lme_service_check.failed) and 
             (not skip_prompts | default(false) and validation_override is defined and validation_override.user_input | lower != 'yes')
 
+- name: Stat the target backup generation directory before creating anything
+  # codex-0945 D-BACKUP-PRIOR-GENERATION-DESTROYED-BEFORE-REPLACEMENT: backup_timestamp has
+  # MINUTE granularity, so a same-minute re-run (or an interrupted retry) would REUSE this
+  # directory, and the downstream stale-cert removal + `rm -rf data/` would destroy the
+  # prior recoverable generation BEFORE a verified replacement is durably admitted. Detect
+  # a pre-existing generation here, before any create/delete, and refuse below.
+  ansible.builtin.stat:
+    path: "{{ backup_base_dir }}/backups/{{ backup_timestamp }}"
+  register: lme_backup_generation_dir_stat
+  become: yes
+
+- name: Refuse to overwrite an existing backup generation directory (INTERIM preservation guard)
+  # INTERIM, bounded producer-local guard (codex-1030): it PRESERVES a prior generation by
+  # refusing to reuse its dir, but it does NOT by itself close the retry / mixed-generation /
+  # interrupted-recovery findings and does NOT SUPERSEDE codex-0845 or dissolve codex-0915.
+  # A timestamp + refuse-all cannot supply the three distinctions those require, which stay
+  # OPEN and are routed to B's generation/provenance contract plus D's consumer state
+  # transitions:
+  #   (a) a COMPLETED matching owned operation verifies + reuses its admitted result;
+  #   (b) an INCOMPLETE owned operation resumes from verified state under its declared identity;
+  #   (c) FOREIGN/conflicting/unknown state refuses without destructive adoption.
+  # This refuse implements only a coarse form of (c) for the whole generation dir, aligned with
+  # manifests/ledger/backup-generation.contract.yaml (committed_is_immutable). TOCTOU: this is
+  # a stat-then-create; a concurrent creator between the stat and the dir creation is NOT
+  # excluded here -- atomic op_id admission is B-owned and OPEN. Behavior change (recorded): a
+  # same-minute re-backup now REFUSES rather than overwriting.
+  ansible.builtin.fail:
+    msg: >-
+      Backup generation directory {{ backup_base_dir }}/backups/{{ backup_timestamp }}
+      already exists. Refusing to reuse it: overwriting would destroy a prior recoverable
+      generation before a verified replacement is admitted (codex-0945
+      D-BACKUP-PRIOR-GENERATION-DESTROYED-BEFORE-REPLACEMENT). Re-run in a later minute, or
+      let the backup-generation ledger mint a fresh bundle_dir/op_id.
+  when: lme_backup_generation_dir_stat.stat.exists
+  become: yes
+
 - name: Create backup directory if it doesn't exist
   file:
     path: "{{ backup_base_dir }}/backups"
@@ -149,7 +206,20 @@
     state: directory
     mode: '0755'
   become: yes
-  
+
+# codex-0845 D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE (cheap fail-closed part): a
+# date-based backup dir can be REUSED within the same minute. If a prior run left a
+# valid bundle_certification.txt and this run then fails or SKIPS the certify task,
+# the stale certificate would qualify a changed/incomplete bundle at restore. Remove
+# any pre-existing certificate up front so an uncertified new bundle is REFUSED (rc3)
+# rather than admitted on a stale certificate. (Backup generation/revision identity is
+# routed to B; this is only the stale-cert invalidation.)
+- name: Invalidate any stale bundle certification before writing a new backup
+  file:
+    path: "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.certification.bundle_file }}"
+    state: absent
+  become: yes
+
 - name: Create backup of LME installation
   shell: |
     # Create the backup directory structure
@@ -158,7 +228,7 @@
     mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/etc_containers_systemd"
     mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/etc_systemd_system_lme"
     mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/secrets"
-    mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes"
+    mkdir -p "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.volume_layout.root_dir }}"
     
     # Copy the LME installation
     {{ cp_preserve_cmd }} "{{ lme_install_dir }}/." "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/lme/"
@@ -497,7 +567,10 @@
 - name: Wait for containers to stop
   shell: |
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman ps --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "lme" || true
+    # Anchor to LME-owned containers (lme-* prefix). A bare lme substring match would
+    # treat a co-tenant container whose name merely contains lme as an LME container,
+    # poisoning the clean-stop data-safety signal derived from this result.
+    podman ps --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E '^lme-' || true
   args:
     executable: /bin/bash
   register: running_containers
@@ -514,7 +587,10 @@
   # Remove all stopped lme-* containers to give podman a clean slate on restart.
   shell: |
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    STALE=$(podman ps -a --filter name=lme --format "{{ '{{' }}.Names{{ '}}' }}" 2>/dev/null || true)
+    # Anchor to LME-owned containers (lme-* prefix). A bare name=lme filter is an
+    # unanchored substring match and would force-remove co-tenant containers whose
+    # name merely contains lme, destroying unrelated services on a shared host.
+    STALE=$(podman ps -a --format "{{ '{{' }}.Names{{ '}}' }}" 2>/dev/null | grep -E '^lme-' || true)
     if [ -n "$STALE" ]; then
       echo "$STALE" | xargs -r podman rm -f 2>/dev/null || true
     fi
@@ -523,34 +599,141 @@
   become: yes
   ignore_errors: yes
 
+- name: Record whether all LME containers stopped cleanly before the volume copy
+  # Data-safety gate. running_containers reflects the graceful stop/wait result BEFORE
+  # the force-remove above. If it is non-empty, containers were still running after the
+  # stop/wait window and were force-killed (crash-consistent) rather than stopped
+  # cleanly, so a volume copy taken now may be torn/inconsistent. Capture this signal
+  # so the run is never reported as a clean SUCCESS.
+  # Fail-safe: a clean stop is affirmative evidence only. A missing, undefined, or
+  # failed wait result is NOT proof of a clean stop -- it is treated as UNCLEAN so a
+  # swallowed error can never read as clean.
+  set_fact:
+    lme_backup_clean_container_stop: >-
+      {{ (running_containers is defined)
+         and (running_containers is not failed)
+         and (running_containers.stdout_lines is defined)
+         and ((running_containers.stdout_lines | length) == 0) }}
+    lme_backup_unclean_containers: "{{ running_containers.stdout_lines | default([]) }}"
+
 - name: Display any running containers
   debug:
     msg: "Warning: The following containers are still running and may not be backed up properly: {{ running_containers.stdout_lines }}"
   when: running_containers.stdout_lines | length > 0
-  
+
 - name: Backup each volume
   shell: |
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
+    {{ lme_integrity_lib }}
     VOLUME_PATH=$(podman volume inspect {{ item }} --format "{{ '{{' }}.Mountpoint{{ '}}' }}")
-    VOLUME_DIR="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes/{{ item }}"
-    
+    # $LME_VOLUME_ROOT/$LME_VOLUME_DATA_DIR/$LME_VOLUME_MANIFEST_FILE come from the sourced
+    # library (single source = vars/integrity.yml volume_layout), so the producer path and
+    # the restore/verify path can never drift and a name change relocates both.
+    VOLUME_DIR="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/$LME_VOLUME_ROOT/{{ item }}"
+
+    # Content manifest + torn-copy guard are provided by the shared rendered library
+    # (lme_write_content_manifest / lme_finalize_volume_backup) so the producer and the
+    # restore verifier can never drift and this task carries no hand-inlined digest
+    # shell. content_sha256 (file CONTENTS + symlink targets) is the NON-VACUOUS signal
+    # restore verifies; a same-size single-byte change changes it. The data dir and the
+    # manifest filename come from the declaration (LME_VOLUME_DATA_DIR / _MANIFEST_FILE).
+
+    # codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED (runtime, producer half):
+    # {{ item }} (a podman volume name) and backup_timestamp are Jinja-interpolated and
+    # could in principle carry a traversal, moving VOLUME_DIR out of the owned generation
+    # tree before the first mutation (this mkdir). Prove the volume name is a single
+    # component, that the generation root stays under backups/, and that VOLUME_DIR
+    # canonically stays under the generation root -- BEFORE any mkdir/rm. realpath -m is
+    # used because the generation tree may not exist yet; it still resolves any symlink in
+    # the existing prefix. These checks are explicit (no reliance on set -e).
+    case "{{ item }}" in
+      */* | "" | "." | "..")
+        echo "Refusing volume name with a path separator or traversal component: '{{ item }}'" >&2
+        exit 1 ;;
+    esac
+    _lme_backups_root="$(realpath -m -- "{{ backup_base_dir }}/backups")"
+    _lme_gen_root="$(realpath -m -- "{{ backup_base_dir }}/backups/{{ backup_timestamp }}")"
+    case "$_lme_gen_root/" in
+      "$_lme_backups_root"/*) : ;;
+      *) echo "Refusing generation root '$_lme_gen_root' outside '$_lme_backups_root' (bad backup_timestamp?)" >&2; exit 1 ;;
+    esac
+    _lme_vdir_rp="$(realpath -m -- "$VOLUME_DIR")"
+    case "$_lme_vdir_rp/" in
+      "$_lme_gen_root"/*) : ;;
+      *) echo "Refusing VOLUME_DIR '$_lme_vdir_rp' outside the owned generation root '$_lme_gen_root'" >&2; exit 1 ;;
+    esac
+
     # Create volume backup directory
     mkdir -p "$VOLUME_DIR"
-    
+
+    # Fail-closed: a real podman volume always resolves to a mountpoint directory.
+    # An empty/unresolved mountpoint means `podman volume inspect` failed -- do NOT let
+    # it fall through to the EMPTY branch, where it would be certified (0 files / 0 bytes
+    # manifest + EMPTY status) as a legitimately empty backup and later authorize
+    # destroying+recreating the live volume as empty at restore.
+    if [ -z "$VOLUME_PATH" ] || [ ! -d "$VOLUME_PATH" ]; then
+      echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+      echo "Failed to resolve mountpoint for volume {{ item }} (got '$VOLUME_PATH'); no manifest written"
+      exit 1
+    fi
+
     # Create a manifest of the volume contents
     echo "Volume: {{ item }}" > "$VOLUME_DIR/manifest.txt"
     echo "Location: $VOLUME_PATH" >> "$VOLUME_DIR/manifest.txt"
     echo "Backup Date: $(date)" >> "$VOLUME_DIR/manifest.txt"
     echo -e "\nContents:" >> "$VOLUME_DIR/manifest.txt"
     find "$VOLUME_PATH" -type f -o -type d | sort >> "$VOLUME_DIR/manifest.txt"
-    
+
+    # Distinguish a GENUINELY EMPTY source from a FAILED inspection: `[ "$(ls -A)" ]`
+    # alone treats an unreadable mountpoint (ls error, empty stdout) as empty and would
+    # certify an empty backup for a volume that actually has unreadable data. Capture the
+    # ls rc and fail closed on a non-zero enumeration.
+    SRC_ENTRIES="$(ls -A "$VOLUME_PATH" 2>/dev/null)"; LS_RC=$?
+    if [ "$LS_RC" -ne 0 ]; then
+      echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+      echo "Failed to enumerate volume {{ item }} mountpoint $VOLUME_PATH (ls rc=$LS_RC); no manifest written" >&2
+      exit 1
+    fi
+
     # Copy the volume contents
-    if [ -d "$VOLUME_PATH" ] && [ "$(ls -A $VOLUME_PATH)" ]; then
-      {{ cp_preserve_cmd }} "$VOLUME_PATH/." "$VOLUME_DIR/data/"
+    if [ -n "$SRC_ENTRIES" ]; then
+      # Clear any pre-existing data/ from a reused backup dir FIRST so cp writes a fresh
+      # copy of the CURRENT source (cp -a merges into an existing tree, which would let
+      # prior-generation since-deleted files survive and be certified as current).
+      # Fail-closed scope guard (codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED):
+      # prove the deletion target canonically resolves to $VOLUME_DIR/<data_dir> and nothing
+      # else before this privileged rm. (Generation-immutability already refuses a reused
+      # generation dir up front, so on a fresh run this data/ does not pre-exist; the guard
+      # is defense-in-depth against a symlinked/escaping target.)
+      lme_assert_deletion_scope "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" "$VOLUME_DIR" "$LME_VOLUME_DATA_DIR" || {
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} refused: data-dir deletion target failed the scope guard; no manifest written" >&2
+        exit 1
+      }
+      rm -rf "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
+      mkdir -p "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
+      # Outcome check (codex-1030): proving the target was in-scope does not prove the clear+
+      # create actually succeeded. Require the data dir to now exist AND be empty before cp.
+      if [ ! -d "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" ] || [ -n "$(ls -A "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" 2>/dev/null)" ]; then
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} clear/create outcome check failed (data dir missing or not empty after clear); no manifest written" >&2
+        exit 1
+      fi
+      {{ cp_preserve_cmd }} "$VOLUME_PATH/." "$VOLUME_DIR/$LME_VOLUME_DATA_DIR/"
       if [ $? -eq 0 ]; then
-        echo "SUCCESS" > "$VOLUME_DIR/backup_status.txt"
-        echo "Volume {{ item }} backed up successfully"
-        exit 0
+        # Write the SOURCE manifest and FAIL the volume (no manifest -> restore refuses)
+        # if the copied content digest differs from the source. A cp returning 0 can
+        # still be self-consistently torn; the library helper is the single source of
+        # this torn-copy guard, shared with restore.
+        if lme_finalize_volume_backup "$VOLUME_PATH" "$VOLUME_DIR"; then
+          echo "SUCCESS" > "$VOLUME_DIR/backup_status.txt"
+          echo "Volume {{ item }} backed up successfully"
+          exit 0
+        else
+          echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+          echo "Volume {{ item }} failed content-integrity finalize (torn/unreadable copy); no manifest written" >&2
+          exit 1
+        fi
       else
         echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
         echo "Failed to backup volume {{ item }}"
@@ -559,8 +742,35 @@
     else
       echo "EMPTY" > "$VOLUME_DIR/backup_status.txt"
       echo "Volume {{ item }} is empty, creating empty data directory"
-      mkdir -p "$VOLUME_DIR/data"
-      exit 0
+      # Clear any retained data from a reused backup dir so the empty manifest never
+      # certifies STALE payload from a prior generation as a successful empty backup.
+      # Fail-closed scope guard (codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED):
+      # same canonical-containment proof as the non-empty branch before this privileged rm.
+      lme_assert_deletion_scope "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" "$VOLUME_DIR" "$LME_VOLUME_DATA_DIR" || {
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} refused: data-dir deletion target failed the scope guard; no manifest written" >&2
+        exit 1
+      }
+      rm -rf "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
+      mkdir -p "$VOLUME_DIR/$LME_VOLUME_DATA_DIR"
+      # Outcome check (codex-1030): the data dir must now exist AND be empty before the
+      # empty-manifest write, proving the clear+create actually took effect.
+      if [ ! -d "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" ] || [ -n "$(ls -A "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" 2>/dev/null)" ]; then
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} clear/create outcome check failed (empty branch); no manifest written" >&2
+        exit 1
+      fi
+      # Empty volume: manifest over the (empty) data dir records 0 files / 0 bytes,
+      # so restore verifies expected-empty instead of treating empty as torn. Fail the
+      # volume (no manifest) if even that manifest cannot be written.
+      if lme_write_content_manifest "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" "$VOLUME_DIR/$LME_VOLUME_MANIFEST_FILE"; then
+        exit 0
+      else
+        rm -f "$VOLUME_DIR/$LME_VOLUME_MANIFEST_FILE"
+        echo "FAILED" > "$VOLUME_DIR/backup_status.txt"
+        echo "Volume {{ item }} empty-manifest write failed; no manifest written" >&2
+        exit 1
+      fi
     fi
   args:
     executable: /bin/bash
@@ -572,7 +782,7 @@
 
 - name: Collect volume backup statuses
   shell: |
-    find "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes" -name "backup_status.txt" -exec cat {} \; | grep -c -E "(SUCCESS|EMPTY)" || echo "0"
+    find "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.volume_layout.root_dir }}" -name "backup_status.txt" -exec cat {} \; | grep -c -E "(SUCCESS|EMPTY)" || echo "0"
   args:
     executable: /bin/bash
   register: successful_volumes
@@ -588,7 +798,7 @@
 
 - name: Find volumes that were empty during backup
   shell: |
-    find "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/volumes" -name "backup_status.txt" -exec grep -l "EMPTY" {} \; | xargs -I {} dirname {} | xargs -I {} basename {}
+    find "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.volume_layout.root_dir }}" -name "backup_status.txt" -exec grep -l "EMPTY" {} \; | xargs -I {} dirname {} | xargs -I {} basename {}
   args:
     executable: /bin/bash
   register: empty_volumes
@@ -666,13 +876,60 @@
       - Quadlet files: {{ 'SUCCESS' if lme_backup_result is success else 'FAILED' }}
       - Host systemd units: {{ 'SUCCESS' if lme_systemd_units_backup_result is defined and lme_systemd_units_backup_result is success else ('SKIPPED' if lme_systemd_units_backup_result is not defined else 'FAILED') }}
       - Secret manifest: {{ 'SUCCESS' if secret_mapping_result is defined and secret_mapping_result is success else 'FAILED' }}
+      - Containers stopped cleanly before copy: {{ 'YES' if lme_backup_clean_container_stop | default(false) | bool else ('NO - volume copy may be torn/inconsistent (' ~ (lme_backup_unclean_containers | default([]) | join(', ')) ~ ')') }}
       - Volumes: {{ successful_volumes.stdout | int }} of {{ lme_backup_selected_volumes | length }} successful
       - Failed volumes: {{ volume_backup.results | default([]) | selectattr('failed', 'eq', true) | map(attribute='item') | list | join(', ') if volume_backup.results is defined and (volume_backup.results | selectattr('failed', 'eq', true) | list | length > 0) else 'None' }}
       - Service restart: {{ 'SKIPPED - Services left stopped for rollback' if skip_service_restart | default(false) else ('SUCCESS' if service_start_result is success and started_containers.stdout_lines | length > 0 else 'FAILED') }}
-      
-      Overall status: {{ 'SUCCESS' if lme_backup_result is success and successful_volumes.stdout | int == lme_backup_selected_volumes | length else 'PARTIAL - See details above' }}
+
+      Overall status: {{ 'UNSAFE - containers did not stop before the volume copy; backup may be torn/inconsistent and must not be trusted for restore' if not (lme_backup_clean_container_stop | default(false) | bool) else ('SUCCESS' if lme_backup_result is success and successful_volumes.stdout | int == lme_backup_selected_volumes | length else 'PARTIAL - See details above') }}
   become: yes
   
+- name: Certify the backup bundle (content-digest integrity)
+  # BACKUP-MANIFEST-CERTIFICATION producer (codex-0700). Renders the canonical
+  # integrity library (single source shared with restore) and writes
+  # bundle_certification.txt = per-payload content digests + a self-consistency
+  # bundle_sha256. GATED so a PARTIAL/UNCLEAN bundle is NEVER certified: the
+  # install/vault/quadlet copy, the secret manifest and every volume must have
+  # succeeded AND the containers must have stopped cleanly. An uncertified bundle
+  # is REFUSED at restore (fail-closed), never restored on listing_sha256 alone.
+  # NOTE: bundle_sha256 is self-consistency only (detects torn/accidental
+  # truncation); adversarial under-declaration needs the OPEN external anchor
+  # (C1 expected-set / B ledger) or the UNWIRED guardian signature -- so
+  # BACKUP-MANIFEST-CERTIFICATION is PARTIAL, not closed.
+  shell: |
+    set -euo pipefail
+    {{ lme_integrity_lib }}
+    lme_bundle_certify "{{ backup_base_dir }}/backups/{{ backup_timestamp }}"
+  args:
+    executable: /bin/bash
+  become: yes
+  register: lme_bundle_cert_result
+  when:
+    - lme_backup_result is success
+    - secret_mapping_result is defined and secret_mapping_result is success
+    - (lme_systemd_units_backup_result is not defined) or (lme_systemd_units_backup_result is success)
+    - lme_backup_clean_container_stop | default(false) | bool
+    - (volume_backup.results is not defined) or ((volume_backup.results | selectattr('failed', 'eq', true) | list | length) == 0)
+
+# codex-0845 D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE: the status file above is
+# written BEFORE certification runs, so record the certification outcome afterward.
+# An uncertified backup CANNOT be restored (restore refuses rc3), so the status must
+# say so explicitly rather than reading SUCCESS while no certificate exists.
+- name: Record bundle certification outcome in the backup status
+  shell: |
+    set -euo pipefail
+    S="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/backup_status.txt"
+    C="{{ backup_base_dir }}/backups/{{ backup_timestamp }}/{{ lme_backup_integrity.certification.bundle_file }}"
+    if [ -f "$C" ]; then
+      echo "- Bundle certification: PRESENT ($C) -- restorable" >> "$S"
+    else
+      echo "- Bundle certification: ABSENT -- UNCERTIFIED, restore will REFUSE this bundle (rc3); take a new backup" >> "$S"
+    fi
+  args:
+    executable: /bin/bash
+  become: yes
+  changed_when: false
+
 - name: Read final backup status
   command: cat "{{ backup_base_dir }}/backups/{{ backup_timestamp }}/backup_status.txt"
   register: final_status
@@ -681,4 +938,43 @@
   
 - name: Backup summary
   debug:
-    msg: "{{ (final_status.stdout + '\n\nBackup location: ' + backup_base_dir + '/backups/' + backup_timestamp).splitlines() }}" 
+    msg: "{{ (final_status.stdout + '\n\nBackup location: ' + backup_base_dir + '/backups/' + backup_timestamp).splitlines() }}"
+
+- name: Fail the backup when containers did not stop cleanly (data-safety gate)
+  # Durability domain: a volume copy taken while a data-store container (Postgres/ES)
+  # was still running (then force-killed) is at best crash-consistent and may be torn.
+  # backup_status.txt has already been written above (Overall status: UNSAFE) and the
+  # summary printed, so the evidence is durable. Now fail the run so this backup is
+  # never reported as a clean success to callers -- notably rollback_lme.yml, which
+  # gates its destructive 'rm -rf /opt/lme' on the safety backup succeeding. Override
+  # with backup_fail_on_unclean_stop=false only when a non-LME container legitimately
+  # matches the 'lme' name filter.
+  fail:
+    msg: >-
+      Backup is UNSAFE: container(s) [{{ lme_backup_unclean_containers | default([]) | join(', ') }}]
+      were still running after the stop/wait window and were force-removed, so the volume
+      copy may be torn/inconsistent. See backup_status.txt (Overall status: UNSAFE) at
+      {{ backup_base_dir }}/backups/{{ backup_timestamp }}. Resolve the stuck containers and
+      re-run, or set backup_fail_on_unclean_stop=false to proceed anyway at your own risk.
+  when:
+    - not (lme_backup_clean_container_stop | default(false) | bool)
+    - backup_fail_on_unclean_stop | default(true) | bool
+
+- name: Fail the backup when the bundle was not certified (integrity gate, NO override)
+  # codex-0845 D-BACKUP-RETRY-AND-OLD-CERTIFICATE-STATE: the certify task is SKIPPED
+  # when any upstream payload failed (secret manifest, a systemd-unit copy, a volume,
+  # or an unclean container stop). An uncertified bundle is UNRESTORABLE -- restore
+  # refuses it (rc3). Without this gate the play would still report success and a
+  # consumer (rollback_lme.yml gates its destructive rm -rf /opt/lme on the safety
+  # backup succeeding) would proceed on an unrestorable backup. Fail closed with NO
+  # override variable (no-ignore-integrity-switch). The unclean-stop gate above may fire
+  # first for that specific cause; this catches every other skip reason.
+  fail:
+    msg: >-
+      Backup bundle was NOT certified (the certification step was skipped because an
+      upstream payload failed). This backup is UNRESTORABLE -- restore refuses an
+      uncertified bundle (rc3). See backup_status.txt at
+      {{ backup_base_dir }}/backups/{{ backup_timestamp }}. Resolve the failed payload and
+      re-run; there is no override.
+  when:
+    - lme_bundle_cert_result is skipped

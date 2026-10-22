@@ -1,0 +1,57 @@
+---
+# testing/remote_harness/controller.yml -- the first route playbook after the seed; runs ONLY under the managed
+# generation of the declared root (tasks/resolve_harness.yml refuses any other executor).
+#
+# Accessible bootstrap (SEED-08), three steps, no hand-reconstructed environment:
+#   0. ansible-playbook -i <inventory> testing/remote_harness/acquire.yml            (MAIN; declared builder; pinned)
+#   1. ansible-playbook -i <inventory> testing/remote_harness/package.yml            (declared builder; admit, render)
+#   (Steps 0-1 are genesis stages: launched ONLY through controller.bootstrap.genesis.launch -- env -i with its declared
+#   pairs, -e <stage_root.act.var>=<act> -- in their own act stage root; the bare form above is shorthand.)
+#   Steps 2-4 launch the seed ONLY through the bundle's generated launcher <bundle>/lme-seed-launch.sh
+#   (controller.bootstrap.seed_launcher.caller_argv; bundle.launcher_file), which execs controller.bootstrap.seed_launch
+#   (argv, env, mode_args): /usr/bin/env -i PATH=<base_env.PATH> LC_ALL=<base_env.LC_ALL> HOME=<the invoker's passwd
+#   home> [SSH_AUTH_SOCK=<socket>, agent mode only] <bundle>/lme-controller-seed.sh <mode> --root <owned root>
+#   <mode_args>; no runtime dir or bus is passed (the seed derives them); an ambient shell launch of the seed refuses
+#   RH-SEED-USAGE. The launcher is invoked by its absolute path from any environment.
+#   2. <bundle>/lme-seed-launch.sh apply <owned root>                                   (unprivileged, offline)
+#   3. <bundle>/lme-seed-launch.sh run <owned root> <ssh auth mode> -i <inventory> testing/remote_harness/controller.yml
+#      (the ssh auth mode has no default even for a localhost-only run: controller.bootstrap.ssh_auth)
+#   4. same `run`, testing/remote_harness/target_bootstrap.yml: the same bundle applied on the declared target group
+# The inventory gives localhost (ansible_connection=local) the host vars lme_toolchain_root=<owned root> and
+# lme_toolchain_owner=<account> (profile controller.bootstrap.inventory; no default; the same vars every target
+# host carries) and, for step 1, rh_artifact_source / rh_bundle_dir.
+#
+# What it does (writes only <owned root>/check):
+#   - refuses pre-supplied derived outputs, resolves the harness policy through the engine;
+#   - verifies the receipt of the declared root against a FRESH render of the declarations (expected seed sha256
+#     and generation id derived independently; custody, ancestry, tree metadata, confined content manifest);
+#   - binds the running executor, ANSIBLE_CONFIG and ANSIBLE_COLLECTIONS_PATH to that receipt;
+#   - records a controller receipt.
+- name: Managed controller -- verify the seed-installed toolchain through itself
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
+
+    - name: Bind the effective controller connection before any effect (local, localhost, no become; r3g)
+      ansible.builtin.include_tasks: tasks/admit_controller.yml
+
+    - name: Resolve the harness policy, verify the receipt and bind the executor
+      ansible.builtin.include_tasks: tasks/resolve_harness.yml
+
+    - name: Record the controller receipt (owned check directory only)
+      ansible.builtin.copy:
+        dest: "{{ rh_owned_root }}/{{ rh.controller.bootstrap.layout.check_dir }}/controller-receipt.{{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}.json"
+        mode: '0600'
+        content: >-
+          {{ {'schema': 'lme-controller-receipt/v2',
+              'toolchain': rh_controller_toolchain,
+              'expected': rh_tc_expected,
+              'executor': {'ansible_core': ansible_version.full, 'python': ansible_playbook_python},
+              'profile_sha256': rh_profile_sha256,
+              'config_revision': rh_config_revision,
+              'engine_revision': rh_engine_revision,
+              'lock_sha256': lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ rh.controller.lock_file_rel) | hash('sha256')} | to_nice_json }}

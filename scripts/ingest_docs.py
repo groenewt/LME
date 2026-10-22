@@ -7,12 +7,14 @@ nomic-embed-text via lme-embeddings, and stores in pgvector for RAG.
 
 Usage (run inside the lme podman network):
     podman run --rm --network lme \\
-      -e PGVECTOR_PASS=<secret> \\
       -v $(pwd)/scripts:/scripts:z \\
+      --mount type=bind,src=/path/to/postgresql-client-bundle,dst=/run/secrets/postgresql,ro \\
       -v /tmp/lme-docs-repo:/repo:z \\
       python:3.11-slim bash -c "pip install -q requests beautifulsoup4 markdownify psycopg2-binary pgvector lxml && python /scripts/ingest_docs.py --reset --docs-repo /repo"
 
-    --reset      : drop and recreate the docs_chunks table before ingesting
+    The client bundle must contain ca.crt, tls.crt, tls.key, and .pgpass.
+
+    --reset      : delete existing docs_chunks rows before ingesting
     --docs-repo  : path to a git clone of cisagov/lme-docs (reads docs/*.md)
     --source-dir : path to pre-scraped index.tsv + page_NNNN.html (offline)
 """
@@ -33,12 +35,38 @@ from markdownify import markdownify as md
 BASE_URL      = "https://cisagov.github.io/lme-docs/"
 EMBED_URL     = os.getenv("EMBED_URL",     "https://lme-embeddings:8081")
 EMBED_DIMS    = 768
+EMBEDDINGS_SSL_VERIFY = os.getenv("EMBEDDINGS_SSL_VERIFY", "true")
+EMBEDDINGS_CA_CERT = os.getenv("EMBEDDINGS_CA_CERT", "/certs/ca/embeddings-ca.crt")
+_TLS_TRUTHY = {"1", "true", "yes", "on"}
+_TLS_FALSY = {"0", "false", "no", "off"}
 
-PG_HOST       = os.getenv("PGVECTOR_HOST", "lme-pgvector")
+
+def _strict_bool(name, raw) -> bool:
+    value = str(raw).strip().lower()
+    if value in _TLS_TRUTHY:
+        return True
+    if value in _TLS_FALSY:
+        return False
+    raise ValueError(
+        f"{name} must be one of true/false, 1/0, yes/no, or on/off; got {raw!r}"
+    )
+
+
+EMBEDDINGS_VERIFY = (
+    EMBEDDINGS_CA_CERT
+    if _strict_bool("EMBEDDINGS_SSL_VERIFY", EMBEDDINGS_SSL_VERIFY)
+    else False
+)
+
+PG_HOST       = os.getenv("PGVECTOR_HOST", "pg-vector-rw")
 PG_PORT       = int(os.getenv("PGVECTOR_PORT", "5432"))
 PG_DB         = os.getenv("PGVECTOR_DB",   "lme_vectors")
-PG_USER       = os.getenv("PGVECTOR_USER", "lme")
-PG_PASS       = os.getenv("PGVECTOR_PASS", "")
+PG_USER       = os.getenv("PGVECTOR_USER", "lme_vectors_app")
+PG_SSLMODE    = os.getenv("PGVECTOR_SSLMODE", "verify-full")
+PG_SSLROOTCERT = os.getenv("PGVECTOR_SSLROOTCERT", "/run/secrets/postgresql/ca.crt")
+PG_SSLCERT    = os.getenv("PGVECTOR_SSLCERT", "/run/secrets/postgresql/tls.crt")
+PG_SSLKEY     = os.getenv("PGVECTOR_SSLKEY", "/run/secrets/postgresql/tls.key")
+PG_PASSFILE   = os.getenv("PGVECTOR_PASSFILE", "/run/secrets/postgresql/.pgpass")
 
 # Chunking config
 CHUNK_SIZE     = 1200  # target characters per chunk
@@ -49,19 +77,42 @@ REQUEST_DELAY  = 0.3   # seconds between HTTP requests (be polite)
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
+def _pg_connection_kwargs(validate_files: bool = True) -> dict:
+    if PG_SSLMODE != "verify-full":
+        raise RuntimeError("PGVECTOR_SSLMODE must be exactly 'verify-full'")
+    files = {
+        "PGVECTOR_SSLROOTCERT": PG_SSLROOTCERT,
+        "PGVECTOR_SSLCERT": PG_SSLCERT,
+        "PGVECTOR_SSLKEY": PG_SSLKEY,
+        "PGVECTOR_PASSFILE": PG_PASSFILE,
+    }
+    if validate_files:
+        for name, path in files.items():
+            if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                raise RuntimeError(f"{name} is missing or unreadable: {path}")
+        for name in ("PGVECTOR_SSLKEY", "PGVECTOR_PASSFILE"):
+            if os.stat(files[name]).st_mode & 0o077:
+                raise RuntimeError(f"{name} must not be accessible by group or other: {files[name]}")
+    return {
+        "host": PG_HOST,
+        "port": PG_PORT,
+        "dbname": PG_DB,
+        "user": PG_USER,
+        "sslmode": PG_SSLMODE,
+        "sslrootcert": PG_SSLROOTCERT,
+        "sslcert": PG_SSLCERT,
+        "sslkey": PG_SSLKEY,
+        "passfile": PG_PASSFILE,
+    }
+
+
 def get_conn():
-    return psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, dbname=PG_DB,
-        user=PG_USER, password=PG_PASS
-    )
+    return psycopg2.connect(**_pg_connection_kwargs())
 
 
 def setup_db(conn, reset: bool = False):
     with conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        if reset:
-            cur.execute("DROP TABLE IF EXISTS docs_chunks;")
-            print("  Dropped existing docs_chunks table.")
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS docs_chunks (
                 id          SERIAL PRIMARY KEY,
@@ -74,6 +125,9 @@ def setup_db(conn, reset: bool = False):
                 created_at  TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+        if reset:
+            cur.execute("DELETE FROM docs_chunks;")
+            print("  Deleted existing docs_chunks rows (schema and sequences preserved).")
         cur.execute("""
             CREATE INDEX IF NOT EXISTS docs_chunks_embedding_idx
             ON docs_chunks
@@ -421,7 +475,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         f"{EMBED_URL}/v1/embeddings",
         json={"model": "nomic-embed-text", "input": texts},
         timeout=120,
-        verify=False,
+        verify=EMBEDDINGS_VERIFY,
     )
     resp.raise_for_status()
     data = resp.json()["data"]
@@ -510,7 +564,7 @@ def ingest(reset: bool = False, source_dir: str | None = None,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest LME docs into pgvector")
     parser.add_argument("--reset", action="store_true",
-                        help="Drop and recreate the docs_chunks table first")
+                        help="Delete existing docs_chunks rows first")
     parser.add_argument("--docs-repo", default=None,
                         help="Path to a git clone of cisagov/lme-docs. "
                              "Reads docs/*.md directly — no web scraping needed. "

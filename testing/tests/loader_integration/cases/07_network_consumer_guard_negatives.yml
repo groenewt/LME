@@ -1,0 +1,84 @@
+# testing/tests/loader_integration/cases/07_network_consumer_guard_negatives.yml
+#
+# NETWORK/CONSUMER guard-classification negatives routed to G by C (T-1). These are
+# STATE-classification invariants: a guard must decide restart-vs-refuse from the ACTUAL
+# service/daemon state (a systemd ActiveState WORD, a tailscale BackendState), never from a
+# proxy that lies -- a zero exit code, a rc that means "absent", or a serve/ingress config
+# that says "up" while the daemon is logged out.
+#
+# None is engine-testable now: each needs C's distribute_ca / tailscale / consumer role plus a
+# lab VM whose systemd + tailscaled can be driven into the adverse state. They are therefore
+# QUEUED on C + a lab VM, fail-closed (codex-check-0015): a documented typed obstruction NEVER
+# counts as a completed acceptance. Authored here against the DOCUMENTED guard surface C named
+# in T-1; C supplies the fix and the lab exercise.
+#
+# No secret VALUES appear here (service/daemon-state identities + synthetic fixtures only).
+
+schema_version: 1
+cases:
+  # --- distribute_ca restart gate (C T-1 item 1): restart ONLY when a CA change actually
+  #     requires it, and REFUSE to bounce a co-enabled, already-active service needlessly ----
+  - name: distribute-ca-co-enabled-active-service-is-not-restarted
+    kind: security_probe
+    requires_contract: false
+    queued_on: [C]
+    environment: lab VM
+    spec_only: true       # needs C's distribute_ca role + a co-enabled active service on a lab VM
+    invariant_task: >-
+      distribute_ca gate: when the CA-consuming service is co-enabled AND already ACTIVE and the
+      CA material did NOT change, the guard does NOT restart it (no needless bounce) and REFUSES
+      a restart that is not warranted by an actual CA change
+    fail_msg: >-
+      distribute_ca REGRESSION: a co-enabled, already-active service was restarted with no CA
+      change (a needless bounce -- the guard treated presence/enablement as a restart trigger
+      instead of gating on an actual CA-material change)
+
+  - name: distribute-ca-only-change-on-active-service-does-restart
+    kind: security_probe
+    requires_contract: false
+    queued_on: [C]
+    environment: lab VM
+    spec_only: true
+    invariant_task: >-
+      distribute_ca gate (companion): when ONLY the CA material changed on an ACTIVE service,
+      the guard DOES restart it -- a real CA rotation must be picked up, so the gate is not
+      inertly refuse-always; restart is warranted here and must fire
+    fail_msg: >-
+      distribute_ca REGRESSION: a genuine CA-material change on an active service did NOT trigger
+      a restart (the service kept serving the stale CA -- the gate over-suppressed restarts)
+
+  # --- systemctl absent-unit classification (C T-1 item 2): classify on the ActiveState WORD,
+  #     not the rc -- `systemctl is-active <absent-unit>` exits rc=4 with output 'inactive' ----
+  - name: systemctl-absent-unit-classified-by-activestate-word-not-rc
+    kind: security_probe
+    requires_contract: false
+    queued_on: [C]
+    environment: lab VM
+    spec_only: true       # needs a lab VM to present an absent/unknown unit to the guard
+    invariant_task: >-
+      state-classification: the service-state guard decides active/inactive from the ActiveState
+      WORD (stdout, e.g. 'active'/'inactive'/'unknown'), NOT from the command rc -- an ABSENT
+      unit makes `systemctl is-active` exit rc=4 while printing 'inactive'/'unknown', which must
+      classify as NOT-active (not as an error that masks the real state)
+    fail_msg: >-
+      state-classification REGRESSION: the guard branched on the systemctl rc (rc=4 for an absent
+      unit) instead of the ActiveState word, so an absent unit was misclassified (an rc-driven
+      guard reads a 'unit not found' the same as a real failure -- classify by the state word)
+
+  # --- tailscale logged-out classification (C T-1 item 3): `tailscale status --json` exits 0
+  #     even when logged OUT, so liveness must read BackendState == Running, not the exit code --
+  - name: tailscale-logged-out-classified-by-backendstate-not-exit-code
+    kind: security_probe
+    requires_contract: false
+    queued_on: [C]
+    environment: tailnet
+    spec_only: true       # needs a lab VM/tailnet node that can be driven logged-out
+    invariant_task: >-
+      state-classification: tailnet liveness reads BackendState == 'Running' from
+      `tailscale status --json`, NOT the command exit code -- the command exits 0 even when the
+      node is LOGGED OUT (BackendState 'NeedsLogin'/'Stopped'), so a logged-out node must
+      classify as NOT-live (no advertising a VIP/serve as up while the backend is down)
+    fail_msg: >-
+      tailscale liveness REGRESSION: liveness trusted the `tailscale status --json` exit 0 and
+      reported the node live while BackendState != 'Running' (logged out) -- a silent-dead node
+      advertised as up (mirrors the silent-dead-VIP false-success pattern)

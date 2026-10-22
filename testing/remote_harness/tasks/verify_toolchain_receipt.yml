@@ -1,0 +1,252 @@
+---
+# testing/remote_harness/tasks/verify_toolchain_receipt.yml -- read-only verification of a toolchain receipt
+# produced by lme-controller-seed.sh (profile controller.bootstrap.consumer_verification; SEED-04).
+#
+# Runs on whichever host the including play targets (controller or target role; no host-name branch) ONLY AS THE
+# DECLARED OWNER (SEED2-MANIFEST-READ-CUSTODY: the reading uid must equal the root's uid, so a link planted by the
+# owner can never make it read what the owner could not read anyway; root is refused). It stats, reads and digests,
+# writes nothing and never executes a toolchain file. Every traversed component -- root ancestry, generations/,
+# the generation dir, receipts/ -- and every file read (incl. tree.sha256 and tree.list) is admitted (no link,
+# owner-owned, not group/other-writable) BEFORE the first read. Requires, earlier in the play:
+# tasks/refuse_pinned_outputs.yml (rh_repo_root) and tasks/resolve_policy.yml (rh, rh_seed_lock).
+#
+# Inputs (no defaults): rh_tc_root, rh_tc_owner -- the host's lme_toolchain_root / lme_toolchain_owner; rh_tc_role --
+# the recipe role (codex-tick853; builder | test), passed through to derive_toolchain_generation.yml, whose rh_tc_recipe
+# every recipe comparison below reads.
+# Output: rh_toolchain (the verified receipt) and rh_tc_expected (the independently derived identity).
+#
+# INDEPENDENT EXPECTATION: the expected seed sha256 and generation id are derived HERE from a fresh render of
+# the declarations (lookup template, byte-identical to package.yml's render), never read from the receipt; every
+# path is derived from the declared root. OWNER TRUST (bs.owner_trust): the owner is the code authority for its
+# root; this proves consistency with the declarations, not provenance against the owner. Residual window: the
+# owner can change files between these reads and any later use; privileged consumers must not execute toolchain
+# files as root.
+
+- name: Admit the declared root and owner with the ONE path-admission rule (no default)
+  ansible.builtin.assert:
+    that:
+      # op1l (codex 924; no-exemption): both REQUIRED inputs (header :13 "Inputs (no defaults)") are tested by membership
+      # in vars before they are read
+      - "'rh_tc_root' in vars and rh_tc_root is string"
+      - rh_tc_root is match(rh.controller.bootstrap.path_admission.regex)
+      - rh_tc_root is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+      - "'rh_tc_owner' in vars and rh_tc_owner is string"
+      - rh_tc_owner is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: >-
+      REFUSED RH-TOOLCHAIN-RECEIPT: {{ rh.controller.bootstrap.inventory.root_var }} (present {{ ('rh_tc_root' in vars) | to_json }}{% if 'rh_tc_root' in vars %}: {{ rh_tc_root }}{% endif %}) must be a normalized absolute
+      path matching {{ rh.controller.bootstrap.path_admission.regex }} and {{ rh.controller.bootstrap.inventory.owner_var }}
+      (present {{ ('rh_tc_owner' in vars) | to_json }}{% if 'rh_tc_owner' in vars %}: {{ rh_tc_owner }}{% endif %}) an account name; both are inventory host vars, required.
+    quiet: true
+
+- name: Derive the expected seed sha256, generation id and directory (the ONE shared recipe; never from the receipt)
+  ansible.builtin.include_tasks: derive_toolchain_generation.yml
+
+- name: Read the reading uid with the declared tool (owner-read boundary)
+  ansible.builtin.command:
+    argv: ["{{ rh.controller.bootstrap.os_tools.id.path }}", -u]
+  register: _rh_tc_uid
+  changed_when: false
+
+- name: Admit the root's ancestry by the ONE resolved rule (path_admission.ancestry incl. owner_private_group; tasks/admit_ancestry.yml)
+  ansible.builtin.include_tasks: admit_ancestry.yml
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ rh_tc_root }}"
+    rh_anc_refusal: RH-TOOLCHAIN-RECEIPT
+
+- name: Stat the root and every ancestor (no link, owner 0 or the owner, not other-writable; group-writable only as admitted above)
+  ansible.builtin.stat:
+    path: "{{ '/' ~ (rh_tc_root.split('/')[1:item] | join('/')) }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ range(1, (rh_tc_root.split('/') | length) + 1) | list }}"
+  register: _rh_tc_anc
+
+- name: Refuse a root with linked, foreign-owned or group/other-writable ancestry
+  ansible.builtin.assert:
+    that:
+      - _rh_tc_anc.results | map(attribute='stat') | selectattr('exists') | list | length == _rh_tc_anc.results | length
+      - _rh_tc_anc.results | map(attribute='stat') | selectattr('islnk') | list | length == 0
+      - _rh_tc_anc.results | map(attribute='stat') | selectattr('isdir') | list | length == _rh_tc_anc.results | length
+      - _rh_tc_anc.results | map(attribute='stat') | selectattr('wgrp') | map(attribute='path') | reject('in', rh_anc_admitted_private_groups) | list | length == 0
+      - _rh_tc_anc.results | map(attribute='stat') | selectattr('woth') | list | length == 0
+      - (_rh_tc_anc.results | map(attribute='stat') | map(attribute='uid') | unique | reject('in', [0, _rh_tc_anc.results[-1].stat.uid]) | list) == []
+      - _rh_tc_anc.results[-1].stat.pw_name == rh_tc_owner
+      - _rh_tc_anc.results[-1].stat.mode == '0700'
+      - _rh_tc_uid.stdout | int == _rh_tc_anc.results[-1].stat.uid
+    fail_msg: >-
+      REFUSED RH-TOOLCHAIN-RECEIPT: {{ rh_tc_root }} or an ancestor is missing, a link, not a directory, group/other-writable (sticky directories
+      are not excepted), owned by another account, or the root is not {{ rh_tc_owner }} mode 0700; or this verifier
+      runs as uid {{ _rh_tc_uid.stdout }} instead of the root's owner (owner-read only; root is refused).
+    quiet: true
+
+- name: Stat every traversed descendant directory (generations/, the generation, receipts/) before any read
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop:
+    - "{{ rh_tc_root }}/{{ rh.controller.bootstrap.layout.generations_dir }}"
+    - "{{ _rh_tc_gen }}"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.receipts_dir }}"
+  register: _rh_tc_desc
+
+- name: Refuse linked, foreign-owned or group/other-writable descendant directories
+  ansible.builtin.assert:
+    that:
+      - _rh_tc_desc.results | map(attribute='stat') | selectattr('exists') | selectattr('isdir') | list | length == 3
+      - _rh_tc_desc.results | map(attribute='stat') | selectattr('islnk') | list | length == 0
+      - _rh_tc_desc.results | map(attribute='stat') | map(attribute='uid') | unique | list == [_rh_tc_anc.results[-1].stat.uid]
+      - _rh_tc_desc.results | map(attribute='stat') | selectattr('wgrp') | list | length == 0
+      - _rh_tc_desc.results | map(attribute='stat') | selectattr('woth') | list | length == 0
+    fail_msg: >-
+      REFUSED RH-TOOLCHAIN-RECEIPT: {{ rh_tc_root }}/{{ rh.controller.bootstrap.layout.generations_dir }}, {{ _rh_tc_gen }} or its
+      {{ rh.controller.bootstrap.layout.receipts_dir }}/ is missing, a link, not owned by {{ rh_tc_owner }} or
+      group/other-writable; refused before any read.
+    quiet: true
+
+- name: Stat the published receipt, pointer, marker, manifests and executables (no link following)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop:
+    - "{{ rh_tc_root }}/{{ rh.controller.bootstrap.toolchain_receipt }}"
+    - "{{ rh_tc_root }}/{{ rh.controller.bootstrap.layout.active_file }}"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.complete_marker }}"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.receipts_dir }}/toolchain.json"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.receipts_dir }}/artifacts.sha256"
+    - "{{ _rh_tc_gen }}/{{ rh_tc_recipe.bs.python.interpreter_rel }}"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.gen_dirs.venv }}/bin/ansible-playbook"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.gen_dirs.uv }}/uv"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.config_file }}"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.receipts_dir }}/tree.sha256"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.receipts_dir }}/tree.list"
+  register: _rh_tc_files
+
+- name: Refuse missing, linked, foreign-owned or group/other-writable custody files
+  ansible.builtin.assert:
+    that:
+      - _rh_tc_files.results | map(attribute='stat') | selectattr('exists') | selectattr('isreg') | list | length == 11
+      - _rh_tc_files.results | map(attribute='stat') | selectattr('islnk') | list | length == 0
+      - _rh_tc_files.results | map(attribute='stat') | map(attribute='pw_name') | unique | list == [rh_tc_owner]
+      - _rh_tc_files.results | map(attribute='stat') | selectattr('wgrp') | list | length == 0
+      - _rh_tc_files.results | map(attribute='stat') | selectattr('woth') | list | length == 0
+    fail_msg: >-
+      REFUSED RH-TOOLCHAIN-RECEIPT: a receipt, pointer, marker, manifest or executable of {{ _rh_tc_gen }} is missing, a link, not owned by
+      {{ rh_tc_owner }} or group/other-writable. Run the seed apply as {{ rh_tc_owner }}.
+    quiet: true
+
+- name: Read the published receipt ONCE (these exact bytes are parsed and compared)
+  ansible.builtin.slurp:
+    src: "{{ rh_tc_root }}/{{ rh.controller.bootstrap.toolchain_receipt }}"
+  register: _rh_tc_bytes
+
+- name: Read the sealed receipt, the active pointer, the completion marker and the manifests
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop:
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.receipts_dir }}/toolchain.json"
+    - "{{ rh_tc_root }}/{{ rh.controller.bootstrap.layout.active_file }}"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.complete_marker }}"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.receipts_dir }}/tree.sha256"
+    - "{{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.receipts_dir }}/tree.list"
+  register: _rh_tc_markers
+
+- name: Parse the receipt from the exact bytes read
+  ansible.builtin.set_fact:
+    rh_toolchain: "{{ _rh_tc_bytes.content | b64decode | from_json }}"
+
+- name: Refuse a receipt that is not the expected installation of the declared root
+  ansible.builtin.assert:
+    that:
+      - _rh_tc_bytes.content == _rh_tc_markers.results[0].content
+      - (_rh_tc_markers.results[1].content | b64decode).splitlines() == [rh_tc_expected.generation]
+      - (_rh_tc_markers.results[2].content | b64decode).splitlines() == [rh_tc_expected.generation]
+      - rh_toolchain.schema == rh.controller.bootstrap.toolchain_receipt_schema
+      - rh_toolchain.seed_sha256 == rh_tc_expected.seed_sha256
+      - rh_toolchain.generation == rh_tc_expected.generation
+      - rh_toolchain.root == rh_tc_root
+      - rh_toolchain.owner_name == rh_tc_owner
+      - rh_toolchain.owner_uid == _rh_tc_anc.results[-1].stat.uid
+      - rh_toolchain.expect_core == rh_tc_recipe.ctl.expect_core
+      - rh_toolchain.python_version == rh_tc_recipe.bs.python.version
+      - rh_toolchain.python_install_mode == rh_tc_recipe.bs.python.install_mode
+      - rh_toolchain.uv_version == rh.controller.bootstrap.uv.version
+      - rh_toolchain.generation_dir == _rh_tc_gen
+      - rh_toolchain.sealed_receipt == _rh_tc_gen ~ '/' ~ rh.controller.bootstrap.layout.receipts_dir ~ '/toolchain.json'
+      - rh_toolchain.ansible_playbook == _rh_tc_gen ~ '/' ~ rh.controller.bootstrap.layout.gen_dirs.venv ~ '/bin/ansible-playbook'
+      - rh_toolchain.ansible_galaxy == _rh_tc_gen ~ '/' ~ rh.controller.bootstrap.layout.gen_dirs.venv ~ '/bin/ansible-galaxy'
+      - rh_toolchain.ansible_inventory == _rh_tc_gen ~ '/' ~ rh.controller.bootstrap.layout.gen_dirs.venv ~ '/bin/ansible-inventory'
+      - rh_toolchain.ansible == _rh_tc_gen ~ '/' ~ rh.controller.bootstrap.layout.gen_dirs.venv ~ '/bin/ansible'
+      - rh_toolchain.python == _rh_tc_gen ~ '/' ~ rh.controller.bootstrap.layout.gen_dirs.venv ~ '/bin/python'
+      - rh_toolchain.interpreter == _rh_tc_gen ~ '/' ~ rh_tc_recipe.bs.python.interpreter_rel
+      - rh_toolchain.uv == _rh_tc_gen ~ '/' ~ rh.controller.bootstrap.layout.gen_dirs.uv ~ '/uv'
+      - rh_toolchain.collections_path == _rh_tc_gen ~ '/' ~ rh.controller.bootstrap.layout.gen_dirs.collections
+      - rh_toolchain.ansible_config == _rh_tc_gen ~ '/' ~ rh.controller.bootstrap.layout.config_file
+      - rh_toolchain.artifacts_manifest_sha256 == _rh_tc_files.results[4].stat.checksum
+      - rh_toolchain.interpreter_sha256 == _rh_tc_files.results[5].stat.checksum
+      - rh_toolchain.ansible_playbook_sha256 == _rh_tc_files.results[6].stat.checksum
+      - rh_toolchain.uv_sha256 == _rh_tc_files.results[7].stat.checksum
+      - rh_toolchain.ansible_config_sha256 == _rh_tc_files.results[8].stat.checksum
+      - rh_toolchain.tree_manifest_sha256 == (_rh_tc_markers.results[3].content | b64decode | hash('sha256'))
+      - rh_toolchain.tree_list_sha256 == (_rh_tc_markers.results[4].content | b64decode | hash('sha256'))
+      - rh_toolchain.tree_manifest_sha256 == _rh_tc_files.results[9].stat.checksum
+      - rh_toolchain.tree_list_sha256 == _rh_tc_files.results[10].stat.checksum
+    fail_msg: >-
+      REFUSED RH-TOOLCHAIN-RECEIPT: receipt {{ rh_tc_root }}/{{ rh.controller.bootstrap.toolchain_receipt }} is not the expected installation
+      {{ rh_tc_expected.generation }} (seed {{ rh_tc_expected.seed_sha256 }}) of {{ rh_tc_root }} owned by
+      {{ rh_tc_owner }}: published/sealed receipt, active pointer, completion marker, identity, a derived path or an
+      installed digest differs. Altered, foreign or stale receipts are refused.
+    quiet: true
+
+- name: Confine every checksum-manifest member to the sealed trees BEFORE any checksum read
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_rh_tc_markers.results[3].content | b64decode).splitlines()
+        | reject('match', '^[0-9a-f]{64}  (' ~ (rh.controller.bootstrap.layout.sealed | map('regex_escape') | join('|')) ~ ')(/[^/]+)*$')
+        | list | length == 0
+      - >-
+        (_rh_tc_markers.results[3].content | b64decode).splitlines()
+        | map('regex_replace', '^[0-9a-f]{64}  ', '')
+        | select('search', rh.controller.bootstrap.path_admission.forbidden_segment_regex) | list | length == 0
+    fail_msg: >-
+      REFUSED RH-TOOLCHAIN-RECEIPT: {{ _rh_tc_gen }}/{{ rh.controller.bootstrap.layout.receipts_dir }}/tree.sha256 names a member outside
+      {{ rh.controller.bootstrap.layout.sealed }} (absolute, escaped, dot or dot-dot path); refused before reading it.
+    quiet: true
+
+- name: Regenerate the actual types, modes, sizes and link targets of the sealed trees (read-only)
+  ansible.builtin.command:
+    argv: "{{ [rh.controller.bootstrap.os_tools.find.path, '-P'] + rh.controller.bootstrap.layout.sealed + ['-printf', '%y %m %s %p -> %l\\n'] }}"
+    chdir: "{{ _rh_tc_gen }}"
+  environment:
+    LC_ALL: C
+  register: _rh_tc_list_now
+  changed_when: false
+
+- name: Refuse changed types, modes, sizes or link targets, and any member that is not a regular file
+  ansible.builtin.assert:
+    that:
+      - (_rh_tc_list_now.stdout_lines | sort) == (_rh_tc_markers.results[4].content | b64decode).splitlines()
+      - >-
+        ((_rh_tc_markers.results[3].content | b64decode).splitlines() | map('regex_replace', '^[0-9a-f]{64}  ', '') | sort)
+        == (_rh_tc_list_now.stdout_lines | select('match', '^f [0-7]+ [0-9]+ ') | map('regex_replace', '^f [0-7]+ [0-9]+ (.*) -> $', '\1') | sort)
+    fail_msg: >-
+      REFUSED RH-TOOLCHAIN-RECEIPT: the sealed trees of {{ _rh_tc_gen }} differ from receipts/tree.list (type, mode, size or link target, e.g. a
+      retargeted venv interpreter link), or tree.sha256 does not cover exactly the regular files.
+    quiet: true
+
+# PARSED-BYTE BINDING (codex-tick355 / tick361 RX-SCOPE row 10): the manifest sha256sum checks is the ONE read above
+# (_rh_tc_markers.results[3]), whose bytes were hashed == the receipt's tree_manifest_sha256 == the stat and CONFINED
+# above -- fed on stdin ('-'), never re-opened by path, so a replacement of tree.sha256 after that read cannot change
+# which members are verified. The member paths stay relative to chdir, exactly as before.
+- name: Re-verify every sealed regular file against the confined content manifest (read-only)
+  ansible.builtin.command:
+    argv: ["{{ rh.controller.bootstrap.os_tools.sha256sum.path }}", --check, --strict, --quiet, '-']
+    chdir: "{{ _rh_tc_gen }}"
+    stdin: "{{ _rh_tc_markers.results[3].content | b64decode }}"
+    stdin_add_newline: false
+  changed_when: false

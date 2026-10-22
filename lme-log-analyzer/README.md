@@ -62,7 +62,7 @@ Set via environment variables or `.streamlit/secrets.toml`:
 - `ELASTICSEARCH_USER` - Default: `elastic`
 - `ELASTICSEARCH_PASSWORD` - **Required**
 - `LITELLM_URL` - Default: `https://lme-litellm:4000`
-- `LITELLM_API_KEY` - Default: `sk-lme-llama-proxy`
+- `LITELLM_API_KEY` - **Required** (no default); injected from the per-install `litellm_master_key` Podman secret
 - `LITELLM_MODEL` - Default: `gemma-3-1b`
 
 ## Usage

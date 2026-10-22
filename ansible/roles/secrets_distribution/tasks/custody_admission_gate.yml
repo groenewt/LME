@@ -1,0 +1,137 @@
+# ansible/roles/secrets_distribution/tasks/custody_admission_gate.yml
+#
+# OUTCOME admission gate (codex-1115 C-REUSE-DISTRIBUTION-ADMISSION-OPEN). Refuses any
+# material CONSUMPTION -- ordinary key generation, grant assembly/emit, and distribution --
+# unless guardian custody produced a VALID, identity-bound admission record for THIS run:
+#   * the record exists on the controller (custody ran + reached a verified pair). Its
+#     mere existence is the FRESHNESS proof: credential_materializer.yml INVALIDATES any
+#     prior-run record at run start (before custody), so no stale record can be replayed
+#     (the run_id/identity checks below are SECONDARY consistency, not the sole freshness
+#     binding -- _cm_run_id is a resolved evidence id, not a guaranteed per-run nonce);
+#   * its run_id / deployment_identity / signer_id match the resolved contract, and its
+#     decision is a real custody decision (generate/recover/rotate/republish/noop);
+#   * its recorded fingerprint STILL matches the controller-staged guardian.pub, re-checked
+#     LIVE here against the INDEPENDENTLY-derived canonical staged-pub path (NOT the path
+#     the record points at) -- so a record cannot redirect its own verification, and the
+#     admission binds to the ACTUAL verified material, not a stale/self-referential claim.
+#
+# This is an OUTCOME/identity binding, NOT a toggle. It is delegation-robust: it reads a
+# CONTROLLER file and re-verifies with openssl (public key only), so it does not depend on
+# a set_fact surviving run_once/delegate_to. A distribution/reuse run with custody disabled
+# writes no record -> this gate REFUSES it: reuse/distribution must run custody (reaching a
+# verified generate/recover/rotate/republish/noop decision) in the SAME run, or be refused.
+# The toggle guard in credential_materializer.yml remains as defense in depth only.
+#
+# REPRESENTATION (codex-1115 harness/representation law): the fingerprint re-check is
+# expressed as a STRUCTURED command argv (openssl -> DER file) + `stat` sha256 + `assert`,
+# never a shell/python program body wrapped in a YAML scalar.
+#
+# Consumes (controller facts, set by credential_materializer.yml before custody):
+#   _cm_staging_root, _cm_run_id, _cm_deployment_identity, guardian_custody_signer_id.
+# No secret VALUE is read, logged, or recorded (a public-key DER + its digest only).
+---
+- name: admission-gate -- derive the canonical controller staged-pub path (independent of the record)
+  ansible.builtin.set_fact:
+    # SAME derivation as guardian_custody.yml (_gc_pub_staging); NOT read from the record,
+    # so a record cannot point the verification at a pub it also controls.
+    _cm_admission_staged_pub: "{{ _cm_staging_root }}/guardian/guardian.pub"
+    _cm_admission_der: "{{ _cm_staging_root }}/.admission-pubcheck.der"
+
+- name: admission-gate -- stat the custody admission record (controller)
+  ansible.builtin.stat:
+    path: "{{ _cm_staging_root }}/custody-admission.json"
+  delegate_to: localhost
+  run_once: true
+  register: _cm_adm_stat
+
+- name: admission-gate -- REFUSE material consumption without a custody admission record
+  ansible.builtin.assert:
+    that:
+      - "_cm_adm_stat.stat.exists"
+    fail_msg: >-
+      material consumption REFUSED: no guardian custody admission record at
+      {{ _cm_staging_root }}/custody-admission.json. Ordinary generation / grant emit /
+      distribution require a FRESH VERIFIED custody admission for this run (codex-1115
+      C-REUSE-DISTRIBUTION-ADMISSION-OPEN). A distribution/reuse run must run custody
+      (which reaches a verified-pair generate/recover/rotate/republish/noop decision) in
+      the SAME run, or be refused. Enforced on the OUTCOME, never a toggle.
+    quiet: true
+
+- name: admission-gate -- read the admission record (controller)
+  ansible.builtin.slurp:
+    src: "{{ _cm_staging_root }}/custody-admission.json"
+  delegate_to: localhost
+  run_once: true
+  register: _cm_adm_raw
+
+- name: admission-gate -- parse the admission record (non-secret)
+  ansible.builtin.set_fact:
+    _cm_admission: "{{ _cm_adm_raw.content | b64decode | from_json }}"
+
+- name: admission-gate -- REFUSE a record whose staged_pub is not the canonical controller path
+  ansible.builtin.assert:
+    that:
+      - "_cm_admission.staged_pub == _cm_admission_staged_pub"
+    fail_msg: >-
+      custody admission record staged_pub={{ _cm_admission.staged_pub | default('?') }} is not
+      the canonical controller staging pub {{ _cm_admission_staged_pub }} -- a record may not
+      redirect its own fingerprint verification. Refusing (codex-1115).
+    quiet: true
+
+- name: admission-gate -- re-derive the staged guardian.pub DER (structured argv; controller)
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - pkey
+      - -pubin
+      - -in
+      - "{{ _cm_admission_staged_pub }}"
+      - -pubout
+      - -outform
+      - DER
+      - -out
+      - "{{ _cm_admission_der }}"
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+
+- name: admission-gate -- fingerprint the staged pub DER (sha256; controller)
+  ansible.builtin.stat:
+    path: "{{ _cm_admission_der }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  run_once: true
+  register: _cm_adm_derfp
+
+- name: admission-gate -- remove the transient DER (public key; tidy)
+  ansible.builtin.file:
+    path: "{{ _cm_admission_der }}"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+
+- name: admission-gate -- bind the admission to THIS run + identity + LIVE staged material (fail closed)
+  ansible.builtin.assert:
+    that:
+      # LIVE re-verification: the canonical staged pub's DER sha256 (recomputed here,
+      # independent of the record) still equals the admitted fingerprint. openssl's own
+      # `openssl dgst -sha256` of the same DER stream (guardian_custody.yml fp_of_pub) is
+      # the identical lowercase hex, so this binds the record to the actual material.
+      - "_cm_adm_derfp.stat.checksum == _cm_admission.fingerprint"
+      - "_cm_admission.run_id == _cm_run_id"
+      - "_cm_admission.deployment_identity == _cm_deployment_identity"
+      - "_cm_admission.signer_id == guardian_custody_signer_id"
+      - "_cm_admission.decision in ['generate', 'recover', 'rotate', 'republish', 'noop']"
+    fail_msg: >-
+      custody admission does NOT bind to this run/identity/material: staged-pub sha256
+      {{ _cm_adm_derfp.stat.checksum | default('?') }} vs record fingerprint
+      {{ _cm_admission.fingerprint | default('?') }}; record run_id={{ _cm_admission.run_id | default('?') }}
+      did={{ _cm_admission.deployment_identity | default('?') }} signer={{ _cm_admission.signer_id | default('?') }}
+      decision={{ _cm_admission.decision | default('?') }} vs this run={{ _cm_run_id }}
+      did={{ _cm_deployment_identity }} signer={{ guardian_custody_signer_id | default('?') }}.
+      Reuse/distribution must be bound to the current run's verified custody identity + material.
+    quiet: true
+
+- name: admission-gate -- record that custody admitted this run (defense-in-depth fact)
+  ansible.builtin.set_fact:
+    _cm_custody_admitted: true

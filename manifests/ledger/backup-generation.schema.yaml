@@ -1,0 +1,138 @@
+---
+# =============================================================================
+# manifests/ledger/backup-generation.schema.yaml
+#
+# B-owned. JSON-Schema (draft 2020-12) shape for the backup-generation ledger,
+# AUTHORED IN YAML (full-declarative rule: JSON is generated from YAML, never
+# hand-authored). A validator loads this YAML to a dict and validates the ledger
+# file (itself a JSON array of generation records) against it. Fail-closed:
+# additionalProperties:false everywhere, so an unknown field is rejected and the
+# ledger can never be mistaken for a desired-state document.
+#
+# Pairs with manifests/ledger/backup-generation.contract.yaml (the semantics) and is
+# exercised by manifests/ledger/backup-generation.cases.yml (data cases, G-driven).
+# =============================================================================
+
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "urn:lme:backup-generation-ledger:1"
+title: LME backup-generation ledger
+description: >-
+  An out-of-bundle JSON array of backup generation records. Only `committed`/`superseded`
+  records are recoverable; only they carry bundle_sha256 + a verified volume_set.
+type: array
+items:
+  $ref: "#/$defs/generation_record"
+
+$defs:
+
+  sha256_hex:
+    type: string
+    pattern: "^[0-9a-f]{64}$"
+
+  volume_member:
+    type: object
+    additionalProperties: false
+    required: [name]
+    properties:
+      name:
+        type: string
+        minLength: 1
+      # Present once the volume's data digest is recorded (at/after produce). A member
+      # recorded at OPEN may carry only its name; a COMMITTED generation's members must
+      # carry data_content_sha256 (enforced by the committed branch below).
+      data_content_sha256:
+        $ref: "#/$defs/sha256_hex"
+
+  generation_record:
+    type: object
+    additionalProperties: false
+    # Fields every record carries regardless of state.
+    required: [schema, host, op_id, bundle_dir, status, opened_at, ledger_path]
+    properties:
+      schema:
+        const: 1
+      host:
+        type: string
+        minLength: 1
+      op_id:
+        type: string
+        minLength: 1
+        description: Unique per attempt; NEVER derived from backup_timestamp alone.
+      bundle_dir:
+        type: string
+        minLength: 1
+        pattern: "^/"          # absolute path to the bundle directory
+      backup_timestamp:
+        type: [string, "null"] # the minute-granular label; informational, not identity
+      status:
+        enum: [open, committed, superseded, aborted]
+      opened_at:
+        type: string           # ISO8601
+      committed_at:
+        type: [string, "null"]
+      # Config revision is OPTIONAL/NULLABLE (the backup producer path does not resolve).
+      revision:
+        oneOf:
+          - $ref: "#/$defs/sha256_hex"
+          - type: "null"
+      # Nullable in the base shape; the allOf below REQUIRES a non-null enum value
+      # whenever `revision` is null (no silent gap).
+      revision_source:
+        oneOf:
+          - enum: [resolved_at_backup_path, unresolved_at_backup_path, projected_by_c1]
+          - type: "null"
+      # Out-of-bundle anchors: null until committed.
+      bundle_sha256:
+        oneOf:
+          - $ref: "#/$defs/sha256_hex"
+          - type: "null"
+      # Volume-set membership recorded from the DECLARED selection at open (names), with
+      # data digests filled by commit.
+      volume_set:
+        type: array
+        items:
+          $ref: "#/$defs/volume_member"
+      ledger_path:
+        type: string
+        pattern: "^/"
+      note:
+        type: [string, "null"]
+    # A null revision MUST carry a revision_source (no silent gap).
+    allOf:
+      - if:
+          properties:
+            revision: {type: "null"}
+          required: [revision]
+        then:
+          required: [revision_source]
+          properties:
+            revision_source:
+              enum: [resolved_at_backup_path, unresolved_at_backup_path, projected_by_c1]
+      # A committed OR superseded generation MUST carry the out-of-bundle anchors + a
+      # committed_at + a non-empty volume_set whose members all have a data digest.
+      - if:
+          properties:
+            status:
+              enum: [committed, superseded]
+          required: [status]
+        then:
+          required: [committed_at, bundle_sha256, volume_set]
+          properties:
+            committed_at:
+              type: string
+            bundle_sha256:
+              $ref: "#/$defs/sha256_hex"
+            volume_set:
+              type: array
+              items:
+                required: [name, data_content_sha256]
+      # An open/aborted generation MUST NOT claim a bundle_sha256 (it is not recoverable).
+      - if:
+          properties:
+            status:
+              enum: [open, aborted]
+          required: [status]
+        then:
+          properties:
+            bundle_sha256:
+              type: "null"

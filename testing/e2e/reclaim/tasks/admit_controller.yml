@@ -1,0 +1,84 @@
+---
+# testing/e2e/reclaim/tasks/admit_controller.yml -- the op, the nonce and the APPROVED RUN RECORD (localhost,
+# observe-only). Inputs: rcl, tr_state (B's admitted state dir), lme_reclaim_op, lme_reclaim_nonce,
+# lme_reclaim_approval, lme_reclaim_service. Outputs: rcl_op, rcl_approval (mapping or none), rcl_approval_sha256.
+# The approval file is DATA the approval producer wrote (JOIN-APPROVAL-PRODUCER); it never selects a host, a path on
+# the target or a privilege -- it is only compared with observations.
+
+- name: Refuse an undeclared op, a malformed nonce, or a service op without an exact service name
+  ansible.builtin.assert:
+    that:
+      - lme_reclaim_op is defined and lme_reclaim_op is string and lme_reclaim_op in rcl.ops
+      - lme_reclaim_nonce is defined and lme_reclaim_nonce is string and lme_reclaim_nonce is match(rcl.inputs.nonce_regex)
+      - lme_reclaim_approval is defined and lme_reclaim_approval is string
+      - lme_reclaim_op != 'native_service_remove' or
+        (lme_reclaim_service | default('') is string and lme_reclaim_service | default('') is match(rcl.service_regex))
+    fail_msg: >-
+      {{ rcl.refusals.op }}: lme_reclaim_op must be one of {{ rcl.ops.keys() | list | sort }} (there is no blanket op),
+      lme_reclaim_nonce must match {{ rcl.inputs.nonce_regex }}, lme_reclaim_approval must be given ('' for a native
+      target), and native_service_remove needs lme_reclaim_service matching {{ rcl.service_regex }}.
+    quiet: true
+
+- name: Stat the approved run record (no link following)
+  when: lme_reclaim_approval | length > 0
+  ansible.builtin.stat:
+    path: "{{ lme_reclaim_approval }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _rcl_ap_st
+
+- name: Refuse an approval outside the admitted state dir, linked, not the gate user's, or not 0600
+  when: lme_reclaim_approval | length > 0
+  ansible.builtin.assert:
+    that:
+      - lme_reclaim_approval is match('^' ~ (tr_state.dir | regex_escape) ~ '/[A-Za-z0-9._-]+$')
+      - _rcl_ap_st.stat.exists and _rcl_ap_st.stat.isreg and not _rcl_ap_st.stat.islnk
+      - _rcl_ap_st.stat.uid == (tr_state.uid | int) and _rcl_ap_st.stat.mode == '0600'
+    fail_msg: >-
+      {{ rcl.refusals.approval }}: {{ lme_reclaim_approval }} must be a regular 0600 file of the gate user directly
+      under {{ tr_state.dir }}.
+    quiet: true
+
+- name: Read the approved run record
+  when: lme_reclaim_approval | length > 0
+  ansible.builtin.slurp:
+    src: "{{ lme_reclaim_approval }}"
+  register: _rcl_ap_raw
+
+- name: Refuse an approval of another schema, a missing field, a malformed binding, another op, or an expired one
+  when: lme_reclaim_approval | length > 0
+  vars:
+    _rcl_a: "{{ _rcl_ap_raw.content | b64decode | from_json }}"
+    _rcl_fr: "{{ rcl.approval.field_rules }}"
+  ansible.builtin.assert:
+    that:
+      - _rcl_a is mapping and (_rcl_a.schema | default('')) == rcl.approval.schema
+      - rcl.approval.required_fields | difference(_rcl_a.keys() | list) | length == 0
+      - _rcl_a.run_id is string and _rcl_a.run_id is match(_rcl_fr.run_id)
+      - _rcl_a.uuid is string and _rcl_a.uuid is match(_rcl_fr.uuid)
+      - _rcl_a.machine_id is string and _rcl_a.machine_id is match(_rcl_fr.machine_id)
+      - _rcl_a.hypervisor_machine_id is string and _rcl_a.hypervisor_machine_id is match(_rcl_fr.hypervisor_machine_id)
+      - _rcl_a.machine_id != _rcl_a.hypervisor_machine_id
+      - _rcl_a.record_sha256 is string and _rcl_a.record_sha256 is match(_rcl_fr.record_sha256)
+      - _rcl_a.record_schema == _rcl_fr.record_schema
+      - _rcl_a.generation is integer and _rcl_a.generation > 0
+      - _rcl_a.disks is mapping and (_rcl_a.disks.keys() | list | sort) == ['data', 'os']
+      - _rcl_a.disks.os.keys() | list | sort == ['dev', 'file', 'inode', 'serial']
+      - _rcl_a.disks.data.keys() | list | sort == ['dev', 'file', 'inode', 'serial']
+      - _rcl_a.endpoint is mapping and (_rcl_a.endpoint.keys() | list | sort) == ['host', 'port']
+      - _rcl_a.host_public_keys is sequence and _rcl_a.host_public_keys is not string and _rcl_a.host_public_keys | length > 0
+      - lme_reclaim_op in _rcl_a.ops
+      - (now(utc=true).timestamp() | int) - (_rcl_a.approved_at | int) >= 0
+      - (now(utc=true).timestamp() | int) - (_rcl_a.approved_at | int) <= rcl.approval.refuse_expired_after_seconds
+    fail_msg: >-
+      {{ rcl.refusals.approval }}: {{ lme_reclaim_approval }} is not a complete, current {{ rcl.approval.schema }}
+      approving op {{ lme_reclaim_op }} (fields {{ rcl.approval.required_fields }}; expiry
+      {{ rcl.approval.refuse_expired_after_seconds }}s).
+    quiet: true
+
+- name: Bind the admitted op and approval (digest re-read before every effect)
+  ansible.builtin.set_fact:
+    rcl_op: "{{ rcl.ops[lme_reclaim_op] | combine({'name': lme_reclaim_op}) }}"
+    rcl_approval: "{{ (_rcl_ap_raw.content | b64decode | from_json) if lme_reclaim_approval | length > 0 else none }}"
+    rcl_approval_sha256: "{{ _rcl_ap_st.stat.checksum if lme_reclaim_approval | length > 0 else none }}"

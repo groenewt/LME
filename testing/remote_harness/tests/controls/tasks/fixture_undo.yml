@@ -1,0 +1,125 @@
+---
+# reverse ONE recorded staging action (tasks/fixture_ops.yml _rhc_staged; increment 2, codex 231744 option (a)).
+# variant.yml (always) loops this file over _rhc_staged in REVERSE order, before finish_variant. It touches ONLY the
+# recorded resource, ONLY while it still has the identity recorded right after the action, and never follows a link
+# (G-UNDO-IDENTITY / G-STAGING-ANCESTRY / G-STAGING-PARTIAL, codex tick297 003441):
+#   1. a record whose action created something (post.exists) first has every component of the path(s) the undo mutates
+#      admitted by the route's ONE rule (admit_ancestry.yml, RHC-FIXTURE-STAGING): symlink dirname(path) (the link itself
+#      is the leaf and never dereferenced), mkdir path, copy_tree to, move to and from -- a linked intermediate refuses
+#   2. the written object (and a move's from) is stat'ed, never followed; so is the written object's immediate parent
+#      (the current ancestry leg of a failed record's binding)
+#   3. controls.j2 fixture_undo_decide (the ONE decision; selftests) compares them with the record:
+#        symlink    unlink only while it IS a link with the recorded dev / inode and the recorded (= declared) target text
+#        mkdir, copy_tree   remove only while a real directory with the recorded dev / inode (chmod -R u+w first; never
+#                   follows links -- a staged copy's own links are removed as links)
+#        move       move `to` back only while a real directory with the recorded dev / inode and `from` is absent
+#      (a COMPLETED record; unchanged by item 4.) An intent without a recorded outcome is never deleted.
+#      G-UNDO-PARTIAL-BINDING (codex tick330 item 4): a FAILED record (state failed: possible partial output) is NOT
+#      reversed like a completed one. Its post-failure dev / inode / kind / link target is identity evidence only. Removal
+#      needs every binding: op copy_tree (the only staging command that can leave partial output of its own under a fresh
+#      name); failed_in action (the copy itself failed, not its post-state check); the intent (pre_absent, parents_admitted,
+#      from / to declared); the recorded pre-state parent = dirname(to), a real directory, not group / other writable (the
+#      exclusive destination: {ctl} and staged mkdirs are created 0700; a copied dir keeps its source's mode and then
+#      binds only if that mode is owner-private); that parent now still the same dev / inode /
+#      uid / kind and still not group / other writable (current ancestry); the object a real directory with the
+#      post-failure dev / inode, owned by that uid (current identity). Anything else -- a failed mkdir / symlink / move that
+#      left something, a post-check failure, an unbound or changed parent, a re-owned or replaced object -- is refused and
+#      left in place as a finding. "Exclusive" means owner-private: another process of the SAME uid is not excluded.
+# Anything else (replaced, re-targeted, occupied, unverifiable, refused ancestry) is NOT forced: it is a cleanup finding
+# and a FAIL of the variant (the staging could not be reversed as recorded), with the decision kept as evidence.
+# G-UNDO-PROTECTION-PROPAGATION (codex tick330): every path a refused decision or a failed undo leaves in place joins
+# _rhc_protected; a LATER (ancestor) record whose unlink / move-back / remove-dir would reach, displace or contain one is
+# refused by the same decision (fixture_undo_decide 4th argument) and is protected in turn, and the declared undo ops
+# (op.yml), the fresh / clone root purges, the scratch and the fixture control dir removal (finish_variant.yml,
+# variant.yml) all skip what is protected. A decision finding is routed by variant.yml (judge_undo_findings: declared in
+# the variant's expect_undo_findings, or a FAIL and a cleanup finding); a failed or refused undo (rescue) always FAILs.
+
+- name: "Undo staging {{ rhc_fu.op }} of step {{ rhc_fu.step }}"
+  vars:
+    # the path(s) this undo would mutate (unlink / remove-dir / move-back): what a finding protects
+    _rhc_fu_mut: >-
+      {{ ([rhc_fu.path] if rhc_fu.op in ['symlink', 'mkdir'] else ([rhc_fu.to, rhc_fu.from] if rhc_fu.op == 'move' else [rhc_fu.to]))
+         | select('string') | reject('equalto', '') | list }}
+  block:
+    - name: Admit every component of the path(s) the undo mutates (only a record that created something; the ONE rule)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+      vars:
+        rh_anc_bs: "{{ rh.controller.bootstrap }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ _rhc_fu_anc }}"
+        rh_anc_refusal: RHC-FIXTURE-STAGING
+      loop: >-
+        {{ [] if not ((rhc_fu.post | default({})).exists | default(false))
+           else ([rhc_fu.path | dirname] if rhc_fu.op == 'symlink'
+                 else ([rhc_fu.path] if rhc_fu.op == 'mkdir' else ([rhc_fu.to] if rhc_fu.op == 'copy_tree' else [rhc_fu.to, rhc_fu.from]))) }}
+      loop_control:
+        loop_var: _rhc_fu_anc
+
+    - name: Stat the recorded resource(s) (never followed)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: >-
+        {{ [rhc_fu.path] if rhc_fu.op in ['symlink', 'mkdir'] else ([rhc_fu.to, rhc_fu.from] if rhc_fu.op == 'move' else [rhc_fu.to]) }}
+      register: _rhc_fu_st
+
+    # G-UNDO-PARTIAL-BINDING: the written object's immediate parent now (never followed), compared by fixture_undo_decide
+    # with the parent identity recorded at the action's pre-state (read for a failed record's removal only)
+    - name: Stat the written object's parent (never followed; the current ancestry of a failed record)
+      ansible.builtin.stat:
+        path: "{{ (rhc_fu.path if rhc_fu.op in ['symlink', 'mkdir'] else rhc_fu.to) | dirname }}"
+        follow: false
+        get_checksum: false
+      register: _rhc_fu_pst
+
+    - name: Decide the undo by the recorded identity (controls.j2 fixture_undo_decide)
+      vars:
+        _a: "{{ _rhc_fu_st.results[0].stat }}"
+        _b: "{{ (_rhc_fu_st.results[1].stat) if (_rhc_fu_st.results | length > 1) else {} }}"
+      ansible.builtin.set_fact:
+        _rhc_fu_dec: >-
+          {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'fixture_undo_decide',
+               'args': [rhc_fu, _a, _b, _rhc_protected | default([]), _rhc_fu_pst.stat]}}) | from_json }}
+
+    - name: Remove the recorded link (the link itself)
+      ansible.builtin.file:
+        path: "{{ rhc_fu.path }}"
+        state: absent
+      when: _rhc_fu_dec.do == 'unlink'
+
+    - name: Move the recorded directory back
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.mv }}", -T, --, "{{ rhc_fu.to }}", "{{ rhc_fu.from }}"]
+      changed_when: true
+      when: _rhc_fu_dec.do == 'move-back'
+
+    - name: Owner write on the recorded directory tree (chmod -R does not follow links below it)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.chmod }}", -R, u+w, --, "{{ rhc_fu.to if rhc_fu.op == 'copy_tree' else rhc_fu.path }}"]
+      changed_when: true
+      when: _rhc_fu_dec.do == 'remove-dir'
+
+    - name: Remove the recorded directory tree
+      ansible.builtin.file:
+        path: "{{ rhc_fu.to if rhc_fu.op == 'copy_tree' else rhc_fu.path }}"
+        state: absent
+      when: _rhc_fu_dec.do == 'remove-dir'
+
+    - name: Keep the undo decision as evidence
+      ansible.builtin.set_fact:
+        _rhc_log: "{{ _rhc_log + [{'fixture_undo': rhc_fu, 'decision': _rhc_fu_dec}] }}"
+
+    # routed by variant.yml (judge_undo_findings): a FAIL and a cleanup finding unless the variant declares it exactly
+    - name: A recorded resource not in its recorded state is an undo finding (never forced; its path(s) protected)
+      ansible.builtin.set_fact:
+        _rhc_undo_found: "{{ _rhc_undo_found | default([]) + [{'path': _rhc_fu_mut | first | default('?'), 'why': _rhc_fu_dec.why, 'record': rhc_fu}] }}"
+        _rhc_protected: "{{ (_rhc_protected | default([]) + _rhc_fu_mut) | unique | list }}"
+      when: _rhc_fu_dec.do == 'finding'
+
+  rescue:
+    - name: A failed or refused undo is a cleanup finding and a FAIL of the variant (nothing forced; its path(s) protected)
+      ansible.builtin.set_fact:
+        _rhc_fail: "{{ _rhc_fail + ['fixture undo ' ~ (rhc_fu | to_json) ~ ': ' ~ (ansible_failed_result.msg | default('') | string)[:300]] }}"
+        rhc_cleanup_findings: "{{ rhc_cleanup_findings + [rhc_c.id ~ '/' ~ rhc_v.id ~ ': fixture undo failed ' ~ (rhc_fu | to_json)] }}"
+        _rhc_protected: "{{ (_rhc_protected | default([]) + _rhc_fu_mut) | unique | list }}"

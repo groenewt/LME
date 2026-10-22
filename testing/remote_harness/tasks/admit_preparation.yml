@@ -1,0 +1,137 @@
+---
+# testing/remote_harness/tasks/admit_preparation.yml -- the ADMISSION POINT of the preparation candidates (codex-tick369).
+# AUTHORED, NEVER EXECUTED. Included by package.yml after its controller identity / missing-tool refusals and BEFORE
+# the source binding and any write, only when the resolved policy declares controller.bootstrap.preparation.
+#
+# The candidate record never authorizes itself. What is admitted is the DECLARATION that C1 landed from it
+# (os_tools.<guest tool>.{path, identity} + preparation.admitted_record.sha256) and B landed from it (a hypervisor's
+# guest.allocation.base_image {file, sha512}), through the ONE loader (resolve_policy.yml). This file re-reads the
+# record BY THAT DECLARED DIGEST (its content-addressed name) and refuses a declaration that is not the candidate:
+#   - every os_tools entry used ONLY by preparation.measures_for consumers (required_by a non-empty subset of it: the
+#     guest-only tools, which no controller or target_prereq measurement produces first), and every entry a declared
+#     package member names, is compared on the CONTROLLER scope (rh = the controller's resolved policy), path +
+#     file_sha256, with the candidate (an entry that ALSO serves another consumer -- env, df, mkdir ... extended with
+#     guest by RS -- keeps its existing controller-fixture producer and is not compared here). A per-host
+#     admitted override on graph (target scope; target_prereq.yml measurement -> candidate override) is NOT compared
+#     here and stays valid: the candidate is the baseline, graph's measurement its separate override check.
+#   - every target scope that carries guest.allocation.base_image (a hypervisor; per-host by design) must name
+#     exactly a {file, sha512} the record's images carry. Under genesis (operator_controller_inventory) there is no
+#     target scope, so only the tool check applies.
+# A guest tool declared WITHOUT an admitted record refuses (the identities were not produced by the declared stage).
+
+- name: "ADMIT PREPARATION -- refuse pre-supplied preparation names (^_?rh_prep_; an extra-var outranks set_fact)"
+  ansible.builtin.assert:
+    that:
+      - (vars | list) | select('match', '^_?rh_prep_') | list | length == 0
+    fail_msg: >-
+      REFUSED RH-DERIVED-OUTPUT-PINNED: preparation names supplied from outside:
+      {{ (vars | list) | select('match', '^_?rh_prep_') | list }}
+    quiet: true
+
+- name: "ADMIT PREPARATION -- the declared guest-tool entries and the admitted record digest"
+  ansible.builtin.set_fact:
+    rh_prep_a_tools: >-
+      {%- set ns = namespace(o=[]) -%}
+      {%- for kv in rh.controller.bootstrap.os_tools | dict2items -%}
+      {%- if (kv.value.required_by | default([]) | length > 0
+             and kv.value.required_by | difference(rh.controller.bootstrap.preparation.measures_for) | length == 0)
+             or kv.key in (rh.controller.bootstrap.preparation.tool_packages.packages | default({}) | dict2items
+                           | map(attribute='value.members') | map('list') | flatten) -%}
+      {%- set ns.o = ns.o + [kv] -%}{%- endif -%}{%- endfor -%}{{ ns.o }}
+    # null / absent admitted_record or sha256 -> '' -> the typed RH-PREPARE refusal below (never an untyped template error)
+    rh_prep_a_sha: "{{ (rh.controller.bootstrap.preparation.admitted_record | default({}, true)).sha256 | default('', true) }}"
+    # [[host, file, sha512]] of every target scope carrying guest.allocation.base_image (none under genesis)
+    rh_prep_a_bases: >-
+      {%- set ns = namespace(o=[]) -%}
+      {%- for kv in (lme_resolved.remote_harness.scopes.targets | default({})) | dict2items -%}
+      {%- if kv.value.policy.guest is defined and kv.value.policy.guest.allocation is defined
+             and kv.value.policy.guest.allocation.base_image is defined -%}
+      {%- set ns.o = ns.o + [[kv.key, kv.value.policy.guest.allocation.base_image.file, kv.value.policy.guest.allocation.base_image.sha512]] -%}
+      {%- endif -%}{%- endfor -%}{{ ns.o }}
+
+- name: "ADMIT PREPARATION -- refuse guest tools or a hypervisor base image declared without an admitted record"
+  ansible.builtin.assert:
+    that:
+      - (rh_prep_a_tools | length == 0 and rh_prep_a_bases | length == 0) or rh_prep_a_sha is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: os_tools {{ rh_prep_a_tools | map(attribute='key') | list }}
+      (required_by {{ rh.controller.bootstrap.preparation.measures_for }}) or the base image of
+      {{ rh_prep_a_bases | map('first') | list }} are declared, but preparation.admitted_record.sha256 is not: the
+      identities must come from the declared preparation record. Nothing was written.
+    quiet: true
+
+- name: "ADMIT PREPARATION -- the record, by its admitted digest (content-addressed name; links not followed)"
+  when: rh_prep_a_sha != ''
+  block:
+    - name: "ADMIT PREPARATION -- admit the preparation root input (no default)"
+      vars:
+        _root: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.preparation.root_var, default='') }}"
+      ansible.builtin.assert:
+        that:
+          - _root is string and _root is match(rh.controller.bootstrap.path_admission.regex)
+          - _root is not search(rh.controller.bootstrap.path_admission.forbidden_segment_regex)
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: the admitted record needs the localhost host var
+          {{ rh.controller.bootstrap.preparation.root_var }} (a normalized absolute path). Nothing was written.
+        quiet: true
+
+    - name: "ADMIT PREPARATION -- stat the admitted record"
+      ansible.builtin.stat:
+        path: >-
+          {{ lookup('ansible.builtin.vars', rh.controller.bootstrap.preparation.root_var) ~ '/'
+             ~ rh.controller.bootstrap.preparation.layout.records ~ '/' ~ rh_prep_a_sha ~ '.json' }}
+        follow: false
+        checksum_algorithm: sha256
+      register: _rh_prep_a_st
+
+    - name: "ADMIT PREPARATION -- read the record ONCE"
+      ansible.builtin.slurp:
+        src: "{{ _rh_prep_a_st.stat.path }}"
+      register: _rh_prep_a_raw
+      when: _rh_prep_a_st.stat.exists | default(false)
+
+    - name: "ADMIT PREPARATION -- bind the bytes READ to the admitted digest BEFORE parsing"
+      ansible.builtin.assert:
+        that:
+          - _rh_prep_a_st.stat.exists and _rh_prep_a_st.stat.isreg and not _rh_prep_a_st.stat.islnk
+          - _rh_prep_a_st.stat.uid == rh_builder.uid | int and _rh_prep_a_st.stat.mode == '0400'
+          - _rh_prep_a_st.stat.checksum == rh_prep_a_sha
+          - (_rh_prep_a_raw.content | b64decode | hash('sha256')) == rh_prep_a_sha
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ _rh_prep_a_st.stat.path | default('?') }} is not
+          the admitted preparation record {{ rh_prep_a_sha }} (an owned 0400 regular file whose bytes READ have that
+          sha256). Nothing was written.
+        quiet: true
+
+    - name: "ADMIT PREPARATION -- refuse a declaration that is not the admitted record's candidate"
+      vars:
+        _r: "{{ _rh_prep_a_raw.content | b64decode | from_json }}"
+        _decl: "{{ dict(rh_prep_a_tools | map(attribute='key') | zip(rh_prep_a_tools | map(attribute='value'))) }}"
+        _want: "{{ (_r.images | default([])) | map(attribute='file') | zip((_r.images | default([])) | map(attribute='sha512')) | map('list') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _r is mapping
+          - _r.schema | default('') == rh.controller.bootstrap.preparation.record_schema
+          - _r.candidate | default(false) is sameas true
+          - _r.self_authorizing | default(true) is sameas false
+          - _r.tools | default(none) is mapping
+          - _r.images | default(none) is sequence
+          # every declared guest tool: present in the record with the same path and file_sha256
+          - rh_prep_a_tools | map(attribute='key') | reject('in', _r.tools | list) | list | length == 0
+          - >-
+            rh_prep_a_tools | map(attribute='key') | map('extract', _decl) | map(attribute='path') | list
+            == rh_prep_a_tools | map(attribute='key') | map('extract', _r.tools) | map(attribute='path') | list
+          - >-
+            rh_prep_a_tools | map(attribute='key') | map('extract', _decl) | map(attribute='identity') | list
+            == rh_prep_a_tools | map(attribute='key') | map('extract', _r.tools) | map(attribute='identity') | list
+          # every hypervisor base image: exactly a candidate {file, sha512}
+          - >-
+            rh_prep_a_bases | map(attribute=1) | zip(rh_prep_a_bases | map(attribute=2)) | map('list')
+            | reject('in', _want) | list | length == 0
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: the declarations are not the admitted preparation
+          record {{ rh_prep_a_sha }}'s candidate (schema {{ rh.controller.bootstrap.preparation.record_schema }}, candidate
+          true, self_authorizing false). Guest tools declared: {% for k in rh_prep_a_tools | map(attribute='key') %}{{ k }}={{ _decl[k].path }}:{{ _decl[k].identity.sha256 | default('?') }} vs record {{ (_r.tools[k].path ~ ':' ~ _r.tools[k].identity.sha256) if (_r.tools is mapping and k in _r.tools) else 'absent' }}; {% endfor %}
+          base images: {% for b in rh_prep_a_bases %}{{ b[0] }}={{ b[1] }}:{{ b[2] }} {% endfor %} vs record {{ _want }}.
+          A differing graph measurement is a per-host override (target scope), never compared here. Nothing was written.
+        quiet: true

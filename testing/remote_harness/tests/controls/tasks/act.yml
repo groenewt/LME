@@ -1,0 +1,148 @@
+---
+# run one action through its real entrypoint (_rhc_step.act). The argv is planned by the pure macro plan_act and run by the
+# ONE record writer (controls.j2 writer_cmd; ported from m1-1g, codex 200213 point 7): the task shell exec's the act's own
+# scope + timeout (plan.bound), whose child is the declared sh running the writer body (precheck, create, identity,
+# admission -- all inside the bound), which exec's the entrypoint (plan.inner) with its streams on the admitted records.
+# m1-1 has no private_create.yml: the record freshness check is the writer's own precheck (stage=precheck) only.
+# Every act runs in its own transient user scope (plan.unit; controls.yml act_scope) unless it declares scope: shared.
+
+- name: "Plan the action of {{ _rhc_step.id }}"
+  ansible.builtin.set_fact:
+    _rhc_plan: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'plan_act', 'args': [_rhc_step, _rhc_ctx]}}) | from_json }}"
+
+# R1 launcher consumption (codex 192321; ported from m1-1g): a seed launch is the bundle's generated launcher by
+# seed_launcher.caller_argv (form launcher) or, only as a declared deviation (act.invoke seed_direct / declared_sh), the
+# seed_launch vector itself
+- name: Refuse a seed launch the resolved seed_launch / seed_launcher does not fully bind (RH-SEED-LAUNCH; lifecycle E78 / E82-E85; before any process)
+  ansible.builtin.assert:
+    that:
+      - _rhc_plan.seed_launch.unresolved | length == 0
+      - _rhc_plan.seed_launch.argv | length > 0
+      - _rhc_plan.seed_launch.form in ['launcher', 'seed_direct']
+      - _rhc_plan.seed_launch.form == 'launcher' or (_rhc_step.act.invoke | default('')) in ['seed_direct', 'declared_sh']
+    fail_msg: >-
+      REFUSED RHC-SEED-LAUNCH: {{ _rhc_step.id }} launches the seed ({{ _rhc_plan.seed_launch.form | default('?') }}), but the
+      resolved controller.bootstrap.seed_launch / seed_launcher leaves {{ _rhc_plan.seed_launch.unresolved }} without a
+      value, or a direct vector was not a declared act.invoke deviation; G never substitutes a default.
+    quiet: true
+  when: _rhc_plan.seed_launch | default({}) | length > 0
+
+# SEED DIRECT LABEL (codex 210509): the direct vector is a labelled fault-injection / control path -- a declared
+# direct_purpose (vocabulary.direct_purposes) AND a step that expects a refusal; never an ordinary or positive launch
+- name: Refuse a direct seed launch that is not a labelled refusal-expecting fault injection (RHC-SEED-DIRECT; before any process)
+  vars:
+    _exp: "{{ _rhc_step.expect | default({}) }}"
+  ansible.builtin.assert:
+    that:
+      - (_rhc_step.act.direct_purpose | default('')) in rhc_decl.vocabulary.direct_purposes
+      - (_exp.rc_nonzero | default(false)) or _exp.refusal is defined or _exp.refusal_any is defined or _exp.refused_at is defined
+    fail_msg: >-
+      REFUSED RHC-SEED-DIRECT: {{ _rhc_step.id }} starts the seed directly (act.invoke {{ _rhc_step.act.invoke | default('') }})
+      without a declared direct_purpose ({{ rhc_decl.vocabulary.direct_purposes | join(' | ') }}) or without a refusal
+      expectation; ordinary and positive-path launches use the generated launcher, and a direct result proves only the
+      direct seed boundary.
+    quiet: true
+  when: (_rhc_plan.seed_launch | default({})).form | default('') == 'seed_direct'
+
+- name: Refuse a working directory outside this run (a decoy cwd is created by the control itself)
+  ansible.builtin.assert:
+    that: _rhc_plan.cwd.startswith(rhc_run_dir ~ '/')
+    fail_msg: "cwd {{ _rhc_plan.cwd }} is outside {{ rhc_run_dir }}"
+    quiet: true
+
+- name: Ensure the default working directory exists
+  ansible.builtin.file:
+    path: "{{ _rhc_plan.cwd }}"
+    state: directory
+    mode: '0700'
+  when: _rhc_plan.cwd == _rhc_t.ctl ~ '/cwd'
+
+# G-RECORD-OPEN-BEFORE-TIMEOUT race control (codex 195110 point 2): act.record_barrier [{fifo|regular: out|err|strace}] is
+# planted by the WRITER ITSELF after its precheck and before its noclobber create (controls.j2 writer_cmd step 2) -- the
+# deterministic precheck-to-open barrier. Only a record role of this very plan; a declaration error otherwise.
+- name: Refuse a record barrier that is not a declared kind at a record of this act (declaration error; before any process)
+  vars:
+    _roles: "{{ ['out', 'err'] + (['strace'] if _rhc_plan.strace else []) }}"
+    _bad: >-
+      {{ _rhc_plan.record_barrier | reject('mapping') | list
+         + (_rhc_plan.record_barrier | select('mapping') | rejectattr('fifo', 'defined') | rejectattr('regular', 'defined') | list)
+         + (_rhc_plan.record_barrier | select('mapping') | selectattr('fifo', 'defined') | rejectattr('fifo', 'in', _roles) | list)
+         + (_rhc_plan.record_barrier | select('mapping') | selectattr('regular', 'defined') | rejectattr('regular', 'in', _roles) | list)
+         + (_rhc_plan.record_barrier | select('mapping') | map('list') | map('length') | reject('equalto', 1) | list) }}
+  ansible.builtin.assert:
+    that: _bad | length == 0
+    fail_msg: "REFUSED RHC-ACT-RECORD-BARRIER: {{ _rhc_step.id }} record_barrier {{ _rhc_plan.record_barrier | to_json }} (bad: {{ _bad | to_json }}); one {fifo|regular: <role>} per entry, role in {{ _roles }}"
+    quiet: true
+  when: _rhc_plan.record_barrier | length > 0
+
+- name: The writer line of this act (records created exclusively by the writer itself; controls.j2 writer_cmd)
+  ansible.builtin.set_fact:
+    _rhc_wcmd: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'writer_cmd', 'args': [_rhc_plan, _rhc_ctx]}}) }}"
+
+- name: Refuse declared targets outside RFC 5737 TEST-NET-1 at run time too (G never reaches a real host; plan-time guard in _steps_unimpl)
+  ansible.builtin.assert:
+    that:
+      - _rhc_plan.inventory_targets | dict2items | map(attribute='value') | map(attribute='ansible_host', default='') | map('string')
+        | reject('match', rhc_decl.vocabulary.target_address_regex) | list | length == 0
+      - (_rhc_plan.inventory_targets | length == 0) or (_rhc_plan.target_group | length > 0)
+    fail_msg: "inventory_targets of {{ _rhc_step.id }} name a non-TEST-NET-1 address or no target group: {{ _rhc_plan.inventory_targets }}"
+    quiet: true
+  when: _rhc_plan.inventory and (_rhc_plan.inventory_targets | default({}) | length > 0)
+
+- name: Write the inventory of a playbook-shaped action (localhost + the declared TEST-NET-1 target group; declared inputs + the step's pins)
+  ansible.builtin.copy:
+    dest: "{{ _rhc_plan.inventory }}"
+    mode: '0600'
+    content: >-
+      {{ {'all': {'hosts': {'localhost': _rhc_plan.inventory_vars}}
+                  | combine({'children': {_rhc_plan.target_group: {'hosts': _rhc_plan.inventory_targets}}}
+                            if (_rhc_plan.inventory_targets | default({}) | length > 0) else {})} | to_nice_yaml }}
+  when: _rhc_plan.inventory
+
+# G-STEP-LIVE-FAIL-GUARD (codex tick313): the launch reads the failure state LIVE (step.yml already skips a step that
+# starts after a failure; this also covers a failure recorded inside this act before its launch). Not launched = logged.
+- name: "{{ _rhc_step.id }} is not launched: a failure is already recorded (logged; never evidence of the act)"
+  ansible.builtin.set_fact:
+    _rhc_log: "{{ _rhc_log + [{'step': _rhc_step.id, 'skipped': 'act not launched: a failure is already recorded', 'failures_before': _rhc_fail | length}] }}"
+  when: _rhc_fail | length > 0
+
+- name: "Run {{ _rhc_step.id }} (synchronous)"
+  ansible.builtin.shell:
+    cmd: "{{ _rhc_wcmd }}"
+    chdir: "{{ _rhc_plan.cwd }}"
+  environment:   # systemd-run --user reaches the owner's user manager; the entrypoint itself still runs under env -i
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
+  register: _rhc_sync
+  changed_when: true
+  failed_when: false
+  timeout: "{{ _rhc_plan.timeout_s + 60 }}"
+  when: not _rhc_plan.async and _rhc_fail | length == 0
+
+- name: "Run {{ _rhc_step.id }} (in the background; joined, killed or awaited by later steps)"
+  ansible.builtin.shell:
+    cmd: "{{ _rhc_wcmd }}"
+    chdir: "{{ _rhc_plan.cwd }}"
+  environment:   # systemd-run --user reaches the owner's user manager; the entrypoint itself still runs under env -i
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
+  register: _rhc_async
+  changed_when: true
+  async: "{{ _rhc_plan.timeout_s + 120 }}"
+  poll: 0
+  when: _rhc_plan.async and _rhc_fail | length == 0
+
+- name: Remember the background job
+  ansible.builtin.set_fact:
+    _rhc_jobs: "{{ _rhc_jobs | combine({_rhc_step.id: {'jid': _rhc_async.ansible_job_id, 'plan': _rhc_plan}}) }}"
+  when: _rhc_plan.async and not (_rhc_async.skipped | default(false))
+
+- name: Collect and judge the synchronous result
+  ansible.builtin.include_tasks: collect.yml
+  vars:
+    rhc_cid: "{{ _rhc_step.id }}"
+    rhc_cplan: "{{ _rhc_plan }}"
+    rhc_crc: "{{ _rhc_sync.rc | default(-1) }}"
+    rhc_cexp: "{{ _rhc_step.expect | default({}) }}"
+    rhc_cwstderr: "{{ _rhc_sync.stderr | default('') }}"   # the writer's own stderr (its RHC-ACT-RECORD refusal / admission), not the record
+  when: not _rhc_plan.async and not (_rhc_sync.skipped | default(false))

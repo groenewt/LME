@@ -1,0 +1,60 @@
+---
+# Heartbeat -- kind: container (a beat, elastic-services pack). B4 per-svc bundle.
+#
+# B4 mount: heartbeat mounts ONLY its own published bundle
+# (cert:heartbeat -> /opt/lme/certs/heartbeat) at /certs, read-only, NO idmap,
+# instead of the shared lme_certs workspace with `,idmap`. ca/ca.key is mounted
+# into NOTHING. In-container paths unchanged: config/heartbeat.yml references only
+# /certs/ca/ca.crt (verified -- heartbeat is a pure client, presents no leaf cert),
+# which the bundle provides (bundle = ca/ca.crt only for this svc).
+#
+# NO uid change here: the static unit already ran WITHOUT User= (image uid 1000),
+# because heartbeat never opened a workspace-owned leaf key -- it reads only
+# /certs/ca/ca.crt (public CA material). Under B4 the bundle is owned by
+# cert_owner = base 0 (host_userns:true) + in_container_uid 1000 = 1000, matching
+# the image uid, so it reads the bundle with no root and no idmap. heartbeat does
+# NOT bind-mount the host journal, so nothing forces host root.
+# It keeps --cap-add=NET_RAW (ICMP/TCP monitors need raw sockets); that is a
+# capability, not a uid, and is orthogonal to the cert model.
+#
+# Fidelity target = quadlet-optional/elastic-services/lme-heartbeat.container with
+# EXACTLY ONE change: Volume lme_certs:/certs:ro,idmap ->
+# /opt/lme/certs/heartbeat:/certs:ro. Everything else identical (no User= in either).
+id: heartbeat
+name: lme-heartbeat
+kind: container
+enabled_when: [install_elastic_services]
+image: heartbeat
+description: Elastic Heartbeat Container Service
+
+dependencies:
+  requires: [elasticsearch, setup-certs]
+  after: [elasticsearch, setup-certs, kibana]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  timeout_start_sec: 300
+  start_limit_interval: 120
+  start_limit_burst: 10
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+network_aliases: [lme-heartbeat]
+podman_args: ["--cap-add=NET_RAW"]
+volumes:
+  - {source: "cert:heartbeat", dest: /certs, options: [ro, Z]}      # B4: per-svc bundle, no idmap; Z=SELinux relabel
+  - {source: /opt/lme/config/heartbeat.yml, dest: /usr/share/heartbeat/heartbeat.yml, options: [ro]}
+secrets:
+  - {name: elastic, type: env, target: ELASTICSEARCH_PASSWORD}
+
+# B4 cert-owner metadata (consumed by init-setup.sh / G5, NOT emitted into the
+# unit). host_userns:true -> cert_owner = base 0 + in_container_uid 1000 = 1000
+# (the image uid). heartbeat is a pure client: bundle carries ca/ca.crt only.
+certs:
+  host_userns: true
+  in_container_uid: 1000
+  needs_ca: true

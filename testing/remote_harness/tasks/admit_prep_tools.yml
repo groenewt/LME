@@ -1,0 +1,53 @@
+---
+# testing/remote_harness/tasks/admit_prep_tools.yml -- admit every PREPARATION executable by its declared identity
+# BEFORE its first use (codex-tick369; advisor point 1). AUTHORED, NEVER EXECUTED. Included by tasks/prepare.yml.
+#
+# acquire.yml runs BEFORE package.yml, so package.yml:99-162 (the controller identity + missing-tool refusals) has not
+# yet judged the tools preparation executes (gpgv, dpkg-deb and the tar dpkg-deb forks). The rule here is the SAME
+# as package.yml's, applied to the entries whose required_by names the controller consumer label
+# preparation.tool_label (C1 proposal: `preparation`, in os_tool_consumers.controller): stat sha256 with links
+# followed, identity kind file_sha256, judged on present files only; an absent or non-executable tool refuses naming
+# its logical package (rh.packages.provides). Never installed ad hoc, no search, no fallback.
+# CONVERGENCE (proposal, not done here): package.yml's inline copy (:99-129, :146-162) can include this file with
+# the controller-consumer entry set; it is left byte-unchanged in this slice so its registers, task names and the
+# git-first ordering (:131-144, D05) cited by existing controls do not move.
+
+- name: "PREPARE TOOLS -- hash every declared preparation executable (stat sha256, links followed; nothing runs yet)"
+  ansible.builtin.stat:
+    path: "{{ item.value.path }}"
+    follow: true
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ rh.controller.bootstrap.os_tools | dict2items
+       | selectattr('value.required_by', 'contains', rh.controller.bootstrap.preparation.tool_label) | list }}
+  loop_control:
+    label: "{{ item.key }}"
+  register: _rh_prep_tident
+
+- name: "PREPARE TOOLS -- refuse an undeclared tool set, a missing / non-executable tool, or a content that is not its identity"
+  vars:
+    _p: "{{ rh.controller.bootstrap.preparation }}"
+    _tst: "{{ _rh_prep_tident.results | selectattr('stat.exists') | list }}"
+    _names: >-
+      {{ _rh_prep_tident.results | rejectattr('stat.exists') | map(attribute='item.key') | list
+         + (_tst | rejectattr('stat.executable') | map(attribute='item.key') | list) }}
+    _pkgs: >-
+      {% set ns = namespace(p=[]) %}{% for kv in rh.packages.provides | dict2items %}{% if kv.value | intersect(_names) | length > 0 %}{% set ns.p = ns.p + [kv.key] %}{% endif %}{% endfor %}{{ ns.p }}
+  ansible.builtin.assert:
+    that:
+      - _p.tool_label in rh.controller.bootstrap.os_tool_consumers.controller
+      - _rh_prep_tident.results | map(attribute='item.key') | sort == _p.tools | sort
+      - _names | length == 0
+      - _rh_prep_tident.results | map(attribute='item.value.identity.kind') | unique | list == ['file_sha256']
+      - >-
+        _tst | map(attribute='stat') | map(attribute='checksum', default='') | list
+        == _tst | map(attribute='item.value.identity.sha256') | list
+    fail_msg: >-
+      REFUSED {{ _p.refusal }}: the preparation tools must be exactly preparation.tools {{ _p.tools }} (os_tools entries
+      required_by {{ _p.tool_label }}, a declared controller consumer), each present, executable and its declared
+      file_sha256. Missing / non-executable: {{ _names }} -> logical packages {{ _pkgs }} = Debian
+      {{ _pkgs | map('extract', rh.packages.by_os_family.Debian) | list }} (MAIN installs them; never ad hoc). Identity
+      mismatch: {% for r in _tst if (r.stat.checksum | default('')) != r.item.value.identity.sha256 %}{{ r.item.key }}={{ r.item.value.path }}({{ r.stat.checksum | default('unreadable') }}) {% endfor %}.
+      Nothing was fetched or executed.
+    quiet: true

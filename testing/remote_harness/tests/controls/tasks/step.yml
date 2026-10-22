@@ -1,0 +1,117 @@
+---
+# one step (rhc_s): expand tokens NOW (bound tokens such as {staging} exist only after the predicate that binds them),
+# refuse a residual token, dispatch by kind, judge (G)
+# G-STEP-LIVE-FAIL-GUARD (codex tick313): variant.yml includes this file in a LOOP, and Ansible evaluates a looped include's
+# `when` for every item BEFORE any included body runs -- so that `when` cannot stop the steps after a failure. The guard
+# is HERE, read live as each step starts (_rhc_step_live): once any earlier step recorded a failure, this step runs
+# nothing (no expansion, act, op, produce or predicate) and only logs that it was skipped. Undo, fixture_undo and cleanup
+# are variant.yml's always section and are never behind this guard.
+
+- name: "Read the live failure state as step {{ rhc_s.id }} starts (an earlier failure stops every later step)"
+  ansible.builtin.set_fact:
+    _rhc_step_live: "{{ _rhc_fail | length == 0 }}"
+
+- name: "Step {{ rhc_s.id }} is not run: an earlier step failed (logged; never evidence of the step)"
+  ansible.builtin.set_fact:
+    _rhc_log: "{{ _rhc_log + [{'step': rhc_s.id, 'skipped': 'not run: an earlier step failed', 'failures_before': _rhc_fail | length}] }}"
+  when: not (_rhc_step_live | bool)
+
+- name: "Expand step {{ rhc_s.id }} (twice: a variant token may itself name a token bound later, e.g. {hold_path} -> {staging})"
+  vars:
+    _once: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [rhc_s | dict2items | rejectattr('key', 'in', ['state', 'post_state']) | items2dict, _rhc_t]}}) | from_json }}"
+  ansible.builtin.set_fact:
+    _rhc_step_json: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [_once, _rhc_t]}}) }}"
+  when: _rhc_step_live | bool
+
+- name: "Parse step {{ rhc_s.id }} (state / post_state stay raw: each predicate is expanded when its turn comes)"
+  ansible.builtin.set_fact:
+    _rhc_step: "{{ (_rhc_step_json | from_json) | combine(rhc_s | dict2items | selectattr('key', 'in', ['state', 'post_state']) | items2dict) }}"
+    _rhc_step_residual: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'residual', 'args': [_rhc_step_json]}}) | from_json }}"
+    _rhc_ctx: "{{ _rhc_ctx | combine({'t': _rhc_t}) }}"
+  when: _rhc_step_live | bool
+
+- name: "A residual token in {{ rhc_s.id }} is a declaration error (never passed to an entrypoint)"
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [rhc_s.id ~ ': unresolved tokens ' ~ (_rhc_step_residual | join(' '))] }}"
+  when: _rhc_step_live | bool and _rhc_step_residual | length > 0
+
+- name: "Act {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: act.yml
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.act is defined
+
+- name: "Wait {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: wait.yml
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.wait is defined
+
+- name: "Kill {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: kill.yml
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.kill is defined
+
+- name: "Freeze or thaw {{ rhc_s.id }} (the act's own transient scope; cgroup v2 freezer)"
+  ansible.builtin.include_tasks: freeze.yml
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and (_rhc_step.freeze is defined or _rhc_step.thaw is defined)
+
+- name: "Join {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: join.yml
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.join is defined
+
+# G-OP-PER-ITEM-GUARD (codex tick330 item 2): this loop's `when` is evaluated for every op before any runs, so the per-op
+# stop is INSIDE op.yml (read live as each op starts); rhc_oi is the op's index, rhc_op_decl marks a step's ops list (the
+# only ops a step's declared op outcome -- expect op_failed / op_index / op_skipped -- may apply to)
+- name: "Ops {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: op.yml
+  loop: "{{ _rhc_step.ops | default([]) }}"
+  loop_control:
+    loop_var: rhc_o
+    index_var: rhc_oi
+  vars:
+    rhc_op_decl: true
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.ops is defined
+
+- name: "Snapshot {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: snapshot.yml
+  vars:
+    rhc_snap: "{{ _rhc_step.snapshot }}"
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.snapshot is defined
+
+- name: "Tree {{ rhc_s.id }} (digest-bearing record; codex 234857)"
+  ansible.builtin.include_tasks: tree.yml
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.tree is defined
+
+- name: "Fixture staging {{ rhc_s.id }} (confined, declared, recorded; codex 231744 option (a))"
+  ansible.builtin.include_tasks: fixture_ops.yml
+  loop: "{{ _rhc_step.fixture_ops | default([]) }}"
+  loop_control:
+    loop_var: rhc_fo
+    index_var: rhc_foi
+    label: "{{ rhc_s.id }}[{{ rhc_foi }}]"
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.fixture_ops is defined and _rhc_fail | length == 0
+
+- name: "Produce {{ rhc_s.id }} (one in-process route producer call; codex 230249 (a))"
+  ansible.builtin.include_tasks: produce.yml
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.produce is defined
+
+- name: "State {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: state.yml
+  vars:
+    rhc_preds: "{{ _rhc_step.state }}"
+    rhc_preds_label: "{{ rhc_s.id }}"
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.state is defined
+
+- name: "Budget scope {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: scope.yml
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.sample_scope is defined
+
+- name: "Judge the pair {{ rhc_s.id }}"
+  ansible.builtin.set_fact:
+    _rhc_fail: >-
+      {{ _rhc_fail + (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_pair', 'args': [_rhc_step.judge_pair, _rhc_results_v, _rhc_ctx]}})
+         | from_json | map('regex_replace', '^', rhc_s.id ~ ': ') | list) }}
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.judge_pair is defined
+
+- name: "Post-state {{ rhc_s.id }}"
+  ansible.builtin.include_tasks: state.yml
+  vars:
+    rhc_preds: "{{ _rhc_step.post_state }}"
+    rhc_preds_label: "{{ rhc_s.id }} post_state"
+  when: _rhc_step_live | bool and _rhc_step_residual | length == 0 and _rhc_step.post_state is defined and _rhc_fail | length == 0

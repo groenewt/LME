@@ -1,0 +1,116 @@
+---
+# testing/remote_harness/tasks/prepare_fetch.yml -- ONE constrained HTTPS hop of a PREPARATION fetch (codex-tick369 /
+# tick372; controller.bootstrap.preparation.fetch). AUTHORED, NEVER EXECUTED. Included by tasks/prepare_image.yml and
+# tasks/prepare_tools.yml only (acquire.yml's preparation phase, controller-local, the genesis acquire stage).
+#
+# A redirect is never followed by the HTTP client: every hop is its own ansible.builtin.uri request with
+# follow_redirects: none, admitted BEFORE it is contacted, and the next hop is this same file included again (bounded
+# by fetch.max_hops). So a hop to an unapproved host, scheme, port or path is refused BEFORE any request is sent to it
+# (no cross-origin escape, no bytes from it). TLS: validate_certs true on every hop (Python ssl: chain against the
+# declared CA bundle fetch.ca_file + hostname match); there is no insecure option and no http downgrade.
+#
+# Inputs (FACTS the caller sets with ONE set_fact before including this file, never include vars -- an include var
+# outranks set_fact and is templated lazily; every rh_prep_* name is in the C1-proposed reserved family, so an
+# extra-var pin refuses at entry; no defaults):
+#   rh_prep_f_url     the URL of THIS hop (absolute https URL)
+#   rh_prep_f_dest    the file the body of a 200 response is written to (inside the preparation root's partial dir;
+#                     removed first, removed again after a redirect hop -- a hop body is never admitted here)
+#   rh_prep_f_hosts   the approved exact host names of this origin (a list; no wildcard, no mirror unless declared)
+#   rh_prep_f_path    a regex every hop's PATH must fully match (the selected edition + file, or the declared archive
+#                     path: a redirect to another edition or file name refuses)
+#   rh_prep_f_hop     this hop's index (the caller passes 0)
+# Accumulated outputs (facts; the caller initialises rh_prep_f_hops: [] before hop 0):
+#   rh_prep_f_hops    ordered [{url, status}] of every hop contacted
+#   rh_prep_f_final   the URL whose 200 body is at rh_prep_f_dest (set only on the terminal hop)
+# Refusal: RH-PREPARE (controller.bootstrap.preparation.refusal). Nothing here parses or admits a body.
+
+- name: "PREPARE FETCH -- admit hop {{ rh_prep_f_hop }} before contacting it (https, approved host, port 443, declared path, bounded)"
+  vars:
+    _s: "{{ rh_prep_f_url | urlsplit }}"
+    _p: "{{ rh.controller.bootstrap.preparation }}"
+  ansible.builtin.assert:
+    that:
+      - rh_prep_f_url is string
+      - rh_prep_f_hop | int <= _p.fetch.max_hops | int
+      - _s.scheme == _p.fetch.scheme
+      - _s.hostname is string and _s.hostname in rh_prep_f_hosts
+      - _s.port in [none, _p.fetch.port | int]
+      - _s.username is none and _s.password is none
+      - _s.query == '' and _s.fragment == ''
+      - _s.path is match(rh_prep_f_path)
+    fail_msg: >-
+      REFUSED {{ _p.refusal }}: hop {{ rh_prep_f_hop }} {{ rh_prep_f_url }} is not admitted (scheme {{ _p.fetch.scheme }}
+      only, a host in {{ rh_prep_f_hosts }}, port {{ _p.fetch.port }}, no userinfo/query/fragment, path fully matching
+      {{ rh_prep_f_path }}, at most {{ _p.fetch.max_hops }} redirects). It was NOT contacted; nothing was admitted.
+    quiet: true
+
+- name: "PREPARE FETCH -- remove a stale hop body (never admitted; an interrupted earlier attempt's partial)"
+  ansible.builtin.file:
+    path: "{{ rh_prep_f_dest }}"
+    state: absent
+
+- name: "PREPARE FETCH -- request hop {{ rh_prep_f_hop }} (redirects NOT followed; TLS chain + hostname validated)"
+  ansible.builtin.uri:
+    url: "{{ rh_prep_f_url }}"
+    method: GET
+    follow_redirects: none
+    validate_certs: true
+    ca_path: "{{ rh.controller.bootstrap.preparation.fetch.ca_file }}"
+    use_proxy: false
+    use_netrc: false
+    force: true
+    timeout: "{{ rh.controller.bootstrap.preparation.fetch.timeout_s }}"
+    dest: "{{ rh_prep_f_dest }}"
+    status_code: "{{ [200] + rh.controller.bootstrap.preparation.fetch.redirect_status }}"
+  register: _rh_prep_f_resp
+  failed_when: false
+
+- name: "PREPARE FETCH -- record hop {{ rh_prep_f_hop }}"
+  ansible.builtin.set_fact:
+    rh_prep_f_hops: "{{ rh_prep_f_hops + [{'url': rh_prep_f_url, 'status': _rh_prep_f_resp.status | default(-1)}] }}"
+
+- name: "PREPARE FETCH -- refuse a failed hop (TLS / hostname / connection error, or a status outside 200 + the declared redirects)"
+  ansible.builtin.assert:
+    that:
+      - (_rh_prep_f_resp.status | default(-1)) in ([200] + rh.controller.bootstrap.preparation.fetch.redirect_status)
+      - _rh_prep_f_resp.failed is not defined or not _rh_prep_f_resp.failed
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: hop {{ rh_prep_f_hop }} {{ rh_prep_f_url }} returned
+      status {{ _rh_prep_f_resp.status | default(-1) }} ({{ _rh_prep_f_resp.msg | default('') }}). An invalid certificate
+      chain or hostname refuses here; there is no fallback. Nothing was admitted.
+    quiet: true
+
+- name: "PREPARE FETCH -- the terminal hop: its body is at the destination (unverified; the caller binds it)"
+  when: _rh_prep_f_resp.status == 200
+  ansible.builtin.set_fact:
+    rh_prep_f_final: "{{ rh_prep_f_url }}"
+
+- name: "PREPARE FETCH -- a redirect hop: an absolute next location, within the hop bound; its body is discarded"
+  when: _rh_prep_f_resp.status != 200
+  block:
+    - name: "PREPARE FETCH -- refuse a relative, absent or over-bound redirect (never guessed)"
+      ansible.builtin.assert:
+        that:
+          - _rh_prep_f_resp.location is defined and _rh_prep_f_resp.location is string
+          - _rh_prep_f_resp.location is match('^[a-z]+://')
+          - (rh_prep_f_hop | int) < (rh.controller.bootstrap.preparation.fetch.max_hops | int)
+        fail_msg: >-
+          REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: hop {{ rh_prep_f_hop }} {{ rh_prep_f_url }} redirected
+          ({{ _rh_prep_f_resp.status }}) to '{{ _rh_prep_f_resp.location | default('') }}', which is not an absolute URL
+          or exceeds max_hops {{ rh.controller.bootstrap.preparation.fetch.max_hops }}. Nothing was admitted.
+        quiet: true
+
+    - name: "PREPARE FETCH -- discard the redirect body (never admitted)"
+      ansible.builtin.file:
+        path: "{{ rh_prep_f_dest }}"
+        state: absent
+
+    # set_fact templates NOW (concrete values); include vars would be templated lazily and re-read the NEXT hop's
+    # register, and a self-referential rh_prep_f_hop include var would recurse. So the hop state is facts only.
+    - name: "PREPARE FETCH -- advance the hop state (concrete values, before the next include)"
+      ansible.builtin.set_fact:
+        rh_prep_f_url: "{{ _rh_prep_f_resp.location }}"
+        rh_prep_f_hop: "{{ rh_prep_f_hop | int + 1 }}"
+
+    - name: "PREPARE FETCH -- the next hop (admitted by the first task of this file before it is contacted)"
+      ansible.builtin.include_tasks: prepare_fetch.yml

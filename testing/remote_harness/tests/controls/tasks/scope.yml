@@ -1,0 +1,46 @@
+---
+# sample the budget scope of a RUNNING seed (_rhc_step.sample_scope.step) and judge its limits against the declared
+# budget (T22). Read-only: /proc/<pid>/cgroup and the cgroup v2 limit files.
+
+- name: Find the processes of the sampled operation
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.pgrep }}", -f, --, "{{ _rhc_jobs[_rhc_step.sample_scope.step].plan.kill_token | regex_escape }}"]
+  register: _rhc_sp
+  changed_when: false
+  failed_when: false
+
+- name: Read their cgroups
+  ansible.builtin.slurp:
+    src: "/proc/{{ item }}/cgroup"
+  loop: "{{ _rhc_sp.stdout_lines }}"
+  register: _rhc_scg
+  failed_when: false
+
+- name: The budget scope (a transient run-*.scope)
+  ansible.builtin.set_fact:
+    _rhc_scope: >-
+      {{ _rhc_scg.results | selectattr('content', 'defined') | map(attribute='content') | map('b64decode')
+         | map('regex_search', '^0::(/\S*/run-[^/\s]+\.scope)\s*$', '\1', multiline=true) | select | map('first') | unique | list }}
+
+- name: Exactly one scope must hold the operation
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [_rhc_step.id ~ ': expected one budget scope, found ' ~ (_rhc_scope | to_json)] }}"
+  when: _rhc_scope | length != 1
+
+- name: Read the scope limits
+  ansible.builtin.slurp:
+    src: "/sys/fs/cgroup{{ _rhc_scope[0] }}/{{ item }}"
+  loop: [memory.max, pids.max, cpu.max]
+  register: _rhc_slim
+  failed_when: false
+  when: _rhc_scope | length == 1
+
+- name: Judge the limits
+  vars:
+    _vals: "{{ dict(_rhc_slim.results | map(attribute='item') | zip(_rhc_slim.results | map(attribute='content', default='') | map('b64decode'))) }}"
+  ansible.builtin.set_fact:
+    _rhc_fail: >-
+      {{ _rhc_fail + (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'scope_check',
+           'args': [_vals, rh.controller.bootstrap]}}) | from_json | map('regex_replace', '^', _rhc_step.id ~ ': ') | list) }}
+    _rhc_log: "{{ _rhc_log + [{'step': _rhc_step.id, 'scope': _rhc_scope[0], 'limits': _vals}] }}"
+  when: _rhc_scope | length == 1

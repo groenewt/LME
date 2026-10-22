@@ -1,0 +1,80 @@
+---
+# testing/e2e/target_prereq/tasks/current.yml -- the CURRENT pair (localhost; non-root). jk_plan.current decides:
+#   fresh  : record 'started' (journal) -> generate -> tool-verified readback -> record 'done'
+#   resume : tool-verified readback of the pair a crashed run generated -> record 'done'
+#   adopt  : tool-verified readback of a pair already in the owned location with declared custody -> record 'done'
+#            (origin adopted)
+#   check  : tool-verified readback; the fingerprint and pub digest must equal the record's -> NO write (the unchanged
+#            reapply is a no-op)
+# Output: jk_record (the record after this phase).
+
+- name: Journal the fresh generation BEFORE it runs (record 'started'; a crash resumes, never re-adopts blindly)
+  ansible.builtin.include_tasks: "{{ jk_dir }}/tasks/record.yml"
+  vars:
+    _jk_rec_new:
+      schema: "{{ jk.record_schema }}"
+      revision: "{{ jk.revision }}"
+      deployment: "{{ jk_ctl.deployment }}"
+      target: "{{ jk_ctl.target }}"
+      owner: "{{ jk_ctl.owner }}"
+      key_type: "{{ jk.key_type }}"
+      key_path: "{{ jk_ctl.key }}"
+      pub_path: "{{ jk_ctl.pub }}"
+      generation: "{{ jk.generation }}"
+      origin: generated
+      state: started
+      fingerprint_sha256: null
+      pub_sha256: null
+      obligations: []
+  when: jk_plan.current == 'fresh'
+
+- name: Generate the current pair (fresh only)
+  ansible.builtin.include_tasks: "{{ jk_dir }}/tasks/generate.yml"
+  vars:
+    _jk_g_key: "{{ jk_ctl.key }}"
+    _jk_g_pub: "{{ jk_ctl.pub }}"
+    _jk_g_comment: "{{ jk_ctl.comment_base | replace('{generation}', jk.generation | string) }}"
+  when: jk_plan.current == 'fresh'
+
+- name: Tool-verified pair readback of the current pair (every plan, including the no-op)
+  ansible.builtin.include_tasks: "{{ jk_dir }}/tasks/readback.yml"
+  vars:
+    _jk_rb_key: "{{ jk_ctl.key }}"
+    _jk_rb_pub: "{{ jk_ctl.pub }}"
+    _jk_rb_what: current
+
+- name: Refuse a current pair that drifted from its record (unchanged reapply must read back identical)
+  ansible.builtin.assert:
+    that:
+      - jk_rb.fingerprint_sha256 == jk_prior.fingerprint_sha256
+      - jk_rb.pub_sha256 == jk_prior.pub_sha256
+    fail_msg: >-
+      REFUSED JKEY-DRIFT: {{ jk_ctl.pub }} reads back {{ jk_rb.fingerprint_sha256 }} / {{ jk_rb.pub_sha256 }} but the
+      record says {{ jk_prior.fingerprint_sha256 }} / {{ jk_prior.pub_sha256 }}; preserved, never regenerated.
+    quiet: true
+  when: jk_plan.current == 'check'
+
+- name: Keep the recorded state on the unchanged reapply (no write)
+  ansible.builtin.set_fact:
+    jk_record: "{{ jk_prior }}"
+  when: jk_plan.current == 'check'
+
+- name: Record the current pair 'done' (fresh / resume / adopt)
+  ansible.builtin.include_tasks: "{{ jk_dir }}/tasks/record.yml"
+  vars:
+    _jk_rec_new:
+      schema: "{{ jk.record_schema }}"
+      revision: "{{ jk.revision }}"
+      deployment: "{{ jk_ctl.deployment }}"
+      target: "{{ jk_ctl.target }}"
+      owner: "{{ jk_ctl.owner }}"
+      key_type: "{{ jk.key_type }}"
+      key_path: "{{ jk_ctl.key }}"
+      pub_path: "{{ jk_ctl.pub }}"
+      generation: "{{ jk.generation if jk_plan.current in ['fresh', 'adopt'] else jk_prior.generation }}"
+      origin: "{{ 'adopted' if jk_plan.current == 'adopt' else (jk_prior.origin if jk_plan.current == 'resume' else 'generated') }}"
+      state: done
+      fingerprint_sha256: "{{ jk_rb.fingerprint_sha256 }}"
+      pub_sha256: "{{ jk_rb.pub_sha256 }}"
+      obligations: "{{ (jk_prior.obligations if jk_plan.current == 'resume' else []) }}"
+  when: jk_plan.current in ['fresh', 'resume', 'adopt']

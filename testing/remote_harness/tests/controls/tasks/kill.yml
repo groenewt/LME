@@ -1,0 +1,129 @@
+---
+# kill a whole operation (_rhc_step.kill: {step} | {root} | {token}): the act's own transient scope and the seed's budget
+# scope first (systemd user scopes of the matching processes; never the runner's own), then every process whose command
+# line carries the token; pgrep must end empty. processes_only: the token kill alone (an act run with scope: shared, E30:
+# its processes die but the session scope they shared stays populated).
+
+- name: The kill token
+  ansible.builtin.set_fact:
+    _rhc_ktok: >-
+      {{ _rhc_step.kill.token if _rhc_step.kill.token is defined
+         else ((' --root ' ~ _rhc_step.kill.root) if _rhc_step.kill.root is defined
+         else _rhc_jobs[_rhc_step.kill.step].plan.kill_token) }}
+
+- name: Find the processes carrying the token
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.pgrep }}", -f, --, "{{ _rhc_ktok | regex_escape }}"]
+  register: _rhc_kp
+  changed_when: false
+  failed_when: _rhc_kp.rc not in [0, 1]
+
+- name: Read their stat and cmdline (a selective kill picks exactly one process of the operation)
+  ansible.builtin.slurp:
+    src: "/proc/{{ item.0 }}/{{ item.1 }}"
+  loop: "{{ _rhc_kp.stdout_lines | product(['stat', 'cmdline']) | list }}"
+  register: _rhc_kpi
+  failed_when: false
+  when: _rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false)
+
+# No doubled-backslash constant inside {{ }} (RH-BUNDLE-CHECKSUM-NEWLINES class: ansible-core 2.19 AnsibleLexer doubles a
+# constant's backslashes, so '\\1' reached re.sub as a literal backslash + 1): the ppid pattern uses bracket classes and the
+# group reference is the var _rhc_g1, a YAML single-quoted value (a variable's value is never lexed).
+- name: Selective kill -- holder_only (the entrypoint's MAIN ansible-playbook process, whose parent is not one) or tracer_only (strace)
+  vars:
+    _rhc_g1: '\1'
+    _pids: "{{ _rhc_kp.stdout_lines }}"
+    _cmd: >-
+      {{ dict(_rhc_kpi.results | selectattr('item.1', 'equalto', 'cmdline') | map(attribute='item.0')
+              | zip(_rhc_kpi.results | selectattr('item.1', 'equalto', 'cmdline') | map(attribute='content', default='') | map('b64decode')
+                    | map('regex_replace', '\x00', ' '))) }}
+    _ppid: >-
+      {{ dict(_rhc_kpi.results | selectattr('item.1', 'equalto', 'stat') | map(attribute='item.0')
+              | zip(_rhc_kpi.results | selectattr('item.1', 'equalto', 'stat') | map(attribute='content', default='') | map('b64decode')
+                    | map('regex_replace', '^.*[)] [^ ]+ ([0-9]+) .*$', _rhc_g1))) }}
+    _tracers: "{{ _pids | select('in', _cmd) | list | zip(_pids | select('in', _cmd) | map('extract', _cmd)) | selectattr('1', 'match', (rhc_decl.runner_tools.strace | regex_escape) ~ ' ') | map('first') | list }}"
+    _others: >-
+      {{ _pids | select('in', _cmd) | list | zip(_pids | select('in', _cmd) | map('extract', _cmd))
+         | rejectattr('1', 'match', '(' ~ ([rhc_decl.runner_tools.strace, rhc_decl.runner_tools.timeout] + (rhc_decl.wraps | dict2items | map(attribute='value') | flatten | select('match', '/') | list))
+                                           | map('regex_escape') | join('|') ~ ') ')
+         | selectattr('1', 'search', rh.controller.bootstrap.bundle.staging_retention.lease.holder_argv_regex) | map('first') | list }}
+  ansible.builtin.set_fact:
+    _rhc_kone: >-
+      {{ (_others | zip(_others | map('extract', _ppid)) | rejectattr('1', 'in', _others) | map('first') | list)
+         if (_rhc_step.kill.holder_only | default(false)) else _tracers }}
+  when: _rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false)
+
+- name: Exactly one process must be selected
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [_rhc_step.id ~ ': selective kill found ' ~ (_rhc_kone | to_json)] }}"
+  when: (_rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false)) and _rhc_kone | length != 1
+
+- name: Kill the selected process only
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.kill }}", -KILL, "{{ _rhc_kone[0] }}"]
+  changed_when: true
+  when: (_rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false)) and _rhc_kone | length == 1
+
+- name: Read their cgroups
+  ansible.builtin.slurp:
+    src: "/proc/{{ item }}/cgroup"
+  loop: "{{ _rhc_kp.stdout_lines }}"
+  register: _rhc_kcg
+  failed_when: false
+  when: not (_rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false))
+
+- name: The runner's own control group (never killed, whatever its name)
+  ansible.builtin.set_fact:
+    _rhc_kself: "{{ lookup('ansible.builtin.file', '/proc/self/cgroup') | regex_search('^0::(\\S+)$', '\\1', multiline=true) | default([''], true) | first }}"
+  when: not (_rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false) or _rhc_step.kill.processes_only | default(false))
+
+- name: Kill the act's own transient scope first (every process of the act, reparented or not; its cgroup then empties)
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.systemctl }}", --user, kill, --signal=SIGKILL, "{{ _rhc_jobs[_rhc_step.kill.step].plan.unit }}"]
+  environment:
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: true
+  failed_when: false
+  when: >-
+    not (_rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false) or _rhc_step.kill.processes_only | default(false))
+    and _rhc_step.kill.step is defined and (_rhc_jobs[_rhc_step.kill.step].plan.unit | default('')) is match('^' ~ (rhc_decl.act_scope.unit_prefix | regex_escape) ~ '[0-9a-f]{20}[.]scope$')
+    and not _rhc_kself.endswith('/' ~ _rhc_jobs[_rhc_step.kill.step].plan.unit)
+
+- name: Kill each budget scope that holds one of them (the seed re-execs inside its unnamed user scope)
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.systemctl }}", --user, kill, --signal=SIGKILL, "{{ item }}"]
+  environment:
+    XDG_RUNTIME_DIR: "{{ _rhc_ctx.env.XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ _rhc_ctx.env.DBUS_SESSION_BUS_ADDRESS }}"
+  loop: >-
+    {{ _rhc_kcg.results | selectattr('content', 'defined') | map(attribute='content') | map('b64decode')
+       | map('regex_search', '/(run-[^/\s]+\.scope)\s*$', '\1', multiline=true) | select | map('first') | unique
+       | reject('in', [_rhc_kself | basename]) | list }}
+  changed_when: true
+  failed_when: false
+  when: not (_rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false) or _rhc_step.kill.processes_only | default(false))
+
+- name: Kill every process carrying the token
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.pkill }}", -KILL, -f, --, "{{ _rhc_ktok | regex_escape }}"]
+  register: _rhc_kk
+  changed_when: _rhc_kk.rc == 0
+  failed_when: _rhc_kk.rc not in [0, 1]
+  when: not (_rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false))
+
+- name: No process carrying the token may remain
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.pgrep }}", -f, --, "{{ _rhc_ktok | regex_escape }}"]
+  register: _rhc_kleft
+  until: _rhc_kleft.rc == 1
+  retries: "{{ rhc_decl.state.timeouts_s.kill_settle }}"
+  delay: 1
+  changed_when: false
+  failed_when: false
+  when: not (_rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false))
+
+- name: A survivor fails the step
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [_rhc_step.id ~ ': processes survived the kill: ' ~ (_rhc_kleft.stdout_lines | join(' '))] }}"
+  when: not (_rhc_step.kill.holder_only | default(false) or _rhc_step.kill.tracer_only | default(false)) and (_rhc_kleft.rc != 1)

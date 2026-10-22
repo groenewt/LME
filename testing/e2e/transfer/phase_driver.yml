@@ -1,0 +1,260 @@
+---
+# testing/e2e/transfer/phase_driver.yml -- PHASE DIAGNOSTIC driver (moved from controls/driver.yml so the route's
+# refuse_pinned_outputs.yml locates the repository from playbook_dir, which it searches at most 3 levels up).
+# It is narrower than integration, and every verdict says so. It runs B's own task files in the entry playbooks'
+# order and phases (observe-controller, observe-target, stage-controller, place-target), using the workstation
+# executor. Policy: the route's refuse_pinned_outputs.yml + resolve_policy.yml (the RESOLVED `rh`, the same
+# lme_resolved.remote_harness.policy the entries consume); this file never reads the raw profile. What it does NOT do:
+#   * run resolve_harness.yml / verify_toolchain_receipt.yml. There is no managed generation here, and none is ever
+#     faked; the writer token is derived from the driver's declared stand-in controller root (drv_ctl_root);
+#   * talk to a remote host. The "target" is the declared local stand-in host drv_stand_in (CASES harness.stand_in:
+#     connection local, a DECLARED member of the deployment's target group, so the projection gives it its own
+#     target scope), with the same modules and the same macros;
+#   * satisfy root-only declarations. decl_overrides narrows what a local user cannot meet (privilege uid,
+#     owner uids).
+# SOURCE-REF load binding (check B): after resolve_policy, controls/load_paths.yml asserts by realpath that every
+# loaded root is the admitted source (drv_candidate_root) and the shipped source is a verified clone
+# (drv_clone_dirs), else CONTROLS-SOURCE-LOAD-PATH; the controller play writes drv_load_paths_out for the verdict.
+# "The source" excludes <source>/<rh.controller.bootstrap.work_roots.root_rel>/ (the git-ignored run scratch, where
+# the clones live). This driver defaults and asserts no work root of its own: every path it writes is an extra-var.
+# Extra-vars come from controls/run_one_case.yml: transfer_dir, drv_ctl_root, drv_stand_in, drv_repo_root, the four
+# *_steps lists, decl_overrides, tamper, and the lme_transfer_* operational inputs. It needs C1's registry
+# (manifests/global.yml reserved_outputs) and the engine's lme_resolved.remote_harness projection: without them it
+# refuses at the route's guard (RH-DERIVED-OUTPUT-PINNED / RH-POLICY-UNRESOLVED), never falls back.
+# ENTRY GUARD (codex tick318-321 item 2): tr / tr_dir / tr_repo_root are DERIVED outputs, never play vars or driver
+# inputs. The declared override SEAMS stay inputs: transfer_dir, decl_overrides (and every drv_* / lme_transfer_*).
+# On each host's first play: the route guard, B's family guard (tasks/refuse_reserved_families.yml: every registered
+# name family, e.g. tr_* / _tr_*; codex-tick333), then the set_fact deriving tr_dir / tr from the seams, then the equality
+# assert (an extra-var would outrank the set_fact; the assert reads the effective value). tr_repo_root is derived from
+# the driver input drv_repo_root only AFTER load_paths.yml admitted it as a verified clone.
+- name: driver observe-controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Refuse pre-supplied harness outputs and derive the repository root (route author; first task)
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname | dirname | dirname }}/testing/remote_harness/tasks/refuse_pinned_outputs.yml"
+
+    - name: Refuse pre-supplied names of a reserved family (B family guard; second task, first entry)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/refuse_reserved_families.yml"
+
+    - name: Derive the transfer declaration and its directory from the declared seams (entry guard)
+      ansible.builtin.set_fact:
+        tr_dir: "{{ transfer_dir }}"
+        tr: "{{ (lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true) }}"
+
+    - name: Refuse a pinned transfer declaration or directory (entry guard; before any use)
+      ansible.builtin.assert:
+        that:
+          - tr_dir == transfer_dir
+          - tr == ((lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true))
+        fail_msg: >-
+          TRANSFER-DERIVED-OUTPUT-PINNED: {{ (['tr_dir'] if tr_dir != transfer_dir else [])
+          + (['tr'] if tr != ((lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true)) else []) }}
+          were supplied from outside the driver (extra-var); they are derived from transfer_dir / decl_overrides, never inputs.
+        quiet: true
+
+    - name: Resolve the harness policy (route author; the resolved `rh`, never the raw profile)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_policy.yml"
+
+    - name: SOURCE-REF load binding (check B) -- every loaded root is the admitted source (recorded for the verdict)
+      ansible.builtin.include_tasks: "{{ tr_dir }}/controls/load_paths.yml"
+      vars:
+        lp_write: true
+
+    - name: Read the controller identity (stand-in writer token; no managed generation)
+      ansible.builtin.slurp:
+        src: "{{ tr.contract.identity_file }}"
+      register: _drv_id
+
+    - name: Bind B to the resolved policy (as bind_controller.yml does after resolve_harness.yml)
+      ansible.builtin.set_fact:
+        tr_bs: "{{ rh.controller.bootstrap }}"
+        tr_adapter: "{{ rh.transfer.adapters[rh.transfer.adapter] }}"
+        tr_repo_root: "{{ drv_repo_root }}"
+        tr_ctl_token: "{{ ((_drv_id.content | b64decode | trim) ~ ':' ~ drv_ctl_root) | hash('sha256') }}"
+
+    # drv_repo_root was admitted above (load_paths.yml: a verified clone of the admitted commit); tr_repo_root is
+    # derived from it (the caller no longer passes tr_repo_root; C1 reserves it). An extra-var tr_repo_root would
+    # outrank the set_fact: the effective value is compared with its derivation before any step uses it.
+    - name: Refuse a pinned repository root (derived output)
+      ansible.builtin.assert:
+        that:
+          - tr_repo_root == drv_repo_root
+        fail_msg: "TRANSFER-DERIVED-OUTPUT-PINNED: ['tr_repo_root'] was supplied from outside the driver (extra-var); it is derived from the admitted drv_repo_root, never an input."
+        quiet: true
+
+    - name: Expect the observed stand-in target's controller-resolved scope (B-PER-HOST-POLICY-BINDING)
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/scope_expect.yml"
+      vars:
+        tr_scope_target: "{{ drv_stand_in }}"
+
+    - name: Run the steps
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/{{ _step }}.yml"
+      loop: "{{ observe_controller_steps }}"
+      loop_control:
+        loop_var: _step
+
+    - name: Report the rendered contract argv (K cases compare it exactly)
+      ansible.builtin.debug:
+        msg: >-
+          KARGV {{ tr_ssh_argv | join(' ') }} KCOMMON {{ tr_conn.ansible_ssh_common_args }} KHOST {{ tr_conn.ansible_host }}
+          KKEY={{ tr.contract.credential_selectors.bind_key | map('extract', tr_conn) | join('|') }}
+          KCLR={{ tr.contract.credential_selectors['clear'] | map('extract', tr_conn) | join('|') }} KEND
+      when: tr_ssh_argv is defined
+
+- name: driver observe-target
+  hosts: "{{ drv_stand_in }}"
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Refuse pre-supplied harness outputs (route author; first task on this host too)
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname | dirname | dirname }}/testing/remote_harness/tasks/refuse_pinned_outputs.yml"
+
+    - name: Refuse pre-supplied names of a reserved family (B family guard; second task, first entry)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/refuse_reserved_families.yml"
+
+    - name: Derive the transfer declaration and its directory from the declared seams (entry guard)
+      ansible.builtin.set_fact:
+        tr_dir: "{{ transfer_dir }}"
+        tr: "{{ (lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true) }}"
+
+    - name: Refuse a pinned transfer declaration or directory (entry guard; before any use)
+      ansible.builtin.assert:
+        that:
+          - tr_dir == transfer_dir
+          - tr == ((lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true))
+        fail_msg: >-
+          TRANSFER-DERIVED-OUTPUT-PINNED: {{ (['tr_dir'] if tr_dir != transfer_dir else [])
+          + (['tr'] if tr != ((lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer | combine(decl_overrides | default({}), recursive=true)) else []) }}
+          were supplied from outside the driver (extra-var); they are derived from transfer_dir / decl_overrides, never inputs.
+        quiet: true
+
+    - name: Resolve the harness policy on this host (route author)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_policy.yml"
+
+    - name: SOURCE-REF load binding (check B) on this host
+      ansible.builtin.include_tasks: "{{ tr_dir }}/controls/load_paths.yml"
+
+    - name: Bind B to the resolved policy on this host (its OWN target scope)
+      ansible.builtin.set_fact:
+        tr_bs: "{{ rh.controller.bootstrap }}"
+        tr_adapter: "{{ rh.transfer.adapters[rh.transfer.adapter] }}"
+
+    - name: Admit only the controller-resolved policy of THIS target's scope (B-PER-HOST-POLICY-BINDING)
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/scope_admit.yml"
+
+    # B-TOOL-PREADMISSION-EXEC control (drv_tool_subst {tool: path}): the derived path of a used tool names a
+    # SUBSTITUTED file while the derived identity sha256 stays the engine's -- a non-root stand-in for a replaced
+    # /usr/bin/id or /usr/bin/cat. target_observe.yml must refuse it before running it.
+    - name: Tamper -- substitute used tools' derived paths (identity unchanged)
+      ansible.builtin.set_fact:
+        lme_resolved: >-
+          {{ lme_resolved | combine({'remote_harness': {'adapter': {'tools': {'target.tools':
+               dict(drv_tool_subst | dict2items | map(attribute='key')
+                    | zip(drv_tool_subst | dict2items | map(attribute='value') | map('community.general.dict_kv', 'path')))}}}},
+               recursive=true) }}
+      when: drv_tool_subst | default({}) | length > 0
+
+    - name: Run the steps
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/{{ _step }}.yml"
+      loop: "{{ observe_target_steps }}"
+      loop_control:
+        loop_var: _step
+
+- name: driver stage-controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    # B-COMMIT-INDEX-RACE controls (cases use src: clone, so only the case's own clone moves): the index moves AFTER
+    # source_admit observed the source and BEFORE source_stage binds the archive -- a concurrent `git add`.
+    #   index_stage_edit: a tracked file's working bytes change and are staged (index blob != the commit's tree blob)
+    #   index_add_new:    a new file is staged (index membership != the commit's tree)
+    - name: Tamper -- move the index between observations (working bytes / new path staged)
+      ansible.builtin.copy:
+        content: "index moved between observations\n"
+        dest: "{{ lme_transfer_src }}/{{ 'README.md' if tamper == 'index_stage_edit' else 'lme-index-only.txt' }}"
+        mode: '0644'
+      when: (tamper | default('')) in ['index_stage_edit', 'index_add_new']
+
+    - name: Tamper -- stage it (git add; the index now differs from the admitted commit's tree)
+      ansible.builtin.command:
+        argv: ["{{ tr.source.git }}", -C, "{{ lme_transfer_src }}", add, --, "{{ 'README.md' if tamper == 'index_stage_edit' else 'lme-index-only.txt' }}"]
+      changed_when: true
+      when: (tamper | default('')) in ['index_stage_edit', 'index_add_new']
+
+    - name: Run the steps
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/{{ _step }}.yml"
+      loop: "{{ stage_controller_steps }}"
+      loop_control:
+        loop_var: _step
+
+    - name: Tamper -- drop the last member from the expected manifests (the archive keeps it, so it is unexpected)
+      ansible.builtin.set_fact:
+        tr_edition: >-
+          {{ tr_edition | combine({'members_text': (tr_edition.members_text.splitlines()[:-1] | join('\n')) ~ '\n',
+                                   'sha256_text': (tr_edition.sha256_text.splitlines()[:-1] | join('\n')) ~ '\n',
+                                   'modes_text': (tr_edition.modes_text.splitlines()[:-1] | join('\n')) ~ '\n'}) }}
+      when: (tamper | default('')) == 'drop_member'
+
+    - name: Tamper -- change the first expected digest
+      ansible.builtin.set_fact:
+        tr_edition: >-
+          {{ tr_edition | combine({'sha256_text': tr_edition.sha256_text | regex_replace('^[0-9a-f]', ('0' if tr_edition.sha256_text[0] != '0' else '1'))}) }}
+      when: (tamper | default('')) == 'change_digest'
+
+- name: driver place-target
+  hosts: "{{ drv_stand_in }}"
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Run the steps
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/{{ _step }}.yml"
+      loop: "{{ place_target_steps }}"
+      loop_control:
+        loop_var: _step
+
+    - name: Report the placement (U01 compares it)
+      ansible.builtin.debug:
+        msg: "PLACED pruned={{ tr_placed.pruned }} adopted={{ tr_placed.adopted }} reaped={{ tr_placed.reaped | length }} commit={{ tr_placed.edition.commit }}"
+      when: tr_placed is defined
+
+# B-INHERITED-OWNER-KEY consumption control (drv_consume_probe; K19/K20): the contract host (never contacted: the
+# case points contract.ssh_client at a RECORDING client that writes its argv and exits 0) gets EXACTLY the connection
+# play vars transfer.yml's target plays bind, and ONE raw task runs through the real ansible 2.19 ssh connection
+# plugin. The recorded argv is what the plugin consumed (IdentityFile / PasswordAuthentication); an inherited inline
+# key that was not cleared makes the plugin refuse before the client runs (SSH_AGENT none) or add its own identity.
+# No key value is printed: the probe task is no_log and nothing reads the key vars.
+- name: driver consume-contract
+  hosts: "{{ lme_transfer_target if (drv_consume_probe | default(false) | bool) else 'localhost:!localhost' }}"
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    ansible_connection: "{{ hostvars['localhost'].tr_conn.ansible_connection }}"
+    ansible_host: "{{ hostvars['localhost'].tr_conn.ansible_host }}"
+    ansible_user: "{{ hostvars['localhost'].tr_conn.ansible_user }}"
+    ansible_ssh_executable: "{{ hostvars['localhost'].tr_conn.ansible_ssh_executable }}"
+    ansible_ssh_common_args: "{{ hostvars['localhost'].tr_conn.ansible_ssh_common_args }}"
+    ansible_ssh_extra_args: "{{ hostvars['localhost'].tr_conn.ansible_ssh_extra_args }}"
+    ansible_ssh_private_key_file: "{{ hostvars['localhost'].tr_conn.ansible_ssh_private_key_file }}"
+    ansible_private_key_file: "{{ hostvars['localhost'].tr_conn.ansible_private_key_file }}"
+    ansible_password: "{{ hostvars['localhost'].tr_conn.ansible_password }}"
+    ansible_ssh_pass: "{{ hostvars['localhost'].tr_conn.ansible_ssh_pass }}"
+    ansible_ssh_pkcs11_provider: "{{ hostvars['localhost'].tr_conn.ansible_ssh_pkcs11_provider }}"
+    ansible_ssh_password: "{{ hostvars['localhost'].tr_conn.ansible_ssh_password }}"
+    ansible_private_key: "{{ hostvars['localhost'].tr_conn.ansible_private_key }}"
+    ansible_ssh_private_key: "{{ hostvars['localhost'].tr_conn.ansible_ssh_private_key }}"
+    ansible_private_key_passphrase: "{{ hostvars['localhost'].tr_conn.ansible_private_key_passphrase }}"
+    ansible_ssh_private_key_passphrase: "{{ hostvars['localhost'].tr_conn.ansible_ssh_private_key_passphrase }}"
+  tasks:
+    - name: Consume the bound contract through the ssh connection plugin (recording client; no remote host)
+      ansible.builtin.raw: 'true'
+      changed_when: false
+      no_log: true
+
+    - name: Report that the plugin reached the client
+      ansible.builtin.debug:
+        msg: KCONSUMED

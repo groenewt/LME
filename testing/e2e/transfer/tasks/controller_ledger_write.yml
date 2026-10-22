@@ -1,0 +1,64 @@
+---
+# testing/e2e/transfer/tasks/controller_ledger_write.yml -- the locked O_APPEND controller-ledger append (controller;
+# effect). Included ONLY by controller_ledger.yml, right after the route's shared ancestry re-admission (every caller,
+# incl. the PRIVILEGED place-target play's delegated terminal write; codex 163642).
+# Before the lock tool runs it is admitted by identity (B-TOOL-PREADMISSION-EXEC discipline); the state dir itself
+# must be a real 0700 directory of the gate user (admit_state_dir.yml's state-dir check, repeated at this use
+# boundary); an existing lock or ledger must be a regular non-link file of the gate user, not group/other-writable.
+# Inputs: tr, tr_dir, _cl_state (the controller's tr_state: dir, ledger, uid), _cl_flock (os_tools.flock: path,
+#         identity), _cl_lines (the ledger lines, in order). Effects: those lines appended, nothing else.
+
+- name: Stat the state dir, the lock tool, the ledger lock and the ledger (no link following; sha256 of the tool)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: "{{ item == _cl_flock.path }}"
+    checksum_algorithm: sha256
+  loop:
+    - "{{ _cl_flock.path }}"
+    - "{{ _cl_state.dir }}/{{ tr.controller_state.ledger_lock }}"
+    - "{{ _cl_state.ledger }}"
+    - "{{ _cl_state.dir }}"
+  register: _tr_cls
+
+- name: Refuse an unadmitted lock tool or state dir, or a linked / foreign / group-writable ledger lock or ledger (before any exec)
+  vars:
+    _t: "{{ _tr_cls.results[0].stat }}"
+    _f: "{{ _tr_cls.results[1:3] | map(attribute='stat') | selectattr('exists') | list }}"
+    _d: "{{ _tr_cls.results[3].stat }}"
+  ansible.builtin.assert:
+    that:
+      - _t.exists and _t.isreg and not _t.islnk and _t.executable
+      - _t.checksum == _cl_flock.identity.sha256
+      - _d.exists and _d.isdir and not _d.islnk and _d.uid == (_cl_state.uid | int) and _d.mode == '0700'
+      - _f | selectattr('islnk') | list | length == 0
+      - _f | rejectattr('isreg') | list | length == 0
+      - _f | selectattr('wgrp') | list | length == 0
+      - _f | selectattr('woth') | list | length == 0
+      - _f | map(attribute='uid') | reject('equalto', _cl_state.uid | int) | list | length == 0
+    fail_msg: >-
+      TRANSFER-STATE-LEDGER: the lock tool {{ _cl_flock.path }} is not the admitted os_tools.flock file (sha256
+      identity), or the state dir {{ _cl_state.dir }} is not a real 0700 directory of uid {{ _cl_state.uid }}, or
+      {{ _cl_state.dir }}/{{ tr.controller_state.ledger_lock }} / {{ _cl_state.ledger }} exists as a link, a non-regular
+      file, group/other-writable, or owned by another uid than {{ _cl_state.uid }}.
+    quiet: true
+
+- name: Append under the shared ledger lock (O_APPEND; serialized with every root sharing this state dir)
+  ansible.builtin.shell:
+    cmd: >-
+      {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                template_vars={'lme_macro': 'ctl_ledger_append', 'lme_args': [tr, _cl_flock.path, _cl_state.dir, _cl_lines]}) }}
+    executable: /bin/sh
+  environment: {LC_ALL: C}
+  register: _tr_cla
+  changed_when: _tr_cla.rc == 0
+  failed_when: false
+
+- name: Refuse a ledger write that did not happen (lock busy or append failed; nothing is assumed recorded)
+  ansible.builtin.assert:
+    that: [_tr_cla.rc == 0]
+    fail_msg: >-
+      TRANSFER-STATE-LEDGER-BUSY: rc={{ _tr_cla.rc }} ({{ tr.controller_state.ledger_busy_rc }} = another writer held
+      {{ _cl_state.dir }}/{{ tr.controller_state.ledger_lock }} longer than {{ tr.controller_state.ledger_wait_s }}s);
+      not recorded: {{ _cl_lines }} {{ _tr_cla.stderr | default('') }}
+    quiet: true

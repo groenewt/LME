@@ -1,0 +1,49 @@
+---
+# testing/remote_harness/tasks/fixture_components.yml -- the ONE in-clone component admission of the checkout-fixture
+# producer (codex 223517 H3-RELOCATE-REGISTRY-ANCESTOR-ESCAPE). Both kinds (tasks/fixture_checkout_edit.yml,
+# tasks/fixture_checkout_relocate.yml) include it for EVERY declared path they read or mutate -- source, destination,
+# registry and profile alike, no path special-cased -- before the first read and again right before each write; never
+# included on its own. tasks/admit_ancestry.yml admits / down to the clone; this admits the clone down to the path:
+# every component BELOW the clone except the last is an existing real directory (no link, so no component can redirect
+# a read or a write outside the clone, e.g. <clone>/manifests linked to the canonical manifests), and the last is
+# exactly the declared leaf state:
+#   reg     an existing regular file (no link)
+#   dir     an existing real directory (no link)
+#   absent  nothing at all (not even a dangling link)
+# Inputs (include params): rh_fx_clone (admitted by the caller), rh_fc_rel (a normalized repository-relative path;
+# asserted here), rh_fc_leaf. Refused REFUSED RH-FIXTURE-UNSUPPORTED otherwise; nothing is written. No output (the
+# callers stat the leaves they digest). A caller that loops over this file names its own loop_var: the stat loop below
+# uses `item`.
+
+- name: Refuse a component admission outside the declared shape
+  ansible.builtin.assert:
+    that:
+      - rh_fc_rel is defined and rh_fc_rel is string and rh_fc_rel is match('^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$')
+      - rh_fc_rel.split('/') | select('in', ['.', '..']) | list | length == 0
+      - rh_fc_leaf is defined and rh_fc_leaf in ['reg', 'dir', 'absent']
+    fail_msg: "REFUSED RH-FIXTURE-UNSUPPORTED: component admission of {{ rh_fc_rel | default('absent') }} as {{ rh_fc_leaf | default('absent') }} (reg | dir | absent)"
+    quiet: true
+
+- name: Stat every component of the path inside the clone, the leaf last (no link followed)
+  ansible.builtin.stat:
+    path: "{{ rh_fx_clone ~ '/' ~ (rh_fc_rel.split('/')[:item] | join('/')) }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ range(1, (rh_fc_rel.split('/') | length) + 1) | list }}"
+  register: _rh_fc_st
+
+- name: Refuse a linked or non-directory component, or a leaf that is not in the declared state
+  vars:
+    _d: "{{ _rh_fc_st.results[:-1] | map(attribute='stat') | list }}"
+    _l: "{{ _rh_fc_st.results[-1].stat }}"
+  ansible.builtin.assert:
+    that:
+      - _d | selectattr('exists') | selectattr('isdir') | rejectattr('islnk') | list | length == _d | length
+      - >-
+        (rh_fc_leaf == 'absent' and not _l.exists)
+        or (rh_fc_leaf == 'reg' and _l.exists and _l.isreg and not _l.islnk)
+        or (rh_fc_leaf == 'dir' and _l.exists and _l.isdir and not _l.islnk)
+    fail_msg: >-
+      REFUSED RH-FIXTURE-UNSUPPORTED: {{ rh_fx_clone }}/{{ rh_fc_rel }} is not reached through real directories of the
+      clone only (no link; a component could redirect outside the clone) or is not {{ rh_fc_leaf }}.
+    quiet: true

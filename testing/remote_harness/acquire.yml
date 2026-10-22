@@ -1,0 +1,529 @@
+---
+# testing/remote_harness/acquire.yml -- declared ACQUISITION route (codex-tick127 genesis: acquisition/admission
+# route + missing-dependency handling). MAIN runs it; it is the ONLY network-permitted stage of the bootstrap.
+#
+#   ansible-playbook -i <operator inventory> testing/remote_harness/acquire.yml
+# localhost host vars (inputs, no defaults), both NAMED by the declaration, never by a literal here (brr-follow-s2
+# OPEN-C; codex-tick542 OD-GEN-09; codex-tick556 settled_join_precision OPEN_C): the host var named by
+# genesis.acquisition.source_var = an EXISTING directory owned by the invoking account (the artifact store); the host var
+# named by genesis.acquisition.receipt_var = the receipt file path, OUTSIDE the store, in an existing owned directory.
+# Their VALUES are read INLINE in every use by a lookup of the declared name (brr-follow-s2 successor-06
+# ACQ-PLAY-VAR-PRECEDENCE, codex-572): no play-level alias exists, so no extra-var or host var can outrank or stand in
+# for the declared inputs; every lookup is evaluated only after the admission task below has checked the declared names
+# and the vars' presence (the measurement-only branch above it reads no acquisition input).
+#
+# Runs on the declared builder only (tasks/admit_builder.yml). For every declared artifact row
+# (controller.bootstrap.artifacts + the lock's packages and collections):
+#   EVERY row must declare `url` (present or not): a row without a declared source refuses before any fetch, so the
+#   declared mechanism alone can always carry a COLD acquisition (codex-000010: no manual placement by MAIN);
+#   a lock row's url must end in its exact `file` name (the lock records the tick112 URLs verbatim)
+#   present with the declared sha256            -> REUSED, not fetched (content-addressed: the digest is the lock's /
+#                                                  profile's declared sha256, never the file's own claim)
+#   present with another digest                 -> refused (never overwritten)
+#   absent                                      -> FETCHED by ansible.builtin.get_url from that exact URL, checksum-
+#                                                  pinned (2.19.11: download into the module tmpdir, sha256 checked
+#                                                  BEFORE atomic_move into the store, temp removed on mismatch)
+# A non-empty store is admitted (warm reapply is idempotent). Q-D04-COLD-START (codex-tick138, option (a)): the
+# store's entries are listed BEFORE any fetch; after the fetch every row is re-verified and ONE YAML receipt is written
+# OUTSIDE the store (so the store snapshot is untouched) recording store_empty_before, store_entries_before,
+# store_foreign_entries and, per row, file / declared url / declared sha256 / observed disposition (fetched | reused).
+# Cold qualification is store_empty_before AND every row fetched -- a warm or manually prefilled store cannot produce
+# it. Stdout marker: ACQUIRED ...; refusal: RH-ACQUIRE.
+# Nothing else is downloaded and nothing is executed. package.yml then admits the directory offline.
+# PREPARATION (codex-tick369 GUEST-ACQUISITION-ADMISSION-CYCLE, tick372 trust correction; C1 proposal
+# controller.bootstrap.preparation): ONLY when the resolved policy declares that section, a last phase
+# (tasks/prepare.yml) produces the CANDIDATES no other producer can -- the guest tool identities (members of the
+# OpenPGP-verified Debian packages, measured by native stat; no local QEMU install) and each declared base image
+# (debian_official_tls_sha512: constrained HTTPS, one dated edition, one checksum entry, SHA512 before atomic
+# admission) -- into ONE immutable content-addressed record under the localhost host var <preparation.root_var>,
+# disjoint from the store. It runs the admitted preparation tools only (tasks/admit_prep_tools.yml first), fetches only
+# through tasks/prepare_fetch.yml, and neither reads a target scope nor guest.allocation (this stage's inventory is
+# operator_controller_inventory). The candidate is admitted by C1 / B declarations and package.yml
+# (tasks/admit_preparation.yml), never by itself. Without the section this playbook is unchanged.
+# MEASUREMENT-ONLY (codex R4, route-r4b; C1 proposal controller.bootstrap.preparation_measurement revision 2 and
+# genesis.launch.stages.acquire selectors / operations): selected by a declared stage selector (localhost host var);
+# right after builder admission a selector gate refuses any requested operation that is undeclared, unsupported or
+# ambiguous, whether or not acquisition inputs are present; the admitted one (tasks/measure_controller_tools.yml)
+# checks the controller-only scope, writes ONE candidate measurement record under preparation_measurement.root_var and
+# ENDS the play (no fetch, no preparation). With no selector supplied this playbook is unchanged. route-r4c: the
+# selector gate's refusals use the common grammar controller.bootstrap.refusal_grammar (REFUSED <code>: <detail>,
+# through its entry template) and its path join uses path_admission.separator (C1 proposal r4c-c1-hunks.yml).
+# BASELINE MR03 PKG-CALLER optb-after-01 (successor of work / m1-1 210d3e15; NOT of the excluded FB-ROUTE afters; codex721
+# LOCKSHA-01; AUTHORED, NEVER EXECUTED, UNRUN): the receipt's lock_sha256 is the RAW captured-file digest of the ONE
+# controller lock capture rh_seed_lock {text, sha256, packages, collections} (captured once, digested, verified and
+# parsed from that capture by tasks/resolve_policy.yml), never a second read of the lock and never the rstripped-text
+# digest of lookup('file') | hash. Historical stripped-digest receipts stay as written (never rewritten, never accepted as
+# the new value; MIGRATION-PKG-LOCKSHA-01, migration-pkg-locksha-01.yml). BLOCKED-ON-MAIN-RECORD + atomic join: the
+# resolve_policy.yml capture successor (a NEW path) and the controller.yml / tasks/prepare.yml writers land in the same
+# unit. Change record: proposals/mr03-pkg-caller/optb-acquire-01v.change.yml.
+- name: Acquire the declared bootstrap artifacts (sha256-pinned, declared sources only)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse pre-supplied derived outputs and derive the repository root
+      ansible.builtin.include_tasks: tasks/refuse_pinned_outputs.yml
+
+    - name: Bind the effective controller connection before any effect (local, localhost, no become; r3g)
+      ansible.builtin.include_tasks: tasks/admit_controller.yml
+
+    - name: Resolve the harness policy through the engine
+      ansible.builtin.include_tasks: tasks/resolve_policy.yml
+      vars:
+        rh_rp_caller: testing/remote_harness/acquire.yml
+        rh_invocation_requirement: "{{ _rh_sa_decl.invocation.requirements.ordinary_permitted }}"
+
+    - name: Admit exactly the declared builder (GENESIS)
+      ansible.builtin.include_tasks: tasks/admit_builder.yml
+      vars:
+        rh_gen_stage: acquire     # genesis.launch.stages key: env and temps under <work root>/tmp/genesis/acquire/<act>
+
+    # STAGE OPERATION SELECTORS (route-r4b R4-MODE-WITHOUT-DECLARATION; C1 proposal genesis.launch.stages.acquire
+    # selectors / operations). The selector NAMES are declared at the stage, apart from the operation nodes, so an
+    # explicitly requested operation is recognised even when its node is undeclared. ANY supplied selector (extra-var or
+    # inventory; presence, whatever its value -- an empty value is a request too) requires: exactly ONE requested
+    # operation, its node declared at the revision the stage declares, its mode selector supplied with the declared mode
+    # value. Otherwise REFUSED here -- after builder admission, before the artifact-source admission and any fetch --
+    # whether or not acquisition inputs are present. With NO selector supplied every expression below is vacuous and the
+    # stage is unchanged. The selector declaration itself is required (no default): the contract
+    # (contract_admission.genesis_stage_operations) makes it mandatory, so every admissible resolve carries it.
+    # Inline in every use (no task var: an extra-var would outrank it).
+    - name: "SELECTORS -- refuse a resolve without the stage selector declaration (required; no default)"
+      ansible.builtin.assert:
+        that:
+          - rh.controller.bootstrap.genesis.launch.stages.acquire.selectors is mapping
+          - rh.controller.bootstrap.genesis.launch.stages.acquire.operations is mapping
+          - rh.controller.bootstrap.genesis.launch.stages.acquire.refusal is string
+          - rh.controller.bootstrap.genesis.launch.stages.acquire.diagnostics is mapping
+        # absent-node diagnostics from the ADMITTED parent (genesis.launch.refusal, the stage's playbook_rel and its key
+        # set), formatted by the common refusal grammar (route-r4c; C1 controller.bootstrap.refusal_grammar)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.genesis.launch.refusal,
+                                   'rh_rf_detail': [rh.controller.bootstrap.genesis.launch.stages.acquire.playbook_rel,
+                                                    rh.controller.bootstrap.genesis.launch.stages.acquire | list | to_json]}) }}
+        quiet: true
+
+    - name: "SELECTORS -- refuse an explicitly requested acquire-stage operation that is undeclared, unsupported or ambiguous"
+      ansible.builtin.assert:
+        that:
+          - >-
+            rh.controller.bootstrap.genesis.launch.stages.acquire.selectors.values()
+            | reject('in', rh.controller.bootstrap.genesis.launch.stages.acquire.operations) | list | length == 0
+          - >-
+            rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+            | map(attribute='value') | unique | list | length <= 1
+          - >-
+            rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+            | map(attribute='value') | unique | reject('in', rh.controller.bootstrap) | list | length == 0
+          - >-
+            (rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+             | map(attribute='value') | unique | map('extract', rh.controller.bootstrap) | map(attribute='revision') | list)
+            == (rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+                | map(attribute='value') | unique | map('extract', rh.controller.bootstrap.genesis.launch.stages.acquire.operations)
+                | map(attribute='revision') | list)
+          - >-
+            rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+            | map(attribute='value') | unique | map('extract', rh.controller.bootstrap.genesis.launch.stages.acquire.operations)
+            | map(attribute='mode_selector') | reject('in', vars) | list | length == 0
+          - >-
+            query('ansible.builtin.vars', *(rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items
+                  | selectattr('key', 'in', vars) | map(attribute='value') | unique
+                  | map('extract', rh.controller.bootstrap.genesis.launch.stages.acquire.operations)
+                  | map(attribute='mode_selector') | list))
+            == (rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+                | map(attribute='value') | unique | map('extract', rh.controller.bootstrap.genesis.launch.stages.acquire.operations)
+                | map(attribute='mode_value') | list)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template',
+                    rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': rh.controller.bootstrap.refusal_grammar,
+                                   'rh_rf_code': rh.controller.bootstrap.genesis.launch.stages.acquire.refusal,
+                                   'rh_rf_detail': [rh.controller.bootstrap.genesis.launch.stages.acquire.diagnostics.selectors,
+                                                    rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | list | select('in', vars) | list | to_json,
+                                                    rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+                                                    | map(attribute='value') | unique | list | to_json,
+                                                    rh.controller.bootstrap.genesis.launch.stages.acquire.diagnostics.stop]}) }}
+        quiet: true
+
+    # THE REQUESTED OPERATION (codex-r2-r4-r5-bootstrap-decisions-20261006 R4; route-r4b): the ONE operation the gate
+    # above admitted runs from its declared tasks_rel (preparation_measurement -> tasks/measure_controller_tools.yml,
+    # which ENDS the play) -- before the artifact-source admission below, any fetch and preparation. No selector
+    # supplied -> skipped (the when is evaluated before the file name is templated) and the stage is unchanged.
+    - name: "STAGE OPERATION -- the requested declared operation, then END (its declared tasks_rel)"
+      ansible.builtin.include_tasks: >-
+        {{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.genesis.launch.stages.acquire.operations[
+             rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+             | map(attribute='value') | first].tasks_rel }}
+      vars:
+        rh_gen_stage: acquire     # the same genesis.launch.stages key as the builder admission above
+      when: >-
+        rh.controller.bootstrap.genesis.launch.stages.acquire.selectors | dict2items | selectattr('key', 'in', vars)
+        | list | length > 0
+
+    - name: Bind the engine-published artifact classes before acquisition
+      ansible.builtin.include_tasks: tasks/scope_classes.yml
+
+    - name: Admit the acquisition execution declaration and resolved toolchain views
+      ansible.builtin.assert:
+        that:
+          - rh.controller.bootstrap.genesis.acquisition.execution is mapping
+          - lme_resolved.remote_harness.toolchain_renderers is mapping
+          - lme_resolved.remote_harness.generation_bindings is mapping
+          - rh.controller.bootstrap.genesis.builder.toolchain_role in lme_resolved.remote_harness.toolchain_renderers
+          - rh.controller.bootstrap.genesis.builder.toolchain_role in lme_resolved.remote_harness.generation_bindings
+          - rh_classes | length > 0
+          - rh_classes | map(attribute='key') | unique(case_sensitive=rh.controller.bootstrap.genesis.acquisition.execution.case_sensitive) | length == rh_classes | length
+        quiet: true
+
+    - name: Capture references to the executing builder and every selected class payload recipe
+      ansible.builtin.set_fact:
+        _rh_acq_recipes: >-
+          {%- set f = rh.controller.bootstrap.genesis.acquisition.execution.fields -%}
+          {%- set br = rh.controller.bootstrap.genesis.builder.toolchain_role -%}
+          {%- set pr = rh.controller.bootstrap.bundle.payload_role -%}
+          {%- set s = lme_resolved.remote_harness -%}
+          {%- set ns = namespace(rows=[{f.binding: s.generation_bindings[br], f.controller: s.toolchain_renderers[br].controller}]) -%}
+          {%- for c in rh_classes -%}
+          {%- set ns.rows = ns.rows + [{f.binding: c.generation_bindings[pr], f.controller: c.toolchain_renderers[pr].controller}] -%}
+          {%- endfor -%}{{ ns.rows }}
+
+    - name: Admit every published recipe reference and source member before reading a new lock
+      vars:
+        _lc: "{{ rh.controller.bootstrap.lock_capture }}"
+        _sa: "{{ rh.controller.bootstrap.source_admission }}"
+      ansible.builtin.assert:
+        that:
+          - item.binding is mapping and item.controller is mapping
+          - item.binding.lock_rel == item.controller.lock_file_rel
+          - item.binding.lock_rel in rh_src_admission[_sa.record_fields.members]
+          - item.binding.lock_sha256 == rh_src_admission[_sa.record_fields.members][item.binding.lock_rel][_sa.member_fields.observed]
+          - item.binding.recipe_sha256 == item.controller.bootstrap.lock_capture.resolved_recipe[item.binding.role].recipe_sha256
+          - _lc.digest_algorithm == _sa.digest_algorithm
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+      loop: "{{ _rh_acq_recipes }}"
+      loop_control:
+        label: "{{ item.binding.role }} {{ item.binding.class_key }} {{ item.binding.lock_rel }}"
+
+    - name: Seed the lock cache from the builder bytes already admitted by resolve_policy
+      ansible.builtin.set_fact:
+        _rh_acq_locks: "{{ {_rh_lock_rel: rh_seed_lock} }}"
+
+    - name: Capture each additional distinct source-admitted lock once
+      ansible.builtin.include_tasks: "{{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.genesis.acquisition.execution.capture_tasks_rel }}"
+      loop: "{{ _rh_acq_recipes | map(attribute='binding.lock_rel') | unique(case_sensitive=rh.controller.bootstrap.genesis.acquisition.execution.case_sensitive) | sort | reject('in', _rh_acq_locks) | list }}"
+      loop_control:
+        loop_var: _rh_acq_lock_rel
+
+    - name: Refuse a captured lock that differs from any referring engine binding
+      ansible.builtin.assert:
+        that:
+          - _rh_acq_locks[item.binding.lock_rel].sha256 == item.binding.lock_sha256
+        fail_msg: "{{ rh.controller.bootstrap.lock_capture.refusal }}"
+        quiet: true
+      loop: "{{ _rh_acq_recipes }}"
+      loop_control:
+        label: "{{ item.binding.role }} {{ item.binding.class_key }}"
+
+    - name: Preserve the declared lock-origin filename check before any fetch
+      ansible.builtin.assert:
+        that:
+          - item.url is defined and item.url is string
+          - item.url | basename == item.file
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+      loop: "{{ (_rh_acq_locks.values() | map(attribute='packages') | flatten) + (_rh_acq_locks.values() | map(attribute='collections') | flatten) }}"
+      loop_control:
+        label: "{{ item.file }}"
+
+    - name: Preserve each artifact contribution with its exact role and class provenance
+      ansible.builtin.set_fact:
+        _rh_acq_refs: >-
+          {%- set e = rh.controller.bootstrap.genesis.acquisition.execution -%}
+          {%- set ns = namespace(rows=[]) -%}
+          {%- for r in _rh_acq_recipes -%}
+          {%- set lock = _rh_acq_locks[r.binding.lock_rel] -%}
+          {%- set binding = r.binding | dict2items | selectattr('key', 'in', e.recipe_fields) | items2dict -%}
+          {%- for row in r.controller.bootstrap.artifacts + lock.packages + lock.collections -%}
+          {%- set ns.rows = ns.rows + [row | combine({e.fields.recipes: [binding]})] -%}
+          {%- endfor -%}{%- endfor -%}{{ ns.rows }}
+
+    - name: Refuse unsafe artifact names, unpinned URLs, invalid budgets or conflicting store identities before fetch
+      vars:
+        _e: "{{ rh.controller.bootstrap.genesis.acquisition.execution }}"
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - _e.artifact_fields | difference(item | list) | length == 0
+          - item.file is string and item.file is ansible.builtin.regex(_e.file_pattern, match_type=_e.regex_match)
+          - item.url is string and item.url is ansible.builtin.regex(_e.url_pattern, match_type=_e.regex_match)
+          - item.sha256 is string and item.sha256 is match(rh.controller.bootstrap.genesis.entry.digest_regex)
+          - item.max_bytes is integer and item.max_bytes is not boolean and item.max_bytes > 0
+          - _rh_acq_refs | selectattr('file', 'equalto', item.file) | map(attribute='sha256') | unique(case_sensitive=rh.controller.bootstrap.genesis.acquisition.execution.case_sensitive) | length == 1
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+      loop: "{{ _rh_acq_refs }}"
+      loop_control:
+        label: "{{ item.file }}"
+
+    - name: Deduplicate store objects while retaining every recipe reference and the strictest byte cap
+      ansible.builtin.set_fact:
+        _rh_acq_rows: >-
+          {%- set e = rh.controller.bootstrap.genesis.acquisition.execution -%}
+          {%- set f = e.fields -%}
+          {%- set ns = namespace(rows=[]) -%}
+          {%- for file in _rh_acq_refs | map(attribute='file') | unique(case_sensitive=rh.controller.bootstrap.genesis.acquisition.execution.case_sensitive) | sort -%}
+          {%- set refs = _rh_acq_refs | selectattr('file', 'equalto', file) | list -%}
+          {%- set first = refs | first -%}
+          {%- set allrefs = namespace(values=[]) -%}
+          {%- for ref in refs -%}
+          {%- for b in ref.recipes -%}{%- if b not in allrefs.values -%}{%- set allrefs.values = allrefs.values + [b] -%}{%- endif -%}{%- endfor -%}
+          {%- endfor -%}
+          {%- set ns.rows = ns.rows + [{f.file: file, f.url: first.url, f.sha256: first.sha256,
+                  f.max_bytes: refs | map(attribute='max_bytes') | min, f.recipes: allrefs.values}] -%}
+          {%- endfor -%}{{ ns.rows }}
+
+    - name: Admit declared store and immutable receipt locations
+      vars:
+        _acq: "{{ rh.controller.bootstrap.genesis.acquisition }}"
+        _pa: "{{ rh.controller.bootstrap.path_admission }}"
+      ansible.builtin.assert:
+        that:
+          - _acq.source_var in vars and _acq.receipt_var in vars
+          - lookup('ansible.builtin.vars', _acq.source_var) is string
+          - lookup('ansible.builtin.vars', _acq.receipt_var) is string
+          - lookup('ansible.builtin.vars', _acq.source_var) is match(_pa.regex)
+          - lookup('ansible.builtin.vars', _acq.receipt_var) is match(_pa.regex)
+          - lookup('ansible.builtin.vars', _acq.source_var) is not search(_pa.forbidden_segment_regex)
+          - lookup('ansible.builtin.vars', _acq.receipt_var) is not search(_pa.forbidden_segment_regex)
+          - not (lookup('ansible.builtin.vars', _acq.receipt_var) ~ _pa.separator).startswith(lookup('ansible.builtin.vars', _acq.source_var) ~ _pa.separator)
+        fail_msg: "{{ _acq.refusal }}"
+        quiet: true
+
+    - name: Stat the receipt and its parent before any acquisition effect
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: "{{ rh.controller.bootstrap.lock_capture.digest_algorithm }}"
+      loop:
+        - "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) | dirname }}"
+        - "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }}"
+      register: _rh_acq_rcpt
+
+    - name: Refuse an unowned, linked, unsafe or oversized receipt location
+      vars:
+        _d: "{{ _rh_acq_rcpt.results[0].stat }}"
+        _f: "{{ _rh_acq_rcpt.results[1].stat }}"
+        _e: "{{ rh.controller.bootstrap.genesis.acquisition.execution }}"
+      ansible.builtin.assert:
+        that:
+          - _d.exists and _d.isdir and not _d.islnk and _d.uid == rh_builder.uid | int and not (_d.wgrp or _d.woth)
+          - not _f.exists or (_f.isreg and not _f.islnk and _f.uid == rh_builder.uid | int and _f.mode == _e.mode and _f.size <= _e.receipt_max_bytes)
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+
+    - name: Build this act's complete immutable receipt identity from admitted source and engine bindings
+      ansible.builtin.set_fact:
+        _rh_acq_identity: >-
+          {%- set a = rh.controller.bootstrap.genesis.acquisition -%}
+          {%- set e = a.execution -%}{%- set f = e.fields -%}
+          {%- set recipes = namespace(rows=[]) -%}
+          {%- for r in _rh_acq_recipes -%}
+          {%- set recipes.rows = recipes.rows + [r.binding | dict2items | selectattr('key', 'in', e.recipe_fields) | items2dict] -%}
+          {%- endfor -%}
+          {{ {f.schema: a.receipt_schema, f.revision: a.revision,
+              f.act: lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.launch.stage_root.act.var),
+              f.store: lookup('ansible.builtin.vars', a.source_var), f.profile_sha256: rh_profile_sha256,
+              f.lock_sha256: rh_seed_lock.sha256, f.builder_uid: rh_builder.uid, f.recipes: recipes.rows} }}
+
+    - name: Read an existing bounded receipt once before any acquisition effect
+      ansible.builtin.slurp:
+        src: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }}"
+      register: _rh_acq_receipt_raw
+      when: _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Require current YAML receipt encoding before strict parsing
+      ansible.builtin.assert:
+        that:
+          - (_rh_acq_receipt_raw.content | b64decode).startswith(rh.controller.bootstrap.genesis.acquisition.execution.yaml.prefix)
+          - _rh_acq_receipt_raw.content | b64decode | hash(rh.controller.bootstrap.lock_capture.digest_algorithm) == _rh_acq_rcpt.results[1].stat.checksum
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+      when: _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Strictly parse the captured existing receipt
+      ansible.builtin.set_fact:
+        _rh_acq_receipt: "{{ _rh_acq_receipt_raw.content | b64decode | lme_manifest_strict(lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var), _lme_global_file.lme_config_registry.remote_harness_schema.document_channel.parse) }}"
+      when: _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Refuse any existing receipt whose act or complete source and recipe identity differs
+      ansible.builtin.include_tasks: "{{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.genesis.acquisition.execution.receipt_tasks_rel }}"
+      when: _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Stat the declared artifact store before listing or fetching
+      ansible.builtin.stat:
+        path: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) }}"
+        follow: false
+        get_checksum: false
+      register: _rh_acq_store
+
+    - name: Require an existing real owned store
+      ansible.builtin.assert:
+        that:
+          - _rh_acq_store.stat.exists and _rh_acq_store.stat.isdir and not _rh_acq_store.stat.islnk
+          - _rh_acq_store.stat.uid == rh_builder.uid | int
+          - not (_rh_acq_store.stat.wgrp or _rh_acq_store.stat.woth)
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+
+    - name: Observe all store entries before fetch without modifying foreign entries
+      ansible.builtin.find:
+        paths: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) }}"
+        file_type: any
+        hidden: true
+        recurse: false
+        follow: false
+      register: _rh_acq_before
+
+    - name: Inspect every distinct declared store object before fetch
+      ansible.builtin.stat:
+        path: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) ~ rh.controller.bootstrap.path_admission.separator ~ item.file }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: "{{ rh.controller.bootstrap.lock_capture.digest_algorithm }}"
+      loop: "{{ _rh_acq_rows }}"
+      loop_control:
+        label: "{{ item.file }}"
+      register: _rh_acq_have
+
+    - name: Refuse wrong existing objects or a reused receipt whose objects no longer all verify
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists or (item.stat.isreg and not item.stat.islnk and item.stat.uid == rh_builder.uid | int and item.stat.checksum == item.item.sha256 and item.stat.size <= item.item.max_bytes)
+          - not _rh_acq_rcpt.results[1].stat.exists or item.stat.exists
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+      loop: "{{ _rh_acq_have.results }}"
+      loop_control:
+        label: "{{ item.item.file }}"
+
+    - name: Fetch only absent checksum-pinned objects for a new receipt act
+      ansible.builtin.get_url:
+        url: "{{ item.item.url }}"
+        dest: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) ~ rh.controller.bootstrap.path_admission.separator ~ item.item.file }}"
+        checksum: "{{ rh.controller.bootstrap.lock_capture.digest_algorithm ~ rh.controller.bootstrap.genesis.acquisition.execution.checksum_separator ~ item.item.sha256 }}"
+        mode: "{{ rh.controller.bootstrap.genesis.acquisition.execution.mode }}"
+        force: false
+        use_proxy: true
+        validate_certs: true
+      loop: "{{ _rh_acq_have.results }}"
+      loop_control:
+        label: "{{ item.item.file }}"
+      when: not item.stat.exists and not _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Reverify each store object after acquisition or same-act receipt reuse
+      ansible.builtin.stat:
+        path: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.source_var) ~ rh.controller.bootstrap.path_admission.separator ~ item.file }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: "{{ rh.controller.bootstrap.lock_capture.digest_algorithm }}"
+      loop: "{{ _rh_acq_rows }}"
+      loop_control:
+        label: "{{ item.file }}"
+      register: _rh_acq_after
+
+    - name: Require every requested object with exact digest and within its strictest declared byte cap
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists and item.stat.isreg and not item.stat.islnk
+          - item.stat.uid == rh_builder.uid | int and item.stat.checksum == item.item.sha256
+          - item.stat.size <= item.item.max_bytes
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+      loop: "{{ _rh_acq_after.results }}"
+      loop_control:
+        label: "{{ item.item.file }}"
+
+    - name: Construct a new receipt from the complete immutable identity and pre-fetch observations
+      ansible.builtin.set_fact:
+        _rh_acq_receipt: >-
+          {%- set a = rh.controller.bootstrap.genesis.acquisition -%}{%- set f = a.execution.fields -%}
+          {%- set rows = namespace(values=[]) -%}
+          {%- for r in _rh_acq_have.results -%}
+          {%- set rows.values = rows.values + [r.item | combine({f.disposition: a.dispositions[1] if r.stat.exists else a.dispositions[0]})] -%}
+          {%- endfor -%}
+          {{ _rh_acq_identity | combine({f.observed_at_utc: now(utc=true).strftime(a.execution.timestamp_format),
+              f.store_empty_before: _rh_acq_before.files | length == 0,
+              f.store_entries_before: _rh_acq_before.files | map(attribute='path') | map('basename') | sort,
+              f.store_foreign_entries: _rh_acq_before.files | map(attribute='path') | map('basename') | reject('in', _rh_acq_rows | map(attribute='file')) | sort,
+              f.rows: rows.values,
+              f.cold_qualified: (_rh_acq_before.files | length == 0) and (_rh_acq_have.results | selectattr('stat.exists') | length == 0)}) }}
+      when: not _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Verify the new receipt against the same immutable contract before serialization
+      ansible.builtin.include_tasks: "{{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh.controller.bootstrap.genesis.acquisition.execution.receipt_tasks_rel }}"
+      when: not _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Serialize only new receipts under the declared YAML format
+      ansible.builtin.set_fact:
+        _rh_acq_receipt_text: "{{ _rh_acq_receipt | to_nice_yaml(explicit_start=rh.controller.bootstrap.genesis.acquisition.execution.yaml.explicit_start, explicit_end=rh.controller.bootstrap.genesis.acquisition.execution.yaml.explicit_end, width=rh.controller.bootstrap.genesis.acquisition.execution.yaml.width) }}"
+      when: not _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Refuse a receipt exceeding the declared byte ceiling
+      ansible.builtin.assert:
+        that:
+          - _rh_acq_receipt_text.encode(rh.controller.bootstrap.genesis.acquisition.execution.encoding) | length <= rh.controller.bootstrap.genesis.acquisition.execution.receipt_max_bytes
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+      when: not _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Publish a new receipt without replacing an existing file
+      ansible.builtin.copy:
+        dest: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }}"
+        content: "{{ _rh_acq_receipt_text }}"
+        mode: "{{ rh.controller.bootstrap.genesis.acquisition.execution.mode }}"
+        force: false
+      when: not _rh_acq_rcpt.results[1].stat.exists
+
+    - name: Read back the immutable receipt after publication or verified reuse
+      ansible.builtin.slurp:
+        src: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }}"
+      register: _rh_acq_readback
+
+    - name: Stat the immutable receipt after publication or verified reuse
+      ansible.builtin.stat:
+        path: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: "{{ rh.controller.bootstrap.lock_capture.digest_algorithm }}"
+      register: _rh_acq_finalstat
+
+    - name: Require exact immutable receipt bytes, regular ownership, mode and digest
+      ansible.builtin.assert:
+        that:
+          - _rh_acq_finalstat.stat.exists and _rh_acq_finalstat.stat.isreg and not _rh_acq_finalstat.stat.islnk
+          - _rh_acq_finalstat.stat.uid == rh_builder.uid | int
+          - _rh_acq_finalstat.stat.mode == rh.controller.bootstrap.genesis.acquisition.execution.mode
+          - _rh_acq_finalstat.stat.checksum == (_rh_acq_readback.content | b64decode | hash(rh.controller.bootstrap.lock_capture.digest_algorithm))
+          - (_rh_acq_readback.content | b64decode) == ((_rh_acq_receipt_raw.content | b64decode) if _rh_acq_rcpt.results[1].stat.exists else _rh_acq_receipt_text)
+        fail_msg: "{{ rh.controller.bootstrap.genesis.acquisition.refusal }}"
+        quiet: true
+
+    - name: Report current verification separately from the immutable receipt's original disposition
+      ansible.builtin.debug:
+        msg:
+          marker: "{{ rh.controller.bootstrap.genesis.acquisition.report }}"
+          receipt: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.genesis.acquisition.receipt_var) }}"
+          receipt_reused: "{{ _rh_acq_rcpt.results[1].stat.exists }}"
+          objects_verified: "{{ _rh_acq_after.results | length }}"
+          recipes_verified: "{{ _rh_acq_recipes | length }}"
+          cold_qualified: "{{ _rh_acq_receipt.cold_qualified }}"
+
+    - name: Produce the declared preparation candidates after acquisition verification
+      ansible.builtin.include_tasks: tasks/prepare.yml
+      when: rh.controller.bootstrap.preparation is defined

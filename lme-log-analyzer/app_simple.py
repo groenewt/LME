@@ -1,10 +1,9 @@
 import streamlit as st
 import requests
 import os
-import urllib3
+import hmac
+import ssl
 import json
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(page_title="LME Security Alerts", layout="wide")
 
@@ -16,15 +15,111 @@ if "chat_messages" not in st.session_state:
 ES_URL = os.getenv("ELASTICSEARCH_URL", "https://lme-elasticsearch:9200")
 ES_USER = os.getenv("ELASTICSEARCH_USER", "elastic")
 ES_PASS = os.getenv("ELASTICSEARCH_PASSWORD", "")
+# Elasticsearch and LiteLLM have separate trust anchors because either may live
+# on another producer host. Both verify chain and hostname by default, and
+# malformed boolean values abort startup instead of falling back.
+ES_SSL_VERIFY = os.getenv("ELASTICSEARCH_SSL_VERIFY", "true")
+ES_CA_CERT = os.getenv("ELASTICSEARCH_CA_CERT", "/certs/ca/elasticsearch-ca.crt")
+LITELLM_SSL_VERIFY = os.getenv("LITELLM_SSL_VERIFY", "true")
+LITELLM_CA_CERT = os.getenv("LITELLM_CA_CERT", "/certs/ca/litellm-ca.crt")
 LITELLM_URL = os.getenv("LITELLM_URL", "https://lme-litellm:4000")
-LITELLM_KEY = os.getenv("LITELLM_API_KEY", "sk-lme-llama-proxy")
+LITELLM_KEY = os.getenv("LITELLM_API_KEY")
+if not LITELLM_KEY:
+    # Fail closed: never fall back to a hardcoded proxy key. LITELLM_API_KEY is
+    # injected from the per-install podman secret `litellm_master_key`.
+    raise RuntimeError(
+        "LITELLM_API_KEY is not set. The log analyzer requires the LiteLLM proxy "
+        "master key (podman secret 'litellm_master_key') to be injected as "
+        "LITELLM_API_KEY. Refusing to start without proxy credentials."
+    )
 LITELLM_MODEL = os.getenv("LITELLM_MODEL", "lfm2.5-1.2b-instruct")
+
+# ── Inbound auth (WebUI API key) ─────────────────────────────────────────────
+# Mirror of the outbound LiteLLM master-key guard above: production injects
+# WEBUI_API_KEY from the per-install podman secret `webui_api_key`. This is a
+# real viewer gate (not the server-side ES password check below): when the key
+# is set, raw alert _source data is never served until the viewer presents it.
+WEBUI_API_KEY = os.getenv("WEBUI_API_KEY")
+
+
+# ── Outbound TLS transports ───────────────────────────────────────────────────
+_TLS_TRUTHY = {"1", "true", "yes", "on"}
+_TLS_FALSY = {"0", "false", "no", "off"}
+
+
+def _strict_bool(name, raw) -> bool:
+    """Parse a configured boolean without silently weakening TLS on a typo."""
+    value = str(raw).strip().lower()
+    if value in _TLS_TRUTHY:
+        return True
+    if value in _TLS_FALSY:
+        return False
+    raise ValueError(
+        f"{name} must be one of true/false, 1/0, yes/no, or on/off; got {raw!r}"
+    )
+
+
+def _tls_verify(name: str, raw, ca_path: str):
+    """Return a requests verify value after validating the configured CA."""
+    if not _strict_bool(name, raw):
+        return False
+    # Validate existence/readability/PEM at startup. requests receives the path
+    # and performs its normal chain and hostname checks on every connection.
+    ssl.create_default_context(cafile=ca_path)
+    return ca_path
+
+
+def _es_transport():
+    """Return the existing requests-style ES transport API and verify value."""
+    return requests, ES_VERIFY
+
+
+def _llm_transport():
+    """Return the requests-style LiteLLM transport and its dedicated trust value."""
+    return requests, LITELLM_VERIFY
+
+
+ES_VERIFY = _tls_verify("ELASTICSEARCH_SSL_VERIFY", ES_SSL_VERIFY, ES_CA_CERT)
+LITELLM_VERIFY = _tls_verify("LITELLM_SSL_VERIFY", LITELLM_SSL_VERIFY, LITELLM_CA_CERT)
+_ES_HTTP, _ES_VERIFY = _es_transport()
+_LLM_HTTP, _LLM_VERIFY = _llm_transport()
+
+
+def require_webui_auth():
+    """Gate the whole app on WEBUI_API_KEY before any alert data is rendered.
+
+    Fail-closed when the key is set (always, in production): the viewer must
+    enter it at the password prompt. Unset (local dev) leaves the app open,
+    mirroring the dashboard middleware. The key is deliberately NOT accepted
+    via a URL query parameter -- a `?api_key=` GET leaks the secret into
+    browser history, the Referer header, and reverse-proxy/access logs
+    (flagged by the automated security review). The prompt keeps it in
+    server-side st.session_state only.
+    """
+    if not WEBUI_API_KEY:
+        return
+    if st.session_state.get("_webui_authed"):
+        return
+
+    st.title("🔒 LME Security Alerts")
+    entered = st.text_input(
+        "API key", type="password", help="Enter the WebUI API key to continue"
+    )
+    if entered and hmac.compare_digest(entered.encode(), WEBUI_API_KEY.encode()):
+        st.session_state["_webui_authed"] = True
+        st.rerun()
+    elif entered:
+        st.error("Invalid API key")
+    st.stop()
+
+
+require_webui_auth()
 
 # Define LLM functions
 def chat_with_llm(messages):
     """Send chat messages to LLM"""
     try:
-        response = requests.post(
+        response = _LLM_HTTP.post(
             f"{LITELLM_URL}/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {LITELLM_KEY}",
@@ -36,7 +131,7 @@ def chat_with_llm(messages):
                 "temperature": 0.7,
                 "max_tokens": 500
             },
-            verify=False,
+            verify=_LLM_VERIFY,
             timeout=300
         )
         response.raise_for_status()
@@ -99,10 +194,10 @@ st.success(f"✓ Connected to Elasticsearch as {ES_USER}")
 
 # Query the alerts index
 try:
-    response = requests.post(
+    response = _ES_HTTP.post(
         f"{ES_URL}/.alerts-security.alerts-*/_search",
         auth=(ES_USER, ES_PASS),
-        verify=False,
+        verify=_ES_VERIFY,
         headers={"Content-Type": "application/json"},
         json={
             "size": 50,

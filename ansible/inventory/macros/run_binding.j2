@@ -1,0 +1,227 @@
+{#-
+  ansible/inventory/macros/run_binding.j2 -- GENERIC run-binding macros (codex-tick350 GRAPH-BINDING-TEMPLATE-TOPOLOGY).
+  Machines and placement are INVENTORY DATA: no host alias, group name, role var name or key path is written here.
+  Every name comes from the resolved contract (rh.controller.bootstrap); every value from the per-run data. Renaming,
+  adding or removing a target is a DATA change only (testing/e2e/inventory_binding/run_binding.cases.yml,
+  declared_unrun).
+  No manifest loader, no merge engine: the macros only project declared data into ONE inventory document; the loader
+  types and validates the result on every leg (target_inputs patterns, lme_validated_deployment_identity).
+
+  binding(bs, repo_root, run, derived) -> the YAML text of the frozen run binding (20-binding.yml).
+    bs         rh.controller.bootstrap from a resolve over the frozen lab copy (10-lab.yml): inventory.target_inputs
+               (role -> var), inventory.target_group, inventory.role_groups, inventory.root_var / owner_var,
+               owner_key (the J-KEY producer contract: location_rule_rel + storage).
+    repo_root  the controller checkout (rh_repo_root): the location rule's work-root anchor.
+    run        the per-run data (MAIN's, frozen with its sha256 in the run receipts) -- ONLY run-time values, under the
+               declared top keys bs.run_binding.run_data.top (r5f):
+      controller            {operation: <bs.inventory.controller_operations key>, inputs?: {<role>: value}} -- REQUIRED;
+                            admitted by the render entry (no default operation); the macro reads it only through
+                            derived.controller (operation + the admitted inputs)
+      hosts                 {<alias>: {
+                               member_of:        [target | <role_groups key>, ...]   (optional; placement)
+                               address:          ansible_host override              (optional)
+                               roles:            {<target_inputs role>: value}      (optional; declared roles only)
+                               bundle:           {leaf}  -> role bundle_dir = <bound prereq_bundle_root>/leaf, 64 hex
+                               global_override:  lme_global_override candidate      (optional; MAIN-admitted)
+                               observed:         runtime observation -> lme_lab_observed (optional; never desired config)
+                             }}
+               Any other top-level key refuses RUN-BINDING-DERIVED-INPUT (deployment_identity, lab_sha256 and controller
+               are derived by the render entry, never supplied: ONE channel each).
+    derived    the render entry's DERIVED values (testing/e2e/inventory_binding/render_run_binding.yml; never MAIN data):
+      deployment_identity   lme_resolved | lme_validated_deployment_identity (declared ONCE in the lab file all.vars)
+      lab_sha256            sha256 of the 10-lab.yml copy (stat of the file the resolve read; written into the header)
+      controller            {toolchain_root, owner, operation, inputs: {<role>: value}} -- localhost carries the root / owner
+                            vars and EXACTLY the selected operation's declared input vars
+                            (bs.inventory.controller_operations.<operation>.inputs.<role>.var); acquisition renders
+                            today's rh_bundle_dir / rh_artifact_source / rh_acquisition_receipt bytes, a run_data operation
+                            (e.g. preparation_measurement) never carries an acquisition input
+      bound                 lme_resolved.remote_harness.binding.deployment.target_inputs (the loader's typed lab values)
+      presence              (r5k) C1's expected endpoint / input presence {alias: {var: vouched lab value | null}},
+                            recorded per alias under bs.run_binding.presence.var (see the binding macro)
+  OPERATION PLACEMENT (r5f; never a workload target by relabelling): an operation with run_hosts false admits no run host;
+  every member_of key of a run host must be in the operation's placement_keys, and placement_required demands at least
+  one (controller_prerequisite: exactly its role group, never `target`). RUN-BINDING-OPERATION-PLACEMENT.
+  DEPLOYMENT IDENTITY (Q7): null only for an identity_nullable operation (the entry admits it); the header then prints the
+  declared texts.identity_absent, and a derived owner key without an identity refuses RUN-BINDING-OWNER-IDENTITY.
+  DERIVED roles, refused when supplied (RUN-BINDING-DERIVED-ROLE):
+    owner_key / owner_pubkey = the J-KEY location rule (bs.owner_key.location_rule_rel) over
+                               (bs, repo_root, derived.deployment_identity, <alias>, <effective owner>): key / pub, where
+                               the effective owner is roles.owner, else the lab's bound owner. Rendered for every host
+                               of run[top.hosts] (r5g: the declared key) with an effective owner. The producer (owner_key.yml) renders the SAME rule
+                               and refuses JKEY-LOCATION on any difference.
+    bundle_dir               = derived.bound[<alias>].prereq_bundle_root ~ '/' ~ bundle.leaf (bundle.root refuses).
+  The binding carries NO all.vars: lme_deployment_identity lives only in the lab file (one channel).
+  Refusals (render fails; a half-bound run inventory never exists): RUN-BINDING-UNDECLARED-ROLE,
+  RUN-BINDING-DERIVED-ROLE, RUN-BINDING-DERIVED-INPUT, RUN-BINDING-UNDECLARED-GROUP, RUN-BINDING-BUNDLE-LEAF,
+  RUN-BINDING-BUNDLE-ROOT, RUN-BINDING-HOST-KEY.
+  The preservation selection and its expectations are DESIRED configuration in the lab file (codex-tick360); observation
+  never feeds this binding (no observation -> binding cycle).
+-#}
+
+{%- macro refuse(code, detail) -%}
+{{- rb_refused | mandatory('REFUSED ' ~ code ~ ': ' ~ detail) -}}
+{%- endmacro -%}
+
+{#- r5h (codex-tick419 R5G-CHANGED-DIAGNOSTIC-VALUES): the reusable grammar-formatted refusal. The message is formatted by
+    the ONE declared refusal grammar entry (bs.refusal_grammar.entry_rel, reached from repo_root by the declared
+    bs.path_admission.separator; template_vars rh_rf_grammar / rh_rf_code / rh_rf_detail, detail a LIST of declared texts
+    and observed values) and raised through the same rb_refused sentinel. refuse() above (literal framing) remains
+    inherited debt at its unchanged sites; new and changed sites use this. -#}
+{%- macro refuse_rf(bs, repo_root, code, detail) -%}
+{{- rb_refused | mandatory(lookup('ansible.builtin.template',
+      (repo_root | mandatory) ~ bs.path_admission.separator ~ bs.refusal_grammar.entry_rel,
+      template_vars={'rh_rf_grammar': bs.refusal_grammar, 'rh_rf_code': code, 'rh_rf_detail': detail}) | trim) -}}
+{%- endmacro -%}
+
+{#- the group name a member_of key declares: 'target' -> target_group, else role_groups[<key>] -#}
+{%- macro group_name(bs, key, alias) -%}
+{%- if key == 'target' -%}{{ bs.inventory.target_group | mandatory }}
+{%- elif key in (bs.inventory.role_groups | default({})) -%}{{ bs.inventory.role_groups[key] }}
+{%- else -%}{{ refuse('RUN-BINDING-UNDECLARED-GROUP', alias ~ ' member_of ' ~ key ~ ' is neither target nor a key of inventory.role_groups ' ~ (bs.inventory.role_groups | default({}) | list | to_json)) }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- one host's vars as JSON: declared roles through their registered var names + derived roles -#}
+{%- macro host_vars(bs, repo_root, derived, alias, h) -%}
+{%- set ti = bs.inventory.target_inputs -%}
+{%- set roles = h.roles | default({}) -%}
+{%- set ns = namespace(v={}) -%}
+{%- if h.keys() | reject('in', ['member_of', 'address', 'roles', 'bundle', 'global_override', 'observed']) | list | length > 0 -%}
+{{- refuse('RUN-BINDING-HOST-KEY', alias ~ ' has undeclared keys ' ~ (h.keys() | reject('in', ['member_of', 'address', 'roles', 'bundle', 'global_override', 'observed']) | list | to_json)) -}}
+{%- endif -%}
+{%- for role in roles -%}
+{%- if role in ['owner_key', 'owner_pubkey', 'bundle_dir'] -%}
+{{- refuse('RUN-BINDING-DERIVED-ROLE', alias ~ '.' ~ role ~ ' is derived (J-KEY location rule / bundle root+leaf), never supplied') -}}
+{%- elif role not in ti -%}
+{{- refuse('RUN-BINDING-UNDECLARED-ROLE', alias ~ '.' ~ role ~ ' is not a role of controller.bootstrap.inventory.target_inputs') -}}
+{%- else -%}
+{%- set ns.v = ns.v | combine({ti[role].var: roles[role]}) -%}
+{%- endif -%}
+{%- endfor -%}
+{%- set lab = (derived.bound | default({}))[alias] | default({}) -%}
+{%- set owner = roles.owner if ('owner' in roles) else (lab.owner | default(none)) -%}
+{%- if owner is not none and derived.deployment_identity is none -%}
+{{- refuse(bs.run_binding.refusals.owner_identity, alias ~ ' has an effective owner but the deployment identity is null (a zero-target controller operation): no owner key location is derived without an identity') -}}
+{%- endif -%}
+{%- if owner is not none -%}
+{%- set loc = lookup('ansible.builtin.template', (repo_root | mandatory) ~ '/' ~ (bs.owner_key.location_rule_rel | mandatory),
+      template_vars={'ok_bs': bs, 'ok_repo_root': repo_root, 'ok_deployment': derived.deployment_identity | mandatory,
+                     'ok_target': alias, 'ok_owner': owner}) | trim | from_json -%}
+{%- set ns.v = ns.v | combine({ti.owner_key.var: loc.key, ti.owner_pubkey.var: loc.pub}) -%}
+{%- endif -%}
+{%- if h.bundle is defined -%}
+{%- if h.bundle.keys() | reject('equalto', 'leaf') | list | length > 0 -%}
+{{- refuse('RUN-BINDING-DERIVED-ROLE', alias ~ ' bundle may carry only leaf; the root is the lab''s bound prereq_bundle_root') -}}
+{%- endif -%}
+{%- if (h.bundle.leaf | mandatory) is not match('^[0-9a-f]{64}$') -%}
+{{- refuse('RUN-BINDING-BUNDLE-LEAF', alias ~ ' bundle.leaf must be the 64-hex class key (a new identity is a new leaf)') -}}
+{%- endif -%}
+{%- set broot = roles.prereq_bundle_root if ('prereq_bundle_root' in roles) else (lab.prereq_bundle_root | default(none)) -%}
+{%- if broot is none -%}
+{{- refuse('RUN-BINDING-BUNDLE-ROOT', alias ~ ' has a bundle leaf but no bound prereq_bundle_root (lab file) -- a run-only host cannot derive its bundle dir') -}}
+{%- endif -%}
+{%- set ns.v = ns.v | combine({ti.bundle_dir.var: broot ~ '/' ~ h.bundle.leaf}) -%}
+{%- endif -%}
+{%- if h.address is defined -%}{%- set ns.v = ns.v | combine({'ansible_host': h.address}) -%}{%- endif -%}
+{%- if h.global_override is defined -%}{%- set ns.v = ns.v | combine({'lme_global_override': h.global_override}) -%}{%- endif -%}
+{%- if h.observed is defined -%}{%- set ns.v = ns.v | combine({'lme_lab_observed': h.observed}) -%}{%- endif -%}
+{{- ns.v | to_json -}}
+{%- endmacro -%}
+
+{#- the whole binding document -#}
+{%- macro binding(bs, repo_root, run, derived) -%}
+{%- set inv = bs.inventory -%}
+{%- set top = (bs.run_binding | mandatory).run_data.top | mandatory -%}
+{%- if run.keys() | reject('in', top.values() | list) | list | length > 0 -%}
+{{- refuse('RUN-BINDING-DERIVED-INPUT', 'per-run data carries only ' ~ (top.values() | list | to_json) ~ '; ' ~ (run.keys() | reject('in', top.values() | list) | list | to_json) ~ ' are derived by the render entry (deployment identity from the lab file, lab sha256 and controller values), never supplied') -}}
+{%- endif -%}
+{%- set c = derived.controller | mandatory -%}
+{%- set op = inv.controller_operations[c.operation | mandatory] | mandatory -%}
+{%- if (c.inputs | mandatory).keys() | list | sort != op.inputs.keys() | list | sort -%}
+{{- refuse(bs.run_binding.refusals.controller, 'operation ' ~ c.operation ~ ' declares inputs ' ~ (op.inputs | list | to_json) ~ ', derived ' ~ (c.inputs | list | to_json)) -}}
+{%- endif -%}
+{#- localhost: root / owner vars + EXACTLY the operation's declared input vars (var <- derived value, per declared role) -#}
+{%- set ns = namespace(hosts={'localhost': {'ansible_connection': 'local',
+      inv.root_var: c.toolchain_root | mandatory, inv.owner_var: c.owner | mandatory}
+      | combine(dict(op.inputs.values() | map(attribute='var') | list | zip(op.inputs.keys() | map('extract', c.inputs) | list)))},
+      groups={}) -%}
+{#- r5g (codex-tick410-412 R5F-DECLARED-HOST-KEY): the run hosts are read under the DECLARED top key
+    bs.run_binding.run_data.top.hosts, never a literal `hosts` (a renamed key keeps its hosts and their placement
+    checks). Its DECLARED optional semantics are kept (header: hosts optional; member_of optional = a run-only host):
+    an ABSENT key is no run host; a PRESENT key must be a mapping of aliases (a supplied non-mapping refuses). -#}
+{%- set run_hosts = run[top.hosts] if (top.hosts in run) else {} -%}
+{%- if run_hosts is not mapping -%}
+{{- refuse_rf(bs, repo_root, bs.run_binding.refusals.placement, [bs.run_binding.texts.hosts_not_mapping, top.hosts, run_hosts | to_json]) -}}
+{%- endif -%}
+{%- if (not op.run_hosts) and (run_hosts | length > 0) -%}
+{{- refuse(bs.run_binding.refusals.placement, 'operation ' ~ c.operation ~ ' admits no run host (zero-target controller operation); run data names ' ~ (run_hosts | list | to_json)) -}}
+{%- endif -%}
+{%- for alias, h in run_hosts.items() -%}
+{%- set mo = h.member_of | default([]) -%}
+{%- if mo | reject('in', op.placement_keys) | list | length > 0 -%}
+{{- refuse(bs.run_binding.refusals.placement, alias ~ ' member_of ' ~ (mo | to_json) ~ ' is outside operation ' ~ c.operation ~ ' placement_keys ' ~ (op.placement_keys | to_json)) -}}
+{%- endif -%}
+{%- if op.placement_required and mo | length == 0 -%}
+{{- refuse(bs.run_binding.refusals.placement, alias ~ ' must be placed (member_of within ' ~ (op.placement_keys | to_json) ~ ') for operation ' ~ c.operation) -}}
+{%- endif -%}
+{%- set ns.hosts = ns.hosts | combine({alias: host_vars(bs, repo_root, derived, alias, h) | from_json}) -%}
+{%- for key in mo -%}
+{%- set g = group_name(bs, key, alias) -%}
+{%- set ns.groups = ns.groups | combine({g: {'hosts': {alias: {}}}}, recursive=true) -%}
+{%- endfor -%}
+{%- endfor -%}
+{#- r5k (codex-tick427-428 R4E-ENDPOINT-PRESENCE-BINDING, writer side): the vouched binding records the COMPLETE
+    declared endpoint / input presence of every expected alias (derived.presence = C1's projection: {alias: {var: lab
+    value | null}}) under the declared var bs.run_binding.presence.var, so an omitted var (e.g. ansible_host when the
+    inventory gives no address) is RECORDED as absent (null) instead of silently missing: a later -e or inventory
+    override then differs from the vouched record (R4 reader). Effective value = this binding's own value when it sets
+    the var, else the vouched lab-inherited value, else the declared absence (null). Only values are recorded, never
+    their source location (a move that keeps the admitted values is not drift); no whole-engine revision is involved.
+    A run host outside the expected set, or a presence var that collides with a written var, refuses.
+    r5m (codex-tick433 R5K-PRESENCE-COMPLETENESS-JOIN): this writer side is SHAPE-ONLY, NOT a coverage or completeness
+    proof. It records exactly the keys derived.presence carries. A projection that omits an expected alias or var
+    (a partial projection, or an alias mapped to {}) is written as-is here. Exact-universe coverage (every declared
+    endpoint/input var of every expected alias) is C1's projection join (C1-R5M-5), and the reader binding is R4's.
+    Negative controls PRS-01/PRS-02 (UNRUN) depend on that join.
+    r5m (codex-tick439 R4F-PROXY-EQUIVALENCE, writer side): the recorded value is the RAW effective value. It is never
+    normalized, and absent (null), empty and the exact selected-mode arguments stay distinguishable in the bytes. So R4's
+    reader applies the ONE declaration-owned ssh_auth inventory_forms rule to both the vouched and the current value.
+    The writer holds no equivalence table and copies none of the rule's values. The refinement of B's earlier X-R4-7
+    law ("null means undefined") applies to the PROXY component only; address, port and key keep strict presence.
+    r5m (codex-tick439 R4F-METADATA-RESERVATION-JOIN, writer side): the member written under presence.var is
+    RECEIPT-BACKED INPUT METADATA, not a reserved derived output. Its authority is the vouched binding bytes (the receipt's
+    binding digest), never caller hostvars. Its alias universe = the keys of derived.presence (refused above if a run
+    host is outside it), and its var universe per alias = derived.presence[alias] keys. C1 admits the exact binding
+    source and digest and binds both universes (C1-R5M-7). It is NOT a global family exemption from the first-entry
+    guard. -#}
+{%- set pv = bs.run_binding.presence.var | mandatory -%}
+{%- set pres = derived.presence | mandatory -%}
+{%- if run_hosts.keys() | reject('in', pres) | list | length > 0 -%}
+{{- refuse_rf(bs, repo_root, bs.run_binding.refusals.placement, [bs.run_binding.texts.presence_incomplete, run_hosts.keys() | reject('in', pres) | list | to_json]) -}}
+{%- endif -%}
+{%- for alias, expected in pres.items() -%}
+{%- set hv = ns.hosts[alias] if alias in ns.hosts else {} -%}
+{%- if pv in hv -%}
+{{- refuse_rf(bs, repo_root, bs.run_binding.refusals.placement, [bs.run_binding.texts.presence_incomplete, alias, pv]) -}}
+{%- endif -%}
+{#- r5p (codex-tick455 R4H-SUPPLIED-NULL-ADMISSION, producer side): null in the presence record is the ONE absence
+    encoding (the declared absence of an unset var). A var this binding SETS to a raw null would collide with it, so it
+    refuses here, BEFORE any absence encoding, for EVERY expected alias in derived.presence (controller and non-target
+    aliases included; the loop universe is pres, not the run's targets). The null is never rewritten to absence and no
+    second presence encoding is introduced. A lab-supplied raw null is C1's projection-side join (c1-proposal C1-R5P-6);
+    this writer cannot tell it from the projection's declared absence and does not try. -#}
+{%- set sn = expected.keys() | select('in', hv | dict2items | selectattr('value', 'none') | map(attribute='key') | list) | list -%}
+{%- if sn | length > 0 -%}
+{{- refuse_rf(bs, repo_root, bs.run_binding.refusals.placement, [bs.run_binding.texts.presence_supplied_null, alias, sn | to_json]) -}}
+{%- endif -%}
+{%- set pns = namespace(r={}) -%}
+{%- for var, lab_value in expected.items() -%}
+{%- set pns.r = pns.r | combine({var: (hv[var] if var in hv else lab_value)}) -%}
+{%- endfor -%}
+{%- set ns.hosts = ns.hosts | combine({alias: hv | combine({pv: pns.r})}) -%}
+{%- endfor -%}
+# RENDERED -- the frozen per-run binding (ansible/inventory/macros/run_binding.j2). Do not edit; re-render.
+# {{ bs.run_binding.lab_basename | mandatory }} sha256: {{ derived.lab_sha256 | mandatory }}
+# deployment identity (lab all.vars, not repeated here): {{ derived.deployment_identity if derived.deployment_identity is not none else bs.run_binding.texts.identity_absent | mandatory }}
+{{ {'all': {'hosts': ns.hosts, 'children': ns.groups}} | to_nice_yaml(indent=2) }}
+{%- endmacro -%}

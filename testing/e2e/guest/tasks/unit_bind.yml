@@ -1,0 +1,108 @@
+---
+# testing/e2e/guest/tasks/unit_bind.yml -- READ-ONLY: bind whatever the owner's user manager currently runs under the
+# unit NAME gp.unit to THIS generation (codex GUEST-RETIRED-UNIT-REUSE). A unit name is not an identity: ActiveState
+# and a positive MainPID say nothing about WHOSE process it is. Bound means ALL of:
+#   - the record carries the argv this generation was started with (state starting/started/retired) and that argv
+#     names this record's uuid (-uuid) and its owned disk files (file=<run dir>/<disk>);
+#   - /proc/<MainPID>/cmdline, split on NUL, EQUALS that RECORDED argv (not a re-render: a policy change between start
+#     and retire must not make a legitimate guest unbindable);
+#   - /proc/<MainPID>/cgroup names the unit (suffix /<gp.unit>; the slice placement is not assumed);
+#   - InvocationID equals the recorded one when the record has it (it is recorded at state=started), unless the
+#     caller passes _g_ub_new_invocation=true (the bind right after a declared same-generation recovery start);
+#   - codex GUEST-INITIALIZED-DISK: the process holds OPEN the recorded disk inodes (record disks.<os|data>.identity
+#     {dev, inode}, recorded at state=starting): every recorded identity is among the (dev, inode) of
+#     /proc/<MainPID>/fd/* (links followed). A pathname removed and recreated under a running guest shows a NEW inode
+#     at the path while the process still holds the OLD one, so argv/shape equality alone can never bind it.
+# Input: g_record [, _g_ub_new_invocation]. Output: g_unit_obs {load, active_state, running, invocation_id, main_pid,
+# argv_ok, disks_held, bound}.
+# RESIDUAL (declared): systemctl addresses units by name, so a reuse between this read and a following stop is a
+# window this file cannot close; every caller holds the lease and re-binds immediately before acting.
+
+- name: Read the named unit's state, invocation and main process (user manager; read-only)
+  environment:
+    XDG_RUNTIME_DIR: "{{ gp.runtime_dir }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path={{ gp.bus }}"
+  ansible.builtin.command:
+    argv: ["{{ gt.systemctl }}", "--user", "show", "--property=LoadState,ActiveState,SubState,InvocationID,MainPID", "--", "{{ gp.unit }}"]
+  changed_when: false
+  register: _g_ub_show
+
+- name: Parse the unit properties (derived)
+  ansible.builtin.set_fact:
+    _g_ub: >-
+      {% set ns = namespace(d={}) %}{% for l in _g_ub_show.stdout_lines %}{% if l is match('^[A-Za-z]+=') %}{% set ns.d
+      = ns.d | combine({l.split('=', 1)[0]: l.split('=', 1)[1]}) %}{% endif %}{% endfor %}{{ ns.d }}
+
+- name: Read the main process's argv and cgroup (the owner's own process; read-only; skipped with no main process)
+  when: _g_ub.MainPID | default('0') is match('^[1-9][0-9]*$')
+  ansible.builtin.slurp:
+    src: "{{ gd.proc_root }}/{{ _g_ub.MainPID }}/{{ item }}"
+  loop: [cmdline, cgroup]
+  failed_when: false
+  register: _g_ub_proc
+
+- name: List the main process's open file descriptors (read-only; skipped with no main process)
+  when: _g_ub.MainPID | default('0') is match('^[1-9][0-9]*$')
+  ansible.builtin.find:
+    paths: ["{{ gd.proc_root }}/{{ _g_ub.MainPID }}/fd"]
+    file_type: link
+    hidden: true
+    recurse: false
+  failed_when: false
+  register: _g_ub_fds
+
+- name: Stat what each open descriptor refers to (links followed; read-only; a vanished fd is simply absent)
+  when: _g_ub.MainPID | default('0') is match('^[1-9][0-9]*$')
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: false
+  loop: "{{ _g_ub_fds.files | default([]) | map(attribute='path') | list }}"
+  failed_when: false
+  register: _g_ub_fdst
+
+- name: Bind the observation (derived output)
+  vars:
+    _g_rargv: "{{ g_record.unit.argv | default([]) }}"
+    _g_cmd: "{{ ((_g_ub_proc.results | default([{}, {}]))[0].content | default('')) | b64decode }}"
+    _g_cg: "{{ ((_g_ub_proc.results | default([{}, {}]))[1].content | default('')) | b64decode }}"
+    _g_pargv: >-
+      {{ (_g_cmd[:-1] if _g_cmd.endswith('\x00') else _g_cmd).split('\x00') if _g_cmd | length > 0 else [] }}
+    _g_argv_ok: >-
+      {{ _g_rargv | length > 0
+         and '-uuid' in _g_rargv and _g_rargv[_g_rargv.index('-uuid') + 1] == g_record.uuid
+         and _g_rargv | select('search', 'file=' ~ (gp.files.os_disk | regex_escape) ~ '(,|$)') | list | length == 1
+         and _g_rargv | select('search', 'file=' ~ (gp.files.data_disk | regex_escape) ~ '(,|$)') | list | length == 1
+         and (g_record.unit.argv_sha256 | default('')) == (_g_rargv | to_json | hash('sha256')) }}
+    _g_fdids: >-
+      {{ (_g_ub_fdst.results | default([])) | selectattr('stat', 'defined') | map(attribute='stat')
+         | selectattr('exists') | map(attribute='dev') | map('string')
+         | zip((_g_ub_fdst.results | default([])) | selectattr('stat', 'defined') | map(attribute='stat')
+               | selectattr('exists') | map(attribute='inode') | map('string'))
+         | map('join', ':') | list }}
+    _g_recids: >-
+      {{ [g_record.disks.os.identity | default(none), g_record.disks.data.identity | default(none)] | select
+         | map(attribute='dev') | map('string')
+         | zip([g_record.disks.os.identity | default(none), g_record.disks.data.identity | default(none)] | select
+               | map(attribute='inode') | map('string'))
+         | map('join', ':') | list }}
+    _g_disks_held: "{{ _g_recids | length == 2 and _g_recids | reject('in', _g_fdids) | list | length == 0 }}"
+  ansible.builtin.set_fact:
+    g_unit_obs:
+      load: "{{ _g_ub.LoadState | default('') }}"
+      active_state: "{{ _g_ub.ActiveState | default('') }}"
+      running: "{{ (_g_ub.ActiveState | default('')) in ['active', 'activating', 'deactivating', 'reloading', 'refreshing'] }}"
+      invocation_id: "{{ _g_ub.InvocationID | default('') }}"
+      main_pid: "{{ _g_ub.MainPID | default('0') | int }}"
+      argv_ok: "{{ _g_argv_ok | bool }}"
+      disks_held: "{{ _g_disks_held | bool }}"
+      bound: >-
+        {{ (_g_argv_ok | bool)
+           and (_g_disks_held | bool)
+           and (_g_ub.MainPID | default('0') | int) > 0
+           and _g_pargv == _g_rargv
+           and ((_g_cg | trim).split('\n') | select('search', '/' ~ (gp.unit | regex_escape) ~ '$') | list | length > 0)
+           and ((_g_ub_new_invocation | default(false) | bool)
+                or (g_record.unit.invocation_id | default(none)) in [none, '']
+                or g_record.unit.invocation_id == (_g_ub.InvocationID | default('')))
+           and (_g_ub.InvocationID | default('')) is match('^[0-9a-f]{32}$') }}

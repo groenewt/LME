@@ -1,0 +1,60 @@
+---
+- name: Require resolved database node and explicit supported profile
+  ansible.builtin.assert:
+    that:
+      - postgresql_platform_config.profile in ['dual-owned-ha', 'shared-ha']
+      - postgresql_platform_config.node in ['graph', 'trixie', 'silmaril']
+      - postgresql_platform_start is boolean
+    fail_msg: Resolved inventory database configuration is required.
+
+- name: Allocate private controller render directory
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: lme-pg-render-
+  delegate_to: localhost
+  become: false
+  register: postgresql_platform_render_stage
+
+- name: Render and stage database contracts
+  block:
+    - name: Write resolved non-secret configuration
+      ansible.builtin.copy:
+        content: "{{ postgresql_platform_config | to_nice_json }}"
+        dest: "{{ postgresql_platform_render_stage.path }}/input.json"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+    - name: Validate inventory and render immutable platform artifacts
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -m
+          - scripts.postgresql_platform
+          - render
+          - --config
+          - "{{ postgresql_platform_render_stage.path }}/input.json"
+          - --output
+          - "{{ postgresql_platform_render_stage.path }}/rendered"
+        chdir: "{{ postgresql_platform_repository }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Stage each independent database owner
+      ansible.builtin.include_tasks: owner.yml
+      loop: "{{ ['hertzbeat', 'vector', 'etcd'] if postgresql_platform_config.profile == 'dual-owned-ha' else ['shared', 'etcd'] }}"
+      loop_control:
+        loop_var: postgresql_platform_domain
+    - name: Stage owner-local endpoint proxies
+      ansible.builtin.include_tasks: proxy-owner.yml
+      loop: "{{ postgresql_platform_config.proxy_owners | default([]) }}"
+      loop_control:
+        loop_var: postgresql_platform_proxy_owner
+  always:
+    - name: Remove this invocation's private render directory
+      ansible.builtin.file:
+        path: "{{ postgresql_platform_render_stage.path }}"
+        state: absent
+      delegate_to: localhost
+      become: false

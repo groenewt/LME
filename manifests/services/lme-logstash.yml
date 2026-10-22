@@ -1,0 +1,91 @@
+---
+# Logstash -- kind: container (elastic-services pack). B4 per-svc cert bundle.
+#
+# B4 mount: logstash mounts ONLY its own published bundle
+# (cert:logstash -> /opt/lme/certs/logstash) at /certs, read-only, NO idmap,
+# instead of the shared lme_certs workspace with `,idmap`. ca/ca.key is mounted
+# into NOTHING. In-container paths unchanged: the beats-input pipeline
+# (config/logstash/pipeline/lme.conf) references /certs/logstash/logstash.crt,
+# /certs/logstash/logstash.key and /certs/ca/ca.crt (verified), which the bundle
+# provides (mirrors the workspace layout: logstash/ leaf + ca/ca.crt).
+#
+# UID DROP (reverses a documented production failure -- read before re-adding root):
+# the static unit ran User=root because, under the OLD `,idmap` mount, the beats-
+# input TLS key was owned by the workspace uid 166536 and the logstash image uid
+# 1000 could not open the 0640 key (documented in the static unit). B4 removes that
+# cause: the bundle is not idmapped and is chowned to cert_owner = base 0
+# (host_userns:true) + in_container_uid 1000 = 1000, i.e. the image uid, so uid
+# 1000 reads its own 0640 leaf key directly -- no root, no idmap. logstash does NOT
+# bind-mount the host journal, so nothing forces host root.
+#
+# LS_JAVA_OPTS is carried in the environment MAP as a VALUE-quoted string
+# (LS_JAVA_OPTS="-Xms512m -Xmx512m"). This pins BOTH Xms and Xmx (the image's
+# jvm.options defaults to -Xms1g/-Xmx1g and LS_JAVA_OPTS is APPENDED; setting only
+# -Xmx512m leaves Xms1g > Xmx512m -> JVM abort). The quotes are load-bearing:
+# systemd Environment= splits on whitespace, so the unquoted form drops -Xmx512m.
+# This is the SAME value-quoted form the deployed elasticsearch .j2 uses for
+# ES_JAVA_OPTS (and that jvm_opts renders); it is systemd-equivalent to the static
+# unit's `Environment="LS_JAVA_OPTS=..."` (both unquote to the identical value).
+#
+# Loopback publish: the raw beats(5044)/http(8085) ports bind 127.0.0.1 only -- not
+# exposed on the tailnet/LAN; container->logstash uses the `lme` network alias.
+#
+# Fidelity target = quadlet-optional/elastic-services/lme-logstash.container with
+# EXACTLY: (1) Volume lme_certs:/certs:ro,idmap -> /opt/lme/certs/logstash:/certs:ro,
+# (2) drop User=root, (3) the LS_JAVA_OPTS quote-form normalization above
+# (systemd-neutral). Directive REORDER within sections is cosmetic.
+id: logstash
+name: lme-logstash
+kind: container
+enabled_when: [install_elastic_services]
+image: logstash
+description: Elastic Logstash Container Service
+
+dependencies:
+  requires: [elasticsearch, setup-certs]
+  after: [elasticsearch, setup-certs]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+
+behavior:
+  restart: always
+  restart_sec: 5
+  timeout_start_sec: 300
+  start_limit_interval: 120
+  start_limit_burst: 10
+service_environment:
+  ANSIBLE_VAULT_PASSWORD_FILE: /etc/lme/pass.sh
+
+environment:
+  LS_JAVA_OPTS: '"-Xms512m -Xmx512m"'
+
+network_aliases: [lme-logstash]
+publish_ports:
+  # serve: tcp -> the tailnet VIP leg (tailscale_service.yml) must front these as
+  # raw TCP passthrough (--tcp), NOT --https: both are raw-TLS listeners (beats
+  # input terminates TLS itself; 8085 http). Consumed ONLY by tailscale_service.yml;
+  # render_port ignores `serve`, so the rendered unit bytes are unchanged.
+  # tailnet_ingress: raw-tcp -> the host ingress leg (tailscale_ingress.yml) fronts
+  # beats(5044) as a raw TCP passthrough (--tcp), NOT --https: the beats input
+  # terminates TLS itself (same raw-TLS hazard `serve: tcp` flags for the VIP leg).
+  # Only 5044 is host-ingress-fronted today; 8085 stays loopback-only (no marker).
+  - {host: 5044, container: 5044, bind: 127.0.0.1, serve: tcp, tailnet_ingress: raw-tcp}
+  - {host: 8085, container: 8085, bind: 127.0.0.1, serve: tcp}
+volumes:
+  - {source: "cert:logstash", dest: /certs, options: [ro, Z]}       # B4: per-svc bundle, no idmap; Z=SELinux relabel
+  - {source: /opt/lme/config/logstash/logstash.yml, dest: /usr/share/logstash/config/logstash.yml, options: [ro]}
+  - {source: /opt/lme/config/logstash/pipeline, dest: /usr/share/logstash/pipeline, options: [ro]}
+secrets:
+  - {name: elastic, type: env, target: ELASTICSEARCH_PASSWORD}
+health:
+  cmd: "curl -fs http://localhost:9600/ -o /dev/null"
+
+# B4 cert-owner metadata (consumed by init-setup.sh / G5, NOT emitted into the
+# unit). host_userns:true -> cert_owner = base 0 + in_container_uid 1000 = 1000
+# (the image uid). logstash is a TLS SERVER for the beats input, so its bundle
+# needs its own leaf (logstash/logstash.crt+.key) and ca/ca.crt; ca.key absent.
+certs:
+  host_userns: true
+  in_container_uid: 1000
+  needs_ca: true

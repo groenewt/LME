@@ -1,0 +1,54 @@
+---
+# testing/remote_harness/tasks/prereq_journal.yml -- write the ROOT-OWNED partial-bootstrap journal of
+# target_prereq.yml (tp.journal; codex ACCOUNT/KEY RESUME). The journal binds owner, uid, GECOS marker and owner
+# public-key sha256 plus the ordered op states; it is rewritten BEFORE an op's effect (started) and AFTER it (done).
+# Its PATH is not an input: it is derived INLINE in every use from tp.journal and tp_ctl.owner (an input or task var
+# could be outranked by an extra-var). Its directory is re-admitted fresh (root_only) right before every write; an
+# existing journal file must be a root-owned regular file (never a link).
+# Inputs: tp, tp_ctl, tp_j (current journal), tp_jop (op name or ''), tp_jstate, tp_juid (optional: the uid observed
+# right after the account op). tp_jop / tp_jstate / tp_juid / tp_ro_* join reserved_outputs (C1 hunk).
+- name: Derive the next journal state
+  ansible.builtin.set_fact:
+    tp_j: >-
+      {{ tp_j
+         | combine({'ops': {tp_jop: tp_jstate}} if (tp_jop | length > 0) else {}, recursive=true)
+         | combine({'binding': {'uid': tp_juid | int}} if (tp_juid is defined and tp_juid is not none) else {}, recursive=true) }}
+
+- name: Refuse an unknown op or state (the declared journal contract)
+  ansible.builtin.assert:
+    that:
+      - tp_jop == '' or tp_jop in tp.journal.ops
+      - tp_jop == '' or tp_jstate in tp.journal.states
+      - tp_j.schema == tp.journal.schema
+      - tp_j.binding.owner == tp_ctl.owner
+    fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: journal op '{{ tp_jop }}' / state '{{ tp_jstate | default('') }}' is not declared (tp.journal), or the journal is not {{ tp_ctl.owner }}'s."
+    quiet: true
+
+- name: Re-admit the journal directory (fresh, root_only)
+  ansible.builtin.include_tasks: prereq_root_only.yml
+  vars:
+    tp_ro_path: "{{ tp.journal.dir }}"
+    tp_ro_refusal: "{{ tp.refusal }}"
+
+- name: Stat the journal file (no link followed)
+  ansible.builtin.stat:
+    path: "{{ tp.journal.dir ~ '/' ~ tp_ctl.owner ~ tp.journal.file_suffix }}"
+    follow: false
+    get_checksum: false
+  register: _tp_jst
+
+- name: Refuse a journal file that is a link, not regular, or not root-owned
+  ansible.builtin.assert:
+    that:
+      - not _tp_jst.stat.exists or (_tp_jst.stat.isreg and not _tp_jst.stat.islnk and _tp_jst.stat.uid == 0)
+    fail_msg: "REFUSED {{ tp.refusal }} on {{ inventory_hostname }}: {{ tp.journal.dir ~ '/' ~ tp_ctl.owner ~ tp.journal.file_suffix }} exists but is not a root-owned regular file (preserved)."
+    quiet: true
+
+- name: Write the journal (root:root, declared mode)
+  ansible.builtin.copy:
+    content: "{{ tp_j | to_nice_json }}\n"
+    dest: "{{ tp.journal.dir ~ '/' ~ tp_ctl.owner ~ tp.journal.file_suffix }}"
+    owner: root
+    group: root
+    mode: "{{ tp.journal.file_mode }}"
+    follow: false

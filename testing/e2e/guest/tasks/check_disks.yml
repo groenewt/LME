@@ -1,0 +1,70 @@
+---
+# testing/e2e/guest/tasks/check_disks.yml -- READ-ONLY: the named final disks are exactly the declared ones (os: qcow2
+# overlay on the immutable base, full declared virtual size; data: standalone qcow2). Shared by provision (after each
+# disk exists, and when a resume finds one) and verify. Input: _g_disks (subset of ['os', 'data']);
+# _g_disk_ids_expect (optional, none = no expectation; {os: {dev, inode}, data: {dev, inode}} from the record once
+# the disks' identities are recorded -- in the claimed stage right after creation, and in every later state).
+# Output: g_disk_ids (observed {os|data: {dev, inode}} of the pathnames, links never followed).
+# codex GUEST-INITIALIZED-DISK: once the record carries identities, a disk pathname whose inode is not the recorded
+# one (removed and recreated, swapped) refuses GUEST-DISK-IDENTITY and is preserved as found -- never adopted.
+
+- name: Stat the disk pathnames (no link followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ gp.files.os_disk if item == 'os' else gp.files.data_disk }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ _g_disks }}"
+  register: _g_dst
+
+- name: Bind the observed disk identities (derived output)
+  ansible.builtin.set_fact:
+    g_disk_ids: >-
+      {% set ns = namespace(d={}) %}{% for r in _g_dst.results %}{% set ns.d = ns.d | combine({r.item:
+      ({'dev': r.stat.dev | int, 'inode': r.stat.inode | int} if (r.stat.exists and not r.stat.islnk) else none)})
+      %}{% endfor %}{{ ns.d }}
+
+- name: Refuse missing disk pathnames or pathnames whose inode is not the recorded one (initialized storage; preserved)
+  when: (_g_disk_ids_expect | default(none)) is not none
+  ansible.builtin.assert:
+    that:
+      - _g_dst.results | map(attribute='stat') | rejectattr('exists') | list | length == 0
+      - _g_dst.results | map(attribute='stat') | selectattr('islnk') | list | length == 0
+      - _g_disks | map('extract', g_disk_ids) | list == _g_disks | map('extract', _g_disk_ids_expect) | list
+    fail_msg: >-
+      REFUSED {{ gd.refusals.disk_identity }} on {{ inventory_hostname }}: initialized disk(s) {{ _g_disks }} are missing
+      or are not the recorded inodes (observed {{ g_disk_ids }}, recorded {{ _g_disk_ids_expect }}). Nothing is created
+      or adopted; the run dir is preserved for explicit recovery.
+    quiet: true
+
+- name: Read the disks' actual backing chains (argv; shared lock, read-only)
+  ansible.builtin.command:
+    argv: ["{{ gt.qemu_img }}", "info", "--force-share", "--backing-chain", "--output=json",
+           "{{ gp.files.os_disk if item == 'os' else gp.files.data_disk }}"]
+  loop: "{{ _g_disks }}"
+  changed_when: false
+  failed_when: false
+  register: _g_chain
+
+- name: Refuse disks whose chain, format or size is not the declared one (a partial or foreign disk is preserved)
+  vars:
+    _g_c: "{{ dict(_g_chain.results | map(attribute='item') | zip(_g_chain.results | map(attribute='stdout') | map('default', '[]'))) }}"
+    _g_rcs: "{{ _g_chain.results | map(attribute='rc') | list }}"
+    # an unreadable disk (rc != 0, empty stdout) yields [] and refuses on the first condition below (asserts stop there)
+    _g_oschain: "{{ (_g_c.os | from_json) if ('os' in _g_disks and (_g_c.os | trim) | length > 0) else [] }}"
+    _g_datachain: "{{ (_g_c.data | from_json) if ('data' in _g_disks and (_g_c.data | trim) | length > 0) else [] }}"
+  ansible.builtin.assert:
+    that:
+      - _g_rcs | reject('equalto', 0) | list | length == 0
+      - ('os' not in _g_disks) or (_g_oschain | length == 2)
+      - ('os' not in _g_disks) or (_g_oschain[0].filename == gp.files.os_disk and _g_oschain[0].format == 'qcow2')
+      - ('os' not in _g_disks) or (_g_oschain[0]['backing-filename'] | default('') == gp.base)
+      - ('os' not in _g_disks) or (_g_oschain[0]['virtual-size'] == gg.os_disk_gib * 1073741824)
+      - ('os' not in _g_disks) or (_g_oschain[1].filename == gp.base and _g_oschain[1].format == 'qcow2' and _g_oschain[1]['backing-filename'] is not defined)
+      - ('data' not in _g_disks) or (_g_datachain | length == 1)
+      - ('data' not in _g_disks) or (_g_datachain[0].filename == gp.files.data_disk and _g_datachain[0].format == 'qcow2')
+      - ('data' not in _g_disks) or (_g_datachain[0]['backing-filename'] is not defined)
+      - ('data' not in _g_disks) or (_g_datachain[0]['virtual-size'] == gg.data_disk_gib * 1073741824)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: the observed disks {{ _g_disks }} are not the declared
+      ones (os overlay -> {{ gp.base }}; standalone data disk; declared virtual sizes). They are preserved as found.
+    quiet: true

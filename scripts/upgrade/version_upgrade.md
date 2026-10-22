@@ -90,7 +90,7 @@ These versions are defined in:
 2. `config/containers.txt` for all containers
 3. `lme-environment.env` as STACK_VERSION
 
-When the optional Elastic services pack is enabled (`--elastic-services`), its images (apm-server, heartbeat, metricbeat, filebeat, logstash — all 8.18.8) are defined in `config/containers-elastic-services.txt` and are also pulled during upgrade.
+If the optional Elastic services pack is already installed, the upgrade auto-detects it from the installed pack quadlets and re-applies it: its images (apm-server, heartbeat, metricbeat, filebeat, logstash — all 8.18.8, defined in `config/containers-elastic-services.txt`) are pulled, and the pack quadlets/configs and certificate top-up are re-applied so pack config changes deploy. If auto-detection misses a pack you know is installed, force the re-land with `-e install_elastic_services=true`. Adding the pack to an install that does not have it is done with `install.sh --elastic-services`, not during upgrade.
 
 ## Troubleshooting
 

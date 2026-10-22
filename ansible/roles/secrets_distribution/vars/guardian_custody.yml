@@ -1,0 +1,198 @@
+---
+# =============================================================================
+# guardian_custody.yml -- DECLARED guardian key custody + recovery PLACEMENTS.
+#
+# These MIRROR the canonical templates authored in
+#   config/postgresql-platform/fencing-protocol.contract.yaml guardian_custody
+# (the AUTHORITY; D CONFIRMED the shape with amendments A1..A5, commit 2e9328f).
+# They are DECLARED here (role-scoped, -e overridable) and RESOLVED by
+# tasks/guardian_custody.yml -- the executable NEVER hardcodes a literal path
+# (codex-0630 guardian_custody_decision.implementation_constraints: "DECLARE it,
+# RESOLVE it -- do NOT hardcode /run/lme-fencing-signer as a new executable
+# default"). tasks/guardian_custody.yml drift-asserts these DEFAULTS against the
+# contract file before it resolves anything.
+#
+# HANDOFF (owed): the canonical home for these is a manifests/global.yml custody
+# registry keyed by deployment_identity + signer_id (producer/custody registry
+# C1 flagged as owed -- catalog_debts.owed_registries). Until C1 lands it, these
+# role vars are the declared source, drift-checked against the contract.
+#
+# NO SECRET VALUES appear here: only path/reference DECLARATIONS. The wrapping
+# key is referenced BY PATH only (guardian_custody_wrapping_key_ref); its bytes
+# are never read into a fact, printed, or logged.
+# =============================================================================
+
+# --- A1: runtime plaintext -- signer-host-only, deployment+signer namespaced ---
+# Plaintext exists ONLY here, ONLY on the signer host, decrypted at runtime from
+# the encrypted durable ref. MUST NOT live under /run/lme-fencing: render()
+# bind-mounts that whole tree READ-ONLY into every member (platform.py L418) and
+# every proxy (L518), so a plaintext key there is readable in every consumer ns.
+# Default root is the CONTRACT literal; a test/override may repoint the root only
+# (the {deployment_identity}/{signer_id}/guardian.key SHAPE is drift-locked).
+# The CONTRACT default root (immutable drift-lock comparand) vs the OPERATIVE root
+# (guardian_custody_runtime_root; equals the default in production, but a test/override
+# may repoint it -- the SHAPE below is what stays drift-locked to the contract).
+guardian_custody_runtime_root_default: /run/lme-fencing-signer
+guardian_custody_runtime_root: "{{ guardian_custody_runtime_root_default }}"
+guardian_custody_runtime_plaintext_tpl: "{runtime_root}/{deployment_identity}/{signer_id}/guardian.key"
+# The contract literal this default must reduce to (drift assert comparand).
+guardian_custody_runtime_plaintext_contract_literal: "/run/lme-fencing-signer/<deployment_identity>/<signer_id>/guardian.key"
+
+# --- A2/A3: encrypted durable authority-reference (recoverable, independent) ---
+# encrypted_durable_ref = <recovery_store>/<deployment_identity>/<signer_id>/guardian.enc
+# recovery_store is a REQUIRED input (no default) and MUST be independent of the
+# signer host and of the DB being recovered (asserted in the task). guardian.meta
+# is a cleartext {epoch, pub_fingerprint} sidecar that is INFORMATIONAL ONLY -- it is
+# NOT authoritative and is NOT bound into the wrapping-key derivation (correcting the
+# original false claim; codex-0730 C-CUSTODY-EPOCH-FINGERPRINT-PASSPHRASE-BINDING).
+# Trust comes from the CONSUMED guardian_custody_expected_pub_fingerprint (D's authority
+# seam) verified against the recovered key, plus the single-line epoch-bound passphrase;
+# editing/relabelling the sidecar changes nothing.
+guardian_custody_durable_tpl: "{recovery_store}/{deployment_identity}/{signer_id}/guardian.enc"
+guardian_custody_meta_tpl: "{recovery_store}/{deployment_identity}/{signer_id}/guardian.meta"
+guardian_custody_durable_contract_literal: "<recovery_store>/<deployment_identity>/<signer_id>/guardian.enc"
+
+# --- Consumer bind-mount roots the runtime plaintext MUST be disjoint from ------
+# Component-wise disjointness (NOT string prefix -- '/run/lme-fencing' is a prefix
+# of '/run/lme-fencing-signer'; a naive startswith would wrongly reject the
+# correct signer path). render() bind-mounts these READ-ONLY into consumers.
+guardian_custody_consumer_bind_mount_roots:
+  - /run/lme-fencing        # platform.py L418 (members) + L518 (proxies); control.sock lives here
+
+# --- The verified-pair MARKER + non-secret decision RECEIPT ---------------------
+# The guard (and every trust-anchor consumer) gates on a VERIFIED pub<->priv pair
+# for the CURRENT epoch (this marker), NEVER on guardian.pub existence alone
+# (retracts the pub-existence-suppresses-retry behaviour). Both live under the
+# signer runtime dir; the receipt carries ONLY non-secret decision tokens.
+guardian_custody_marker_name: guardian.verified-pair
+guardian_custody_receipt_name: guardian.custody-receipt
+
+# --- Encryption parameters ------------------------------------------------------
+# CORRECTION (codex-0730 C-CUSTODY-EPOCH-FINGERPRINT-PASSPHRASE-BINDING, HIGH,
+# CONFIRMED): the ORIGINAL ca2e93f claim that "epoch+fingerprint are bound into the
+# KDF passphrase (tamper/relabel/wrong-key -> decrypt fails by construction)" was
+# FALSE. OpenSSL `-pass file:` reads ONLY the FIRST LINE of the passphrase file
+# (/usr/share/man/man1/openssl-passphrase-options.1ssl.gz), so the epoch/fingerprint
+# appended on later lines had NO effect on the key, and the only epoch comparand was
+# the EDITABLE guardian.meta sidecar -- not an authenticated binding.
+# CORRECTED design (implemented in tasks/guardian_custody.yml repair wave):
+#   * the wrapping-key reference is a SINGLE-LINE hex/base64 secret (asserted), so
+#     `-pass file:` consumes it whole (a multi-line/binary key was silently truncated);
+#   * TRUST comes from guardian_custody_expected_pub_fingerprint -- a CONSUMED input on
+#     D's authority seam (alongside authority_epoch, A4), NOT the sidecar -- and recovery
+#     accepts a key ONLY if its structurally-parsed public fingerprint equals that
+#     independently-trusted expectation, then a pub<->priv pair-verify;
+#   * confidentiality is CBC+PBKDF2 (no AEAD via `openssl enc` on this toolchain).
+# RESIDUAL (hardening, joint review): an authenticated durable envelope
+# (openssl cms AuthEnvelopedData / encrypt-then-MAC) so a tampered ciphertext fails
+# BEFORE the fingerprint check, not only at it.
+guardian_custody_enc_cipher: aes-256-cbc
+guardian_custody_enc_pbkdf2_iter: 200000
+guardian_custody_enc_md: sha256
+# The wrapping key reference MUST be a single-line secret (hex or base64), because
+# `-pass file:` stops at the first newline; the task asserts this format.
+guardian_custody_wrapping_key_format: single_line_hex_or_base64
+
+# --- C's CALLER PRECONDITION (codex-0845 C-CUSTODY-NOT-PREGENERATION, C-owned) ---
+# The custody producer decides generate/recover/rotate/republish/noop and NEVER
+# re-mints over a durable. That safety only holds if custody admission runs BEFORE
+# any ordinary key generation for this identity: a caller that generates first
+# defeats the recover / lost-custody gates. This is a DECLARED contract C owns
+# closing -- codex-0845 explicitly rejected routing the ordering to C1 as a pure
+# wiring hand-off. It is recorded (not claimed satisfied) because the candidate is
+# UNWIRED; scalars first, the list stays LAST.
+guardian_custody_caller_contract:
+  precondition: >-
+    tasks/guardian_custody.yml MUST run (and reach a verified-pair decision) BEFORE any
+    ordinary key generation for the same deployment_identity/signer_id.
+  current_state: >-
+    RECONCILED-IN-DORMANT-CALLER (wave-6-caller-order; addressed_interim, codex re-review
+    pending -- NOT self-certified). credential_materializer.yml now orders the
+    "Guardian custody (signer-node encrypted-durable custody + recovery)" include AND a
+    NOT-PREGENERATION toggle guard BEFORE the "Credential generation (controller-central
+    ...)" block, so custody admission precedes any ordinary key generation for this
+    deployment_identity/signer_id. The candidate is still UNWIRED (no live entrypoint
+    includes credential_materializer.yml), so the order is reconciled in the caller but
+    never yet EXERCISED in production. The real file's order is driven by the
+    order-acceptance fixture at testing/tests/custody_caller_order.
+  scope_of_closure: >-
+    This closes ONLY the NOT-PREGENERATION half of C-CUSTODY-NOT-PREGENERATION-AND-CANONICAL-DEBT.
+    The CANONICAL-DEBT half (the generation manifest sourcing canonical resolved-material rather
+    than this producer's own enumeration) remains OPEN and is routed to C1 / the joint contract;
+    it is NOT addressed by the reorder.
+  ownership: >-
+    C authored the reorder so custody admission precedes generation; F reviews. C1
+    integrates the shared admission seam but does NOT inherit the ordering fix.
+  blocks: wiring
+  refusals_if_violated:
+    - "a caller that generates guardian key material before the custody decision is a contract breach (re-mint/never-recover hazard)"
+    - "credential_materializer_generate=true with guardian custody disabled (guardian_custody=false) is refused by the caller's NOT-PREGENERATION toggle guard"
+
+# =============================================================================
+# DECLARED C -> D SIGNING INTERFACE (codex-0700 C/D boundary; coordinator
+# codex-0715 interface_precision). This is C's deliverable: a DECLARED custody +
+# SIGNING primitive that D's authority service CONSUMES for AUTHORIZED signing
+# operations. It is NOT a socket server and NOT new Python -- D owns the
+# control.sock / authority PROTOCOL (lease, epoch, reservation admission,
+# authorization + inhibition publication, revoke/stop-drain/replace serialization,
+# nonce consumption). C does NOT stand up a second listener and does NOT move the
+# authority protocol to C.
+#
+# CRITICAL BOUNDARY: reaching the runtime key OR reaching D's socket is NOT
+# authorization to obtain a signature. Authorization is D's protocol: a signature
+# is produced ONLY after D has CONSUMED an authorization for the CURRENT leased
+# epoch. C's interface adds defense-in-depth (it refuses unless the caller-supplied
+# epoch equals the durable-bound epoch, A3), but C is NOT the authority.
+#
+# This is a DECLARATION consumed at integration time; the interface ACK gates
+# INTEGRATION with D's service, not C's independent custody authoring. It is UNWIRED
+# until the joint C/D integration lands a caller.
+guardian_signing_interface:
+  # WHO may invoke a signature.
+  invoker: "D's guardian AUTHORITY SERVICE only (never a member/proxy consumer, never a bare caller)."
+  # WHAT must already be true before a signature is produced (D's authority protocol).
+  precondition_authorization: >-
+    D has CONSUMED an authorization for the CURRENT leased authority_epoch (D's control.sock
+    protocol: lease + reservation admission + nonce consumption). Possession of the key or
+    reachability of the socket is NOT authorization.
+  precondition_epoch_binding: >-
+    The caller-supplied authority_epoch MUST equal the CONSUMED expected epoch on D's
+    authority seam, and the signing key's structurally-parsed public fingerprint MUST equal
+    the CONSUMED guardian_custody_expected_pub_fingerprint (D's recorded expectation), NOT the
+    editable guardian.meta sidecar (codex-0730 C-CUSTODY-EPOCH-FINGERPRINT-PASSPHRASE-BINDING:
+    the sidecar is not authoritative). C refuses otherwise (defense in depth).
+  trust_epoch_binding_input:
+    # THE concrete C<-D trust/epoch binding (codex-0700 asked C to record it): D records the
+    # fingerprint C emits at bootstrap/rotation and hands it back as an input to recovery/sign.
+    expected_pub_fingerprint: "D-recorded SHA-256 of the guardian DER public key (C emits at bootstrap/rotation; D stores + supplies back)"
+    authority_epoch: "D's current leased epoch (A4, consumed; C never mints it)"
+  # WHERE the private half is read from (never distributed; signer-host-only).
+  key_source: >-
+    The signer-namespace runtime plaintext at
+    guardian_custody_runtime_plaintext_tpl, asserted disjoint from the consumer
+    bind-mount roots. The private half is NEVER copied to a consumer or a distributable.
+  # HOW a signature is produced (Ed25519 raw sign over D-supplied canonical bytes).
+  operation: "Ed25519 raw sign (openssl pkeyutl -sign -rawin) over the canonical byte string D supplies; C does not choose or interpret the message."
+  # WHAT C returns to D.
+  output_fields:
+    - signature            # raw Ed25519 signature bytes over the supplied message
+    - guardian_pub_fingerprint  # SHA-256 of the DER public key (binds the signing key identity)
+    - authority_epoch      # the epoch under which the signature was authorized + produced
+  # WHAT C refuses (defense in depth on top of D's authority protocol).
+  refusals:
+    - "no verified pub<->priv pair for the current epoch (the guardian_custody marker is absent/stale)"
+    - "caller-supplied epoch != durable-bound epoch (A3)"
+    - "runtime key absent or not resident on the signer host (never mint-to-sign)"
+  # WHAT is explicitly NOT C's (stays D's authority protocol).
+  not_owned_by_c:
+    - "the control.sock / authority-socket protocol (listener, admission, serialization)"
+    - "minting/leasing/advancing authority_epoch (A4: epoch is a CONSUMED input)"
+    - "revoke / stop-drain / replace / start serialization + nonce consumption"
+
+# The signing PRIMITIVE as an openssl command TEMPLATE (declaration; no socket, no
+# Python). {runtime_key} = the resolved signer-namespace plaintext; {message_file} =
+# D-supplied canonical bytes; {sig_file} = output signature. Mirrors the pair-verify
+# sign in tasks/guardian_custody.yml, so the interface signs with the same primitive
+# the custody producer already proves a verified pair against.
+guardian_signing_command_tpl: "openssl pkeyutl -sign -inkey {runtime_key} -rawin -in {message_file} -out {sig_file}"
+guardian_signing_verify_command_tpl: "openssl pkeyutl -verify -pubin -inkey {pub_file} -rawin -in {message_file} -sigfile {sig_file}"

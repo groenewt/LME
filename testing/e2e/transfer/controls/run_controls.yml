@@ -1,0 +1,695 @@
+---
+# testing/e2e/transfer/controls/run_controls.yml -- the GENERIC runner for the declared transfer controls
+# (controls/CASES.yml).
+#
+#   <ansible-playbook> -i localhost, testing/e2e/transfer/controls/run_controls.yml [-e '{"only": ["P01-...", ...]}']
+#
+# WORK ROOT (codex 135012/135500): DEFAULT = the declared <checkout>/<work_roots.root_rel>/<sub_roots.run>/
+# <runners.transfer_controls> (e.g. <checkout>/.work/run/transfer-controls), read from the RESOLVED policy
+# (resolve_work_root.yml: refuse_pinned_outputs + resolve_policy, never the raw profile); -e work_root overrides it.
+# Either is admitted against path_admission (regex, forbidden segments; ancestry through the route's ONE rule
+# testing/remote_harness/tasks/admit_ancestry.yml, incl. owner_private_group) and work_roots.admission.refused_prefixes
+# (CONTROLS-WORK-ROOT); missing levels are created 0755 explicitly. Free bytes, inodes and fs type are the run-local
+# seed's admission (work_roots.admission), not re-checked here. A work root inside the
+# checkout must be git-ignored (`git check-ignore`), so SOURCE-REF's clean-tree check (status_args, ignored files
+# excluded) never sees run evidence as untracked; and SOURCE-REF's "inside the source" (load binding A and B)
+# EXCLUDES <source>/<root_rel>, so a scratch dir under the work root never counts as candidate bytes.
+#
+# Each run gets a unique immutable directory <work_root>/runs/<run_id>/ (EVIDENCE-RETENTION: no earlier run's
+# verdicts, cases or receipt are ever removed or overwritten; a pre-existing run directory refuses). Each case goes
+# through run_one_case.yml and leaves <run_dir>/verdicts/<id>.json. The aggregate
+# <run_dir>/receipt.json is GREEN only if every RUNNABLE case (every kind except integration) has an ok verdict,
+# and every named neighbour is ok. Integration cases are listed in the receipt as declared_unrun.
+# Local and unprivileged: no remote host, no network, no root, no ssh (gate cases use a fake), no package manager.
+# The repository is only read. Phase cases need a clone of the declared SOURCE into <run_dir>/src (nothing is
+# committed), so they run only with -e allow_git_fixture=true (a lane that may not run git leaves it false and the
+# runner REFUSES a selection containing phase or source cases instead of skipping them).
+# r5q KIND ADMISSION (X-MAIN-R5P-1; codex-tick461): the kind vocabulary and each kind's git_fixture / source / runnable
+# / case_keys requirements are read from the ONE declaration CASES.yml harness.kinds (never derived from the cases).
+# An undeclared kind refuses (REFUSED CONTROLS-CASES) before anything is written; every kind whose declared
+# git_fixture is not none (phase, source, check -- its one-commit fixture since r5p -- and generation) needs
+# -e allow_git_fixture=true (REFUSED CONTROLS-GIT-FIXTURE); kinds declared source admitted / shared_clone (generation /
+# phase) trigger SOURCE-REF; only shared_clone kinds get the shared clone. regex / gate / scope stay git-free.
+# SOURCE-REF (phase cases only): -e '{"source_ref": {"path": "/abs/candidate", "commit": "<40-hex>"}}' (path defaults
+# to this repository, commit to HEAD). controls/source_ref.yml admits it BEFORE any clone: CONTROLS-SOURCE-INPUT,
+# CONTROLS-SOURCE-DIRTY (tracked edits or untracked files), CONTROLS-SOURCE-MISMATCH (commit is not the source's
+# HEAD), CONTROLS-RUNNER-SOURCE-MISMATCH (these controls must run from inside the source, so B's tasks, the phase
+# driver and the route tasks are the same commit as the shipped source). Every clone (controls/source_clone.yml) is
+# `--no-checkout` + `checkout --detach <commit>` and is re-checked for commit and tree. The receipt records
+# source_ref {used, path, requested, commit, tree, clean, runner_root, git, clones, load_binding}; a phase selection
+# with used=false is refused (CONTROLS-SOURCE-VACUOUS). A dirty working tree (e.g. an uncommitted candidate)
+# therefore refuses instead of silently testing HEAD. LOAD BINDING (policy: transfer.decl.yml controls_source):
+# (A) before any clone, `ansible-config dump` with chdir = the source refuses CONTROLS-SOURCE-LOAD-PATH for a config
+# file outside the source or a non-empty project plugin/role/module path outside it (collections and the ansible
+# install are recorded); (B) every phase run asserts its loaded roots at runtime (controls/load_paths.yml, same
+# code) and its verdict carries load_paths; (C) check.yml refuses an undeclared lookup/include base
+# (TRANSFER-CHECK-LOAD-BASE). Phase driver runs use chdir = the source, the directory (A) checked.
+# Receipt schema lme.transfer.controls/v4.
+# Phase cases also need C1's registry reserved_outputs and the engine's lme_resolved.remote_harness projection.
+# OPEN cases (status: OPEN, e.g. K06/I4 per TR01) are listed separately and are never counted as covered: a
+# refusal does not cover them.
+- name: transfer controls
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    ctl_dir: "{{ playbook_dir }}"
+    transfer_dir: "{{ playbook_dir | dirname }}"
+    repo_root: "{{ playbook_dir | dirname | dirname | dirname | dirname }}"
+    only: []
+    allow_git_fixture: false
+  tasks:
+    - name: Load the declarations
+      ansible.builtin.set_fact:
+        C: "{{ lookup('ansible.builtin.file', ctl_dir ~ '/CASES.yml') | from_yaml }}"
+        T: "{{ (lookup('ansible.builtin.file', transfer_dir ~ '/transfer.decl.yml') | from_yaml).transfer }}"
+        me_uid: "{{ lookup('ansible.builtin.pipe', 'id -u') | int }}"
+
+    # PASSWD-HOME ORACLE (codex 202245 B-R1-CONTROL-PASSWD-HOME): the invoking uid's passwd home, obtained HERE by
+    # the ansible.builtin.getent module (NSS passwd lookup by uid, parsed by the module), independently of the route
+    # launcher under test (which derives HOME in POSIX sh through seed_launch.derive.home). Gate cases compare the
+    # HOME the stand-in seed recorded against it (placeholder @passwd_home@); the launcher's value is never the oracle.
+    - name: PASSWD-HOME -- the invoking uid's passwd entry (independent oracle)
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ me_uid }}"
+        split: ':'
+
+    - name: PASSWD-HOME -- exactly one entry, of this uid, with an absolute home (CONTROLS-PASSWD-HOME)
+      vars:
+        _pe: "{{ getent_passwd | dict2items }}"
+      ansible.builtin.assert:
+        that:
+          - _pe | length == 1
+          - (_pe[0]['value'][1] | string) == (me_uid | string)
+          - _pe[0]['value'][4] is string and _pe[0]['value'][4] is match('^/[A-Za-z0-9._/+-]*$')   # JSON/placeholder-safe
+        fail_msg: "CONTROLS-PASSWD-HOME: no single absolute passwd home for uid {{ me_uid }}: {{ _pe }}"
+        quiet: true
+
+    - name: PASSWD-HOME -- record the oracle
+      ansible.builtin.set_fact:
+        me_passwd_home: "{{ (getent_passwd | dict2items)[0]['value'][4] }}"
+
+    - name: WORK-ROOT -- resolve the declared work-root rules (resolved policy; see resolve_work_root.yml)
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, 'umask 022 && exec "$0" -i localhost, "$1" 2>&1', "{{ C.harness.ansible_playbook }}",
+               "{{ transfer_dir }}/resolve_work_root.yml"]
+        chdir: "{{ repo_root }}"
+      environment: {ANSIBLE_NOCOLOR: '1', ANSIBLE_RETRY_FILES_ENABLED: '0'}
+      register: _wrr
+      changed_when: false
+      failed_when: false
+
+    - name: WORK-ROOT -- the resolver answered (CONTROLS-WORK-ROOT)
+      ansible.builtin.assert:
+        that:
+          - _wrr.rc == 0
+          - _wrr.stdout is search('TR-WORK-ROOTS [A-Za-z0-9+/=]+ TR-WORK-ROOTS-END')
+        fail_msg: "CONTROLS-WORK-ROOT: the declared work-root rules did not resolve (rc {{ _wrr.rc }}): {{ (_wrr.stdout | default(''))[-800:] }}"
+        quiet: true
+
+    - name: WORK-ROOT -- the declared rules and the effective work root (-e work_root overrides the declared default)
+      vars:
+        _p: >-
+          {{ _wrr.stdout | regex_search('TR-WORK-ROOTS [A-Za-z0-9+/=]+ TR-WORK-ROOTS-END')
+             | regex_replace('^TR-WORK-ROOTS ', '') | regex_replace(' TR-WORK-ROOTS-END$', '') | b64decode | from_json }}
+      ansible.builtin.set_fact:
+        _wrp: "{{ _p }}"
+        _wroot: >-
+          {{ work_root | default(_p.repo_root ~ '/' ~ _p.work_roots.root_rel ~ '/' ~ _p.work_roots.sub_roots.run
+                                 ~ '/' ~ _p.work_roots.runners.transfer_controls) }}
+
+    - name: WORK-ROOT -- admitted (path_admission, declared refused prefixes; the resolver's checkout is this runner's)
+      ansible.builtin.assert:
+        that:
+          - (_wrp.repo_root | realpath) == (repo_root | realpath)
+          - _wroot is string and _wroot is match(_wrp.path_admission.regex)
+          - _wrp.path_admission.forbidden_segment_regex is string
+          - _wroot is not search(_wrp.path_admission.forbidden_segment_regex)
+          - ((_wroot | realpath) ~ '/') is not match('(' ~ (_wrp.work_roots.admission.refused_prefixes | map('regex_escape') | join('|')) ~ ')')
+          - (_wroot ~ '/') is not match('(' ~ (_wrp.work_roots.admission.refused_prefixes | map('regex_escape') | join('|')) ~ ')')
+        fail_msg: >-
+          CONTROLS-WORK-ROOT: work root {{ _wroot }} is not admitted (path_admission {{ _wrp.path_admission.regex }};
+          refused prefixes {{ _wrp.work_roots.admission.refused_prefixes }}; resolver checkout {{ _wrp.repo_root }})
+        quiet: true
+
+    - name: WORK-ROOT -- inside the checkout, the work root must be git-ignored
+      ansible.builtin.command:
+        argv: ["{{ T.source.git }}", -C, "{{ repo_root }}", check-ignore, --quiet, --no-index, "{{ _wroot }}/"]
+      register: _wri
+      changed_when: false
+      failed_when: false
+      when: ((_wroot | realpath) ~ '/').startswith((repo_root | realpath) ~ '/')
+
+    - name: WORK-ROOT -- ignored, so SOURCE-REF's clean-tree check never sees run evidence (CONTROLS-WORK-ROOT)
+      ansible.builtin.assert:
+        that:
+          - _wri is skipped or _wri.rc == 0
+        fail_msg: "CONTROLS-WORK-ROOT: {{ _wroot }} is inside the checkout {{ repo_root }} but not git-ignored"
+        quiet: true
+
+    - name: WORK-ROOT -- stat the work root and every ancestor (no link following)
+      ansible.builtin.stat:
+        path: "{{ '/' ~ (_wroot.split('/')[1:item] | join('/')) }}"
+        follow: false
+        get_checksum: false
+      loop: "{{ range(1, (_wroot.split('/') | length) + 1) | list }}"
+      register: _wranc
+
+    # The ancestry (links, directories, owners, other/group-writable, owner-private-group) is the route's ONE rule:
+    # testing/remote_harness/tasks/admit_ancestry.yml (route revision 5), included here at the USE boundary (right
+    # before the first write under the work root). No local copy of the rule is kept (codex 143342).
+    # LOAD-BASE (codex-tick306): included through the DECLARED base repo_root (load_binding.lookup_bases), never the
+    # resolver's _wrp.repo_root; the WORK-ROOT admission above asserts (_wrp.repo_root | realpath) == (repo_root | realpath),
+    # so both name the same checkout and the rule file is this checkout's.
+    - name: WORK-ROOT -- declared ancestry through the route's ONE rule (CONTROLS-WORK-ROOT)
+      ansible.builtin.include_tasks: "{{ repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+      vars:
+        rh_anc_bs: "{{ _wrp.bootstrap }}"
+        rh_anc_repo_root: "{{ _wrp.repo_root }}"
+        rh_anc_path: "{{ _wroot }}"
+        rh_anc_refusal: CONTROLS-WORK-ROOT
+
+    - name: WORK-ROOT -- the missing levels, created in order below (explicit 0755, never umask-dependent)
+      ansible.builtin.set_fact:
+        _wr_missing: >-
+          {%- set o = [] -%}
+          {%- for r in _wranc.results if not r.stat.exists -%}
+            {{- o.append('/' ~ (_wroot.split('/')[1:r.item] | join('/'))) or '' -}}
+          {%- endfor -%}
+          {{ o | to_json }}
+
+    - name: WORK-ROOT -- parse
+      ansible.builtin.set_fact:
+        _wr_missing: "{{ _wr_missing if (_wr_missing is not string) else (_wr_missing | from_json) }}"
+
+    # r5q KIND ADMISSION (X-MAIN-R5P-1; codex-tick461): the supported kinds and each kind's fixture / source
+    # requirements come from the ONE declaration C.harness.kinds (vocabulary C.harness.kind_vocabulary), never from
+    # the cases being validated. Declaration shape first, then the cases, then the selection -- all BEFORE the run
+    # directory, any clone or any fixture exists (the first write is "Work root, run root, ..." below).
+    # r5r (codex-tick464 r5q-changed-source-value-sourcing): every refusal of this admission is composed through the
+    # ONE shared refusal grammar entry from DECLARED codes and texts (CASES harness.refusals / texts); the grammar's own
+    # presence is checked first (its diagnostic is the declared grammar_absent text in the R2 admit_git_paths form).
+    # r5u-rf2 (codex-tick510 RF-OD-2): the FAMILY SHAPE is admitted here, before any member is read: the key sets of
+    # harness.refusals / texts must EQUAL the declared member names (harness.family.members; names, not codes -- no code
+    # registry). This pre-grammar diagnostic is the family's PARENT declaration harness.family (refusal + text, the
+    # former texts.grammar_absent moved out of the family), so the message never reads a member of the family it
+    # admits: an omitted, null or partial family refuses typed. The parent node is the root of the diagnostic (its own
+    # absence would fail as an undefined variable, never pass -- recorded limit, not a fallback).
+    # r5u-rf3 (codex-tick518 RF2-CASES-REFUSAL-DOUBLE-OWNER): harness.family.refusal is the SOLE CONTROLS-CASES value;
+    # the case-admission refusals below read it directly (harness.refusals carries no `cases` member any more), so no
+    # restated copy and no equality clause exist to diverge after a profile / operator overlay.
+    - name: Refuse an absent refusal grammar or undeclared harness refusal codes / texts (before any admission)
+      vars:
+        _hfam: "{{ C.harness.family }}"
+      ansible.builtin.assert:
+        that:
+          - _wrp.bootstrap.refusal_grammar is mapping
+          - _wrp.bootstrap.refusal_grammar.entry_rel is string
+          - _wrp.bootstrap.path_admission.separator is string
+          - _hfam.members is mapping
+          - _hfam.members.refusals is sequence and _hfam.members.refusals is not string
+          - _hfam.members.texts is sequence and _hfam.members.texts is not string
+          - C.harness.refusals is defined and C.harness.refusals is mapping
+          - (C.harness.refusals.keys() | list | sort) == (_hfam.members.refusals | sort)
+          - C.harness.refusals.values() | reject('string') | list | length == 0
+          - C.harness.texts is defined and C.harness.texts is mapping
+          - (C.harness.texts.keys() | list | sort) == (_hfam.members.texts | sort)
+          - C.harness.texts.values() | reject('string') | list | length == 0
+        fail_msg: >-
+          REFUSED {{ _hfam.refusal }}: {{ _hfam.text }}
+        quiet: true
+
+    # r5u-rf2 (codex-tick510 RF-OD-9 option a): the grammar ENTRY is no longer bound to an alias fact; every harness
+    # grammar lookup writes repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel
+    # inline as its first token (check.yml LOAD-BASE). Only the grammar VALUE stays bound here (a template var, not a
+    # load base).
+    - name: The shared refusal grammar (one binding; consumed by every harness refusal below)
+      ansible.builtin.set_fact:
+        _hrf_grammar: "{{ _wrp.bootstrap.refusal_grammar }}"
+
+    # r5u-rf4 (codex-tick526 RF3-INNER-FAILURE-CUSTODY / RF3-PRELAUNCH-VERDICT-SOURCE): before any selection or write,
+    # (1) the custody declaration (harness.inner_failure) and the generation verdict stages are admitted by shape, and
+    # (2) every declared custody fixture runs through the SAME rule run_one_case.yml uses
+    # (controls/inner_failure_custody.yml) and its outer failures must equal the fixture's declared outer list exactly
+    # -- the ordinary / exactly-one / unrelated-extra / missing / repeated / equal-text-alias controls. Pure: no I/O.
+    # Refusal: the family's CONTROLS-CASES (harness.family.refusal) with texts.inner_failure_selftest.
+    - name: Refuse a malformed inner-failure custody declaration or generation verdict stages (presence and type first)
+      vars:
+        _ifd: "{{ C.harness.inner_failure }}"
+      ansible.builtin.assert:
+        that:
+          - _ifd is mapping
+          - _ifd.reasons is mapping and _ifd.reasons | length > 0
+          - _ifd.reasons.values() | reject('string') | list | length == 0
+          - _ifd.reasons.values() | reject('in', C.harness.texts.keys() | list) | list | length == 0
+          - _ifd.controls is sequence and _ifd.controls is not string and _ifd.controls | length > 0
+          - _ifd.controls | reject('mapping') | list | length == 0
+          - _ifd.controls | rejectattr('id', 'string') | list | length == 0
+          - (_ifd.controls | map(attribute='id') | unique | list | length) == (_ifd.controls | length)
+          - _ifd.controls | rejectattr('reasons', 'sequence') | list | length == 0
+          - _ifd.controls | rejectattr('failures', 'sequence') | list | length == 0
+          - _ifd.controls | map(attribute='failures') | flatten(levels=1) | reject('mapping') | list | length == 0
+          - _ifd.controls | map(attribute='failures') | flatten(levels=1) | rejectattr('text', 'string') | rejectattr('raw', 'string') | list | length == 0
+          - _ifd.controls | rejectattr('outer', 'sequence') | list | length == 0
+          - _ifd.controls | selectattr('expected', 'defined') | rejectattr('expected', 'sequence') | list | length == 0
+          - _ifd.controls | selectattr('texts_alias', 'defined') | rejectattr('texts_alias', 'mapping') | list | length == 0
+          - C.harness.generation.verdict_stage is mapping
+          - C.harness.generation.verdict_stage.pre_launch is string
+          - C.harness.generation.verdict_stage.generated is string
+          - C.harness.generation.verdict_stage.pre_launch != C.harness.generation.verdict_stage.generated
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.family.refusal,
+                                   'rh_rf_detail': [C.harness.texts.inner_failure_selftest, '[]']}) | trim }}
+        quiet: true
+
+    - name: Custody self-test -- no results yet
+      ansible.builtin.set_fact:
+        _ifc_results: []
+
+    - name: Custody self-test -- every declared fixture through the one custody rule
+      ansible.builtin.include_tasks: inner_failure_custody.yml
+      loop: "{{ C.harness.inner_failure.controls }}"
+      loop_control:
+        loop_var: _ifcx
+        label: "{{ _ifcx.id }}"
+      vars:
+        _ifc_tx: >-
+          {%- set ns = namespace(t=C.harness.texts) -%}
+          {%- for ak, src in (_ifcx.texts_alias.items() if (_ifcx.texts_alias is defined) else []) -%}
+          {%- set ns.t = ns.t | combine({ak: C.harness.texts[src]}) -%}
+          {%- endfor -%}{{ ns.t }}
+        ifc_texts: "{{ _ifc_tx }}"
+        ifc_reasons: "{{ _ifcx.reasons }}"
+        ifc_failures: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for f in _ifcx.failures -%}
+          {%- set ns.o = ns.o + [(_ifc_tx[f.text]) if (f.text is defined) else f.raw] -%}
+          {%- endfor -%}{{ ns.o }}
+        ifc_expected: "{{ _ifcx.expected if (_ifcx.expected is defined) else none }}"
+        ifc_record: "{{ _ifcx.id }}"
+
+    - name: Custody self-test -- every fixture's outer failures are EXACTLY its declared ones (refused otherwise, before any write)
+      vars:
+        _ifc_want: >-
+          {%- set out = namespace(m={}) -%}
+          {%- for x in C.harness.inner_failure.controls -%}
+          {%- set tx = namespace(t=C.harness.texts) -%}
+          {%- for ak, src in (x.texts_alias.items() if (x.texts_alias is defined) else []) -%}
+          {%- set tx.t = tx.t | combine({ak: C.harness.texts[src]}) -%}
+          {%- endfor -%}
+          {%- set ns = namespace(o=[]) -%}
+          {%- for s in x.outer -%}
+          {%- if s.text is defined -%}{%- set ns.o = ns.o + [tx.t[s.text]] -%}
+          {%- elif s.raw is defined -%}{%- set ns.o = ns.o + [s.raw] -%}
+          {%- elif s.mismatch is defined -%}{%- set ns.o = ns.o + [C.harness.texts.inner_failure_mismatch ~ ' ' ~ (s.mismatch | to_json)] -%}
+          {%- elif s.alias is defined -%}{%- set ns.o = ns.o + [C.harness.texts.inner_failure_alias ~ ' ' ~ (s.alias | to_json)] -%}
+          {%- else -%}{%- set ns.o = ns.o + [none] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set out.m = out.m | combine({x.id: ns.o}) -%}
+          {%- endfor -%}{{ out.m }}
+        _ifc_bad: >-
+          {%- set ns = namespace(o=[]) -%}
+          {%- for x in C.harness.inner_failure.controls -%}
+          {%- set got = _ifc_results | selectattr('id', 'equalto', x.id) | list -%}
+          {%- if (got | length) != 1 or got[0].outer != _ifc_want[x.id] -%}
+          {%- set ns.o = ns.o + [{'id': x.id, 'want': _ifc_want[x.id], 'got': got | map(attribute='outer') | list}] -%}
+          {%- endif -%}
+          {%- endfor -%}{{ ns.o }}
+      ansible.builtin.assert:
+        that:
+          - (_ifc_results | length) == (C.harness.inner_failure.controls | length)
+          - _ifc_bad | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.family.refusal,
+                                   'rh_rf_detail': [C.harness.texts.inner_failure_selftest, _ifc_bad | to_json]}) | trim }}
+        quiet: true
+
+    - name: Refuse an undeclared or malformed kind admission declaration (presence and type first)
+      vars:
+        _kv: "{{ C.harness.kind_vocabulary }}"
+      ansible.builtin.assert:
+        that:
+          - _kv is mapping
+          - _kv.git_fixture is sequence and _kv.git_fixture is not string
+          - _kv.source is sequence and _kv.source is not string
+          - _kv.row_roles is mapping
+          - _kv.row_roles.values() | reject('string') | list | length == 0
+          - (_kv.row_roles.values() | list | unique | length) == (_kv.row_roles | length)
+          - _kv.row_roles.runnable is string and _kv.row_roles.git_fixture is string
+          - _kv.row_roles.source is string and _kv.row_roles.case_keys is string
+          - _kv.classes is mapping
+          - _kv.classes.no_fixture in _kv.git_fixture
+          - _kv.classes.no_source in _kv.source
+          - _kv.classes.shared_source in _kv.source
+          - _kv.classes.admitted_source in _kv.source
+          - _kv.case_status is mapping and _kv.case_status.open is string
+          - C.harness.kinds is mapping
+          - C.harness.kinds | length > 0
+          - C.harness.kinds.values() | reject('mapping') | list | length == 0
+          - >-
+            C.harness.kinds.values() | map('list') | map('sort')
+            | reject('equalto', _kv.row_roles.values() | list | sort) | list | length == 0
+          - C.harness.kinds.values() | map(attribute=_kv.row_roles.runnable) | reject('sameas', true) | reject('sameas', false) | list | length == 0
+          - C.harness.kinds.values() | map(attribute=_kv.row_roles.git_fixture) | reject('in', _kv.git_fixture) | list | length == 0
+          - C.harness.kinds.values() | map(attribute=_kv.row_roles.source) | reject('in', _kv.source) | list | length == 0
+          - C.harness.kinds.values() | map(attribute=_kv.row_roles.case_keys) | reject('sequence') | list | length == 0
+          - C.harness.kinds.values() | map(attribute=_kv.row_roles.case_keys) | select('string') | list | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.family.refusal,
+                                   'rh_rf_detail': [C.harness.texts.kinds_declaration]}) | trim }}
+        quiet: true
+
+    - name: Name the declared kind sets (from harness.kinds and the declared row roles / classes only)
+      vars:
+        _kv: "{{ C.harness.kind_vocabulary }}"
+      ansible.builtin.set_fact:
+        _k_all: "{{ C.harness.kinds.keys() | list }}"
+        _k_unrun: "{{ C.harness.kinds | dict2items | rejectattr('value.' ~ _kv.row_roles.runnable) | map(attribute='key') | list }}"
+        _k_git: "{{ C.harness.kinds | dict2items | rejectattr('value.' ~ _kv.row_roles.git_fixture, 'equalto', _kv.classes.no_fixture) | map(attribute='key') | list }}"
+        _k_src: "{{ C.harness.kinds | dict2items | rejectattr('value.' ~ _kv.row_roles.source, 'equalto', _kv.classes.no_source) | map(attribute='key') | list }}"
+        _k_shared: "{{ C.harness.kinds | dict2items | selectattr('value.' ~ _kv.row_roles.source, 'equalto', _kv.classes.shared_source) | map(attribute='key') | list }}"
+        _k_admitted: "{{ C.harness.kinds | dict2items | selectattr('value.' ~ _kv.row_roles.source, 'equalto', _kv.classes.admitted_source) | map(attribute='key') | list }}"
+
+    - name: Cases are well-formed (unique ids, DECLARED kinds, expectations, known neighbours)
+      ansible.builtin.assert:
+        that:
+          - C.cases | map(attribute='id') | unique | list | length == C.cases | length
+          - C.cases | rejectattr('kind', 'defined') | list | length == 0
+          - C.cases | map(attribute='kind') | reject('in', _k_all) | list | length == 0
+          - C.cases | rejectattr('expect', 'defined') | list | length == 0
+          - C.cases | selectattr('neighbour', 'defined') | map(attribute='neighbour') | reject('in', C.cases | map(attribute='id') | list) | list | length == 0
+          - only | reject('in', C.cases | map(attribute='id') | list) | list | length == 0
+          - C.cases | selectattr('status', 'defined') | map(attribute='status') | reject('equalto', C.harness.kind_vocabulary.case_status.open) | list | length == 0
+          # r5u-rf3 (codex-tick518 RF2-PRELAUNCH-REACH-FALSE-PASS control; OD-f): a declared expect.harness_failures sits
+          # only on a case declaring generation.reach and is a non-empty list of DISTINCT harness.texts keys (never free
+          # strings: run_one_case.yml consumes only failures EQUAL to those declared texts); admitted before any write
+          # r5u-rf4: the generation node is admitted as a mapping FIRST, so the dotted reach test never reads through an
+          # absent node (a non-generation case has no `generation`)
+          - C.cases | selectattr('expect.harness_failures', 'defined') | rejectattr('generation', 'mapping') | list | length == 0
+          - C.cases | selectattr('expect.harness_failures', 'defined') | rejectattr('generation.reach', 'defined') | list | length == 0
+          - C.cases | selectattr('expect.harness_failures', 'defined') | map(attribute='expect.harness_failures') | reject('sequence') | list | length == 0
+          - C.cases | selectattr('expect.harness_failures', 'defined') | map(attribute='expect.harness_failures') | select('string') | list | length == 0
+          - C.cases | selectattr('expect.harness_failures', 'defined') | map(attribute='expect.harness_failures') | map('length') | select('equalto', 0) | list | length == 0
+          - C.cases | selectattr('expect.harness_failures', 'defined') | map(attribute='expect.harness_failures') | flatten(levels=1) | reject('string') | list | length == 0
+          # r5u-rf4 (codex-tick526 RF3-INNER-FAILURE-CUSTODY): entries are DECLARED inner-failure identities
+          # (harness.inner_failure.reasons values); a repeated entry is a declared occurrence count, matched exactly by
+          # controls/inner_failure_custody.yml (the rf3 distinctness clause is retired with prefix / text matching)
+          - C.cases | selectattr('expect.harness_failures', 'defined') | map(attribute='expect.harness_failures') | flatten(levels=1) | reject('in', C.harness.inner_failure.reasons.values() | list) | list | length == 0
+          # r5u-rf4 (codex-tick526 OD-f scope: EXPLICIT NEGATIVE CONTROLS ONLY): a case declaring expect.harness_failures
+          # expects rc fail and names a neighbour that is itself a declared reach case WITHOUT expect.harness_failures --
+          # so the key can never turn a required reach check green; the required check stays separate and must be ok
+          # for the receipt to be green (neighbour accounting)
+          - C.cases | selectattr('expect.harness_failures', 'defined') | rejectattr('expect.rc', 'equalto', 'fail') | list | length == 0
+          - C.cases | selectattr('expect.harness_failures', 'defined') | rejectattr('neighbour', 'defined') | list | length == 0
+          - >-
+            C.cases | selectattr('expect.harness_failures', 'defined') | map(attribute='neighbour')
+            | reject('in', C.cases | selectattr('generation', 'mapping') | selectattr('generation.reach', 'defined')
+                             | rejectattr('expect.harness_failures', 'defined') | map(attribute='id') | list)
+            | list | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.family.refusal,
+                                   'rh_rf_detail': [C.harness.texts.cases_malformed, C.harness.texts.undeclared_kinds,
+                                                    C.cases | selectattr('kind', 'defined') | map(attribute='kind')
+                                                    | reject('in', _k_all) | unique | list | to_json]}) | trim }}
+        quiet: true
+
+    - name: Name the selected cases
+      ansible.builtin.set_fact:
+        _sel: "{{ C.cases | selectattr('id', 'in', only if (only | length > 0) else (C.cases | map(attribute='id') | list)) | list }}"
+
+    - name: Every selected case carries its kind's declared case keys (before any fixture)
+      ansible.builtin.set_fact:
+        _sel_missing: >-
+          {%- set ns = namespace(m=[]) -%}
+          {%- for c in _sel -%}
+          {%- for k in C.harness.kinds[c.kind][C.harness.kind_vocabulary.row_roles.case_keys] if k not in c -%}
+          {%- set ns.m = ns.m + [c.id ~ ':' ~ k] -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ ns.m }}
+
+    - name: Refuse a selected case without its kind's declared keys (CONTROLS-CASES)
+      ansible.builtin.assert:
+        that:
+          - _sel_missing | length == 0
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.family.refusal,
+                                   'rh_rf_detail': [C.harness.texts.cases_missing_keys, _sel_missing | to_json]}) | trim }}
+        quiet: true
+
+    # the ACTUAL git-fixture gate: every selected kind whose declared git_fixture is not `none` (phase, source and now
+    # check and generation) needs allow_git_fixture; kinds declared `none` (regex, gate, scope, integration) never do.
+    - name: Refuse git-fixture kinds without the git fixture (declared per kind; never skipped silently)
+      ansible.builtin.assert:
+        that:
+          - allow_git_fixture | bool or (_sel | selectattr('kind', 'in', _k_git) | list | length == 0)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.git_fixture,
+                                   'rh_rf_detail': [C.harness.texts.git_fixture,
+                                                    _sel | selectattr('kind', 'in', _k_git) | map(attribute='id') | list | to_json,
+                                                    _sel | selectattr('kind', 'in', _k_git) | map(attribute='kind') | unique | list | to_json,
+                                                    _k_all | reject('in', _k_git) | list | to_json]}) | trim }}
+        quiet: true
+
+    # r5r (codex-tick461 R5P-FIXTURE-GIT-ISOLATION; R2 r2k C1-R2K-GIT-MUTATION, hunks 51b9c0fc, admit_git_paths
+    # 6ede9063 -- FROZEN, consumed verbatim): every fixture git process this runner starts (the source clone, the check
+    # one-commit repository, the generation case clone's move / commit, every location check and every readback) is
+    # built from R2's ONE declared git policy, the resolved bootstrap source_admission.git (projection
+    # lme_resolved.remote_harness.source_admission.git) and its mutation sub-node -- never a private command policy:
+    #   _gitr  read prefix      [env, env_clear] + env_pairs + [git] + global                 (+ <repo> + subcommand)
+    #   _giti  inspection       [env, env_clear] + env_pairs + [git] + inspect_global         (+ <repo> + git.config)
+    #   _gitm  mutation prefix  [env, env_clear] + env_pairs + mutation.env_pairs + [git] + mutation.global
+    #                                                                       (+ <repo> + mutation.fence + subcommand)
+    #   _gitc  clone prefix     the read prefix MINUS its trailing directory flag (R2: "read_prefix MINUS -C/<repo>")
+    # env -i drops GIT_DIR / GIT_WORK_TREE / GIT_TEMPLATE_DIR / GIT_CONFIG_* / HOME; GIT_CONFIG_NOSYSTEM /
+    # GIT_CONFIG_GLOBAL=/dev/null drop system / global config; mutation.global sets core.hooksPath=/dev/null (EVERY hook,
+    # incl. prepare-commit-msg / post-commit, which --no-verify does not cover) and commit/tag gpgSign false;
+    # mutation.fence pins the repository to the fixture (no upward discovery); mutation.init / clone carry --template=.
+    # git / env are the os_tools entries named by source_admission.tool_roles (R2's per-role tools). transfer.source.git
+    # (seam S6, the SOURCE-REF tool) is untouched and recorded as a seam, not unified here.
+    # Bound only for a selection with a git-fixture kind; an absent policy refuses BEFORE any fixture exists.
+    - name: Refuse an absent or malformed declared git policy (git-fixture selections; before any fixture)
+      vars:
+        _sa: "{{ _wrp.bootstrap.source_admission }}"
+      ansible.builtin.assert:
+        that:
+          - _sa is mapping
+          - _sa.tool_roles is mapping and _sa.tool_roles.git is string and _sa.tool_roles.env is string
+          - _wrp.bootstrap.os_tools[_sa.tool_roles.git].path is string
+          - _wrp.bootstrap.os_tools[_sa.tool_roles.env].path is string
+          - _sa.git is mapping
+          - _sa.git.env_clear is string
+          - _sa.git.env_pairs is sequence and _sa.git.env_pairs is not string and _sa.git.env_pairs | reject('string') | list | length == 0
+          - _sa.git.global is sequence and _sa.git.global is not string and _sa.git.global | reject('string') | list | length == 0
+          - _sa.git.inspect_global is sequence and _sa.git.inspect_global is not string
+          - _sa.git.config is sequence and _sa.git.config is not string
+          - _sa.git.config_record is mapping and _sa.git.config_record.terminator is string
+          - _sa.git.config_key_regex is string and _sa.git.config_refused_regex is string
+          - _sa.git.mutation is mapping
+          - _sa.git.mutation.env_pairs is sequence and _sa.git.mutation.env_pairs is not string
+          - _sa.git.mutation.env_pairs | reject('string') | list | length == 0
+          - _sa.git.mutation.global is sequence and _sa.git.mutation.global is not string
+          - _sa.git.mutation.fence is sequence and _sa.git.mutation.fence is not string
+          - _sa.git.mutation.init is sequence and _sa.git.mutation.clone is sequence and _sa.git.mutation.commit is sequence
+          - _sa.git.mutation.location is sequence and _sa.git.mutation.location is not string
+          - _sa.git.mutation.refused_config_regex is string
+          - _sa.git.global | length > 0 and _sa.git.mutation.global | length > 0 and _sa.git.inspect_global | length > 0
+          - (_sa.git.global | last) == (_sa.git.mutation.global | last)
+          - (_sa.git.global | last) == (_sa.git.inspect_global | last)
+        fail_msg: >-
+          {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                    template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.git_policy,
+                                   'rh_rf_detail': [C.harness.texts.git_policy]}) | trim }}
+        quiet: true
+      when: _sel | selectattr('kind', 'in', _k_git) | list | length > 0
+
+    - name: The fixture git prefixes (R2's declared policy only; each appends <repo> [+ fence] + the subcommand)
+      vars:
+        _sa: "{{ _wrp.bootstrap.source_admission }}"
+        _git: "{{ _wrp.bootstrap.os_tools[_wrp.bootstrap.source_admission.tool_roles.git].path }}"
+        _env: "{{ _wrp.bootstrap.os_tools[_wrp.bootstrap.source_admission.tool_roles.env].path }}"
+      ansible.builtin.set_fact:
+        _gitr: "{{ [_env, _sa.git.env_clear] + _sa.git.env_pairs + [_git] + _sa.git.global }}"
+        _giti: "{{ [_env, _sa.git.env_clear] + _sa.git.env_pairs + [_git] + _sa.git.inspect_global }}"
+        _gitm: "{{ [_env, _sa.git.env_clear] + _sa.git.env_pairs + _sa.git.mutation.env_pairs + [_git] + _sa.git.mutation.global }}"
+        _gitc: "{{ [_env, _sa.git.env_clear] + _sa.git.env_pairs + [_git] + _sa.git.global[:-1] }}"
+        _gitp: "{{ _sa.git }}"
+        _gitt: {git: "{{ _git }}", env: "{{ _env }}"}
+      when: _sel | selectattr('kind', 'in', _k_git) | list | length > 0
+
+    # source selection: SOURCE-REF admission for every kind declared source != none (phase AND generation: the
+    # generation kind clones the admitted commit per case); the shared clone <run_dir>/src only for shared_clone kinds.
+    - name: Whether this selection needs the declared source, and whether it needs the shared clone
+      ansible.builtin.set_fact:
+        _needs_src: "{{ _sel | selectattr('kind', 'in', _k_src) | list | length > 0 }}"
+        _needs_shared: "{{ _sel | selectattr('kind', 'in', _k_shared) | list | length > 0 }}"
+
+    - name: Name this run (EVIDENCE-RETENTION -- every run gets its own immutable directory; nothing earlier is removed)
+      ansible.builtin.set_fact:
+        run_id: "{{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') ~ '-' ~ lookup('ansible.builtin.password', '/dev/null', chars=['0123456789abcdef'], length=8) }}"
+
+    - name: Name the run directory
+      ansible.builtin.set_fact:
+        wr: "{{ _wroot }}/runs/{{ run_id }}"
+
+    - name: Stat the run directory
+      ansible.builtin.stat:
+        path: "{{ wr }}"
+        follow: false
+      register: _wrst
+
+    - name: Refuse to reuse a run directory (receipts are never overwritten)
+      ansible.builtin.assert:
+        that: [not _wrst.stat.exists]
+        fail_msg: "run directory {{ wr }} already exists; an earlier run's evidence is never overwritten"
+        quiet: true
+
+    - name: SOURCE-REF -- admit the declared source before any clone (selections with a source-declared kind only)
+      ansible.builtin.include_tasks: source_ref.yml
+      vars:
+        sr_decl: "{{ T }}"
+        sr_runner_root: "{{ repo_root }}"
+        sr_work_root: "{{ _wroot }}"
+        sr_work_rel: "{{ _wrp.work_roots.root_rel }}"
+        sr_ansible_config: "{{ C.harness.ansible_config }}"
+      when: _needs_src | bool
+
+    - name: SOURCE-REF -- not used (no source-declared kind selected)
+      ansible.builtin.set_fact:
+        sr: {used: false, path: null, requested: null, commit: null, tree: null, clean: null, runner_root: null, git: null,
+             clones: [], load_binding: null}
+      when: not (_needs_src | bool)
+
+    - name: SOURCE-REF -- a source-kind selection with an unused source is impossible (CONTROLS-SOURCE-VACUOUS)
+      ansible.builtin.assert:
+        that:
+          - (sr.used | bool) == (_needs_src | bool)
+        fail_msg: "CONTROLS-SOURCE-VACUOUS: source-declared kinds {{ _k_src }} selected={{ _needs_src }} but source_ref.used={{ sr.used }}"
+        quiet: true
+
+    - name: Work root, run root, case root and verdicts (explicit 0755 modes -- no umask-dependent ancestry)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ _wr_missing + [_wroot, _wroot ~ '/runs', wr, wr ~ '/cases', wr ~ '/verdicts'] }}"
+
+    - name: The shared source clone at the admitted commit (nothing is committed; only for selected shared_clone kinds)
+      ansible.builtin.include_tasks: source_clone.yml
+      vars:
+        sr_dest: "{{ wr }}/src"
+        sr_decl: "{{ T }}"
+      when: _needs_shared | bool
+
+    - name: Run the declared cases
+      ansible.builtin.include_tasks: run_one_case.yml
+      loop: "{{ _sel }}"
+      loop_control:
+        loop_var: case
+        label: "{{ case.id }}"
+
+    - name: Aggregate -- find verdicts
+      ansible.builtin.find:
+        paths: "{{ wr }}/verdicts"
+        patterns: ['*.json']
+      register: _vf
+
+    - name: Aggregate -- read verdicts
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ _vf.files | sort(attribute='path') }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: _vs
+
+    - name: Aggregate -- compute
+      ansible.builtin.set_fact:
+        _verdicts: "{{ _vs.results | map(attribute='content') | map('b64decode') | map('from_json') | list }}"
+        _ran: "{{ _sel }}"
+
+    - name: Aggregate -- every phase verdict ran on the admitted source (non-vacuity)
+      ansible.builtin.set_fact:
+        _source_vacuous: >-
+          {{ ([] if ((sr.used | bool) == (_needs_src | bool)) else ['source_ref.used != phase selected'])
+             + ([] if (not (_needs_shared | bool)) or ((sr.clones | map(attribute='dir') | list) is contains(wr ~ '/src'))
+                else ['no shared clone at ' ~ wr ~ '/src'])
+             + (_verdicts | selectattr('kind', 'in', _k_shared)
+                | rejectattr('source_commit', 'equalto', sr.commit) | map(attribute='id') | map('regex_replace', '^', 'source_commit differs: ') | list)
+             + (_verdicts | selectattr('kind', 'in', _k_shared)
+                | rejectattr('source_tree', 'equalto', sr.tree) | map(attribute='id') | map('regex_replace', '^', 'source_tree differs: ') | list)
+             + (_verdicts | selectattr('kind', 'in', _k_admitted)
+                | selectattr('stage', 'equalto', C.harness.generation.verdict_stage.generated)
+                | rejectattr('source_parent', 'equalto', sr.commit) | map(attribute='id')
+                | map('regex_replace', '^', C.harness.texts.source_parent_differs ~ ' ') | list)
+             + (_verdicts | selectattr('kind', 'equalto', 'phase') | selectattr('rc', 'equalto', 0)
+                | selectattr('load_paths', 'none') | map(attribute='id') | map('regex_replace', '^', 'rc 0 without asserted load_paths: ') | list) }}
+
+    - name: Aggregate -- green only when every runnable case and its neighbour is ok
+      ansible.builtin.set_fact:
+        _receipt:
+          schema: lme.transfer.controls/v4
+          narrower_than_integration: >-
+            phase cases use the local stand-in target and the resolved `rh` (resolve_policy) without a managed
+            generation, and decl_overrides for privilege uid and owner uids; their source = source_ref.commit (a
+            local-only candidate, not the integration branch). Gate cases use a fake seed and a fake ssh; scope
+            cases feed synthetic schema-3 projections (no resolver, no transport) through the real scope task
+            files; source cases run source_ref.yml against local fixture clones. Load binding: the route files and
+            lme_manifests.py are covered by the realpath and role-path asserts only (not content-scanned); python
+            sys.path / site-packages and the ansible collections are recorded as the managed toolchain, not
+            refused. The integration cases are
+            declared and not run.
+          source_ref: "{{ sr }}"
+          source_vacuous: "{{ _source_vacuous }}"
+          open: "{{ _ran | selectattr('status', 'defined') | selectattr('status', 'equalto', 'OPEN') | map(attribute='id') | list }}"
+          covered: >-
+            {{ _verdicts | selectattr('ok') | map(attribute='id')
+               | reject('in', _ran | selectattr('status', 'defined') | selectattr('status', 'equalto', 'OPEN') | map(attribute='id') | list) | list }}
+          work_root: "{{ _wroot }}"
+          run_id: "{{ run_id }}"
+          run_dir: "{{ wr }}"
+          cases: "{{ _verdicts }}"
+          declared_unrun: "{{ _ran | selectattr('kind', 'in', _k_unrun) | map(attribute='id') | list }}"
+          failed: "{{ _verdicts | rejectattr('ok') | map(attribute='id') | list }}"
+          # r5u-rf4 (codex-tick526): stage and inner-failure accounting, published beside the outer result. pre_launch =
+          # admitted-source verdicts refused before launch (no source / launch evidence; never counted as a generation
+          # that ran); inner_failed = verdicts whose RAW inner verdict failed (for an ok one: a negative control's
+          # assertion over a failed inner execution -- the raw failures are in that verdict's `inner`); the custody
+          # self-test results are the exact outer lists every fixture produced.
+          pre_launch: "{{ _verdicts | selectattr('stage', 'equalto', C.harness.generation.verdict_stage.pre_launch) | map(attribute='id') | list }}"
+          generated: "{{ _verdicts | selectattr('stage', 'equalto', C.harness.generation.verdict_stage.generated) | map(attribute='id') | list }}"
+          inner_failed: "{{ _verdicts | selectattr('inner.failed') | map(attribute='id') | list }}"
+          inner_custody_selftest: "{{ _ifc_results }}"
+          neighbour_missing: >-
+            {{ _ran | rejectattr('kind', 'in', _k_unrun) | selectattr('neighbour', 'defined')
+               | map(attribute='neighbour') | reject('in', _verdicts | selectattr('ok') | map(attribute='id') | list) | unique | list }}
+          green: >-
+            {{ (_source_vacuous | length == 0)
+               and (_verdicts | rejectattr('ok') | list | length == 0)
+               and (_verdicts | length == (_ran | rejectattr('kind', 'in', _k_unrun) | list | length))
+               and (_ran | rejectattr('kind', 'in', _k_unrun) | selectattr('neighbour', 'defined')
+                    | map(attribute='neighbour') | reject('in', _verdicts | selectattr('ok') | map(attribute='id') | list) | list | length == 0) }}
+
+    - name: Aggregate -- write the receipt
+      ansible.builtin.copy:
+        content: "{{ _receipt | to_nice_json }}\n"
+        dest: "{{ wr }}/receipt.json"
+        mode: '0644'
+
+    - name: Aggregate -- verdict
+      ansible.builtin.assert:
+        that: [_receipt.green | bool]
+        fail_msg: >-
+          CONTROLS NOT GREEN: failed={{ _receipt.failed }} neighbour_missing={{ _receipt.neighbour_missing }}
+          {{ ('CONTROLS-SOURCE-VACUOUS: ' ~ (_receipt.source_vacuous | string)) if (_receipt.source_vacuous | length > 0) else '' }}
+        success_msg: >-
+          CONTROLS GREEN: {{ _verdicts | length }} run, {{ _receipt.covered | length }} covered,
+          {{ _receipt.open | length }} OPEN (not covered: {{ _receipt.open }}), {{ _receipt.declared_unrun | length }} declared-unrun (kinds {{ _k_unrun }})

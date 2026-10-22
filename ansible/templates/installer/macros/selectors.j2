@@ -1,0 +1,102 @@
+{%- macro fmt(s, pattern, bindings) -%}
+{%- set n = namespace(value=pattern) -%}
+{%- for key, value in bindings.items() -%}
+  {%- set n.value = n.value.replace(s.rendering.placeholders[key], value | string) -%}
+{%- endfor -%}
+{{- n.value -}}
+{%- endmacro -%}
+
+{%- macro quote(s, value) -%}
+{{- s.rendering.quote ~ (value | string).replace(s.rendering.quote, s.rendering.quote_escape) ~ s.rendering.quote -}}
+{%- endmacro -%}
+
+{%- macro expansion(s, name, array) -%}
+{{- s.rendering.double_quote ~ fmt(s, s.rendering.formats.array if array else s.rendering.formats.variable, dict(name=name)) ~ s.rendering.double_quote -}}
+{%- endmacro -%}
+
+{%- macro refusal(s, message) -%}
+{{- fmt(s, s.rendering.formats.fail, dict(format=quote(s, s.rendering.printf_format), message=quote(s, message), status=s.status.refusal)) -}}
+{%- endmacro -%}
+
+{%- macro enumeration(s, variable, choices, message) -%}
+{%- set n = namespace(arms=s.rendering.list_empty) -%}
+{%- for choice in choices -%}{%- set n.arms = n.arms + [quote(s, choice)] -%}{%- endfor -%}
+{{- fmt(s, s.rendering.formats.case_open, dict(name=variable)) ~ s.rendering.newline -}}
+{{- fmt(s, s.rendering.formats.case_ok, dict(arms=n.arms | join(s.rendering.case_separator))) ~ s.rendering.newline -}}
+{{- fmt(s, s.rendering.formats.case_else, dict(args=refusal(s, message))) ~ s.rendering.newline -}}
+{{- s.rendering.formats.case_end ~ s.rendering.newline -}}
+{%- endmacro -%}
+
+{%- macro append_value(s, array, variable, field, flag) -%}
+{{- fmt(s, s.rendering.formats.if_nonempty, dict(name=variable)) ~ s.rendering.newline -}}
+{%- set value = s.rendering.double_quote ~ field ~ s.rendering.assignment_separator ~ fmt(s, s.rendering.formats.variable, dict(name=variable)) ~ s.rendering.double_quote -%}
+{{- fmt(s, s.rendering.formats.array_append, dict(array=array, args=quote(s, flag) ~ s.rendering.argument_separator ~ value)) ~ s.rendering.newline -}}
+{{- s.rendering.formats.if_end ~ s.rendering.newline -}}
+{%- endmacro -%}
+
+{%- macro validation(s, parser, selectors) -%}
+{{- fmt(s, s.rendering.formats.array_init, dict(name=s.args_var)) ~ s.rendering.newline -}}
+{%- for binding in s.axis_bindings -%}
+  {%- set axis = selectors.axes | selectattr(s.template_filters.axis_id_attribute, s.template_filters.equality_test, binding.axis) | first -%}
+  {%- set variable = parser.installer.flags[binding.flag].binds[s.binding_index].var -%}
+{{- fmt(s, s.rendering.formats.if_nonempty, dict(name=variable)) ~ s.rendering.newline -}}
+{{- enumeration(s, variable, axis.options | list, s.messages.selector) -}}
+{{- s.rendering.formats.if_end ~ s.rendering.newline -}}
+{{- append_value(s, s.args_var, variable, axis.field, s.invocation.extra_vars_flag) -}}
+{%- endfor -%}
+{%- set destination_variable = parser.installer.flags[s.destination_flag].binds[s.binding_index].var -%}
+{%- set telemetry_variable = parser.installer.flags[s.telemetry_flag].binds[s.binding_index].var -%}
+{{- fmt(s, s.rendering.formats.if_nonempty, dict(name=destination_variable)) ~ s.rendering.newline -}}
+{{- fmt(s, s.rendering.formats.if_empty, dict(name=telemetry_variable)) ~ s.rendering.newline -}}
+{{- refusal(s, s.messages.destinations_dependency) ~ s.rendering.newline -}}
+{{- s.rendering.formats.if_end ~ s.rendering.newline -}}
+{%- set choices = namespace(values=s.rendering.list_empty) -%}
+{%- for axis in selectors.axes if axis.field == selectors.destination_selector -%}
+  {%- for option in axis.options.values() -%}
+    {%- for order in option.destinations | permutations -%}
+      {%- set choices.values = choices.values + [order | join(selectors.destination_separator)] -%}
+    {%- endfor -%}
+  {%- endfor -%}
+{%- endfor -%}
+{{- enumeration(s, destination_variable, choices.values, s.messages.destinations) -}}
+{{- s.rendering.formats.if_end ~ s.rendering.newline -}}
+{{- append_value(s, s.args_var, destination_variable, selectors.destination_field, s.invocation.extra_vars_flag) -}}
+{{- fmt(s, s.rendering.formats.array_init, dict(name=s.operator_args_var)) ~ s.rendering.newline -}}
+{%- set transport = parser.installer.transport.extra_vars -%}
+{{- fmt(s, s.rendering.formats.if_nonempty, dict(name=transport.var)) ~ s.rendering.newline -}}
+{{- fmt(s, s.rendering.formats.array_append, dict(array=s.operator_args_var, args=quote(s, transport.ansible_flag) ~ s.rendering.argument_separator ~ expansion(s, transport.var, s.constants.disabled))) ~ s.rendering.newline -}}
+{{- s.rendering.formats.if_end ~ s.rendering.newline -}}
+{%- endmacro -%}
+
+{%- macro suffix(s) -%}
+{{- s.rendering.argument_separator ~ expansion(s, s.args_var, s.constants.enabled)
+    ~ s.rendering.argument_separator ~ fmt(s, s.rendering.formats.variable_unbraced, dict(name=s.invocation.options_var))
+    ~ s.rendering.argument_separator ~ expansion(s, s.operator_args_var, s.constants.enabled) -}}
+{%- endmacro -%}
+
+{%- macro master(s) -%}
+{{- fmt(s, s.rendering.formats.statement_indent, dict(body=fmt(s, s.rendering.formats.local_array, dict(name=s.invocation.master.array, args=quote(s, s.invocation.command))))) ~ s.rendering.newline -}}
+{%- set path = fmt(s, s.rendering.formats.script_path, dict(name=s.invocation.script_var, path=s.invocation.local_inventory)) -%}
+{{- fmt(s, s.rendering.formats.statement_indent, dict(body=fmt(s, s.rendering.formats.if_file, dict(path=path)))) ~ s.rendering.newline -}}
+{{- fmt(s, s.rendering.formats.statement_indent, dict(body=fmt(s, s.rendering.formats.array_append, dict(array=s.invocation.master.array, args=quote(s, s.invocation.inventory_flag) ~ s.rendering.argument_separator ~ s.rendering.double_quote ~ path ~ s.rendering.double_quote)))) ~ s.rendering.newline -}}
+{{- fmt(s, s.rendering.formats.statement_indent, dict(body=s.rendering.formats.if_end)) ~ s.rendering.newline -}}
+{{- fmt(s, s.rendering.formats.statement_indent, dict(body=fmt(s, s.rendering.formats.array_append, dict(array=s.invocation.master.array, args=expansion(s, s.invocation.playbook_var, s.constants.disabled) ~ s.rendering.argument_separator ~ quote(s, s.invocation.extra_vars_flag) ~ s.rendering.argument_separator ~ expansion(s, s.invocation.master.payload_var, s.constants.disabled) ~ suffix(s))))) ~ s.rendering.newline -}}
+{{- fmt(s, s.rendering.formats.statement_indent, dict(body=fmt(s, s.rendering.formats.invoke, dict(name=s.invocation.master.array)))) ~ s.rendering.newline -}}
+{%- endmacro -%}
+
+{%- macro nodes(s) -%}
+{%- set path = fmt(s, s.rendering.formats.script_path, dict(name=s.invocation.script_var, path=s.invocation.cluster_playbook)) -%}
+{%- set args = quote(s, s.invocation.command) ~ s.rendering.argument_separator ~ quote(s, s.invocation.inventory_flag) ~ s.rendering.argument_separator ~ expansion(s, s.invocation.cluster_inventory_var, s.constants.disabled) ~ s.rendering.argument_separator ~ s.rendering.double_quote ~ path ~ s.rendering.double_quote ~ s.rendering.argument_separator ~ quote(s, s.invocation.extra_vars_flag) ~ s.rendering.argument_separator ~ expansion(s, s.invocation.nodes.payload_var, s.constants.disabled) ~ suffix(s) -%}
+{{- fmt(s, s.rendering.formats.statement_indent, dict(body=fmt(s, s.rendering.formats.local_array, dict(name=s.invocation.nodes.array, args=args)))) ~ s.rendering.newline -}}
+{{- fmt(s, s.rendering.formats.statement_indent, dict(body=fmt(s, s.rendering.formats.invoke, dict(name=s.invocation.nodes.array)))) ~ s.rendering.newline -}}
+{%- endmacro -%}
+
+{%- macro successor(s, source, snippets) -%}
+{%- set n = namespace(text=source) -%}
+{%- for patch in s.patches -%}
+  {%- set before = patch.pattern if patch.selection == s.patch_words.literal else (n.text | regex_search(patch.pattern)) -%}
+  {%- set after = s.rendering.empty if patch.replacement == s.patch_words.empty else snippets[patch.replacement] -%}
+  {%- set n.text = n.text.replace(before, after) -%}
+{%- endfor -%}
+{{- n.text -}}
+{%- endmacro -%}

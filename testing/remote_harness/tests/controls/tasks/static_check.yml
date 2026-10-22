@@ -1,0 +1,82 @@
+---
+# one independent static check (rhc_sc = {<kind>: spec}) of control rhc_c (G). Runs no entrypoint and writes nothing:
+# it gathers the check's inputs (a template render of the candidate's seed, the repository-scoped committable file
+# list, parsed declarations), then judges them with the pure sc_<kind> macro -- once as declared (no failure allowed)
+# and once per declared negative control (a mutation the judge MUST reject). A negative control the judge accepts is a
+# FAIL: the check could not have caught that defect. Appends to _rhc_fail (failures) and _rhc_sc_out (evidence).
+
+- name: "Static check {{ (rhc_sc | list)[0] }} -- kind and spec"
+  ansible.builtin.set_fact:
+    _rhc_sck: "{{ (rhc_sc | list)[0] }}"
+    _rhc_scs: "{{ rhc_sc[(rhc_sc | list)[0]] }}"
+    _rhc_sci: {}
+
+- name: render_tool_path -- render the candidate seed as declared and with os_tools.<tool>.path changed
+  vars:
+    _bs: "{{ rh.controller.bootstrap }}"
+    _tpl: "{{ rh_repo_root }}/{{ rh.controller.bootstrap.template_rel }}"
+    _bs2: "{{ _bs | combine({'os_tools': {_rhc_scs.tool: {'path': _rhc_scs.path}}}, recursive=true) }}"
+  ansible.builtin.set_fact:
+    _rhc_sci:
+      old: "{{ _bs.os_tools[_rhc_scs.tool].path }}"
+      base: "{{ lookup('ansible.builtin.template', _tpl, template_vars={'lme_seed_bs': _bs, 'lme_seed_ctl': rh.controller, 'lme_seed_lock': rh_seed_lock, 'lme_seed_dispatch': rh.controller.entry_generation.dispatch}) }}"
+      patched: "{{ lookup('ansible.builtin.template', _tpl, template_vars={'lme_seed_bs': _bs2, 'lme_seed_ctl': rh.controller, 'lme_seed_lock': rh_seed_lock, 'lme_seed_dispatch': rh.controller.entry_generation.dispatch}) }}"
+  when: _rhc_sck == 'render_tool_path'
+
+- name: representation -- the committable files under the declared tree (tracked + untracked, ignore rules applied; read-only)
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.git }}", -C, "{{ rh_repo_root }}", ls-files, --cached, --others, --exclude-standard, --, "{{ _rhc_scs.under }}"]
+  register: _rhc_sc_ls
+  changed_when: false
+  when: _rhc_sck == 'representation'
+
+- name: representation -- inputs
+  ansible.builtin.set_fact:
+    _rhc_sci: {files: "{{ _rhc_sc_ls.stdout_lines | unique | list }}"}
+  when: _rhc_sck == 'representation'
+
+- name: adapter_closure -- inputs (the resolved harness policy)
+  ansible.builtin.set_fact:
+    _rhc_sci: {rh: "{{ rh }}"}
+  when: _rhc_sck == 'adapter_closure'
+
+- name: transport_disposition -- inputs (B's rows and contract, the lifecycle ids, every control)
+  vars:
+    _bref: "{{ rhc_decl.cases_refs | selectattr('prefix', 'equalto', _rhc_scs.prefix) | first }}"
+  ansible.builtin.set_fact:
+    _rhc_sci:
+      bcases: "{{ (lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ _bref.file) | from_yaml)[_bref.key] }}"
+      lids: "{{ (rhc_sources | selectattr('prefix', 'equalto', '') | first).ids }}"
+      rh: "{{ rh }}"
+      bdecl: "{{ lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ _rhc_scs.b_decl_file) | from_yaml }}"
+      controls: "{{ rhc_decl.controls }}"
+      self_id: "{{ rhc_c.id }}"
+  when: _rhc_sck == 'transport_disposition'
+
+- name: "Judge {{ _rhc_sck }} as declared and under each negative control"
+  vars:
+    _r: >-
+      {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'sc_' ~ _rhc_sck,
+           'args': [_rhc_sci, _rhc_scs, item]}}) | from_json }}
+  ansible.builtin.set_fact:
+    _rhc_sc_now: "{{ (_rhc_sc_now if ansible_loop.index0 > 0 else []) + [{'check': _rhc_sck, 'mutation': item, 'failures': _r.failures, 'observations': _r.observations}] }}"
+  loop: "{{ [{}] + (_rhc_scs.negative_controls | default([])) }}"
+  loop_control:
+    extended: true
+    label: "{{ item.kind | default('as declared') }}"
+
+- name: "Record {{ _rhc_sck }} (declared: no failure; every negative control rejected, for the declared reason)"
+  vars:
+    _pos: "{{ _rhc_sc_now[0] }}"
+    _neg: "{{ _rhc_sc_now[1:] }}"
+    _neg_bad: >-
+      {{ _neg | selectattr('failures', 'equalto', []) | map(attribute='mutation') | map(attribute='kind')
+         | map('regex_replace', '^', 'negative control ' ~ _rhc_sck ~ '/') | map('regex_replace', '$', ' NOT rejected') | list }}
+  ansible.builtin.set_fact:
+    _rhc_sc_out: "{{ _rhc_sc_out + _rhc_sc_now }}"
+    _rhc_fail: >-
+      {{ _rhc_fail
+         + (_pos.failures | map('regex_replace', '^', 'static ' ~ _rhc_sck ~ ': ') | list)
+         + _neg_bad
+         + ((['static ' ~ _rhc_sck ~ ': no negative control declared']) if _neg | length == 0 else [])
+         + (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'sc_negative_reasons', 'args': [_rhc_sck, _neg]}}) | from_json) }}

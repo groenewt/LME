@@ -1,0 +1,53 @@
+---
+# one DIGEST-bearing tree record (step `tree: {name, of}`; codex 234857 content readback). Read-only: the root is
+# stat'ed without following it; only a REAL directory root is listed (find, no link followed, hidden entries included,
+# every type), and every regular file below it is digested (sha256). The record (controls.j2 tree_lines) is one line
+# '<relpath> <f|d|l|o> <mode> <sha256|->' per entry, sorted; an absent root records ['ABSENT'], a link or non-directory
+# root ['NOT-A-REAL-DIR'] (never listed through). Compared by the `trees` predicate: equal records mean equal paths,
+# types, modes and BYTES (a metadata snapshot never does).
+
+- name: "Admit the tree step {{ rhc_s.id }} (a name and a path inside this run)"
+  ansible.builtin.assert:
+    that:
+      - _rhc_step.tree is mapping and (_rhc_step.tree | list | sort) == ['name', 'of']
+      - _rhc_step.tree.name is string and _rhc_step.tree.name | length > 0
+      - _rhc_step.tree.of is string and _rhc_step.tree.of is match('/')
+      - _rhc_step.tree.of is not search('(^|/)\.\.(/|$)')
+    fail_msg: "RHC-TREE: step {{ rhc_s.id }} tree {{ _rhc_step.tree | to_json }} is not {name, of} with an absolute, normalized path"
+    quiet: true
+
+- name: "Stat the tree root {{ _rhc_step.tree.of }} (never followed)"
+  ansible.builtin.stat:
+    path: "{{ _rhc_step.tree.of }}"
+    follow: false
+    get_checksum: false
+  register: _rhc_tr_root
+
+- name: "List the tree (a real directory root only; no link followed)"
+  ansible.builtin.find:
+    paths: "{{ _rhc_step.tree.of }}"
+    recurse: true
+    file_type: any
+    hidden: true
+    follow: false
+  register: _rhc_tr_list
+  when: _rhc_tr_root.stat.exists and _rhc_tr_root.stat.isdir and not _rhc_tr_root.stat.islnk
+
+- name: "Digest every regular file of the tree (sha256; a link is never opened)"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    checksum_algorithm: sha256
+  loop: "{{ _rhc_tr_list.files | default([]) | selectattr('isreg') | map(attribute='path') | sort | list }}"
+  register: _rhc_tr_sums
+
+- name: "Keep tree {{ _rhc_step.tree.name }}"
+  vars:
+    _root: "{{ _rhc_tr_root.stat | combine({'path': _rhc_step.tree.of}) }}"
+    _sums: "{{ _rhc_tr_sums.results | default([]) | map(attribute='stat') | list }}"
+    _lines: >-
+      {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'tree_lines',
+         'args': [_root, _rhc_tr_list.files | default([]), _sums]}}) | from_json }}
+  ansible.builtin.set_fact:
+    _rhc_trees: "{{ _rhc_trees | combine({_rhc_step.tree.name: {'of': _rhc_step.tree.of, 'lines': _lines}}) }}"
+    _rhc_log: "{{ _rhc_log + [{'step': rhc_s.id, 'tree': _rhc_step.tree.name, 'of': _rhc_step.tree.of, 'lines': _lines}] }}"

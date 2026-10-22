@@ -1,0 +1,385 @@
+---
+# one filesystem op (rhc_o) of a control: setup, variant ops, step ops, undo. The op map's FIRST key is its kind.
+# Every written path must lie inside this run dir or the fixtures dir (never the candidate, never the MAIN source).
+# In-place edits keep the inode (dd through the declared tool; a read-only file is made owner-writable for the edit and
+# its mode restored), so a sealed directory never needs unsealing for an edit of a member.
+
+# G-OP-PER-ITEM-GUARD (codex tick330 item 2; distinct from fixture_ops.yml's staging stop): every includer loops this file,
+# and a looped include's `when` is evaluated for every op BEFORE any runs -- so the per-op stop is HERE, read live as each
+# op starts. A setup / variant / step / planted op runs nothing once an earlier failure is recorded, nor (a step's ops list
+# only, rhc_op_decl) once that list's DECLARED op outcome (expect op_failed + op_index) has occurred; it is logged as
+# op_skipped. An UNDO op (rhc_op_is_undo) is never behind this guard: undo and cleanup always run (the protection
+# refusal below is their only stop).
+- name: "Read the live state as op {{ rhc_oi | default('-') }} starts (an earlier failure or the declared op outcome stops it; undo always runs)"
+  ansible.builtin.set_fact:
+    _rhc_op_live: >-
+      {{ (rhc_op_is_undo | default(false) | bool)
+         or (_rhc_fail | length == 0
+             and not ((rhc_op_decl | default(false) | bool) and (rhc_oi | default(0) | int) > 0 and (_rhc_op_stop | default(false) | bool))) }}
+    _rhc_op_stop: "{{ false if ((rhc_op_decl | default(false) | bool) and (rhc_oi | default(0) | int) == 0) else (_rhc_op_stop | default(false) | bool) }}"
+
+- name: "Op {{ rhc_oi | default('-') }} is not run (logged; never evidence of the op)"
+  ansible.builtin.set_fact:
+    _rhc_log: >-
+      {{ _rhc_log + [{'step': (rhc_s.id if (rhc_s is defined and rhc_s is mapping) else 'ops'), 'op_index': rhc_oi | default(none), 'op': rhc_o,
+                      'op_skipped': 'not run: ' ~ ('an earlier failure was recorded' if _rhc_fail | length > 0 else 'the declared op outcome ended this list')}] }}
+  when: not (_rhc_op_live | bool)
+
+- name: Expand the op
+  ansible.builtin.set_fact:
+    _rhc_op: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'xjson', 'args': [rhc_o, _rhc_t]}}) | from_json }}"
+
+# G-UNDO-STASH-PATH-UNBOUND (codex tick334): _rhc_owrites is the op's FULL actual mutation set (controls.j2 op_writes) --
+# every source it removes or displaces and every destination it creates or replaces, INCLUDING the DERIVED stash entry
+# {ctl}/stash/<sha1(path)> that stash (destination), stash_copy (destination) and unstash (source, removed) touch and
+# that the declaration never names. It is complete BEFORE the confinement assert and the undo protection overlap below;
+# the argv of stash / stash_copy / unstash derives the SAME name (sha1 of the same expanded path). (Edits keep their
+# file's inode and create nothing else: edit_in_place.yml; copy / copy_tree read `from`, which is never mutated.)
+- name: Name the op kind, its value and the paths it writes (reset the previous op's edit)
+  vars:
+    _k: "{{ _rhc_op | list | first }}"
+    _v: "{{ _rhc_op[_k] }}"
+  ansible.builtin.set_fact:
+    _rhc_ok: "{{ _k }}"
+    _rhc_edit: []
+    _rhc_ov: "{{ _v }}"
+    _rhc_owrites: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'op_writes', 'args': [_rhc_op, _rhc_t.ctl]}}) | from_json }}"
+    _rhc_oresid: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'residual', 'args': [_rhc_op | to_json]}}) | from_json }}"
+    _rhc_oprot: []
+    _rhc_op_admitted: false
+
+# G-UNDO-PROTECTION-PROPAGATION (codex tick330): the staging reversal runs BEFORE the declared undo ops (variant.yml), so a
+# declared undo op (remove, remove_glob, move, stash / unstash, chmod, an edit, ...) whose written path(s) are, contain or
+# lie inside a path a refused undo left in place (controls.j2 protected_overlap) is NOT run: it is an undo finding
+# (variant.yml routes it: declared in expect_undo_findings, or a FAIL and a cleanup finding), its paths are protected in
+# turn, and a shared-root control is tainted (its restoration did not run).
+- name: A declared undo op that would reach a protected path is refused as an undo finding (never run)
+  vars:
+    _hit: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'protected_overlap', 'args': [_rhc_owrites, _rhc_protected]}}) | from_json }}"
+  ansible.builtin.set_fact:
+    _rhc_oprot: "{{ _hit }}"
+    _rhc_undo_found: >-
+      {{ _rhc_undo_found | default([]) + ([{'path': _rhc_owrites | first | default('?'), 'op': _rhc_op,
+           'why': 'declared undo ' ~ _rhc_ok ~ ' refused: the protected ' ~ (_hit | join(', ')) ~ ' is at, below or above it (left in place by a refused undo); not run'}]
+          if _hit | length > 0 else []) }}
+    _rhc_protected: "{{ ((_rhc_protected + _rhc_owrites) | unique | list) if _hit | length > 0 else _rhc_protected }}"
+    rhc_shared_tainted: "{{ (rhc_shared_tainted | default(false)) or (_hit | length > 0 and (rhc_c.root | default('')) == 'shared') }}"
+  when: (rhc_op_is_undo | default(false)) and (_rhc_protected | default([]) | length > 0)
+
+- name: "Op {{ _rhc_ok }}"
+  when: _rhc_op_live | bool and _rhc_oprot | length == 0
+  block:
+    - name: Refuse a residual token or a write outside this run (a declaration error, never executed)
+      ansible.builtin.assert:
+        that:
+          - _rhc_oresid | length == 0
+          - _rhc_owrites | reject('match', '^(' ~ (rhc_run_dir | regex_escape) ~ '|' ~ (rhc_base_tokens.fixtures | regex_escape) ~ ')/') | list | length == 0
+          - _rhc_owrites | select('search', '(^|/)\.\.(/|$)') | list | length == 0
+          - _rhc_ok not in rhc_decl.vocabulary.not_implemented.ops
+        fail_msg: "op {{ _rhc_op | to_json }}: residual {{ _rhc_oresid }}, or writes outside {{ rhc_run_dir }}, or unimplemented"
+        quiet: true
+
+    # G-OP-PER-ITEM-GUARD: only an op past the refusal above can meet a declared op outcome (a declaration error never does)
+    - name: The op is admitted (a failure from here on is the op's own)
+      ansible.builtin.set_fact:
+        _rhc_op_admitted: true
+
+    - name: mkdir
+      ansible.builtin.file:
+        path: "{{ _rhc_ov }}"
+        state: directory
+        mode: "{{ _rhc_op.mode | default('0700') }}"
+      when: _rhc_ok == 'mkdir'
+
+    - name: write (a new file, or a replacement of the name)
+      ansible.builtin.copy:
+        dest: "{{ _rhc_ov }}"
+        content: "{{ _rhc_op.content }}"
+        mode: "{{ _rhc_op.mode | default('0600') }}"
+        follow: false
+      when: _rhc_ok == 'write'
+
+    - name: symlink (relative targets kept verbatim)
+      ansible.builtin.file:
+        path: "{{ _rhc_ov }}"
+        src: "{{ _rhc_op.target }}"
+        state: link
+        follow: false
+        force: false
+      when: _rhc_ok == 'symlink'
+
+    - name: chmod (the named entry only; links are not followed)
+      ansible.builtin.file:
+        path: "{{ _rhc_ov }}"
+        mode: "{{ _rhc_op.mode }}"
+        follow: false
+      when: _rhc_ok == 'chmod'
+
+    - name: mkfifo
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.mkfifo }}", -m, '0600', --, "{{ _rhc_ov }}"]
+        creates: "{{ _rhc_ov }}"
+      when: _rhc_ok == 'mkfifo'
+
+    - name: Paths a remove / remove_glob takes
+      ansible.builtin.find:
+        paths: "{{ _rhc_ov.dir }}"
+        patterns: ["{{ _rhc_ov.pattern }}"]
+        hidden: true
+        file_type: any
+        recurse: false
+      register: _rhc_rg
+      when: _rhc_ok == 'remove_glob'
+
+    - name: Stat the removal targets (no links followed)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop: "{{ [_rhc_ov] if _rhc_ok == 'remove' else (_rhc_rg.files | default([]) | map(attribute='path') | list) }}"
+      register: _rhc_rs
+      when: _rhc_ok in ['remove', 'remove_glob']
+
+    - name: Make a real directory tree owner-writable before removal (chmod -R does not follow links below it)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.chmod }}", -R, u+w, --, "{{ item.stat.path }}"]
+      loop: "{{ _rhc_rs.results | default([]) | selectattr('stat.exists') | selectattr('stat.isdir') | rejectattr('stat.islnk') | list }}"
+      loop_control:
+        label: "{{ item.stat.path }}"
+      changed_when: true
+      when: _rhc_ok in ['remove', 'remove_glob']
+
+    - name: remove
+      ansible.builtin.file:
+        path: "{{ item.stat.path }}"
+        state: absent
+      loop: "{{ _rhc_rs.results | default([]) | selectattr('stat.exists') | list }}"
+      loop_control:
+        label: "{{ item.stat.path }}"
+      when: _rhc_ok in ['remove', 'remove_glob']
+
+    - name: stash (move the entry itself -- inode, mode, link -- into this control's stash)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.mv }}", -f, -T, --, "{{ _rhc_ov }}", "{{ _rhc_t.ctl }}/stash/{{ _rhc_ov | hash('sha1') }}"]
+      changed_when: true
+      when: _rhc_ok == 'stash'
+
+    - name: stash_copy (a mode- and time-preserving copy; the original stays)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.cp }}", -a, --no-dereference, -T, --, "{{ _rhc_ov }}", "{{ _rhc_t.ctl }}/stash/{{ _rhc_ov | hash('sha1') }}"]
+      changed_when: true
+      when: _rhc_ok == 'stash_copy'
+
+    - name: unstash (the stashed entry replaces whatever the name holds now)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.mv }}", -f, -T, --, "{{ _rhc_t.ctl }}/stash/{{ _rhc_ov | hash('sha1') }}", "{{ _rhc_ov }}"]
+      changed_when: true
+      when: _rhc_ok == 'unstash'
+
+    - name: copy (content and the given mode; links in the source followed)
+      ansible.builtin.copy:
+        src: "{{ _rhc_ov.from }}"
+        dest: "{{ _rhc_ov.to }}"
+        remote_src: true
+        mode: "{{ _rhc_ov.mode | default('preserve') }}"
+      when: _rhc_ok == 'copy'
+
+    - name: copy_tree (cp -a into an absent destination)
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.cp }}", -a, --no-dereference, -T, --, "{{ _rhc_ov.from }}", "{{ _rhc_ov.to }}"]
+        creates: "{{ _rhc_ov.to }}"
+      when: _rhc_ok == 'copy_tree'
+
+    - name: move
+      ansible.builtin.command:
+        argv: ["{{ rhc_decl.runner_tools.mv }}", -T, --, "{{ _rhc_ov.from }}", "{{ _rhc_ov.to }}"]
+      changed_when: true
+      when: _rhc_ok == 'move'
+
+    - name: Stat the entry to unseal / reseal
+      ansible.builtin.stat:
+        path: "{{ _rhc_ov }}"
+        follow: false
+        get_checksum: false
+      register: _rhc_us
+      when: _rhc_ok in ['unseal', 'reseal']
+
+    - name: unseal (record the mode, add owner write to this entry only)
+      ansible.builtin.set_fact:
+        _rhc_modes: "{{ _rhc_modes | default({}) | combine({_rhc_ov: _rhc_us.stat.mode}) }}"
+      when: _rhc_ok == 'unseal' and _rhc_ov not in (_rhc_modes | default({}))
+
+    - name: unseal chmod
+      ansible.builtin.file:
+        path: "{{ _rhc_ov }}"
+        mode: u+w
+        follow: false
+      when: _rhc_ok == 'unseal'
+
+    - name: reseal (the recorded mode, or owner write removed when none was recorded)
+      ansible.builtin.file:
+        path: "{{ _rhc_ov }}"
+        mode: "{{ (_rhc_modes | default({}))[_rhc_ov] | default('u-w') }}"
+        follow: false
+      when: _rhc_ok == 'reseal'
+
+    - name: run_shaped_dirs (owned, older-than-any-real run dirs named like the seed's run dirs)
+      ansible.builtin.file:
+        path: "{{ _rhc_ov.dir }}/1999010{{ (item // 60) % 10 }}T0000{{ '%02d' | format(item % 60) }}Z.rhcrun{{ '%04d' | format(item) }}"
+        state: directory
+        mode: '0700'
+      loop: "{{ range(1, (_rhc_t[_rhc_ov.count_token] | int) + 1) | list }}"
+      when: _rhc_ok == 'run_shaped_dirs'
+
+    # RH-BUNDLE-CHECKSUM-NEWLINES class (codex G packet after be7c8711): ansible-core 2.19 AnsibleLexer doubles every
+    # backslash of a string CONSTANT inside {{ }} of a templated task argument, so '\n' there renders as backslash + n.
+    # No expression below carries a backslash constant: the newline is the task var _rhc_nl, a YAML double-quoted "\n"
+    # (decoded by the YAML parser to one real LF before any templating; a plain value without template markup is not
+    # re-templated). A variable's VALUE is never lexed, only constants in the template source are.
+    - name: json_rewrite edit (the key set; the file re-serialized)
+      vars:
+        _rhc_nl: "\n"
+      ansible.builtin.set_fact:
+        _rhc_edit: >-
+          {{ [[_rhc_ov.file, ((lookup('ansible.builtin.file', _rhc_ov.file) | from_json) | combine({_rhc_ov.key: _rhc_ov.value})) | to_json ~ _rhc_nl, 'truncate']] }}
+      when: _rhc_ok == 'json_rewrite'
+
+    - name: drop_line edit (the FIRST line matching the regex removed)
+      vars:
+        _rhc_nl: "\n"
+        _text: "{{ lookup('ansible.builtin.file', _rhc_ov.file, rstrip=false) }}"
+        _lines: "{{ _text.splitlines() }}"
+        _hit: "{{ _lines | select('search', _rhc_ov.regex) | list }}"
+        _at: "{{ _lines.index(_hit[0]) if _hit else -1 }}"
+      ansible.builtin.set_fact:
+        _rhc_drop_hit: "{{ _hit | length > 0 }}"
+        _rhc_edit: >-
+          {{ [[_rhc_ov.file, ((_lines[:(_at | int)] + _lines[(_at | int) + 1:]) | join(_rhc_nl)) ~ (_rhc_nl if _text.endswith(_rhc_nl) else ''), 'truncate']] }}
+      when: _rhc_ok == 'drop_line'
+
+    - name: A drop_line whose regex matches nothing is a declaration error
+      ansible.builtin.assert:
+        that: _rhc_drop_hit | bool
+        fail_msg: "drop_line: no line of {{ _rhc_ov.file }} matches {{ _rhc_ov.regex }}"
+        quiet: true
+      when: _rhc_ok == 'drop_line'
+
+    - name: append edit
+      ansible.builtin.set_fact:
+        _rhc_edit: "{{ [[_rhc_ov.file, _rhc_ov.text, 'append']] }}"
+      when: _rhc_ok == 'append'
+
+    - name: overwrite_first_byte -- the first regular file of the dir (sorted)
+      ansible.builtin.find:
+        paths: "{{ _rhc_ov.dir }}"
+        file_type: file
+        recurse: false
+      register: _rhc_ofb
+      when: _rhc_ok == 'overwrite_first_byte'
+
+    - name: overwrite_first_byte edit
+      ansible.builtin.set_fact:
+        _rhc_edit: "{{ [[_rhc_ofb.files | map(attribute='path') | sort | first, _rhc_ov.char, 'first_byte']] }}"
+      when: _rhc_ok == 'overwrite_first_byte'
+
+    - name: rehash_into_json -- digest of the named file
+      ansible.builtin.stat:
+        path: "{{ _rhc_ov.digest_of }}"
+        follow: false
+        checksum_algorithm: sha256
+      register: _rhc_rh
+      when: _rhc_ok == 'rehash_into_json'
+
+    - name: rehash_into_json -- read every JSON file to update
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: "{{ _rhc_ov.files }}"
+      register: _rhc_rj
+      when: _rhc_ok == 'rehash_into_json'
+
+    - name: rehash_into_json edits (the key set to the new digest in every named JSON file, re-serialized)
+      vars:
+        _rhc_nl: "\n"
+      ansible.builtin.set_fact:
+        _rhc_edit: >-
+          {{ _rhc_ov.files
+             | zip(_rhc_rj.results | map(attribute='content') | map('b64decode') | map('from_json')
+                   | map('combine', {_rhc_ov.key: _rhc_rh.stat.checksum}) | map('to_json') | map('regex_replace', '$', _rhc_nl) | list,
+                   ['truncate'] * (_rhc_ov.files | length))
+             | map('list') | list }}
+      when: _rhc_ok == 'rehash_into_json'
+
+    - name: Include the in-place writer
+      ansible.builtin.include_tasks: edit_in_place.yml
+      loop: "{{ _rhc_edit | default([]) }}"
+      loop_control:
+        loop_var: rhc_e
+        label: "{{ rhc_e[0] }}"
+      when: _rhc_ok in ['json_rewrite', 'drop_line', 'append', 'overwrite_first_byte', 'rehash_into_json']
+
+    - name: Final mode of an edited file (json_rewrite / drop_line `mode`)
+      ansible.builtin.file:
+        path: "{{ _rhc_ov.file }}"
+        mode: "{{ _rhc_ov.mode }}"
+        follow: false
+      when: _rhc_ok in ['json_rewrite', 'drop_line'] and _rhc_ov.mode is defined
+
+    # G-OP-PER-ITEM-GUARD: a step's op declared to fail (expect op_failed + op_index) that COMPLETED fails the variant
+    - name: A completed op of a step's ops list is judged against the step's declared op outcome
+      vars:
+        _r: >-
+          {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_op_outcome',
+               'args': [_rhc_step.expect | default({}), rhc_oi | int, {'phase': 'done', 'task': '', 'msg': ''}]}}) | from_json }}
+      ansible.builtin.set_fact:
+        _rhc_fail: "{{ _rhc_fail + (_r | map('regex_replace', '^', rhc_s.id ~ ' op[' ~ rhc_oi ~ ']: ') | list) }}"
+      when: (rhc_op_decl | default(false) | bool) and not (rhc_op_is_undo | default(false) | bool)
+
+  rescue:
+    - name: An op error fails the variant (an undo error also taints the shared root)
+      ansible.builtin.set_fact:
+        _rhc_fail: "{{ _rhc_fail + [('undo ' if rhc_op_is_undo | default(false) else 'op ') ~ (_rhc_op | to_json) ~ ': ' ~ (ansible_failed_result.msg | default('') | string)[:300]] }}"
+        rhc_shared_tainted: "{{ (rhc_shared_tainted | default(false)) or ((rhc_op_is_undo | default(false)) and (rhc_c.root | default('')) == 'shared') }}"
+      when: not ((rhc_op_decl | default(false) | bool) and not (rhc_op_is_undo | default(false) | bool))
+
+    # G-OP-PER-ITEM-GUARD: in a step's ops list the failure is judged (controls.j2 judge_op_outcome): exactly the declared
+    # index failing with the declared message strings is the step's expected result (logged; the later ops of the list are
+    # not run); any other failure FAILS the variant. Either way _rhc_op_stop ends the list.
+    - name: A failed op of a step's ops list is judged against the step's declared op outcome (the later ops never run)
+      vars:
+        _out:
+          phase: "{{ 'failed' if (_rhc_op_admitted | bool) else 'refused' }}"
+          task: "{{ ansible_failed_task.name | default('?') }}"
+          msg: >-
+            {{ (ansible_failed_result.msg | default('') | string)
+               ~ ((' stderr: ' ~ (ansible_failed_result.stderr | string)) if (ansible_failed_result.stderr | default('') | length > 0) else '') }}
+        _r: >-
+          {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_op_outcome',
+               'args': [_rhc_step.expect | default({}), rhc_oi | int, _out]}}) | from_json }}
+      ansible.builtin.set_fact:
+        _rhc_fail: "{{ _rhc_fail + (_r | map('regex_replace', '^', rhc_s.id ~ ' op[' ~ rhc_oi ~ ']: ') | list) }}"
+        _rhc_op_stop: true
+        _rhc_log: >-
+          {{ _rhc_log + [{'step': rhc_s.id, 'op_index': rhc_oi | int, 'op': _rhc_op, 'outcome': _out, 'judgement': _r, 'declared': _r | length == 0}] }}
+      when: (rhc_op_decl | default(false) | bool) and not (rhc_op_is_undo | default(false) | bool)
+
+# G-OP-PER-ITEM-GUARD: at the LAST op of a step's ops list (run, rescued or skipped) the step's declared op_skipped
+# [indexes] is compared with the op_skipped records this step logged (controls.j2 judge_op_skipped): a declared index
+# without its record ran, an undeclared skip was not declared -- both FAIL the variant. A later marker op's absence is a
+# separate state predicate in controls.yml.
+- name: "Judge which ops of {{ rhc_s.id | default('-') }} were not run after the declared op outcome (the per-op skip records)"
+  vars:
+    _x: "{{ _rhc_step.expect | default({}) }}"
+    _sk: >-
+      {{ _rhc_log | selectattr('step', 'defined') | selectattr('step', 'equalto', rhc_s.id)
+         | selectattr('op_skipped', 'defined') | map(attribute='op_index') | map('int') | list }}
+    _r: >-
+      {{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_op_skipped', 'args': [_x, _sk]}}) | from_json }}
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + (_r | map('regex_replace', '^', rhc_s.id ~ ': ') | list) }}"
+    _rhc_log: "{{ _rhc_log + [{'step': rhc_s.id, 'op_skipped_judged': _sk, 'declared': _x.op_skipped | default([]), 'judgement': _r}] }}"
+  when:
+    - rhc_op_decl | default(false) | bool
+    - not (rhc_op_is_undo | default(false) | bool)
+    - (rhc_oi | int) == ((_rhc_step.ops | default([]) | length) - 1)
+    - (_rhc_step.expect | default({})) is mapping
+    - (_rhc_step.expect | default({})).op_skipped is defined or (_rhc_step.expect | default({})).op_index is defined

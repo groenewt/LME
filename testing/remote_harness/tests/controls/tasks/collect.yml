@@ -1,0 +1,104 @@
+---
+# read the output files of one finished action and judge them (rhc_cid, rhc_cplan, rhc_crc, rhc_cexp, rhc_cwstderr)
+# (ported from m1-1g, codex 200213 point 7)
+# G-PRIVATE-PREPARE-CUSTODY: the writer (controls.j2 writer_cmd) refused when BOTH its exit status is
+# state.record_refusal.rc AND its own stderr (the shell's, never a record) carries `REFUSED <record_refusal.code>: stage=`.
+# Then the entrypoint never ran and the record paths hold whatever appeared there -- they are NOT read (never evidence of
+# this act; the planted object stays untouched for the control's post_state).
+# G-RECORD-OPEN-BEFORE-TIMEOUT (codex 200213 point 4): otherwise a record is read ONLY through the identity its writer
+# ADMITTED (writer_cmd step 5; controls.j2 writer_admitted): no ADMITTED line -> never opened here. An admitted record is
+# read only when a stat (follow false; mime / attributes / checksum off: nothing opened) shows the path still names that
+# regular single-link object (dev / inode / uid), by the declared timeout + dd iflag=nofollow,nonblock (a link refuses, a
+# FIFO never blocks, bounded by state.record_readback.timeout_s), and a second stat afterwards shows the same object
+# unchanged (controls.j2 record_readback). Never lookup('file') on a record path (a plain open that follows links and
+# blocks on a FIFO). A record that fails any of this is res.record_unadmitted: never read, never evidence (judge).
+# Stated limit: a same-uid swap-and-swap-back between the two stats is not detected.
+
+- name: "Did the writer of {{ rhc_cid }} refuse, and which record identities did it admit?"
+  vars:
+    _rr: "{{ _rhc_ctx.record_refusal }}"
+  ansible.builtin.set_fact:
+    _rhc_rrefused: "{{ (rhc_crc | int) == (_rr.rc | int) and ('REFUSED ' ~ _rr.code ~ ': stage=') in (rhc_cwstderr | default('')) }}"
+    _rhc_radm: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'writer_admitted', 'args': [rhc_cwstderr | default(''), rhc_cplan, _rhc_ctx]}}) | from_json }}"
+
+- name: "Stat each admitted record of {{ rhc_cid }} before reading it (no link followed, nothing opened)"
+  ansible.builtin.stat:
+    path: "{{ rhc_rb.path }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: "{{ _rhc_radm.records if not (_rhc_rrefused | bool) else [] }}"
+  loop_control:
+    loop_var: rhc_rb
+    label: "{{ rhc_rb.role }}"
+  register: _rhc_rpre
+
+- name: "The admitted records of {{ rhc_cid }} whose path still names the admitted object"
+  ansible.builtin.set_fact:
+    _rhc_rpok: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'record_readback', 'args': [_rhc_radm, _rhc_rpre.results | default([]), none, none]}}) | from_json }}"
+
+- name: "Read each such record of {{ rhc_cid }} (bounded; O_NOFOLLOW | O_NONBLOCK; never a lookup reopen)"
+  ansible.builtin.command:
+    argv:
+      - "{{ rhc_decl.runner_tools.timeout }}"
+      - --kill-after=5
+      - "{{ _rhc_ctx.record_readback.timeout_s }}s"
+      - "{{ rhc_decl.runner_tools.dd }}"
+      - "if={{ rhc_rb.path }}"
+      - iflag=nofollow,nonblock
+      - status=none
+  loop: "{{ _rhc_radm.records if not (_rhc_rrefused | bool) else [] }}"
+  loop_control:
+    loop_var: rhc_rb
+    label: "{{ rhc_rb.role }}"
+  register: _rhc_rread
+  changed_when: false
+  failed_when: false
+  when: rhc_rb.role in _rhc_rpok
+
+- name: "Stat each admitted record of {{ rhc_cid }} again (the read must have seen the same unchanged object)"
+  ansible.builtin.stat:
+    path: "{{ rhc_rb.path }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: "{{ _rhc_radm.records if not (_rhc_rrefused | bool) else [] }}"
+  loop_control:
+    loop_var: rhc_rb
+    label: "{{ rhc_rb.role }}"
+  register: _rhc_rpost
+
+- name: "Accept the readback of {{ rhc_cid }}"
+  ansible.builtin.set_fact:
+    _rhc_rb: >-
+      {{ (lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'record_readback',
+           'args': [_rhc_radm, _rhc_rpre.results | default([]), _rhc_rread.results | default([]), _rhc_rpost.results | default([])]}}) | from_json)
+         if not (_rhc_rrefused | bool) else {'text': {}, 'rejected': []} }}
+
+- name: "Read the result of {{ rhc_cid }}"
+  ansible.builtin.set_fact:
+    _rhc_res:
+      rc: "{{ rhc_crc | int }}"
+      record_refused: "{{ _rhc_rrefused | bool }}"
+      record_refused_stage: "{{ _rhc_radm.stage if (_rhc_rrefused | bool) else '' }}"
+      record_unadmitted: "{{ [] if (_rhc_rrefused | bool) else (_rhc_radm.missing | map('regex_replace', '$', ': never admitted') | list) + _rhc_rb.rejected }}"
+      writer_stderr: "{{ (rhc_cwstderr | default('')) if (_rhc_rrefused | bool) else '' }}"
+      stdout: "{{ _rhc_rb.text.out | default('') }}"
+      stderr: "{{ _rhc_rb.text.err | default('') }}"
+      trace: "{{ _rhc_rb.text.strace | default('') if rhc_cplan.strace else '' }}"
+
+- name: "Judge {{ rhc_cid }}"
+  ansible.builtin.set_fact:
+    _rhc_judged: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge', 'args': [rhc_cexp, _rhc_res, _rhc_ctx]}}) | from_json }}"
+
+- name: "Record {{ rhc_cid }}"
+  ansible.builtin.set_fact:
+    _rhc_results_v: "{{ _rhc_results_v | combine({rhc_cid: _rhc_res}) }}"
+    _rhc_fail: "{{ _rhc_fail + (_rhc_judged | map('regex_replace', '^', rhc_cid ~ ': ') | list) }}"
+    _rhc_log: >-
+      {{ _rhc_log + [{'step': rhc_cid, 'argv': rhc_cplan.argv, 'cwd': rhc_cplan.cwd, 'inventory': rhc_cplan.inventory,
+          'rc': _rhc_res.rc, 'stdout': rhc_cplan.out, 'stderr': rhc_cplan.err, 'strace': rhc_cplan.strace,
+          'admitted': _rhc_radm.records, 'unadmitted': _rhc_res.record_unadmitted, 'refused_stage': _rhc_res.record_refused_stage,
+          'expect': rhc_cexp, 'failures': _rhc_judged}] }}

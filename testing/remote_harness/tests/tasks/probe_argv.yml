@@ -1,0 +1,61 @@
+---
+# testing/remote_harness/tests/tasks/probe_argv.yml -- the ONE argv builder of a nested probe (RH-NESTED-PROBE-EXECUTOR).
+# Requires bind_probe_executor.yml earlier in the play (bpe_exec, bpe_env_tool, bpe_env_fixed = lme_resolved_run.env,
+# bpe_work_root = lme_resolved_run.work_root); without the binding every probe is refused.
+# Inputs (include vars): bpe_case_dir (absolute, UNDER the resolved work root; its per-probe dirs are created here),
+# bpe_args (list, after the executable), bpe_extra_env (probe-specific names; may not redefine a resolved or per-probe name).
+# Output: bpe_argv = [/usr/bin/env, -i, NAME=value ..., <lme_resolved_run.ansible_playbook>, *bpe_args].
+# Environment (later wins; the same layering as C1 a0e341e testing/loader-tests-r4/one_case.yml):
+#   1. EVERY lme_resolved_run.env item, unchanged;
+#   2. the per-probe values, all under the case dir inside the resolved work root:
+#        HOME                                   = <case>           (as the original probes)
+#        ANSIBLE_HOME                           = <case>/ansible-home (route 814cf6a lists the runner's $_run/ansible-home;
+#                                                 a nested probe never shares the runner's Ansible home -- C1 79e77ec same)
+#        TMPDIR / TMP / TEMP                    = <case>/tmp       (the allowed per-case TMPDIR override)
+#        ANSIBLE_LOCAL_TEMP                     = <case>/tmp/ansible-local
+#        ANSIBLE_REMOTE_TMP                     = <case>/tmp/ansible-remote
+#      and PATH = <dirname of lme_resolved_run.ansible_playbook>:/usr/bin:/bin. PATH is NOT a resolved env item (the
+#      producer lists path-valued names only); it is fixed here, never inherited, and never selects the executor
+#      (argv[0] after env -i is the absolute resolved ansible-playbook);
+#   3. bpe_extra_env. Nothing else is inherited.
+
+- name: Refuse a probe dir outside the resolved work root, or an extra env name that redefines a bound one
+  vars:
+    _bound: "{{ (bpe_env_fixed | default({}) | list) + ['PATH', 'HOME', 'ANSIBLE_HOME', 'TMPDIR', 'TMP', 'TEMP', 'ANSIBLE_LOCAL_TEMP', 'ANSIBLE_REMOTE_TMP'] }}"
+  ansible.builtin.assert:
+    that:
+      - bpe_exec is defined and bpe_env_fixed is defined and bpe_env_tool is defined and bpe_work_root is defined
+      - bpe_case_dir is string and bpe_case_dir is not search('(^|/)\.\.?(/|$)')
+      - (bpe_case_dir ~ '/') is match('^' ~ ((bpe_work_root ~ '/') | regex_escape))
+      - (bpe_extra_env | list) | intersect(_bound) | length == 0
+      - bpe_args is sequence and bpe_args is not string
+    fail_msg: >-
+      REFUSED RH-NESTED-PROBE-EXECUTOR: nested probe dir {{ bpe_case_dir | default('') }} is not a normalized path under the
+      resolved work root {{ bpe_work_root | default('(unbound)') }}, or bpe_extra_env redefines a bound name
+      ({{ (bpe_extra_env | default({}) | list) | intersect(_bound) }}), or the executor binding has not run.
+    quiet: true
+
+- name: Create the probe's own home and temp dirs (under the resolved work root)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0700'
+  loop:
+    - "{{ bpe_case_dir }}"
+    - "{{ bpe_case_dir }}/ansible-home"
+    - "{{ bpe_case_dir }}/tmp"
+    - "{{ bpe_case_dir }}/tmp/ansible-local"
+    - "{{ bpe_case_dir }}/tmp/ansible-remote"
+
+- name: Compose the nested probe argv
+  ansible.builtin.set_fact:
+    bpe_argv: >-
+      {{ [bpe_env_tool, '-i']
+         + (bpe_env_fixed
+            | combine({'PATH': (bpe_exec | dirname) ~ ':/usr/bin:/bin',
+                       'HOME': bpe_case_dir, 'ANSIBLE_HOME': bpe_case_dir ~ '/ansible-home',
+                       'TMPDIR': bpe_case_dir ~ '/tmp', 'TMP': bpe_case_dir ~ '/tmp', 'TEMP': bpe_case_dir ~ '/tmp',
+                       'ANSIBLE_LOCAL_TEMP': bpe_case_dir ~ '/tmp/ansible-local',
+                       'ANSIBLE_REMOTE_TMP': bpe_case_dir ~ '/tmp/ansible-remote'})
+            | combine(bpe_extra_env) | dictsort | map('join', '=') | list)
+         + [bpe_exec] + bpe_args }}

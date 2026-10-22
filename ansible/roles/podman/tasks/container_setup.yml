@@ -1,68 +1,87 @@
 ---
-# Container setup tasks for podman role
+# Container setup tasks for podman role.
+#
+# Images AND the podman-secret set are BOTH derived from the manifest tree
+# (manifests/global.yml images map + manifests/services/*), never from
+# config/containers*.txt (removed) or a hand-maintained list here. The rendered
+# units reference lme_global.images[<key>].local (see ansible/templates/units/
+# container.j2), so realizing every image to that exact `local` tag here is what
+# makes the units startable.
 
-- name: Check if containers.txt exists on Ansible controller
-  stat:
-    path: "{{ clone_directory }}/config/containers.txt"
-  register: containers_file
-  delegate_to: localhost
-  run_once: true
-  # Note: This check runs on localhost because lookup('file', ...) reads from the controller.
-  # The file must exist on the Ansible controller where the repository is cloned.
+# container_setup runs BEFORE quadlet_setup (main.yml), which is where G2 wires
+# load_manifests. Load it here defensively so lme_global / lme_services /
+# lme_enable_flags exist for the image + secret derivations below. The facts are
+# idempotent set_facts, so a later re-include (quadlet_setup) simply recomputes
+# them; the guard avoids a redundant pass when they are already present.
+- name: Ensure manifest facts are loaded (idempotent)
+  ansible.builtin.include_tasks: load_manifests.yml
+  when: >-
+    (lme_global is not defined)
+    or (lme_services is not defined)
+    or (lme_enable_flags is not defined)
 
-- name: Fail if containers.txt doesn't exist on controller
-  fail:
-    msg: |
-      containers.txt file not found on Ansible controller at {{ clone_directory }}/config/containers.txt
-      
-      This file must exist on the Ansible controller (localhost) because the playbook uses
-      lookup('file', ...) to read it. The file will be copied to target hosts later in the playbook.
-      
-      Please ensure:
-      1. The LME repository is cloned on the Ansible controller
-      2. The clone_directory variable points to the repository root on the controller
-      3. The config/containers.txt file exists in the repository
-  when: not containers_file.stat.exists
+# --- SF-8 co-residency memory budget preflight (fail fast, BEFORE any pull) ----
+# Weigh the MemoryMax of every ENABLED capped container service against THIS host's
+# usable RAM (actual ansible_memtotal_mb minus reserve_gb, NOT the static
+# global.budget.host_ram_gb) -- so a roomy VM passes and a tight host is caught
+# HERE, before the multi-GB image realization below, instead of OOMing mid-deploy.
+# Two DISTINCT signals (see the memory_budget docstring):
+#   * over_budget -> ADVISORY warning only. MemoryMax is a per-service kill ceiling,
+#     not a reservation; the default+llm stack over-commits (23G of ceilings) yet
+#     ran end-to-end on a 14G host, so hard-failing it would false-block a proven-
+#     good profile. We WARN and recommend --no-llm / a roomier host.
+#   * oversized   -> HARD FAIL. A single service whose OWN MemoryMax exceeds usable
+#     RAM (e.g. kibana 5G on a 4G VM) cannot be backed by the host -- a real
+#     fail-fast with no over-commit ambiguity.
+# Skipped on ES-only child nodes (they render only ES; the whole-stack sum would
+# overcount) and when host RAM is unmeasurable (gather_facts off -> no false fail).
+- name: SF-8 preflight -- co-residency memory budget vs actual host RAM
+  ansible.builtin.set_fact:
+    lme_mem_budget: >-
+      {{ lme_services | memory_budget(
+           lme_enable_flags,
+           lme_global | combine({'budget':
+             (lme_global.budget | default({}))
+             | combine({'host_ram_gb':
+                 (ansible_memtotal_mb | default(0) | int / 1024) | round(1)})}),
+           host_services=lme_host_services | default(None)) }}
+  when: not (lme_child_es_only | default(false) | bool)
 
-# Skip secret creation on cluster nodes - secrets will be copied from master via secrets_distribution role.
-# Set lme_skip_secret_creation=true in elasticsearch.yml for cluster deployments.
-- name: Skip secret creation (cluster node - secrets from master)
-  debug:
-    msg: "Skipping secret creation. Secrets will be copied from master via secrets_distribution."
-  when: lme_skip_secret_creation | default(false)
+- name: SF-8 preflight -- report co-residency budget
+  ansible.builtin.debug:
+    msg: >-
+      {% if (ansible_memtotal_mb | default(0) | int) == 0 %}Co-residency budget check SKIPPED (host RAM unavailable -- gather_facts off?).{% else %}Co-residency budget on this {{ lme_mem_budget.host_ram_gb }}G host: capped MemoryMax total {{ lme_mem_budget.total_gb }}G of usable {{ lme_mem_budget.usable_gb }}G (reserve {{ lme_mem_budget.reserve_gb }}G). Uncapped (excluded from sum): {{ lme_mem_budget.uncapped }}. over_budget(advisory)={{ lme_mem_budget.over_budget }} oversized(hard-gate)={{ lme_mem_budget.oversized }}.{% endif %}
+  when: not (lme_child_es_only | default(false) | bool)
 
-- name: set service user passwords
-  shell: |
-    source /root/.profile 
-    podman secret ls | grep -q elastic
-  register: result
-  become: yes
-  args:
-    executable: /bin/bash
-  ignore_errors: true
-  #only fail on a real error
-  failed_when: result.rc != 0 and (result.rc == 1 and result.changed == false)
-  when: not (lme_skip_secret_creation | default(false))
-  
-- name: Set podman secret passwords
-  shell: |
-    source /root/.profile 
-    password="$(</dev/urandom tr -dc 'A-Za-z' | head -c1)$(</dev/urandom tr -dc 'A-Za-z0-9_.-' | head -c29)"
-    while ! echo -n "$password" | grep -Eq '[_.-]+';do password="$(</dev/urandom tr -dc 'A-Za-z' | head -c1)$(</dev/urandom tr -dc 'A-Za-z0-9_.-' | head -c29)";done
-    echo -n $password | podman secret create --driver shell --replace "{{ item }}" -
-  args:
-    executable: /bin/bash
-  loop: 
-    - elastic
-    - kibana_system
-    - wazuh_api
-    - wazuh
-  become: yes
-  ## only run this when secrets don't exist and we're not skipping creation
+- name: SF-8 preflight -- WARN when the enabled stack over-commits host RAM (advisory)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: co-residency OVER-COMMIT -- capped MemoryMax total
+      {{ lme_mem_budget.total_gb }}G exceeds usable {{ lme_mem_budget.usable_gb }}G on this
+      {{ lme_mem_budget.host_ram_gb }}G host. This is a ceiling sum, not a reservation, so the
+      stack may still run, but under load expect memory pressure / possible OOM. Consider
+      --no-llm (drops the llm pack) or a roomier host. Enabled capped services: {{ lme_mem_budget.capped }}.
   when:
-    - not (lme_skip_secret_creation | default(false))
-    - result.rc == 1
+    - not (lme_child_es_only | default(false) | bool)
+    - (ansible_memtotal_mb | default(0) | int) > 0
+    - lme_mem_budget.over_budget | bool
 
+- name: SF-8 preflight -- HARD FAIL when a single service cannot fit host RAM
+  ansible.builtin.assert:
+    that:
+      - (lme_mem_budget.oversized | default([])) | length == 0
+    fail_msg: >-
+      Service(s) {{ lme_mem_budget.oversized }} each declare a MemoryMax larger than this
+      host's usable RAM ({{ lme_mem_budget.usable_gb }}G = {{ lme_mem_budget.host_ram_gb }}G
+      - {{ lme_mem_budget.reserve_gb }}G reserve); the host cannot back them. Deploy on a
+      roomier host, lower the service's cap in its manifest, or raise
+      lme_global.budget.host_ram_gb for this host.
+    success_msg: "No single service exceeds usable host RAM."
+  when:
+    - not (lme_child_es_only | default(false) | bool)
+    - (ansible_memtotal_mb | default(0) | int) > 0
+
+# --- container image policy ---------------------------------------------------
 - name: Check if policy.json exists
   stat:
     path: /etc/containers/policy.json
@@ -82,97 +101,195 @@
     dest: /etc/containers/policy.json
   become: yes
   when: not policy_file.stat.exists or policy_file.stat.size == 0
-  
-- name: Pull containers
+
+# --- podman image realization (replaces config/containers*.txt) ---------------
+# One loop over lme_global.images. `pull` images are pulled from upstream then
+# retagged to their stable `local` ref (the exact string the rendered unit
+# references); `build` images are built from their Dockerfile. The group gate
+# mirrors main.yml's include gating: `core` always; `llm` / `elastic_services`
+# only when their enable flag is on and this is not an ES-only child node.
+#
+# Fail-closed by design (NO ignore_errors, unlike the old containers.txt loop):
+# a missing/unbuildable image must stop the install, not leave a rendered unit
+# that can never start (definition-of-done: no false success). Transient pull
+# flakiness is still absorbed by retries/until. Offline installs skip this loop
+# and load from the prepared tars via load_offline_containers.yml.
+- name: Realize container images from global.images (pull|build then retag to local)
   shell: |
     export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman pull {{ item }}
+    {% if item.value.pull is defined %}
+    podman pull {{ item.value.pull | quote }}
+    podman image tag {{ item.value.pull | quote }} {{ item.value.local | quote }}
+    {% else %}
+    podman build -t {{ item.value.local | quote }} \
+      -f {{ (clone_directory ~ '/' ~ item.value.build) | quote }} \
+      {{ (clone_directory ~ '/' ~ (item.value.build | dirname)) | quote }}
+    {% endif %}
   args:
     executable: /bin/bash
-  loop: "{{ lookup('file', clone_directory + '/config/containers.txt').splitlines() | select('match', '^[^#].*') | reject('match', '^\\s*$') | list }}"
-  register: pull_result
+  loop: "{{ lme_global.images | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} ({{ item.value.group | default('core') }})"
+  register: image_realize_result
   become: yes
   retries: 3
   delay: 5
-  until: pull_result is not failed
-  ignore_errors: yes
-  when: not (offline_mode | default(false))
-
-- name: Display container pull errors
-  debug:
-    msg: "Failed to pull container: {{ item.item }}"
-  loop: "{{ pull_result.results }}"
-  when: item is failed and not (offline_mode | default(false))
-  loop_control:
-    label: "{{ item.item }}"
+  until: image_realize_result is not failed
+  when:
+    - not (offline_mode | default(false))
+    - >-
+      (item.value.group | default('core')) == 'core'
+      or ((item.value.group | default('core')) == 'llm'
+          and (install_llm | default(true) | bool)
+          and not (lme_child_es_only | default(false) | bool))
+      or ((item.value.group | default('core')) == 'elastic_services'
+          and (install_elastic_services | default(false) | bool)
+          and not (lme_child_es_only | default(false) | bool))
 
 - name: Load and tag containers from offline resources
   include_tasks: load_offline_containers.yml
   when: offline_mode | default(false)
 
-- name: Tag containers (online mode only)
-  shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman image tag {{ item }} {{ item.split('/')[-1].split(':')[0] }}:LME_LATEST
-  args:
-    executable: /bin/bash
-  loop: "{{ lookup('file', clone_directory + '/config/containers.txt').splitlines() | select('match', '^[^#].*') | reject('match', '^\\s*$') | list }}"
-  register: tag_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: tag_result is not failed
-  ignore_errors: yes
-  when: not (offline_mode | default(false))
-
-- name: Display container tag errors (online mode only)
+# --- podman secret set (B3: derived from ENABLED services) --------------------
+# Skip on cluster data nodes: secrets are copied from the master by the
+# secrets_distribution role. lme_skip_secret_creation=true is set on that path.
+- name: Skip secret creation (cluster node - secrets from master)
   debug:
-    msg: "Failed to tag container: {{ item.item }}"
-  loop: "{{ tag_result.results }}"
+    msg: "Skipping secret creation. Secrets will be copied from master via secrets_distribution."
+  when: lme_skip_secret_creation | default(false)
+
+# The B3 union: the set of podman secrets that ENABLED service manifests declare.
+# render_units renders a unit ONLY when is_enabled(enabled_when) is true, so a
+# secret in this union is exactly a secret some rendered unit will reference.
+- name: Reset required-secret accumulator
+  set_fact:
+    lme_required_secrets: []
+
+- name: Derive required podman secrets from enabled services (B3 union)
+  set_fact:
+    lme_required_secrets: >-
+      {{ (lme_required_secrets
+          + (item.value.secrets | default([]) | map(attribute='name') | list)) | unique }}
+  loop: "{{ lme_services | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name | default(item.key) }}"
   when:
-    - not (offline_mode | default(false))
-    - item is failed
-  loop_control:
-    label: "{{ item.item }}"
+    - item.value.enabled_when | default(['always']) | is_enabled(lme_enable_flags | default({}))
+    # GAP-3 host-scope: accumulate a service's secrets on THIS host only when it is in
+    # the roster (empty/undefined roster -> full host, backward-compat).
+    - (lme_host_services | default([]) | length == 0) or (item.key in (lme_host_services | default([])))
 
-- name: Display container tag errors
-  debug:
-    msg: "Failed to tag container: {{ item.item }}"
-  loop: "{{ tag_result.results }}"
-  when: item is failed
-  loop_control:
-    label: "{{ item.item }}"
+# Two secret-creation recipes exist (the classes live in role defaults):
+#   * known credentials  -> created HERE with the shell-driver random-password
+#     recipe below when creation is local.
+#   * deferred secrets   -> created by llama_cpp_setup.yml with their own recipes
+#     (pgvector + litellm_master_key + webui_api_key: random file-driver passwords;
+#     llm-keys: empty placeholder). GAP-5 host-scopes llama_cpp_setup to hosts that
+#     RENDER the LLM backend (lme_llm_backing_service='pgvector' in
+#     lme_host_rendered_services). So on a cross-host consumer that renders the two web
+#     UIs (dashboard/log-analyzer, enabled_when:[install_llm]) but NOT pgvector, these
+#     are minted by neither llama_cpp_setup (gated off) nor the shell loop (they are
+#     deferred) -- they must instead arrive via armed cross-host distribution (GAP-4).
+#     The B3 guard below enforces that PER HOST: an unarmed/incomplete consumer fails
+#     LOUD, rather than deploying silent-green with UIs that crash on the missing secret.
+#     (The prior claim here -- "a rendered consumer never precedes their creation" -- was
+#     the same false premise GAP-5 corrected in trixie.yml/site.yml; it assumed the mint
+#     rode install_llm, but GAP-5 re-gates it on the pgvector RENDER.)
+# Fail-closed: the two sets MUST stay disjoint. lme_password_secrets (below) strips the
+# deferred set from the shell-driver mint, so a deferred name ALSO listed as a known password
+# would satisfy the recipe guard (it is in known) yet never be minted here -> the very
+# silent-green this guard prevents. No default config trips this; it catches a bad
+# `-e lme_known_password_secrets=[...]` override (extra-vars outrank the set_fact above) or a
+# future edit -- and it makes the guard's own remedy (3) safe.
+- name: B3 guard -- known-password and deferred secret sets must be disjoint
+  ansible.builtin.assert:
+    that:
+      - (lme_known_password_secrets | intersect(lme_secrets_deferred)) | length == 0
+    fail_msg: >-
+      Secret name(s) {{ lme_known_password_secrets | intersect(lme_secrets_deferred) }} appear in
+      BOTH lme_known_password_secrets and lme_secrets_deferred. A deferred name is stripped from
+      the shell-driver mint (lme_password_secrets = ... | difference(lme_secrets_deferred)), so
+      listing it as a known password makes the recipe guard PASS while the secret is never created.
+      Remove it from lme_known_password_secrets: a deferred secret is minted by llama_cpp_setup on
+      an LLM host or arrives via cross-host distribution, never by the shell loop.
+    success_msg: "known-password and deferred secret sets are disjoint."
 
-- name: Pull Elastic services containers
+# GAP-5: the deferred local recipe (llama_cpp_setup) is HOST-CONDITIONAL -- it runs only
+# where this host renders the LLM backend (lme_llm_backing_service='pgvector' in
+# lme_host_rendered_services). So "deferred" is a valid creation recipe HERE only on such
+# a host; on a cross-host consumer the deferred secrets can only arrive via armed
+# distribution. When local creation is skipped, ONLY the authorized distribution roster
+# is a recipe; known local-password names must not accidentally satisfy B3. Note this is a
+# declarative check, so a dangling/payload-less persisted entry cannot mask a missing recipe.
+- name: Compute the secrets THIS host has a creation recipe for (GAP-5 host-scoped)
+  set_fact:
+    lme_secrets_recipe_here: >-
+      {{ ((lme_cross_host_file_secrets | default([]))
+          if (lme_skip_secret_creation | default(false) | bool)
+          else
+            (lme_known_password_secrets
+             + (lme_secrets_deferred
+                if ((lme_llm_backing_service | default('')) in (lme_host_rendered_services | default([])))
+                else []))) | unique }}
+
+# Fail-closed B3 guard: any enabled+rendered secret with no creation recipe ON THIS HOST
+# has no way to exist -> a rendered unit would reference an uncreated secret. Stop loudly
+# instead of proceeding to a SILENT-GREEN deploy whose units crash on the missing secret.
+# Catches (a) a future/renamed manifest secret (e.g. `pgvector_pass`); (b) GAP-5's
+# cross-host consumer where the deferred UI secrets (pgvector/litellm_master_key/
+# webui_api_key) are gated off llama_cpp_setup AND distribution is unarmed/incomplete.
+# A full / no-roster host renders pgvector (install_llm) -> deferred is a recipe -> reduces
+# to the pre-GAP-5 check -> byte-unchanged.
+- name: B3 guard -- every enabled-service secret has a creation recipe on THIS host
+  assert:
+    that:
+      - (lme_required_secrets | difference(lme_secrets_recipe_here)) | length == 0
+    fail_msg: >-
+      Rendered service(s) on this host declare podman secret(s) with no creation recipe
+      here: {{ lme_required_secrets | difference(lme_secrets_recipe_here) }}.
+      Fix ONE of: (1) run the LLM stack on this host so lme_llm_backing_service
+      ({{ lme_llm_backing_service | default('') }}) renders (currently
+      {{ 'rendered' if ((lme_llm_backing_service | default('')) in (lme_host_rendered_services | default([]))) else 'NOT rendered' }}
+      here); (2) for a cross-host consumer, arm lme_distribute_secrets=true AND add each
+      missing name to lme_cross_host_file_secrets (currently
+      {{ lme_cross_host_file_secrets | default([]) }}) so the producer distributes it;
+      (3) ONLY if a missing name is a NEW manifest secret NOT in the deferred set
+      ({{ lme_secrets_deferred }}), add it to lme_known_password_secrets for a shell-driver mint
+      -- a deferred name added there is rejected by the disjoint-set guard above and would stay
+      uncreated. No rendered unit may reference an uncreated secret (B3).
+    success_msg: "All rendered-service secrets have a creation recipe on this host."
+
+# Credentials to create = (enabled union + floor) minus the LLM-deferred set.
+- name: Compute credential secrets to create
+  set_fact:
+    lme_password_secrets: >-
+      {{ ((lme_required_secrets + lme_known_password_secrets) | unique)
+         | difference(lme_secrets_deferred) }}
+
+- name: Check whether service-credential secrets already exist
   shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman pull {{ item }}
+    source /root/.profile
+    podman secret ls | grep -q elastic
+  register: result
+  become: yes
   args:
     executable: /bin/bash
-  loop: "{{ lookup('file', clone_directory + '/config/containers-elastic-services.txt').splitlines() | select('match', '^[^#].*') | reject('match', '^\\s*$') | list }}"
-  register: pull_elastic_services_result
-  become: yes
-  retries: 3
-  delay: 5
-  until: pull_elastic_services_result is not failed
-  ignore_errors: yes
-  when:
-    - not (offline_mode | default(false))
-    - install_elastic_services | default(false) | bool
+  ignore_errors: true
+  # only fail on a real error
+  failed_when: result.rc != 0 and (result.rc == 1 and result.changed == false)
+  when: not (lme_skip_secret_creation | default(false))
 
-- name: Tag Elastic services containers (online mode only)
+- name: Set podman secret passwords (derived credential set)
   shell: |
-    export PATH=$PATH:/nix/var/nix/profiles/default/bin
-    podman image tag {{ item }} {{ item.split('/')[-1].split(':')[0] }}:LME_LATEST
+    source /root/.profile
+    password="$(</dev/urandom tr -dc 'A-Za-z' | head -c1)$(</dev/urandom tr -dc 'A-Za-z0-9_.-' | head -c29)"
+    while ! echo -n "$password" | grep -Eq '[_.-]+';do password="$(</dev/urandom tr -dc 'A-Za-z' | head -c1)$(</dev/urandom tr -dc 'A-Za-z0-9_.-' | head -c29)";done
+    echo -n $password | podman secret create --driver shell --replace "{{ item }}" -
   args:
     executable: /bin/bash
-  loop: "{{ lookup('file', clone_directory + '/config/containers-elastic-services.txt').splitlines() | select('match', '^[^#].*') | reject('match', '^\\s*$') | list }}"
-  register: tag_elastic_services_result
+  loop: "{{ lme_password_secrets }}"
   become: yes
-  retries: 3
-  delay: 5
-  until: tag_elastic_services_result is not failed
-  ignore_errors: yes
+  ## only run this when secrets don't exist and we're not skipping creation
   when:
-    - not (offline_mode | default(false))
-    - install_elastic_services | default(false) | bool
+    - not (lme_skip_secret_creation | default(false))
+    - result.rc == 1

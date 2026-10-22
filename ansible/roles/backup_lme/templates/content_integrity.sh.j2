@@ -1,0 +1,520 @@
+{#- =========================================================================
+   content_integrity.sh.j2 -- CANONICAL, reusable shell library for backup-bundle
+   content integrity. Rendered (via lookup('template', ...)) into BOTH the backup
+   producer and the restore verifier so the two can never drift.
+
+   REPRESENTATION (codex-0845 D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE):
+   this file is a set of genuine, PARAMETERIZED Jinja macros. lme_integrity_library(bi)
+   takes the lme_backup_integrity DECLARATION as its argument and emits the shell
+   library from it: payload classes, volume layout names (data dir + manifest file)
+   and certification field names are all DRIVEN by the declaration, never hardcoded
+   twice. Changing a name in vars/integrity.yml relocates the mechanism on BOTH the
+   producer and the restore side (the library exports LME_VOLUME_DATA_DIR /
+   LME_VOLUME_MANIFEST_FILE which the producer task and the restore checks consume).
+
+   FAIL-CLOSED (codex-0845 D-BACKUP-IO-AND-CERTIFICATE-PUBLICATION-FALSE-SUCCESS):
+   a read, enumeration, staging or publication failure returns NON-ZERO and never
+   contributes an empty digest field. A missing input is a FAILURE return, not a
+   success sentinel. Callers run under set -euo pipefail; these functions add the
+   explicit || return checks that command substitution does not inherit.
+
+   No secret VALUES are read: secret payloads are digested as CIPHERTEXT bytes.
+
+   Exported shell entrypoints (after {{ '{{' }} lme_integrity_lib {{ '}}' }}):
+     lme_content_sha256 <dir>              subtree content digest (files+symlinks)
+     lme_content_sha256_file <file>        single-file content digest
+     lme_write_content_manifest <src> <out>   write a volume content_manifest
+     lme_finalize_volume_backup <mnt> <vdir>  manifest + torn-copy guard (producer)
+     lme_bundle_certify <root>             publish + self-verify the certification
+     lme_bundle_verify  <root>            fail-closed verify (COMPLETE, pre-mutation)
+========================================================================= -#}
+{#- codex-1115 D-DECLARED-PATH-SHELL-INTERPOLATION: declared values must enter the
+    rendered shell as safely-quoted DATA, never as bare text inside a double-quoted
+    assignment (where a value containing ", $(...), `...` or ${...} would EXECUTE when
+    the library is sourced). _shq single-quote-serializes any value (wrap in '...',
+    and render each embedded ' as '\'' -- the POSIX close/escape/reopen idiom), so the
+    shell treats it as a literal with no expansion. _cmt neutralizes newlines/CR for the
+    handful of values interpolated into '#' COMMENT lines, so a value cannot break out of
+    the comment onto an executable line. These are pure-Jinja (replace/string only): they
+    render identically under Ansible lookup('template') AND the frozen test's plain
+    jinja2.Environment (no dependency on Ansible's |quote). Component/path allowlist
+    validation in assert_integrity_paths.yml is defense-in-depth, NOT a substitute for this
+    serialization. A missing key still renders '' and trips the :? guard below (fail-closed). -#}
+{%- macro _shq(v) -%}'{{ (v | string) | replace("'", "'\\''") }}'{%- endmacro -%}
+{%- macro _cmt(v) -%}{{ (v | string) | replace('\n', ' ') | replace('\r', ' ') }}{%- endmacro -%}
+{%- macro lme_integrity_library(bi) -%}
+# --- rendered from lme_backup_integrity (schema {{ _cmt(bi.schema) }}) ---
+LME_SCHEMA={{ _shq(bi.schema) }}
+LME_BUNDLE_CERT_FILE={{ _shq(bi.certification.bundle_file) }}
+LME_BUNDLE_SELF_FIELD={{ _shq(bi.certification.self_digest_field) }}
+LME_VOLUME_ROOT={{ _shq(bi.volume_layout.root_dir) }}
+LME_VOLUME_DATA_DIR={{ _shq(bi.volume_layout.data_dir) }}
+LME_VOLUME_MANIFEST_FILE={{ _shq(bi.volume_layout.manifest_file) }}
+# content_manifest.txt field NAMES (role-keyed in bi.manifest_fields): a SINGLE source
+# consumed by BOTH the writer (lme_write_content_manifest) and the reader
+# (lme_verify_content_manifest) so a field-name change relocates producer and restore
+# together. NOTE: the bundle_certification.txt "content_sha256=" lines are a SEPARATE
+# schema (the certificate, not the manifest) and stay literal.
+LME_MF_COUNT={{ _shq(bi.manifest_fields.count) }}
+LME_MF_BYTES={{ _shq(bi.manifest_fields.bytes) }}
+LME_MF_LISTING={{ _shq(bi.manifest_fields.listing) }}
+LME_MF_CONTENT={{ _shq(bi.manifest_fields.content) }}
+# Topology-classification signals (codex-1015 D-RESTORE-TOPOLOGY-DECLARATION-DIVERGENCE):
+# DECLARED in vars/integrity.yml topology_classification and exported so the restore probe
+# CONSUMES them instead of hardcoding the quadlet path/marker/note id. LME_TOPO_NOTE_PATH is
+# DERIVED from the note payload's OWN payload_classes entry (single source; not restated).
+{% set _lme_note = (bi.payload_classes | selectattr('id', 'equalto', bi.topology_classification.note_payload_id) | list | first) -%}
+LME_TOPO_QUADLET_PAYLOAD={{ _shq(bi.topology_classification.quadlet_payload_id) }}
+LME_TOPO_QUADLET_RELPATH={{ _shq(bi.topology_classification.quadlet_relpath) }}
+LME_TOPO_SINGLE_NODE_MARKER={{ _shq(bi.topology_classification.single_node_marker) }}
+LME_TOPO_NOTE_ID={{ _shq(bi.topology_classification.note_payload_id) }}
+LME_TOPO_NOTE_PATH={{ _shq(_lme_note.path) }}
+LME_TOPO_REQUIRE_EVIDENCE="{{ 'yes' if bi.topology_classification.require_affirmative_evidence | default(true) else 'no' }}"
+# Fail-closed on an under-declared contract: a missing volume_layout key would render
+# to an empty string (plain jinja2 emits "" for a missing attribute), turning
+# "$root/$LME_VOLUME_ROOT" into "$root/" (every payload tree read as an uncertified
+# volume, rc8) and, worse, "$VOLUME_DIR/$LME_VOLUME_DATA_DIR" into "$VOLUME_DIR/" for a
+# become:yes rm -rf. `:?` aborts the sourcing shell (non-interactive bash exits on an
+# unset/null :? expansion even without set -e), so an incomplete declaration can never
+# produce a path that resolves to a parent directory.
+: "${LME_BUNDLE_CERT_FILE:?content_integrity: certification.bundle_file missing from declaration}" \
+  "${LME_BUNDLE_SELF_FIELD:?content_integrity: certification.self_digest_field missing from declaration}" \
+  "${LME_VOLUME_ROOT:?content_integrity: volume_layout.root_dir missing from declaration}" \
+  "${LME_VOLUME_DATA_DIR:?content_integrity: volume_layout.data_dir missing from declaration}" \
+  "${LME_VOLUME_MANIFEST_FILE:?content_integrity: volume_layout.manifest_file missing from declaration}" \
+  "${LME_MF_COUNT:?content_integrity: manifest_fields.count missing from declaration}" \
+  "${LME_MF_BYTES:?content_integrity: manifest_fields.bytes missing from declaration}" \
+  "${LME_MF_LISTING:?content_integrity: manifest_fields.listing missing from declaration}" \
+  "${LME_MF_CONTENT:?content_integrity: manifest_fields.content missing from declaration}" \
+  "${LME_TOPO_QUADLET_PAYLOAD:?content_integrity: topology_classification.quadlet_payload_id missing from declaration}" \
+  "${LME_TOPO_QUADLET_RELPATH:?content_integrity: topology_classification.quadlet_relpath missing from declaration}" \
+  "${LME_TOPO_SINGLE_NODE_MARKER:?content_integrity: topology_classification.single_node_marker missing from declaration}" \
+  "${LME_TOPO_NOTE_ID:?content_integrity: topology_classification.note_payload_id missing from declaration}" \
+  "${LME_TOPO_NOTE_PATH:?content_integrity: note payload path not resolvable from payload_classes}"
+
+# codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-UNVALIDATED (library-source-time half): the
+# `:?` guards above only prove NON-NULL. A path-name field that renders to a value with a
+# path separator or a traversal component (e.g. data_dir: ../other, bundle_file: ../../x)
+# would still pass `:?` and then be used to build a privileged rm target that escapes the
+# owned bundle. These fields are declared as SINGLE path components; assert that here, at
+# source time, BEFORE any function can build a target. Fail-closed: an offending value
+# aborts the sourcing shell (exit 1) before any mutation. The declaration-level Ansible
+# `assert` in tasks/assert_integrity_paths.yml is the PRIMARY, module-reachable gate (it
+# also covers `file: state=absent` on certification.bundle_file, which no shell can guard);
+# this is defense-in-depth on the shell side and is what the unit harness exercises.
+for _lme_pn in "$LME_VOLUME_ROOT" "$LME_VOLUME_DATA_DIR" "$LME_VOLUME_MANIFEST_FILE" "$LME_BUNDLE_CERT_FILE"; do
+  case "$_lme_pn" in
+    */* | "" | "." | "..")
+      echo "content_integrity: refusing declaration path-name field that is not a single component: '$_lme_pn'" >&2
+      exit 1 ;;
+  esac
+done
+unset _lme_pn
+
+lme_tree_payloads=()
+lme_file_payloads=()
+{# codex-1200 D-U1-PAYLOAD-ARRAY-STILL-EXECUTES-DECLARED-ID: p.id/p.path are DECLARED values
+   that previously interpolated raw into a double-quoted array literal, so an id/path with
+   $()/backtick EXECUTED when the library was sourced. Serialize the WHOLE id|path|req record
+   as ONE single-quoted shell literal via _shq (inert; value is byte-identical to the old
+   "id|path|req" for benign inputs, and IFS='|' read still splits it). Unambiguous field
+   encoding + requiredness are ENFORCED at the declaration gate (assert_integrity_paths.yml:
+   id/path charset excludes '|' and CR/LF; kind is enumerated; optional is boolean), so a
+   delimiter- or newline-bearing value is REFUSED before this record is ever built. #}
+{% for p in bi.payload_classes if p.kind == 'tree' -%}
+lme_tree_payloads+=( {{ _shq(p.id ~ '|' ~ p.path ~ '|' ~ ('opt' if p.optional | default(false) else 'req')) }} )
+{% endfor -%}
+{% for p in bi.payload_classes if p.kind == 'file' -%}
+lme_file_payloads+=( {{ _shq(p.id ~ '|' ~ p.path ~ '|' ~ ('opt' if p.optional | default(false) else 'req')) }} )
+{% endfor %}
+# Fail-closed pre-deletion scope guard (codex-0945 D-BACKUP-DESTRUCTIVE-PATH-SCOPE-
+# UNVALIDATED, runtime half): before any privileged `rm -rf` of a resolved TARGET, prove
+# the target canonically equals OWNED_PARENT/LEAF and nothing else -- rejecting a traversal
+# leaf, absolute injection, and symlink escape. OWNED_PARENT must already exist (the
+# producer mkdir's the volume dir first); TARGET may not exist yet, so it is canonicalized
+# with `realpath -m`, which still resolves any symlink present in the existing prefix (so a
+# data/ that is a symlink to /etc resolves out of scope and is REFUSED). Returns non-zero
+# on any doubt; it NEVER widens scope, it only refuses. The caller fails the volume and
+# writes no manifest on a non-zero return.
+lme_assert_deletion_scope() {
+  local target="$1" owned_parent="$2" leaf="$3" rp_parent rp_target
+  case "$leaf" in
+    */* | "" | "." | "..")
+      echo "lme_assert_deletion_scope: leaf is not a single component: '$leaf'" >&2; return 1 ;;
+  esac
+  rp_parent="$(realpath -e -- "$owned_parent" 2>/dev/null)" \
+    || { echo "lme_assert_deletion_scope: owned parent does not resolve: '$owned_parent'" >&2; return 1; }
+  rp_target="$(realpath -m -- "$target" 2>/dev/null)" \
+    || { echo "lme_assert_deletion_scope: target does not resolve: '$target'" >&2; return 1; }
+  if [ "$rp_target" != "$rp_parent/$leaf" ]; then
+    echo "lme_assert_deletion_scope: REFUSING deletion outside owned scope: target resolves to '$rp_target', expected '$rp_parent/$leaf'" >&2
+    return 1
+  fi
+  return 0
+}
+# Content digest over a directory subtree: binds each relative path to its file
+# CONTENT hash (or symlink target), NUL-safe (no variable capture of the NUL stream),
+# LC_ALL=C ordered so a cluster tarball restored on another host still matches.
+# Covers {{ _cmt(bi.digest_covers | join(', ')) }}; does NOT cover
+# {{ _cmt(bi.digest_excludes | join(', ')) }} (see vars/integrity.yml digest_excludes).
+# Fail-closed: a missing dir, an unreadable subtree, a readlink or a sha256sum
+# failure returns non-zero -- it never emits a partial or empty digest.
+lme_content_sha256() {
+  local dir="$1" tmp rc
+  if [ ! -d "$dir" ]; then
+    echo "lme_content_sha256: not a directory: $dir" >&2
+    return 1
+  fi
+  tmp="$(mktemp)" || { echo "lme_content_sha256: mktemp failed" >&2; return 1; }
+  # Capture the subshell rc explicitly: `if ! ( ... )` would make $? the status of the
+  # negation (always 0), silently swallowing the real failure. `|| rc=$?` records it.
+  rc=0
+  (
+    set -o pipefail
+    cd "$dir" || exit 3
+    find . \( -type f -o -type l \) -printf '%P\0' | LC_ALL=C sort -z | \
+    while IFS= read -r -d '' rel; do
+      printf 'P:%s\0' "$rel"
+      if [ -L "$rel" ]; then
+        local tgt
+        tgt="$(readlink -- "$rel")" || exit 4
+        printf 'L:%s\0' "$tgt"
+      else
+        local h
+        h="$(sha256sum < "$rel")" || exit 5
+        printf 'F:%s\0' "${h%% *}"
+      fi
+    done
+  ) > "$tmp" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$tmp"
+    echo "lme_content_sha256: enumeration/read failure (rc=$rc) under $dir" >&2
+    return "$rc"
+  fi
+  # Hash the NUL-preserving stream from the temp file (no $() capture, which strips NUL).
+  local out
+  out="$(sha256sum < "$tmp")" || { rm -f "$tmp"; echo "lme_content_sha256: final hash failed" >&2; return 5; }
+  rm -f "$tmp"
+  printf '%s\n' "${out%% *}"
+}
+
+lme_content_sha256_file() {
+  local f="$1" h
+  if [ ! -f "$f" ]; then
+    echo "lme_content_sha256_file: not a file: $f" >&2
+    return 1
+  fi
+  h="$(sha256sum < "$f")" || { echo "lme_content_sha256_file: read failed: $f" >&2; return 5; }
+  printf '%s\n' "${h%% *}"
+}
+
+# Write a volume content_manifest from SRC. listing_sha256 (paths+sizes) is RETAINED
+# for info; content_sha256 (file CONTENTS + symlink targets) is the NON-VACUOUS signal
+# restore verifies. Fail-closed: any enumeration/digest failure returns non-zero and
+# writes NO manifest, so a partial backup is left with no manifest and restore refuses it.
+lme_write_content_manifest() {
+  local src="$1" out="$2" fc tb sha csha
+  if [ ! -d "$src" ]; then
+    echo "lme_write_content_manifest: source not a directory: $src" >&2
+    return 1
+  fi
+  fc="$( cd "$src" && find . -type f -printf '.' | wc -c | tr -d ' ' )" || return 1
+  tb="$( cd "$src" && find . -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}' )" || return 1
+  sha="$( cd "$src" && find . -type f -printf '%P\t%s\n' | LC_ALL=C sort | sha256sum | awk '{print $1}' )" || return 1
+  csha="$(lme_content_sha256 "$src")" || return 1
+  [ -n "$csha" ] || { echo "lme_write_content_manifest: empty content digest for $src" >&2; return 1; }
+  {
+    echo "${LME_MF_COUNT}=${fc:-0}"
+    echo "${LME_MF_BYTES}=${tb:-0}"
+    echo "${LME_MF_LISTING}=${sha}"
+    echo "${LME_MF_CONTENT}=${csha}"
+  } > "$out" || return 1
+  return 0
+}
+
+# Reader companion to lme_write_content_manifest: verify a produced volume's data dir
+# against its content_manifest, BEFORE any destructive restore. This is the SINGLE
+# source of the manifest recompute (file count / total bytes / listing / content), so
+# the restore consumer no longer hand-inlines a "keep byte-identical to the producer"
+# snippet (codex-0845/0915 D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE). Field
+# names come from LME_MF_*; the recompute formulas MATCH lme_write_content_manifest
+# exactly (find -printf '.' | wc -c, not find | wc -l, so a newline in a filename does
+# not falsely fail). Fail-closed exit codes (caller runs under set -euo pipefail; every
+# grep is guarded so a missing field never aborts before the explicit refusal):
+#   3 = manifest missing, data dir missing, or the content field absent (LEGACY bundle
+#       -- NO fallback to listing alone, no ignore-integrity switch)
+#   4 = a recomputed value does not match the manifest (partial/corrupt/altered payload)
+lme_verify_content_manifest() {
+  local manifest="$1" data="$2"
+  if [ ! -f "$manifest" ]; then
+    echo "lme_verify_content_manifest: content manifest missing at $manifest" >&2
+    echo "Backup predates integrity manifests or is corrupt; refusing destructive restore." >&2
+    return 3
+  fi
+  if [ ! -d "$data" ]; then
+    echo "lme_verify_content_manifest: backup data dir missing at $data" >&2
+    return 3
+  fi
+  local exp_fc exp_tb exp_ls exp_cs act_fc act_tb act_ls act_cs
+  exp_fc="$(grep "^${LME_MF_COUNT}=" "$manifest" | head -n1 | cut -d= -f2 || true)"
+  exp_tb="$(grep "^${LME_MF_BYTES}=" "$manifest" | head -n1 | cut -d= -f2 || true)"
+  exp_ls="$(grep "^${LME_MF_LISTING}=" "$manifest" | head -n1 | cut -d= -f2 || true)"
+  # content is the real check. A manifest WITHOUT it is a pre-content-digest bundle and
+  # is REFUSED here (rc3, route to LEGACY-BUNDLE), never accepted on listing alone.
+  exp_cs="$(grep "^${LME_MF_CONTENT}=" "$manifest" | head -n1 | cut -d= -f2 || true)"
+  if [ -z "$exp_cs" ]; then
+    echo "lme_verify_content_manifest: ${LME_MF_CONTENT} missing from $manifest (pre-content-digest bundle)." >&2
+    echo "Refusing destructive restore on ${LME_MF_LISTING} alone (no ignore-integrity switch); qualify via LEGACY-BUNDLE." >&2
+    return 3
+  fi
+  act_fc="$( cd "$data" && find . -type f -printf '.' | wc -c | tr -d ' ' )"
+  act_tb="$( cd "$data" && find . -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}' )"
+  act_ls="$( cd "$data" && find . -type f -printf '%P\t%s\n' | LC_ALL=C sort | sha256sum | awk '{print $1}' )"
+  act_cs="$(lme_content_sha256 "$data")" || { echo "lme_verify_content_manifest: content digest recompute failed for $data" >&2; return 4; }
+  if [ "$exp_fc" != "$act_fc" ] || [ "$exp_tb" != "$act_tb" ] || [ "$exp_ls" != "$act_ls" ] || [ "$exp_cs" != "$act_cs" ]; then
+    echo "lme_verify_content_manifest: content integrity mismatch -- refusing destructive restore." >&2
+    echo "  expected: ${LME_MF_COUNT}=$exp_fc ${LME_MF_BYTES}=$exp_tb ${LME_MF_LISTING}=$exp_ls ${LME_MF_CONTENT}=$exp_cs" >&2
+    echo "  actual:   ${LME_MF_COUNT}=$act_fc ${LME_MF_BYTES}=$act_tb ${LME_MF_LISTING}=$act_ls ${LME_MF_CONTENT}=$act_cs" >&2
+    return 4
+  fi
+  echo "content integrity OK: ${LME_MF_COUNT}=$act_fc ${LME_MF_BYTES}=$act_tb ${LME_MF_CONTENT}=$act_cs"
+  return 0
+}
+
+# Producer helper (moved out of the inline task body): after cp has populated
+# <vdir>/$LME_VOLUME_DATA_DIR from <mountpoint>, write the SOURCE manifest and then
+# FAIL (leaving NO manifest) if the copied content digest differs from the source --
+# a cp that returns 0 can still be self-consistently torn.
+lme_finalize_volume_backup() {
+  local mountpoint="$1" vdir="$2"
+  local man="$vdir/$LME_VOLUME_MANIFEST_FILE"
+  local data="$vdir/$LME_VOLUME_DATA_DIR"
+  lme_write_content_manifest "$mountpoint" "$man" || { rm -f "$man"; return 1; }
+  local src copy
+  src="$(grep "^${LME_MF_CONTENT}=" "$man" | head -n1 | cut -d= -f2 || true)"
+  copy="$(lme_content_sha256 "$data")" || { rm -f "$man"; return 1; }
+  if [ -z "$src" ] || [ "$src" != "$copy" ]; then
+    rm -f "$man"
+    echo "lme_finalize_volume_backup: copied content ($copy) != source ($src) at $vdir; torn copy, no manifest" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Recompute bundle_sha256 over the SORTED payload lines (excludes the self line).
+lme_bundle_self_digest() {
+  local cert="$1"
+  grep -E '^payload=' "$cert" | LC_ALL=C sort | sha256sum | awk '{print $1}'
+}
+
+# Producer: certify the finished bundle. REFUSES (non-zero) if a REQUIRED tree/file
+# payload is absent, if any digest cannot be computed, or if staging/publication
+# fails. Stages on the SAME filesystem as the final file (atomic mv) and RE-VERIFIES
+# the committed artifact before reporting success (codex-0845). Caller must ALSO
+# refuse to call this when any upstream backup task failed or the stop was unclean.
+lme_bundle_certify() {
+  local root="$1"
+  if [ ! -d "$root" ]; then echo "CERTIFY-REFUSED: root not a directory: $root" >&2; return 1; fi
+  local cert="$root/$LME_BUNDLE_CERT_FILE"
+  local tmp entry pid ppath preq dig vname vman vsha
+  tmp="$(mktemp "$root/.cert.XXXXXX")" || { echo "CERTIFY-REFUSED: staging mktemp failed under $root" >&2; return 1; }
+  {
+    echo "# LME backup bundle certification"
+    echo "# schema=$LME_SCHEMA"
+    echo "# created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >> "$tmp" || { rm -f "$tmp"; return 1; }
+
+  for entry in "${lme_tree_payloads[@]}"; do
+    IFS='|' read -r pid ppath preq <<< "$entry"
+    if [ ! -d "$root/$ppath" ]; then
+      if [ "$preq" = "req" ]; then
+        echo "CERTIFY-REFUSED: required tree payload '$pid' absent at $root/$ppath" >&2
+        rm -f "$tmp"; return 1
+      fi
+      continue
+    fi
+    dig="$(lme_content_sha256 "$root/$ppath")" || { echo "CERTIFY-REFUSED: digest failed for tree '$pid'" >&2; rm -f "$tmp"; return 1; }
+    [ -n "$dig" ] || { echo "CERTIFY-REFUSED: empty digest for tree '$pid'" >&2; rm -f "$tmp"; return 1; }
+    echo "payload=$pid|kind=tree|content_sha256=$dig" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  done
+
+  for entry in "${lme_file_payloads[@]}"; do
+    IFS='|' read -r pid ppath preq <<< "$entry"
+    if [ ! -f "$root/$ppath" ]; then
+      if [ "$preq" = "req" ]; then
+        echo "CERTIFY-REFUSED: required file payload '$pid' absent at $root/$ppath" >&2
+        rm -f "$tmp"; return 1
+      fi
+      continue
+    fi
+    dig="$(lme_content_sha256_file "$root/$ppath")" || { echo "CERTIFY-REFUSED: digest failed for file '$pid'" >&2; rm -f "$tmp"; return 1; }
+    [ -n "$dig" ] || { echo "CERTIFY-REFUSED: empty digest for file '$pid'" >&2; rm -f "$tmp"; return 1; }
+    echo "payload=$pid|kind=file|content_sha256=$dig" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  done
+
+  # Volume payloads: bind each volume's already-produced content_manifest content_sha256.
+  # Capture the enumeration rc (a find on volumes/ inside <(...) would let an unreadable
+  # dir silently omit volumes; podman volume names carry no newline so line-reading is safe).
+  if [ -d "$root/$LME_VOLUME_ROOT" ]; then
+    local cert_voldirs
+    cert_voldirs="$( set -o pipefail; find "$root/$LME_VOLUME_ROOT" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort )" \
+      || { echo "CERTIFY-REFUSED: cannot enumerate $root/$LME_VOLUME_ROOT" >&2; rm -f "$tmp"; return 1; }
+    while IFS= read -r vdir; do
+      [ -n "$vdir" ] || continue
+      vname="$(basename "$vdir")"
+      # A volume dir with no data/ is a FAILED/partial volume (e.g. mountpoint resolve
+      # failure leaves FAILED status, no data, no manifest). Do NOT silently skip it --
+      # a partial bundle must never be certified (mirrors b7c60cd; the Ansible when: gate
+      # is defense in depth, the library is the contract).
+      if [ ! -d "$vdir/$LME_VOLUME_DATA_DIR" ]; then
+        echo "CERTIFY-REFUSED: volume '$vname' has no $LME_VOLUME_DATA_DIR dir (failed/partial backup)" >&2
+        rm -f "$tmp"; return 1
+      fi
+      vman="$vdir/$LME_VOLUME_MANIFEST_FILE"
+      if [ ! -f "$vman" ]; then
+        echo "CERTIFY-REFUSED: volume '$vname' has no $LME_VOLUME_MANIFEST_FILE (partial backup)" >&2
+        rm -f "$tmp"; return 1
+      fi
+      vsha="$(grep "^${LME_MF_CONTENT}=" "$vman" | head -n1 | cut -d= -f2 || true)"
+      if [ -z "$vsha" ]; then
+        echo "CERTIFY-REFUSED: volume '$vname' manifest lacks content_sha256" >&2
+        rm -f "$tmp"; return 1
+      fi
+      echo "payload=volume:$vname|kind=volume_data|content_sha256=$vsha" >> "$tmp" || { rm -f "$tmp"; return 1; }
+    done <<< "$cert_voldirs"
+  fi
+
+  local self
+  self="$(grep -E '^payload=' "$tmp" | LC_ALL=C sort | sha256sum | awk '{print $1}')" || { rm -f "$tmp"; return 1; }
+  echo "$LME_BUNDLE_SELF_FIELD=$self" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$cert" || { rm -f "$tmp"; echo "CERTIFY-REFUSED: publication mv failed for $cert" >&2; return 1; }
+  # Verify the COMMITTED artifact before reporting certification (no false success). If
+  # the just-published certificate does NOT verify, REMOVE it -- never leave an
+  # unverifiable certificate installed (an absent cert -> restore refuses rc3, which is
+  # the safe state; a bad-but-present cert is a worse footgun).
+  if ! lme_bundle_verify "$root" >/dev/null; then
+    rm -f "$cert"
+    echo "CERTIFY-REFUSED: post-publication verification failed for $cert (certificate removed)" >&2
+    return 1
+  fi
+  echo "Bundle certified: $cert ($LME_BUNDLE_SELF_FIELD=$self)"
+  return 0
+}
+
+# Verifier (fail-closed, COMPLETE pre-mutation qualification). Exit codes:
+#   2 = root not a directory
+#   3 = certification file missing (legacy/old bundle -> LEGACY-BUNDLE path; NO
+#       fallback to listing_sha256, NO ignore-integrity switch)
+#   4 = self-digest mismatch (torn/truncated/recomputed-inconsistent certification)
+#   5 = a payload content does not match the certified digest (tree/file/volume data,
+#       or a volume manifest rebound away from the certificate)
+#   6 = a certified volume payload has an empty recorded content_sha256
+#   7 = a required (tree/file) payload, or a certified volume member, is absent
+#   8 = certified/on-disk volume set mismatch (duplicate or extra/undeclared member)
+lme_bundle_verify() {
+  local root="$1"
+  if [ ! -d "$root" ]; then echo "VERIFY-REFUSED(2): root not a directory: $root" >&2; return 2; fi
+  local cert="$root/$LME_BUNDLE_CERT_FILE"
+  local entry pid ppath preq exp act line
+
+  if [ ! -f "$cert" ]; then
+    echo "VERIFY-REFUSED(3): bundle certification missing at $cert." >&2
+    echo "Backup predates integrity certification or is corrupt; refusing destructive restore (no ignore-integrity switch)." >&2
+    echo "REMEDY: take a NEW backup (it is certified at write time) and restore from that; a pre-certification bundle cannot be admitted." >&2
+    return 3
+  fi
+
+  local recorded actual
+  recorded="$(grep -E "^$LME_BUNDLE_SELF_FIELD=" "$cert" | head -n1 | cut -d= -f2 || true)"
+  actual="$(lme_bundle_self_digest "$cert")"
+  if [ -z "$recorded" ] || [ "$recorded" != "$actual" ]; then
+    echo "VERIFY-REFUSED(4): certification self-digest mismatch (recorded=$recorded actual=$actual); torn/tampered certification." >&2
+    return 4
+  fi
+
+  # Tree/file payloads: recompute on-disk content and compare to the certified digest,
+  # BEFORE the trees are consumed by the install restore.
+  for entry in "${lme_tree_payloads[@]}"; do
+    IFS='|' read -r pid ppath preq <<< "$entry"
+    line="$(grep -E "^payload=$pid\|kind=tree\|" "$cert" | head -n1 || true)"
+    if [ -z "$line" ]; then
+      if [ "$preq" = "req" ]; then echo "VERIFY-REFUSED(7): required tree payload '$pid' not certified." >&2; return 7; fi
+      continue
+    fi
+    exp="${line##*content_sha256=}"
+    act="$(lme_content_sha256 "$root/$ppath")" || { echo "VERIFY-REFUSED(5): tree payload '$pid' digest recompute failed." >&2; return 5; }
+    if [ "$exp" != "$act" ]; then
+      echo "VERIFY-REFUSED(5): tree payload '$pid' content mismatch (cert=$exp disk=$act)." >&2
+      return 5
+    fi
+  done
+
+  for entry in "${lme_file_payloads[@]}"; do
+    IFS='|' read -r pid ppath preq <<< "$entry"
+    line="$(grep -E "^payload=$pid\|kind=file\|" "$cert" | head -n1 || true)"
+    if [ -z "$line" ]; then
+      if [ "$preq" = "req" ]; then echo "VERIFY-REFUSED(7): required file payload '$pid' not certified." >&2; return 7; fi
+      continue
+    fi
+    exp="${line##*content_sha256=}"
+    act="$(lme_content_sha256_file "$root/$ppath")" || { echo "VERIFY-REFUSED(5): file payload '$pid' digest recompute failed." >&2; return 5; }
+    if [ "$exp" != "$act" ]; then
+      echo "VERIFY-REFUSED(5): file payload '$pid' content mismatch (cert=$exp disk=$act)." >&2
+      return 5
+    fi
+  done
+
+  # Volume payloads: COMPLETE pre-mutation qualification (codex-0845
+  # D-BACKUP-CERTIFIED-VOLUME-SET-AND-DIGEST-UNBOUND + D-RESTORE-COMPLETE-CONTENT-
+  # QUALIFICATION-AFTER-MUTATION). For every certified volume line: require the data
+  # dir, require the local manifest digest == certified digest (catches a volume+
+  # manifest edited together while the certificate is unchanged), and recompute the
+  # data content digest and require == certified (catches actual data corruption).
+  # Then enforce an EXACT set: reject duplicates and any on-disk volume not certified
+  # (an extra/undeclared member), and a certified volume that is absent (silent shrink).
+  local vroot="$root/$LME_VOLUME_ROOT"
+  local seen=" " name cdig vdata vman mdig ddig d dn
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line#payload=volume:}"; name="${name%%|*}"
+    cdig="${line##*content_sha256=}"
+    if [ -z "$cdig" ]; then echo "VERIFY-REFUSED(6): certified volume '$name' has an empty content_sha256." >&2; return 6; fi
+    case "$seen" in *" $name "*) echo "VERIFY-REFUSED(8): duplicate certified volume '$name'." >&2; return 8;; esac
+    seen="$seen$name "
+    vdata="$vroot/$name/$LME_VOLUME_DATA_DIR"
+    vman="$vroot/$name/$LME_VOLUME_MANIFEST_FILE"
+    if [ ! -d "$vdata" ]; then echo "VERIFY-REFUSED(7): certified volume '$name' missing data dir $vdata." >&2; return 7; fi
+    if [ ! -f "$vman" ]; then echo "VERIFY-REFUSED(7): certified volume '$name' missing manifest $vman." >&2; return 7; fi
+    mdig="$(grep "^${LME_MF_CONTENT}=" "$vman" | head -n1 | cut -d= -f2 || true)"
+    if [ -z "$mdig" ] || [ "$mdig" != "$cdig" ]; then
+      echo "VERIFY-REFUSED(5): volume '$name' manifest digest ($mdig) != certified ($cdig)." >&2; return 5
+    fi
+    ddig="$(lme_content_sha256 "$vdata")" || { echo "VERIFY-REFUSED(5): volume '$name' data digest recompute failed." >&2; return 5; }
+    if [ "$ddig" != "$cdig" ]; then
+      echo "VERIFY-REFUSED(5): volume '$name' data content ($ddig) != certified ($cdig)." >&2; return 5
+    fi
+  done < <(grep -E '^payload=volume:' "$cert" || true)
+
+  if [ -d "$vroot" ]; then
+    local ondisk_voldirs
+    ondisk_voldirs="$( set -o pipefail; find "$vroot" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort )" \
+      || { echo "VERIFY-REFUSED(2): cannot enumerate $vroot" >&2; return 2; }
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      dn="$(basename "$d")"
+      # Do NOT skip a dir that lacks data/: an on-disk volume dir that is not certified
+      # is an extra/undeclared member (a retained/injected volumes/<name> without data/
+      # would otherwise sneak past the gate and be discovered only after install copying).
+      case "$seen" in
+        *" $dn "*) ;;
+        *) echo "VERIFY-REFUSED(8): on-disk volume '$dn' is not in the certification (extra/undeclared or incomplete member)." >&2; return 8;;
+      esac
+    done <<< "$ondisk_voldirs"
+  fi
+
+  echo "Bundle certification OK: $cert"
+  return 0
+}
+{%- endmacro -%}
+{{ lme_integrity_library(lme_backup_integrity) }}

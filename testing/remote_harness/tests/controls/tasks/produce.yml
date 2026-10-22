@@ -1,0 +1,148 @@
+---
+# one route producer call (step `produce`; increment 2 -- codex 230249 (a), codex 231744 option (a)). G calls the ROUTE's
+# own producer IN PROCESS (vocabulary.producer_tasks: fixture_bundle.yml | fixture_checkout.yml | admit_bundle.yml under
+# rh_repo_root, the canonical run checkout; route-owned and pinned) and judges the call with controls.j2 judge_produce:
+#   produced: true         the call succeeded and published a NEW result naming this step's own case / destination / clone
+#   produce_refused: CODE  the call failed at EXACTLY produce_task (the leaf task, never an include), its message starts
+#                          'REFUSED CODE' and carries every produce_msg_has string, produce_only_component names the ONE
+#                          offending component of an ancestry refusal, and the producer's result fact is UNCHANGED
+# The call's shape, the class binding and the confinement are asserted OUTSIDE the block: a malformed call is a runner
+# error (variant.yml rescue), never a producer refusal. The producer's shared result facts (rh_fx_result; rh_bundle for
+# admit) are read right before and right after the call; G copies the outcome into _rhc_prod at once (the producer's fact
+# names are shared with every other producer call).
+# Class binding (bundle / admit): the key is C1's published controller class key
+# lme_resolved.remote_harness.scopes.controller[per_class.key_field] (never read from a bundle.json), the policy that
+# scope's own resolved policy (its policy_sha256 == rh_config_revision), the lock that policy's lock_file_rel -- the same
+# derivation as scope_classes.yml / pack_class.yml. Dependency bundle_a_class (tasks/prepare.yml) queues the control
+# when the runner's resolve does not carry it.
+
+- name: "Admit the producer call of {{ rhc_s.id }} (declared shape, confinement, class binding; a runner error otherwise)"
+  vars:
+    _p: "{{ _rhc_step.produce }}"
+    _pk: {bundle: [case, dest, src, task], checkout: [case, clone, ctl, task], admit: [dir, task]}
+    _ex: "{{ _rhc_step.expect | default({}) }}"
+    _paths: >-
+      {{ ([_p.src, _p.dest] if _p.task == 'bundle' else ([_p.clone, _p.ctl] if _p.task == 'checkout' else [_p.dir])) if _p is mapping and _p.task is defined else [] }}
+    _s: "{{ lme_resolved.remote_harness.scopes | default(none) }}"
+    _pc: "{{ rh.controller.bootstrap.bundle.per_class }}"
+  ansible.builtin.assert:
+    that:
+      - _p is mapping
+      - _p.task | default('') in rhc_decl.vocabulary.producer_tasks
+      - _p.task | default('') in _pk
+      - (_p | list | sort) == _pk[_p.task]
+      - _paths | length > 0
+      - _paths | reject('string') | list | length == 0
+      - _paths | reject('match', (rhc_run_dir | regex_escape) ~ '/') | list | length == 0
+      - _paths | select('search', '(^|/)\.\.(/|$)') | list | length == 0
+      - (_ex.produced | default(false)) != (_ex.produce_refused is defined)
+      - _ex.produce_refused is not defined or _ex.produce_task is defined
+      - _p.task != 'checkout' or (_p.clone == _p.ctl ~ '/vclone' and _p.clone == _rhc_t.vclone and _p.ctl == _rhc_t.vctl)
+      - >-
+        _p.task == 'checkout' or (_s is mapping and (_s.controller | default(none)) is mapping
+        and (_s.controller[_pc.key_field] | default('')) is match(_pc.key_regex)
+        and (_s.controller.policy_sha256 | default('')) == rh_config_revision and (_s.controller.policy | default(none)) is mapping)
+    fail_msg: >-
+      RHC-PRODUCE: step {{ rhc_s.id }} produce {{ _rhc_step.produce | to_json }} is not a declared producer call (task in
+      vocabulary.producer_tasks with exactly its keys, every path inside {{ rhc_run_dir }}, exactly one of produced /
+      produce_refused, a refusal naming produce_task, a checkout on this variant's own {vctl}/vclone, and for bundle / admit
+      the controller class bound from lme_resolved.remote_harness.scopes.controller)
+    quiet: true
+
+- name: "Bind the producer call of {{ rhc_s.id }} (class key / policy / lock for bundle and admit; the result fact before)"
+  vars:
+    _p: "{{ _rhc_step.produce }}"
+    _pc: "{{ rh.controller.bootstrap.bundle.per_class }}"
+  ansible.builtin.set_fact:
+    _rhc_prod_cls: >-
+      {{ {} if _p.task == 'checkout' else
+         {'key': lme_resolved.remote_harness.scopes.controller[_pc.key_field],
+          'policy': lme_resolved.remote_harness.scopes.controller.policy,
+          'lock': lookup('ansible.builtin.file', rh_repo_root ~ '/' ~ lme_resolved.remote_harness.scopes.controller.policy.controller.lock_file_rel) | from_yaml} }}
+    _rhc_prod_before: "{{ (rh_bundle | default(none)) if _p.task == 'admit' else (rh_fx_result | default(none)) }}"
+    _rhc_prod_sentinel:
+      schema: rhc-produce-sentinel/1
+      step: "{{ rhc_s.id }}"
+      nonce: "{{ (rhc_run_dir ~ '|' ~ rhc_s.id ~ '|' ~ now(utc=true).isoformat()) | hash('sha256') }}"
+    _rhc_prod: {}
+
+# G-ADMIT-FRESHNESS (codex tick297 003441): the producer's shared result fact is replaced by a runner-owned INVALID sentinel
+# right before the call, so "published during THIS call" is observable (after != sentinel) -- a stale fact of an earlier
+# call with the same dir is never evidence, while an identical fresh re-admission is. The prior value is kept separately
+# (_rhc_prod_before, logged as evidence) and restored after the call when nothing was published; a refusal is judged on
+# the sentinel remaining. The class derivation and the producers are unchanged.
+- name: "Plant the runner sentinel in rh_bundle before the admission call of {{ rhc_s.id }}"
+  ansible.builtin.set_fact:
+    rh_bundle: "{{ _rhc_prod_sentinel }}"
+  when: _rhc_step.produce.task == 'admit'
+
+- name: "Plant the runner sentinel in rh_fx_result before the producer call of {{ rhc_s.id }}"
+  ansible.builtin.set_fact:
+    rh_fx_result: "{{ _rhc_prod_sentinel }}"
+  when: _rhc_step.produce.task != 'admit'
+
+- name: "Produce {{ rhc_s.id }}"
+  block:
+    - name: "Call the route bundle producer (tasks/fixture_bundle.yml)"
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/{{ rhc_decl.vocabulary.producer_tasks.bundle }}"
+      vars:
+        rh_fx_src: "{{ _rhc_step.produce.src }}"
+        rh_fx_dest: "{{ _rhc_step.produce.dest }}"
+        rh_fx_case: "{{ _rhc_step.produce.case }}"
+        rh_fx_key: "{{ _rhc_prod_cls.key }}"
+        rh_fx_policy: "{{ _rhc_prod_cls.policy }}"
+        rh_fx_lock: "{{ _rhc_prod_cls.lock }}"
+      when: _rhc_step.produce.task == 'bundle'
+
+    - name: "Call the route checkout producer (tasks/fixture_checkout.yml; the Route 3 record of THIS variant's clone)"
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/{{ rhc_decl.vocabulary.producer_tasks.checkout }}"
+      vars:
+        rh_fx_clone: "{{ _rhc_step.produce.clone }}"
+        rh_fx_route3: {ctl: "{{ _rhc_step.produce.ctl }}", vclone: "{{ _rhc_step.produce.clone }}", head: "{{ _rhc_t.head }}"}
+        rh_fx_case: "{{ _rhc_step.produce.case }}"
+      when: _rhc_step.produce.task == 'checkout'
+
+    - name: "Call the route bundle admission (tasks/admit_bundle.yml)"
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/{{ rhc_decl.vocabulary.producer_tasks.admit }}"
+      vars:
+        rh_admit_dir: "{{ _rhc_step.produce.dir }}"
+        rh_admit_key: "{{ _rhc_prod_cls.key }}"
+        rh_admit_policy: "{{ _rhc_prod_cls.policy }}"
+        rh_admit_lock: "{{ _rhc_prod_cls.lock }}"
+      when: _rhc_step.produce.task == 'admit'
+
+    - name: The producer returned
+      ansible.builtin.set_fact:
+        _rhc_prod: {ok: true, task: '', msg: ''}
+
+  rescue:
+    - name: The producer (or its include) failed -- keep the LEAF task and its message for the judge
+      ansible.builtin.set_fact:
+        _rhc_prod: {ok: false, task: "{{ ansible_failed_task.name | default('?') }}", msg: "{{ ansible_failed_result.msg | default('') | string }}"}
+
+- name: "Judge the producer call of {{ rhc_s.id }} (controls.j2 judge_produce)"
+  vars:
+    _p: "{{ _rhc_step.produce }}"
+    _prod: >-
+      {{ _rhc_prod | combine({'before': _rhc_prod_before, 'sentinel': _rhc_prod_sentinel,
+                              'after': (rh_bundle | default(none)) if _p.task == 'admit' else (rh_fx_result | default(none))}) }}
+    _want: >-
+      {{ {'kind': _p.task, 'case': _p.case | default(''), 'dest': _p.dest | default(''), 'clone': _p.clone | default(''),
+          'head': _rhc_t.head, 'dir': _p.dir | default('')} }}
+    _r: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'judge_produce', 'args': [_rhc_step.expect, _prod, _want]}}) | from_json }}"
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + (_r | map('regex_replace', '^', rhc_s.id ~ ': ') | list) }}"
+    _rhc_log: >-
+      {{ _rhc_log + [{'step': rhc_s.id, 'produce': _p, 'ok': _prod.ok, 'task': _prod.task, 'msg': (_prod.msg | string)[:2000],
+                      'result': _prod.after if _prod.ok else none, 'judgement': _r,
+                      'published': _prod.after != _prod.sentinel, 'prior': _prod.before, 'sentinel': _prod.sentinel}] }}
+
+- name: "Restore the prior rh_bundle when the admission call of {{ rhc_s.id }} published nothing (the sentinel never outlives the call)"
+  ansible.builtin.set_fact:
+    rh_bundle: "{{ _rhc_prod_before }}"
+  when: _rhc_step.produce.task == 'admit' and (rh_bundle | default(none)) == _rhc_prod_sentinel
+
+- name: "Restore the prior rh_fx_result when the producer call of {{ rhc_s.id }} published nothing"
+  ansible.builtin.set_fact:
+    rh_fx_result: "{{ _rhc_prod_before }}"
+  when: _rhc_step.produce.task != 'admit' and (rh_fx_result | default(none)) == _rhc_prod_sentinel

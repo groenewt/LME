@@ -1,0 +1,150 @@
+{% macro bounded_byte_length(sc) -%}
+BEGIN { count = {{ sc.zero }} }
+{ count += length(${{ sc.zero }}); if (NR > {{ sc.byte_count.maximum_rows }} || count > {{ sc.byte_count.bound_parameter }}) exit {{ sc.statuses.refused }} }
+END { if (NR > {{ sc.byte_count.maximum_rows }} || count > {{ sc.byte_count.bound_parameter }}) exit {{ sc.statuses.refused }}; printf {{ sc.formats.text | to_json }}, count }
+{%- endmacro %}
+{% macro staging_creation(bs, wb, effect, operation, witness, source_path, target_path) -%}
+{%- set sc = wb.obligations.staging_creation -%}
+{%- set tool = bs.os_tools -%}
+{%- set ok = sc.statuses.success -%}
+{%- set refuse = sc.statuses.refused -%}
+{%- set q = sc.json.quote -%}
+{%- set fields = sc.identity_fields + (sc.witness_fields | list) -%}
+{%- set emitted = namespace(parts=[], args=[]) -%}
+{%- if operation == sc.operations.create -%}
+{%- for key in fields | sort(case_sensitive=bs.path_admission.case_sensitive) -%}
+  {%- set emitted.parts = emitted.parts + [q ~ key ~ q ~ sc.json.key_separator ~ q ~ sc.json.slot ~ q] -%}
+  {%- if key in sc.identity_fields -%}
+    {%- set emitted.args = emitted.args + [effect.lease_identity[key] | quote] -%}
+  {%- else -%}
+    {%- set emitted.args = emitted.args + ['"$w_' ~ sc.witness_fields[key] ~ '"'] -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- endif %}
+read_meta() {
+    meta=$({{ tool.stat.path | quote }} {{ sc.lstat_args | map('quote') | join(' ') }} "$1")
+    meta_rc=$?
+    [ "$meta_rc" = {{ ok | string | quote }} ] || return {{ refuse }}
+    set -f
+    IFS={{ sc.formats.field_separator | quote }}
+    set -- $meta
+    [ "$#" -ge {{ sc.lstat_fields | length }} ] || return {{ refuse }}
+    m_size=$1; shift
+    m_perms=$1; shift
+    m_uid=$1; shift
+    m_inode=$1; shift
+    m_dev=$1; shift
+    m_type="$*"
+}
+byte_length() {
+    printf {{ sc.formats.text | quote }} "$1" | LC_ALL={{ sc.byte_count.locale | quote }} {{ tool.awk.path | quote }} {{ sc.byte_count.variable_arg | quote }} "{{ sc.byte_count.bound_parameter }}=$2" {{ bounded_byte_length(sc) | quote }}
+}
+refuse() { exit {{ refuse }}; }
+{% if operation == sc.operations.create %}
+read_meta {{ effect.record_path | quote }} || refuse
+[ "$m_uid" = {{ effect.uid | string | quote }} ] || refuse
+[ "$m_perms" = {{ sc.lease_mode_perms | quote }} ] || refuse
+case "$m_type" in {% for v in sc.regular_types %}{{ v | quote }}{% if not loop.last %}|{% endif %}{% endfor %}) ;; *) refuse ;; esac
+record_digest=$({{ tool.sha256sum.path | quote }} {{ sc.digest_args | map('quote') | join(' ') }} {{ effect.record_path | quote }}) || refuse
+[ "${record_digest%% *}" = {{ effect.record_sha256 | quote }} ] || refuse
+read_meta {{ effect.destination | dirname | quote }} || refuse
+[ "$m_type" = {{ sc.directory_type | quote }} ] || refuse
+parent_dev=$m_dev
+{% set record = effect.record_text | from_json %}
+{% set rf = wb.obligations.record_fields %}
+case "$parent_dev" in
+{% for dev, size in record[rf.destination_lease_encoded_bytes].items() %}
+{{ dev | quote }}) [ {{ size }} -ge {{ effect.destination_lease_encoded_bytes }} ] || refuse ;;
+{% endfor %}
+*) refuse ;;
+esac
+[ ! -e {{ effect.lease_path | quote }} ] && [ ! -L {{ effect.lease_path | quote }} ] || refuse
+{{ tool.mkdir.path | quote }} {{ sc.mkdir_args | map('quote') | join(' ') }} {{ effect.staging | quote }}
+mkdir_rc=$?
+[ "$mkdir_rc" = {{ ok | string | quote }} ] || refuse
+read_meta {{ effect.staging | quote }} || refuse
+[ "$m_uid" = {{ effect.uid | string | quote }} ] || refuse
+[ "$m_perms" = {{ sc.staging_mode_perms | quote }} ] || refuse
+[ "$m_type" = {{ sc.directory_type | quote }} ] || refuse
+[ "$m_dev" = "$parent_dev" ] || refuse
+created_dev=$m_dev; created_inode=$m_inode; created_uid=$m_uid; created_perms=$m_perms; created_type=$m_type
+{% for rel in effect.inner_dirs %}
+{{ tool.mkdir.path | quote }} {{ sc.mkdir_args | map('quote') | join(' ') }} {{ (effect.staging ~ bs.path_admission.separator ~ rel) | quote }} || refuse
+{% endfor %}
+read_meta {{ effect.staging | quote }} || refuse
+[ "$m_dev" = "$created_dev" ] && [ "$m_inode" = "$created_inode" ] && [ "$m_uid" = "$created_uid" ] && [ "$m_perms" = "$created_perms" ] && [ "$m_type" = "$created_type" ] || refuse
+[ "$m_uid" = {{ effect.uid | string | quote }} ] || refuse
+[ "$m_perms" = {{ sc.staging_mode_perms | quote }} ] || refuse
+[ "$m_type" = {{ sc.directory_type | quote }} ] || refuse
+[ "$m_dev" = "$parent_dev" ] || refuse
+inode_length=$(byte_length "$m_inode" {{ sc.integer_decimal_max_digits }}) || refuse
+[ "$inode_length" -le {{ sc.integer_decimal_max_digits }} ] || refuse
+w_dev=$m_dev; w_inode=$m_inode; w_uid=$m_uid; w_perms=$m_perms; w_type=$m_type
+w_path={{ effect.staging | quote }}
+lease_text=$(printf {{ (sc.json.object_open ~ (emitted.parts | join(sc.json.item_separator)) ~ sc.json.object_close) | quote }} {{ emitted.args | join(' ') }}) || refuse
+lease_length=$(byte_length "$lease_text" {{ effect.destination_lease_encoded_bytes }}) || refuse
+[ "$lease_length" -le {{ effect.destination_lease_encoded_bytes }} ] || refuse
+umask {{ sc.umask | quote }}
+set -C
+printf {{ sc.formats.text | quote }} "$lease_text" > {{ effect.lease_temp_path | quote }} || refuse
+set +C
+{{ tool.chmod.path | quote }} {{ sc.chmod_args | map('quote') | join(' ') }} {{ effect.lease_temp_path | quote }} || refuse
+read_meta {{ effect.lease_temp_path | quote }} || refuse
+[ "$m_dev" = "$parent_dev" ] || refuse
+[ "$m_uid" = {{ effect.uid | string | quote }} ] || refuse
+[ "$m_perms" = {{ sc.lease_mode_perms | quote }} ] || refuse
+case "$m_type" in {% for v in sc.regular_types %}{{ v | quote }}{% if not loop.last %}|{% endif %}{% endfor %}) ;; *) refuse ;; esac
+[ "$m_size" = "$lease_length" ] || refuse
+[ "$m_size" -le {{ effect.destination_lease_encoded_bytes }} ] || refuse
+{{ tool.sync.path | quote }} {{ sc.sync_args | map('quote') | join(' ') }} {{ effect.lease_temp_path | quote }} || refuse
+lease_inode=$m_inode; lease_dev=$m_dev; lease_size=$m_size
+lease_digest=$({{ tool.sha256sum.path | quote }} {{ sc.digest_args | map('quote') | join(' ') }} {{ effect.lease_temp_path | quote }}) || refuse
+lease_digest=${lease_digest%% *}
+[ ! -e {{ effect.lease_path | quote }} ] && [ ! -L {{ effect.lease_path | quote }} ] || refuse
+{{ tool.mv.path | quote }} {{ sc.rename_args | map('quote') | join(' ') }} {{ effect.lease_temp_path | quote }} {{ effect.lease_path | quote }} || refuse
+[ ! -e {{ effect.lease_temp_path | quote }} ] && [ ! -L {{ effect.lease_temp_path | quote }} ] || refuse
+read_meta {{ effect.lease_path | quote }} || refuse
+[ "$m_dev" = "$lease_dev" ] && [ "$m_inode" = "$lease_inode" ] && [ "$m_size" = "$lease_size" ] || refuse
+[ "$m_uid" = {{ effect.uid | string | quote }} ] && [ "$m_perms" = {{ sc.lease_mode_perms | quote }} ] || refuse
+final_digest=$({{ tool.sha256sum.path | quote }} {{ sc.digest_args | map('quote') | join(' ') }} {{ effect.lease_path | quote }}) || refuse
+[ "${final_digest%% *}" = "$lease_digest" ] || refuse
+read_meta {{ effect.staging | quote }} || refuse
+[ "$m_dev" = "$w_dev" ] && [ "$m_inode" = "$w_inode" ] && [ "$m_uid" = "$w_uid" ] && [ "$m_perms" = "$w_perms" ] && [ "$m_type" = "$w_type" ] || refuse
+record_digest=$({{ tool.sha256sum.path | quote }} {{ sc.digest_args | map('quote') | join(' ') }} {{ effect.record_path | quote }}) || refuse
+[ "${record_digest%% *}" = {{ effect.record_sha256 | quote }} ] || refuse
+{{ tool.sync.path | quote }} {{ sc.sync_args | map('quote') | join(' ') }} {{ effect.destination | dirname | quote }} || refuse
+printf {{ sc.formats.text | quote }} {{ sc.output.created | quote }}
+{% elif operation == sc.operations.remove_lease %}
+read_meta {{ source_path | quote }} || refuse
+[ "$m_uid" = {{ effect.uid | string | quote }} ] && [ "$m_perms" = {{ sc.lease_mode_perms | quote }} ] || refuse
+case "$m_type" in {% for v in sc.regular_types %}{{ v | quote }}{% if not loop.last %}|{% endif %}{% endfor %}) ;; *) refuse ;; esac
+lease_digest=$({{ tool.sha256sum.path | quote }} {{ sc.digest_args | map('quote') | join(' ') }} {{ source_path | quote }}) || refuse
+[ "${lease_digest%% *}" = {{ effect.lease_sha256 | quote }} ] || refuse
+{{ tool.rm.path | quote }} {{ sc.remove_lease_args | map('quote') | join(' ') }} {{ source_path | quote }} || refuse
+[ ! -e {{ source_path | quote }} ] && [ ! -L {{ source_path | quote }} ] || refuse
+{{ tool.sync.path | quote }} {{ sc.sync_args | map('quote') | join(' ') }} {{ source_path | dirname | quote }} || refuse
+printf {{ sc.formats.text | quote }} {{ wb.obligations.registry_applicability.observation_boundary.reobserve_then_mutate_one_command.outcomes.removed.stdout | quote }}
+{% elif operation in [sc.operations.relocate, sc.operations.remove] %}
+read_meta {{ source_path | quote }} || refuse
+[ "$m_dev" = {{ witness.staging_dev | quote }} ] && [ "$m_inode" = {{ witness.staging_inode | quote }} ] || refuse
+[ "$m_uid" = {{ witness.staging_uid | quote }} ] && [ "$m_perms" = {{ witness.staging_perms | quote }} ] || refuse
+[ "$m_type" = {{ witness.staging_type | quote }} ] && [ "$m_type" = {{ sc.directory_type | quote }} ] || refuse
+{% if operation == sc.operations.relocate %}
+[ ! -e {{ target_path | quote }} ] && [ ! -L {{ target_path | quote }} ] || refuse
+{{ tool.mv.path | quote }} {{ sc.rename_args | map('quote') | join(' ') }} {{ source_path | quote }} {{ target_path | quote }} || refuse
+[ ! -e {{ source_path | quote }} ] && [ ! -L {{ source_path | quote }} ] || refuse
+read_meta {{ target_path | quote }} || refuse
+[ "$m_dev" = {{ witness.staging_dev | quote }} ] && [ "$m_inode" = {{ witness.staging_inode | quote }} ] || refuse
+{{ tool.sync.path | quote }} {{ sc.sync_args | map('quote') | join(' ') }} {{ source_path | dirname | quote }} || refuse
+printf {{ sc.formats.text | quote }} {{ sc.output.relocated | quote }}
+{% else %}
+{{ tool.rm.path | quote }} {{ sc.remove_args | map('quote') | join(' ') }} {{ source_path | quote }} || refuse
+[ ! -e {{ source_path | quote }} ] && [ ! -L {{ source_path | quote }} ] || refuse
+{{ tool.sync.path | quote }} {{ sc.sync_args | map('quote') | join(' ') }} {{ source_path | dirname | quote }} || refuse
+printf {{ sc.formats.text | quote }} {{ sc.output.removed | quote }}
+{% endif %}
+{% else %}
+refuse
+{% endif %}
+{%- endmacro %}
+{{ staging_creation(rh_sc_bs, rh_sc_wb, rh_sc_effect, rh_sc_operation, rh_sc_witness, rh_sc_source_path, rh_sc_target_path) }}

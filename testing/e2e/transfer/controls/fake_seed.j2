@@ -1,0 +1,37 @@
+#!/bin/bash
+# TEST DOUBLE of the route's executor entrypoint (<bundle>/<bundle.seed_file> run), for the GATE cases only. It is
+# rendered at <case>/bundle/<bundle.seed_file>, beside the route-rendered launcher (<bundle.launcher_file>) that execs it.
+# It tests deploy_gate's consumption of the executor: exact argv, the rc, and the declared outputs. It is NOT a
+# receipt check; the real seed and receipt verification are the integration cases, applied by MAIN.
+# It logs its argv (one line, %q-quoted words) and then acts per the case's declared mode for the named playbook:
+#   contract: ok | refuse     transfer: ok | rc0_no_receipt | refuse
+printf '%q ' "$@" >> {{ cd }}/seed.calls; printf '\n' >> {{ cd }}/seed.calls
+{% if case.gate.record_env | default(false) %}
+# C27 (argv/environment-construction proof only): record the EXACT initial environment the launcher exec'd this
+# process with (/proc/self/environ: NUL-separated, launch order), one NAME=value per line, then the ordered name list.
+_n=''; while IFS= read -r -d '' _e; do printf '%s\n' "$_e" >> {{ cd }}/seed.env; _n="$_n ${_e%%=*}"; done < /proc/self/environ
+printf 'ENVNAMES%s END\n' "$_n" >> {{ cd }}/seed.env
+{% endif %}
+# It is started by route's generated launcher, whose env -i passes no LME_* name: the state dir, like the label, is
+# read from the argv word the real seed receives (lme_transfer_state_dir=...), never from the environment.
+label=""; pb=""; sd=""
+for a in "$@"; do
+  case "$a" in
+    lme_transfer_label=*) label="${a#lme_transfer_label=}";;
+    lme_transfer_state_dir=*) sd="${a#lme_transfer_state_dir=}";;
+    */resolve_target.yml|*/transfer.yml) pb="${a##*/}";;
+  esac
+done
+[ -n "$sd" ] || { echo "fake seed: no lme_transfer_state_dir word in its argv"; exit 98; }
+out="$sd/{{ T.outputs.prefix }}$label"
+case "$pb:{{ case.gate.contract | default('ok') }}:{{ case.gate.transfer | default('ok') }}" in
+  resolve_target.yml:ok:*)
+    printf '%s\n' {{ cd }}/fake_ssh root@{{ case.gate.host }} > "$out{{ T.outputs.ssh_argv }}"
+    printf '%s\n' {{ case.gate.contract_identity | quote }} > "$out{{ T.outputs.machine_id }}"
+    exit 0;;
+  resolve_target.yml:refuse:*) echo "TRANSFER-CONTRACT-CONFLICT (fake)"; exit 2;;
+  transfer.yml:*:ok) printf '{"schema":"fake"}\n' > "$out{{ T.outputs.transfer_receipt }}"; exit 0;;
+  transfer.yml:*:rc0_no_receipt) exit 0;;
+  transfer.yml:*:refuse) echo "TRANSFER-TARGET-DEPENDENCY (fake)"; exit 2;;
+esac
+echo "fake seed: unexpected playbook $pb"; exit 99

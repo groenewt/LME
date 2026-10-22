@@ -1,0 +1,169 @@
+---
+# =============================================================================
+# backup_lme/vars/integrity.yml -- CANONICAL DECLARATION of the backup-bundle
+# integrity contract (payload classes + manifest fields). This is DATA, not
+# logic: the reusable macro template roles/backup_lme/templates/content_integrity.sh.j2
+# renders BOTH the producer and the recovery verifier from this single source, so
+# the backup-side digest and the restore-side check can never drift.
+#
+# This is the concrete CONSUMER that
+#   config/postgresql-platform/recovery-semantics.contract.yaml
+# names for RESTORE-CONTENT-DIGEST and BACKUP-MANIFEST-CERTIFICATION (codex-0700
+# D-RECOVERY-CONTRACT-NOT-EXECUTION-AUTHORITY: the contract is a requirements
+# record, THIS declaration + the rendered macro + the bound restore tasks are the
+# enforcement).
+#
+# Loaded on BOTH sides:
+#   * backup_lme role tasks/main.yml -> include_vars: integrity.yml (producer)
+#   * ansible/restore_lme_master.yml -> include_vars: roles/backup_lme/vars/integrity.yml (verifier)
+#
+# NO SECRET VALUES: only structural declarations. Secret payloads are digested as
+# CIPHERTEXT file bytes (the vault-encrypted files under secrets/ and
+# etc_lme/vault/); plaintext is never read or digested here.
+# =============================================================================
+
+lme_backup_integrity:
+  schema: 1
+
+  # Field NAMES the per-volume content_manifest.txt records, ROLE-KEYED so BOTH the
+  # writer (lme_write_content_manifest) and the reader (lme_verify_content_manifest,
+  # rendered into the restore consumer) take the SAME names from HERE -- the manifest
+  # field names are no longer hardcoded twice across the producer and the restore path
+  # (codex-0845/0915 D-BACKUP-DECLARATION-TEMPLATE-RESTORE-DIVERGENCE). The library
+  # exports these as LME_MF_COUNT/_BYTES/_LISTING/_CONTENT. `content` is the NON-VACUOUS
+  # digest (codex-0700 RESTORE-CONTENT-DIGEST: "volume digest excludes file contents");
+  # `listing` (paths+sizes only) is RETAINED for info but is NOT sufficient and NOT a
+  # fallback -- a manifest missing the content field is REFUSED, never accepted on
+  # listing alone (fail_closed_invariants.no-ignore-integrity-switch).
+  manifest_fields:
+    count: file_count
+    bytes: total_bytes
+    listing: listing_sha256
+    content: content_sha256
+
+  # SCOPE of the content-digest label (codex-0845 additional_integrity_limits,
+  # recorded honestly, NOT silently claimed): content_sha256 binds relative path +
+  # regular-file CONTENT bytes + symlink target. It does NOT bind POSIX permission
+  # bits, owner/group, directory metadata, ACLs or xattrs. Those are OUT of the
+  # "content" claim; a restore that must preserve mode/owner relies on cp_preserve_cmd
+  # (cp -a / rsync -a), not on this digest. Do not read this digest as a full
+  # filesystem-metadata seal.
+  digest_covers: [relative_path, regular_file_content, symlink_target]
+  digest_excludes: [mode_bits, owner, group, dir_metadata, acl, xattr]
+
+  # Declaration-driven volume layout (codex-0845 D-BACKUP-DECLARATION-TEMPLATE-
+  # RESTORE-DIVERGENCE): the producer AND the restore verifier both consume these
+  # names from HERE (the rendered library exports them as LME_VOLUME_DATA_DIR /
+  # LME_VOLUME_MANIFEST_FILE), so changing a name here relocates the mechanism on
+  # both sides instead of being hardcoded in two places.
+  volume_layout:
+    root_dir: volumes                    # <backup>/<root_dir>/<name>/...
+    data_dir: data                       # <root_dir>/<name>/<data_dir>
+    manifest_file: content_manifest.txt  # <root_dir>/<name>/<manifest_file>
+
+  # Topology-classification signals (codex-1015 D-RESTORE-TOPOLOGY-DECLARATION-DIVERGENCE +
+  # D-RESTORE-UNKNOWN-TOPOLOGY-ENABLES-DESTRUCTIVE-RESTORE): the restore topology probe
+  # STEERS the DESTRUCTIVE ES-volume decision, so the signals it reads are DECLARED HERE (the
+  # rendered library exports them as LME_TOPO_*) instead of being hardcoded in the restore
+  # shell. quadlet_payload_id names WHICH certified payload tree carries the elasticsearch
+  # quadlet, and quadlet_relpath is the path WITHIN that tree -- both DECLARED so a portable/
+  # relocated archive changes them HERE, not in the consumer. note_payload_id references the
+  # cluster_recovery_note payload above (its on-disk path is derived from payload_classes, not
+  # restated). require_affirmative_evidence makes a MISSING/ambiguous quadlet fail closed: the
+  # probe returns 'unknown' and the restore decision REFUSES rather than defaulting to a
+  # destructive ES-volume restore (see restore_lme_master.yml "Resolve restore_es_volumes").
+  # PORTABILITY: the etc_containers_systemd default is D's current single-host layout; a
+  # portable cluster-tarball archive contract is routed to B (do NOT read this as a permanent
+  # layout assumption).
+  topology_classification:
+    quadlet_payload_id: etc_containers_systemd
+    quadlet_relpath: lme-elasticsearch.container
+    single_node_marker: 'discovery.type=single-node'
+    note_payload_id: cluster_recovery_note
+    require_affirmative_evidence: true
+
+  certification:
+    # Written by the producer AFTER every payload is produced; verified by the
+    # restore entry point BEFORE the first destructive step.
+    bundle_file: bundle_certification.txt
+    self_digest_field: bundle_sha256
+    # SELF-CONSISTENCY ONLY (codex advisor): bundle_sha256 binds the recorded
+    # per-payload content digests together, so a TORN or accidentally TRUNCATED
+    # certification is detected. It does NOT resist an adversary who deletes a
+    # payload line and recomputes bundle_sha256 (under-declaration). That needs an
+    # EXTERNAL anchor -- see completeness_anchor / signature below. Hence
+    # BACKUP-MANIFEST-CERTIFICATION is PARTIAL, not closed.
+    completeness_anchor:
+      status: OPEN
+      # The complete EXPECTED owned payload set is not derivable inside the
+      # restore entry point today (lme_resolved is NOT in scope in
+      # restore_lme_master.yml -- verified). Routed, not invented here:
+      routed_to:
+        - "C1: project the expected owned secret/material set into lme_resolved so restore can check completeness, not just self-consistency"
+        - "B: record bundle_sha256 in the operational ledger as an out-of-bundle anchor"
+    signature:
+      # UNWIRED defense-in-depth: an authenticity signature over bundle_sha256 via
+      # C's guardian signing primitive (guardian_signing_interface). Absent the
+      # guardian AUTHORITY SERVICE (fail-closed / UNSTARTABLE per
+      # fencing-protocol.contract.yaml), this layer stays UNWIRED. Its ABSENCE is
+      # NOT a pass and NOT this-wave's gate -- the enforceable-now gate is the
+      # content-digest + self-consistency check below.
+      status: UNWIRED
+      consumes: ansible/roles/secrets_distribution/vars/guardian_custody.yml#guardian_signing_interface
+      over: bundle_sha256
+
+  # Payload classes the certification covers. Order is irrelevant (the producer
+  # and verifier both sort). kind drives how the digest is computed:
+  #   tree        -> content digest over a directory subtree (files + symlinks)
+  #   file        -> content digest over a single file
+  #   volume_data -> per-volume data/ dir; actual data recompute happens at the
+  #                  existing per-volume restore task (before volume rm), the
+  #                  bundle only binds the recorded digest.
+  payload_classes:
+    - id: lme
+      kind: tree
+      path: lme
+      verified_before: install          # trees are consumed by the install restore
+    - id: etc_lme
+      kind: tree
+      path: etc_lme                      # includes vault/ CIPHERTEXT
+      verified_before: install
+    - id: etc_containers_systemd
+      kind: tree
+      path: etc_containers_systemd
+      verified_before: install
+    - id: etc_systemd_system_lme
+      kind: tree
+      path: etc_systemd_system_lme
+      optional: true                     # absent on hosts with no host units
+      verified_before: install
+    - id: secrets
+      kind: tree
+      path: secrets                      # captured ansible-vault CIPHERTEXT payloads
+      optional: true
+      verified_before: install
+    - id: secret_manifest
+      kind: file
+      path: secret_manifest.txt
+      optional: true                     # legacy bundles carry only secret_mapping.txt
+      verified_before: secrets_restore
+    - id: secret_mapping
+      kind: file
+      path: secret_mapping.txt
+      optional: true
+      verified_before: secrets_restore
+    - id: cluster_recovery_note
+      kind: file
+      path: cluster_recovery_note.txt
+      # Present ONLY on cluster-mode backups (backup_lme writes it under
+      # when: lme_backup_is_cluster_install). It STEERS the destructive ES-volume restore
+      # decision, so it must be CERTIFIED before use (codex-0930
+      # D-RESTORE-UNCERTIFIED-CLASSIFICATION-INPUTS): binding it here makes its content part
+      # of the certificate, and the restore topology probe additionally REFUSES a present-but-
+      # uncertified note or one that disagrees with the certified elasticsearch quadlet.
+      optional: true
+      verified_before: classify
+    - id: volumes
+      kind: volume_data
+      path: volumes                      # each volumes/<name>/data has its own content_manifest
+      verified_before: volume_restore

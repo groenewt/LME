@@ -31,8 +31,10 @@
 ### SEC-CRIT: Dashboard/Log Analyzer no auth
 Both respond to unauthenticated `/api/health`. Network-accessible information disclosure.
 
-### SEC-HIGH: LiteLLM static master_key
-Hardcoded `sk-lme-llama-proxy` in config file.
+### SEC-HIGH: LiteLLM static master_key  — RESOLVED
+Was: hardcoded `sk-lme-llama-proxy` in config file. Now a per-install random Podman
+secret (`litellm_master_key`), read as `master_key: os.environ/LITELLM_MASTER_KEY`;
+proxy binds loopback by default.
 
 ### TS-01: Only 10 containers (timing bug)
 One container fails to start — this is the bug `cbaxley-fix-quadlet-timing` was created to fix.

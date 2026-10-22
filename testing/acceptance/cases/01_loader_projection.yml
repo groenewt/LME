@@ -1,0 +1,109 @@
+# testing/acceptance/cases/01_loader_projection.yml
+#
+# F1 -- projection readback acceptance through the REAL load_manifests.yml caller.
+# load_manifests.yml runs end-to-end standalone from the HEAD snapshot: it composes
+# lme_services from the manifest tree, accumulates lme_host_rendered_services, and
+# derives the required_material / datastore / membership projections, then merges
+# them into the single canonical lme_resolved and runs the complete-revision rebind
+# + read-back guard. On the CURRENT manifest set 0/29 services declare
+# material_requirements, so required_material_status.<node>.<svc>.status=undeclared
+# for every selected CONTAINER service (visible debt, not hidden-empty).
+#
+# Structure discovered from the no-pin control at HEAD (mutation-free, changed=0):
+#   required_material_status.localhost covers the enabled container services incl.
+#   elasticsearch, kibana, fleet-server, dashboard, log-analyzer, litellm, ...
+# The RED case asserts a FAITHFUL DERIVATION (that container set is covered), which
+# survives the pin only if the projection is truly recomputed -- not if it is read
+# back from the overridable intermediate.
+#
+# NB (codex-0900): membership defaults to None and datastore may be empty on this
+# manifest set, so an `{}` pin on _lme_membership_proj / _lme_datastore_proj cannot
+# discriminate; this tier does NOT claim those and pins only the required-material
+# projection, whose non-empty status map at HEAD makes the drop observable.
+
+cases:
+  # ---------------------------------------------------------------------------
+  # RED -- C1-PROJECTION-READBACK-TRUSTS-PINNED-INTERMEDIATES (HIGH). `-e
+  # _lme_required_material_proj={}` makes load_manifests.yml line 328 set_fact a
+  # no-op; the merge (344-351) and the read-back guard (378-397) both REUSE that
+  # SAME pinned {} value, so the guard agrees and passes while the required-material
+  # /status data disappears from lme_resolved. This case asserts the status map is a
+  # FAITHFUL DERIVATION from the admitted inputs (covers the rendered container
+  # services), which the pin breaks.
+  - name: c1-projection-pin-suppresses-required-material
+    kind: loader_projection
+    caller: load_manifests
+    discriminates: C1-PROJECTION-READBACK-TRUSTS-PINNED-INTERMEDIATES
+    predicted: RED
+    control: c1-projection-control
+    invariant_task: "judge :: c1-projection-pin-suppresses-required-material"
+    # Future-proof (same as the eff-inputs RED): a correct C1 fix that rejects the
+    # pin fail-closed shows up as REJECTED-as-expected (the load_manifests read-back
+    # guard fail_msg contains "-e-pinned"); a faithful-derivation fix shows up as
+    # PASS. Today it is RED (judge runs and fails on the suppressed projection).
+    expect:
+      fail_closed_cause: "-e-pinned"
+    pins:
+      _lme_required_material_proj: {}
+    assert:
+      that:
+        - "(['elasticsearch','kibana','fleet-server','dashboard','log-analyzer'] | difference((lme_resolved.required_material_status.localhost | default({})).keys() | list)) | length == 0"
+      success_msg: "FAITHFUL: required_material_status.localhost covers {{ (lme_resolved.required_material_status.localhost | default({})).keys() | list | sort }}"
+      fail_msg: "PROJECTION-DROPPED: required_material_status.localhost keys={{ (lme_resolved.required_material_status.localhost | default({})).keys() | list }} -- the pinned _lme_required_material_proj suppressed the derivation and the read-back guard still passed (completeness was proven by equality of two uses of an overridable intermediate, not by derivation from admitted inputs)"
+
+  # GREEN control: identical, minus the projection pin.
+  - name: c1-projection-control
+    kind: loader_projection
+    caller: load_manifests
+    discriminates: C1-PROJECTION-READBACK-TRUSTS-PINNED-INTERMEDIATES (control -- no intermediate pin)
+    predicted: GREEN
+    invariant_task: "judge :: c1-projection-control"
+    pins: {}
+    assert:
+      that:
+        - "(['elasticsearch','kibana','fleet-server','dashboard','log-analyzer'] | difference((lme_resolved.required_material_status.localhost | default({})).keys() | list)) | length == 0"
+      success_msg: "CONTROL OK: required_material_status.localhost covers {{ (lme_resolved.required_material_status.localhost | default({})).keys() | list | sort }}"
+      fail_msg: "CONTROL BROKEN (harness): required_material_status.localhost keys={{ (lme_resolved.required_material_status.localhost | default({})).keys() | list }}"
+
+  # ---------------------------------------------------------------------------
+  # G_focus "distinct service/configuration revisions". The COMPLETE composed
+  # revision (load_manifests rebind) must MOVE when the effective config or a
+  # service definition changes, and must NOT move for the identical control. These
+  # two cases assert `revision_differs_from` the no-pin control -- proving the
+  # revision is content-addressed over the composed desired state, not snapshot-once.
+
+  # A CONFIGURATION change (install_otel true) must change the complete revision.
+  - name: loader-config-change-revision-differs
+    kind: loader_projection
+    caller: load_manifests
+    discriminates: F1 -- distinct CONFIGURATION revision (complete-revision rebind tracks config)
+    predicted: GREEN
+    invariant_task: "judge :: loader-config-change-revision-differs"
+    revision_differs_from: c1-projection-control
+    pins:
+      install_otel: true
+    assert:
+      that:
+        - "lme_resolved.install_otel == true"
+      success_msg: "config change admitted (install_otel={{ lme_resolved.install_otel }}); complete revision={{ lme_resolved_revision }}"
+      fail_msg: "config change not admitted: install_otel={{ lme_resolved.install_otel }}"
+
+  # A SERVICE-definition change (operator lme_service_overrides on one service's
+  # environment) must change the complete revision (it is folded into the rebind).
+  - name: loader-service-override-revision-differs
+    kind: loader_projection
+    caller: load_manifests
+    discriminates: F1 -- distinct SERVICE revision (service override folds into the complete revision)
+    predicted: GREEN
+    invariant_task: "judge :: loader-service-override-revision-differs"
+    revision_differs_from: c1-projection-control
+    pins:
+      lme_service_overrides:
+        elasticsearch:
+          environment:
+            LME_ACCEPTANCE_MARKER: probe-service-revision-differ
+    assert:
+      that:
+        - "lme_services.elasticsearch.environment.LME_ACCEPTANCE_MARKER | default('') == 'probe-service-revision-differ'"
+      success_msg: "service override folded (marker present); complete revision={{ lme_resolved_revision }}"
+      fail_msg: "service override not folded into lme_services.elasticsearch.environment"

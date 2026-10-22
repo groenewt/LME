@@ -1,0 +1,118 @@
+{#- testing/loader-tests-r4/macros/bootstrap_receipt.j2 -- renders the managed interpreter bootstrap receipt R
+    (managed-bootstrap-receipts.yml receipt_contract, schema 2; codex-tick332 F3 + apply adapter).
+    Rendered ONLY by project_bootstrap_receipt.yml (run-local runner bootstrap_receipt) through the template lookup,
+    with template_vars:
+      contract   managed-bootstrap-receipts.yml receipt_contract (kind, schema, key sets)
+      claims     the SEALED generation receipt <generation>/receipts/toolchain.json, parsed (the producer's claims)
+      tc         {path, sha256}: that receipt's location and MEASURED byte digest (== lme_resolved_run.receipt)
+      gen        the generation directory holding that receipt (the parent of its receipts dir)
+      m          the projection's own MEASUREMENTS (stat / setup / git), kept apart from `claims`
+      sel        the unresolved executable selections the loader receives
+      src, cfg, boot, proj   source / config / bootstrap provenance and the projector identity
+    The projection has already asserted every claim == its measurement; `executables` is built from MEASUREMENTS
+    only. No review field (a receipt never claims its own review; the review is the detached catalog entry), no
+    timestamp, sorted keys: the same inputs render the same bytes.
+
+    OP DISPATCH (codex-tick355 BOOTSTRAP-READBACK-PARSED-BYTE-BINDING pattern repair; key_remove.j2 op pattern).
+    Every caller passes `op` EXPLICITLY in template_vars (template_vars outrank play vars AND extra-vars, so an
+    injected -e op= never reaches a caller that names its op); an absent or unknown op renders the error JSON below,
+    which fails closed in every caller (it is neither receipt_contract-shaped nor carries `bound`).
+      op render           -> R (above; project_bootstrap_receipt.yml only)
+      op payload_binding  -> JSON {op, bound, read_sha256, expected_sha256, stat_sha256, reasons}: the declared
+                             PARSED-BYTE BINDING check (managed-bootstrap-receipts.yml payload_binding_contract).
+        template_vars (all explicit; none optional):
+          content   the base64 `content` of the ONE slurp whose decoded payload the caller will parse (never a
+                    second read; never a lookup('file') text, which strips trailing whitespace)
+          expected  the ADMITTED sha256 of those bytes (64 lowercase hex), from a declared value, never from the payload
+          stat      the not-followed stat (checksum_algorithm sha256) of the same path taken BEFORE the read, or none
+          sealed    true -> the stat must also carry no write bit (wusr/wgrp/woth); ignored when stat is none
+        bound is true iff reasons == []:
+          expected-not-sha256   expected is not 64 lowercase hex
+          content-missing       content is not a non-empty string (no read, or an empty payload)
+          read-mismatch         sha256(b64decode(content)) != expected  (THE rename-replace-between-stat-and-read refusal)
+          stat-not-mapping      stat is neither a mapping nor none
+          stat-absent / stat-not-regular / stat-link / stat-mismatch / stat-writable   (stat given)
+        The hash is taken over the decoded payload (b64decode -> utf-8 text -> sha256 of its utf-8 encoding = the file
+        bytes for a UTF-8 file; a non-UTF-8 payload errors in b64decode and so fails closed). The caller asserts
+        `bound` in its OWN task BEFORE any task or task var parses `content`, then parses only that same `content`. -#}
+{%- if op is not defined or op is not string or op not in ['render', 'payload_binding'] -%}
+{{- {'error': 'op must be render or payload_binding', 'bound': false} | to_json -}}
+{%- elif op == 'payload_binding' -%}
+{%- set pb = namespace(reasons=[], read='', stat_sha256=none) -%}
+{%- if expected is not string or expected is not match('^[0-9a-f]{64}$') -%}
+{%- set pb.reasons = pb.reasons + ['expected-not-sha256'] -%}
+{%- endif -%}
+{%- if content is not string or (content | length) == 0 -%}
+{%- set pb.reasons = pb.reasons + ['content-missing'] -%}
+{%- else -%}
+{%- set pb.read = content | b64decode | hash('sha256') -%}
+{%- if pb.read != expected -%}
+{%- set pb.reasons = pb.reasons + ['read-mismatch'] -%}
+{%- endif -%}
+{%- endif -%}
+{%- if stat is mapping -%}
+{%- set pb.stat_sha256 = stat.checksum | default(none) -%}
+{%- if not (stat.exists | default(false)) -%}
+{%- set pb.reasons = pb.reasons + ['stat-absent'] -%}
+{%- else -%}
+{%- if not (stat.isreg | default(false)) -%}{%- set pb.reasons = pb.reasons + ['stat-not-regular'] -%}{%- endif -%}
+{%- if stat.islnk | default(true) -%}{%- set pb.reasons = pb.reasons + ['stat-link'] -%}{%- endif -%}
+{%- if (stat.checksum | default('')) != expected -%}{%- set pb.reasons = pb.reasons + ['stat-mismatch'] -%}{%- endif -%}
+{%- if (sealed is sameas true) and ((stat.wusr | default(true)) or (stat.wgrp | default(true)) or (stat.woth | default(true))) -%}
+{%- set pb.reasons = pb.reasons + ['stat-writable'] -%}
+{%- endif -%}
+{%- endif -%}
+{%- elif stat is not none -%}
+{%- set pb.reasons = pb.reasons + ['stat-not-mapping'] -%}
+{%- endif -%}
+{{- {'op': 'payload_binding', 'bound': (pb.reasons | length) == 0, 'read_sha256': pb.read,
+     'expected_sha256': expected if expected is string else none, 'stat_sha256': pb.stat_sha256,
+     'reasons': pb.reasons} | to_json -}}
+{%- else -%}
+{%- set r = {
+  'kind': contract.kind,
+  'schema': contract.schema,
+  'managed_root': gen,
+  'executables': {
+    'probe_ansible_playbook': {'path': sel.probe_ansible_playbook, 'sha256': m.ansible_playbook.sha256},
+    'probe_python': {'path': m.python.lnk_source, 'sha256': m.python.followed_sha256},
+    'runner_python': {'path': m.runner_python.lnk_source, 'sha256': m.runner_python.followed_sha256}
+  },
+  'selected': {
+    'probe_ansible_playbook': sel.probe_ansible_playbook,
+    'probe_python_executable': sel.probe_python_executable,
+    'runner_python': sel.runner_python
+  },
+  'toolchain_receipt': {
+    'path': tc.path,
+    'sha256': tc.sha256,
+    'schema': claims.schema,
+    'generation': claims.generation,
+    'generation_dir': claims.generation_dir
+  },
+  'producer_claims': {
+    'ansible_playbook': claims.ansible_playbook,
+    'ansible_playbook_sha256': claims.ansible_playbook_sha256,
+    'python': claims.python,
+    'interpreter': claims.interpreter,
+    'interpreter_sha256': claims.interpreter_sha256,
+    'expect_core': claims.expect_core,
+    'python_version': claims.python_version,
+    'seed_path': claims.seed_path,
+    'seed_sha256': claims.seed_sha256,
+    'ansible_config': claims.ansible_config,
+    'ansible_config_sha256': claims.ansible_config_sha256,
+    'tree_manifest_sha256': claims.tree_manifest_sha256,
+    'tree_list_sha256': claims.tree_list_sha256,
+    'root': claims.root,
+    'operation': claims.operation,
+    'completed_utc': claims.completed_utc
+  },
+  'measured': m,
+  'bootstrap': boot,
+  'source': src,
+  'config': cfg,
+  'projector': proj
+} -%}
+{{ r | to_nice_yaml(indent=2, sort_keys=True, width=4096) }}
+{%- endif %}

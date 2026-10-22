@@ -1,0 +1,63 @@
+{#- testing/e2e/guest/templates/record.json.j2 -- the guest LIFECYCLE RECORD (rh.guest.record; the EI-GUEST-ENDPOINT carrier,
+    1748:152 "guest UUID + generation + endpoint"). Inputs: gd, gg, gp, g_owner_uid, g_uuid, g_generation, g_state
+    (claimed | starting | started; retire.yml sets retired), g_unit_argv (the generation's process argv; [] while
+    claimed), g_invocation_id (systemd InvocationID; none until started), g_fingerprints (list of structured console
+    observations; empty until started), g_lease_nonce (the lease under which this version was written), inventory_hostname.
+    Every identity/endpoint field is an OBSERVATION of this run. host_key_fingerprints are what the guest PRINTED on its
+    serial console ({key_type, bits, fingerprint_sha256, source, console_file}); they are NOT a known_hosts file and
+    authenticate nothing by themselves: B binds the host key the endpoint presents to them before any privileged SSH.
+    host_public_keys are the PUBLIC host-key lines the guest printed on the same console, one entry per key
+    ({key_type, public_line, public_key = "<algorithm> <base64>", key_base64, source, console_file}; [] until
+    started; input g_host_public_keys from the S8 parse). Also observations only: B renders a per-run known_hosts from
+    public_key, re-derives each SHA256 fingerprint and refuses on any mismatch with host_key_fingerprints.
+    tasks/verify.yml compares every observed resource with this record; tasks/unit_bind.yml binds the running process
+    to unit.argv / unit.invocation_id and to the recorded disk inodes.
+    codex GUEST-INITIALIZED-DISK: disks.<os|data>.identity = {dev, inode} of the disk pathname, recorded once right
+    after the pre-start creation (input g_disk_ids_record; null while none is recorded) and never changed after.
+    codex GUEST-SAME-GENERATION-RECOVERY: recoveries = append-only history of same-generation recoveries (input
+    g_recoveries; {previous_invocation_id, invocation_id, previous_unit, console_evidence, lease_epoch,
+    recovered_at_epoch}). lease_epoch = the lease epoch (tasks/lease.yml fencing token) this version was written under.
+    codex tick331 GUEST-RECOVERY-CONSOLE-EVIDENCE: a recoveries entry's console_evidence is EITHER {path, dev, inode}
+    (path = the evidence name the ORIGINAL console is renamed to; dev/inode = that original console's identity, observed
+    before the intent) OR none (the original console was EXPLICITLY ABSENT at the intent). Part of /2 (no /2 record was
+    ever produced before this shape; no re-bump). Except the S1 claim (written inside the generation-unique, dot-named
+    claim staging, published by a fenced no-replace rename), the template writes only this epoch's partial
+    (<record><layout.epoch_partial_infix><epoch>); a fenced rename publishes it (tasks/lease.yml HOST-SIDE FENCE).
+    codex tick331 RECORD VERSION: schema = gd.record.schema, which guest.yml pins to lme-guest-record/2 (the required
+    shape gained lease_epoch and recoveries). /2 is the ONLY version produced; every reader accepts only gd.record.schema
+    and refuses anything else GUEST-RECORD-VERSION (gd.refusals.record_version), leaving that record byte-identical. A
+    /1 record is never reinterpreted, rewritten or migrated here. -#}
+{{ {
+  'schema': gd.record.schema,
+  'run_id': gg.run_id,
+  'name': gg.name,
+  'hypervisor': inventory_hostname,
+  'owner_uid': g_owner_uid | int,
+  'uuid': g_uuid,
+  'generation': g_generation,
+  'state': g_state,
+  'lease_nonce': g_lease_nonce,
+  'lease_epoch': g_lease_epoch | int,
+  'storage_root': gg.storage_root,
+  'run_dir': gp.run,
+  'base': gp.base,
+  'base_sha512': gg.base_image.sha512,
+  'disks': {
+    'os': {'file': gp.files.os_disk, 'format': 'qcow2', 'backing': gp.base, 'virtual_gib': gg.os_disk_gib,
+           'serial': gd.qemu.os_serial_prefix ~ g_uuid[:8], 'identity': g_disk_ids_record.os},
+    'data': {'file': gp.files.data_disk, 'format': 'qcow2', 'backing': none, 'virtual_gib': gg.data_disk_gib,
+             'serial': gd.qemu.data_serial_prefix ~ g_uuid[:8], 'guest_mount': gd.cloud_init.data_fs.mount,
+             'identity': g_disk_ids_record.data}},
+  'unit': {'name': gp.unit, 'scope': 'user', 'owner_uid': g_owner_uid | int,
+           'argv': g_unit_argv, 'argv_sha256': (g_unit_argv | to_json | hash('sha256')) if g_unit_argv | length > 0 else none,
+           'invocation_id': g_invocation_id},
+  'endpoint': {'address': gd.qemu.net.bind, 'port': gg.forward_port, 'guest_port': gd.qemu.net.guest_port,
+               'via': inventory_hostname},
+  'allocation': {'vcpus': gg.vcpus, 'memory_mib': gg.memory_mib, 'os_disk_gib': gg.os_disk_gib,
+                 'data_disk_gib': gg.data_disk_gib, 'physical_reserve_gib': gg.physical_reserve_gib,
+                 'host_headroom_mib': gg.host_headroom_mib},
+  'host_key_fingerprints': g_fingerprints,
+  'host_public_keys': (g_host_public_keys | default([])) if g_state == 'started' else [],
+  'recoveries': g_recoveries,
+  'observed_at_utc': now(utc=True).strftime('%Y-%m-%dT%H:%M:%SZ')
+} | to_nice_json(sort_keys=True) }}

@@ -1,0 +1,105 @@
+---
+# testing/e2e/transfer/controls/source_clone.yml -- clone the ADMITTED source (sr, from source_ref.yml) at its
+# declared commit and re-check the clone. Nothing is committed; the source is only read.
+# Inputs: sr (its `git` is the decl's referenced executable), sr_decl (controls_source.status_args), sr_dest (a
+# directory that must not exist). Output: sr.clones gains {dir, commit, tree}; sr_clone.
+# Refusal: CONTROLS-SOURCE-MISMATCH when the clone's HEAD commit or tree is not the admitted one, or the clone is
+# not clean (tracked or untracked).
+
+- name: SOURCE-CLONE -- only an admitted source is cloned
+  ansible.builtin.assert:
+    that:
+      - sr is defined and sr is mapping and sr.used | default(false) | bool
+      - sr.git is string and sr.git.startswith('/')
+      - sr.commit is match(sr_decl.controls_source.commit_regex) and sr.tree is match(sr_decl.controls_source.commit_regex)
+    fail_msg: "CONTROLS-SOURCE-INPUT: no admitted source_ref (source_ref.yml) before cloning into {{ sr_dest }}"
+    quiet: true
+
+# r5r (codex-tick461 R5P-FIXTURE-GIT-ISOLATION; R2 r2k C1-R2K-GIT-MUTATION, consumed verbatim): the clone runs under
+# the declared clone prefix _gitc with git.mutation.clone (--template=, no hardlinks, `--` before the operands); the
+# new repository is then admitted (fixture_git_admit.yml: location + configuration) BEFORE the checkout writes its
+# worktree, the checkout runs under the mutation prefix + fence, and the location is admitted again after it. The
+# --no-checkout / checkout --detach words are this file's existing clone shape (r5r only adds --no-checkout after the
+# declared clone words, ahead of the `--`). sr.git (transfer.source.git, seam S6) is SOURCE-REF's tool; the clone
+# uses the declared os_tools git of the prefix.
+# r5s (codex-tick482 R2L-B-CLONE-SEQUENCE; replaces r5r's PROVISIONAL marker): clone is its OWN declared operation
+# sequence under the SAME git.mutation policy -- git.mutation.clone_sequence (C1-R5S-5) -- NOT fresh-init words:
+#   destination admission (fixture_fresh_dest.yml with ff_seq = clone_sequence: absent, realpath, parent ancestry)
+#   -> isolated clone WITHOUT checkout (_gitc + mutation.clone with clone_sequence.no_checkout before the `--`)
+#   -> location + config admission (fixture_git_admit.yml)
+#   -> guarded checkout (_gitm + fence + clone_sequence.checkout + [admitted commit]) -> location -> readback.
+# r5r's private '--no-checkout' / 'checkout --quiet --detach' words now come from the declared node. No location
+# rev-parse runs before the clone; the destination is never adopted. Controls: FRESH-02 (refused destination),
+# CLONE-01 (successful clone, separate from the fresh-fixture control FRESH-03).
+- name: SOURCE-CLONE -- refuse an undeclared clone sequence (before any stat or clone)
+  ansible.builtin.assert:
+    that:
+      # evaluated in order: presence first, so an absent node REFUSES (never an undefined-variable error)
+      - _gitp.mutation.clone_sequence is defined and _gitp.mutation.clone_sequence is mapping
+      - _gitp.mutation.clone_sequence.no_checkout is defined and _gitp.mutation.clone_sequence.checkout is defined
+      - _gitp.mutation.clone_sequence.no_checkout is sequence and _gitp.mutation.clone_sequence.no_checkout is not string
+      - _gitp.mutation.clone_sequence.checkout is sequence and _gitp.mutation.clone_sequence.checkout is not string
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', repo_root ~ _wrp.bootstrap.path_admission.separator ~ _wrp.bootstrap.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': _hrf_grammar, 'rh_rf_code': C.harness.refusals.git_fresh_init,
+                               'rh_rf_detail': [C.harness.texts.git_fresh_init, sr_dest, sr_dest]}) | trim }}
+    quiet: true
+
+- name: SOURCE-CLONE -- admit the clone destination (absent; parent ancestry; no link) before the clone
+  ansible.builtin.include_tasks: fixture_fresh_dest.yml
+  vars:
+    ff_dest: "{{ sr_dest }}"
+    ff_case: "{{ sr_dest }}"
+    ff_seq: "{{ _gitp.mutation.clone_sequence }}"
+
+- name: SOURCE-CLONE -- isolated clone without checkout (declared clone prefix, clone words and clone_sequence.no_checkout)
+  ansible.builtin.command:
+    argv: >-
+      {{ _gitc + (_gitp.mutation.clone[:-1]) + _gitp.mutation.clone_sequence.no_checkout
+         + [_gitp.mutation.clone | last, sr.path, sr_dest] }}
+  changed_when: true
+
+- name: SOURCE-CLONE -- post-init admission of the new repository (location then configuration; before the checkout writes)
+  ansible.builtin.include_tasks: fixture_git_admit.yml
+  vars:
+    fg_repo: "{{ sr_dest }}"
+    fg_case: "{{ sr_dest }}"
+
+- name: SOURCE-CLONE -- guarded checkout at the admitted commit (mutation prefix + fence + clone_sequence.checkout)
+  ansible.builtin.command:
+    argv: "{{ _gitm + [sr_dest] + _gitp.mutation.fence + _gitp.mutation.clone_sequence.checkout + [sr.commit] }}"
+  changed_when: true
+
+- name: SOURCE-CLONE -- admit the location again after the checkout
+  ansible.builtin.include_tasks: fixture_git_admit.yml
+  vars:
+    fg_repo: "{{ sr_dest }}"
+    fg_case: "{{ sr_dest }}"
+
+- name: SOURCE-CLONE -- the clone's HEAD commit, tree and state (read prefix)
+  ansible.builtin.command:
+    argv: "{{ _gitr + [sr_dest] + item }}"
+  loop:
+    - [rev-parse, --verify, --quiet, 'HEAD^{commit}']
+    - [rev-parse, --verify, --quiet, 'HEAD^{tree}']
+    - "{{ sr_decl.controls_source.status_args }}"
+  register: _sc_rp
+  changed_when: false
+  failed_when: false
+
+- name: SOURCE-CLONE -- the clone is the admitted commit and tree (CONTROLS-SOURCE-MISMATCH)
+  ansible.builtin.assert:
+    that:
+      - _sc_rp.results | map(attribute='rc') | reject('equalto', 0) | list | length == 0
+      - (_sc_rp.results[0].stdout | trim) == sr.commit
+      - (_sc_rp.results[1].stdout | trim) == sr.tree
+      - _sc_rp.results[2].stdout | trim | length == 0
+    fail_msg: >-
+      CONTROLS-SOURCE-MISMATCH: clone {{ sr_dest }} is commit '{{ _sc_rp.results[0].stdout | default('') | trim }}'
+      tree '{{ _sc_rp.results[1].stdout | default('') | trim }}', admitted {{ sr.commit }} / {{ sr.tree }}
+    quiet: true
+
+- name: SOURCE-CLONE -- record the clone
+  ansible.builtin.set_fact:
+    sr_clone: {dir: "{{ sr_dest }}", commit: "{{ sr.commit }}", tree: "{{ sr.tree }}"}
+    sr: "{{ sr | combine({'clones': sr.clones + [{'dir': sr_dest, 'commit': sr.commit, 'tree': sr.tree}]}) }}"

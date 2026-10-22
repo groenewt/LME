@@ -1,0 +1,523 @@
+---
+# testing/e2e/transfer/tasks/resolve_contract.yml -- B2-TARGET-BINDING (localhost, observe-only).
+# Resolves the ONE admitted target/connection contract for ONE declared peer (tr_peer), the route's `privileged`
+# connection profile and ONE auth mode (rh ssh_auth), plus the one supported override (deploy_gate --ssh-key, workload
+# kind only), refusing anything it cannot carry identically on every stage.
+# PEER KINDS (r5f, codex-tick400 R4-PRIVILEGED-CONTRACT; tr.contract.endpoint_kinds): a workload_target (the transfer
+# target; today's behaviour and today's tr_contract) or a declared controller_operation endpoint (the only member of
+# its declared role group, never a target-group member, key reference from the loader-bound input). Every kind passes
+# the SAME endpoint, port, connection, refused-var, proxy, auth-mode, key-reference and credential-selector checks.
+# Key material is never read: the key is a path reference, stat'ed without checksum, mime or attributes.
+# Inputs: tr (transfer.decl.yml), tr_bs (resolved rh.controller.bootstrap), tr_peer ({alias, kind[, role_group]}),
+#         lme_transfer_ssh_key (workload kind only; refused for a kind without the ssh_key override),
+#         lme_resolved.remote_harness.binding.deployment (controller kind: the loader-bound inputs and the published
+#         endpoint roster), rh_repo_root (refusal grammar entry), and -- controller kind only -- the route's
+#         binding-receipt record named by tr.contract.endpoint_kinds.controller_operation.admission.record (r5h).
+# Outputs: tr_contract, tr_ssh_argv (deploy_gate's argv), tr_conn (the Ansible connection vars of the same contract).
+
+# r5u-rf (codex-tick500 R5U-REFUSAL-AND-INVENTORY-CONTRACT; closes R5U-LITERAL-REFUSAL-CODES): EVERY refusal of this
+# file is the common grammar entry (tr_bs.refusal_grammar) with a code of the declared contract family
+# transfer.contract.refusals (or the kind-scoped endpoint_kinds codes) and a detail LIST of declared
+# transfer.contract.texts plus observed values; no code or text is restated here.
+# r5u-rf2 (codex-tick510 RF-OD-9 option a): every grammar lookup writes the canonical declared-root expression
+# rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel inline as its FIRST token (check.yml
+# LOAD-BASE reads that token); no alias task var (r5u-rf's _tr_rf is retired).
+# r5u-rf2 (codex-tick510 RF-OD-2): the family SHAPE is admitted by the FIRST task below, before any task that reads a
+# member. Its diagnostic is the family's PARENT declaration transfer.contract.family (refusal + texts.absent + the
+# member names), never a member, so an omitted, null or partial family refuses typed through the loader-admitted
+# grammar (the loader's contract admits refusal_grammar without when_present) instead of failing as an undefined
+# variable. The detail names member KEYS only (no contract value, no key reference). The parent node itself is the
+# root of this diagnostic: if transfer.contract.family were absent the message would fail as an undefined variable,
+# never pass (recorded limit, not a fallback).
+- name: Admit the contract refusal family's declared shape before any member is read (RF-OD-2; parent diagnostic)
+  vars:
+    _tr_fam: "{{ tr.contract.family }}"
+  ansible.builtin.assert:
+    that:
+      - _tr_fam.members is mapping
+      - _tr_fam.members.refusals is sequence and _tr_fam.members.refusals is not string
+      - _tr_fam.members.texts is sequence and _tr_fam.members.texts is not string
+      - tr.contract.refusals is defined and tr.contract.refusals is mapping
+      - (tr.contract.refusals.keys() | list | sort) == (_tr_fam.members.refusals | sort)
+      - tr.contract.refusals.values() | reject('string') | list | length == 0
+      - tr.contract.texts is defined and tr.contract.texts is mapping
+      - (tr.contract.texts.keys() | list | sort) == (_tr_fam.members.texts | sort)
+      - tr.contract.texts.values() | reject('string') | list | length == 0
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': _tr_fam.refusal,
+                               'rh_rf_detail': [_tr_fam.texts.absent,
+                                                _tr_fam.members | to_json,
+                                                {'refusals': ((tr.contract.refusals.keys() | list | sort)
+                                                              if (tr.contract.refusals is defined and tr.contract.refusals is mapping)
+                                                              else none),
+                                                 'texts': ((tr.contract.texts.keys() | list | sort)
+                                                           if (tr.contract.texts is defined and tr.contract.texts is mapping)
+                                                           else none)} | to_json]}) | trim }}
+    quiet: true
+
+- name: Admit the contract peer's shape and kind (staged before any use)
+  ansible.builtin.assert:
+    that:
+      - tr.contract.endpoint_kinds is mapping
+      - tr_peer is defined and tr_peer is mapping
+      - tr_peer.kind is defined and tr_peer.kind is string and tr_peer.kind in tr.contract.endpoint_kinds
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.input,
+                               'rh_rf_detail': [tr.contract.texts.peer_kind,
+                                                ((tr.contract.endpoint_kinds | list) if tr.contract.endpoint_kinds is mapping
+                                                 else []) | to_json]}) | trim }}
+    quiet: true
+
+- name: Name the peer's declared endpoint kind
+  ansible.builtin.set_fact:
+    _tr_kind: "{{ tr.contract.endpoint_kinds[tr_peer.kind] }}"
+
+- name: Admit the peer alias and the override input (no default)
+  ansible.builtin.assert:
+    that:
+      - (tr_peer.keys() | list | sort) == (_tr_kind.peer_keys | sort)
+      - tr_peer.alias is string
+      - tr_peer.alias is match(tr.inputs.host_regex)
+      - tr_peer.alias in groups['all'] and tr_peer.alias != 'localhost'
+      - >-
+        ('ssh_key' in _tr_kind.flag_overrides)
+        == (q('ansible.builtin.varnames', '^lme_transfer_ssh_key$') | length > 0)
+      - >-
+        ('ssh_key' not in _tr_kind.flag_overrides) or (lme_transfer_ssh_key is string and (lme_transfer_ssh_key == ''
+        or (lme_transfer_ssh_key is match(tr_bs.path_admission.regex)
+        and lme_transfer_ssh_key is not search(tr_bs.path_admission.forbidden_segment_regex))))
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.input,
+                               'rh_rf_detail': [tr.contract.texts.peer_input, _tr_kind.peer_keys | to_json,
+                                                tr.inputs.host_regex, tr_peer.kind]}) | trim }}
+    quiet: true
+
+- name: Name the peer and its admitted flag override
+  ansible.builtin.set_fact:
+    _tr_alias: "{{ tr_peer.alias }}"
+    _tr_flag: "{{ lme_transfer_ssh_key if ('ssh_key' in _tr_kind.flag_overrides) else '' }}"
+
+# workload_target: the transfer target is the target_scope (scope_expect.yml already bound it); nothing more here.
+# controller_operation: FIRST the route's verified binding-receipt record (r5h, codex-tick419 R5G-RECEIPT-ADMISSION-CONSUMER
+# + codex-tick421 consumer gate), then membership by the declared role group / required role / published endpoint
+# roster, and the loader-bound inputs of this alias. No controller-operation contract value is read before the record
+# is bound.
+# RECEIPT RECORD (declared in tr.contract.endpoint_kinds.controller_operation.admission; names PROVISIONAL until R4's
+# r4e-admission-output proposal joins through MAIN): the record names are R4's derived outputs of
+# testing/remote_harness/tasks/admit_binding_receipt.yml (exact C1 registry reserved_outputs, so a caller-supplied
+# -e / inventory value is refused by refuse_pinned_outputs.yml at the entry's FIRST task, before this file runs). The
+# record is not trusted as a flag: the receipt record (path, stat, parsed receipt) and R4's admission EVIDENCE (a mapping
+# keyed by binding_admission.result_keys; r4e, PROVISIONAL) are re-bound here to (1) the receipt BYTES (fresh stat + one
+# read; digest equal to the recorded stat, to the evidence and to the read; the parsed bytes equal the recorded receipt;
+# its key set exactly run_binding.receipt_keys), (2) the SELECTED inventory files (in the declared kind's order, exactly
+# the receipt's lab and binding and the evidence's files; the receipt path derived from the binding by the declared
+# suffix), (3) every declared COMPARED receipt binding (run_binding.receipt_bindings, role binding_roles.compared,
+# iterated and walked from its current-resolve record {var, path} NOW: receipt value == evidence value == current
+# value), while ATTRIBUTED fields (e.g. engine_revision) are required present and never compared (codex-tick421 J-B8),
+# (4) the CURRENT effective values of the evidence's operation inputs, (5) the resolved endpoint scope (evidence scope
+# digest == this resolve's scope_sha256; the peer alias is one of the evidence's placed members). Then the peer assert
+# adds the required-role and published-roster checks and _tr_bk the loader-bound key. Every refusal is the common
+# grammar entry.
+# STAGED: presence and type of every declaration the receipt binding and the peer admission below read. Its own fail_msg
+# relies only on refusal_grammar / path_admission (the loader's contract admits refusal_grammar with NO when_present,
+# so resolve_policy.yml has already refused a profile without it -- the renderer's r5g rationale) and on
+# _tr_adm.refusal / _tr_adm.texts.absent (transfer.decl.yml data B authors in the same revision; if they were absent the
+# message would fail as an undefined variable, never pass -- recorded limit, not a fallback).
+- name: Require the route's binding-receipt record before any controller-operation contract use (staged presence)
+  vars:
+    _tr_adm: "{{ _tr_kind.admission }}"
+  ansible.builtin.assert:
+    that:
+      - _tr_kind.admission is mapping
+      - _tr_adm.record is mapping
+      - (_tr_adm.record.keys() | list | sort) == (_tr_adm.record_keys | sort)
+      - (_tr_adm.record.values() | list) | reject('in', vars) | list | length == 0
+      - lookup('ansible.builtin.vars', _tr_adm.record.path) is string
+      - lookup('ansible.builtin.vars', _tr_adm.record.stat) is mapping
+      - lookup('ansible.builtin.vars', _tr_adm.record.receipt) is mapping
+      - _tr_adm.inventory_kind is string
+      - tr_bs.genesis.launch.inventory_kinds is mapping and _tr_adm.inventory_kind in tr_bs.genesis.launch.inventory_kinds
+      - tr_bs.genesis.launch.inventory_kinds[_tr_adm.inventory_kind].files is sequence
+      - tr_bs.binding_admission is mapping
+      - tr_bs.binding_admission.digest is string
+      - tr_bs.binding_admission.binding_role is string
+      - tr_bs.binding_admission.fields is mapping
+      - tr_bs.binding_admission.fields.binding is string and tr_bs.binding_admission.fields.lab is string
+      - tr_bs.run_binding.lab_role is string
+      - tr_bs.run_binding.receipt_suffix is string
+      - tr_bs.run_binding.receipt_keys is sequence and tr_bs.run_binding.receipt_keys is not string
+      - lookup('ansible.builtin.vars', _tr_adm.record.admission) is mapping
+      - tr_bs.binding_admission.result_keys is mapping
+      - _tr_adm.result_roles | reject('in', tr_bs.binding_admission.result_keys) | list | length == 0
+      - tr_bs.run_binding.receipt_bindings is mapping and tr_bs.run_binding.receipt_bindings | length > 0
+      - tr_bs.run_binding.binding_roles is mapping
+      - tr_bs.run_binding.binding_roles.compared is string and tr_bs.run_binding.binding_roles.attributed is string
+      - tr_bs.inventory.controller_operations is mapping
+      - lme_resolved.remote_harness.scope_sha256 is string
+      - _tr_adm.texts.unbound is string
+      - _tr_kind.texts.peer_membership is string
+      - _tr_kind.roster_at is string
+      - tr_bs.inventory.controller_endpoint_groups is mapping
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': _tr_adm.refusal,
+                               'rh_rf_detail': [_tr_adm.texts.absent, _tr_alias,
+                                                _tr_adm.record | to_json,
+                                                (_tr_adm.record.values() | list) | reject('in', vars) | list | to_json]}) | trim }}
+    quiet: true
+  when: not _tr_kind.target_scope
+
+- name: Observe the recorded receipt afresh (no link followed; digest only)
+  ansible.builtin.stat:
+    path: "{{ lookup('ansible.builtin.vars', _tr_kind.admission.record.path) }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: "{{ tr_bs.binding_admission.digest }}"
+    get_mime: false
+    get_attributes: false
+  register: _tr_rcs
+  when: not _tr_kind.target_scope
+
+- name: Read the recorded receipt once (its bytes are bound to the fresh stat below)
+  ansible.builtin.slurp:
+    src: "{{ lookup('ansible.builtin.vars', _tr_kind.admission.record.path) }}"
+  register: _tr_rcb
+  when: not _tr_kind.target_scope and _tr_rcs.stat.exists and _tr_rcs.stat.isreg
+
+- name: Bind the receipt record and admission evidence to the bytes, files, compared bindings, inputs and scope
+  vars:
+    _tr_adm: "{{ _tr_kind.admission }}"
+    _tr_ba: "{{ tr_bs.binding_admission }}"
+    _tr_rk: "{{ tr_bs.binding_admission.result_keys }}"
+    _tr_rp: "{{ lookup('ansible.builtin.vars', _tr_kind.admission.record.path) }}"
+    _tr_rs: "{{ lookup('ansible.builtin.vars', _tr_kind.admission.record.stat) }}"
+    _tr_rc: "{{ lookup('ansible.builtin.vars', _tr_kind.admission.record.receipt) }}"
+    _tr_ev: "{{ lookup('ansible.builtin.vars', _tr_kind.admission.record.admission) }}"
+    _tr_kf: "{{ tr_bs.genesis.launch.inventory_kinds[_tr_kind.admission.inventory_kind].files }}"
+    # the COMPARED fields and their CURRENT values, walked from the declared records (the r4e W-1 construction)
+    _tr_cmp: >-
+      {{ tr_bs.run_binding.receipt_bindings | dict2items
+         | selectattr('value.role', 'equalto', tr_bs.run_binding.binding_roles.compared) | map(attribute='key') | list }}
+    _tr_att: >-
+      {{ tr_bs.run_binding.receipt_bindings | dict2items
+         | selectattr('value.role', 'equalto', tr_bs.run_binding.binding_roles.attributed) | map(attribute='key') | list }}
+    _tr_cur: >-
+      {%- set ns = namespace(d={}, v=none) -%}
+      {%- for f, b in tr_bs.run_binding.receipt_bindings.items() if b.role == tr_bs.run_binding.binding_roles.compared -%}
+      {%- set ns.v = lookup('ansible.builtin.vars', b.var) -%}
+      {%- for k in b.path -%}{%- set ns.v = ns.v[k] -%}{%- endfor -%}
+      {%- set ns.d = ns.d | combine({f: ns.v}) -%}
+      {%- endfor -%}{{ ns.d }}
+    _tr_opin: >-
+      {{ tr_bs.inventory.controller_operations[_tr_ev[_tr_rk.operation]].inputs | dict2items
+         | map(attribute='value.var') | list }}
+  ansible.builtin.assert:
+    that:
+      - _tr_rcs.stat.exists and _tr_rcs.stat.isreg and not _tr_rcs.stat.islnk
+      - _tr_rcb.content is defined
+      - _tr_rcs.stat.checksum == _tr_rs.checksum
+      - (_tr_rcb.content | b64decode | hash(_tr_ba.digest)) == _tr_rcs.stat.checksum
+      - (_tr_rcb.content | b64decode | from_yaml) == _tr_rc
+      - _tr_ba.fields.binding in _tr_rc and _tr_ba.fields.lab in _tr_rc
+      - >-
+        ansible_inventory_sources
+        == (tr_bs.genesis.launch.inventory_kinds[_tr_adm.inventory_kind].files
+            | map('extract', {tr_bs.run_binding.lab_role: _tr_rc[_tr_ba.fields.lab],
+                              _tr_ba.binding_role: _tr_rc[_tr_ba.fields.binding]}) | list)
+      - _tr_rp == (_tr_rc[_tr_ba.fields.binding] | dirname) ~ tr_bs.run_binding.receipt_suffix
+      - (_tr_rc.keys() | list | sort) == (tr_bs.run_binding.receipt_keys | sort)
+      # the evidence IS this receipt and these files
+      - (_tr_ev.keys() | list | sort) == (_tr_rk.values() | list | sort)
+      - _tr_ev[_tr_rk.receipt] == _tr_rp
+      - _tr_ev[_tr_rk.receipt_sha256] == _tr_rcs.stat.checksum
+      - _tr_ev[_tr_rk.kind] == _tr_kind.admission.inventory_kind
+      - _tr_ev[_tr_rk.files] == dict(_tr_kf | zip(ansible_inventory_sources))
+      # compared bindings: receipt value == evidence value == the CURRENT walked value; attributed: present, not compared
+      - _tr_cmp | length > 0
+      - _tr_ev[_tr_rk.compared] == _tr_cur
+      - (_tr_cmp | map('extract', _tr_rc) | list) == (_tr_cmp | map('extract', _tr_cur) | list)
+      - _tr_att | reject('in', _tr_rc) | list | length == 0
+      # the operation's effective inputs NOW equal the evidence (an override after the admission refuses)
+      - _tr_ev[_tr_rk.operation] in tr_bs.inventory.controller_operations
+      - _tr_ev[_tr_rk.inputs] == dict(_tr_opin | zip(q('ansible.builtin.vars', *_tr_opin)))
+      # the resolved endpoint scope: the same scope digest, and the peer is one of the admitted placed members
+      - _tr_ev[_tr_rk.scope_sha256] == lme_resolved.remote_harness.scope_sha256
+      - _tr_alias in _tr_ev[_tr_rk.members]
+      # G-3 (r4e-admission-output.proposal consumer_gate): the members the admission checked are THIS peer's role
+      # group of the admitted operation, not another operation's (staged: type before membership)
+      - tr_bs.inventory.controller_operations[_tr_ev[_tr_rk.operation]].placement_keys is sequence
+      - tr_bs.inventory.controller_operations[_tr_ev[_tr_rk.operation]].placement_keys is not string
+      - tr_peer.role_group in tr_bs.inventory.controller_operations[_tr_ev[_tr_rk.operation]].placement_keys
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': _tr_adm.refusal,
+                               'rh_rf_detail': [_tr_adm.texts.unbound, _tr_alias, _tr_rp,
+                                                _tr_rcs.stat | to_json,
+                                                ansible_inventory_sources | to_json,
+                                                _tr_cmp | to_json]}) | trim }}
+    quiet: true
+  when: not _tr_kind.target_scope
+
+- name: Admit a controller-operation peer (its declared role group's only member; required role; published roster)
+  vars:
+    _tr_bd: "{{ lme_resolved.remote_harness.binding.deployment }}"
+  ansible.builtin.assert:
+    that:
+      - tr_peer.role_group is string and tr_peer.role_group in tr_bs.inventory.role_groups
+      - tr_bs.inventory.role_groups[tr_peer.role_group] in groups
+      - groups[tr_bs.inventory.role_groups[tr_peer.role_group]] | list == [_tr_alias]
+      - _tr_alias not in groups[tr_bs.inventory.target_group]
+      - lme_resolved.remote_harness.binding.deployment is defined
+      - _tr_bd is mapping and _tr_kind.inputs_at in _tr_bd and _tr_bd[_tr_kind.inputs_at] is mapping
+      - _tr_alias in _tr_bd[_tr_kind.inputs_at] and _tr_bd[_tr_kind.inputs_at][_tr_alias] is mapping
+      - _tr_kind.key_input in _tr_bd[_tr_kind.inputs_at][_tr_alias]
+      - _tr_kind.key_input in tr_bs.inventory.target_inputs
+      - >-
+        tr_bs.inventory.target_inputs[_tr_kind.key_input].var
+        == tr_bs.inventory.connection_profiles[tr.contract.connection_profile].key_var
+      # r5h (codex-tick419 R5G-CONTROLLER-ENDPOINT-READBACK, consumer side): the key input is a REQUIRED role of the
+      # peer's declared endpoint group, and the loader-published roster (expectations from the resolved projection,
+      # never the surviving submitted maps) places this alias in that group
+      - tr_peer.role_group in tr_bs.inventory.controller_endpoint_groups
+      - _tr_kind.key_input in tr_bs.inventory.controller_endpoint_groups[tr_peer.role_group].required
+      - _tr_kind.roster_at in _tr_bd and _tr_bd[_tr_kind.roster_at] is mapping
+      - _tr_alias in _tr_bd[_tr_kind.roster_at]
+      - _tr_bd[_tr_kind.roster_at][_tr_alias].group == tr_peer.role_group
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': _tr_kind.refusal,
+                               'rh_rf_detail': [_tr_kind.texts.peer_membership, _tr_alias, tr_peer.role_group,
+                                                _tr_kind.inputs_at, _tr_kind.key_input, _tr_kind.roster_at,
+                                                tr.contract.connection_profile]}) | trim }}
+    quiet: true
+  when: not _tr_kind.target_scope
+
+# r5u (X-B-01, route r4k admit_transport presence style): the host's auth-mode var is tested by EXACT NAME before it is
+# read. r5p read it with a '' fallback, refused only indirectly ('' is not a declared mode); absence is now refused by
+# name under the same code, before any read, and the read below carries no default.
+- name: Refuse a peer that does not set the declared auth-mode var (exact-name presence; no default)
+  ansible.builtin.assert:
+    that:
+      - tr_bs.ssh_auth.mode_var is string
+      - tr_bs.ssh_auth.mode_var in hostvars[_tr_alias]
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.auth_mode,
+                               'rh_rf_detail': [tr.contract.texts.auth_mode_absent, _tr_alias,
+                                                tr_bs.ssh_auth.mode_var | to_json,
+                                                tr.contract.auth_modes_admitted | to_json,
+                                                tr.contract.auth_modes_refused | to_json]}) | trim }}
+    quiet: true
+
+- name: Name the route's privileged connection profile and the ONE auth mode of this deployment
+  ansible.builtin.set_fact:
+    _tr_prof: "{{ tr_bs.inventory.connection_profiles[tr.contract.connection_profile] }}"
+    _tr_mode: "{{ hostvars[_tr_alias][tr_bs.ssh_auth.mode_var] }}"
+    _tr_run_mode: "{{ lookup('ansible.builtin.env', tr_bs.ssh_auth.env_mode) }}"
+
+- name: Refuse an auth mode B's privileged legs do not carry (route matrix disposition; never silently dropped)
+  ansible.builtin.assert:
+    that:
+      - _tr_mode in tr_bs.ssh_auth.modes
+      - _tr_mode == _tr_run_mode
+      - _tr_mode in tr.contract.auth_modes_admitted
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.auth_mode,
+                               'rh_rf_detail': [tr.contract.texts.auth_mode_unadmitted, _tr_alias,
+                                                tr_bs.ssh_auth.mode_var, _tr_mode | to_json,
+                                                tr_bs.ssh_auth.env_mode, _tr_run_mode | to_json,
+                                                tr.contract.auth_modes_admitted | to_json,
+                                                tr.contract.auth_modes_refused | to_json]}) | trim }}
+    quiet: true
+
+# r5p H-FORM-SITES (JOIN-ATOMIC with C1 H-FORM-1 lme_rh_proxy_outcome; codex-tick455): the proxy form is NOT
+# interpreted here any more (the r5o fallback read of the form var, the local accepted-form test and the regex_replace
+# extraction are removed). The ONE shared interpreter reads the host's inventory Mapping as-is (key absence != supplied
+# null), validates the WHOLE admitted endpoint rule (controller.bootstrap.ssh_auth.composition, the node the registry's
+# host_scope.endpoint.rule_path names) before interpreting, matches end-anchored, never folds case, and returns
+# {admitted, jump, cause}; this file reads only that result. The mode passed is the one ADMITTED by the task above
+# (equal to the run's selected mode), so this file never relies on a later transport check. Until C1's filter lands
+# this task is an undefined-filter TEMPLATE error, not a typed refusal (atomic join; no fallback interpreter).
+- name: Interpret the peer's proxy form through the shared interpreter (one result; no local form logic)
+  ansible.builtin.set_fact:
+    _tr_px: "{{ hostvars[_tr_alias] | lme_rh_proxy_outcome(tr_bs.ssh_auth.composition, tr_bs.ssh_auth, _tr_mode) }}"
+
+- name: Refuse connection settings the contract cannot carry on every stage (present means refused, never ignored)
+  ansible.builtin.assert:
+    that:
+      - tr.contract.refused_vars | select('in', hostvars[_tr_alias]) | list | length == 0
+      # r5u OPEN (X-B-01 site :290 base; ledger r5u-value-ledger OPEN-RC-CONN): the absent-connection meaning ('ssh',
+      # decl comment `absent == ssh` only) has NO declared node; it stays this read until transfer.contract gains the
+      # declared absent-connection value (requested node, not invented here)
+      - (hostvars[_tr_alias][tr.contract.connection_var] | default('ssh')) in tr.contract.connection_admitted
+      - _tr_px is mapping
+      - _tr_px.admitted is sameas true
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.unsupported,
+                               'rh_rf_detail': [tr.contract.texts.unsupported, _tr_alias,
+                                                tr.contract.refused_vars | select('in', hostvars[_tr_alias]) | list | to_json,
+                                                tr.contract.connection_admitted | to_json,
+                                                _tr_px | to_json]}) | trim }}
+    quiet: true
+
+- name: Refuse an --ssh-key that conflicts with the privileged profile's key (translate only when the profile has none)
+  ansible.builtin.assert:
+    that:
+      - >-
+        hostvars[_tr_alias][_tr_prof.key_var] is not defined or _tr_flag == ''
+        or hostvars[_tr_alias][_tr_prof.key_var] == _tr_flag
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.conflict,
+                               'rh_rf_detail': [tr.contract.texts.flag_conflict, tr.contract.overrides.ssh_key.flag,
+                                                _tr_flag | to_json, _tr_alias, _tr_prof.key_var,
+                                                ([hostvars[_tr_alias][_tr_prof.key_var]]
+                                                 if _tr_prof.key_var in hostvars[_tr_alias] else []) | to_json]}) | trim }}
+    quiet: true
+  when: _tr_kind.target_scope
+
+# r5g (codex-tick410-412 R5F-DERIVED-ALIASES): the task var is in the reserved ^_?tr_ family (reserved_transfer_vars),
+# so a supplied -e/inventory _tr_bk is refused by refuse_reserved_families.yml at the entry's first play, before any
+# contact; a task var alone would be outranked by an extra var.
+- name: Refuse a controller-operation host key var that differs from its loader-bound key input
+  vars:
+    _tr_bk: "{{ lme_resolved.remote_harness.binding.deployment[_tr_kind.inputs_at][_tr_alias][_tr_kind.key_input] }}"
+  ansible.builtin.assert:
+    that:
+      - hostvars[_tr_alias][_tr_prof.key_var] is not defined or hostvars[_tr_alias][_tr_prof.key_var] == _tr_bk
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.conflict,
+                               'rh_rf_detail': [tr.contract.texts.bound_key_conflict, _tr_alias, _tr_prof.key_var,
+                                                [_tr_kind.inputs_at, _tr_alias, _tr_kind.key_input] | to_json]}) | trim }}
+    quiet: true
+  when: not _tr_kind.target_scope
+
+- name: Name the peer's key reference by its declared source (a path reference; never read)
+  ansible.builtin.set_fact:
+    # r5u (X-B-01): exact-name presence, then the value; r5p's falsy-replacing fallback semantics kept EXACTLY (a set but
+    # falsy key var -- '' / null -- yields to the flag, else none); no fallback filter
+    _tr_keyref: >-
+      {{ {'key': (hostvars[_tr_alias][_tr_prof.key_var]
+                  if (_tr_prof.key_var in hostvars[_tr_alias] and hostvars[_tr_alias][_tr_prof.key_var])
+                  else (_tr_flag if _tr_flag != '' else none)),
+          'key_source': ('profile' if _tr_prof.key_var in hostvars[_tr_alias]
+                         else ('flag' if _tr_flag != '' else 'none'))}
+         if _tr_kind.target_scope else
+         {'key': lme_resolved.remote_harness.binding.deployment[_tr_kind.inputs_at][_tr_alias][_tr_kind.key_input],
+          'key_source': (_tr_kind.key_source
+                         if lme_resolved.remote_harness.binding.deployment[_tr_kind.inputs_at][_tr_alias][_tr_kind.key_input] is not none
+                         else 'none')} }}
+
+# r5u (X-B-01): the address / port ABSENCE rules are the declared endpoint composition rule
+# (controller.bootstrap.ssh_auth.composition.{address, port}; the route's admit_transport compares the same
+# declaration), not consumer defaults: B's contract vars must BE the composition vars, and an absent address is the
+# host var the composition names (address.absent). An absent port stays the contract's existing absent encoding
+# (none: no -p; composition.port.absent delegates to the owner's ssh configuration) -- no number is invented.
+- name: Refuse a contract address / port var that is not the declared composition rule (exact-name presence)
+  vars:
+    _tr_cmp_rule: "{{ tr_bs.ssh_auth.composition }}"
+  ansible.builtin.assert:
+    that:
+      - _tr_cmp_rule.address is mapping and _tr_cmp_rule.port is mapping
+      - tr.contract.address_var == _tr_cmp_rule.address.var
+      - tr.contract.port_var == _tr_cmp_rule.port.var
+      - _tr_cmp_rule.address.absent is string and _tr_cmp_rule.address.absent in hostvars[_tr_alias]
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.field,
+                               'rh_rf_detail': [tr.contract.texts.composition, _tr_alias,
+                                                [tr.contract.address_var, tr.contract.port_var] | to_json,
+                                                _tr_cmp_rule | to_json]}) | trim }}
+    quiet: true
+
+- name: Resolve the contract (one value per field; no invented default)
+  ansible.builtin.set_fact:
+    tr_contract: >-
+      {{ {'schema': tr.contract_schema,
+          'alias': _tr_alias,
+          'address': (hostvars[_tr_alias][tr.contract.address_var]
+                      if tr.contract.address_var in hostvars[_tr_alias]
+                      else hostvars[_tr_alias][tr_bs.ssh_auth.composition.address.absent]),
+          'user': _tr_prof.user,
+          'profile': tr.contract.connection_profile,
+          'auth_mode': _tr_mode,
+          'mode_args': tr_bs.ssh_auth.modes[_tr_mode].ssh_common_args,
+          'port': (hostvars[_tr_alias][tr.contract.port_var] if tr.contract.port_var in hostvars[_tr_alias] else none),
+          'key': _tr_keyref.key,
+          'key_source': _tr_keyref.key_source,
+          'proxy': _tr_px.jump if (_tr_px.jump is string and (_tr_px.jump | length) > 0) else none,
+          'privilege': tr.contract.privilege} }}
+
+- name: Admit every contract field (address, declared privilege, port, key per auth mode, proxy)
+  ansible.builtin.assert:
+    that:
+      - tr_contract.address is string and tr_contract.address is match(tr.contract.address_regex)
+      - tr_contract.user == tr.contract.privilege.remote_user
+      - tr_contract.port is none or ((tr_contract.port | string) is match('^[1-9][0-9]{0,4}$') and (tr_contract.port | int) <= 65535)
+      - >-
+        tr_contract.key is none or (tr_contract.key is string and tr_contract.key is match(tr_bs.path_admission.regex)
+        and tr_contract.key is not search(tr_bs.path_admission.forbidden_segment_regex))
+      - (tr_contract.auth_mode != 'explicit_key') or (tr_contract.key is not none)
+      - (tr_contract.auth_mode != 'tailnet_identity') or (tr_contract.key is none)
+      - tr_contract.proxy is none or tr_contract.proxy is match('^[A-Za-z0-9._@:-]+$')
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.field,
+                               'rh_rf_detail': [tr.contract.texts.field, _tr_alias, tr_peer.kind, tr_contract | to_json,
+                                                tr.contract.privilege.remote_user, _tr_prof.key_var,
+                                                tr.contract.overrides.ssh_key.flag]}) | trim }}
+    quiet: true
+
+- name: Stat the credential reference (a key must be a readable regular file, not a link; content never read)
+  ansible.builtin.stat:
+    path: "{{ tr_contract.key }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: _tr_key
+  when: tr_contract.key is not none
+
+- name: Refuse a missing or linked key
+  ansible.builtin.assert:
+    that:
+      - _tr_key.stat.exists and _tr_key.stat.isreg and _tr_key.stat.readable
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.key,
+                               'rh_rf_detail': [tr.contract.texts.key, tr_contract.key]}) | trim }}
+    quiet: true
+  when: tr_contract.key is not none
+
+- name: Render deploy_gate's ssh argv and the Ansible connection vars from the SAME contract (one macro)
+  ansible.builtin.set_fact:
+    tr_ssh_argv: >-
+      {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                template_vars={'lme_macro': 'ssh_argv', 'lme_args': [tr, tr_contract]}) | from_json }}
+    tr_conn: >-
+      {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                template_vars={'lme_macro': 'ansible_conn', 'lme_args': [tr, tr_contract]}) | from_json }}
+
+- name: Every connection var and credential selector is bound, and only those (B-INHERITED-OWNER-KEY)
+  vars:
+    _sel: "{{ tr.contract.credential_selectors }}"
+    # _sel['clear'] by SUBSCRIPT: `_sel.clear` is the dict METHOD clear in Jinja, never the data key (route audit)
+    _clr: "{{ _sel['clear'] }}"
+  ansible.builtin.assert:
+    that:
+      - _clr is sequence and _clr is not string and _clr | length > 0
+      - (tr_conn.keys() | list | sort) == ((tr.contract.conn_vars + _sel.bind_key + _clr) | sort)
+      - _sel.bind_key | map('extract', tr_conn) | unique | list == [tr_contract.key if tr_contract.key is not none else '']
+      - _clr | map('extract', tr_conn) | reject('equalto', '') | list | length == 0
+    fail_msg: >-
+      {{ lookup('ansible.builtin.template', rh_repo_root ~ tr_bs.path_admission.separator ~ tr_bs.refusal_grammar.entry_rel,
+                template_vars={'rh_rf_grammar': tr_bs.refusal_grammar, 'rh_rf_code': tr.contract.refusals.credential,
+                               'rh_rf_detail': [tr.contract.texts.credential, tr_conn.keys() | list | sort | to_json,
+                                                (tr.contract.conn_vars + _sel.bind_key + _clr) | sort | to_json]}) | trim }}
+    quiet: true

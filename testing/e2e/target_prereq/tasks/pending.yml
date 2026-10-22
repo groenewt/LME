@@ -1,0 +1,102 @@
+---
+# testing/e2e/target_prereq/tasks/pending.yml -- explicit ROTATION / GENERATION CHANGE (localhost; non-root).
+# Never touches the CURRENT pair (it is the recovery material until the declared retirement condition,
+# jk.obligations.retirement_condition, is recorded by the owner rotate leg). At most ONE open obligation.
+#   hold   : an open obligation 'pending' -> tool-verified readback of the .next pair == the obligation's -> no write
+#   resume : an open obligation 'started' (crash) -> generate the .next pair if BOTH halves are absent, read back,
+#            mark 'pending'; one half only -> JKEY-RESUME
+#   open   : no open obligation AND (lme_owner_key_op == rotate OR the record generation != jk.generation) -> journal
+#            the obligation 'started', generate the .next pair, read back, mark 'pending'
+#   none   : nothing to do (a .next half without an open obligation refuses JKEY-RESUME: unrecorded replacement)
+# This leg NEVER closes an obligation, promotes .next, or removes / changes the current pair (closed_by
+# jk.obligations.closed_by). Output: jk_record (updated), jk_plan.pending.
+
+- name: Classify the pending phase (observation of the record just read or written + the .next presence)
+  vars:
+    _jk_open: "{{ jk_record.obligations | rejectattr('state', 'equalto', 'closed') | list }}"
+    _jk_need: "{{ lme_owner_key_op == 'rotate' or (jk_record.generation | int) != (jk.generation | int) }}"
+  ansible.builtin.set_fact:
+    _jk_ob: "{{ _jk_open | first | default(none) }}"
+    jk_plan: >-
+      {{ jk_plan | combine({'pending':
+           ('hold' if (_jk_open | length == 1 and _jk_open[0].state == 'pending' and jk_obs.next and jk_obs.next_pub)
+            else 'drift' if (_jk_open | length == 1 and _jk_open[0].state == 'pending')
+            else 'resume' if (_jk_open | length == 1 and _jk_open[0].state == 'started' and (jk_obs.next == jk_obs.next_pub))
+            else 'partial' if (_jk_open | length == 1)
+            else 'partial' if (jk_obs.next or jk_obs.next_pub)
+            else 'open' if _jk_need
+            else 'none')}) }}
+
+- name: Refuse a pending replacement that is gone, a half replacement, or an unrecorded replacement (all preserved)
+  ansible.builtin.assert:
+    that:
+      - jk_plan.pending in ['hold', 'resume', 'open', 'none']
+    fail_msg: >-
+      REFUSED {{ 'JKEY-DRIFT' if jk_plan.pending == 'drift' else 'JKEY-RESUME' }}: {{ jk_ctl.keydir }} holds
+      next={{ jk_obs.next }} next_pub={{ jk_obs.next_pub }} with open obligation
+      {{ _jk_ob.id | default('none') if _jk_ob is not none else 'none' }}; the current pair, the replacement files and the
+      obligation are kept (MAIN decides; the owner rotate leg closes obligations).
+    quiet: true
+
+- name: Journal the new obligation BEFORE generating its replacement ('started')
+  vars:
+    _jk_new_ob:
+      id: "{{ 'ob-' ~ ((jk_record.obligations | length) + 1) }}"
+      kind: "{{ 'rotation' if lme_owner_key_op == 'rotate' else 'generation_change' }}"
+      state: started
+      from_generation: "{{ jk_record.generation | int }}"
+      to_generation: "{{ jk.generation | int }}"   # rotation keeps the declared generation; a change moves to it
+      prior_fingerprint_sha256: "{{ jk_record.fingerprint_sha256 }}"
+      prior_pub_sha256: "{{ jk_record.pub_sha256 }}"
+      next_key_path: "{{ jk_ctl.next }}"
+      next_pub_path: "{{ jk_ctl.next_pub }}"
+      next_fingerprint_sha256: null
+      next_pub_sha256: null
+      steps: "{{ dict(jk.obligations.steps | zip(['open'] * (jk.obligations.steps | length))) }}"
+      retirement_condition: "{{ jk.obligations.retirement_condition }}"
+      closed_by: "{{ jk.obligations.closed_by }}"
+    _jk_rec_new: "{{ jk_record | combine({'obligations': jk_record.obligations + [_jk_new_ob]}) }}"
+  ansible.builtin.include_tasks: "{{ jk_dir }}/tasks/record.yml"
+  when: jk_plan.pending == 'open'
+
+- name: Bind the open obligation (after journaling)
+  ansible.builtin.set_fact:
+    _jk_ob: "{{ jk_record.obligations | rejectattr('state', 'equalto', 'closed') | list | first }}"
+  when: jk_plan.pending in ['open', 'resume', 'hold']
+
+- name: Generate the replacement pair (.next; the current pair is untouched)
+  ansible.builtin.include_tasks: "{{ jk_dir }}/tasks/generate.yml"
+  vars:
+    _jk_g_key: "{{ jk_ctl.next }}"
+    _jk_g_pub: "{{ jk_ctl.next_pub }}"
+    _jk_g_comment: "{{ jk_ctl.comment_base | replace('{generation}', (_jk_ob.to_generation | string) ~ '-' ~ _jk_ob.id) }}"
+  when: jk_plan.pending == 'open' or (jk_plan.pending == 'resume' and not jk_obs.next)
+
+- name: Tool-verified pair readback of the replacement pair
+  ansible.builtin.include_tasks: "{{ jk_dir }}/tasks/readback.yml"
+  vars:
+    _jk_rb_key: "{{ jk_ctl.next }}"
+    _jk_rb_pub: "{{ jk_ctl.next_pub }}"
+    _jk_rb_what: replacement
+  when: jk_plan.pending in ['open', 'resume', 'hold']
+
+- name: Refuse a held replacement that drifted from its obligation, or a replacement equal to the current key
+  ansible.builtin.assert:
+    that:
+      - jk_plan.pending != 'hold' or (jk_rb.fingerprint_sha256 == _jk_ob.next_fingerprint_sha256 and jk_rb.pub_sha256 == _jk_ob.next_pub_sha256)
+      - jk_rb.fingerprint_sha256 != jk_record.fingerprint_sha256
+    fail_msg: >-
+      REFUSED JKEY-DRIFT: the replacement {{ jk_ctl.next_pub }} reads back {{ jk_rb.fingerprint_sha256 }} but obligation
+      {{ _jk_ob.id }} recorded {{ _jk_ob.next_fingerprint_sha256 }} (or it equals the current key); everything is preserved.
+    quiet: true
+  when: jk_plan.pending in ['open', 'resume', 'hold']
+
+- name: Mark the obligation 'pending' with the replacement's public digests (open / resume)
+  ansible.builtin.include_tasks: "{{ jk_dir }}/tasks/record.yml"
+  vars:
+    _jk_rec_new: >-
+      {{ jk_record | combine({'obligations':
+           (jk_record.obligations | rejectattr('id', 'equalto', _jk_ob.id) | list)
+           + [_jk_ob | combine({'state': 'pending', 'next_fingerprint_sha256': jk_rb.fingerprint_sha256,
+                                'next_pub_sha256': jk_rb.pub_sha256})]}) }}
+  when: jk_plan.pending in ['open', 'resume']

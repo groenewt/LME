@@ -1,0 +1,263 @@
+- name: Require the new preseal source observation without claiming a completed X2 seal
+  ansible.builtin.assert:
+    that:
+    - rh_ar_preseal is mapping
+    - (rh_ar_preseal | list | sort) == (rh_ar_contract.preseal_fields | sort)
+    - (rh_ar_preseal.source | list | sort) == (rh_ar_contract.source_fields | sort)
+    - (rh_ar_preseal.lock | list | sort) == (rh_ar_contract.lock_fields | sort)
+    - (rh_ar_preseal.dependencies | list | sort) == (rh_ar_contract.dependency_roles | sort)
+    - rh_ar_preseal.source.status == rh_ar_contract.empty_text
+    - rh_ar_preseal.lock.kind == rh_ar_contract.lock.proof_kind
+    - rh_ar_preseal.lock.pid is match(rh_ar_contract.lock_pid_pattern)
+    - rh_ar_preseal.lock.fd == rh_ar_contract.lock.fd
+    - rh_ar_preseal.lock.fdinfo_line is match(rh_ar_contract.lock_line_pattern)
+    - rh_ar_preseal.lock.fdinfo_line | length <= rh_ar_contract.line_bound
+    - rh_ar_preseal.closure | length > rh_ar_contract.zero
+    - (rh_ar_preseal.override | list | sort) == (rh_ar_contract.override_fields | sort)
+    - rh_ar_preseal.override.state in rh_ar_contract.override_states.values()
+    - (rh_ar_preseal.captures | list | sort) == ((rh_ar_contract.capture_roles + ([rh_ar_contract.capture_role_names.override] if rh_ar_preseal.override.state
+      == rh_ar_contract.override_states.present else rh_ar_contract.empty_list)) | sort)
+    - (rh_ar_preseal.override.state == rh_ar_contract.override_states.absent and rh_ar_preseal.override.identity == rh_ar_contract.override_none)
+      or (rh_ar_preseal.override.state == rh_ar_contract.override_states.present and rh_ar_preseal.override.identity is match(rh_ar_contract.digest_pattern)
+      and rh_ar_preseal.captures[rh_ar_contract.capture_role_names.override].sha256 == rh_ar_preseal.override.identity)
+    - (rh_ar_contract.source_members | difference(rh_ar_preseal.closure | map(attribute='rel') | list) | length) == rh_ar_contract.zero
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }}'
+    quiet: true
+- name: Admit selected bootstrap tool binaries before invoking them
+  ansible.builtin.include_tasks: admit_authoring_tools.yml
+- name: Reobserve the current source commit tree and clean status
+  ansible.builtin.command:
+    argv: '{{ [rh_ar_tools.git.path] + item.value }}'
+    chdir: '{{ rh_ar_preseal.source.checkout }}'
+  loop: '{{ rh_ar_contract.git_args | dict2items }}'
+  register: _rh_ar_git
+  changed_when: false
+- name: Compare actual source identity before imports or publication
+  ansible.builtin.assert:
+    that:
+    - item.stdout == rh_ar_preseal.source[item.item.key]
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }} {{ item.item.key }}'
+    quiet: true
+  loop: '{{ _rh_ar_git.results }}'
+- name: Confine source closure members before filesystem access
+  ansible.builtin.assert:
+    that:
+    - item.rel is match(rh_ar_contract.source_rel_pattern)
+    - item.rel is not search(rh_ar_contract.forbidden_segments)
+    - item.sha256 is match(rh_ar_contract.digest_pattern)
+    - rh_ar_preseal.closure | map(attribute='rel') | list | unique | length == rh_ar_preseal.closure | length
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }}'
+    quiet: true
+  loop: '{{ rh_ar_preseal.closure }}'
+- name: Rehash the actual preseal source closure
+  ansible.builtin.stat:
+    path: '{{ [rh_ar_preseal.source.checkout, item.rel] | join(rh_ar_contract.separator) }}'
+    follow: false
+    get_checksum: true
+    checksum_algorithm: '{{ rh_ar_contract.digest }}'
+    get_mime: false
+    get_attributes: false
+  loop: '{{ rh_ar_preseal.closure }}'
+  register: _rh_ar_closure
+- name: Refuse source drift in any preseal closure member
+  ansible.builtin.assert:
+    that:
+    - item.stat.exists and item.stat.isreg and not item.stat.islnk
+    - item.stat.checksum == item.item.sha256
+    - not item.stat.wgrp and not item.stat.woth
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }} {{ item.item.rel }}'
+    quiet: true
+  loop: '{{ _rh_ar_closure.results }}'
+- name: Admit each capture as a member of the already verified closure
+  ansible.builtin.assert:
+    that:
+    - (item.value | list | sort) == (rh_ar_contract.capture_fields | sort)
+    - item.value.path == ([rh_ar_preseal.source.checkout, item.value.rel] | join(rh_ar_contract.separator))
+    - rh_ar_preseal.closure | selectattr('rel', 'equalto', item.value.rel) | selectattr('sha256', 'equalto', item.value.sha256) | list | length
+      == rh_ar_contract.one
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }} {{ item.key }}'
+    quiet: true
+  loop: '{{ rh_ar_preseal.captures | dict2items }}'
+- name: Capture the current admitted source documents without another configuration merge
+  ansible.builtin.slurp:
+    src: '{{ item.value.path }}'
+  loop: '{{ rh_ar_preseal.captures | dict2items }}'
+  register: _rh_ar_capture_reads
+- name: Bind captured source bytes before parsing their values
+  ansible.builtin.assert:
+    that:
+    - (item.content | b64decode | hash(rh_ar_contract.digest)) == item.item.value.sha256
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.source }} {{ item.item.key }}'
+    quiet: true
+  loop: '{{ _rh_ar_capture_reads.results }}'
+- name: Strict parse the source-bound declaration registry override and dependency lock
+  ansible.builtin.set_fact:
+    _rh_ar_capture_values: '{% set ns = namespace(pairs=rh_ar_contract.empty_list) %} {% for row in _rh_ar_capture_reads.results %} {% set ns.pairs
+      = ns.pairs + [[row.item.key, (row.content | b64decode | lme_manifest_strict(row.item.value.rel, rh_ar_contract.parse))]] %} {% endfor %}{{
+      dict(ns.pairs) }}'
+- name: Select the admitted source controller using its declared address only
+  ansible.builtin.set_fact:
+    _rh_ar_current_controller: '{% set ns = namespace(node=_rh_ar_capture_values[rh_ar_contract.capture_role_names.declaration]) %} {% for part
+      in rh_ar_contract.source_paths.controller %}{% set ns.node = ns.node[part] %}{% endfor %}{{ ns.node }}'
+    _rh_ar_current_global: '{% set ns = namespace(node=_rh_ar_capture_values[rh_ar_contract.capture_role_names.registry]) %} {% for part in rh_ar_contract.source_paths.global
+      %}{% set ns.node = ns.node[part] %}{% endfor %}{{ ns.node }}'
+    _rh_ar_current_lock: '{{ _rh_ar_capture_values[rh_ar_contract.capture_role_names.lock] }}'
+- name: Refuse preseal dependency overrides that require the complete loader
+  vars:
+    _rh_ar_override_shape: '{% set ns = namespace(node=(_rh_ar_capture_values[rh_ar_contract.capture_role_names.override] if rh_ar_preseal.override.state
+      == rh_ar_contract.override_states.present else rh_ar_contract.empty_mapping), ok=rh_ar_contract.present) %} {% if ns.node != rh_ar_contract.empty_mapping
+      %} {% for part in rh_ar_contract.source_paths.allowed_override %} {% if ns.node is not mapping or (ns.node | list) != [part] %}{% set ns.ok
+      = rh_ar_contract.absent %} {% else %}{% set ns.node = ns.node[part] %}{% endif %} {% endfor %} {% if ns.node is not mapping or (ns.node
+      | list | sort) != (rh_ar_contract.locator_fields | sort) %}{% set ns.ok = rh_ar_contract.absent %}{% endif %} {% endif %}{{ ns.ok }}'
+    _rh_ar_required_artifact_keys: '{{ [_rh_ar_current_controller.bootstrap.uv.installer_artifact, _rh_ar_current_controller.bootstrap.uv.archive_artifact,
+      _rh_ar_current_controller.bootstrap.python.artifact] }}'
+    _rh_ar_source_yaml_tags: '{% set ns = namespace(node=_rh_ar_capture_values[rh_ar_contract.capture_role_names.registry]) %}{% for part in rh_ar_contract.yaml_tags_from_registry
+      %}{% set ns.node = ns.node[part] %}{% endfor %}{{ ns.node }}'
+  ansible.builtin.assert:
+    that:
+    - _rh_ar_override_shape
+    - rh_ar_bootstrap | lme_type_aware_equal(_rh_ar_current_controller.bootstrap)
+    - rh_ar_contract | lme_type_aware_equal(_rh_ar_current_controller.bootstrap.genesis.builder.authoring.reconciliation)
+    - rh_ar_record_schemas | lme_type_aware_equal(_rh_ar_current_global.record_schemas)
+    - rh_ar_serialization | lme_type_aware_equal(_rh_ar_current_global.serialization_policies)
+    - rh_ar_preseal.dependencies.expect_core == _rh_ar_current_controller.expect_core
+    - rh_ar_preseal.dependencies.python_version == _rh_ar_current_controller.bootstrap.python.version
+    - rh_ar_preseal.dependencies.python_install_mode == _rh_ar_current_controller.bootstrap.python.install_mode
+    - rh_ar_preseal.dependencies.uv_version == _rh_ar_current_controller.bootstrap.uv.version
+    - rh_ar_preseal.dependencies.architecture == _rh_ar_current_lock.platform.arch
+    - rh_ar_subject | lme_type_aware_equal(_rh_ar_capture_values[rh_ar_contract.capture_role_names.subject])
+    - (_rh_ar_current_controller.bootstrap.artifacts | map(attribute=rh_ar_contract.artifact_fields.key) | list | unique | length) == (_rh_ar_current_controller.bootstrap.artifacts
+      | length)
+    - (_rh_ar_current_controller.bootstrap.artifacts | selectattr(rh_ar_contract.artifact_fields.key, 'in', _rh_ar_required_artifact_keys) | list
+      | length) == (_rh_ar_required_artifact_keys | length)
+    - (rh_ar_preseal.dependencies.dependency_sha256s | sort) == (((_rh_ar_current_lock.packages + _rh_ar_current_lock.collections) | map(attribute=rh_ar_contract.artifact_fields.sha256)
+      | list) + (_rh_ar_current_controller.bootstrap.artifacts | selectattr(rh_ar_contract.artifact_fields.key, 'in', _rh_ar_required_artifact_keys)
+      | map(attribute=rh_ar_contract.artifact_fields.sha256) | list) | sort)
+    - rh_ar_yaml_tags | lme_type_aware_equal(_rh_ar_source_yaml_tags)
+    - rh_ar_preseal.dependencies.architecture == _rh_ar_current_controller.bootstrap.platform.arch
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.dependency }}'
+    quiet: true
+- name: Select only current source registry and explicitly admitted locator inputs
+  ansible.builtin.set_fact:
+    _rh_ar_location_schema: '{% set ns = namespace(node=_rh_ar_capture_values[rh_ar_contract.capture_role_names.registry]) %}{% for part in rh_ar_contract.source_paths.location_schema
+      %}{% set ns.node = ns.node[part] %}{% endfor %}{{ ns.node }}'
+    _rh_ar_locator_override: '{% set ns = namespace(node=(_rh_ar_capture_values[rh_ar_contract.capture_role_names.override] if rh_ar_preseal.override.state
+      == rh_ar_contract.override_states.present else rh_ar_contract.empty_mapping)) %}{% if rh_ar_preseal.override.state == rh_ar_contract.override_states.present
+      %}{% for part in rh_ar_contract.source_paths.allowed_override %}{% set ns.node = ns.node[part] %}{% endfor %}{% endif %}{{ ns.node }}'
+- name: Project current authoring location through the sole existing engine
+  ansible.builtin.set_fact:
+    _rh_ar_effective_location: '{{ (dict([[rh_ar_contract.location_controller_role, _rh_ar_current_controller]]) | lme_authoring_location_with_locator(_rh_ar_location_schema,
+      rh_ar_preseal.source.checkout, _rh_ar_locator_override)) if rh_ar_preseal.override.state == rh_ar_contract.override_states.present else
+      (dict([[rh_ar_contract.location_controller_role, _rh_ar_current_controller]]) | lme_authoring_location(_rh_ar_location_schema, rh_ar_preseal.source.checkout))
+      }}'
+- name: Require the observed installation subject at the independently projected current root
+  ansible.builtin.assert:
+    that:
+    - rh_ar_subject.root == _rh_ar_effective_location[rh_ar_contract.location_root_field]
+    - _rh_ar_effective_location[rh_ar_contract.location_receipt_field] == rh_ar_subject.root ~ rh_ar_contract.separator ~ rh_ar_contract.active_rel
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.path }}'
+    quiet: true
+- name: Verify the actual live preseal root exclusion
+  ansible.builtin.include_tasks: verify_authoring_lock.yml
+- name: Reobserve the complete historical installation through the owned observation task
+  ansible.builtin.include_tasks: observe_authoring_installation.yml
+  vars:
+    rh_ar_context:
+      source: '{{ rh_ar_preseal.source }}'
+      dependencies: '{{ rh_ar_preseal.dependencies }}'
+- name: Require the same root inode and owner as the held descriptor
+  ansible.builtin.assert:
+    that:
+    - (_rh_ar_dirs.results | first).stat.dev == _rh_ar_lock_fd.stat.dev
+    - (_rh_ar_dirs.results | first).stat.inode == _rh_ar_lock_fd.stat.inode
+    - _rh_ar_lock_fd.stat.uid == (_rh_ar_uid.stdout | int)
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.lock }}'
+    quiet: true
+- name: Retain the originally observed and locked root identity as publication authority
+  ansible.builtin.set_fact:
+    _rh_ar_admitted_root_identity: '{{ [(_rh_ar_dirs.results | first).stat.dev | string, (_rh_ar_dirs.results | first).stat.inode | string, (_rh_ar_dirs.results
+      | first).stat.uid | string, ((_rh_ar_dirs.results | first).stat.mode | regex_replace(rh_ar_contract.mode_leading_zero_pattern, rh_ar_contract.empty_text))]
+      | join(rh_ar_contract.identity_separator) }}'
+- name: Verify retained historical source and current exact artifact compatibility
+  ansible.builtin.include_tasks: verify_authoring_origin.yml
+  vars:
+    rh_ar_context:
+      source: '{{ rh_ar_preseal.source }}'
+      dependencies: '{{ rh_ar_preseal.dependencies }}'
+- name: Exercise existing managed binaries without installation retention or cleanup
+  ansible.builtin.include_tasks: smoke_authoring_installation.yml
+  vars:
+    rh_ar_context:
+      source: '{{ rh_ar_preseal.source }}'
+      dependencies: '{{ rh_ar_preseal.dependencies }}'
+- name: Build the distinct current compatibility admission without rewriting origin
+  ansible.builtin.set_fact:
+    _rh_ar_current:
+      source_commit: '{{ rh_ar_preseal.source.commit }}'
+      source_tree: '{{ rh_ar_preseal.source.tree }}'
+      declaration_sha256: '{{ rh_ar_preseal.captures.declaration.sha256 }}'
+      registry_sha256: '{{ rh_ar_preseal.captures.registry.sha256 }}'
+      override_sha256: '{{ rh_ar_preseal.override.identity }}'
+      compatibility: '{{ rh_ar_preseal.dependencies }}'
+- name: Derive immutable successor name using the existing canonical record renderer
+  ansible.builtin.set_fact:
+    _rh_ar_current_identity: '{{ _rh_ar_current | lme_render_record(rh_ar_record_schemas, rh_ar_serialization, rh_ar_yaml_tags, rh_ar_contract.current_admission_record)
+      | hash(rh_ar_contract.digest) }}'
+- name: Build the canonical authoring admission with separated historical and current fields
+  ansible.builtin.set_fact:
+    _rh_ar_receipt:
+      schema: '{{ rh_ar_contract.receipt_schema }}'
+      historical_origin: '{{ rh_ar_subject.historical_origin | combine({''installation'': _rh_ar_origin, ''legacy_receipt_sha256'': rh_ar_subject.legacy_sha256})
+        }}'
+      current_admission: '{{ _rh_ar_current }}'
+      observed_content: '{{ dict(rh_ar_contract.critical_fields | zip(rh_ar_contract.critical_fields | map(''extract'', _rh_ar_origin))) }}'
+      custody:
+        root: '{{ rh_ar_subject.root }}'
+        generation: '{{ rh_ar_subject.generation }}'
+        owner_uid: '{{ _rh_ar_uid.stdout | int }}'
+        owner_name: '{{ rh_ar_subject.owner }}'
+        active_receipt: '{{ rh_ar_subject.root ~ rh_ar_contract.separator ~ rh_ar_contract.active_rel }}'
+        sealed_receipt: '{{ rh_ar_subject.root ~ rh_ar_contract.separator ~ rh_ar_contract.sealed_prefix ~ _rh_ar_current_identity ~ rh_ar_contract.sealed_suffix
+          }}'
+- name: Render the successor through the existing canonical serializer
+  ansible.builtin.set_fact:
+    _rh_ar_text: '{{ _rh_ar_receipt | lme_render_record(rh_ar_record_schemas, rh_ar_serialization, rh_ar_yaml_tags, rh_ar_contract.receipt_record)
+      }}'
+- name: Enforce the declared admission metadata bound before any write
+  ansible.builtin.assert:
+    that:
+    - _rh_ar_text | length <= rh_ar_contract.publication_max_bytes
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.publication }}'
+    quiet: true
+- name: Reverify the same live root exclusion immediately before publication
+  ansible.builtin.include_tasks: verify_authoring_lock.yml
+- name: Capture exact root identity immediately before publication
+  ansible.builtin.command:
+    argv: '{{ [rh_ar_tools.stat.path] + rh_ar_contract.stat_args + [rh_ar_subject.root] }}'
+  register: _rh_ar_root_identity
+  changed_when: false
+- name: Refuse replacement of the already observed locked root before publication
+  ansible.builtin.assert:
+    that:
+    - _rh_ar_root_identity.stdout == _rh_ar_admitted_root_identity
+    - _rh_ar_lock_fd.stat.dev == (_rh_ar_dirs.results | first).stat.dev
+    - _rh_ar_lock_fd.stat.inode == (_rh_ar_dirs.results | first).stat.inode
+    - _rh_ar_lock_fd.stat.uid == (_rh_ar_dirs.results | first).stat.uid
+    fail_msg: '{{ rh_ar_contract.refusal }}: {{ rh_ar_contract.messages.lock }}'
+    quiet: true
+- name: Publish only new canonical metadata using the declared bounded macro
+  ansible.builtin.command:
+    argv:
+    - '{{ rh_ar_tools.sh.path }}'
+    - '{{ rh_ar_contract.shell_args | first }}'
+    - '{{ rh_ar_contract.shell_args | last }}'
+    - '{{ lookup(rh_ar_contract.template_plugin, rh_ar_preseal.source.checkout ~ rh_ar_contract.separator ~ rh_ar_contract.publish_template_rel,
+      template_vars={''rh_ar_template_root'': rh_ar_preseal.source.checkout, ''rh_ar_publication'': {''sealed'': _rh_ar_receipt.custody.sealed_receipt,
+      ''active'': _rh_ar_receipt.custody.active_receipt, ''pending'': _rh_ar_receipt.custody.sealed_receipt ~ rh_ar_contract.pending_suffix, ''text'':
+      _rh_ar_text, ''sha256'': (_rh_ar_text | hash(rh_ar_contract.digest)), ''uid'': (_rh_ar_uid.stdout | int), ''root_identity'': _rh_ar_admitted_root_identity}})
+      }}'
+  environment: '{{ rh_ar_contract.environment }}'
+  register: _rh_ar_publish
+  changed_when: _rh_ar_publish.stdout == rh_ar_contract.success_word
+- name: Read back through the same current admission verifier used by consumers
+  ansible.builtin.include_tasks: verify_authoring_admission.yml

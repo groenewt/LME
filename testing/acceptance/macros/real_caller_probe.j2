@@ -1,0 +1,63 @@
+{# testing/acceptance/macros/real_caller_probe.j2
+   Reusable probe renderer for ONE real-caller acceptance case.
+
+   Renders a mutation-free probe playbook that drives the REAL shared caller
+   (resolve.yml or load_manifests.yml) from a per-run HEAD snapshot. The caller
+   INPUT CONTRACT (clone_directory / lme_manifests_dir / lme_profile / lme_inputs)
+   is set via play `vars:` -- deliberately BELOW extra-var precedence -- and the
+   snapshot paths are BAKED at render time (| to_json). The case's hostile/valid
+   pins are NOT in this file: the runner injects them with `-e @pins.yml`, i.e. at
+   TRUE extra-var precedence, so a pinned PRIVATE derived intermediate
+   (_lme_eff_inputs / _lme_required_material_proj / a bare enable flag) overrides
+   the play-var contract. That precedence gap is exactly what discriminates the
+   codex C1 counterexamples and is unreachable from the loader_integration tier.
+
+   become:false + gather_facts:false + connection:local + the caller's own
+   localhost-delegated find make this change nothing on any host (mirrors E's
+   elasticsearch.yml barrier technique); an ACCEPT run proves stats.changed == 0.
+
+   Render-time facts the runner supplies: `case`, `snap_tasks` (dir holding the
+   snapshot resolve.yml/validate_resolved_config.yml/load_manifests.yml, co-located
+   so their relative include_tasks resolve), `snap_manifests` (snapshot manifests
+   dir). `case.assert.that` items are Jinja expression strings; success/fail msgs
+   may carry runtime `{{ ... }}` -- to_json bakes them verbatim for the probe to
+   evaluate at run time.
+#}
+---
+- name: "acceptance probe :: {{ case.name }} ({{ case.caller | default('resolve') }})"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    clone_directory: {{ (snap_manifests | dirname) | to_json }}
+    lme_manifests_dir: {{ snap_manifests | to_json }}
+    lme_profile: {{ (case.profile | default('default')) | to_json }}
+    lme_inputs: {{ (case.base_inputs | default({})) | to_json }}
+  tasks:
+    - name: "real-caller include :: {{ case.name }}"
+      ansible.builtin.include_tasks: {{ (snap_tasks ~ '/' ~ (case.caller | default('resolve')) ~ '.yml') | to_json }}
+
+    # Structured observed values (revision + the enable-flag resolutions). debug is
+    # changed:false; the runner reads this task's msg DICT from the JSON result (not
+    # a stdout scrape) to record observed values and to compare the resolved
+    # revision ACROSS runs (revision_equals / revision_differs_from). Only runs when
+    # the include did NOT reject (a rejected case emits nothing, correctly).
+    - name: "emit :: {{ case.name }}"
+      ansible.builtin.debug:
+        msg:
+{% raw %}
+          revision: '{{ lme_resolved_revision | default("NONE") }}'
+          install_otel: '{{ lme_resolved.install_otel | default("ABSENT") }}'
+          install_llm: '{{ lme_resolved.install_llm | default("ABSENT") }}'
+{% endraw %}
+
+    - name: "judge :: {{ case.name }}"
+      ansible.builtin.assert:
+        that:
+{% for a in (case.assert.that | default(['true'])) %}
+          - {{ a | to_json }}
+{% endfor %}
+        success_msg: {{ (case.assert.success_msg | default('acceptance judge OK :: ' ~ case.name)) | to_json }}
+        fail_msg: {{ (case.assert.fail_msg | default('acceptance judge FAILED :: ' ~ case.name)) | to_json }}
+        quiet: true

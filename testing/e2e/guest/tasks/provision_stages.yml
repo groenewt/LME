@@ -1,0 +1,1172 @@
+---
+# testing/e2e/guest/tasks/provision_stages.yml -- the STAGED, RESUMABLE provision of ONE generation (codex
+# GUEST-INTERRUPTED-PROVISION). Included ONLY by provision.yml, inside the held lease. Every stage is re-decided from
+# OBSERVED state under the lease; every artifact appears ATOMICALLY (built under a declared partial name, then renamed
+# into place with mv -T -n and read back), so an interruption leaves only states listed here:
+#   S1 CLAIM    runs/<run_id> absent       -> ids drawn, record(state=claimed) written in a dot-named staging dir,
+#                                             staging renamed onto runs/<run_id>; read back by GENERATION. The state
+#                                             "run dir without record" is unreachable; an existing one (legacy
+#                                             residue / foreign) refuses GUEST-STATE-AMBIGUOUS and is preserved.
+#                                             Leftover stagings are never adopted: preserved and reported.
+#   S2 ADOPT    runs/<run_id>/record        -> the generation the record names (ids are never re-drawn).
+#   S3 CHARGE   capacity for the not-yet-committed disk bytes; memory only while the guest is not running.
+#   S4 DISKS    codex GUEST-INITIALIZED-DISK. A disk is CREATED only from the PROVEN PRE-START stage: record
+#               state=claimed with NO recorded disk identity, unit load not-found, no console. partial -> rename ->
+#               chain check -> the (dev, inode) of both disks recorded (record still state=claimed). From then on
+#               (claimed-with-identity, starting, started) a missing disk pathname or one whose inode is not the
+#               recorded one refuses GUEST-DISK-IDENTITY and is preserved: initialized storage is NEVER recreated,
+#               not even when the pathname vanished under a running guest that still holds the old inode open.
+#   S5 SEED     user-data/meta-data byte-equal to the render (written only when absent, only before the unit ever ran);
+#               seed partial -> rename.
+#   S6 STARTING record(state=starting, argv, argv_sha256) BEFORE the unit exists (the argv is the generation's).
+#   S7 UNIT     bound+running -> adopt; not-found AND no console -> start; codex GUEST-SAME-GENERATION-RECOVERY: a
+#               STARTED generation whose process is gone is restarted IN THE SAME GENERATION only on the explicit
+#               token -e <gd.recovery.var>=<generation> and only when the gone unit binds to the record (not-found, or
+#               failed/inactive with the RECORDED InvocationID and no main process) and both disks are the recorded
+#               inodes (S4); the old console is renamed to console evidence, the RECORDED argv is started, and S8/S9
+#               require the recorded host-key observations. Anything else refuses and preserves.
+#   S8 OBSERVE  codex GUEST-PUBLIC-KEY-COMPLETION: waits (bounded) for BOTH console blocks -- fingerprints, then the
+#               public-key block -- or the identity marker; an incomplete console refuses GUEST-HOST-KEYS naming the
+#               markers found (the console is kept as evidence). S9 record(state=started) once (and on a recovery).
+# An unchanged apply of a started generation performs no write: every stage reads back and verify.yml runs.
+# codex tick331 GUEST-DELAYED-HOLDER-FENCE: every target mutation COMMAND runs under g_step_argv = the storage-root lock
+# + THIS epoch's live token + coreutils timeout (tasks/lease.yml HOST-SIDE FENCE), so a holder paused anywhere can never
+# mutate after a successor revoked it. Every MODULE write (template/copy) writes ONLY this epoch's partial
+# (<file><layout.epoch_partial_infix><epoch>); a FENCED rename publishes it. Each LEASE boundary declares the number of
+# operations up to the next boundary (_g_lease_ops) and admits them only within the RECORDED lease term.
+
+# ---- S0 re-decide under the lease (USE BOUNDARY)
+- name: USE BOUNDARY -- re-admit the ancestry of runs/<run_id>, preserved/<run_id> and bases/ (route rule, facts afresh)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ _g_anc_path }}"
+    rh_anc_refusal: "{{ gd.refusals.storage }}"
+  loop: ["{{ gp.run }}", "{{ gp.preserved_run }}", "{{ gp.bases }}"]
+  loop_control:
+    loop_var: _g_anc_path
+
+- name: Re-observe this run_id's owned state under the lease (read-only)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/observe_run.yml"
+
+- name: Refuse a retired run_id, or a run dir no record attributes to this lifecycle (preserved as found)
+  ansible.builtin.assert:
+    that:
+      - not _g_run.results[2].stat.exists
+      - (not _g_run.results[0].stat.exists) or _g_run.results[1].stat.exists
+    fail_msg: >-
+      REFUSED {{ gd.refusals.present if _g_run.results[2].stat.exists else gd.refusals.ambiguous }} on
+      {{ inventory_hostname }}: {{ gp.preserved_run }} exists (a run_id names ONE generation; declare a new run_id), or
+      {{ gp.run }} exists without {{ gd.layout.run_files.record }} (unattributable; preserved, never adopted).
+    quiet: true
+
+- name: Report leftover claim stagings of this run_id (preserved, never adopted or removed)
+  when: _g_claims.matched > 0
+  ansible.builtin.debug:
+    msg: "PRESERVED-UNKNOWN {{ _g_claims.files | map(attribute='path') | list }}"
+
+# ---- S1 CLAIM (only when runs/<run_id> is absent)
+- name: S1 -- draw this generation's uuid and generation id from the kernel (NEW claim only; read-only)
+  when: not _g_run.results[0].stat.exists
+  ansible.builtin.slurp:
+    src: "{{ gd.uuid_source }}"
+  loop: [uuid, generation]
+  register: _g_ids
+
+- name: S1 -- bind the drawn ids (derived)
+  when: not _g_run.results[0].stat.exists
+  ansible.builtin.set_fact:
+    g_uuid: "{{ (_g_ids.results[0].content | b64decode).strip() }}"
+    g_generation: "{{ (_g_ids.results[1].content | b64decode).strip() }}"
+    g_fingerprints: []
+    g_unit_argv: []
+    g_invocation_id: "{{ none }}"
+    g_disk_ids_record: {os: null, data: null}
+    g_recoveries: []
+
+- name: S1 -- refuse malformed or equal identities
+  when: not _g_run.results[0].stat.exists
+  ansible.builtin.assert:
+    that:
+      - g_uuid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+      - g_generation is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+      - g_uuid != g_generation
+    fail_msg: "REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: {{ gd.uuid_source }} returned malformed identities."
+    quiet: true
+
+- name: S1 -- LEASE boundary (claim)
+  when: not _g_run.results[0].stat.exists
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+    _g_lease_ops: 3
+
+- name: S1 -- ensure the owned runs/ and preserved/ directories (FENCED; mode applies only when created; existing kept)
+  when: not _g_run.results[0].stat.exists
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mkdir, '-p', '-m', gd.layout.dir_mode, '--', gp.runs, gp.preserved] }}"
+
+- name: S1 -- create this generation's claim staging EXCLUSIVELY (dot-named; can never match a run_id)
+  when: not _g_run.results[0].stat.exists
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mkdir, '-m', gd.layout.dir_mode, '--', gp.claim_prefix ~ g_generation] }}"
+
+- name: S1 -- write record(state=claimed) INSIDE the staging (the run dir never exists without its record)
+  when: not _g_run.results[0].stat.exists
+  vars:
+    g_state: claimed
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/templates/record.json.j2"
+    dest: "{{ gp.claim_prefix }}{{ g_generation }}/{{ gd.layout.run_files.record }}"
+    mode: "{{ gd.layout.file_mode }}"
+    force: false
+  timeout: "{{ gd.lease.step_s }}"
+
+- name: S1 -- LEASE boundary (publish claim)
+  when: not _g_run.results[0].stat.exists
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+
+- name: S1 -- publish the claim -- rename the staging onto runs/<run_id> (atomic; -n never replaces an existing entry)
+  when: not _g_run.results[0].stat.exists
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '-n', '--', gp.claim_prefix ~ g_generation, gp.run] }}"
+
+# ---- S2 ADOPT the generation the record names (fresh claim or resume)
+- name: S2 -- stat the record (no link followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ gp.files.record }}"
+    follow: false
+    get_checksum: false
+  register: _g_rec_st
+
+- name: S2 -- refuse a claim that did not publish THIS generation, or a record that is not an owned regular file
+  ansible.builtin.assert:
+    that:
+      - _g_rec_st.stat.exists and _g_rec_st.stat.isreg and not _g_rec_st.stat.islnk
+      - _g_rec_st.stat.uid == g_owner_uid | int
+    fail_msg: >-
+      REFUSED {{ gd.refusals.ambiguous }} on {{ inventory_hostname }}: {{ gp.files.record }} is absent or not an owned
+      regular file after the claim (mv -n refuses an existing destination silently); the staging and the run dir are
+      preserved as found.
+    quiet: true
+
+- name: S2 -- read the record
+  ansible.builtin.slurp:
+    src: "{{ gp.files.record }}"
+  register: _g_rec_raw
+
+- name: S2 -- bind the record (derived)
+  ansible.builtin.set_fact:
+    g_record: "{{ _g_rec_raw.content | b64decode | from_json }}"
+
+# codex tick331 RECORD VERSION: FIRST, before any shape check (a /1 record lacks lease_epoch/recoveries and must refuse
+# as its version, never as a shape mismatch). Nothing has been written to this run dir by this apply: S1 is skipped
+# whenever runs/<run_id> exists, so the record is left byte-identical. Never reinterpreted, rewritten or migrated.
+- name: S2 -- refuse a record of any version other than the one this lifecycle produces (preserved byte-identical)
+  ansible.builtin.assert:
+    that:
+      - g_record is mapping
+      - (g_record.schema | default(none)) == gd.record.schema
+    fail_msg: >-
+      REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.files.record }} is version
+      {{ (g_record.schema | default('undeclared')) if g_record is mapping else 'not-a-mapping' }}; this lifecycle
+      produces and reads only {{ gd.record.schema }}. The record and its run dir are preserved byte-identical; nothing
+      is reinterpreted, rewritten, migrated, started or moved (a migration is an explicit, separately reviewed step).
+    quiet: true
+
+# codex tick342-346: the owner/shape binding is the ONE shared admission tasks/record_admit.yml (also the record_chain
+# proof of tasks/lease_recover.yml): keys, state, run_id/name, hypervisor/owner, run_dir/storage_root, base, unit,
+# endpoint, allocation, disks, uuid/generation, lease_epoch, disk identities both-or-neither, recoveries consistency.
+- name: S2 -- admit the record's owner/shape binding (shared admission; derived, read-only)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/record_admit.yml"
+  vars:
+    _g_ra_rec: "{{ g_record }}"
+    _g_ra_states: [claimed, starting, started]
+
+- name: S2 -- refuse a record that is not THIS allocation's generation (a changed allocation is a NEW run_id)
+  ansible.builtin.assert:
+    that:
+      - _g_ra_ok | bool
+      - _g_run.results[0].stat.exists or g_record.generation == g_generation
+    fail_msg: >-
+      REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: {{ gp.files.record }} is not a claimed/starting/
+      started generation of THIS allocation (or the claim published another generation, or its disk identities /
+      recoveries are inconsistent with its state); preserved as found.
+    quiet: true
+
+- name: S2 -- adopt the recorded generation (ids are never re-drawn on resume)
+  ansible.builtin.set_fact:
+    g_uuid: "{{ g_record.uuid }}"
+    g_generation: "{{ g_record.generation }}"
+    g_fingerprints: "{{ g_record.host_key_fingerprints }}"
+    g_unit_argv: "{{ g_record.unit.argv }}"
+    g_invocation_id: "{{ g_record.unit.invocation_id }}"
+    g_disk_ids_record: "{{ {'os': g_record.disks.os.identity, 'data': g_record.disks.data.identity} }}"
+    g_host_public_keys: "{{ g_record.host_public_keys }}"
+    g_recoveries: "{{ g_record.recoveries }}"
+    g_recovering: false
+
+# ---- S3 CHARGE (resume-aware: never charge what this generation already holds)
+- name: S3 -- bind the running unit, if any, to this generation (read-only)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/unit_bind.yml"
+
+- name: S3 -- read the allocated size of the final disks that already exist (argv; shared lock, read-only)
+  ansible.builtin.command:
+    argv: ["{{ gt.qemu_img }}", "info", "--force-share", "--output=json", "{{ item }}"]
+  loop: "{{ [gp.files.os_disk, gp.files.data_disk] | select('in', _g_have | dict2items | selectattr('value') | map(attribute='key') | list) | list }}"
+  changed_when: false
+  register: _g_held
+
+- name: S3 -- observe free bytes of the storage root (argv; read-only)
+  ansible.builtin.command:
+    argv: ["{{ gt.df }}", "--output=avail", "-B1", "{{ gg.storage_root }}"]
+  changed_when: false
+  register: _g_df
+
+- name: S3 -- refuse insufficient capacity for the NOT-YET-COMMITTED virtual bytes plus the physical-host reserve
+  vars:
+    _g_avail: "{{ (_g_df.stdout_lines | default([]))[-1] | default('') | trim }}"
+    _g_virt: "{{ (gg.os_disk_gib + gg.data_disk_gib) * 1073741824 }}"
+    _g_used: "{{ _g_held.results | map(attribute='stdout') | map('from_json') | map(attribute='actual-size') | map('int') | sum }}"
+    _g_need: "{{ (_g_virt | int) - (_g_used | int) + gg.physical_reserve_gib * 1073741824 }}"
+  ansible.builtin.assert:
+    that:
+      - _g_avail is match('^[0-9]+$')
+      - _g_avail | int >= _g_need | int
+    fail_msg: >-
+      REFUSED {{ gd.refusals.capacity }} on {{ inventory_hostname }}: {{ gg.storage_root }} has {{ _g_avail }} bytes free;
+      this generation still needs {{ _g_need }} (full virtual size {{ _g_virt }} - already allocated {{ _g_used }} +
+      reserve {{ gg.physical_reserve_gib }} GiB).
+    quiet: true
+
+- name: S3 -- read the hypervisor's meminfo (only while this generation's guest is not running; read-only)
+  when: not (g_unit_obs.running | bool and g_unit_obs.bound | bool)
+  ansible.builtin.slurp:
+    src: "{{ gd.proc_meminfo }}"
+  register: _g_mem
+
+- name: S3 -- refuse insufficient available memory for the allocation plus the declared host headroom
+  when: not (g_unit_obs.running | bool and g_unit_obs.bound | bool)
+  vars:
+    _g_memline: "{{ (_g_mem.content | b64decode).split('\n') | select('match', '^MemAvailable:') | first | default('') }}"
+    _g_availb: "{{ ((_g_memline | regex_replace('^MemAvailable:\\s+([0-9]+) kB$', '\\1')) | int) * 1024 if _g_memline is match('^MemAvailable:\\s+[0-9]+ kB$') else -1 }}"
+    _g_needb: "{{ (gg.memory_mib + gg.host_headroom_mib) * 1048576 }}"
+  ansible.builtin.assert:
+    that:
+      - _g_availb | int > 0
+      - _g_availb | int >= _g_needb | int
+    fail_msg: >-
+      REFUSED {{ gd.refusals.memory }} on {{ inventory_hostname }}: MemAvailable {{ _g_availb }} bytes < guest
+      {{ gg.memory_mib }} MiB + host headroom {{ gg.host_headroom_mib }} MiB ({{ _g_needb }} bytes).
+    quiet: true
+
+# ---- S4 DISKS (codex GUEST-INITIALIZED-DISK: created ONLY from the proven pre-start stage; identity-bound after)
+- name: S4 -- bind the disk stage (derived; S3's unit observation and S0's run-file observation, both under the lease)
+  ansible.builtin.set_fact:
+    _g_missing_disks: >-
+      {{ (['os'] if not _g_have[gp.files.os_disk] else []) + (['data'] if not _g_have[gp.files.data_disk] else []) }}
+    _g_prestart: >-
+      {{ g_record.state == 'claimed' and g_disk_ids_record.os is none and g_disk_ids_record.data is none
+         and g_unit_obs.load == 'not-found' and not _g_have[gp.files.console] }}
+
+- name: S4 -- refuse to create a disk outside the proven pre-start stage (initialized storage is never recreated)
+  when: _g_missing_disks | length > 0
+  ansible.builtin.assert:
+    that:
+      - _g_prestart | bool
+    fail_msg: >-
+      REFUSED {{ gd.refusals.disk_identity }} on {{ inventory_hostname }}: disk(s) {{ _g_missing_disks }} of generation
+      {{ g_generation }} are missing, but the generation is past its pre-start stage (record state {{ g_record.state }},
+      recorded identities {{ g_disk_ids_record }}, unit {{ g_unit_obs.load }}/{{ g_unit_obs.active_state }} holding the
+      recorded inodes {{ g_unit_obs.disks_held }}, console present {{ _g_have[gp.files.console] }}). Nothing is created;
+      the run dir (and any running guest) is preserved as found for explicit recovery: retire moves it to preserved/.
+    quiet: true
+
+# codex tick331: the S4 create + publish commands (up to 2 + 2) are admitted TOGETHER against the recorded term
+- name: S4 -- LEASE boundary (disks)
+  when: _g_missing_disks | length > 0
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+    _g_lease_ops: "{{ 2 * (_g_missing_disks | length) }}"
+
+- name: S4 -- create each missing disk under its partial name (qcow2; a stale partial of THIS run is recreated)
+  when: not _g_have[item.final]
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.qemu_img, 'create', '-f', 'qcow2'] + item.backing + [item.partial, item.gib ~ 'G'] }}"
+  loop:
+    - {final: "{{ gp.files.os_disk }}", partial: "{{ gp.files.os_disk_partial }}", backing: ['-F', 'qcow2', '-b', "{{ gp.base }}"], gib: "{{ gg.os_disk_gib }}"}
+    - {final: "{{ gp.files.data_disk }}", partial: "{{ gp.files.data_disk_partial }}", backing: [], gib: "{{ gg.data_disk_gib }}"}
+  loop_control:
+    label: "{{ item.final }}"
+
+- name: S4 -- publish each new disk -- rename partial onto final (atomic; -n never replaces an existing disk)
+  when: not _g_have[item.final]
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '-n', '--', item.partial, item.final] }}"
+  loop:
+    - {final: "{{ gp.files.os_disk }}", partial: "{{ gp.files.os_disk_partial }}"}
+    - {final: "{{ gp.files.data_disk }}", partial: "{{ gp.files.data_disk_partial }}"}
+  loop_control:
+    label: "{{ item.final }}"
+
+# once recorded, the identities are an expectation: a missing, swapped or recreated pathname refuses GUEST-DISK-IDENTITY
+- name: S4 -- refuse any final disk that is not the declared one, or not the recorded inode (read-only)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/check_disks.yml"
+  vars:
+    _g_disks: [os, data]
+    _g_disk_ids_expect: "{{ g_disk_ids_record if (g_disk_ids_record.os is not none) else none }}"
+
+- name: S4 -- LEASE boundary (record the disk identities; stage claimed -> claimed-with-identity)
+  when: g_disk_ids_record.os is none
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+    _g_lease_ops: 2
+
+# set_fact, NOT task vars: g_disk_ids_record is a set_fact since S1/S2
+- name: S4 -- bind the observed disk identities to record (derived; only while none is recorded)
+  when: g_disk_ids_record.os is none
+  ansible.builtin.set_fact:
+    g_disk_ids_record: "{{ g_disk_ids }}"
+
+- name: S4 -- record the disk identities -- write this epoch's record partial (record state stays claimed)
+  when: g_record.disks.os.identity is none
+  vars:
+    g_state: claimed
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/templates/record.json.j2"
+    dest: "{{ gp.files.record }}{{ gd.layout.epoch_partial_infix }}{{ g_lease_epoch }}"
+    mode: "{{ gd.layout.file_mode }}"
+  timeout: "{{ gd.lease.step_s }}"
+
+- name: S4 -- record the disk identities -- FENCED rename of the partial onto the record (atomic replace)
+  when: g_record.disks.os.identity is none
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '--', gp.files.record ~ gd.layout.epoch_partial_infix ~ g_lease_epoch, gp.files.record] }}"
+
+- name: S4 -- read the record back (read-only)
+  ansible.builtin.slurp:
+    src: "{{ gp.files.record }}"
+  register: _g_rec_raw
+
+- name: S4 -- bind the record (derived)
+  ansible.builtin.set_fact:
+    g_record: "{{ _g_rec_raw.content | b64decode | from_json }}"
+
+- name: S4 -- refuse a read-back of any other record version (preserved as found)
+  ansible.builtin.assert:
+    that:
+      - g_record is mapping and (g_record.schema | default(none)) == gd.record.schema
+    fail_msg: "REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.files.record }} read back as version {{ g_record.schema | default('undeclared') }}, not {{ gd.record.schema }}; preserved as found."
+    quiet: true
+
+- name: S4 -- refuse a record that does not carry the observed disk identities of this generation
+  ansible.builtin.assert:
+    that:
+      - g_record.generation == g_generation
+      - g_record.disks.os.identity == g_disk_ids.os and g_record.disks.data.identity == g_disk_ids.data
+      - g_disk_ids.os is mapping and g_disk_ids.data is mapping
+    fail_msg: >-
+      REFUSED {{ gd.refusals.disk_identity }} on {{ inventory_hostname }}: {{ gp.files.record }} records disk identities
+      {{ g_record.disks.os.identity }} / {{ g_record.disks.data.identity }}, observed {{ g_disk_ids }}; preserved as found.
+    quiet: true
+
+# ---- S5 SEED (inputs byte-equal to the render; the seed image only ever appears complete)
+- name: S5 -- refuse to (re)build seed material once the unit may have run (only before the first start)
+  when: not (_g_have[gp.files.user_data] and _g_have[gp.files.meta_data] and _g_have[gp.files.seed])
+  ansible.builtin.assert:
+    that:
+      - g_record.state in ['claimed', 'starting']
+      - g_unit_obs.load == 'not-found' and not _g_have[gp.files.console]
+    fail_msg: >-
+      REFUSED {{ gd.refusals.ambiguous }} on {{ inventory_hostname }}: seed material of generation {{ g_generation }} is
+      missing after its guest may have run (record state {{ g_record.state }}, unit {{ g_unit_obs.load }}, console
+      present {{ _g_have[gp.files.console] }}). Nothing is rebuilt; preserved as found.
+    quiet: true
+
+# ops: 2 partial writes + 2 publishes + seed build + seed publish
+- name: S5 -- LEASE boundary (seed)
+  when: not (_g_have[gp.files.user_data] and _g_have[gp.files.meta_data] and _g_have[gp.files.seed])
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+    _g_lease_ops: 6
+
+- name: S5 -- write the NoCloud user-data and meta-data renders to this epoch's partials when absent (PUBLIC keys only)
+  when: not _g_have[item.dest]
+  timeout: "{{ gd.lease.step_s }}"
+  ansible.builtin.copy:
+    content: "{{ lookup('ansible.builtin.template', playbook_dir ~ '/templates/' ~ item.src) }}"
+    dest: "{{ item.dest }}{{ gd.layout.epoch_partial_infix }}{{ g_lease_epoch }}"
+    mode: "{{ gd.layout.file_mode }}"
+  loop:
+    - {src: user-data.j2, dest: "{{ gp.files.user_data }}"}
+    - {src: meta-data.j2, dest: "{{ gp.files.meta_data }}"}
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: S5 -- publish each render -- FENCED no-replace rename of the partial (one render, never rewritten)
+  when: not _g_have[item]
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '-n', '--', item ~ gd.layout.epoch_partial_infix ~ g_lease_epoch, item] }}"
+  loop: ["{{ gp.files.user_data }}", "{{ gp.files.meta_data }}"]
+
+- name: S5 -- read the seed inputs back (read-only)
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: ["{{ gp.files.user_data }}", "{{ gp.files.meta_data }}"]
+  register: _g_seedin
+
+- name: S5 -- refuse seed inputs that are not byte-equal to THIS generation's render (preserved as found)
+  ansible.builtin.assert:
+    that:
+      - (_g_seedin.results[0].content | b64decode) == lookup('ansible.builtin.template', playbook_dir ~ '/templates/user-data.j2')
+      - (_g_seedin.results[1].content | b64decode) == lookup('ansible.builtin.template', playbook_dir ~ '/templates/meta-data.j2')
+    fail_msg: >-
+      REFUSED {{ gd.refusals.ambiguous }} on {{ inventory_hostname }}: {{ gp.files.user_data }} / {{ gp.files.meta_data }}
+      are not this generation's render; nothing is rebuilt over them.
+    quiet: true
+
+- name: S5 -- build the seed image under its partial name when the seed is absent
+  when: not _g_have[gp.files.seed]
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.cloud_localds, gp.files.seed_partial, gp.files.user_data, gp.files.meta_data] }}"
+
+- name: S5 -- publish the seed -- rename partial onto final (atomic; -n never replaces)
+  when: not _g_have[gp.files.seed]
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '-n', '--', gp.files.seed_partial, gp.files.seed] }}"
+
+- name: S5 -- stat the published seed (no link followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ gp.files.seed }}"
+    follow: false
+    get_checksum: false
+  register: _g_seed_st
+
+- name: S5 -- refuse a missing or foreign seed
+  ansible.builtin.assert:
+    that:
+      - _g_seed_st.stat.exists and _g_seed_st.stat.isreg and not _g_seed_st.stat.islnk
+      - _g_seed_st.stat.uid == g_owner_uid | int and _g_seed_st.stat.size > 0
+    fail_msg: "REFUSED {{ gd.refusals.ambiguous }} on {{ inventory_hostname }}: {{ gp.files.seed }} is not an owned, non-empty regular file."
+    quiet: true
+
+# ---- S6 STARTING (the argv is recorded BEFORE the unit can exist; the recorded argv IS the generation's process)
+- name: S6 -- render this generation's process argv (derived; never through a shell)
+  ansible.builtin.set_fact:
+    _g_qemu: "{{ lookup('ansible.builtin.template', playbook_dir ~ '/templates/qemu-argv.json.j2') | from_json }}"
+
+- name: S6 -- refuse a not-yet-started generation whose recorded argv differs from the declaration (new run_id instead)
+  when: g_record.state == 'starting'
+  ansible.builtin.assert:
+    that:
+      - g_record.unit.argv == _g_qemu or (g_unit_obs.running | bool and g_unit_obs.bound | bool)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.mismatch }} on {{ inventory_hostname }}: the declaration changed after {{ gg.run_id }} recorded
+      its argv and before its guest ran; a changed declaration is a NEW run_id. Preserved as found.
+    quiet: true
+
+- name: S6 -- LEASE boundary (starting record)
+  when: g_record.state == 'claimed'
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+    _g_lease_ops: 2
+
+# set_fact, NOT task vars: g_unit_argv is already a set_fact (S1/S2), which outranks a task-level var of the same name
+- name: S6 -- bind the argv to record (derived)
+  when: g_record.state == 'claimed'
+  ansible.builtin.set_fact:
+    g_unit_argv: "{{ _g_qemu }}"
+
+- name: S6 -- record state=starting with the argv and its sha256 -- write this epoch's record partial
+  when: g_record.state == 'claimed'
+  vars:
+    g_state: starting
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/templates/record.json.j2"
+    dest: "{{ gp.files.record }}{{ gd.layout.epoch_partial_infix }}{{ g_lease_epoch }}"
+    mode: "{{ gd.layout.file_mode }}"
+  timeout: "{{ gd.lease.step_s }}"
+
+- name: S6 -- record state=starting -- FENCED rename of the partial onto the record (atomic replace)
+  when: g_record.state == 'claimed'
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '--', gp.files.record ~ gd.layout.epoch_partial_infix ~ g_lease_epoch, gp.files.record] }}"
+
+- name: S6 -- read the record back
+  ansible.builtin.slurp:
+    src: "{{ gp.files.record }}"
+  register: _g_rec_raw
+
+- name: S6 -- bind the record (derived)
+  ansible.builtin.set_fact:
+    g_record: "{{ _g_rec_raw.content | b64decode | from_json }}"
+
+- name: S6 -- refuse a read-back of any other record version (preserved as found)
+  ansible.builtin.assert:
+    that:
+      - g_record is mapping and (g_record.schema | default(none)) == gd.record.schema
+    fail_msg: "REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.files.record }} read back as version {{ g_record.schema | default('undeclared') }}, not {{ gd.record.schema }}; preserved as found."
+    quiet: true
+
+- name: S6 -- refuse a record that does not carry this generation's argv
+  ansible.builtin.assert:
+    that:
+      - g_record.state in ['starting', 'started'] and g_record.generation == g_generation
+      - g_record.unit.argv | length > 0
+      - g_record.unit.argv_sha256 == (g_record.unit.argv | to_json | hash('sha256'))
+      - g_record.disks.os.identity == g_disk_ids.os and g_record.disks.data.identity == g_disk_ids.data
+    fail_msg: "REFUSED {{ gd.refusals.ambiguous }} on {{ inventory_hostname }}: {{ gp.files.record }} does not carry this generation's argv and disk identities."
+    quiet: true
+
+# ---- S7 UNIT (no duplicate VM: start only when nothing ran; adopt only what binds)
+- name: S7 -- bind the unit again, right before the decision (read-only)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/unit_bind.yml"
+
+# codex GUEST-SAME-GENERATION-RECOVERY. The token is explicit, names THIS generation (never a run_id) and is only
+# honoured for a STARTED record whose unit is not running and whose gone unit is this generation's: not-found, or
+# failed/inactive with the RECORDED InvocationID and no main process. Disks were bound to the recorded inodes at S4.
+# Recovery is recorded in TWO writes around the start, so no interruption leaves an unbindable guest of this generation:
+#   INTENT   (before the evidence rename and the start) unit.invocation_id := null, recoveries += {previous_invocation_id,
+#            invocation_id: null, ...}. A record in this PENDING state binds any InvocationID (unit_bind: none recorded)
+#            as long as argv, cgroup and the recorded disk inodes bind, so a guest started by an interrupted recovery is
+#            adopted (and retire can stop it); a pending recovery whose unit is not-found is resumed with the same token
+#            and reuses its entry and evidence name.
+#   COMPLETE (after the bind) unit.invocation_id := the running InvocationID, and the pending entry's invocation_id too.
+# codex tick331 GUEST-PENDING-TOKEN-RETRY: the SAME token retried (identical invocation) after an interruption is
+# honoured without any rename, reset or restart when THIS generation's guest runs and binds and its recovery is
+# PENDING (-> the completion write only) or already COMPLETED with exactly that running invocation (-> no write at all).
+# _g_recover_restart (token AND the guest is not running+bound) alone gates the reset, the console evidence, the intent
+# and the start; g_recovering (token given) gates only the completion/read-back/observation path.
+# codex tick331 GUEST-RECOVERY-CONSOLE-EVIDENCE: the intent binds the ORIGINAL console's identity
+# (console_evidence = {path, dev, inode}) or records it explicitly ABSENT (none); a resumed pending recovery starts only
+# when the observed console / evidence state is exactly one the intent allows (see the evidence refusal below).
+- name: S7 -- bind the recovery decision (derived)
+  ansible.builtin.set_fact:
+    _g_running_bound: "{{ g_unit_obs.running | bool and g_unit_obs.bound | bool }}"
+    _g_rec_done: >-
+      {{ g_record.state == 'started' and g_record.unit.invocation_id is not none
+         and g_record.recoveries | length > 0 and g_record.recoveries[-1].invocation_id == g_record.unit.invocation_id
+         and g_unit_obs.running | bool and g_unit_obs.bound | bool
+         and g_unit_obs.invocation_id == g_record.unit.invocation_id }}
+    _g_pending_rec: >-
+      {{ g_record.state == 'started' and g_record.unit.invocation_id is none
+         and g_record.recoveries | length > 0 and g_record.recoveries[-1].invocation_id is none }}
+    _g_rec_prev_inv: >-
+      {{ g_record.recoveries[-1].previous_invocation_id
+         if (g_record.state == 'started' and g_record.unit.invocation_id is none and g_record.recoveries | length > 0)
+         else g_record.unit.invocation_id }}
+    _g_recover_token: "{{ lookup('ansible.builtin.vars', gd.recovery.var, default='') | string }}"
+    _g_gone_is_ours: >-
+      {{ not (g_unit_obs.running | bool)
+         and (g_unit_obs.load == 'not-found'
+              or (g_unit_obs.load == 'loaded' and g_unit_obs.active_state in gd.recovery.gone_active_states
+                  and (g_unit_obs.main_pid | int) == 0
+                  and (g_record.unit.invocation_id | default('')) is match('^[0-9a-f]{32}$')
+                  and g_unit_obs.invocation_id == g_record.unit.invocation_id)) }}
+
+- name: S7 -- refuse a recovery token that is not this generation's, or given when there is nothing to recover
+  when: _g_recover_token | length > 0
+  ansible.builtin.assert:
+    that:
+      - _g_recover_token == g_generation
+      - g_record.state == 'started'
+      - >-
+        (_g_gone_is_ours | bool)
+        or ((_g_running_bound | bool) and ((_g_pending_rec | bool) or (_g_rec_done | bool)))
+    fail_msg: >-
+      REFUSED {{ gd.refusals.recovery }} on {{ inventory_hostname }}: {{ gd.recovery.var }}={{ _g_recover_token }} does
+      not name a recoverable generation here (record generation {{ g_generation }}, state {{ g_record.state }}, unit
+      {{ g_unit_obs.load }}/{{ g_unit_obs.active_state }} pid {{ g_unit_obs.main_pid }} invocation
+      {{ g_unit_obs.invocation_id }} vs recorded {{ g_record.unit.invocation_id }}, bound {{ g_unit_obs.bound }}, pending
+      {{ _g_pending_rec }}). Nothing is started or moved.
+    quiet: true
+
+- name: S7 -- bind whether this apply recovers the recorded generation and whether it must RESTART it (derived)
+  ansible.builtin.set_fact:
+    g_recovering: "{{ _g_recover_token | length > 0 }}"
+    _g_recover_restart: "{{ _g_recover_token | length > 0 and not (_g_running_bound | bool) }}"
+    _g_rec_prev_load: "{{ g_unit_obs.load }}"
+    _g_rec_prev_active: "{{ g_unit_obs.active_state }}"
+
+- name: S7 -- refuse a unit state that is neither this generation's running guest, a never-started one, nor a declared recovery
+  ansible.builtin.assert:
+    that:
+      - >-
+        (g_unit_obs.running | bool and g_unit_obs.bound | bool)
+        or (g_record.state == 'starting' and g_unit_obs.load == 'not-found' and not _g_have[gp.files.console])
+        or (g_recovering | bool)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.unit_reused if (g_unit_obs.running | bool) else gd.refusals.ambiguous }} on
+      {{ inventory_hostname }}: {{ gp.unit }} is {{ g_unit_obs.load }}/{{ g_unit_obs.active_state }} (bound to this
+      generation: {{ g_unit_obs.bound }}), record state {{ g_record.state }}, console present
+      {{ _g_have[gp.files.console] }}. Nothing is stopped, started or moved: a foreign unit of this name or a guest
+      that ran and exited before its started record (e.g. an identity-check poweroff) is preserved (retire it). A
+      STARTED generation whose own guest is gone is recovered in the same generation only on explicit
+      -e {{ gd.recovery.var }}={{ g_generation }}{{ '' if (g_record.state == 'started' and _g_gone_is_ours | bool)
+      else ' (not applicable to this state)' }}.
+    quiet: true
+
+- name: S7 RECOVERY -- LEASE boundary (clear the gone unit)
+  when: _g_recover_restart | bool and g_unit_obs.load != 'not-found'
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+
+- name: S7 RECOVERY -- clear the failed/inactive unit of the RECORDED invocation (bound above; name-addressed residual)
+  when: _g_recover_restart | bool and g_unit_obs.load != 'not-found'
+  environment:
+    XDG_RUNTIME_DIR: "{{ gp.runtime_dir }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path={{ gp.bus }}"
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.systemctl, '--user', 'reset-failed', '--', gp.unit] }}"
+
+- name: S7 RECOVERY -- bind the unit after clearing it (read-only)
+  when: _g_recover_restart | bool
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/unit_bind.yml"
+
+- name: S7 RECOVERY -- stat the console and its evidence name (no link followed; read-only)
+  when: _g_recover_restart | bool
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ gp.files.console }}", "{{ gp.console_evidence_prefix }}.{{ _g_rec_prev_inv }}"]
+  register: _g_cev
+
+# codex tick331 GUEST-RECOVERY-CONSOLE-EVIDENCE. The console / evidence state allowed before the start:
+#   FRESH intent        evidence absent; console absent (-> intent records console_evidence: none = EXPLICITLY absent)
+#                       or an owned regular non-link file (-> intent records its {path, dev, inode})
+#   PENDING, recorded none           console absent AND evidence absent (an appeared console or evidence is foreign)
+#   PENDING, recorded {path,dev,inode}
+#                       rename not yet done: console = the RECORDED inode (owned regular non-link), evidence absent
+#                       rename done:         console absent, evidence = the RECORDED inode (owned regular non-link)
+# Anything else (missing, replaced, symlinked or foreign evidence after the rename checkpoint) refuses GUEST-RECOVERY;
+# nothing is started, moved or rewritten.
+- name: S7 RECOVERY -- bind the console / evidence observations and the intent's recorded evidence (derived)
+  when: _g_recover_restart | bool
+  vars:
+    _g_c0: "{{ _g_cev.results[0].stat }}"
+    _g_c1: "{{ _g_cev.results[1].stat }}"
+  ansible.builtin.set_fact:
+    _g_con_ok: >-
+      {{ _g_c0.exists and _g_c0.isreg and not _g_c0.islnk and _g_c0.uid == g_owner_uid | int }}
+    _g_ev_ok: >-
+      {{ _g_c1.exists and _g_c1.isreg and not _g_c1.islnk and _g_c1.uid == g_owner_uid | int }}
+    _g_ev_rec: "{{ g_record.recoveries[-1].console_evidence if (_g_pending_rec | bool) else none }}"
+    _g_ev_path: "{{ gp.console_evidence_prefix }}.{{ _g_rec_prev_inv }}"
+
+- name: S7 RECOVERY -- refuse unless the unit is gone and the console / evidence state is one the intent allows
+  when: _g_recover_restart | bool
+  vars:
+    _g_c0: "{{ _g_cev.results[0].stat }}"
+    _g_c1: "{{ _g_cev.results[1].stat }}"
+  ansible.builtin.assert:
+    that:
+      - g_unit_obs.load == 'not-found'
+      - _g_rec_prev_inv is match('^[0-9a-f]{32}$')
+      - >-
+        (not (_g_pending_rec | bool)
+         and not _g_c1.exists and ((not _g_c0.exists) or (_g_con_ok | bool)))
+        or ((_g_pending_rec | bool) and _g_ev_rec is none
+            and not _g_c0.exists and not _g_c1.exists)
+        or ((_g_pending_rec | bool) and _g_ev_rec is mapping and _g_ev_rec.path == _g_ev_path
+            and (((_g_con_ok | bool) and _g_c0.dev == _g_ev_rec.dev and _g_c0.inode == _g_ev_rec.inode and not _g_c1.exists)
+                 or (not _g_c0.exists and (_g_ev_ok | bool) and _g_c1.dev == _g_ev_rec.dev and _g_c1.inode == _g_ev_rec.inode)))
+    fail_msg: >-
+      REFUSED {{ gd.refusals.recovery }} on {{ inventory_hostname }}: {{ gp.unit }} is {{ g_unit_obs.load }} after clearing,
+      or the console / evidence state is not one the recovery intent allows (pending {{ _g_pending_rec }}, recorded
+      evidence {{ _g_ev_rec }}; console exists {{ _g_c0.exists }} regular-owned {{ _g_con_ok }} inode
+      {{ _g_c0.inode | default('-') }}; {{ _g_ev_path }} exists {{ _g_c1.exists }} regular-owned {{ _g_ev_ok }} inode
+      {{ _g_c1.inode | default('-') }}). Nothing is started, moved or rewritten.
+    quiet: true
+
+- name: S7 RECOVERY -- LEASE boundary (recovery intent)
+  when: _g_recover_restart | bool and not (_g_pending_rec | bool)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+    _g_lease_ops: 2
+
+- name: S7 RECOVERY -- bind the recovery intent to record (derived; binds the ORIGINAL console identity or its absence)
+  when: _g_recover_restart | bool and not (_g_pending_rec | bool)
+  ansible.builtin.set_fact:
+    g_invocation_id: "{{ none }}"
+    g_recoveries: >-
+      {{ g_record.recoveries + [{'previous_invocation_id': _g_rec_prev_inv,
+                                  'invocation_id': none,
+                                  'previous_unit': {'load': _g_rec_prev_load, 'active_state': _g_rec_prev_active},
+                                  'console_evidence': {'path': _g_ev_path, 'dev': _g_cev.results[0].stat.dev,
+                                                       'inode': _g_cev.results[0].stat.inode}
+                                                      if _g_cev.results[0].stat.exists else none,
+                                  'lease_epoch': g_lease_epoch | int,
+                                  'recovered_at_epoch': _g_now | int}] }}
+
+- name: S7 RECOVERY -- record the recovery intent -- write this epoch's record partial (state stays started)
+  when: _g_recover_restart | bool and not (_g_pending_rec | bool)
+  vars:
+    g_state: started
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/templates/record.json.j2"
+    dest: "{{ gp.files.record }}{{ gd.layout.epoch_partial_infix }}{{ g_lease_epoch }}"
+    mode: "{{ gd.layout.file_mode }}"
+  timeout: "{{ gd.lease.step_s }}"
+
+- name: S7 RECOVERY -- record the recovery intent -- FENCED rename of the partial onto the record (atomic replace)
+  when: _g_recover_restart | bool and not (_g_pending_rec | bool)
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '--', gp.files.record ~ gd.layout.epoch_partial_infix ~ g_lease_epoch, gp.files.record] }}"
+
+- name: S7 RECOVERY -- read the record back (read-only)
+  when: _g_recover_restart | bool
+  ansible.builtin.slurp:
+    src: "{{ gp.files.record }}"
+  register: _g_rec_ri
+
+- name: S7 RECOVERY -- refuse a read-back of any other record version (preserved as found)
+  when: _g_recover_restart | bool
+  vars:
+    _g_ri: "{{ _g_rec_ri.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _g_ri is mapping and (_g_ri.schema | default(none)) == gd.record.schema
+    fail_msg: "REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.files.record }} read back as version {{ _g_ri.schema | default('undeclared') }}, not {{ gd.record.schema }}; nothing is started or moved."
+    quiet: true
+
+- name: S7 RECOVERY -- refuse a record that does not carry the pending recovery and the kept observations
+  when: _g_recover_restart | bool
+  vars:
+    _g_ri: "{{ _g_rec_ri.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _g_ri.state == 'started' and _g_ri.generation == g_generation
+      - _g_ri.unit.invocation_id is none
+      - _g_ri.recoveries == g_recoveries
+      - _g_ri.recoveries[-1].invocation_id is none and _g_ri.recoveries[-1].previous_invocation_id == _g_rec_prev_inv
+      - _g_ri.host_key_fingerprints == g_record.host_key_fingerprints
+      - _g_ri.host_public_keys == g_record.host_public_keys
+      - _g_ri.disks.os.identity == g_record.disks.os.identity and _g_ri.disks.data.identity == g_record.disks.data.identity
+    fail_msg: >-
+      REFUSED {{ gd.refusals.recovery }} on {{ inventory_hostname }}: {{ gp.files.record }} does not carry the pending
+      recovery of generation {{ g_generation }} (previous invocation {{ _g_rec_prev_inv }}); nothing is started or moved.
+    quiet: true
+
+- name: S7 RECOVERY -- bind the pending record and ITS recorded console evidence (derived)
+  when: _g_recover_restart | bool
+  ansible.builtin.set_fact:
+    g_record: "{{ _g_rec_ri.content | b64decode | from_json }}"
+    _g_ev_rec: "{{ (_g_rec_ri.content | b64decode | from_json).recoveries[-1].console_evidence }}"
+
+- name: S7 RECOVERY -- LEASE boundary (keep the previous console as evidence)
+  when: _g_recover_restart | bool and _g_cev.results[0].stat.exists
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+
+- name: S7 RECOVERY -- rename the previous console to its evidence name (FENCED; atomic; -n never replaces; never deleted)
+  when: _g_recover_restart | bool and _g_cev.results[0].stat.exists
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '-n', '--', gp.files.console, _g_ev_path] }}"
+
+- name: S7 RECOVERY -- read the evidence rename back (no link followed; read-only)
+  when: _g_recover_restart | bool
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ gp.files.console }}", "{{ _g_ev_path }}"]
+  register: _g_cev2
+
+# codex tick331 GUEST-RECOVERY-CONSOLE-EVIDENCE: after the rename checkpoint the evidence must be EXACTLY the recorded
+# original console (owned regular non-link, recorded dev/inode), or -- recorded explicitly absent -- still absent.
+- name: S7 RECOVERY -- refuse to start unless the evidence is the recorded original console and no console is in place
+  when: _g_recover_restart | bool
+  vars:
+    _g_e: "{{ _g_cev2.results[1].stat }}"
+  ansible.builtin.assert:
+    that:
+      - not _g_cev2.results[0].stat.exists
+      - >-
+        (_g_ev_rec is none and not _g_e.exists)
+        or (_g_ev_rec is mapping and _g_ev_rec.path == _g_ev_path
+            and _g_e.exists and _g_e.isreg and not _g_e.islnk and _g_e.uid == g_owner_uid | int
+            and _g_e.dev == _g_ev_rec.dev and _g_e.inode == _g_ev_rec.inode)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.recovery }} on {{ inventory_hostname }}: {{ gp.files.console }} is still in place, or
+      {{ _g_ev_path }} is not the recorded original console (recorded {{ _g_ev_rec }}; observed exists {{ _g_e.exists }}
+      link {{ _g_e.islnk | default('-') }} inode {{ _g_e.inode | default('-') }}). mv -n does not fail on a refused
+      rename. Nothing is started; both are left as found (the record keeps the pending recovery).
+    quiet: true
+
+- name: S7 -- LEASE boundary (start)
+  when: not (g_unit_obs.running | bool and g_unit_obs.bound | bool)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+
+- name: S7 -- start the guest as ONE transient user unit of the owner (the RECORDED argv; systemd-run --user)
+  when: not (g_unit_obs.running | bool and g_unit_obs.bound | bool)
+  environment:
+    XDG_RUNTIME_DIR: "{{ gp.runtime_dir }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path={{ gp.bus }}"
+  ansible.builtin.command:
+    argv: >-
+      {{ g_step_argv
+         + [gt.systemd_run, '--user', '--unit=' ~ gp.unit, '--quiet']
+         + (gd.unit.properties | map('regex_replace', '^', '--property=') | list)
+         + ['--working-directory=' ~ gp.run, '--']
+         + g_record.unit.argv }}
+
+# a recovery start has a NEW InvocationID by construction (the pending record names none, so unit_bind accepts it);
+# everything else (argv, cgroup, recorded disk inodes held open) must still bind.
+- name: S7 -- bind the started unit (read-only)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/unit_bind.yml"
+  vars:
+    # only a recovery that RESTARTED here may bind a new invocation; a retried completed recovery keeps the recorded one
+    _g_ub_new_invocation: "{{ _g_recover_restart | default(false) | bool }}"
+
+- name: S7 -- refuse a unit that is not this generation's running guest after the start
+  ansible.builtin.assert:
+    that:
+      - g_unit_obs.running | bool and g_unit_obs.bound | bool
+      # a completed recovery retried (GUEST-PENDING-TOKEN-RETRY) keeps its recorded, running invocation
+      - (not (g_recovering | bool)) or (_g_rec_done | bool) or g_unit_obs.invocation_id != _g_rec_prev_inv
+    fail_msg: "REFUSED {{ gd.refusals.recovery if (g_recovering | bool) else gd.refusals.unit }} on {{ inventory_hostname }}: {{ gp.unit }} is not this generation's running guest ({{ g_unit_obs }})."
+    quiet: true
+
+# codex tick339-340 GUEST-RECOVERY-CONSOLE-EVIDENCE (reopened): the RECORDED evidence identity (or its explicit absence)
+# is validated before EVERY completion and on every token retry of a completed recovery -- independently of whether this
+# apply restarted the guest (a running-bound pending retry, or an adoption without the token, never skips it). The
+# current console.log is the recovered guest's and is not judged here.
+- name: S7 RECOVERY -- stat the recorded console evidence of the last recovery (no link followed; read-only)
+  when: >-
+    g_record.state == 'started' and g_record.recoveries | length > 0
+    and (g_record.unit.invocation_id is none or (g_recovering | bool))
+  ansible.builtin.stat:
+    path: "{{ gp.console_evidence_prefix }}.{{ g_record.recoveries[-1].previous_invocation_id }}"
+    follow: false
+    get_checksum: false
+  register: _g_evchk
+
+- name: S7 RECOVERY -- refuse to complete or confirm a recovery whose recorded evidence is missing, replaced or linked
+  when: >-
+    g_record.state == 'started' and g_record.recoveries | length > 0
+    and (g_record.unit.invocation_id is none or (g_recovering | bool))
+  vars:
+    _g_er: "{{ g_record.recoveries[-1].console_evidence | default(none) }}"
+    _g_es: "{{ _g_evchk.stat }}"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_g_er is none and not _g_es.exists)
+        or (_g_er is mapping
+            and _g_er.path == gp.console_evidence_prefix ~ '.' ~ g_record.recoveries[-1].previous_invocation_id
+            and _g_es.exists and _g_es.isreg and not _g_es.islnk and _g_es.uid == g_owner_uid | int
+            and _g_es.dev == _g_er.dev and _g_es.inode == _g_er.inode)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.recovery }} on {{ inventory_hostname }}: the recovery of generation {{ g_generation }}
+      records console evidence {{ _g_er }}, but {{ gp.console_evidence_prefix }}.{{ g_record.recoveries[-1].previous_invocation_id }}
+      is {{ 'present' if _g_es.exists else 'absent' }} (link {{ _g_es.islnk | default('-') }}, inode
+      {{ _g_es.inode | default('-') }}). Nothing is recorded; the running guest, the record and every file are left as
+      found (retire binds and stops it).
+    quiet: true
+
+# COMPLETE a pending recovery (this apply's, or an interrupted one whose guest is running and binds): RIGHT AFTER the
+# bind, BEFORE the console is judged, so a recovery that S8 refuses (e.g. changed host keys) leaves a guest whose
+# record names its invocation (retire binds and stops it). The host-key observations stay the RECORDED ones; S8
+# refuses unless the recovered console prints exactly them; verify.yml refuses a console that does not carry them.
+- name: S7 RECOVERY -- LEASE boundary (complete the recovery record)
+  when: g_record.state == 'started' and g_record.unit.invocation_id is none
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+    _g_lease_ops: 2
+
+- name: S7 RECOVERY -- bind the running invocation into the pending entry (derived)
+  when: g_record.state == 'started' and g_record.unit.invocation_id is none
+  ansible.builtin.set_fact:
+    g_recovering: true
+    g_invocation_id: "{{ g_unit_obs.invocation_id }}"
+    g_recoveries: >-
+      {{ g_record.recoveries[:-1] + [g_record.recoveries[-1] | combine({'invocation_id': g_unit_obs.invocation_id})] }}
+
+- name: S7 RECOVERY -- record the completed recovery -- write this epoch's record partial (state stays started)
+  when: g_record.state == 'started' and g_record.unit.invocation_id is none
+  vars:
+    g_state: started
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/templates/record.json.j2"
+    dest: "{{ gp.files.record }}{{ gd.layout.epoch_partial_infix }}{{ g_lease_epoch }}"
+    mode: "{{ gd.layout.file_mode }}"
+  timeout: "{{ gd.lease.step_s }}"
+
+- name: S7 RECOVERY -- record the completed recovery -- FENCED rename of the partial onto the record (atomic replace)
+  when: g_record.state == 'started' and g_record.unit.invocation_id is none
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '--', gp.files.record ~ gd.layout.epoch_partial_infix ~ g_lease_epoch, gp.files.record] }}"
+
+- name: S7 RECOVERY -- read the record back (read-only)
+  when: g_recovering | bool
+  ansible.builtin.slurp:
+    src: "{{ gp.files.record }}"
+  register: _g_rec_rv
+
+- name: S7 RECOVERY -- refuse a completed read-back of any other record version (preserved as found)
+  when: g_recovering | bool
+  vars:
+    _g_rv: "{{ _g_rec_rv.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _g_rv is mapping and (_g_rv.schema | default(none)) == gd.record.schema
+    fail_msg: "REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.files.record }} read back as version {{ _g_rv.schema | default('undeclared') }}, not {{ gd.record.schema }}; the guest and the evidence are left as found."
+    quiet: true
+
+- name: S7 RECOVERY -- refuse a recovery record that does not name the running invocation and the kept observations
+  when: g_recovering | bool
+  vars:
+    _g_rv: "{{ _g_rec_rv.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _g_rv.state == 'started' and _g_rv.generation == g_generation
+      - _g_rv.unit.invocation_id == g_unit_obs.invocation_id
+      - _g_rv.recoveries == g_recoveries
+      - _g_rv.recoveries[-1].invocation_id == g_unit_obs.invocation_id
+      - _g_rv.host_key_fingerprints == g_record.host_key_fingerprints
+      - _g_rv.host_public_keys == g_record.host_public_keys
+      - _g_rv.disks.os.identity == g_record.disks.os.identity and _g_rv.disks.data.identity == g_record.disks.data.identity
+    fail_msg: >-
+      REFUSED {{ gd.refusals.recovery }} on {{ inventory_hostname }}: {{ gp.files.record }} does not record the recovery
+      of generation {{ g_generation }} (running invocation {{ g_unit_obs.invocation_id }}); the guest and the console
+      evidence are left as found.
+    quiet: true
+
+- name: S7 RECOVERY -- bind the record (derived; S8 compares the recovered console with its kept observations)
+  when: g_recovering | bool
+  ansible.builtin.set_fact:
+    g_record: "{{ _g_rec_rv.content | b64decode | from_json }}"
+
+# ---- S8 OBSERVE (OBSERVATION ONLY: B binds the host key the endpoint presents to these before privileged SSH)
+- name: S8 -- LEASE boundary (boot wait; the lease must outlast BOTH bounded console waits and the S9 write)
+  when: g_record.state != 'started' or (g_recovering | bool)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+    # both bounded waits + the S9 boundary's full fenced two-command budget (partial write + fenced publish)
+    _g_lease_need_s: "{{ gd.boot_timeout_s + gd.cloud_init.console_host_keys.wait_s + 2 * (g_op_budget_s | int) }}"
+
+# codex GUEST-PUBLIC-KEY-COMPLETION: keys-to-console prints the fingerprint block, THEN the public-key block. Waiting
+# for the first alone can read a console whose second block is not (fully) written yet. Both waits are bounded and
+# never fail by themselves; the completion refusal below is the one typed outcome (the console is kept as evidence).
+# Alternation with the identity marker: a first-boot identity mismatch powers the guest off BEFORE keys-to-console; it
+# must reach the typed GUEST-ENDPOINT refusal instead of a timeout.
+- name: S8 -- wait (bounded) for the fingerprint block's end marker or the identity-mismatch marker
+  ansible.builtin.wait_for:
+    path: "{{ gp.files.console }}"
+    search_regex: "({{ gd.cloud_init.console_fingerprints.end_marker | regex_escape }}|{{ gd.cloud_init.identity_check.marker | regex_escape }})"
+    timeout: "{{ gd.boot_timeout_s }}"
+  failed_when: false
+  register: _g_wait_fp
+
+- name: S8 -- wait (bounded) for the public-key block's end marker or the identity-mismatch marker
+  ansible.builtin.wait_for:
+    path: "{{ gp.files.console }}"
+    search_regex: "({{ gd.cloud_init.console_host_keys.end_marker | regex_escape }}|{{ gd.cloud_init.identity_check.marker | regex_escape }})"
+    timeout: "{{ gd.cloud_init.console_host_keys.wait_s }}"
+  failed_when: false
+  register: _g_wait_keys
+
+- name: S8 -- stat the console (no link followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ gp.files.console }}"
+    follow: false
+    get_checksum: false
+  register: _g_con_st
+
+- name: S8 -- refuse a missing or foreign console (nothing to observe; preserved as found)
+  ansible.builtin.assert:
+    that:
+      - _g_con_st.stat.exists and _g_con_st.stat.isreg and not _g_con_st.stat.islnk
+      - _g_con_st.stat.uid == g_owner_uid | int
+    fail_msg: >-
+      REFUSED {{ gd.refusals.host_keys }} on {{ inventory_hostname }}: {{ gp.files.console }} is absent or not an owned
+      regular file after waiting {{ gd.boot_timeout_s }} s + {{ gd.cloud_init.console_host_keys.wait_s }} s
+      (waits: {{ _g_wait_fp.msg | default('ok') }} / {{ _g_wait_keys.msg | default('ok') }}). The guest and run dir stay as-is.
+    quiet: true
+
+- name: S8 -- read the console (owned file; read-only)
+  ansible.builtin.slurp:
+    src: "{{ gp.files.console }}"
+  register: _g_console
+
+# Two console blocks, both OBSERVATIONS (what the guest printed; they authenticate nothing by themselves):
+#   fingerprints  gd.cloud_init.console_fingerprints (keys-to-console fingerprint block)
+#   public keys   gd.cloud_init.console_host_keys    (keys-to-console "HOST KEY KEYS" block; PUBLIC lines only)
+# The public lines exist so B can render a per-run known_hosts from the record, RE-DERIVE each SHA256 fingerprint
+# from the public key and refuse on any mismatch with the fingerprint observations -- before any privileged SSH.
+- name: S8 -- parse the console's fingerprint and public host-key lines into structured observations (derived)
+  vars:
+    _g_ctxt: "{{ _g_console.content | b64decode }}"
+    _g_cf: "{{ gd.cloud_init.console_fingerprints }}"
+    _g_ck: "{{ gd.cloud_init.console_host_keys }}"
+    _g_blk: "{{ _g_ctxt | regex_search((_g_cf.begin_marker | regex_escape) ~ '([\\s\\S]*?)' ~ (_g_cf.end_marker | regex_escape), '\\1') | default([''], true) | first }}"
+    _g_kblk: "{{ _g_ctxt | regex_search((_g_ck.begin_marker | regex_escape) ~ '([\\s\\S]*?)' ~ (_g_ck.end_marker | regex_escape), '\\1') | default([''], true) | first }}"
+  ansible.builtin.set_fact:
+    _g_fp_seen: >-
+      {% set ns = namespace(o=[]) %}{% for l in _g_blk.split('\n') %}{% set m = l | regex_search(_g_cf.line_regex, '\\1', '\\2', '\\3') %}{%
+      if m %}{% set ns.o = ns.o + [{'key_type': m[2] | lower, 'bits': m[0] | int, 'fingerprint_sha256': m[1],
+      'source': 'serial_console', 'console_file': gp.files.console}] %}{% endif %}{% endfor %}{{ ns.o }}
+    # line_regex groups: 1 = "<algorithm> <base64>" (the known_hosts key part), 2 = algorithm, 3 = base64
+    g_host_public_keys: >-
+      {% set ns = namespace(o=[]) %}{% for l in _g_kblk.split('\n') %}{% set t = l | trim %}{% set m = t
+      | regex_search(_g_ck.line_regex, '\\1', '\\2', '\\3') %}{% if m %}{% set ns.o = ns.o + [{'key_type': m[1],
+      'public_line': t, 'public_key': m[0], 'key_base64': m[2], 'source': 'serial_console',
+      'console_file': gp.files.console}] %}{% endif %}{% endfor %}{{ ns.o }}
+
+# codex decision: GUEST-ENDPOINT only for endpoint failures; any failure of host-key material, count, type, source or
+# binding refuses GUEST-HOST-KEYS. The ENDPOINT task runs FIRST, so an identity-check poweroff (which prints no keys)
+# refuses as GUEST-ENDPOINT, never as a missing-key GUEST-HOST-KEYS.
+- name: S8 -- ENDPOINT -- refuse a start whose guest reported an identity mismatch on its console
+  ansible.builtin.assert:
+    that:
+      - gd.cloud_init.identity_check.marker not in (_g_console.content | b64decode)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.endpoint }} on {{ inventory_hostname }}: {{ gp.files.console }} reports an identity mismatch
+      ({{ gd.cloud_init.identity_check.marker }}). The run dir stays as-is; retire moves it to preserved/ (never deleted).
+    quiet: true
+
+- name: S8 -- HOST KEYS -- refuse an incomplete console (every required block begun AND ended; evidence named)
+  vars:
+    _g_ctxt: "{{ _g_console.content | b64decode }}"
+    _g_cf: "{{ gd.cloud_init.console_fingerprints }}"
+    _g_ck: "{{ gd.cloud_init.console_host_keys }}"
+    _g_found: >-
+      {{ {'fingerprints_begin': _g_cf.begin_marker in _g_ctxt, 'fingerprints_end': _g_cf.end_marker in _g_ctxt,
+          'public_keys_begin': _g_ck.begin_marker in _g_ctxt, 'public_keys_end': _g_ck.end_marker in _g_ctxt} }}
+  ansible.builtin.assert:
+    that:
+      - _g_found.values() | reject | list | length == 0
+      - _g_ctxt.find(_g_cf.begin_marker) < _g_ctxt.find(_g_cf.end_marker)
+      - _g_ctxt.find(_g_ck.begin_marker) < _g_ctxt.find(_g_ck.end_marker)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.host_keys }} on {{ inventory_hostname }}: {{ gp.files.console }} ({{ _g_con_st.stat.size }}
+      bytes) does not carry every required console block complete after the bounded waits (fingerprints
+      {{ gd.boot_timeout_s }} s: {{ _g_wait_fp.msg | default('matched') }}; public keys
+      {{ gd.cloud_init.console_host_keys.wait_s }} s: {{ _g_wait_keys.msg | default('matched') }}). Markers found:
+      {{ _g_found }}. Nothing is recorded; the console and the guest are kept as evidence (retire preserves them).
+    quiet: true
+
+- name: S8 -- HOST KEYS -- refuse missing, duplicated, undeclared or (on resume) changed fingerprint observations
+  ansible.builtin.assert:
+    that:
+      - _g_fp_seen | length > 0
+      - _g_fp_seen | map(attribute='key_type') | unique | sort | list == gd.cloud_init.ssh.genkeytypes | map('lower') | unique | sort | list
+      - _g_fp_seen | map(attribute='fingerprint_sha256') | unique | list | length == _g_fp_seen | length
+      - _g_fp_seen | map(attribute='source') | unique | list == ['serial_console']
+      - g_record.state != 'started' or _g_fp_seen == g_record.host_key_fingerprints
+    fail_msg: >-
+      REFUSED {{ gd.refusals.host_keys }} on {{ inventory_hostname }}: {{ gp.files.console }} carries no (or not exactly
+      the declared {{ gd.cloud_init.ssh.genkeytypes }}, or duplicated) host-key fingerprints, or they differ from the
+      recorded observations. Observations only; B binds the presented host key. The run dir stays as-is.
+    quiet: true
+
+# Consistency of the PUBLIC host-key observations with the fingerprint observations and the declaration. Still not
+# authentication: B re-derives each fingerprint from public_key and binds the presented key before privileged SSH.
+# Short (genkeytypes / fingerprint "(ED25519)") <-> long (public-line algorithm) names come ONLY from the declared
+# leaf gd.cloud_init.console_host_keys.type_map, never from an inline table here.
+- name: S8 -- refuse missing, miscounted, undeclared or (on resume) changed public host-key observations
+  vars:
+    _g_tmap: "{{ gd.cloud_init.console_host_keys.type_map }}"
+  ansible.builtin.assert:
+    that:
+      - g_host_public_keys | length > 0
+      - g_host_public_keys | length == _g_fp_seen | length
+      - g_host_public_keys | map(attribute='public_key') | unique | list | length == g_host_public_keys | length
+      - gd.cloud_init.ssh.genkeytypes | map('lower') | reject('in', _g_tmap) | list | length == 0
+      - >-
+        g_host_public_keys | map(attribute='key_type') | unique | sort | list
+        == gd.cloud_init.ssh.genkeytypes | map('lower') | map('extract', _g_tmap) | unique | sort | list
+      # asserts stop at the first false condition, so the extract below never meets an unmapped type
+      - _g_fp_seen | map(attribute='key_type') | reject('in', _g_tmap) | list | length == 0
+      - >-
+        _g_fp_seen | map(attribute='key_type') | map('extract', _g_tmap) | unique | sort | list
+        == g_host_public_keys | map(attribute='key_type') | unique | sort | list
+      - g_record.state != 'started' or g_host_public_keys == g_record.host_public_keys
+    fail_msg: >-
+      REFUSED {{ gd.refusals.host_keys }} on {{ inventory_hostname }}: {{ gp.files.console }} carries
+      {{ g_host_public_keys | length }} public host-key lines ({{ g_host_public_keys | map(attribute='key_type') | list }})
+      for {{ _g_fp_seen | length }} fingerprints; they must be exactly the declared {{ gd.cloud_init.ssh.genkeytypes }}
+      (mapped by console_host_keys.type_map), one per fingerprint, and on resume equal to the recorded host_public_keys.
+      Nothing is written; the run dir stays as-is.
+    quiet: true
+
+# ---- S9 STARTED (written once; an unchanged apply of a started generation writes nothing)
+- name: S9 -- LEASE boundary (started record; partial write + fenced publish)
+  when: g_record.state != 'started'
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease.yml"
+  vars:
+    _g_lease_op: check
+    _g_lease_ops: 2
+
+# set_fact, NOT task vars: these names are set_facts since S1/S2 and would outrank task-level vars
+- name: S9 -- bind the observations to record (derived)
+  when: g_record.state != 'started'
+  ansible.builtin.set_fact:
+    g_fingerprints: "{{ _g_fp_seen }}"
+    g_unit_argv: "{{ g_record.unit.argv }}"
+    g_invocation_id: "{{ g_unit_obs.invocation_id }}"
+
+- name: S9 -- record state=started -- write this epoch's record partial (identity, disks, argv, invocation, endpoint, observations)
+  when: g_record.state != 'started'
+  vars:
+    g_state: started
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/templates/record.json.j2"
+    dest: "{{ gp.files.record }}{{ gd.layout.epoch_partial_infix }}{{ g_lease_epoch }}"
+    mode: "{{ gd.layout.file_mode }}"
+  timeout: "{{ gd.lease.step_s }}"
+
+- name: S9 -- record state=started -- FENCED rename of the partial onto the record (atomic replace)
+  when: g_record.state != 'started'
+  ansible.builtin.command:
+    argv: "{{ g_step_argv + [gt.mv, '-T', '--', gp.files.record ~ gd.layout.epoch_partial_infix ~ g_lease_epoch, gp.files.record] }}"
+
+- name: S9 -- read the record back (read-only)
+  ansible.builtin.slurp:
+    src: "{{ gp.files.record }}"
+  register: _g_rec_s9
+
+- name: S9 -- refuse a read-back of any other record version (preserved as found)
+  vars:
+    _g_r9: "{{ _g_rec_s9.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _g_r9 is mapping and (_g_r9.schema | default(none)) == gd.record.schema
+    fail_msg: "REFUSED {{ gd.refusals.record_version }} on {{ inventory_hostname }}: {{ gp.files.record }} read back as version {{ _g_r9.schema | default('undeclared') }}, not {{ gd.record.schema }}; preserved as found."
+    quiet: true
+
+- name: S9 -- refuse a started record whose public host-key observations are not the ones this run observed
+  vars:
+    _g_r9: "{{ _g_rec_s9.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _g_r9.state == 'started' and _g_r9.generation == g_generation
+      - _g_r9.host_public_keys == g_host_public_keys
+      - _g_r9.host_key_fingerprints == _g_fp_seen
+      - _g_r9.unit.invocation_id == g_unit_obs.invocation_id
+      - _g_r9.recoveries == g_recoveries
+      - _g_r9.disks.os.identity == g_disk_ids.os and _g_r9.disks.data.identity == g_disk_ids.data
+    fail_msg: >-
+      REFUSED {{ gd.refusals.recovery if (g_recovering | bool) else gd.refusals.host_keys }} on {{ inventory_hostname }}:
+      {{ gp.files.record }} does not carry the public host keys / fingerprints observed on {{ gp.files.console }}, the
+      running invocation {{ g_unit_obs.invocation_id }}, the recovery history or the disk identities of generation
+      {{ g_generation }}.
+    quiet: true
+
+- name: Verify the started guest against its record (read-only)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/verify.yml"

@@ -1,0 +1,304 @@
+---
+# testing/e2e/transfer/tasks/target_place.yml -- claim, stage, verify, promote, prune, read back, record (target host, effect).
+# Preconditions: target_observe.yml passed in an EARLIER observe play (tools at their canonical os_tools paths,
+# PATH tar/gzip equality, privilege, identity, REMOTE_DIR ancestry, owned state, ledger classified, no foreign
+# unfinished op, no unknown staging entry); source_stage.yml produced a bound edition on localhost.
+# Model: transfer.decl.yml edition.model = in_place_reconcile (R-B3). Sequence (target ledger <state>/operations.log;
+# every ledger append runs inside `flock` on <state>/<lock>, route E25-E27):
+#   CLAIM   flock -n: compare-and-swap on the observed ledger sha256 (moved -> TRANSFER-TARGET-LEDGER-MOVED, rc 75);
+#           reap EXACTLY the observed reap set; `abandon <dead op>`; `start <op> <controller token>`
+#   STAGE   ship the archive -> unpack into staging/<op> -> write ops/<op>.{sha256,modes,members,prune}
+#           -> staging readback (exact digests + exact member set; the live tree is untouched)
+#   PUBLISH flock -w publish_wait_s: `promote <op>` + per-member rename + owned prune (out_of_edition never pruned)
+#           -> live readback (digests, modes, pruned absent)
+#   RECORD  owned manifest + modes + edition.json (edition revision) -> flock: `complete <op>` + remove this op's
+#           staging/incoming and the ops files of this op and the superseded promoted-uncompleted ops (exact paths)
+# Failure after the claim: flock: remove this op's incoming + staging (exact), `fail <op>`; ops/<op>.* stay when the
+# promotion started, so the NEXT op prunes what this one may have placed. A failed claim (busy/moved) changed nothing
+# and records nothing on the target. Controller: the archive is removed and the controller ledger records
+# complete/fail in every case (always). Only edition members are written; only previously OWNED regular files are
+# removed; a file no edition recorded, and every out_of_edition path, is never removed.
+# Inputs: tr, tr_bs, tr_target (incl. tools), tr_scope (scope_admit.yml), rh_config_revision, lme_transfer_remote_dir, hostvars.localhost.{tr_edition, tr_state}.
+# Outputs: tr_placed {op, identity, adopted, pruned, abandoned, reaped, edition}.
+
+- name: Name this op's paths and its edition record
+  ansible.builtin.set_fact:
+    _tr_e: "{{ hostvars['localhost'].tr_edition }}"
+    _tr_sd: "{{ lme_transfer_remote_dir }}/{{ tr.target.state_dir }}"
+    _tr_rsd: "{{ tr.target.state_dir }}"
+    _tr_tl: "{{ tr_target.tools }}"
+    _tr_ok: false
+    _tr_claimed: false
+
+- name: Compose the edition record (fields exactly transfer.decl.yml edition.record_fields)
+  ansible.builtin.set_fact:
+    _tr_rec:
+      schema: "{{ tr.edition.record_schema }}"
+      op: "{{ _tr_e.op }}"
+      commit: "{{ _tr_e.commit }}"
+      edition_kind: "{{ _tr_e.kind }}"
+      decl_sha256: "{{ lookup('ansible.builtin.file', tr_dir ~ '/transfer.decl.yml', rstrip=false) | hash('sha256') }}"
+      policy_sha256: "{{ rh_config_revision }}"
+      scope_id: "{{ tr_scope.id }}"
+      scope_sha256: "{{ tr_scope.scope_sha256 }}"
+      scopes_sha256: "{{ tr_scope.scopes_sha256 }}"
+      owned_sha256_digest: "{{ _tr_e.sha256_text | hash('sha256') }}"
+      member_count: "{{ _tr_e.member_count | int }}"
+      completed_by: "{{ tr_target.token }}"
+
+- name: Refuse prune candidates / reap paths outside their grammar (they came from on-target state)
+  ansible.builtin.assert:
+    that:
+      - _tr_rec.keys() | list | sort == tr.edition.record_fields | sort
+      - tr_target.prune_candidates | map('regex_replace', '^', '/') | reject('match', tr_bs.path_admission.regex) | list | length == 0
+      - tr_target.prune_candidates | select('search', tr_bs.path_admission.forbidden_segment_regex) | list | length == 0
+      - tr_target.prune_candidates | select('match', '^' ~ (tr.target.state_dir | regex_escape) ~ '(/|$)') | list | length == 0
+      - >-
+        tr_target.reap | reject('match', '^' ~ (tr.target.state_dir | regex_escape) ~ '/(' ~ tr.target.staging_dir ~ '|'
+        ~ tr.target.incoming_dir ~ '|' ~ tr.target.ops_dir ~ ')/[A-Za-z0-9.-]+$') | list | length == 0
+    fail_msg: >-
+      TRANSFER-OWNED-STATE: a prune candidate is outside the member grammar or inside {{ tr.target.state_dir }}, a reap
+      path is not one entry of staging/incoming/ops, or the edition record fields differ from the declaration.
+    quiet: true
+
+- name: Re-admit the owned state's internal ancestry and custody right before the first mutation (B-TARGET-INTERNAL-CUSTODY)
+  ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/target_custody.yml"
+
+- name: Place the edition
+  block:
+    - name: Deployment root and owned state directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "{{ tr.target.dir_mode }}"
+      loop:
+        - "{{ lme_transfer_remote_dir }}"
+        - "{{ _tr_sd }}"
+        - "{{ _tr_sd }}/{{ tr.target.staging_dir }}"
+        - "{{ _tr_sd }}/{{ tr.target.incoming_dir }}"
+        - "{{ _tr_sd }}/{{ tr.target.ops_dir }}"
+
+    - name: The state lock file, created explicitly 0600 when absent (never through flock's umask-dependent create)
+      ansible.builtin.copy:
+        content: ''
+        dest: "{{ _tr_sd }}/{{ tr.target.lock }}"
+        force: false
+        mode: '0600'
+
+    - name: CLAIM -- compare-and-swap on the observed ledger, reap the observed set, record abandon + start (flock -n)
+      ansible.builtin.shell:
+        cmd: >-
+          {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                    template_vars={'lme_macro': 'sh_locked', 'lme_args': [tr, _tr_tl,
+                      lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                             template_vars={'lme_macro': 'sh_claim',
+                                            'lme_args': [tr, _tr_tl, tr_target.ledger_sha256, tr_target.reap,
+                                                         tr_target.interrupted, _tr_e.op, tr_target.token]}), false]}) }}
+        chdir: "{{ lme_transfer_remote_dir }}"
+        executable: /bin/sh
+      environment: {LC_ALL: C}
+      register: _tr_claim
+      failed_when: false
+
+    - name: Refuse a busy or moved owned state (nothing was changed, nothing recorded on the target)
+      ansible.builtin.assert:
+        that: [_tr_claim.rc == 0]
+        fail_msg: >-
+          {{ 'TRANSFER-TARGET-BUSY' if _tr_claim.rc == tr.target.busy_rc else 'TRANSFER-TARGET-CLAIM' }}:
+          rc={{ _tr_claim.rc }} {{ _tr_claim.stderr | default('') }} -- another writer holds {{ tr.target.state_dir }}/{{ tr.target.lock }}
+          or moved the ledger since observation; re-run observes afresh. Nothing was changed.
+        quiet: true
+
+    - name: Mark the claim
+      ansible.builtin.set_fact:
+        _tr_claimed: true
+
+    - name: Ship the bound archive (exact op path)
+      ansible.builtin.copy:
+        src: "{{ _tr_e.archive }}"
+        dest: "{{ _tr_sd }}/{{ tr.target.incoming_dir }}/{{ _tr_e.op }}.tar.gz"
+        mode: '0600'
+
+    - name: Stat the shipped archive (bytes identical to the bound archive)
+      ansible.builtin.stat:
+        path: "{{ _tr_sd }}/{{ tr.target.incoming_dir }}/{{ _tr_e.op }}.tar.gz"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: _tr_inc
+
+    - name: Refuse a shipped archive that is not the bound one
+      ansible.builtin.assert:
+        that: [_tr_inc.stat.exists and _tr_inc.stat.checksum == _tr_e.archive_sha256]
+        fail_msg: "TRANSFER-SHIPPED-DIGEST: {{ _tr_inc.stat.checksum | default('absent') }} != {{ _tr_e.archive_sha256 }}"
+        quiet: true
+
+    - name: Staging tree for this op
+      ansible.builtin.file:
+        path: "{{ _tr_sd }}/{{ tr.target.staging_dir }}/{{ _tr_e.op }}"
+        state: directory
+        mode: '0700'
+
+    - name: Unpack into staging (adapter managed_archive, target module; tar + gzip checked earlier)
+      ansible.builtin.unarchive:
+        src: "{{ _tr_sd }}/{{ tr.target.incoming_dir }}/{{ _tr_e.op }}.tar.gz"
+        dest: "{{ _tr_sd }}/{{ tr.target.staging_dir }}/{{ _tr_e.op }}"
+        remote_src: true
+
+    - name: Write this op's expected manifests (digests, modes, members) and its prune list
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ _tr_sd }}/{{ tr.target.ops_dir }}/{{ _tr_e.op }}{{ item.suffix }}"
+        mode: '0600'
+      loop:
+        - {suffix: .sha256, content: "{{ _tr_e.sha256_text }}"}
+        - {suffix: .modes, content: "{{ _tr_e.modes_text }}"}
+        - {suffix: .members, content: "{{ _tr_e.members_text }}"}
+        - suffix: .prune
+          content: >-
+            {{ (tr_target.prune_candidates | reject('in', _tr_e.members_text.splitlines()) | list | join('\n'))
+               ~ ('\n' if (tr_target.prune_candidates | reject('in', _tr_e.members_text.splitlines()) | list | length > 0) else '') }}
+      loop_control:
+        label: "{{ item.suffix }}"
+
+    - name: Staging readback -- exact digests and exact member set (nothing live has changed yet)
+      ansible.builtin.shell:
+        cmd: >-
+          {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                    template_vars={'lme_macro': 'sh_readback',
+                                   'lme_args': [tr, _tr_e.op, tr.target.state_dir ~ '/' ~ tr.target.staging_dir ~ '/' ~ _tr_e.op, true, _tr_tl]}) }}
+        chdir: "{{ lme_transfer_remote_dir }}"
+        executable: /bin/sh
+      environment: {LC_ALL: C}
+      changed_when: false
+
+    - name: PUBLISH -- record the promotion, per-member rename, prune previously owned members (flock -w)
+      ansible.builtin.shell:
+        cmd: >-
+          {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                    template_vars={'lme_macro': 'sh_locked', 'lme_args': [tr, _tr_tl,
+                      'set -eu\n'
+                      ~ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                               template_vars={'lme_macro': 'sh_append', 'lme_args': [tr, [tr.target.verbs.promote ~ ' ' ~ _tr_e.op]]})
+                      ~ '\n'
+                      ~ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                               template_vars={'lme_macro': 'sh_promote', 'lme_args': [tr, _tr_e.op, _tr_tl]}), true]}) }}
+        chdir: "{{ lme_transfer_remote_dir }}"
+        executable: /bin/sh
+      environment: {LC_ALL: C}
+
+    - name: Live readback -- every member's digest and mode, every pruned path absent (before PASS)
+      ansible.builtin.shell:
+        cmd: >-
+          {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                    template_vars={'lme_macro': 'sh_readback', 'lme_args': [tr, _tr_e.op, '.', false, _tr_tl]}) }}
+        chdir: "{{ lme_transfer_remote_dir }}"
+        executable: /bin/sh
+      environment: {LC_ALL: C}
+      changed_when: false
+
+    - name: RECORD -- the owned manifest, modes and edition revision of the active edition (atomic writes)
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ _tr_sd }}/{{ item.name }}"
+        mode: '0600'
+      loop:
+        - {name: "{{ tr.target.owned_manifest }}", content: "{{ _tr_e.sha256_text }}"}
+        - {name: "{{ tr.target.modes_manifest }}", content: "{{ _tr_e.modes_text }}"}
+        - {name: "{{ tr.edition.record }}", content: "{{ (_tr_rec | to_json(sort_keys=true)) ~ '\n' }}"}
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: RECORD -- complete, then remove exactly this op's staging/incoming and the superseded ops files (flock -w)
+      ansible.builtin.shell:
+        cmd: >-
+          {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                    template_vars={'lme_macro': 'sh_locked', 'lme_args': [tr, _tr_tl,
+                      'set -eu\n'
+                      ~ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                               template_vars={'lme_macro': 'sh_append', 'lme_args': [tr, [tr.target.verbs.complete ~ ' ' ~ _tr_e.op]]})
+                      ~ '\n'
+                      ~ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                               template_vars={'lme_macro': 'sh_reap', 'lme_args': [tr,
+                                 [_tr_rsd ~ '/' ~ tr.target.staging_dir ~ '/' ~ _tr_e.op, _tr_rsd ~ '/' ~ tr.target.incoming_dir ~ '/' ~ _tr_e.op ~ '.tar.gz']
+                                 + (([_tr_e.op] + tr_target.promoted_unfinished)
+                                    | product(['.sha256', '.modes', '.members', '.prune', '.found'])
+                                    | map('join', '') | map('regex_replace', '^', _tr_rsd ~ '/' ~ tr.target.ops_dir ~ '/') | list),
+                                 _tr_tl]}), true]}) }}
+        chdir: "{{ lme_transfer_remote_dir }}"
+        executable: /bin/sh
+      environment: {LC_ALL: C}
+
+    - name: Mark success
+      ansible.builtin.set_fact:
+        _tr_ok: true
+        tr_placed:
+          op: "{{ _tr_e.op }}"
+          identity: "{{ tr_target.identity }}"
+          adopted: "{{ tr_target.adopted }}"
+          pruned: "{{ tr_target.prune_candidates | reject('in', _tr_e.members_text.splitlines()) | list | length }}"
+          abandoned: "{{ tr_target.interrupted }}"
+          reaped: "{{ tr_target.reap }}"
+          edition: "{{ _tr_rec }}"
+
+  rescue:
+    - name: Failure after the claim -- remove exactly this op's incoming + staging, record fail (flock -w)
+      ansible.builtin.shell:
+        cmd: >-
+          {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                    template_vars={'lme_macro': 'sh_locked', 'lme_args': [tr, _tr_tl,
+                      lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                             template_vars={'lme_macro': 'sh_reap', 'lme_args': [tr,
+                               [_tr_rsd ~ '/' ~ tr.target.incoming_dir ~ '/' ~ _tr_e.op ~ '.tar.gz', _tr_rsd ~ '/' ~ tr.target.staging_dir ~ '/' ~ _tr_e.op],
+                               _tr_tl]})
+                      ~ '\n'
+                      ~ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                               template_vars={'lme_macro': 'sh_append', 'lme_args': [tr, [tr.target.verbs.fail ~ ' ' ~ _tr_e.op]]}), true]}) }}
+        chdir: "{{ lme_transfer_remote_dir }}"
+        executable: /bin/sh
+      environment: {LC_ALL: C}
+      when: _tr_claimed | bool
+      failed_when: false
+
+    - name: Failure -- stop (the rescue never turns a failure into success)
+      ansible.builtin.fail:
+        msg: "TRANSFER-PLACE-FAILED: {{ ansible_failed_task.name | default('') }}: {{ ansible_failed_result.msg | default('') }} {{ ansible_failed_result.stderr | default('') }}"
+
+  always:
+    - name: Controller -- remove exactly this op's archive (success and failure)
+      ansible.builtin.file:
+        path: "{{ _tr_e.archive }}"
+        state: absent
+      delegate_to: localhost
+      # RH-CONTROLLER-DELEGATION (route rev 7/8 note a): the play's target connection vars reach a delegated task, and
+      # the PRIVILEGED contact set the target's interpreter / root module temp as host facts; pin the declared
+      # controller connection, the controller's own interpreter and its run temp as TASK vars (the route's pins in
+      # decide_private_group.yml). Unverified until run: that the target's set_fact values do not reach this task.
+      vars:
+        ansible_connection: "{{ hostvars['localhost'].tr_bs.inventory.controller_delegation.connection }}"
+        ansible_python_interpreter: "{{ lookup('ansible.builtin.vars', hostvars['localhost'].tr_bs.inventory.controller_delegation.python_var) }}"
+        ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') or '~/.ansible/tmp' }}"
+
+    # B-CROSS-ROOT-RECOVERY residual: the terminal row goes through the ONE locked O_APPEND ledger writer, with the
+    # CONTROLLER's state and admitted flock, pinned to the controller exactly like the task above.
+    # B-CONTROLLER-LEDGER-ANCESTRY-REFRESH (codex 163642): this is an OWNER-CONTROLLER execution boundary (delegated to
+    # localhost with the route's controller_delegation pins), so the SHARED ancestry admission (admit_ancestry.yml via
+    # controller_ledger.yml) runs here again at the use boundary; owner-only route files stay forbidden only in
+    # TARGET context (check.yml execution scope, transfer.decl.yml controller_scope).
+    # LOAD-BASE (codex-tick306): the scalar include (declared base tr_dir, one line, as check.yml's static scan reads
+    # it) carries `apply` through `args` (ansible-core 2.19.11 include_tasks free-form + args.apply; the same task
+    # args as the mapping form, playbook/task_include.py). The walker folds args.apply exactly like a mapping apply.
+    - name: Controller -- record the terminal state (ancestry re-admitted, shared ledger lock, append-only)
+      ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/controller_ledger.yml"
+      args:
+        apply:
+          delegate_to: localhost
+          vars:
+            ansible_connection: "{{ hostvars['localhost'].tr_bs.inventory.controller_delegation.connection }}"
+            ansible_python_interpreter: "{{ lookup('ansible.builtin.vars', hostvars['localhost'].tr_bs.inventory.controller_delegation.python_var) }}"
+            ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') or '~/.ansible/tmp' }}"
+      vars:
+        _cl_state: "{{ hostvars['localhost'].tr_state }}"
+        _cl_flock: "{{ hostvars['localhost'].tr_bs.os_tools.flock }}"
+        _cl_bs: "{{ hostvars['localhost'].tr_bs }}"
+        _cl_lines: ["{{ (tr.controller_state.verbs.complete if _tr_ok else tr.controller_state.verbs.fail) }} {{ _tr_e.op }}"]

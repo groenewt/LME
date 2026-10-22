@@ -1,0 +1,351 @@
+---
+# testing/e2e/transfer/tasks/target_observe.yml -- everything the target must satisfy BEFORE its first mutation
+# (target host, observe-only; runs under the target's system python, as the declared privilege).
+#   B2-TARGET-DEPENDENCIES: the adapter's tools + the tools owned pruning/readback need, found now (not at unarchive).
+#   B2-TARGET-BINDING:      the connected account is the declared privilege; the endpoint identity is read.
+#   B2-OWNED-SOURCE-EDITION: REMOTE_DIR admitted by the ONE path rule + ancestry (no link, dirs only, not
+#                            group/other-writable, owned by the declared uids); the owned state is read.
+# Inputs: tr, tr_bs, tr_adapter, lme_transfer_remote_dir.
+# Outputs: tr_tl (tool -> THIS host's derived adapter path, lme_resolved.remote_harness.adapter.tools['target.tools']);
+#          tr_target {identity, remote_dir_exists, adopted, owned_paths, interrupted (this controller's dead ops),
+#                     promoted_unfinished, edition_before, tools, prune_candidates (out_of_edition never included)}.
+
+# Owner trust (codex 155203): the owner toolchain is never verified or executed on this root leg, so its root is
+# only a STRING here (the inventory root_var declaration; nothing under it is read). The privileged contact already
+# set and asserted the admitted system interpreter; this re-checks at B's own boundary that the effective one is
+# that interpreter (when the contact ran) and never inside the owner's declared toolchain root.
+- name: Refuse the owner toolchain's interpreter for these privileged tasks (they run under the admitted system python)
+  vars:
+    _py: "{{ lookup('ansible.builtin.vars', 'ansible_python_interpreter', default='') | string }}"
+    _troot: "{{ lookup('ansible.builtin.vars', rh.controller.bootstrap.inventory.root_var, default='') | string }}"
+  ansible.builtin.assert:
+    that:
+      - _troot == '' or _py is not match('^' ~ (_troot | regex_escape) ~ '(/|$)')
+      - _rh_ic_plan is not defined or (_rh_ic_plan.variant == 'privileged' and _py == _rh_ic_plan.python)
+    fail_msg: >-
+      TRANSFER-TARGET-INTERPRETER: ansible_python_interpreter '{{ _py }}' is inside the owner toolchain root
+      '{{ _troot }}' or is not the interpreter the PRIVILEGED contact admitted ('{{ _rh_ic_plan.python | default('') }}',
+      variant {{ _rh_ic_plan.variant | default('none') }}); the transfer connects as {{ tr.contract.privilege.remote_user }}
+      and never runs the owner's toolchain.
+    quiet: true
+
+- name: Refuse a projection other than schema 3, another adapter, or a used tool this host's engine did not derive (R-B3, r3f)
+  vars:
+    _dt: "{{ lme_resolved.remote_harness.adapter.tools['target.tools'] | default({}) }}"
+  ansible.builtin.assert:
+    that:
+      - lme_resolved.remote_harness.schema_version | default(none) == 3
+      - lme_resolved.remote_harness.adapter.name | default('') == tr.implements_adapter
+      - _dt is mapping
+      - tr.target.tools_used | reject('in', tr_adapter.target.tools.keys() | list) | list | length == 0
+      - tr.target.tools_used | reject('in', _dt.keys() | list) | list | length == 0
+      - >-
+        tr.target.tools_used | map('extract', _dt) | rejectattr('path', 'defined') | list | length == 0
+      - >-
+        tr.target.tools_used | map('extract', _dt) | map(attribute='path') | map('string') | reject('match', '^/') | list | length == 0
+      - >-
+        tr.target.tools_used | map('extract', _dt) | map(attribute='identity') | map(attribute='sha256', default='')
+        | map('string') | reject('match', '^[0-9a-f]{64}$') | list | length == 0
+      - tr.target.path_resolved.values() | flatten | reject('in', tr.target.tools_used) | list | length == 0
+    fail_msg: >-
+      TRANSFER-TARGET-DEPENDENCY-DECL: on {{ inventory_hostname }} the engine projection must be schema 3 with adapter
+      {{ tr.implements_adapter }}, and tools_used {{ tr.target.tools_used }} must be names of the route's adapter closure
+      {{ tr_adapter.target.tools.keys() | list }} and of THIS host's derived lme_resolved.remote_harness.adapter.tools['target.tools']
+      ({{ _dt.keys() | list }}) with an absolute path and a sha256 identity; path-resolved tools must be used tools.
+    quiet: true
+
+- name: The tool map of THIS host, from its own engine derivation (the ONLY paths and identities the target shell bodies use)
+  ansible.builtin.set_fact:
+    tr_tl: "{{ dict(tr.target.tools_used | zip(tr.target.tools_used | map('extract', lme_resolved.remote_harness.adapter.tools['target.tools']) | map(attribute='path'))) }}"
+    _tr_tid: "{{ tr.target.tools_used | map('extract', lme_resolved.remote_harness.adapter.tools['target.tools']) | map(attribute='identity') | map(attribute='sha256') | list }}"
+
+- name: Stat every used tool at its declared path (following links; sha256 for identity)
+  ansible.builtin.stat:
+    path: "{{ tr_tl[item] }}"
+    follow: true
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ tr.target.tools_used }}"
+  register: _tr_tools
+
+# B-TOOL-PREADMISSION-EXEC (codex tick165/166): the identities are admitted HERE, from stat alone, before ANY
+# command runs on the target -- the PATH resolution below and the id/cat reads come only after this refusal point,
+# so a substituted id/cat is refused with zero executions. (Residual, disclosed: stat-then-exec is not atomic; the
+# tool files' custody is the target's root-owned system paths, which the declared privilege already trusts.)
+- name: Refuse a missing or substituted tool (before any target command and any target mutation)
+  ansible.builtin.assert:
+    that:
+      - _tr_tools.results | rejectattr('stat.exists') | list | length == 0
+      - _tr_tools.results | selectattr('stat.exists') | rejectattr('stat.executable') | list | length == 0
+      - >-
+        _tr_tools.results | selectattr('stat.exists')
+        | map(attribute='stat.checksum') | list
+        == _tr_tid
+    fail_msg: >-
+      TRANSFER-TARGET-TOOL-IDENTITY: missing {{ _tr_tools.results | rejectattr('stat.exists') | map(attribute='item') | list }};
+      or a tool is not executable, or its sha256 differs from this host's derived adapter identity
+      ({{ _tr_tools.results | selectattr('stat.exists') | map(attribute='item') | zip(_tr_tools.results | selectattr('stat.exists') | map(attribute='stat.checksum')) | list }}).
+      Route it through the ONE target bootstrap (packages.required; {{ tr.remedy }}); an identity differing by package
+      version is an lme_global_override identity override.
+    quiet: true
+
+- name: Resolve the tools a module finds through PATH (unarchive -> tar, tar -z -> gzip), under the module's PATH
+  ansible.builtin.command:
+    argv: [/bin/sh, -c, 'command -v -- "$1"', sh, "{{ item }}"]
+  loop: "{{ tr.target.path_resolved.values() | flatten | unique }}"
+  register: _tr_pathres
+  changed_when: false
+  failed_when: false
+
+- name: Stat the PATH-resolved tools (following links)
+  ansible.builtin.stat:
+    path: "{{ item.stdout if item.rc == 0 and item.stdout is match('^/') else '/nonexistent/' ~ item.item }}"
+    follow: true
+    get_checksum: false
+  loop: "{{ _tr_pathres.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: _tr_pathst
+
+- name: Refuse a PATH-resolved tool that is not the admitted one (R-B3 unarchive_path_equality)
+  ansible.builtin.assert:
+    that:
+      - _tr_pathst.results | rejectattr('stat.exists') | list | length == 0
+      - >-
+        _tr_pathst.results | map(attribute='stat') | map(attribute='dev') | list
+        == _tr_pathst.results | map(attribute='item.item') | map('extract', dict(tr.target.tools_used | zip(_tr_tools.results | map(attribute='stat')))) | map(attribute='dev') | list
+      - >-
+        _tr_pathst.results | map(attribute='stat') | map(attribute='inode') | list
+        == _tr_pathst.results | map(attribute='item.item') | map('extract', dict(tr.target.tools_used | zip(_tr_tools.results | map(attribute='stat')))) | map(attribute='inode') | list
+    fail_msg: >-
+      TRANSFER-TARGET-PATH-TOOL: the module's PATH resolves
+      {{ _tr_pathres.results | map(attribute='item') | zip(_tr_pathres.results | map(attribute='stdout')) | list }},
+      which is not the declared admitted {{ tr.target.path_resolved }} tool file (same device + inode required).
+    quiet: true
+
+- name: Read the connected uid and the endpoint identity (only admitted tool identities run)
+  ansible.builtin.command:
+    argv: "{{ item }}"
+  loop:
+    - ["{{ tr_tl.id }}", -u]
+    - ["{{ tr_tl.cat }}", "{{ tr.contract.identity_file }}"]
+  register: _tr_who
+  changed_when: false
+  failed_when: false
+
+- name: Refuse a non-declared privilege or an unreadable identity (before any target mutation)
+  ansible.builtin.assert:
+    that:
+      - _tr_who.results[0].rc == 0 and (_tr_who.results[0].stdout | int) == tr.contract.privilege.uid
+      - _tr_who.results[1].rc == 0 and _tr_who.results[1].stdout is match(tr.contract.identity_regex)
+    fail_msg: >-
+      TRANSFER-TARGET-PRIVILEGE: connected uid {{ _tr_who.results[0].stdout }} != declared {{ tr.contract.privilege.uid }},
+      or {{ tr.contract.identity_file }} unreadable/malformed.
+    quiet: true
+
+- name: Admit REMOTE_DIR with the ONE path rule (no default)
+  ansible.builtin.assert:
+    that:
+      - lme_transfer_remote_dir is defined and lme_transfer_remote_dir is string
+      - lme_transfer_remote_dir is match(tr_bs.path_admission.regex)
+      - lme_transfer_remote_dir is not search(tr_bs.path_admission.forbidden_segment_regex)
+      - (lme_transfer_remote_dir.split('/') | length) >= 3
+    fail_msg: >-
+      TRANSFER-REMOTE-DIR: {{ lme_transfer_remote_dir | default('') }} must be a normalized absolute path below a
+      top-level directory ({{ tr_bs.path_admission.regex }}; no '.', '..', '//' or trailing '/').
+    quiet: true
+
+- name: Stat REMOTE_DIR and every ancestor (no link following)
+  ansible.builtin.stat:
+    path: "{{ '/' ~ (lme_transfer_remote_dir.split('/')[1:item] | join('/')) }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ range(1, (lme_transfer_remote_dir.split('/') | length) + 1) | list }}"
+  register: _tr_ranc
+
+- name: Refuse symlinked, non-directory, writable or foreign ancestry (REMOTE_DIR itself may be absent)
+  ansible.builtin.assert:
+    that:
+      - _tr_ranc.results[:-1] | map(attribute='stat') | selectattr('exists') | list | length == (_tr_ranc.results | length) - 1
+      - _tr_ranc.results | map(attribute='stat') | selectattr('exists') | selectattr('islnk') | list | length == 0
+      - _tr_ranc.results | map(attribute='stat') | selectattr('exists') | rejectattr('isdir') | list | length == 0
+      - _tr_ranc.results | map(attribute='stat') | selectattr('exists') | selectattr('wgrp') | list | length == 0
+      - _tr_ranc.results | map(attribute='stat') | selectattr('exists') | selectattr('woth') | list | length == 0
+      - _tr_ranc.results | map(attribute='stat') | selectattr('exists') | map(attribute='uid') | reject('in', tr.target.owner_uids) | list | length == 0
+    fail_msg: >-
+      TRANSFER-REMOTE-DIR-ANCESTRY: {{ lme_transfer_remote_dir }} or an ancestor is a link, not a directory,
+      group/other-writable, owned outside {{ tr.target.owner_uids }}, or its parent is missing. Nothing was changed.
+    quiet: true
+
+- name: Admit the owned state's internal ancestry and custody (B-TARGET-INTERNAL-CUSTODY)
+  ansible.builtin.include_tasks: "{{ tr_dir }}/tasks/target_custody.yml"
+
+- name: Stat the owned state (manifest, modes, ledger)
+  ansible.builtin.stat:
+    path: "{{ lme_transfer_remote_dir }}/{{ tr.target.state_dir }}/{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ tr.target.owned_manifest }}", "{{ tr.target.ledger }}", "{{ tr.edition.record }}"]
+  register: _tr_ost
+
+- name: Refuse linked or non-regular owned-state files
+  ansible.builtin.assert:
+    that:
+      - _tr_ost.results | map(attribute='stat') | selectattr('exists') | selectattr('islnk') | list | length == 0
+      - _tr_ost.results | map(attribute='stat') | selectattr('exists') | rejectattr('isreg') | list | length == 0
+    fail_msg: "TRANSFER-OWNED-STATE: {{ lme_transfer_remote_dir }}/{{ tr.target.state_dir }} holds a linked or non-regular state file"
+    quiet: true
+
+- name: Read the owned state
+  ansible.builtin.slurp:
+    src: "{{ item.stat.path }}"
+  loop: "{{ _tr_ost.results | selectattr('stat.exists') | list }}"
+  loop_control:
+    label: "{{ item.stat.path }}"
+  register: _tr_osb
+
+- name: Parse the owned manifest and the target ledger
+  ansible.builtin.set_fact:
+    _tr_own: >-
+      {{ ((_tr_osb.results | selectattr('item.item', 'equalto', tr.target.owned_manifest) | map(attribute='content') | first | default('') | b64decode).splitlines()) }}
+    _tr_tl: >-
+      {{ ((_tr_osb.results | selectattr('item.item', 'equalto', tr.target.ledger) | map(attribute='content') | first | default('') | b64decode).splitlines()) }}
+    _tr_edrec: >-
+      {{ (_tr_osb.results | selectattr('item.item', 'equalto', tr.edition.record) | map(attribute='content') | first | default('e30=') | b64decode | from_json) }}
+    _tr_tlre: >-
+      {{ '^((' ~ tr.target.verbs.start ~ ' ' ~ tr.controller_state.op_regex[1:-1] ~ ' ' ~ tr.target.token_regex[1:-1] ~ ')|(('
+         ~ (tr.target.verbs.values() | reject('equalto', tr.target.verbs.start) | join('|')) ~ ') ' ~ tr.controller_state.op_regex[1:-1] ~ '))$' }}
+    _tr_oore: >-
+      {{ lookup('ansible.builtin.template', tr_dir ~ '/templates/call.j2',
+                template_vars={'lme_macro': 'exclusion_regex', 'lme_args': [tr.edition.out_of_edition]}) | trim }}
+
+- name: Refuse an owned manifest or ledger outside the declared grammar
+  ansible.builtin.assert:
+    that:
+      - _tr_own | reject('match', '^[0-9a-f]{64}  [A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$') | list | length == 0
+      - _tr_own | map('regex_replace', '^[0-9a-f]{64}  ', '') | select('search', tr_bs.path_admission.forbidden_segment_regex) | list | length == 0
+      - _tr_tl | reject('match', _tr_tlre) | list | length == 0
+      - _tr_own | map('regex_replace', '^[0-9a-f]{64}  ', '') | select('search', _tr_oore) | list | length == 0
+    fail_msg: >-
+      TRANSFER-OWNED-STATE: the owned manifest or ledger of {{ lme_transfer_remote_dir }} is outside the declared
+      grammar, or the owned manifest names an out-of-edition persistent path (never removable).
+    quiet: true
+
+- name: Derive the owned state (interrupted ops, promoted-but-unfinished ops)
+  ansible.builtin.set_fact:
+    _tr_started: "{{ _tr_tl | select('match', '^' ~ tr.target.verbs.start ~ ' ') | map('regex_replace', '^\\S+ (\\S+) \\S+$', '\\1') | list }}"
+    _tr_tokens: >-
+      {{ dict(_tr_tl | select('match', '^' ~ tr.target.verbs.start ~ ' ') | map('regex_replace', '^\S+ (\S+) \S+$', '\1') | list
+              | zip(_tr_tl | select('match', '^' ~ tr.target.verbs.start ~ ' ') | map('regex_replace', '^\S+ \S+ (\S+)$', '\1') | list)) }}
+    _tr_terminal: "{{ _tr_tl | select('match', '^(' ~ tr.target.verbs.complete ~ '|' ~ tr.target.verbs.fail ~ '|' ~ tr.target.verbs.abandon ~ ') ') | map('regex_replace', '^\\S+ ', '') | list }}"
+    _tr_promoted: "{{ _tr_tl | select('match', '^' ~ tr.target.verbs.promote ~ ' ') | map('regex_replace', '^\\S+ ', '') | list }}"
+    _tr_completed: "{{ _tr_tl | select('match', '^' ~ tr.target.verbs.complete ~ ' ') | map('regex_replace', '^\\S+ ', '') | list }}"
+    _tr_abandoned: "{{ _tr_tl | select('match', '^' ~ tr.target.verbs.abandon ~ ' ') | map('regex_replace', '^\\S+ ', '') | list }}"
+
+- name: Classify unfinished ops (DEAD = this controller's token, whose seed root lock we hold; else UNKNOWN)
+  ansible.builtin.set_fact:
+    _tr_unfinished: "{{ _tr_started | reject('in', _tr_terminal) | list }}"
+    _tr_dead: >-
+      {{ _tr_started | reject('in', _tr_terminal)
+         | select('in', _tr_tokens | dict2items | selectattr('value', 'equalto', hostvars['localhost'].tr_ctl_token) | map(attribute='key') | list) | list }}
+
+- name: Refuse while an op of another writer is unfinished (kept and charged to the budget; never deleted by age)
+  ansible.builtin.assert:
+    that:
+      - (_tr_unfinished | reject('in', _tr_dead) | list | length) <= tr.target.staging_max_unknown
+    fail_msg: >-
+      TRANSFER-TARGET-FOREIGN-UNFINISHED: {{ lme_transfer_remote_dir }} has unfinished op(s)
+      {{ _tr_unfinished | reject('in', _tr_dead) | list }} written by another controller/root (tokens
+      {{ _tr_unfinished | reject('in', _tr_dead) | map('extract', _tr_tokens) | list }}); their staging is preserved and
+      an in-place reconcile cannot interleave. Nothing was changed; MAIN resolves the other writer.
+    quiet: true
+
+- name: Enumerate the bounded staging areas (staging/, incoming/, ops/; one level, links not followed)
+  ansible.builtin.find:
+    paths:
+      - "{{ lme_transfer_remote_dir }}/{{ tr.target.state_dir }}/{{ tr.target.staging_dir }}"
+      - "{{ lme_transfer_remote_dir }}/{{ tr.target.state_dir }}/{{ tr.target.incoming_dir }}"
+      - "{{ lme_transfer_remote_dir }}/{{ tr.target.state_dir }}/{{ tr.target.ops_dir }}"
+    file_type: any
+    hidden: true
+    recurse: false
+    follow: false
+  register: _tr_stg
+
+- name: Refuse a foreign or group/other-writable staging entry, or an ops entry that is not a regular file (custody)
+  ansible.builtin.assert:
+    that:
+      - _tr_stg.files | map(attribute='uid') | reject('in', tr.target.owner_uids) | list | length == 0
+      - _tr_stg.files | selectattr('wgrp') | list | length == 0
+      - _tr_stg.files | selectattr('woth') | list | length == 0
+      - >-
+        _tr_stg.files | selectattr('path', 'search', '/' ~ (tr.target.ops_dir | regex_escape) ~ '/[^/]+$')
+        | rejectattr('isreg') | list | length == 0
+      - >-
+        _tr_stg.files | selectattr('path', 'search', '/' ~ (tr.target.ops_dir | regex_escape) ~ '/[^/]+$')
+        | selectattr('islnk') | list | length == 0
+    fail_msg: >-
+      TRANSFER-TARGET-INTERNAL-CUSTODY: staging/incoming/ops entries
+      {{ _tr_stg.files | rejectattr('uid', 'in', tr.target.owner_uids) | map(attribute='path') | list }} are owned outside
+      {{ tr.target.owner_uids }}, or an entry is group/other-writable, or an ops entry is linked or not a regular file
+      (ops files are read and pruned from). Nothing was changed.
+    quiet: true
+
+- name: Classify every staging entry by the ledger op it belongs to (an entry no ledger line names is UNKNOWN)
+  ansible.builtin.set_fact:
+    _tr_stg_rel: >-
+      {{ _tr_stg.files | map(attribute='path') | map('regex_replace', '^' ~ ((lme_transfer_remote_dir ~ '/') | regex_escape), '') | sort }}
+    _tr_stg_op: >-
+      {{ dict(_tr_stg.files | map(attribute='path') | map('regex_replace', '^' ~ ((lme_transfer_remote_dir ~ '/') | regex_escape), '') | sort
+              | zip(_tr_stg.files | map(attribute='path') | sort | map('basename')
+                    | map('regex_replace', '^(' ~ tr.controller_state.op_regex[1:-1] ~ ')(\.[a-z.0-9]+)?$', '\1') | list)) }}
+
+- name: Derive the exact reap set (dead ops' staging/incoming; finished ops' residue incl. their ops files)
+  ansible.builtin.set_fact:
+    _tr_stg_unknown: >-
+      {{ _tr_stg_rel | reject('in', _tr_stg_op | dict2items | selectattr('value', 'in', _tr_started) | map(attribute='key') | list) | list }}
+    _tr_reap: >-
+      {{ _tr_stg_rel
+         | select('in', _tr_stg_op | dict2items
+                  | selectattr('value', 'in', _tr_dead + _tr_completed + _tr_abandoned + (_tr_terminal | reject('in', _tr_promoted) | list))
+                  | map(attribute='key') | list)
+         | reject('match', '^' ~ ((tr.target.state_dir ~ '/' ~ tr.target.ops_dir ~ '/') | regex_escape) ~ '('
+                  ~ ((_tr_promoted | reject('in', _tr_completed) | list | map('regex_escape') | list + ['(?!)']) | join('|')) ~ ')\.')
+         | list }}
+
+- name: Refuse unknown staging entries (never deleted by age; preserved; MAIN resolves them)
+  ansible.builtin.assert:
+    that:
+      - _tr_stg_unknown | length <= tr.target.staging_max_unknown
+    fail_msg: >-
+      TRANSFER-TARGET-FOREIGN-UNFINISHED: staging entries {{ _tr_stg_unknown }} under {{ lme_transfer_remote_dir }}
+      belong to no op this ledger records; they are preserved and a new in-place reconcile is refused.
+    quiet: true
+
+- name: Read the manifests of promoted-but-uncompleted ops (they join the prune set; terminal or this controller's)
+  ansible.builtin.slurp:
+    src: "{{ lme_transfer_remote_dir }}/{{ tr.target.state_dir }}/{{ tr.target.ops_dir }}/{{ item }}.sha256"
+  loop: "{{ _tr_promoted | reject('in', _tr_completed) | list }}"
+  register: _tr_unf
+
+- name: Publish the target observation
+  ansible.builtin.set_fact:
+    tr_target:
+      identity: "{{ _tr_who.results[1].stdout }}"
+      remote_dir_exists: "{{ _tr_ranc.results[-1].stat.exists }}"
+      adopted: "{{ not _tr_ost.results[0].stat.exists }}"
+      owned_paths: "{{ _tr_own | map('regex_replace', '^[0-9a-f]{64}  ', '') | list }}"
+      interrupted: "{{ _tr_dead }}"
+      promoted_unfinished: "{{ _tr_promoted | reject('in', _tr_completed) | list }}"
+      reap: "{{ _tr_reap }}"
+      token: "{{ hostvars['localhost'].tr_ctl_token }}"
+      edition_before: "{{ _tr_edrec }}"
+      ledger_sha256: >-
+        {{ (_tr_osb.results | selectattr('item.item', 'equalto', tr.target.ledger) | map(attribute='content') | map('b64decode') | map('hash', 'sha256') | first)
+           if (_tr_ost.results[1].stat.exists) else 'absent' }}
+      tools: "{{ tr_tl }}"
+      prune_candidates: >-
+        {{ (_tr_own | map('regex_replace', '^[0-9a-f]{64}  ', '') | list
+            + (_tr_unf.results | map(attribute='content') | map('b64decode') | map('split', '\n') | flatten
+               | select('match', '^[0-9a-f]{64}  ') | map('regex_replace', '^[0-9a-f]{64}  ', '') | list)) | unique | sort
+            | reject('search', _tr_oore) | list }}

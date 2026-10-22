@@ -1,0 +1,205 @@
+---
+# wait for an observable (_rhc_step.wait): a seed phase line, a file regex, a path, a glob match, or a gone operation
+#
+# G-WAIT-TOTAL-DEADLINE (codex 203437; G-WAIT-ANSIBLE217-BREAK-WHEN codex 210615): the step's timeout_s is a TOTAL
+# deadline, fixed ONCE here (_rhc_w_deadline, epoch seconds). MECHANISM (ansible-core 2.17 AND 2.19; no loop_control
+# break_when, which 2.17 lacks): each observable is ONE task under until / retries / delay, with
+#   - a FIXED per-poll bound T = min(state.record_readback.timeout_s, wait_poll.poll_bound_s, timeout_s - kill_after_s -
+#     margin_s), clamped >= 1 (GNU `timeout 0s` would DISABLE the bound): runner_tools.timeout --kill-after=<kill_after_s>
+#     <T>s around the dd read and the pgrep, the task `timeout:` keyword (T + kill_after_s) around the stat / find. T is
+#     templated once -- args and keywords are post_validated ONCE before the attempt loop (2.17.14 task_executor.py:533
+#     then :638; 2.19.11 :533 then :618) -- and needs no re-templating: it is <= the remaining time at the first attempt;
+#   - remaining-time ADMISSION of every further attempt: `until` is re-evaluated after EACH attempt with fresh now()
+#     (2.17.14 :765 Conditional over vars_copy; 2.19.11 :727 _resolve_conditional) and ends the task when the observable
+#     is seen OR remaining < delay_s + T + kill_after_s + margin_s, i.e. no attempt starts that could end past the
+#     deadline (the delay sleep, 2.17.14 :783 / 2.19.11 :744, runs only when until is false). retries = timeout_s //
+#     delay_s + 1 >= the attempts the deadline admits, so exhaustion (2.17.14 :787 / 2.19.11 :748) is never the stop;
+#     ignore_errors keeps an exhausted or timed-out attempt from failing the play (the judgement below decides).
+#   - the timeout keyword is per attempt (2.17.14 :641-643 signal.alarm; 2.19.11 :621 alarm_timeout); a TIMED-OUT stat /
+#     find attempt ends the whole task in both (2.17.14 :649-651 returns; 2.19.11 :427) -- reported (timed_out), never a
+#     silent pass. Every construct used (until, retries, delay, timeout, now(fmt)) exists in 2.17.14 (playbook/task.py:75,
+#     :81, :82; playbook/base.py:742; template/__init__.py:797).
+# Stated cost: the last (delay_s + T + kill_after_s + margin_s) seconds before the deadline start no new poll (the
+# admission above); a fast observable appearing only in that tail is reported as a deadline failure. Worst case: the last
+# admitted attempt ends by deadline - margin_s (+ task overhead), so the measured elapsed is judged against timeout_s +
+# wait_poll.overshoot_s on EVERY wait. The failure record is structured (_rhc_w_report: declared total, per-poll bound,
+# measured elapsed, attempts, last rc / timed-out, reason matched | deadline | poll-timed-out).
+# Stated limits (unrun): the clock is now(fmt='%s') (whole seconds, the controller's local clock); until-registered
+# results keep the LAST attempt only (rc of earlier attempts is not retained).
+#
+# wait options (vocabulary.wait_options):
+#   poll_hold: {syscall, hold}   the dd poll runs under runner_tools.strace --kill-on-exit with a delay injected on
+#                                ENTER of <syscall> for the awaited file only (-P): a deliberately slow read (the
+#                                discriminating control runner.wait.total-deadline). Bounded by the same per-poll T.
+#   deadline_expected: {elapsed_max_s}   the wait is a NEGATIVE control: it passes only when the observable never
+#                                appeared, the measured elapsed <= elapsed_max_s, and (with poll_hold) the last poll
+#                                ended by its bound (rc in state.record_readback.bound_rcs); anything else fails the step
+#                                with the structured record.
+
+- name: Wait bounds (G-WAIT-TOTAL-DEADLINE)
+  ansible.builtin.set_fact:
+    _rhc_w_total: "{{ _rhc_step.timeout_s | default(300) | int }}"
+    _rhc_w_start: "{{ now(fmt='%s') | int }}"
+    _rhc_w_deadline: "{{ (now(fmt='%s') | int) + (_rhc_step.timeout_s | default(300) | int) }}"
+    _rhc_w_retries: "{{ ((_rhc_step.timeout_s | default(300) | int) // (rhc_decl.state.wait_poll.delay_s | int)) + 1 }}"
+    _rhc_w_bound: >-
+      {{ [[_rhc_ctx.record_readback.timeout_s | int, rhc_decl.state.wait_poll.poll_bound_s | int,
+           (_rhc_step.timeout_s | default(300) | int) - (rhc_decl.state.wait_poll.kill_after_s | int)
+           - (rhc_decl.state.wait_poll.margin_s | int)] | min, 1] | max }}
+    _rhc_w_file: >-
+      {{ (_rhc_t.ctl ~ '/' ~ _rhc_step.wait.step ~ '.stderr') if _rhc_step.wait.phase is defined
+         else (_rhc_step.wait.file_regex.file if _rhc_step.wait.file_regex is defined else '') }}
+    _rhc_w_regex: >-
+      {{ ('(^|\n)lme-controller-seed: ' ~ (_rhc_step.wait.phase | regex_escape) ~ '(\s|$)') if _rhc_step.wait.phase is defined
+         else (_rhc_step.wait.file_regex.regex if _rhc_step.wait.file_regex is defined else '') }}
+    _rhc_w_hold: >-
+      {{ ([rhc_decl.runner_tools.strace, '-f', '--kill-on-exit', '-qq', '-o', _rhc_t.ctl ~ '/' ~ _rhc_step.id ~ '.wait.strace',
+           '-e', 'trace=' ~ _rhc_step.wait.poll_hold.syscall,
+           '-e', 'inject=' ~ _rhc_step.wait.poll_hold.syscall ~ ':delay_enter=' ~ _rhc_step.wait.poll_hold.hold,
+           '-P', _rhc_step.wait.file_regex.file | default(_rhc_t.ctl ~ '/' ~ (_rhc_step.wait.step | default('')) ~ '.stderr'), '--'])
+         if _rhc_step.wait.poll_hold is defined else [] }}
+
+# the admission threshold of a further attempt (seconds that must remain): delay + T + kill_after + margin
+- name: Wait admission threshold
+  ansible.builtin.set_fact:
+    _rhc_w_admit: >-
+      {{ (rhc_decl.state.wait_poll.delay_s | int) + (_rhc_w_bound | int) + (rhc_decl.state.wait_poll.kill_after_s | int)
+         + (rhc_decl.state.wait_poll.margin_s | int) }}
+
+# G-RECORD-OPEN-BEFORE-TIMEOUT: a LIVE record (the writer's ADMITTED identity is on the background task's stderr, known
+# only when it is joined) is polled by the declared timeout + dd iflag=nofollow,nonblock -- a link refuses, a FIFO never
+# blocks, each poll is bounded (by T, within the remaining total). Stated limit: this is still a pathname reopen of a live
+# record, never custody evidence; the step's judgement reads the record again through its admitted identity at the join.
+- name: "Wait for {{ _rhc_w_regex }} in {{ _rhc_w_file }}"
+  ansible.builtin.command:
+    argv: >-
+      {{ [rhc_decl.runner_tools.timeout, '--kill-after=' ~ rhc_decl.state.wait_poll.kill_after_s, (_rhc_w_bound | int) ~ 's']
+         + _rhc_w_hold
+         + [rhc_decl.runner_tools.dd, 'if=' ~ _rhc_w_file, 'iflag=nofollow,nonblock', 'status=none'] }}
+  register: _rhc_w
+  changed_when: false
+  until: >-
+    ((_rhc_w.stdout | default('')) is search(_rhc_w_regex, multiline=true))
+    or ((_rhc_w_deadline | int) - (now(fmt='%s') | int)) < (_rhc_w_admit | int)
+  retries: "{{ _rhc_w_retries }}"
+  delay: "{{ rhc_decl.state.wait_poll.delay_s }}"
+  failed_when: false
+  ignore_errors: true
+  when: _rhc_w_file | length > 0
+
+- name: Wait for the path
+  ansible.builtin.stat:
+    path: "{{ _rhc_step.wait.path_exists }}"
+    follow: false
+    get_checksum: false
+  register: _rhc_wp
+  timeout: "{{ (_rhc_w_bound | int) + (rhc_decl.state.wait_poll.kill_after_s | int) }}"
+  until: >-
+    (_rhc_wp.stat.exists | default(false))
+    or ((_rhc_w_deadline | int) - (now(fmt='%s') | int)) < (_rhc_w_admit | int)
+  retries: "{{ _rhc_w_retries }}"
+  delay: "{{ rhc_decl.state.wait_poll.delay_s }}"
+  failed_when: false
+  ignore_errors: true
+  when: _rhc_step.wait.path_exists is defined
+
+- name: Wait for a glob match
+  ansible.builtin.find:
+    paths: "{{ _rhc_step.wait.glob.dir }}"
+    patterns: ["{{ _rhc_step.wait.glob.pattern }}"]
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _rhc_wg
+  timeout: "{{ (_rhc_w_bound | int) + (rhc_decl.state.wait_poll.kill_after_s | int) }}"
+  until: >-
+    ((_rhc_wg.matched | default(0)) > 0)
+    or ((_rhc_w_deadline | int) - (now(fmt='%s') | int)) < (_rhc_w_admit | int)
+  retries: "{{ _rhc_w_retries }}"
+  delay: "{{ rhc_decl.state.wait_poll.delay_s }}"
+  failed_when: false
+  ignore_errors: true
+  when: _rhc_step.wait.glob is defined
+
+- name: Wait until no process of the named operation remains (gone)
+  ansible.builtin.command:
+    argv:
+      - "{{ rhc_decl.runner_tools.timeout }}"
+      - "--kill-after={{ rhc_decl.state.wait_poll.kill_after_s }}"
+      - "{{ _rhc_w_bound }}s"
+      - "{{ rhc_decl.runner_tools.pgrep }}"
+      - -f
+      - --
+      - "{{ _rhc_jobs[_rhc_step.wait.gone].plan.kill_token | regex_escape }}"
+  register: _rhc_wgone
+  changed_when: false
+  until: >-
+    ((_rhc_wgone.rc | default(-1)) == 1)
+    or ((_rhc_w_deadline | int) - (now(fmt='%s') | int)) < (_rhc_w_admit | int)
+  retries: "{{ _rhc_w_retries }}"
+  delay: "{{ rhc_decl.state.wait_poll.delay_s }}"
+  failed_when: false
+  ignore_errors: true
+  when: _rhc_step.wait.gone is defined
+
+# the one applicable poll task's result (every wait names exactly one observable; controls.j2 unimplemented)
+- name: Wait outcome (G-WAIT-TOTAL-DEADLINE structured record)
+  ansible.builtin.set_fact:
+    _rhc_w_last: >-
+      {{ (_rhc_w | default({})) if (_rhc_step.wait.phase is defined or _rhc_step.wait.file_regex is defined)
+         else (_rhc_wp | default({})) if _rhc_step.wait.path_exists is defined
+         else (_rhc_wg | default({})) if _rhc_step.wait.glob is defined
+         else (_rhc_wgone | default({})) }}
+    _rhc_w_found: >-
+      {{ ((_rhc_w.stdout | default('')) is search(_rhc_w_regex, multiline=true))
+           if (_rhc_step.wait.phase is defined or _rhc_step.wait.file_regex is defined)
+         else (_rhc_wp.stat.exists | default(false)) if _rhc_step.wait.path_exists is defined
+         else ((_rhc_wg.matched | default(0)) > 0) if _rhc_step.wait.glob is defined
+         else ((_rhc_wgone.rc | default(-1)) == 1) }}
+    _rhc_w_elapsed: "{{ (now(fmt='%s') | int) - (_rhc_w_start | int) }}"
+
+- name: Wait report
+  ansible.builtin.set_fact:
+    _rhc_w_report:
+      total_s: "{{ _rhc_w_total | int }}"
+      poll_bound_s: "{{ _rhc_w_bound | int }}"
+      admit_s: "{{ _rhc_w_admit | int }}"
+      elapsed_s: "{{ _rhc_w_elapsed | int }}"
+      overshoot_s: "{{ rhc_decl.state.wait_poll.overshoot_s | int }}"
+      attempts: "{{ _rhc_w_last.attempts | default(1) }}"
+      last_rc: "{{ _rhc_w_last.rc | default('-') }}"
+      timed_out: "{{ (_rhc_w_last.msg | default('')) is search('expected time frame|timed out') }}"
+      reason: >-
+        {{ 'matched' if (_rhc_w_found | bool)
+           else ('poll-timed-out' if ((_rhc_w_last.msg | default('')) is search('expected time frame|timed out')) else 'deadline') }}
+      wait: "{{ _rhc_step.wait }}"
+
+- name: A wait that never saw its observable fails the step (structured)
+  ansible.builtin.set_fact:
+    _rhc_fail: >-
+      {{ _rhc_fail + [_rhc_step.id ~ ': ' ~ ('operation ' ~ _rhc_step.wait.gone ~ ' still has processes '
+           ~ ((_rhc_wgone.stdout_lines | default([])) | join(' '))
+           if _rhc_step.wait.gone is defined else 'the awaited observable never appeared')
+         ~ ' RHC-WAIT ' ~ (_rhc_w_report | to_json)] }}
+  when: _rhc_step.wait.deadline_expected is not defined and not (_rhc_w_found | bool)
+
+- name: A wait that overran its declared total deadline fails the step
+  ansible.builtin.set_fact:
+    _rhc_fail: "{{ _rhc_fail + [_rhc_step.id ~ ': the wait overran its total deadline RHC-WAIT-DEADLINE ' ~ (_rhc_w_report | to_json)] }}"
+  when: (_rhc_w_elapsed | int) > (_rhc_w_total | int) + (rhc_decl.state.wait_poll.overshoot_s | int)
+
+- name: A deadline_expected wait must end at its deadline, bounded, without the observable
+  ansible.builtin.set_fact:
+    _rhc_fail: >-
+      {{ _rhc_fail + [_rhc_step.id ~ ': deadline_expected not met ('
+           ~ ('observable appeared' if (_rhc_w_found | bool)
+              else ('elapsed ' ~ _rhc_w_elapsed ~ ' > ' ~ _rhc_step.wait.deadline_expected.elapsed_max_s)
+                if (_rhc_w_elapsed | int) > (_rhc_step.wait.deadline_expected.elapsed_max_s | int)
+              else 'the last poll did not end by its per-poll bound (rc in ' ~ (_rhc_ctx.record_readback.bound_rcs | to_json) ~ ')')
+           ~ ') RHC-WAIT ' ~ (_rhc_w_report | to_json)] }}
+  when: >-
+    _rhc_step.wait.deadline_expected is defined
+    and ((_rhc_w_found | bool)
+         or (_rhc_w_elapsed | int) > (_rhc_step.wait.deadline_expected.elapsed_max_s | int)
+         or (_rhc_step.wait.poll_hold is defined
+             and ((_rhc_w_last.rc | default(-1) | int) not in (_rhc_ctx.record_readback.bound_rcs | map('int') | list))))

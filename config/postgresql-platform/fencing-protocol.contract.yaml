@@ -1,0 +1,778 @@
+# LME PostgreSQL/Patroni durability core -- fencing & authorization protocol.
+#
+# Declarative contract for the container-restart fence (positive authorization),
+# safe-failover eligibility, and the rejoin race/stop guards implemented in
+# scripts/postgresql_platform/{platform.py,rejoin.py}. This file is the single
+# source of truth for the authorize / consume / route protocol and the owner
+# handoff. It is machine-validated with yaml.safe_load and carries no code.
+#
+# It SUPERSEDES the negative-inhibitor description in this directory's README.md
+# (see supersedes.readme_sections below); that README is outside this wave's
+# write scope and must be reconciled by its owner.
+
+contract:
+  name: lme-postgresql-fencing-protocol
+  version: 1
+  domain: D_database
+  status: >-
+    FAIL-CLOSED and intentionally UNSTARTABLE. The fencing authority
+    (control.sock server + Ed25519 signer + authorization/marker writer) does
+    NOT exist yet, and the C1 registry does not yet supply the stable
+    deployment identity. Under positive authorization that means HA cannot
+    start -- which is the correct, safe state. NOBODY may add a default-allow,
+    a static nofailover=false, or a synthetic authorization to make it start.
+
+  doctrine:
+    default: deny
+    principle: >-
+      Every gate is positive: a member or transition proceeds ONLY on present,
+      readable, current, exactly-bound, guardian-issued authorization. Absence,
+      unreadability (EACCES), staleness, wrong binding or unresolved identity
+      all DENY. A deny only prevents THIS unit/transition; it never escalates to
+      a physical-host action (no poweroff, no host fencing from a guest path).
+    do_not_weaken:
+      - synchronous_mode_strict
+      - synchronous_node_count=1
+      - failover slots (failover=true, synced, non-temporary, no invalidation)
+      - synchronized_standby_slots
+      - clientcert=verify-full / sslmode=verify-full everywhere
+      - pg_verifybackup / quarantine / rename-dance in rejoin
+
+  # ---- Named integration seams (all currently ABSENT unless noted) ----------
+  seams:
+    control_sock_server:
+      status: absent
+      path: /run/lme-fencing/control.sock
+      role: >-
+        Guardian-owned Unix-socket server that answers the three operations
+        below. It owns real etcd leader/reservation verification and the
+        nonce/epoch compare-and-set; static signed booleans cannot satisfy it.
+      operations: [authorize, consume, route]
+      referenced_by:
+        - scripts/postgresql_platform/platform.py (live_gate, gate, proxy_route)
+        - scripts/postgresql_platform/rejoin.py (read_route -> proxy_route)
+    ed25519_guardian_signer:
+      status: absent
+      role: >-
+        Signs the gate-live context/receipt/route/consume envelopes with detached
+        Ed25519 over canonical UTF-8 JSON (json.dumps sort_keys, separators
+        (',',':'), ensure_ascii=false). Verified by platform.verify_envelope,
+        which requires a 44-byte Ed25519 SubjectPublicKeyInfo public key. NOTE:
+        this signer does NOT sign the container-restart authorization file, which
+        is plaintext (see container_restart_fence.integrity_model).
+      signing_material_owner: C
+      signing_material: >-
+        C generates the Ed25519 keypair and publishes ONLY the public key -- to
+        members at /run/secrets/guardian.pub and to proxies at
+        /run/guardian/public.pem.
+      private_key_destination: >-
+        RUNTIME-ONLY PLAINTEXT at the SIGNER path (see guardian_custody.runtime_plaintext_path),
+        NOT the consumer-shared /run/lme-fencing socket tree. RECONCILED (codex-0500
+        guardian_protocol; D-INCOMPLETE-CONTRACT-TENSIONS): what is never persisted is the
+        PLAINTEXT private half -- NOT the signing IDENTITY. The identity is recoverable from an
+        ENCRYPTED DURABLE authority-reference (guardian_custody.encrypted_durable); the plaintext is
+        decrypted and mounted ONLY at runtime on the signer host and never written to a volume or
+        disk in the clear, and never distributed. This is the counterpart to the fail-closed
+        authorize/consume/route path. (C owns generation+custody+placement and the signer handoff;
+        D owns fencing authority/rejoin semantics; D only references guardian.pub.)
+      private_key_recovery_status: >-
+        DIRECTION SETTLED, RECOVERY NOT YET QUALIFIED (codex-0500 guardian_protocol accepts encrypted
+        durable custody with runtime-only plaintext; coordinator reconcile claude-reconcile-codex0345-0400).
+        tmpfs-only was INSUFFICIENT (no recovery for restart / authority-host loss / guest reboot); it is
+        REPLACED by guardian_custody below -- an encrypted DURABLE authority-reference recovers the SAME
+        trusted signing identity, plaintext mounted ONLY at the runtime signer path, with restart /
+        host-loss / reboot recovery OR an explicit verifiable rotation that NEVER silently mints a new
+        identity on reapply. Open joint C+D deliverable + tests; runtime acceptance stays OPEN.
+    forced_command_relay:
+      status: present-but-inert
+      owner: B
+      implementation: config/postgresql-platform/reconcile_guest.py
+      role: >-
+        Narrowly-scoped, root, single-domain forced-command relay. It performs
+        only inspect / subscriber_slots / set_guard / eligibility on ONE owned
+        Patroni domain, re-checks the observed guest QEMU generation against
+        /var/lib/cloud/data/instance-id, and refuses any other operation. It is
+        the ONLY writer permitted to toggle a member's nofailover tag or its
+        synchronized_standby_slots guard, and only via SIGHUP (never a restart).
+    reconciler_driver:
+      status: quarantined
+      owner: guardian
+      symbol: lme_lab.postgresql_reconcile.reconcile_once
+      role: >-
+        The loop (documented cadence: every ~10s) that drives the relay:
+        set_guard to the DCS-authorized synchronous standby, then eligibility
+        to clear nofailover on exactly that qualified standby after readback.
+        Until it is reintegrated from .quarantine, automatic failover is
+        UNAVAILABLE by design.
+    c1_registry_stable_identity:
+      status: absent
+      token: deployment_identity
+      role: >-
+        Stable deployment identity that keys the container-restart fence path.
+        It is NOT run_id and NOT qemu_generation: it must survive across
+        evidence runs and QEMU boots so a fresh run cannot silently un-fence a
+        member. platform.render reads config['deployment_identity'];
+        resolved_role_config does not source it yet, so it is unresolved and the
+        fence renders an unconditional deny. When C1 lands, resolved_role_config
+        must populate it from the resolved inventory.
+
+  # ---- Guardian key custody + recovery (D CONFIRMS C's shape, with amendments) ----
+  # Joint C+D seam (codex-0500 guardian_protocol; C guardian_joint_proposal 0512).
+  # DIRECTION: encrypted DURABLE custody with RUNTIME-ONLY plaintext. D CONFIRMS C's
+  # proposal and AMENDS it (A1..A5) to close the shared-path collision
+  # (C-GUARDIAN-DEPLOYMENT-COLLISION) and the "readable backup == authority" hazard.
+  # Owners: C custody/generation + signer handoff; D fencing authority + rejoin
+  # semantics; B owned runtime observations; G failure/recovery exercise.
+  # Runtime recovery acceptance stays OPEN (no deploy).
+  guardian_custody:
+    decision: >-
+      ACCEPTED direction (encrypted durable custody, runtime-only plaintext); NOT yet
+      qualified recovery. Guard is gated on a VERIFIED public<->private pair, never on
+      public-file existence alone.
+    encrypted_durable:
+      role: >-
+        A recoverable, encrypted-at-rest authority-reference for the SAME Ed25519 signing
+        identity. It is the durable half: it survives signer-host loss, guest reboot and
+        restart, and it is what a recovery re-derives the runtime plaintext from. It NEVER
+        holds the plaintext private half and NEVER depends on the signer host it recovers or
+        on the database it exists to help recover.
+      namespacing: >-      # AMENDMENT A1 + collision fix
+        Keyed by STABLE deployment_identity AND the declared signer/resource identity, NOT by
+        the public-key staging path. Path template:
+        encrypted_durable_ref = <recovery_store>/<deployment_identity>/<signer_id>/guardian.enc
+      binds:               # AMENDMENT A3
+        - authority_epoch          # the one coherent authority epoch this identity is bound to
+        - guardian_pub_fingerprint # sha256 of the published SubjectPublicKeyInfo public key
+      wrapping_key:        # AMENDMENT A2
+        rule: >-
+          Encrypted under a wrapping key held as a DECLARED reference that is INDEPENDENT of the
+          signer host and of the database being recovered. A backup that is merely readable does
+          not yield plaintext without the independently-held wrapping key.
+        reference: recovery_store.wrapping_key_ref   # declared placement; owned by C custody
+    runtime_plaintext_path:   # AMENDMENT A1 -- signer-only, NOT consumer-shared
+      path: /run/lme-fencing-signer/<deployment_identity>/<signer_id>/guardian.key
+      rule: >-
+        Plaintext exists ONLY here, ONLY on the signer host, decrypted at runtime from
+        encrypted_durable_ref. It is deployment+signer namespaced so deployment-02's mint can
+        NEVER overwrite deployment-01's signer. It MUST NOT live under /run/lme-fencing: render
+        bind-mounts that whole tree READ-ONLY into every member (platform.py L418) and every
+        proxy (L518), so a plaintext key there would be readable inside every consumer namespace.
+        Only control.sock stays under the shared /run/lme-fencing.
+      collision_fix: >-
+        RESOLVES C-GUARDIAN-DEPLOYMENT-COLLISION: the old shared /run/lme-fencing private path let
+        deployment-02's mint overwrite deployment-01's signer while deployment-01's pub suppressed
+        retry -> a trust anchor with no signer. Both the durable ref and the runtime plaintext are
+        now namespaced by deployment_identity + signer_id, so neither overwrites the other.
+    install_before_publish:   # AMENDMENT A5 -- checkpointed
+      order: [generate_or_recover, install_runtime_plaintext, pair_verify, publish_pub]
+      rule: >-
+        Install + PAIR-VERIFY the private half (a signed challenge verifies under the published
+        public key) BEFORE guardian.pub is published as a trust anchor. Each step is a restartable
+        checkpoint: an interrupted install leaves NO trusted pub without a verified matching signer.
+      guard_gate: >-
+        The guard and any consumer of the trust anchor require a VERIFIED pub<->priv pair for the
+        CURRENT epoch, NOT public-file existence alone (retracts the pub-existence-suppresses-retry
+        behavior).
+    authority_is_not_key_possession:   # AMENDMENT A4
+      rule: >-
+        Fencing AUTHORITY means holding the CURRENT leased authority epoch (etcd leader/reservation
+        + lease + epoch), never mere possession of a readable key or backup. A second signer that
+        can read the encrypted backup gains NO concurrent authority; it must still win the current
+        epoch through the control.sock authority. One coherent authority epoch at a time.
+    recovery_and_rotation:
+      restart_or_reboot: >-
+        Re-derive the plaintext at runtime_plaintext_path from encrypted_durable_ref (same identity,
+        same epoch); pair-verify against the published pub before the socket authority answers.
+      signer_host_loss: >-
+        Recover the SAME identity on a replacement signer host from encrypted_durable_ref +
+        independently-held wrapping key; pair-verify; the durable ref does not depend on the lost host.
+      explicit_rotation: >-
+        Rotation is EXPLICIT, bumps authority_epoch, republishes guardian.pub + fingerprint, and
+        re-binds a new encrypted_durable. It NEVER happens silently on reapply; a prior-epoch blob
+        is REFUSED against the current epoch.
+      partial_install: >-
+        An interrupted install/rotation resumes from the last verified checkpoint; it never leaves a
+        published pub without a verified matching signer, and never a durable ref bound to a stale epoch.
+    d_ack: >-
+      D CONFIRMS the custody shape (encrypted durable + runtime-only plaintext, pair-verified,
+      deployment+signer namespaced, guard on a verified pair) with amendments A1..A5 above. C may
+      author the recovery path against this; joint implementation is reviewed before wiring. See
+      the D->C channel ack claude-D-guardian-recovery-*.
+    tests_open:   # G exercises; author now, runtime acceptance OPEN
+      - signer-host loss recovers the SAME identity (pub fingerprint unchanged), pair-verifies
+      - runtime-key loss (plaintext deleted) re-derives from the durable ref; pub stays valid
+      - guest reboot re-mounts runtime plaintext; authority resumes only after pair-verify
+      - partial install leaves NO trusted pub without a verified signer (each checkpoint)
+      - explicit rotation bumps the epoch and refuses a prior-epoch blob; no silent reapply mint
+      - a second readable backup grants NO concurrent authority without winning the current epoch
+      - two deployments on one host: neither mint overwrites the other's namespaced signer
+
+  # ---- Owner handoff (who does what) ---------------------------------------
+  handoff:
+    who_signs: >-
+      C (Ed25519 guardian signer) signs the gate-live envelopes only: context,
+      receipt, consume result and route. Members/proxies hold only the public
+      key. IMPORTANT: the container-restart authorization file is UNSIGNED
+      plaintext -- ExecStartPre verifies no signature. Its integrity rests solely
+      on the file being root-owned and NOT writable by the member owner. A
+      non-promoting restart (e.g. a replica coming back up) passes through ONLY
+      this plaintext gate; Ed25519 is verified only at bootstrap/promote via
+      gate-live. Closing that gap (a signed restart authorization) is an open
+      item below.
+    who_writes_authorization: >-
+      The guardian authorization/marker writer (part of the control.sock
+      authority, absent). It writes root-owned authorization files readable by
+      the exact rootless member owner and by no writer, and the root-owned
+      inhibit quarantine records consumed by rejoin.
+    who_relays_forced_command: >-
+      B (config/postgresql-platform/reconcile_guest.py), driven by the guardian
+      reconciler. It relays ONLY set_guard and eligibility to a single owned
+      domain, gated by its own ready() readback for eligibility=false.
+    who_consumes:
+      - >-
+        Member promotion/bootstrap: platform.live_gate -> gate consumes the
+        signed receipt's nonce via a control.sock `consume` (CAS), enforcing
+        quorum + leader_authorized + consumed, all freshly bound.
+      - >-
+        Proxy data path: platform.proxy_route consumes a signed `route` bound to
+        run/domain/node/owner/challenge with fenced+quorum+leader lease/epoch.
+      - >-
+        Rejoin: rejoin.read_route consumes a fresh `route`; the AUTHORITATIVE
+        single-consumption of the rejoin nonce is a guardian `consume` (seam
+        absent), corroborated locally by the O_EXCL member lock.
+
+  # ---- Protocol: exact-domain + exact-generation binding --------------------
+  protocol:
+    authorize:
+      request_fields: [operation, run_id, domain, node, qemu_generation, action, challenge]
+      transport_timeout_seconds: 180
+      response: signed context + inner receipt; 30s freshness
+      binding: >-
+        Response must echo run_id/domain/node/qemu_generation/action exactly;
+        context.candidate must equal {node, qemu_generation}; any rebinding to a
+        different transition is rejected (platform.live_gate).
+    consume:
+      request_fields: [operation, receipt_sha256, challenge, context]
+      transport_timeout_seconds: 15
+      result_freshness_seconds: 5
+      required_true: [consumed, quorum, leader_authorized]
+      binding: >-
+        Signed result must echo run_id/domain/candidate/authority/action/
+        request_nonce, the challenge and the receipt digest. Replay (reused
+        nonce) must fail the CAS (platform.gate).
+    route:
+      request_fields: [operation, run_id, domain, node, owner, challenge]
+      result_freshness_seconds: 5
+      required_true: [quorum, leader_authorized, fenced]
+      required_present: [authority.lease, authority.epoch]
+      binding: >-
+        primary_node must map to an allowed {host,port} in the resolved
+        inventory; otherwise the route is refused (platform.validate_route).
+    exact_domain: >-
+      Every gate is bound to a single domain (hertzbeat|vector|shared); a
+      receipt/authorization for another domain fails the binding check.
+    exact_generation: >-
+      Every gate is bound to the canonical observed QEMU generation (a UUID).
+      The restart fence pins that generation in the authorization content AND
+      (FENCE-CURRENT-GENERATION-AND-AUTHORITY, codex-0415) re-reads the CURRENTLY
+      OBSERVED guest generation at start time and denies if it differs from the
+      rendered literal -- so a guest that rebooted to a NEW generation is denied
+      until re-rendered with a fresh authorization, rather than passing on a stale
+      config-rendered literal. A stale generation is a deny.
+
+  # ---- Task 1: container-restart fence (platform.render) --------------------
+  container_restart_fence:
+    model: positive-authorization
+    replaces: >-
+      The former `ExecCondition=/usr/bin/test ! -e
+      /var/lib/lme-fencing/inhibit/<run>/<domain>/<node>`, which had two holes:
+      (a) `test ! -e` treated a MISSING marker and an EACCES traversal failure
+      alike as "no marker => ALLOW" (missing-permissive + EACCES-permissive);
+      (b) it keyed on run_id, so a fresh evidence run got an empty inhibit tree
+      and silently UN-FENCED the node.
+    rule: >-
+      The member unit starts ONLY when a readable, current, exact-domain and
+      exact-generation authorization is present and valid. DENY in every other
+      case.
+    authorization_path: /var/lib/lme-fencing/authorize/<deployment_identity>/<domain>/<node>
+    keyed_on: deployment_identity  # stable; never run_id
+    authorization_file_format:
+      line_1: '"authorize <deployment_identity> <domain> <node> <qemu_generation>" (exact whole line)'
+      line_2: '<not_after_epoch_seconds> (integer)'
+    deny_cases:
+      - missing (file absent)
+      - unreadable (EACCES for the rootless owner)
+      - stale (now >= not_after epoch, or non-integer epoch)
+      - wrong-domain (line 1 mismatch)
+      - wrong-generation (line 1 mismatch against the rendered literal)
+      - observed-generation-drift (the live observed guest generation differs from the rendered literal)
+      - unresolved-identity (deployment_identity is None -> unconditional deny)
+    observed_generation_check:   # FENCE-CURRENT-GENERATION-AND-AUTHORITY (codex-0415)
+      source: /var/lib/cloud/data/instance-id   # same source reconcile_guest.py re-checks
+      rule: >-
+        When deployment_identity is resolved, the ExecStartPre body reads the observed
+        guest instance-id and denies (exit 255) unless it exactly equals the rendered
+        qemu_generation. This closes the gap where a retained unit + retained authorization
+        still agree after a generation change: the gate now binds the CURRENTLY OBSERVED
+        generation, not only a config-rendered literal. An unreadable instance-id is a deny
+        (fail-closed). NOTE this is QEMU-generation binding; native/physical hosts that
+        declare no qemu runtime are a separate residual (see runtime-inventory-requirements
+        host_view_fields.qemu_generation.required_only_for + D-PORTABILITY-CONSUMER-DEBT).
+    integrity_model: >-
+      The authorization file is UNSIGNED plaintext; ExecStartPre performs no
+      cryptographic check. Its integrity rests ENTIRELY on the file being
+      root-owned and NOT writable by the member owner (the trust boundary is
+      filesystem write access, not a signature). This is a coarse restart gate; a
+      restart that does NOT promote (a replica returning) passes ONLY this gate.
+      The cryptographic Ed25519 gate runs only at bootstrap/promote via gate-live.
+      A signed restart authorization is an open item.
+    access_requirement: >-
+      The authority must grant the exact rootless member owner READ and NO write
+      access to the authorization file. A wrong mode reads as EACCES, i.e. deny;
+      the member owner must never be able to forge its own authorization.
+    visibility_decision:
+      mechanism: ExecStartPre
+      exit_on_deny: 255
+      rationale: >-
+        systemd.service(5): an ExecCondition= exit of 1..254 QUIETLY SKIPS the
+        unit without marking it failed, so a fenced member would be invisible.
+        A fenced start MUST be observable, so the gate is an ExecStartPre= that
+        exits 255 on any deny, putting the unit into the failed state.
+      restart_interaction: >-
+        Restart=on-failure makes the unit restart-loop to start-limit-hit and
+        stay failed while fenced. After a valid authorization is published the
+        guardian/operator must `systemctl reset-failed` the unit before it will
+        start.
+    systemd_escaping: >-
+      systemd expands `$` and `%` in Exec lines, so the rendered shell escapes
+      every literal `$` as `$$` and every `%` as `%%` (e.g. `date +%%s` ->
+      `date +%s` at runtime). Validated offline three ways: (1) simulating the
+      `$$`->`$` / `%%`->`%` expansion and running the un-escaped body under POSIX
+      `sh` across all seven cases (allow=rc0; missing/EACCES/stale/wrong-domain/
+      wrong-generation/bad-epoch=rc255); (2) `sh -n` on the body; (3) the podman
+      Quadlet generator dry-run (`quadlet -dryrun -user`), which emitted the
+      ExecStartPre= line into the generated pg-vector.service with `$$`/`%%`
+      intact, confirming Quadlet passes [Service] ExecStartPre= through unchanged.
+    non_escalation: >-
+      The deny path exits the unit's own ExecStartPre only. It never issues a
+      host command; guest fencing is never converted into a physical-host
+      shutdown.
+    while_authority_absent: >-
+      No authorization can exist, so every member is denied and HA is correctly
+      UNSTARTABLE. This is the intended fail-closed state; do not add a
+      default-allow to make the cluster start.
+
+  # ---- Task 2: safe-failover eligibility (platform.render tags.nofailover) ---
+  failover_eligibility:
+    render_default:
+      rule: nofailover = (node != initial_owner)
+      meaning: every non-initial member RENDERS nofailover=true (fail-closed)
+      note: this default is NOT loosened; render never emits nofailover=false
+    eligible_member: >-
+      The initial owner's synchronous standby: the member named by
+      synchronized_standby_slots under synchronous_mode_strict, which therefore
+      holds the durable committed state. Only it may become promotable.
+    clearing:
+      authority: guardian reconciler -> B-owned reconcile_guest.py `eligibility`
+      precondition: >-
+        The relay's ready() gate re-verifies recovery=true, matching lineage
+        (system_identifier), minimum replayed WAL (LSN), and complete
+        synchronized failover slots BEFORE it clears nofailover to false. render
+        must never pre-empt this by statically emitting false.
+      mechanism: SIGHUP reload of patroni.json; never a restart
+    promotion_gate:
+      pre_promote: wired  # platform.render member.postgresql.pre_promote = gate_command
+      effect: >-
+        Even after nofailover is cleared, the actual promotion runs pre_promote
+        -> gate-live (promote) -> guardian authorize/consume, which re-qualifies
+        the candidate. Eligibility alone promotes nothing.
+    recovery_target_90s:
+      status: NOT RUN
+      reason: >-
+        Requires the guardian reconciler driver (reconcile_once, currently
+        quarantined) plus the fencing authority and a live cluster. Not claimed.
+
+  # ---- Task 3: rejoin race-safety + verified stop (rejoin.rebuild) ----------
+  rejoin:
+    member_lock:
+      path: <member_volume>/<domain>.rejoin.lock
+      scope: per (owner-volume, domain); NOT run-scoped
+      mechanism: >-
+        fcntl.flock(LOCK_EX|LOCK_NB) on a persistent lock file, held for the whole
+        critical section. Advisory but sufficient: rejoin is the only writer of the
+        datadir rename. Chosen over an O_EXCL sentinel because the kernel releases a
+        flock when the holding process dies, so a SIGKILL/OOM during the up-to-900s
+        pg_basebackup does NOT strand the lock and brick future rejoins.
+      release: fd closed in finally (kernel releases the flock); file is NOT unlinked
+        (unlinking a flock target is racy); a lingering empty file is inert.
+      location_rule: >-
+        On the member volume ONLY. Never under /var/lib/lme-fencing, which is the
+        root-owned guardian fence tree the rootless rebuild container cannot
+        write (that write would EACCES/EROFS and fail every rejoin).
+      closes: concurrent-rebuild race (two rebuilds racing the datadir rename)
+    nonce_single_consumption:
+      local: nonce-keyed stage/retained trees are never reused (replay guard)
+      authoritative:
+        status: absent-seam
+        rule: >-
+          The authoritative single-consumption of the rejoin nonce is a guardian
+          `consume` over control.sock. Until present, the flock member lock is
+          the local corroboration, not a substitute for guardian CAS.
+    reservation_compare:
+      status: PARTIAL
+      rule: >-
+        The guardian-issued source binding (source_authority, source_node), WHEN
+        carried in the request, must equal the freshly observed route; a mismatch
+        is refused. The former self-defaulting compare
+        (request.get('source_authority', before_route['authority'])) was VACUOUS
+        and is removed.
+      open: >-
+        The current test fixture carries neither field, so making them REQUIRED
+        needs the owner of testing/tests/unit/test_postgresql_rejoin.py to add
+        them; that is out of this wave's write scope.
+    verified_stop:
+      rule: >-
+        Before any datadir rename/replace, quarantine() requires VERIFIED
+        exact-stop: restart_inhibited == the persistent inhibit marker present
+        and bound to this exact generation, AND stopped == the old datadir holds
+        NO postmaster.pid AT ALL, AND authorization_revoked == NO positive restart
+        authorization exists for this member (see authorization_revoked below). Any
+        pid file -- including a STALE one left by a crash, a SIGKILL after a podman
+        stop timeout, or a hypervisor fence -- is UNKNOWN stop evidence and FAILS
+        qualification, mirroring platform.validate_receipt which raises unless every
+        prior writer is stopped=true and restart_inhibited=true.
+    authorization_revoked:   # REJOIN-RESTART-SERIALIZATION fix (codex-0415)
+      rule: >-
+        quarantine() ALSO requires the positive-authorization file for this member
+        (/var/lib/lme-fencing/authorize/<deployment_identity>/<domain>/<node>) to be
+        ABSENT. deployment_identity is REQUIRED: rejoin.rebuild fails closed if it is
+        missing/malformed (codex-0630 fix -- a missing identity previously set the path
+        to None and SKIPPED this check, a fail-OPEN), so the authorize-absence check is
+        UNCONDITIONAL. An UNEXPIRED authorization would let the container restart onto
+        the old datadir DURING the rename -- the inhibit marker alone does not stop that,
+        because the container-restart fence admits a start whenever a valid authorization
+        is present. So the authority must have REVOKED (removed) the member's
+        authorization before the rebuild renames the datadir.
+      residual: >-
+        The AUTHORITATIVE revocation + single-consumption is a guardian `consume`/revoke
+        over control.sock (absent seam). The local absence check + member flock are the
+        corroboration, not a substitute; full revocation/drain is the open joint C+D seam.
+      operator_note: >-
+        This is a deliberately conservative LOCAL stand-in for the guardian-attested
+        stopped flag. The usual rejoin triggers (crash, SIGKILL, hypervisor fence)
+        leave a stale pid file, so each such case is refused until an operator
+        confirms the old server is down and removes the pid file by hand.
+      rechecked: quarantine() runs again immediately before the rename
+      fence_bridge: >-
+        CORRECTED (REJOIN-RESTART-SERIALIZATION, codex-0415): the positive-authorization
+        container fence does NOT by itself protect the rename interval -- an UNEXPIRED
+        authorization would ADMIT a restart onto the old datadir. The rename is protected
+        by verified authorization REVOCATION (quarantine.authorization_revoked: the
+        member's authorize file is absent) PLUS the per-member flock, re-checked
+        immediately before the rename. The postmaster.pid + authorization-absence checks
+        are this helper's LOCAL corroboration; the authoritative one enforced authority
+        transition (revoke -> verified stop -> replace -> permitted restart) is the guardian
+        control.sock seam (absent). Do NOT claim the current positive gate serializes the rename.
+    preserved:
+      - pg_basebackup + backup_manifest lineage/timeline/WAL verification
+      - pg_verifybackup checksum verification
+      - pg_controldata lineage/timeline match
+      - isolated read-only replica probe on a private socket (no TCP)
+      - retain old + staged trees on failure; never auto-roll-back to a writable primary
+
+  # ---- Cross-references that this contract supersedes or flags ---------------
+  supersedes:
+    readme_sections:
+      - file: config/postgresql-platform/README.md
+        lines_approx: "129-133"
+        was: >-
+          Describes a NEGATIVE inhibitor -- "Quadlet ExecCondition prevents
+          restart while that marker exists". Superseded by positive
+          authorization; the inhibit marker is retained ONLY as the rejoin
+          restart_inhibited quarantine record.
+      - file: config/postgresql-platform/README.md
+        lines_approx: "33-38"
+        note: >-
+          Describes the reconciler that clears nofailover after readback. Still
+          accurate in intent; this contract records that its driver is currently
+          quarantined, so failover is unavailable until reintegrated.
+      - file: config/postgresql-platform/README.md
+        lines_approx: "42-50 (Ordered deployment, step 3 bootstrap)"
+        note: >-
+          Under positive authorization the bootstrap step can no longer start
+          Patroni until the authority has published an authorization for the
+          initial owner (in addition to the existing gate-live bootstrap permit).
+          The ordered deployment must account for the authority being live first.
+    other_consumers:
+      - file: config/postgresql-platform/reconcile_guest.py
+        owner: B
+        note: >-
+          Reads the NEGATIVE inhibit marker (observed['inhibited'], L59) and the
+          nofailover tag (L64). Consistent with this contract: the inhibit marker
+          is retained as the quarantine record; reconcile_guest is the sole writer
+          of nofailover/synchronized_standby_slots. Unaffected by the fence flip.
+      - file: ansible/roles/postgresql_backup/files/retire.py
+        lines_approx: "68"
+        note: >-
+          The SEPARATE backup-retire unit still uses a root-owned marker +
+          Quadlet ExecCondition (a different unit, not the pg member restart
+          fence). Out of this wave's scope; flagged if the same positive-auth
+          treatment is later wanted there.
+      - concern: Ansible tasks that create fence directories or assert on the rendered unit
+        note: >-
+          None found under ansible/ referencing /var/lib/lme-fencing/{inhibit,
+          authorize} or the member ExecCondition/ExecStartPre (grep clean, excluding
+          .quarantine). If such tasks exist elsewhere they must create the
+          authorize/ tree and expect ExecStartPre, not the old ExecCondition.
+
+  open_items:
+    - C1 registry must supply deployment_identity to resolved_role_config.
+    - control.sock authority (server + Ed25519 signer + authorization/marker writer) must be built.
+    - Ed25519 private key -- DIRECTION SETTLED (guardian_custody: encrypted durable custody + runtime-only plaintext, deployment+signer namespaced, install+pair-verify before publish, guard on a verified pair, restart/host-loss/reboot recovery OR explicit epoch-bumping rotation). Joint C+D implementation + tests remain OPEN; runtime recovery acceptance stays OPEN. D has CONFIRMED the shape to C (amendments A1..A5).
+    - signed restart authorization -- the restart-fence authorization is currently unsigned plaintext (root-owned, non-owner-writable); a signed form would close the non-promoting-restart gap.
+    - authoritative revocation/drain -- rejoin now checks positive-authorization ABSENCE before the rename (authorization_revoked), but the AUTHORITATIVE revoke/consume is the guardian control.sock seam (absent).
+    - reconcile_once driver must be reintegrated from .quarantine to enable failover.
+    - guardian `consume` of the rejoin nonce (authoritative single-use) must be built.
+    - make rejoin source_authority/source_node REQUIRED once the test fixture carries them.
+    - bootstrap ordering (README step 3) must wait for a published authorization for the initial owner.
+    - reconcile README.md negative-inhibitor description with this contract.
+
+  # ===========================================================================
+  # guardian_cd_binding -- the shared C/D interface contract for the guardian
+  # AUTHORITY SERVICE's use of C's signing primitive (codex-0700 ownership split;
+  # codex-0715 interface_precision). D (accountable author of the authority
+  # service + control.sock/authority protocol) is the DESIGN-FIRST author here.
+  #
+  # STATUS: UNWIRED / PROPOSED. This section is ADDRESSED TO C for mutual ack. It
+  # binds to C's DECLARED primitive at
+  #   ansible/roles/secrets_distribution/vars/guardian_custody.yml#guardian_signing_interface
+  # RE-PINNED to C's frozen_set_A_v2 COMMITTED interface (see binding_pin below): the committed
+  # guardian_custody.yml blob at commit ce414b9, full content sha256 239cf586...  (SUPERSEDES the
+  # prior 45f18ce3 pin at 775af2e; older ebc5e850/a33d08d were proposals). This re-pin is
+  # PROVENANCE ONLY -- it re-anchors the byte pin to the file C actually committed; it is NOT joint
+  # semantic acceptance (signed-field coverage + authority-epoch semantics stay OPEN, below).
+  # codex-0745 was a useful proposal, NOT an implemented
+  # boundary; this is still NOT yet a mutual ack. Integration is GATED on that mutual C/D
+  # ack AND on the guardian authority service existing (fail-closed / UNSTARTABLE today).
+  # NO unit template is authored this wave; nothing here is wired to consume
+  # guardian_custody.yml yet.
+  #
+  # BOUNDARY (unchanged): reaching the key OR the socket is NOT authorization. A
+  # signature is produced ONLY after D's authority protocol has CONSUMED an
+  # authorization for the CURRENT leased epoch. C never mints the epoch (A4).
+  # ===========================================================================
+  guardian_cd_binding:
+    status: UNWIRED_PROPOSED_AWAITING_C_ACK
+    consumes: ansible/roles/secrets_distribution/vars/guardian_custody.yml#guardian_signing_interface
+
+    # binding_pin -- the EXACT interface revision this binding is written against, so a later
+    # edit of guardian_custody.yml cannot silently move the boundary under an existing ack.
+    # Pinned to C's HANDED-BACK final interface. The pin is the COMMITTED blob (not the
+    # working tree, which has drifted while a C relaunch edits the file); mutual C/D ack is
+    # taken against this committed content, and any re-ack must re-pin.
+    binding_pin:
+      file: ansible/roles/secrets_distribution/vars/guardian_custody.yml
+      section: guardian_signing_interface
+      content_sha256: 239cf58691d3e8980b16557ca3831f6894eea8d99198120da8f10e7447508c69
+      pinned_commit: ce414b9   # C's frozen_set_A_v2 commit (parent cd3e837); verified ce414b9:<file> == worktree == this sha256
+      supersedes_pin: 45f18ce3de0365b246bf40ed59095a3df4768f9fafe9a2c8f507f3036332c1fe   # prior pin (commit 775af2e), now superseded
+      working_tree_drift_note: >-
+        RESOLVED (2026-09-23): the C relaunch's edits LANDED in commit ce414b9; the working-tree
+        blob and the committed blob are now BOTH 239cf586..., so the drift that motivated the prior
+        45f18ce3 pin is gone. Re-pinned to the committed 239cf586 content per coordinator + codex
+        authorization (re-pin allowed only AFTER the actual commit was confirmed).
+      repin_is_provenance_not_ack: >-
+        This hash update re-anchors the byte pin ONLY. It is NOT joint semantic acceptance. Per codex:
+        the fixed signed-field list (fencing fields_in_order 670-681) carries nonce but NO explicit
+        challenge / receipt digest / authenticated full-result digest and declares no nonce->challenge
+        equivalence, while authorize:247 + consume:255/260-261 require request_nonce + challenge +
+        receipt digest -- so the signed-coverage gap is NOT closed by this re-pin. Mutual C/D ack of
+        the exact signed bytes per message kind (joint signed-envelope work) remains REQUIRED.
+      ack_status: PROPOSED_AWAITING_C   # mutual ack = closure, not a hash re-pin
+    integration_gate: [mutual_C_D_interface_ack, guardian_authority_service_exists]
+
+    # (0) REQUIRED PRECISION -- the LEAD VIABILITY item (coordinator tick25). Before any
+    # authority-transition or recovery semantics can be stated without contradiction, three
+    # DISTINCT epoch/identity notions that the signing interface touches MUST be kept
+    # separate. Conflating any two of them is the root viability defect: it would let a key
+    # rotation, an authority handover, or a restore of old ciphertext silently authorize (or
+    # silently refuse) a transition. Names below are the ACTUAL fields of the pinned
+    # guardian_signing_interface (output_fields / trust_epoch_binding_input) and A2's
+    # recovery_store.wrapping_key_ref -- not invented.
+    required_precision:
+      item_1_three_epoch_identities:
+        status: DRAFT_AWAITING_C_ACK
+        leased_authority_epoch:
+          field: authority_epoch   # guardian_signing_interface.output_fields + trust_epoch_binding_input
+          owner: D_database
+          meaning: >-
+            The CURRENT authority lease held via D's control.sock (etcd leader/reservation +
+            lease + monotonic epoch). It answers "who is authorized to authorize a transition
+            RIGHT NOW". D mints/advances it; C NEVER mints it (guardian_signing_interface
+            not_owned_by_c). A signature is authorized under exactly one authority_epoch and D
+            rejects a returned epoch != the supplied one.
+          governs: authority-transition (promote/revoke/drain/permit-start), NOT key trust, NOT ciphertext age.
+        signing_key_identity_and_rotation:
+          field: guardian_pub_fingerprint   # output_fields; expected form = trust_epoch_binding_input.expected_pub_fingerprint
+          owner: C_custody   # C emits at bootstrap/rotation; D RECORDS the expectation and supplies it back
+          meaning: >-
+            SHA-256 of the guardian DER SubjectPublicKeyInfo public key -- the IDENTITY of the
+            key that produced a signature. Rotation changes THIS (a new keypair -> a new
+            fingerprint), independently of whether the authority lease changed. Trust = the
+            signing key's structurally-parsed fingerprint equals D's recorded expectation FOR
+            the current authority_epoch (precondition_epoch_binding).
+          governs: which signature bytes are trusted; a rotation is bound to a specific epoch (rotation_interleaving), it does NOT itself advance authority.
+          not_the_same_as: leased_authority_epoch   # a rotation may occur within one authority_epoch; an authority handover may occur without a rotation.
+        ciphertext_wrapping_epoch:
+          field: recovery_store.wrapping_key_ref   # AMENDMENT A2 (recovery_store), C custody owned
+          owner: C_custody
+          meaning: >-
+            The epoch/identity of the WRAP (key-encryption) key under which recovery-store /
+            backup ciphertext was encrypted at rest. It answers "which KEK can decrypt THIS
+            ciphertext", and it advances on wrap-key rotation while prior-epoch ciphertext is
+            preserved (guardian_custody wave-5c). It is NEITHER the signing-key identity NOR
+            the authority lease: old ciphertext stays decryptable under its own wrapping epoch
+            long after the signing key rotated and after many authority handovers.
+          governs: decryptability of recovered ciphertext, NOT authorization and NOT signature trust.
+        why_distinct: >-
+          A restore is the case that forces the separation: recovered ciphertext carries an
+          OLD ciphertext_wrapping_epoch; it must be decryptable under that old wrap epoch, yet
+          the restore action must be authorized under the CURRENT leased_authority_epoch and
+          any restore-authorization signature must verify against the CURRENT
+          signing_key_identity. Binding restore admission to the ciphertext's wrapping epoch,
+          or trusting a signature because the wrapping epoch matches, would be the viability
+          bug this item exists to forbid.
+      authority_transition_semantics:
+        status: DRAFT_AWAITING_C_ACK
+        transition_authorized_under: leased_authority_epoch   # the ONLY epoch that authorizes a transition
+        rule: >-
+          Every authority transition (promote | revoke | drain | permit-start | restart) is
+          authorized under the CURRENT leased_authority_epoch and serialized through the sole
+          engine path (serialization/revoke_interleaving above). A transition NEVER derives its
+          authority from a key fingerprint or a ciphertext wrapping epoch. A signature produced
+          under authority_epoch N is not valid for a transition claimed under epoch N+1
+          (d_side_acceptance), and single-use nonce CAS makes a since-revoked authorization
+          non-replayable.
+      recovery_semantics:
+        status: DRAFT_AWAITING_C_ACK
+        rule: >-
+          On recovery/restore: (1) admission is authorized under the CURRENT
+          leased_authority_epoch, never under the restored bundle's ciphertext_wrapping_epoch;
+          (2) restored ciphertext is decrypted under ITS OWN ciphertext_wrapping_epoch via the
+          independently-held wrapping key (recovery_store.wrapping_key_ref, A2), then MUST be
+          re-wrapped to the current wrapping epoch before it is treated as live custody; (3) any
+          restore-authorization signature is verified against the CURRENT signing_key_identity
+          (expected_pub_fingerprint) for the current authority_epoch -- a signature that only
+          verifies against a prior key is REFUSED. Absence of the authority is UNSTARTABLE, never
+          a default-allow (invariant below).
+        routed_open:
+          - "C: ACK that recovery_store.wrapping_key_ref is the SOLE carrier of ciphertext_wrapping_epoch and that prior-epoch wrap keys remain resolvable for decrypt-then-rewrap (wave-5c preserve-prior-epoch-ciphertext)."
+          - "D: the concrete restore-authorization signature seam is the same canonical_message binding (message_kind=authorize over a restore transition); it stays UNWIRED until the guardian authority service exists."
+
+    # (1) The CANONICAL SIGNED MESSAGE BYTES D hands to C's signing primitive.
+    # D constructs this; C signs the exact bytes and does NOT interpret them.
+    canonical_message:
+      domain_separation_tag: "lme.guardian.authority.v1"   # first field; prevents cross-protocol reuse
+      encoding: >-
+        A deterministic, length-prefixed field list: the tag, then each field below
+        in the FIXED order, each as decimal-length + ':' + raw UTF-8 bytes, joined by
+        no separator (canonical; no whitespace, no map ordering ambiguity). D computes
+        it identically on sign and on verify.
+      fields_in_order:
+        - message_kind          # one of: authorize | consume_result | route | revoke | inhibit
+        - operation             # the f:operation:* identity
+        - run_id
+        - deployment_identity   # stable identity (NOT run_id) the authority is keyed on
+        - domain                # hertzbeat | vector | shared (exact-domain binding)
+        - node
+        - qemu_generation       # the canonical observed generation UUID (exact-generation binding)
+        - action                # bootstrap | promote | restart | rejoin | drain | stop
+        - authority_epoch       # D's CURRENT leased epoch (A4; consumed input, C never mints)
+        - nonce                 # single-use; consumed via control.sock CAS
+        - not_after_epoch_seconds  # integer expiry
+      note: >-
+        The restart-fence authorization file is CURRENTLY unsigned plaintext (handoff.who_signs);
+        this binding is the seam that lets D produce a SIGNED restart authorization over these exact
+        bytes, closing the non-promoting-restart gap (open_items 'signed restart authorization').
+
+    # (2) The AUTHORITY CONTEXT that must already hold before D asks C to sign.
+    authority_context_precondition:
+      leased_epoch_held: "D holds the CURRENT authority_epoch (etcd leader/reservation + lease + epoch)."
+      authorization_consumed: "D has CONSUMED the authorization + nonce for THIS transition (control.sock CAS)."
+      quorum_leader: "quorum + leader_authorized true where the message_kind requires it (see protocol.consume/route)."
+      not_key_possession: "Possession of the runtime key or reachability of the socket is explicitly NOT sufficient (A4)."
+
+    # (3) The EXPECTED-FINGERPRINT RECORD (the concrete C<-D trust binding).
+    expected_fingerprint_record:
+      field: guardian_custody_expected_pub_fingerprint
+      definition: "SHA-256 of the guardian DER SubjectPublicKeyInfo public key."
+      lifecycle: >-
+        C EMITS the fingerprint at bootstrap and at each rotation; D RECORDS it as the
+        trusted expectation and SUPPLIES it back on every sign/verify. Trust is D's
+        recorded expectation, NOT the editable guardian.meta sidecar
+        (codex-0730 C-CUSTODY-EPOCH-FINGERPRINT-PASSPHRASE-BINDING).
+      storage_owner: D_database   # D's authority record; C1 owned registry is the eventual canonical home
+      binding_rule: >-
+        A signature is trusted ONLY if the signing key's structurally-parsed public
+        fingerprint equals this recorded expectation for the current authority_epoch.
+
+    # (4) The RETURNED METADATA C gives back to D (mirrors guardian_signing_interface.output_fields).
+    returned_metadata:
+      - signature                 # raw Ed25519 signature over the canonical_message bytes
+      - guardian_pub_fingerprint  # MUST equal expected_fingerprint_record for the current epoch, else D rejects
+      - authority_epoch           # MUST equal the epoch D supplied, else D rejects (A3 defense-in-depth on C's side too)
+    d_side_acceptance:
+      - "reject if guardian_pub_fingerprint != recorded expected fingerprint for authority_epoch"
+      - "reject if returned authority_epoch != supplied authority_epoch"
+      - "reject if openssl pkeyutl -verify of signature over the canonical bytes fails against the expected pub"
+
+    # (5) ROTATION and REVOKE interleavings (the hard cases).
+    rotation_interleaving:
+      rule: >-
+        Rotation is EXPLICIT and D-driven: D advances authority_epoch, C promotes the new
+        runtime key + pair-verifies BEFORE the marker flip, republishes guardian.pub +
+        fingerprint; D records the NEW expected fingerprint. A signature request that
+        arrives mid-rotation is bound to a SPECIFIC epoch: a request for the OLD epoch after
+        the flip is REFUSED (prior-epoch blob), a request for the NEW epoch before D has
+        recorded the new fingerprint is REFUSED (no trusted expectation yet). No silent
+        reapply mint (guardian_custody.rotation).
+    revoke_interleaving:
+      rule: >-
+        Revocation is D's control.sock authority: D consumes/invalidates the epoch's nonce and
+        removes the positive authorization. A signature produced under a since-revoked
+        authorization is NOT retroactively valid because CONSUMPTION is single-use CAS -- a
+        replayed nonce fails. rejoin checks positive-authorization ABSENCE before the rename
+        (authorization_revoked); the AUTHORITATIVE revoke/verified-stop-drain/permitted-start
+        transition is the guardian seam (open_items 'authoritative revocation/drain').
+    serialization:
+      rule: >-
+        revoke -> verified stop-drain -> permitted start is a SERIALIZED transition through the
+        sole engine path (D-FENCING-ACTUAL-CALLER-VALIDATION-BYPASS): no caller may obtain a
+        signed start authorization while a drain of the same deployment_identity/domain is
+        in-flight.
+
+    # (6) FAILURE RESULTS (what each side returns; all fail-closed).
+    failure_results:
+      c_refuses:   # from guardian_signing_interface.refusals
+        - "no verified pub<->priv pair for the current epoch (marker absent/stale)"
+        - "caller-supplied epoch != durable-bound epoch (A3)"
+        - "runtime key absent or not resident on the signer host (never mint-to-sign)"
+      d_refuses:
+        - "authority_context_precondition not met (no leased epoch / no consumed authorization / no quorum)"
+        - "returned fingerprint or epoch mismatch, or signature verify failure"
+        - "authority service unavailable -> the authorization is NOT produced and the gated unit does NOT start (fail-closed / UNSTARTABLE); NEVER a default-allow"
+      invariant: >-
+        Absence or failure of the authority is UNSTARTABLE, never permissive. There is NO
+        default-allow path that makes a gated unit start when the guardian is unavailable.
+
+    sequenced_fencing_residuals:   # the residuals this seam unblocks, in order
+      - REJOIN-RESTART-SERIALIZATION
+      - D-RESTART-AUTHORIZATION-INTEGRITY
+      - D-REJOIN-RESERVATION-OPTIONAL
+      - FENCE-CURRENT-GENERATION-AND-AUTHORITY
+      - D-FENCING-ACTUAL-CALLER-VALIDATION-BYPASS
+
+    coordination:
+      to_C: "ACK the canonical_message field order/encoding + the output/fingerprint/epoch binding; confirm C signs bytes verbatim and refuses per c_refuses. This ACK gates INTEGRATION only, not C's independent custody authoring."
+      to_C1: "eventual canonical home for expected_fingerprint_record + signer/producer registry (catalog_debts.owed_registries)."
+      to_G: "author negative/interruption cases against THIS binding now (mid-rotation epoch, revoked-nonce replay, fingerprint mismatch, authority-unavailable-unstartable); runtime acceptance awaits the built service."

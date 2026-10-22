@@ -1,0 +1,188 @@
+---
+- name: Validate resolved HertzBeat service contract
+  ansible.builtin.assert:
+    that:
+      - hertzbeat_platform.home is match('^/[^\s]+$')
+      - hertzbeat_platform.user is match('^[a-z_][a-z0-9_-]*$')
+      - hertzbeat_platform.uid | int > 0
+      - hertzbeat_platform.memory_mib | int >= 256
+      - hertzbeat_platform.data_home is match('^/[^\s]+$')
+      - hertzbeat_platform.schema_database.url | hertzbeat_verified_jdbc
+      - hertzbeat_platform.image is match('^([^\s]+@)?sha256:[a-f0-9]{64}$')
+      - hertzbeat_platform.database.url | hertzbeat_verified_jdbc
+      - hertzbeat_platform.database.username | length > 0
+      - hertzbeat_platform.secret_directory is match('^/[^\s]+$')
+      - hertzbeat_platform.truststore_file is match('^/[^\s]+$')
+      - hertzbeat_platform.known_hosts_file is match('^/[^\s]+$')
+      - hertzbeat_platform.native_export.enabled is boolean
+      - hertzbeat_platform.lifecycle.enabled is boolean
+      - hertzbeat_platform_phase in ['render', 'schema', 'application']
+      - hertzbeat_platform.greptime.image is match('^([^\s]+@)?sha256:[a-f0-9]{64}$')
+      - hertzbeat_platform.greptime.username | length > 0
+      - not hertzbeat_platform.native_export.enabled or hertzbeat_platform.native_export.sinks == 'elastic'
+      - not hertzbeat_platform.native_export.enabled or hertzbeat_platform.native_export.endpoint is match('^https://[^\s]+/v1/metrics$')
+      - not hertzbeat_platform.lifecycle.enabled or hertzbeat_platform.lifecycle.admission_url is match('^https://[^\s]+/v1/logs$')
+    fail_msg: HertzBeat requires the resolved rootless service, immutable image and verified TLS contract.
+
+- name: Create service directories as the rootless service owner
+  ansible.builtin.file:
+    path: '{{ item }}'
+    state: directory
+    mode: '0700'
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+  loop:
+    - '{{ hertzbeat_platform.home }}/.config/containers/systemd'
+    - '{{ hertzbeat_platform.data_home }}/hertzbeat/config'
+    - '{{ hertzbeat_platform.data_home }}/hertzbeat/sink-proxy'
+    - '{{ hertzbeat_platform.data_home }}/hertzbeat/native-receipts'
+    - '{{ hertzbeat_platform.home }}/.config/systemd/user'
+    - '{{ hertzbeat_platform.data_home }}/hertzbeat/data'
+    - '{{ hertzbeat_platform.data_home }}/hertzbeat/logs'
+    - '{{ hertzbeat_platform.native_export.directory }}'
+    - '{{ hertzbeat_platform.data_home }}/hertzbeat/greptime'
+
+- name: Render service configuration without secret values
+  ansible.builtin.template:
+    src: '{{ item.src }}'
+    dest: '{{ hertzbeat_platform.home if item.dest.startswith(".config/") else hertzbeat_platform.data_home }}/{{ item.dest }}'
+    mode: '0600'
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+  loop:
+    - {src: sink-proxy.json.j2, dest: hertzbeat/config/sink-proxy.json}
+    - {src: native-receipts.json.j2, dest: hertzbeat/config/native-receipts.json}
+    - {src: hertzbeat-native-receipts.service.j2, dest: .config/systemd/user/hertzbeat-native-receipts.service}
+    - {src: hertzbeat-native-receipts.timer.j2, dest: .config/systemd/user/hertzbeat-native-receipts.timer}
+    - {src: hertzbeat-sink-proxy.service.j2, dest: .config/systemd/user/hertzbeat-sink-proxy.service}
+    - {src: application.yml.j2, dest: hertzbeat/config/application.yml}
+    - {src: monitors.json.j2, dest: hertzbeat/config/monitors.json}
+    - {src: schema-application.yml.j2, dest: hertzbeat/config/schema-application.yml}
+    - {src: java.security.j2, dest: hertzbeat/config/java.security}
+    - {src: hertzbeat.pod.j2, dest: .config/containers/systemd/hertzbeat.pod}
+    - {src: greptime.container.j2, dest: .config/containers/systemd/greptime.container}
+    - {src: greptime.toml.j2, dest: hertzbeat/config/greptime.toml}
+    - {src: hertzbeat.container.j2, dest: .config/containers/systemd/hertzbeat.container}
+    - {src: hertzbeat-schema.container.j2, dest: .config/containers/systemd/hertzbeat-schema.container}
+
+- name: Create an empty fail-closed known hosts file only when none was provisioned
+  ansible.builtin.copy:
+    content: "# Provision authenticated collector host keys before enabling SSH monitors.\n"
+    dest: '{{ hertzbeat_platform.known_hosts_file }}'
+    force: false
+    mode: '0600'
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+
+- name: Install the source-scoped gateway package without additional dependencies
+  ansible.builtin.copy:
+    src: '{{ role_path }}/../../../lme_sink_proxy'
+    dest: '{{ hertzbeat_platform.data_home }}/hertzbeat/sink-proxy/'
+    mode: '0600'
+    directory_mode: '0700'
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+
+- name: Install the native content receipt worker under the outbox owner
+  ansible.builtin.copy:
+    src: '{{ role_path }}/../../../lme_telemetry'
+    dest: '{{ hertzbeat_platform.data_home }}/hertzbeat/native-receipts/'
+    mode: '0600'
+    directory_mode: '0700'
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+
+- name: Install monitor reconciliation and native probe commands
+  ansible.builtin.copy:
+    src: '{{ item }}'
+    dest: '{{ hertzbeat_platform.data_home }}/hertzbeat/{{ item }}'
+    mode: '0700'
+  loop:
+    - reconcile_monitors.py
+    - native_probe.py
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+
+- name: Run the explicit one-shot schema phase
+  ansible.builtin.systemd_service:
+    name: hertzbeat-schema.service
+    scope: user
+    daemon_reload: true
+    state: restarted
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+  environment:
+    XDG_RUNTIME_DIR: '/run/user/{{ hertzbeat_platform.uid }}'
+  when: hertzbeat_platform_phase == 'schema'
+
+- name: Start Greptime before the normal application in the explicit application phase
+  ansible.builtin.systemd_service:
+    name: '{{ item }}'
+    scope: user
+    daemon_reload: true
+    state: started
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+  environment:
+    XDG_RUNTIME_DIR: '/run/user/{{ hertzbeat_platform.uid }}'
+  loop:
+    - greptime.service
+    - hertzbeat.service
+  when: hertzbeat_platform_phase == 'application'
+
+- name: Enable the source-scoped gateway for native readback in every profile
+  ansible.builtin.systemd_service:
+    name: hertzbeat-sink-proxy.service
+    scope: user
+    daemon_reload: true
+    enabled: true
+    state: started
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+  environment:
+    XDG_RUNTIME_DIR: '/run/user/{{ hertzbeat_platform.uid }}'
+  when: hertzbeat_platform_phase == 'application' and hertzbeat_platform.sink_gateway.enabled
+
+- name: Reconcile only inventory-owned native monitors after application startup
+  ansible.builtin.command:
+    argv:
+      - python3
+      - '{{ hertzbeat_platform.data_home }}/hertzbeat/reconcile_monitors.py'
+      - --url
+      - http://127.0.0.1:1157
+      - --allow-loopback
+      - --ca-file
+      - /etc/ssl/certs/ca-certificates.crt
+      - --authorization-file
+      - '{{ hertzbeat_platform.secret_directory }}/admin-authorization'
+      - --run-id
+      - '{{ hertzbeat_platform.run_id }}'
+      - --desired-file
+      - '{{ hertzbeat_platform.data_home }}/hertzbeat/config/monitors.json'
+      - --apply
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+  register: hertzbeat_reconciliation
+  retries: 30
+  delay: 2
+  until: hertzbeat_reconciliation.rc == 0
+  changed_when: >-
+    hertzbeat_reconciliation.rc == 0 and
+    ((hertzbeat_reconciliation.stdout | from_json).created +
+     (hertzbeat_reconciliation.stdout | from_json).updated +
+     (hertzbeat_reconciliation.stdout | from_json).deleted) > 0
+  when: hertzbeat_platform_phase == 'application'
+
+
+- name: Enable the bounded native receipt reconciliation timer
+  ansible.builtin.systemd_service:
+    name: hertzbeat-native-receipts.timer
+    scope: user
+    daemon_reload: true
+    enabled: true
+    state: started
+  become: true
+  become_user: '{{ hertzbeat_platform.user }}'
+  environment:
+    XDG_RUNTIME_DIR: '/run/user/{{ hertzbeat_platform.uid }}'
+  when: hertzbeat_platform_phase == 'application'

@@ -4,8 +4,11 @@ LiteLLM provides an OpenAI-compatible API proxy for LME's local LLM (llama.cpp) 
 
 ## Quick Start
 
-**Endpoint:** `https://localhost:4000`  
-**API Key:** `sk-lme-llama-proxy`  
+**Endpoint:** `https://localhost:4000` (loopback-only by default; use `--tailscale` / a profile to expose it)  
+**API Key:** a **per-install random secret** (`litellm_master_key`), not a committed value. Fetch it on the host and export it for the examples below:  
+```bash
+export LITELLM_API_KEY=$(podman exec lme-litellm printenv LITELLM_MASTER_KEY)
+```
 **Default Model:** `gemma-3-1b` (local)
 
 ## Basic Usage Examples
@@ -14,7 +17,7 @@ LiteLLM provides an OpenAI-compatible API proxy for LME's local LLM (llama.cpp) 
 
 ```bash
 curl -k https://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer sk-lme-llama-proxy" \
+  -H "Authorization: Bearer $LITELLM_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma-3-1b",
@@ -29,7 +32,7 @@ curl -k https://localhost:4000/v1/chat/completions \
 
 ```bash
 curl -k https://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer sk-lme-llama-proxy" \
+  -H "Authorization: Bearer $LITELLM_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma-3-1b",
@@ -52,7 +55,7 @@ curl -k https://localhost:4000/v1/chat/completions \
 
 ```bash
 curl -k https://localhost:4000/v1/models \
-  -H "Authorization: Bearer sk-lme-llama-proxy"
+  -H "Authorization: Bearer $LITELLM_API_KEY"
 ```
 
 ### 4. Health Check
@@ -64,12 +67,13 @@ curl -k https://localhost:4000/health
 ## Using from Python
 
 ```python
+import os
 import requests
 import json
 
 url = "https://localhost:4000/v1/chat/completions"
 headers = {
-    "Authorization": "Bearer sk-lme-llama-proxy",
+    "Authorization": f"Bearer {os.environ['LITELLM_API_KEY']}",
     "Content-Type": "application/json"
 }
 payload = {
@@ -94,7 +98,7 @@ From inside the `lme` network (e.g., from lme-elasticsearch, lme-kibana, or any 
 ```bash
 # Example: Running from inside lme-elasticsearch container
 curl -k https://lme-litellm:4000/v1/chat/completions \
-  -H "Authorization: Bearer sk-lme-llama-proxy" \
+  -H "Authorization: Bearer $LITELLM_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma-3-1b",
@@ -119,7 +123,7 @@ Once configured, just change the `"model"` parameter:
 ```bash
 # Use OpenAI GPT-4 instead of local model
 curl -k https://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer sk-lme-llama-proxy" \
+  -H "Authorization: Bearer $LITELLM_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4",

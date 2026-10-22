@@ -1,0 +1,318 @@
+---
+# testing/remote_harness/tasks/prepare_image.yml -- acquire ONE declared base image under its declared trust mode
+# (codex-tick372; RS descriptors r2 image_source_descriptor / verification_semantics). AUTHORED, NEVER EXECUTED.
+# Included by tasks/prepare.yml once per preparation.base_images entry (loop_var rh_prep_img = {key, value}).
+#
+# TRUST MODE debian_official_tls_sha512 (the ONLY mode this file implements): the checksum metadata and the image are
+# fetched over HTTPS from the declared official origins only (tasks/prepare_fetch.yml: every hop admitted before
+# contact, TLS chain + hostname validated, redirects bounded and confined to the approved hosts and to the selected
+# edition + file path), ONE dated edition and ONE exact checksum entry are bound, and the image SHA512 is verified
+# BEFORE atomic admission. The record states the boundary: Web PKI / TLS + the official origin, then content pinning
+# by SHA512 -- NOT an OpenPGP signature, no protection against compromise of the official publishing origin, no
+# DNSSEC claim. A descriptor that selects any other mode (signed_detached) REFUSES here: this file never evaluates a
+# signature and never falls back from a signed mode to the TLS mode.
+#
+# EDITION: edition_select.mode explicit (one declared dated id) or listed_newest (the concrete dated directory is
+# PRODUCED by acquisition: the release index is fetched under the same constraints and the greatest dated id that
+# fully matches edition_regex is selected and recorded; a moving alias is never the admitted edition). The file name
+# is PRODUCED from the edition's checksum metadata: exactly one line of the declared grammar whose name fully matches
+# file_regex (with {edition} substituted); zero, several, or a malformed line refuses. Nothing is guessed: a layout
+# other than the declared (HYPOTHESIS) URL / path patterns refuses on the hop admission or the entry selection.
+# ADMISSION: <root>/<layout.bases>/<file>, mode 0444, by a no-replace hard link of the verified partial (os.link
+# fails on an existing name); an existing base of that name is REUSED only when its sha512 is the entry's, otherwise
+# REFUSED and preserved (never overwritten). An interrupted earlier attempt leaves only a partial, which is discarded
+# and refetched from scratch (tasks/prepare_fetch.yml removes it before the request).
+
+- name: "PREPARE IMAGE -- admit the descriptor (a declared trust mode this file implements; no fallback)"
+  vars:
+    _d: "{{ rh_prep_img.value }}"
+    _p: "{{ rh.controller.bootstrap.preparation }}"
+  ansible.builtin.assert:
+    that:
+      - _d.trust_mode == 'debian_official_tls_sha512'
+      - _d.trust_mode in _p.trust_modes
+      - _d.origin_hosts is sequence and _d.origin_hosts | length > 0
+      - _d.edition_select.mode in ['explicit', 'listed_newest']
+      - _d.edition_select.mode != 'explicit' or (_d.edition_select.value is string and _d.edition_select.value is match(_d.edition_regex))
+    fail_msg: >-
+      REFUSED {{ _p.refusal }}: base image {{ rh_prep_img.key }} declares trust mode {{ _d.trust_mode | default('?') }};
+      this producer implements only debian_official_tls_sha512 for images (a signed_detached declaration is never
+      satisfied by it and never downgraded), with origin hosts, an edition_select of explicit (a value fully matching
+      edition_regex) or listed_newest. Nothing was fetched.
+    quiet: true
+
+# ---- edition: explicit, or PRODUCED from the release index (listed_newest) ----
+- name: "PREPARE IMAGE -- the release index for the edition selection (listed_newest only)"
+  when: rh_prep_img.value.edition_select.mode == 'listed_newest'
+  block:
+    - name: "PREPARE IMAGE -- set the index fetch (facts; tasks/prepare_fetch.yml)"
+      ansible.builtin.set_fact:
+        rh_prep_f_url: "{{ rh_prep_img.value.index_url }}"
+        rh_prep_f_dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/' ~ rh_prep_img.key ~ '.index' }}"
+        rh_prep_f_hosts: "{{ rh_prep_img.value.origin_hosts }}"
+        rh_prep_f_path: "{{ rh_prep_img.value.index_path_regex }}"
+        rh_prep_f_hop: 0
+        rh_prep_f_hops: []
+
+    - name: "PREPARE IMAGE -- fetch the release index (constrained)"
+      ansible.builtin.include_tasks: prepare_fetch.yml
+
+    - name: "PREPARE IMAGE -- digest the index bytes on disk"
+      ansible.builtin.stat: {path: "{{ rh_prep_f_dest }}", follow: false, checksum_algorithm: sha256}
+      register: _rh_prep_ixst
+
+    - name: "PREPARE IMAGE -- read the index ONCE"
+      ansible.builtin.slurp: {src: "{{ rh_prep_f_dest }}"}
+      register: _rh_prep_ixraw
+
+    - name: "PREPARE IMAGE -- bind the index bytes READ to the digest, then select the greatest dated edition"
+      vars:
+        _txt: "{{ _rh_prep_ixraw.content | b64decode }}"
+        _l: "{{ _txt | regex_findall(rh_prep_img.value.index_href_regex) | unique | select('match', rh_prep_img.value.edition_regex) | sort | list }}"
+      ansible.builtin.set_fact:
+        rh_prep_i_edition: "{{ (_l | last) if ((_txt | hash('sha256')) == _rh_prep_ixst.stat.checksum and _l | length > 0) else '' }}"
+        rh_prep_i_selection: >-
+          {{ {'mode': 'listed_newest', 'index_url': rh_prep_f_final | default(''), 'index_hops': rh_prep_f_hops,
+              'index_sha256': _rh_prep_ixst.stat.checksum, 'bound': (_txt | hash('sha256')) == _rh_prep_ixst.stat.checksum,
+              'listed': _l | length} }}
+
+- name: "PREPARE IMAGE -- the declared edition (explicit)"
+  when: rh_prep_img.value.edition_select.mode == 'explicit'
+  ansible.builtin.set_fact:
+    rh_prep_i_edition: "{{ rh_prep_img.value.edition_select.value }}"
+    rh_prep_i_selection: {mode: explicit}
+
+- name: "PREPARE IMAGE -- refuse an unselected, unbound or malformed edition (never a moving alias)"
+  ansible.builtin.assert:
+    that:
+      - rh_prep_i_edition is string and rh_prep_i_edition is match(rh_prep_img.value.edition_regex)
+      - rh_prep_i_selection.bound | default(true)
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: base image {{ rh_prep_img.key }} has no single dated
+      edition fully matching {{ rh_prep_img.value.edition_regex }} (selection {{ rh_prep_i_selection }}); nothing is guessed.
+    quiet: true
+
+# ---- the edition's checksum metadata: fetched, bound, parsed, ONE entry ----
+- name: "PREPARE IMAGE -- set the metadata fetch (edition + metadata file confined in every hop's path)"
+  ansible.builtin.set_fact:
+    rh_prep_f_url: "{{ rh_prep_img.value.edition_url | replace('{edition}', rh_prep_i_edition) ~ rh_prep_img.value.metadata_file }}"
+    rh_prep_f_dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/' ~ rh_prep_img.key ~ '.' ~ rh_prep_img.value.metadata_file }}"
+    rh_prep_f_hosts: "{{ rh_prep_img.value.origin_hosts }}"
+    rh_prep_f_path: "{{ (rh_prep_img.value.edition_path_regex | replace('{edition}', rh_prep_i_edition | regex_escape)) ~ (rh_prep_img.value.metadata_file | regex_escape) ~ '$' }}"
+    rh_prep_f_hop: 0
+    rh_prep_f_hops: []
+
+- name: "PREPARE IMAGE -- fetch the checksum metadata (constrained)"
+  ansible.builtin.include_tasks: prepare_fetch.yml
+
+- name: "PREPARE IMAGE -- keep the metadata fetch provenance"
+  ansible.builtin.set_fact:
+    rh_prep_i_meta_fetch: {source_url: "{{ rh_prep_f_hops[0].url }}", final_url: "{{ rh_prep_f_final }}", hops: "{{ rh_prep_f_hops }}"}
+
+- name: "PREPARE IMAGE -- digest the metadata bytes on disk (sha256, then sha512)"
+  ansible.builtin.stat: {path: "{{ rh_prep_f_dest }}", follow: false, checksum_algorithm: "{{ item }}"}
+  loop: [sha256, sha512]
+  register: _rh_prep_mdst
+
+- name: "PREPARE IMAGE -- read the metadata ONCE (the bytes every check below parses)"
+  ansible.builtin.slurp: {src: "{{ rh_prep_f_dest }}"}
+  register: _rh_prep_mdraw
+
+# LINE GRAMMAR (declared, preparation.base_images.<k>.line_grammar; C1 proposal
+# '^([0-9a-f]{128})  ([A-Za-z0-9._+~-]+)$'): exactly two groups, digest then name, text-mode two-space separator; a
+# binary-marker ('*'), CR, tab, path or any other shape is MALFORMED and refuses (no tolerant parse). Lines are split
+# on '\n' only (never splitlines, which would silently drop a CR).
+- name: "PREPARE IMAGE -- bind the metadata bytes READ to the on-disk digests; every line of the declared grammar"
+  vars:
+    _txt: "{{ _rh_prep_mdraw.content | b64decode }}"
+    _l: "{{ _txt.split('\n') | reject('equalto', '') | list }}"
+    _m: "{{ _l | reject('match', rh_prep_img.value.line_grammar) | list }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_mdst.results[0].stat.isreg and not _rh_prep_mdst.results[0].stat.islnk
+      - (_txt | hash('sha256')) == _rh_prep_mdst.results[0].stat.checksum
+      - (_txt | hash('sha512')) == _rh_prep_mdst.results[1].stat.checksum
+      - _txt.endswith('\n')
+      - _l | length > 0
+      - _m | length == 0
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ rh_prep_f_final | default('?') }} ({{ rh_prep_i_edition }})
+      must be exactly the bytes read ({{ _rh_prep_mdst.results[0].stat.checksum | default('?') }}), newline-terminated,
+      non-empty, EVERY line of the declared grammar {{ rh_prep_img.value.line_grammar }} (malformed lines:
+      {{ _m | length }}). Nothing was admitted.
+    quiet: true
+
+- name: "PREPARE IMAGE -- the entries naming the selected file (file PRODUCED from the metadata, sha512 from its line)"
+  vars:
+    _txt: "{{ _rh_prep_mdraw.content | b64decode }}"
+    _want: "{{ '^' ~ (rh_prep_img.value.file_regex | replace('{edition}', rh_prep_i_edition | regex_escape)) ~ '$' }}"
+    _e: >-
+      {{ _txt.split('\n') | reject('equalto', '') | map('regex_replace', rh_prep_img.value.line_grammar, '\\1 \\2')
+         | map('split', ' ') | selectattr(1, 'match', _want) | list }}
+  ansible.builtin.set_fact:
+    rh_prep_i_entry:
+      count: "{{ _e | length }}"
+      sha512: "{{ _e[0][0] if (_e | length) == 1 else '' }}"
+      file: "{{ _e[0][1] if (_e | length) == 1 else '' }}"
+      line: "{{ (_e[0][0] ~ '  ' ~ _e[0][1]) if (_e | length) == 1 else '' }}"
+
+- name: "PREPARE IMAGE -- refuse zero or several entries for the file, or a malformed selected entry"
+  ansible.builtin.assert:
+    that:
+      - rh_prep_i_entry.count | int == 1
+      - rh_prep_i_entry.sha512 is match('^[0-9a-f]{128}$')
+      - rh_prep_i_entry.file is match('^' ~ (rh_prep_img.value.file_regex | replace('{edition}', rh_prep_i_edition | regex_escape)) ~ '$')
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ rh_prep_img.key }} ({{ rh_prep_i_edition }}) needs
+      EXACTLY ONE checksum line naming a file fully matching {{ rh_prep_img.value.file_regex }} (found
+      {{ rh_prep_i_entry.count }}); zero or duplicate entries refuse, no prefix/suffix/glob match. Nothing was admitted.
+    quiet: true
+
+- name: "PREPARE IMAGE -- store the metadata bytes content-addressed beside the record (no-replace hard link)"
+  ansible.builtin.file:
+    src: "{{ rh_prep_f_dest }}"
+    dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.metadata ~ '/' ~ _rh_prep_mdst.results[0].stat.checksum ~ '-' ~ rh_prep_img.value.metadata_file }}"
+    state: hard
+    force: false
+
+- name: "PREPARE IMAGE -- re-stat the stored metadata (same bytes; an existing name must already be them)"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.metadata ~ '/' ~ _rh_prep_mdst.results[0].stat.checksum ~ '-' ~ rh_prep_img.value.metadata_file }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rh_prep_mdkeep
+
+- name: "PREPARE IMAGE -- refuse a stored metadata name holding other bytes (preserved)"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_mdkeep.stat.isreg and not _rh_prep_mdkeep.stat.islnk
+      - _rh_prep_mdkeep.stat.checksum == _rh_prep_mdst.results[0].stat.checksum
+    fail_msg: "REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ _rh_prep_mdkeep.stat.path | default('?') }} exists with other bytes; preserved."
+    quiet: true
+
+# ---- the base: REUSED when the verified immutable base exists, else FETCHED, verified, admitted atomically ----
+- name: "PREPARE IMAGE -- stat an existing base of the selected name (sha512; links not followed)"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.bases ~ '/' ~ rh_prep_i_entry.file }}"
+    follow: false
+    checksum_algorithm: sha512
+  register: _rh_prep_base0
+
+- name: "PREPARE IMAGE -- refuse a conflicting existing base (same name, other digest / not an immutable regular file; preserved)"
+  when: _rh_prep_base0.stat.exists
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_base0.stat.isreg and not _rh_prep_base0.stat.islnk
+      - _rh_prep_base0.stat.mode == '0444'
+      - _rh_prep_base0.stat.uid == rh_builder.uid | int
+      - _rh_prep_base0.stat.checksum == rh_prep_i_entry.sha512
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ _rh_prep_base0.stat.path }} exists and is not the
+      verified immutable base of entry {{ rh_prep_i_entry.line }} (sha512 {{ _rh_prep_base0.stat.checksum | default('?') }},
+      mode {{ _rh_prep_base0.stat.mode | default('?') }}). Both are preserved; nothing was overwritten or fetched.
+    quiet: true
+
+# a run killed AFTER the admission link but BEFORE the partial name was released leaves <partial>/<file> as a second
+# name of the admitted inode: released here on the reuse path (the fetch path's prepare_fetch.yml removes it anyway)
+- name: "PREPARE IMAGE -- release a stale partial name on the reuse path (never admitted by its own name)"
+  when: _rh_prep_base0.stat.exists
+  ansible.builtin.file:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/' ~ rh_prep_i_entry.file }}"
+    state: absent
+
+- name: "PREPARE IMAGE -- fetch, verify and admit the base (absent only)"
+  when: not _rh_prep_base0.stat.exists
+  block:
+    - name: "PREPARE IMAGE -- set the image fetch (edition + exact file confined in every hop's path)"
+      ansible.builtin.set_fact:
+        rh_prep_f_url: "{{ rh_prep_img.value.edition_url | replace('{edition}', rh_prep_i_edition) ~ rh_prep_i_entry.file }}"
+        rh_prep_f_dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/' ~ rh_prep_i_entry.file }}"
+        rh_prep_f_hosts: "{{ rh_prep_img.value.origin_hosts }}"
+        rh_prep_f_path: "{{ (rh_prep_img.value.edition_path_regex | replace('{edition}', rh_prep_i_edition | regex_escape)) ~ (rh_prep_i_entry.file | regex_escape) ~ '$' }}"
+        rh_prep_f_hop: 0
+        rh_prep_f_hops: []
+
+    - name: "PREPARE IMAGE -- fetch the image into the partial (constrained; a stale partial is discarded first)"
+      ansible.builtin.include_tasks: prepare_fetch.yml
+
+    - name: "PREPARE IMAGE -- digest the partial (sha512 over its bytes)"
+      ansible.builtin.stat: {path: "{{ rh_prep_f_dest }}", follow: false, checksum_algorithm: sha512}
+      register: _rh_prep_part
+
+    - name: "PREPARE IMAGE -- a changed image: remove the partial, then refuse (the bases dir is untouched)"
+      when: >-
+        not (_rh_prep_part.stat.isreg | default(false)) or (_rh_prep_part.stat.islnk | default(true))
+        or (_rh_prep_part.stat.checksum | default('')) != rh_prep_i_entry.sha512
+      block:
+        - name: "PREPARE IMAGE -- remove the unverified partial"
+          ansible.builtin.file: {path: "{{ rh_prep_f_dest }}", state: absent}
+
+        - name: "PREPARE IMAGE -- refuse the changed image"
+          ansible.builtin.fail:
+            msg: >-
+              REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ rh_prep_f_final | default('?') }} sha512
+              {{ _rh_prep_part.stat.checksum | default('?') }} is not the selected entry {{ rh_prep_i_entry.line }}; the
+              partial was removed and nothing was admitted.
+
+    - name: "PREPARE IMAGE -- make the verified partial immutable before admission"
+      ansible.builtin.file: {path: "{{ rh_prep_f_dest }}", mode: '0444'}
+
+    - name: "PREPARE IMAGE -- admit atomically (no-replace hard link; an existing name refuses, never replaced)"
+      ansible.builtin.file:
+        src: "{{ rh_prep_f_dest }}"
+        dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.bases ~ '/' ~ rh_prep_i_entry.file }}"
+        state: hard
+        force: false
+
+    - name: "PREPARE IMAGE -- release the partial name (the admitted base keeps the inode)"
+      ansible.builtin.file: {path: "{{ rh_prep_f_dest }}", state: absent}
+
+    - name: "PREPARE IMAGE -- keep the image fetch provenance"
+      ansible.builtin.set_fact:
+        rh_prep_i_img_fetch: {source_url: "{{ rh_prep_f_hops[0].url }}", final_url: "{{ rh_prep_f_final }}", hops: "{{ rh_prep_f_hops }}"}
+
+- name: "PREPARE IMAGE -- re-verify the admitted base (sha512, then sha256; links not followed)"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.bases ~ '/' ~ rh_prep_i_entry.file }}"
+    follow: false
+    checksum_algorithm: "{{ item }}"
+  loop: [sha512, sha256]
+  register: _rh_prep_base1
+
+- name: "PREPARE IMAGE -- refuse unless the admitted base is the immutable verified entry"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_base1.results[0].stat.isreg and not _rh_prep_base1.results[0].stat.islnk
+      - _rh_prep_base1.results[0].stat.mode == '0444'
+      - _rh_prep_base1.results[0].stat.checksum == rh_prep_i_entry.sha512
+      - _rh_prep_base1.results[1].stat.inode == _rh_prep_base1.results[0].stat.inode
+    fail_msg: "REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: the admitted base {{ rh_prep_i_entry.file }} is not the verified immutable entry."
+    quiet: true
+
+- name: "PREPARE IMAGE -- the image's candidate record entry (trust mode and its boundary stated, never 'signed')"
+  ansible.builtin.set_fact:
+    rh_prep_images: >-
+      {{ rh_prep_images + [{
+           'key': rh_prep_img.key,
+           'trust_mode': rh_prep_img.value.trust_mode,
+           'trust_boundary': rh.controller.bootstrap.preparation.trust_boundaries[rh_prep_img.value.trust_mode],
+           'signature_verified': false,
+           'dnssec_verified': false,
+           'origin_hosts': rh_prep_img.value.origin_hosts,
+           'ca_file': rh.controller.bootstrap.preparation.fetch.ca_file,
+           'edition': rh_prep_i_edition,
+           'edition_selection': rh_prep_i_selection,
+           'metadata': {'source_url': rh_prep_i_meta_fetch.source_url, 'final_url': rh_prep_i_meta_fetch.final_url,
+                        'hops': rh_prep_i_meta_fetch.hops, 'sha256': _rh_prep_mdst.results[0].stat.checksum,
+                        'sha512': _rh_prep_mdst.results[1].stat.checksum, 'size': _rh_prep_mdst.results[0].stat.size,
+                        'stored': rh.controller.bootstrap.preparation.layout.metadata ~ '/' ~ _rh_prep_mdst.results[0].stat.checksum ~ '-' ~ rh_prep_img.value.metadata_file,
+                        'selected_entry_line': rh_prep_i_entry.line},
+           'file': rh_prep_i_entry.file,
+           'sha512': _rh_prep_base1.results[0].stat.checksum,
+           'sha256': _rh_prep_base1.results[1].stat.checksum,
+           'size_bytes': _rh_prep_base1.results[0].stat.size,
+           'stored': rh.controller.bootstrap.preparation.layout.bases ~ '/' ~ rh_prep_i_entry.file,
+           'image_fetch': (rh_prep_i_img_fetch if not _rh_prep_base0.stat.exists else none),
+           'disposition': ('reused' if _rh_prep_base0.stat.exists else 'fetched'),
+           'acquired_at_utc': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+           'conflicts_preserved': []}] }}

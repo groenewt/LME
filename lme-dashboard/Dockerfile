@@ -12,6 +12,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY telemetry_views.py .
+COPY ai_views.py .
 COPY static/ static/
 COPY scripts/ scripts/
 

@@ -19,7 +19,7 @@ follow the existing vault pattern, so they are documented here together.
 | `wazuh_api` | Wazuh API user | Same as `elastic` | `change_passwords.yml -e lme_user=wazuh_api ...` (paired with `wazuh`) |
 | `pgvector` | PostgreSQL `lme` superuser inside `lme-pgvector` | Podman **file** secret in `/var/lib/containers/storage/secrets/<id>` | `change_passwords.yml -e lme_user=pgvector ...` |
 | `llm-keys` | Cloud LLM provider keys for LiteLLM (OpenAI, Anthropic, etc.) | Encrypted bundle `/opt/lme/config/llm_keys.enc` rendered into Podman **file** secret `llm-keys` by `scripts/sync_llm_keys.py` | Manage keys via the dashboard UI (or edit `llm_keys.enc`); see [LiteLLM cloud keys](#litellm-cloud-keys-llm-keys) |
-| `LITELLM_API_KEY` (`sk-lme-llama-proxy`) | Internal proxy key (LiteLLM `master_key`) | Plain string in `config/litellm_config.yaml`, mirrored in `quadlet/lme-dashboard.container` and `quadlet/lme-log-analyzer.container` | Manual edit + service restart; see [Internal LiteLLM proxy key](#internal-litellm-proxy-key) |
+| `litellm_master_key` | Internal proxy key (LiteLLM `master_key`) | Per-install random Podman **file** secret, minted by `llama_cpp_setup.yml`; injected as env `LITELLM_MASTER_KEY` (proxy) / `LITELLM_API_KEY` (UIs), read from `os.environ/…`. Not committed. | Recreate the secret + restart services; see [Internal LiteLLM proxy key](#internal-litellm-proxy-key-litellm_master_key) |
 | Vault password | Encrypts everything in `/etc/lme/vault/` | `/etc/lme/pass.sh` (mode 0700) | Out of scope for `change_passwords.yml`; rotation requires re-encrypting every vault file |
 
 ## Inventory by service
@@ -80,19 +80,29 @@ sudo systemctl start lme-llm-keys.service     # or touch the trigger file
 sudo journalctl -u lme-llm-keys.service -n 50
 ```
 
-#### Internal LiteLLM proxy key
-- LiteLLM's `master_key` is the bearer token external clients (the dashboard
-  and the log analyzer) present to call the proxy.
-- Default value `sk-lme-llama-proxy` is hard-coded in:
-  - [`config/litellm_config.yaml`](../config/litellm_config.yaml)
-  - [`quadlet/lme-dashboard.container`](../quadlet/lme-dashboard.container)
-  - [`quadlet/lme-log-analyzer.container`](../quadlet/lme-log-analyzer.container)
-- This is currently a static internal token and is not vault-managed. To
-  rotate it, change all three files to the same new value, copy the quadlets
-  to `/etc/containers/systemd/`, and restart the affected services:
+#### Internal LiteLLM proxy key (`litellm_master_key`)
+- LiteLLM's `master_key` is the bearer token the dashboard and the log analyzer
+  present to call the proxy.
+- It is a **per-install random secret**, generated on first install by
+  `ansible/roles/podman/tasks/llama_cpp_setup.yml` (30-char alnum, file-driver
+  Podman secret `litellm_master_key`). It is **not** committed anywhere: the
+  proxy reads it as `master_key: os.environ/LITELLM_MASTER_KEY`
+  ([`config/litellm_config.yaml`](../config/litellm_config.yaml)); the rendered
+  `lme-litellm` unit injects it as env `LITELLM_MASTER_KEY` and the two UI units
+  as env `LITELLM_API_KEY` (all from the same secret, declared in
+  `manifests/services/lme-{litellm,dashboard,log-analyzer}.yml`).
+- Read the live value on the host:
 
 ```bash
-sudo systemctl daemon-reload
+podman secret inspect --showsecret litellm_master_key   # or:
+podman exec lme-litellm printenv LITELLM_MASTER_KEY
+```
+
+- To rotate it, replace the secret and restart the consumers:
+
+```bash
+NEW=$(</dev/urandom tr -dc A-Za-z0-9 | head -c30)
+echo -n "$NEW" | sudo podman secret create --driver file --replace litellm_master_key -
 sudo systemctl restart lme-litellm.service lme-dashboard.service lme-log-analyzer.service
 ```
 

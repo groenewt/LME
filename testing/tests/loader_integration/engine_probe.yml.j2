@@ -1,0 +1,142 @@
+{# testing/tests/loader_integration/engine_probe.yml.j2
+   RUNNABLE-NOW engine-level probe for a single `kind: engine_regression` case.
+   Renders a self-contained playbook that invokes the REAL resolver filters
+   (lme_resolve_config / lme_validate_config / lme_config_revision /
+   lme_known_enable_flags) through ACTUAL ansible-playbook Jinja -- the same pipeline
+   load_manifests.yml will use -- against an IMMUTABLE copied resolver
+   (ANSIBLE_FILTER_PLUGINS is set to the per-run copy by one_case.yml).
+
+   This is the G-owned faithful probe for the ENGINE scope: it needs NO C1 loader
+   cutover (the engine filters exist at HEAD). The ENTRYPOINT-level probe (real
+   -e/-i through site/upgrade/... via a resolve-only seam) stays separate and QUEUED
+   (see contract_binding.probe_handler). No hand-authored Python test: the case is
+   pure data, this macro is the only representation, and the assertions are generated.
+
+   Case data contract:
+     call: resolve | validate | validate_reversed | revision
+     registry: <synthetic registry mapping>            (inlined as JSON below), OR
+     registry_from_rel: <repo-root-relative path to a real vars file> + registry_key: <key>
+                                                         (load the REAL shipped registry; the
+                                                          runner joins it onto repo_root at render)
+     resolve: {selections?, profile_vars?, observations?, origins?}   (call: resolve)
+     resolved: <input resolved dict/value>             (call: validate / validate_reversed)
+     payload: <mapping>  payload_b?: <mapping>          (call: revision)
+     expect:
+       raises: true                                    -> the call MUST fail closed
+       raises_match: "<substring>"                     -> AND that substring MUST appear in
+                                                          the raised error message (defeats the
+                                                          fail-OPEN hole where ANY error passed)
+       resolved: {field: value}                        -> _out.resolved[field] == value
+       origins:  {field: origin}                       -> _out.origins[field] == origin
+       valid: true                                     -> validate returned the input unchanged
+       validate_roundtrip: true                        -> (resolve) registry | validate(resolved) == resolved
+       known_enable_flags_match: true                  -> '' | lme_known_enable_flags == registry enable_flag keys
+       revision_equal: true                            -> (revision) rev(payload) == rev(payload_b)
+       revision_differ: true                           -> (revision) rev(payload) != rev(payload_b)
+#}
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _err: ""
+{% if case.registry is defined %}
+    _registry: {{ case.registry | to_json }}
+{% endif %}
+{% if case.resolved is defined %}
+    _resolved_input: {{ case.resolved | to_json }}
+{% endif %}
+{% if case.call == 'resolve' %}
+    _selections: {{ (case.resolve.selections | default({})) | to_json }}
+    _profile_vars: {{ (case.resolve.profile_vars | default({})) | to_json }}
+    _observations: {{ (case.resolve.observations | default({})) | to_json }}
+    _origins: {{ (case.resolve.origins | default({})) | to_json }}
+{% endif %}
+{% if case.call == 'revision' %}
+    _payload: {{ case.payload | to_json }}
+    _payload_b: {{ (case.payload_b | default(case.payload)) | to_json }}
+{% endif %}
+  tasks:
+{% if case.registry_from_rel is defined %}
+    # Load the REAL registry from the repo (not a synthetic mirror): this case proves the
+    # behavior holds against the SHIPPED manifests/global.yml, not just a hand-built shape.
+    # repo_root is a runner var, known at TEMPLATE-render time, so the absolute path is baked in.
+    - name: "load the real registry from {{ case.registry_from_rel }}"
+      ansible.builtin.include_vars:
+        file: {{ (repo_root ~ '/' ~ case.registry_from_rel) | to_json }}
+        name: _gv
+    - name: "bind _registry := _gv.{{ case.registry_key }}"
+      ansible.builtin.set_fact:
+        _registry: "{% raw %}{{ _gv.{% endraw %}{{ case.registry_key }}{% raw %} }}{% endraw %}"
+{% endif %}
+    - name: "invoke the real resolver (fail-closed captured by rescue)"
+      block:
+{% if case.call == 'resolve' %}
+        - ansible.builtin.set_fact:
+            _out: {% raw %}"{{ _registry | lme_resolve_config(selections=_selections, profile_vars=_profile_vars, observations=_observations, origins=_origins) }}"{% endraw +%}
+{% if case.expect.validate_roundtrip | default(false) %}
+        - ansible.builtin.set_fact:
+            _rt: {% raw %}"{{ _registry | lme_validate_config(_out.resolved) }}"{% endraw +%}
+{% endif %}
+{% elif case.call == 'validate' %}
+        - ansible.builtin.set_fact:
+            _out: {% raw %}"{{ _registry | lme_validate_config(_resolved_input) }}"{% endraw +%}
+{% elif case.call == 'validate_reversed' %}
+        # DELIBERATE argument-order mistake: `resolved | lme_validate_config(registry)`
+        # binds the registry parameter to the resolved dict (no 'fields') -> fail closed.
+        - ansible.builtin.set_fact:
+            _out: {% raw %}"{{ _resolved_input | lme_validate_config(_registry) }}"{% endraw +%}
+{% elif case.call == 'revision' %}
+        - ansible.builtin.set_fact:
+            _rev_a: {% raw %}"{{ _payload | lme_config_revision }}"{% endraw +%}
+            _rev_b: {% raw %}"{{ _payload_b | lme_config_revision }}"{% endraw +%}
+{% endif %}
+        - ansible.builtin.set_fact:
+            _raised: false
+      rescue:
+        # Capture BOTH that it raised AND the message, so a `raises_match` assertion can
+        # verify it failed for the RIGHT reason -- a raises:true that passes on ANY error
+        # is fail-OPEN (advisor blocker); raises_match closes it.
+        - ansible.builtin.set_fact:
+            _raised: true
+            _err: {% raw %}"{{ ansible_failed_result.msg | default('') }}"{% endraw +%}
+    - name: "judge :: {{ case.name }}"
+      ansible.builtin.assert:
+        that:
+{# assert entries are SINGLE-quoted YAML scalars so the JSON (double-quoted) keys/values
+   baked in by to_json below do not collide with the YAML string quotes. #}
+{% if case.expect.raises | default(false) %}
+          - '_raised'
+{% if case.expect.raises_match is defined %}
+          - '{{ case.expect.raises_match | to_json }} in _err'
+{% endif %}
+{% else %}
+          - 'not _raised'
+{% for k, v in (case.expect.resolved | default({})).items() %}
+{% if v is none %}
+          - '_out.resolved[{{ k | to_json }}] is none'
+{% else %}
+          - '_out.resolved[{{ k | to_json }}] == {{ v | to_json }}'
+{% endif %}
+{% endfor %}
+{% for k, v in (case.expect.origins | default({})).items() %}
+          - '_out.origins[{{ k | to_json }}] == {{ v | to_json }}'
+{% endfor %}
+{% if case.expect.valid | default(false) %}
+          - '_out == _resolved_input'
+{% endif %}
+{% if case.expect.validate_roundtrip | default(false) %}
+          - '_rt == _out.resolved'
+{% endif %}
+{% if case.expect.known_enable_flags_match | default(false) %}
+          - "('' | lme_known_enable_flags) == (_registry.fields | dict2items | selectattr('value.enable_flag','defined') | selectattr('value.enable_flag') | map(attribute='key') | sort | list)"
+{% endif %}
+{% if case.expect.revision_equal | default(false) %}
+          - '_rev_a == _rev_b'
+{% endif %}
+{% if case.expect.revision_differ | default(false) %}
+          - '_rev_a != _rev_b'
+{% endif %}
+{% endif %}
+        fail_msg: {{ case.fail_msg | to_json }}
+        success_msg: {{ case.invariant_task | to_json }}

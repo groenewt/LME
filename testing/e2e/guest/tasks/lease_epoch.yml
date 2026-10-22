@@ -1,0 +1,136 @@
+---
+# testing/e2e/guest/tasks/lease_epoch.yml -- READ-ONLY admission of ONE lease epoch <storage_root>/<epoch_prefix><N>
+# (codex tick331 GUEST-LEASE-RELEASE-CUSTODY + GUEST-LEASE-RECORDED-TERM). The ONE admission sequence of tasks/lease.yml:
+# acquire admits the PREDECESSOR with it, the fence re-admits this invocation's OWN epoch at every boundary, and release
+# reads its OWN published marker back through it. Input: _g_le_n (epoch number >= 1). Output: _g_le {n, holder_ok,
+# holder, term_end, live, live_absent, released_present, released_ok, revoked_self, dir, listing, holder_seen,
+# holder_parsed, holder_sha256}.
+#   holder_ok    holder.json is an owned regular non-link file that PARSES, has EXACTLY gd.lease.holder_fields, the
+#                declared schema, epoch == N, a uuid nonce, integer acquired_epoch / ttl_s and term_end_epoch ==
+#                acquired_epoch + ttl_s (the RECORDED, immutable term; never the reader's configured ttl_s).
+#   released_ok  released.json is an owned regular non-link file that PARSES, has EXACTLY gd.lease.released_fields, the
+#                declared schema, epoch == N and nonce == THAT epoch's admitted holder nonce, AND the holder quiesced
+#                itself: NO entry exists at its live path (lstat) and its own revocation marker <revoked_prefix><holder
+#                nonce> is present as the owner's directory (non-link, owner uid, epoch-dir gid).
+#                An empty, malformed, foreign-owned, wrong-epoch, wrong-nonce or unrelated marker is NOT a release and
+#                never permits a takeover (the epoch is then held until its recorded term expires + operator break).
+# A marker/holder that does not parse is admitted as absent (rescue below), never as released.
+# codex tick339-340 OWNERSHIP-PROVEN RECOVERY: the admission also OBSERVES (never judges) what tasks/lease_recover.yml
+# needs for an epoch WITHOUT an admitted holder: the epoch dir's own identity (dev, inode, uid, isdir, islnk), its
+# exact listing, whether holder.json parsed as a mapping (holder_seen: the parsed mapping, or {}) and its sha256.
+
+- name: LEASE epoch -- stat the epoch dir itself (no link followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ gp.lease_prefix }}{{ _g_le_n }}"
+    follow: false
+    get_checksum: false
+  register: _g_le_dir
+
+- name: LEASE epoch -- list the epoch's entries (hidden included, no recursion; read-only)
+  when: _g_le_dir.stat.exists and _g_le_dir.stat.isdir and not _g_le_dir.stat.islnk
+  ansible.builtin.find:
+    paths: ["{{ gp.lease_prefix }}{{ _g_le_n }}"]
+    patterns: ['*']
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _g_le_ls
+
+- name: LEASE epoch -- stat the holder, released marker and live token of the epoch (no link followed; read-only)
+  ansible.builtin.stat:
+    path: "{{ gp.lease_prefix }}{{ _g_le_n }}/{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ gd.lease.holder_file }}", "{{ gd.lease.released_file }}", "{{ gd.lease.live_dir }}"]
+  register: _g_le_st
+
+- name: LEASE epoch -- read the holder and the released marker (owned regular files only; read-only)
+  when:
+    - _g_le_st.results[item].stat.exists and _g_le_st.results[item].stat.isreg and not _g_le_st.results[item].stat.islnk
+    - _g_le_st.results[item].stat.uid == g_owner_uid | int
+  ansible.builtin.slurp:
+    src: "{{ _g_le_st.results[item].stat.path }}"
+  loop: [0, 1]
+  failed_when: false
+  register: _g_le_raw
+
+- name: LEASE epoch -- parse the holder and the marker (a parse failure admits NOTHING; never a takeover)
+  block:
+    - name: LEASE epoch -- parse the holder (derived)
+      ansible.builtin.set_fact:
+        _g_le_h: "{{ (_g_le_raw.results[0].content | b64decode | from_json) if (_g_le_raw.results[0].content is defined) else {} }}"
+  rescue:
+    - name: LEASE epoch -- an unparsable holder is no holder (derived)
+      ansible.builtin.set_fact:
+        _g_le_h: {}
+
+- name: LEASE epoch -- parse the released marker (a parse failure is NOT a release)
+  block:
+    - name: LEASE epoch -- parse the marker (derived)
+      ansible.builtin.set_fact:
+        _g_le_r: "{{ (_g_le_raw.results[1].content | b64decode | from_json) if (_g_le_raw.results[1].content is defined) else {} }}"
+  rescue:
+    - name: LEASE epoch -- an unparsable marker is no marker (derived)
+      ansible.builtin.set_fact:
+        _g_le_r: {}
+
+- name: LEASE epoch -- admit the holder (exact shape, recorded term; derived)
+  ansible.builtin.set_fact:
+    _g_le_hok: >-
+      {{ _g_le_h is mapping and _g_le_h.keys() | list | sort == gd.lease.holder_fields | sort
+         and _g_le_h.schema == gd.lease.schema
+         and _g_le_h.epoch is integer and _g_le_h.epoch == _g_le_n | int
+         and _g_le_h.nonce is string and _g_le_h.nonce is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+         and _g_le_h.owner_uid is integer and _g_le_h.owner_uid == g_owner_uid | int
+         and _g_le_h.acquired_epoch is integer and _g_le_h.ttl_s is integer and _g_le_h.ttl_s > 0
+         and _g_le_h.term_end_epoch is integer and _g_le_h.term_end_epoch == _g_le_h.acquired_epoch + _g_le_h.ttl_s }}
+
+- name: LEASE epoch -- stat the holder's OWN revocation marker (only for an admitted holder; read-only)
+  when: _g_le_hok | bool
+  ansible.builtin.stat:
+    path: "{{ gp.lease_prefix }}{{ _g_le_n }}/{{ gd.lease.revoked_prefix }}{{ _g_le_h.nonce }}"
+    follow: false
+    get_checksum: false
+  register: _g_le_self
+
+- name: LEASE epoch -- bind the admitted epoch (derived output)
+  vars:
+    _g_le_live: >-
+      {{ _g_le_st.results[2].stat.exists and _g_le_st.results[2].stat.isdir and not _g_le_st.results[2].stat.islnk
+         and _g_le_st.results[2].stat.uid == g_owner_uid | int }}
+    # codex tick339-340 GUEST-LEASE-RELEASE-CUSTODY: "live absent" means NO entry at all at the live path (lstat); an
+    # invalid, foreign or symlinked live entry is NOT absence. The self-revocation must be the owner's own directory
+    # (type dir, not a link, uid = owner, gid = the epoch dir's gid) -- a foreign-owned revoked-by-<holder> admits nothing.
+    _g_le_live_absent: "{{ not (_g_le_st.results[2].stat.exists | default(true)) }}"
+    _g_le_revself: >-
+      {{ (_g_le_hok | bool) and (_g_le_self.stat.exists | default(false)) and (_g_le_self.stat.isdir | default(false))
+         and not (_g_le_self.stat.islnk | default(true))
+         and (_g_le_self.stat.uid | default(-1)) == g_owner_uid | int
+         and (_g_le_self.stat.gid | default(-1)) == (_g_le_dir.stat.gid | default(-2)) }}
+  ansible.builtin.set_fact:
+    _g_le:
+      n: "{{ _g_le_n | int }}"
+      holder_ok: "{{ _g_le_hok | bool }}"
+      holder: "{{ _g_le_h if (_g_le_hok | bool) else {} }}"
+      term_end: "{{ (_g_le_h.term_end_epoch | int) if (_g_le_hok | bool) else none }}"
+      live: "{{ _g_le_live | bool }}"
+      live_absent: "{{ _g_le_live_absent | bool }}"
+      revoked_self: "{{ _g_le_revself | bool }}"
+      released_present: "{{ _g_le_st.results[1].stat.exists }}"
+      # observations only (tasks/lease_recover.yml judges them; nothing here admits anything)
+      dir: >-
+        {{ {'exists': _g_le_dir.stat.exists, 'isdir': _g_le_dir.stat.isdir | default(false),
+            'islnk': _g_le_dir.stat.islnk | default(false), 'uid': _g_le_dir.stat.uid | default(none),
+            'dev': _g_le_dir.stat.dev | default(none), 'inode': _g_le_dir.stat.inode | default(none)} }}
+      listing: "{{ (_g_le_ls.files | default([])) | map(attribute='path') | map('basename') | sort | list }}"
+      holder_seen: "{{ _g_le_h if (_g_le_h is mapping) else {} }}"
+      holder_parsed: "{{ _g_le_h is mapping and _g_le_h | length > 0 }}"
+      holder_sha256: "{{ (_g_le_raw.results[0].content | b64decode | hash('sha256')) if (_g_le_raw.results[0].content is defined) else none }}"
+      released_ok: >-
+        {{ (_g_le_hok | bool)
+           and _g_le_r is mapping and _g_le_r.keys() | list | sort == gd.lease.released_fields | sort
+           and _g_le_r.schema == gd.lease.schema
+           and _g_le_r.epoch is integer and _g_le_r.epoch == _g_le_n | int
+           and _g_le_r.nonce == _g_le_h.nonce
+           and _g_le_r.released_epoch is integer
+           and (_g_le_live_absent | bool) and (_g_le_revself | bool) }}

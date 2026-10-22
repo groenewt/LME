@@ -63,6 +63,8 @@ if [ "$UPGRADE_NEEDED" = true ]; then
     echo "========================================"
     echo "Run the following command to upgrade:"
     echo "cd $REPO_DIR/ansible && ansible-playbook upgrade_lme.yml"
+    echo "(An already-installed Elastic services pack is auto-detected and re-applied."
+    echo " If detection misses it, force the re-land with: -e install_elastic_services=true)"
     exit 100  # Exit with code indicating upgrade needed
 else
     echo "========================================"

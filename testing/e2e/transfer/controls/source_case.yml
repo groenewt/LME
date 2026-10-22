@@ -1,0 +1,218 @@
+---
+# testing/e2e/transfer/controls/source_case.yml -- ONE `source` control: SOURCE-REF admission (source_ref.yml) and,
+# when admitted, the checked clone (source_clone.yml), against a LOCAL FIXTURE clone of this repository (never the
+# candidate; nothing is committed; the repository is only read). Run by run_one_case.yml with -e @vars.json:
+#   ctl_dir, sc_out (the case directory), sc_repo (this repository), sc_work_rel (the resolved work_roots.root_rel:
+#   the fixture's <fixture>/<root_rel>/ is run scratch, never candidate bytes), sc_work_rules (run_controls.yml's
+#   resolved work-root rules, for the SR05 copy's resolver stub), sc:
+#     fixture     true -> clone sc_repo into <sc_out>/fixture first (a SETUP clone, not a candidate clone)
+#     undeclared  true -> no source_ref at all (the defaults: path = the runner, commit = HEAD)
+#     path        the declared source_ref.path; '@fixture@' becomes <sc_out>/fixture
+#     commit      the declared source_ref.commit (omitted -> the input's default HEAD)
+#     commit_rev  instead of commit: a revision resolved IN the fixture to the declared 40-hex sha (e.g. HEAD~1)
+#     dirty       none | tracked (append to the tracked .gitignore) | untracked (a new, not-ignored .yml file)
+#     runner      source (the runner is the fixture) | repo (the runner is this repository, outside the source)
+#     scratch_dirs [{path, files}] directories created OUTSIDE the source (files: [] leaves one empty)
+#     cfg         {path, content}: an ansible.cfg written OUTSIDE the source
+#     env         the environment of the config dump (e.g. ANSIBLE_FILTER_PLUGINS, ANSIBLE_CONFIG)
+#     vacuous_mutation  true -> NON-VACUITY: copy run_controls.yml and its declarations to <sc_out>/m, mutate the
+#                 copy so a phase selection runs with an unused source (admission replaced by a no-op AND the
+#                 `used: false` record forced), and run that copy with a phase selection. The copy must refuse
+#                 with CONTROLS-SOURCE-VACUOUS before any clone and write no receipt.
+# Admission refuses BEFORE any candidate clone: a refused case leaves no <sc_out>/clone. SOURCE-OK only after the
+# clone is re-checked.
+- name: source control -- non-vacuity (a mutated runner copy)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    _m: "{{ sc_out }}/m/testing/e2e/transfer"
+  tasks:
+    - name: NON-VACUITY
+      when: sc.vacuous_mutation | default(false) | bool
+      block:
+        - name: The copy's directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: '0755'
+          loop: ["{{ _m }}/controls", "{{ sc_out }}/w"]
+
+        - name: Copy the runner and its declarations
+          ansible.builtin.copy:
+            src: "{{ item.s }}"
+            dest: "{{ item.d }}"
+            mode: '0644'
+          loop:
+            - {s: "{{ ctl_dir }}/run_controls.yml", d: "{{ _m }}/controls/run_controls.yml"}
+            - {s: "{{ ctl_dir }}/run_one_case.yml", d: "{{ _m }}/controls/run_one_case.yml"}
+            - {s: "{{ ctl_dir }}/source_ref.yml", d: "{{ _m }}/controls/source_ref.yml"}
+            - {s: "{{ ctl_dir }}/source_clone.yml", d: "{{ _m }}/controls/source_clone.yml"}
+            - {s: "{{ ctl_dir }}/CASES.yml", d: "{{ _m }}/controls/CASES.yml"}
+            - {s: "{{ ctl_dir | dirname }}/transfer.decl.yml", d: "{{ _m }}/transfer.decl.yml"}
+
+        - name: The no-op admission stub
+          ansible.builtin.copy:
+            content: "---\n[]\n"
+            dest: "{{ _m }}/controls/source_ref_noop.yml"
+            mode: '0644'
+
+        # The copy has no route files or profile, so its WORK-ROOT resolver is a stub that answers with THIS run's
+        # resolved rules (sc_work_rules, from run_controls.yml) re-rooted at the copy; the copy still admits its
+        # -e work_root against them, so the case reaches the vacuity guard only through the real admission tasks.
+        - name: The copy's work-root resolver stub (this run's resolved rules, re-rooted at the copy)
+          ansible.builtin.copy:
+            content: |
+              ---
+              - name: transfer controls -- resolve the declared work root (SR05 stub)
+                hosts: localhost
+                connection: local
+                gather_facts: false
+                tasks:
+                  - name: TR-WORK-ROOTS
+                    ansible.builtin.debug:
+                      msg: "TR-WORK-ROOTS {{ sc_work_rules | combine({'repo_root': sc_out ~ '/m'}) | to_json | b64encode }} TR-WORK-ROOTS-END"
+            dest: "{{ _m }}/resolve_work_root.yml"
+            mode: '0644'
+
+        - name: Mutate the copy (admission -> no-op; force the unused-source record)
+          ansible.builtin.replace:
+            path: "{{ _m }}/controls/run_controls.yml"
+            regexp: "{{ item.r }}"
+            replace: "{{ item.w }}"
+          loop:
+            - {r: 'include_tasks: source_ref\.yml', w: 'include_tasks: source_ref_noop.yml'}
+            - {r: 'when: not \(_needs_src \| bool\)', w: 'when: true'}
+          register: _mut
+
+        - name: Both mutations applied (else the case is vacuous)
+          ansible.builtin.assert:
+            that: [_mut.results | rejectattr('changed') | list | length == 0]
+            fail_msg: "NON-VACUITY-SETUP: a mutation did not apply"
+            quiet: true
+
+        - name: The copy's extra-vars (a phase selection, git fixture allowed)
+          ansible.builtin.copy:
+            content: "{{ {'work_root': sc_out ~ '/w', 'only': [sc.phase_id], 'allow_git_fixture': true} | to_nice_json }}"
+            dest: "{{ sc_out }}/m.vars.json"
+            mode: '0644'
+
+        - name: Run the mutated copy
+          ansible.builtin.command:
+            argv: [/bin/sh, -c, 'umask 022 && exec "$0" -i localhost, "$1" -e "@$2" 2>&1', "{{ sc_ansible_playbook }}",
+                   "{{ _m }}/controls/run_controls.yml", "{{ sc_out }}/m.vars.json"]
+          environment: {ANSIBLE_NOCOLOR: '1', ANSIBLE_RETRY_FILES_ENABLED: '0'}
+          register: _mr
+          changed_when: false
+          failed_when: false
+
+        - name: Any clone or receipt the copy left
+          ansible.builtin.find:
+            paths: "{{ sc_out }}/w"
+            recurse: true
+            file_type: any
+            patterns: ['src', 'receipt.json']
+          register: _mleft
+
+        - name: The copy's result
+          ansible.builtin.debug:
+            msg: >-
+              NON-VACUITY rc={{ _mr.rc }} left={{ _mleft.files | map(attribute='path') | list }}
+              {{ 'VACUOUS-REFUSED' if ('CONTROLS-SOURCE-VACUOUS: phase cases selected=True but source_ref.used=False' in _mr.stdout
+                                       and _mr.rc != 0 and _mleft.files | length == 0) else 'VACUOUS-NOT-REFUSED' }}
+              refusals={{ _mr.stdout | regex_findall('CONTROLS-[A-Z-]+: ') | unique | list }}
+
+- name: source control
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    _fx: "{{ sc_out }}/fixture"
+    T: "{{ (lookup('ansible.builtin.file', ctl_dir ~ '/../transfer.decl.yml') | from_yaml).transfer }}"
+  tasks:
+    - name: The non-vacuity case ends with the first play
+      ansible.builtin.meta: end_play
+      when: sc.vacuous_mutation | default(false) | bool
+
+    - name: SETUP -- the local fixture clone of this repository
+      ansible.builtin.command:
+        argv: ["{{ T.source.git }}", clone, --no-hardlinks, --quiet, "{{ sc_repo }}", "{{ _fx }}"]
+      changed_when: true
+      when: sc.fixture | default(false) | bool
+
+    - name: SETUP -- a tracked edit
+      ansible.builtin.lineinfile:
+        path: "{{ _fx }}/.gitignore"
+        line: "# source control: a tracked edit"
+      when: (sc.dirty | default('none')) == 'tracked'
+
+    - name: SETUP -- an untracked, not-ignored file an include could load
+      ansible.builtin.copy:
+        content: "---\n- name: an untracked task\n  ansible.builtin.debug: {msg: untracked}\n"
+        dest: "{{ _fx }}/sr-untracked-probe.yml"
+        mode: '0644'
+      when: (sc.dirty | default('none')) == 'untracked'
+
+    - name: SETUP -- resolve commit_rev in the fixture
+      ansible.builtin.command:
+        argv: ["{{ T.source.git }}", -C, "{{ _fx }}", rev-parse, --verify, "{{ sc.commit_rev }}^{commit}"]
+      register: _crev
+      changed_when: false
+      when: sc.commit_rev is defined
+
+    - name: SETUP -- scratch plugin directories OUTSIDE the source (load binding; an empty files list leaves one empty)
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ sc.scratch_dirs | default([]) }}"
+
+    - name: SETUP -- their files (a scratch evaluator that would be silently loaded)
+      ansible.builtin.copy:
+        content: "# scratch evaluator (never loaded: SOURCE-REF refuses first)\n"
+        dest: "{{ item.0.path }}/{{ item.1 }}"
+        mode: '0644'
+      loop: "{{ sc.scratch_dirs | default([]) | subelements('files') }}"
+
+    - name: SETUP -- an ansible.cfg OUTSIDE the source
+      ansible.builtin.copy:
+        content: "{{ sc.cfg.content }}"
+        dest: "{{ sc.cfg.path }}"
+        mode: '0644'
+      when: sc.cfg is defined
+
+    - name: The declared source_ref (undeclared -> the input's defaults apply)
+      when: not (sc.undeclared | default(false) | bool)
+      ansible.builtin.set_fact:
+        source_ref: >-
+          {{ {'path': sc.path | replace('@fixture@', _fx)}
+             | combine({'commit': _crev.stdout | trim} if sc.commit_rev is defined
+                       else ({'commit': sc.commit} if sc.commit is defined else {})) }}
+
+    - name: SOURCE-REF admission
+      ansible.builtin.include_tasks: "{{ ctl_dir }}/source_ref.yml"
+      vars:
+        sr_decl: "{{ T }}"
+        sr_runner_root: "{{ _fx if (sc.runner | default('source')) == 'source' else sc_repo }}"
+        sr_work_root: "{{ sc_out }}/nominal-work-root"
+        sr_work_rel: "{{ sc_work_rel }}"
+        sr_ansible_config: "{{ sc_ansible_config }}"
+        sr_env: "{{ sc.env | default({}) }}"
+
+    - name: SOURCE-CLONE (only after admission)
+      ansible.builtin.include_tasks: "{{ ctl_dir }}/source_clone.yml"
+      vars:
+        sr_dest: "{{ sc_out }}/clone"
+        sr_decl: "{{ T }}"
+
+    - name: SOURCE-OK
+      ansible.builtin.debug:
+        msg: >-
+          SOURCE-OK requested={{ sr.requested }} commit={{ sr.commit }} tree={{ sr.tree }} clones={{ sr.clones | length }}
+          git={{ sr.git }} config_file={{ 'none' if (sr.load_binding.config_file is none or sr.load_binding.config_file == '') else sr.load_binding.config_file }} project_paths={{ sr.load_binding.project_paths | length }}
+          collections={{ sr.load_binding.collections | length }}
+          LB {{ sr.load_binding.project_paths | rejectattr('inside') | selectattr('exists')
+                | map(attribute='key') | zip(sr.load_binding.project_paths | rejectattr('inside') | selectattr('exists') | map(attribute='entries'))
+                | map('join', ':') | join(',') }} LB-END

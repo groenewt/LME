@@ -1,0 +1,404 @@
+---
+# testing/remote_harness/tasks/render_artifact.yml -- the ONE RENDER + FRESH-READBACK step (new path N10; MAIN
+# new-paths-recorded-05.yml: "the ONE render + fresh-readback step called by N13 once per render row (seed, launcher, N7);
+# manifest/binding writing is NOT moved into N10 and stays caller-supplied content inside the N13 seal phase").
+# NEW FILE. AUTHORED, NEVER EXECUTED (UNRUN).
+# Generalizes package_bundle.yml (first-runner frozen base) :164-207 (render the seed / launcher, then refuse a staged file
+# that is not a regular file of the declared mode or differs from a FRESH render of the same declarations) and the seed
+# half of :209-239. ONE mechanism for both the write and the readback: the template lookup over the row's declared vars
+# (package_bundle.yml already compared its module render with exactly this lookup, :199-202 / :228-234). The staged
+# file is written once (force: false: an existing staged path is never replaced -- the staging dir is a fresh mkdtemp).
+# Called ONLY by tasks/reserve_publish.yml (N13), once per render row, inside its reserved staging dir.
+# Include parameters (registry reserved_outputs; never an -e / inventory value):
+#   rh_ra_name      the row name (key of the accumulated output)
+#   rh_ra_src       the template, repository-relative (a source input the caller bound through N12)
+#   rh_ra_dest      the staged destination, absolute, inside the caller's staging dir
+#   rh_ra_mode      the declared mode (a quoted octal string)
+#   rh_ra_vars      the template variables (mapping; the SAME mapping renders and re-renders)
+#   rh_ra_refusal   the caller's staged refusal code (package: bundle.refusals.staged; release: custody.refusals.staged)
+#   rh_ra_max_bytes (successor-02) the row's admitted byte cap (N13 passes rh_rsv_max_bytes.rows[<row rel>]; no default)
+# SUCCESSOR-02 of N10: supersedes render_artifact.yml.after (FROZEN, not rewritten) per codex-tick682
+# (OD-REL-BUDGET-ENFORCE): render in memory, bound the bytes by the row cap, then write; readback unchanged. The render is
+# held in the task fact _rh_ra_text; its value is a lookup result and is not templated again when written (Ansible 2.19
+# trust model; verify control C-N10-NO-RETEMPLATE). Change record: successor-03/records-n13.yml.
+# Output (fact, accumulated; the caller initializes it to {} before its loop): _rh_ra_rendered[<rh_ra_name>] =
+# {path, sha256, mode} of the admitted staged file.
+# SUCCESSOR-03 of N10 (B op1d, owner per codex 917 render_options_and_ownership; cp -n of successor-02 5291aafb, then
+# Edit). Change record: b/op1d-projector/records-b-op1d-projector-01.yml. The declared renderer options
+# controller.entry_generation.render (trim_blocks, lstrip_blocks, newline_sequence, output_encoding and the six
+# split-character delimiters decoded by join(word_separator)) are the MODULE-scope options of the admitted engine
+# (render.engine.by_core[<expect_core>].scopes.module.options); the LOOKUP scope admits only template_vars on that core
+# (scopes.lookup.options), so the options can only be applied through the template MODULE. Two added REQUIRED params:
+#   rh_ra_scope  render.n10.scopes word: module -> render with the declared options (module context = task vars: the
+#                template reads its vars from rh_ra_vars); lookup -> the frozen successor-02 behaviour, unchanged
+#   rh_ra_op     render.n10.ops word: render -> write once + fresh readback + accumulate (N13 rows); verify -> NO write:
+#                a fresh module render in check mode against the existing rh_ra_dest must report no change (the
+#                caller's independent readback of a PUBLISHED file through the SAME options, vars and closure)
+# Module-scope byte cap (DEV-N10-S03-CAP): the module renders straight to the staged path, so the row cap is checked by
+# stat right after the write and before N13's SEAL / publication (N13 :515-531 re-checks every staged file and the
+# total); the reservation (need >= total + largest cap) bounds the write. The lookup scope keeps the pre-write bound.
+# SUCCESSOR-04 of N10 (B op1f; cp -n of successor-03 b7fb28ee, then Edit). Change record:
+# b/op1f-projector/records-b-op1f-projector-01.yml. Codex 920 SR920_RENDER_PREWRITE_BOUND (682 OD-REL-BUDGET-ENFORCE)
+# over the C1 s37 contract envelope_projection.capacity.write_bound (CPL-SR919B-N13-WRITE-BOUND). DEV-N10-S03-CAP is
+# WITHDRAWN: a row is admitted against its row cap BEFORE its first write anywhere, never by the stat after the write.
+#   unit         encoded bytes of the text in write_bound.encoding_at (render.output_encoding), counted by the ONE base64
+#                length law source_admission.encodings.base64 {group, bytes, pad} (no literal group / byte / pad)
+#   lookup       write_bound.scopes.lookup measured_text: render ONCE in memory, measure, admit, write exactly that text
+#   module       write_bound.scopes.module input_bound: BEFORE the module render, the measured template member bytes plus
+#                the canonical JSON bytes of rh_ra_vars (the ingress canonical_json word) times budget.expansion[<row
+#                name>] (walked at input_bound.expansion_from) must be within the row; budget.expansion ABSENT ->
+#                REFUSED before rendering (HOLE-SR919B-X2P-EXPANSION; never unbounded, never the lookup scope, never a
+#                second renderer); the row must be the declared row (write_bound.row_from[<row name>]); every declared
+#                copy allocation (write_bound.copies: the local temp, the remote temp, the staged file) covers the row
+#   fresh_verify after staged_size_admitted: the staged / published file is stat'ed and its size admitted FIRST; only
+#                then the fresh check-mode render (module) or the in-memory digest compare (lookup) runs
+#   in_flight 1  N13 includes this file once per row in a sequential loop on the one controller host (no parallel row)
+#   post_seal    kept (N13's after-SEAL per-file / total checks)
+# SUCCESSOR-05 of N10 (B op1g; cp -n of successor-04 6146e774, then Edit). Change record:
+# b/op1g-projector/records-b-op1g-projector-01.yml. C1 sr922b (s39 render.n10 :7051-7082; codex 923
+# N13_CALLER_AND_DECLARATION_JOIN / OBS_B_OP1F_INPUT_BOUND_WIDTH):
+#   HOME         the write bound is read at its ONE home controller.entry_generation.render.n10.write_bound
+#                (envelope_projection.capacity.write_bound is RETIRED and no longer read, CPL-SR922B-B-HOME)
+#   SITE         the module-scope words (row_from, view_from, expansion_from, copies) are read from the callers.sites row
+#                whose render_scope names rh_ra_scope; EXACTLY ONE such site is admitted (a second module-scope site
+#                refuses until a declared site word reaches N10: CPL-OP1G-B-N10-SITE-BY-SCOPE)
+#   COPIES       ONE shape: copy role -> a list of paths, each walked from controller.bootstrap to a positive integer
+#                allocation; every listed allocation covers the row (copy_bound row); local_temp / remote_temp carry the
+#                write's AND the fresh verification's temp copies (in_flight 1)
+#   VIEW         rh_ra_vars is exactly the three template_vars names (walked at the site view's entry_read) and the row is
+#                a declared view role; the bound measures that SAME mapping, the one the module renders
+#   FRESH        fresh_verify.module input_bound_then_check_mode_render: the input bound is APPLIED AGAIN to the fresh
+#                inputs (rh_ra_vars re-templated for this task) immediately before the check-mode render, in both ops
+# SUCCESSOR-06 of N10 (B op1h; cp -n of successor-05 8500df73, then Edit). Change record:
+# b/op1h-projector/records-b-op1h-projector-01.yml. C1 sr922c (s40 render.n10.write_bound :7151-7287):
+#   SITE         a REQUIRED param rh_ra_site (identity.site_param; N13 passes its classified site key, a caller's op-verify
+#                readback passes its own site key): every site word is read at callers.sites[rh_ra_site], and the row is
+#                refused unless scopes[that row's render_scope] == rh_ra_scope. The one-module-site selection by scope is
+#                RETIRED (CPL-OP1G-B-N10-SITE-BY-SCOPE closed).
+#   COPIES       the copies are walked from copies_roots[site.copies_root] (declaration -> controller.bootstrap; call -> the
+#                include parameter it names, rh_rsv_max_bytes of the enclosing N13 call) under copies_leaf (integer ->
+#                itself; mapping of integers -> its largest value); every allocation still covers the row.
+#   MULTIPLICITY CPL-SR922C-B-MULTIPLICITY: M is the JSON integer returned by the macro named budget.multiplicity
+#                .macros[<row name>] (walked at site.multiplicity_from), from the module at macros_from[<that name>]
+#                (walked at multiplicity.macros_at), imported WITHOUT CONTEXT and called with the row's bs view
+#                (rh_ra_vars[<template_vars.bs>]); a non-integer, boolean or < 1 result refuses. The bound is
+#                T + I x expansion x M <= row, applied before the write and again before the check-mode render. P4 is
+#                retired; no input maximum is declared or added (codex 925 SELECTED_INVOCATION_FIT: an oversize input
+#                refuses here, before any write). The import resolves the module rel against playbook_dir (the task
+#                templar's loader basedir): an UNRUN engine assumption, control C-OP1H-N10-MULT-IMPORT.
+# SUCCESSOR-07 of N10 (B op1i; cp -n of successor-06 1df2798f, then Edit). Change record:
+# b/op1i-projector/records-b-op1i-projector-01.yml. C1 sr922e (budget.multiplicity.floor s42 :1686-1692 = s44 :1686-1692):
+#   FLOOR        M[role] = max(floor, the role's derived terms); the macro is called (bs view, floor) with floor walked at
+#                site.multiplicity_from (the same node as macros / macros_at), and a result that is not a non-boolean
+#                integer >= floor refuses before rendering. DEV-B-OP1I-MULT-FLOOR-ARG: the floor is passed as a SECOND
+#                macro argument because no role's bs view (s44 input_view :1780, roles.*.bs from :1785) carries the budget node;
+#                C1 either ratifies the (bs, floor) call shape or adds the floor path to the views
+#                (CPL-OP1I-B-MULT-FLOOR-VIEW). No literal floor remains in N10 or the macro module.
+# SUCCESSOR-08 of N10 (B op1k; cp -n of op1i successor-07 ce70511f, then Edit). Change record:
+# b/op1k-projector/records-b-op1k-projector-01.yml (HOLE-SEAT-COERCION-FILTER-SWEEP). The ONE coercion site of this file,
+# `_rh_ra_inb | int` in the input_bound assert, coerced a byte count derived from the base64 length law words
+# (source_admission.encodings.base64 group / bytes / pad, s44 :7259-7264), which no earlier step type-admits. It is
+# replaced by TYPED ADMISSION in the same assert, before use: group and bytes non-boolean integers > 0, pad a string,
+# and the derived _rh_ra_inb a non-boolean integer >= 0; the bound then reads _rh_ra_inb without coercion. Control
+# C-OP1K-N10-INB-TYPED (UNRUN). C1 SR922g (s44 655567dd / r31 d8087bb4): CPL-OP1I-B-MULT-FLOOR-VIEW is RATIFIED --
+# budget.multiplicity.macro_params [view, floor] (s44 :1696-1701; pinned r31 :4249-4254); the views are not extended.
+# The (bs, floor) call shape and the floor (s44 :1692, unshifted) are UNCHANGED; DEV-B-OP1I-MULT-FLOOR-ARG is closed by
+# that word.
+
+- name: "RENDER -- refuse a missing or malformed render row (no default)"
+  vars:
+    _rh_ra_wb: "{{ rh.controller.entry_generation.render.n10.write_bound }}"
+  ansible.builtin.assert:
+    that:
+      # SUCCESSOR-04: the write bound declares this scope (lookup measured_text | module input_bound)
+      - rh_ra_scope in _rh_ra_wb.scopes
+      # SUCCESSOR-05: and its fresh verification (lookup in_memory_digest | module input_bound_then_check_mode_render)
+      - rh_ra_scope in _rh_ra_wb.fresh_verify
+      - rh_ra_name is string and rh_ra_name | length > 0
+      - rh_ra_src is string and rh_ra_src | length > 0
+      - rh_ra_dest is string and rh_ra_dest is match(rh.controller.bootstrap.path_admission.regex)
+      - rh_ra_mode is string
+      - rh_ra_vars is mapping
+      - rh_ra_refusal is string
+      - rh_ra_max_bytes is integer and rh_ra_max_bytes > 0
+      - rh_ra_scope in rh.controller.entry_generation.render.n10.scopes.values()
+      - rh_ra_scope in rh.controller.entry_generation.render.engine.by_core[rh.controller.expect_core].scopes
+      # SUCCESSOR-06 (identity.site_param): the passed site is a declared caller site whose render scope is this scope
+      - rh_ra_site is string and rh_ra_site in _rh_ra_wb.callers.sites
+      - rh.controller.entry_generation.render.n10.scopes[_rh_ra_wb.callers.sites[rh_ra_site].render_scope] == rh_ra_scope
+      - rh_ra_op in rh.controller.entry_generation.render.n10.ops.values()
+      - rh_ra_op == rh.controller.entry_generation.render.n10.ops.render or rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.module
+      - _rh_ra_rendered is mapping
+      - rh_ra_name not in _rh_ra_rendered or rh_ra_op == rh.controller.entry_generation.render.n10.ops.verify
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.genesis.builder.refusal }}: a render row is not {name, src, dest, mode, vars,
+      refusal, max_bytes, scope, op, site} with a declared site of this scope, or repeats a rendered name (the row
+      parameters are not echoed: an absent one would not render).
+    quiet: true
+
+# SUCCESSOR-02 (codex-tick682 OD-REL-BUDGET-ENFORCE): the row is rendered IN MEMORY first and its UTF-8 byte length (the
+# base64 length of the encoded bytes, less its padding) is bounded by the row's admitted cap BEFORE anything is written, so
+# no pre-SEAL write exceeds the caller's admitted allocation. The write then stages exactly that rendered value; the
+# readback below still compares the staged bytes with a FRESH, independent render (unchanged).
+- name: "RENDER -- render the row from its declarations in memory (derived; nothing written yet)"
+  when: rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.lookup
+  ansible.builtin.set_fact:
+    _rh_ra_text: "{{ lookup('ansible.builtin.template', rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh_ra_src, template_vars=rh_ra_vars) }}"
+
+- name: "RENDER -- refuse a rendered row larger than its admitted byte cap (before its write)"
+  when: rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.lookup
+  # SUCCESSOR-04 (write_bound.unit encoded_bytes): the text encoded in write_bound.encoding_at, counted by the declared
+  # base64 length law (decoded bytes = length / group * bytes - pads); no literal group, byte count or pad
+  vars:
+    _rh_ra_wb: "{{ rh.controller.entry_generation.render.n10.write_bound }}"
+    _rh_ra_law: "{{ rh.controller.bootstrap.source_admission.encodings.base64 }}"
+    _rh_ra_enc: >-
+      {%- set w = namespace(v=rh) -%}
+      {%- for k in _rh_ra_wb.encoding_at.split(rh.controller.bootstrap.source_admission.early_view.override.audit_join) -%}{%- set w.v = w.v[k] -%}{%- endfor -%}{{ w.v }}
+    _rh_ra_b64: "{{ _rh_ra_text | b64encode(encoding=_rh_ra_enc) }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_ra_b64 is match(_rh_ra_law.part_regex)
+      - ((_rh_ra_b64 | length) // _rh_ra_law.group * _rh_ra_law.bytes - _rh_ra_b64.count(_rh_ra_law.pad)) <= rh_ra_max_bytes
+    fail_msg: >-
+      REFUSED {{ rh_ra_refusal }}: the render of {{ rh_ra_src }} ({{ rh_ra_name }}) exceeds its admitted byte cap
+      {{ rh_ra_max_bytes }}; nothing was written for it (the staging dir is left for inspection; the next run reaps it
+      under bundle.staging_retention).
+    quiet: true
+
+- name: "RENDER -- write the bounded render into the staging dir (the ONLY way the artifact comes to exist)"
+  when: rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.lookup
+  ansible.builtin.copy:
+    dest: "{{ rh_ra_dest }}"
+    mode: "{{ rh_ra_mode }}"
+    force: false
+    content: "{{ _rh_ra_text }}"
+
+# SUCCESSOR-04 MODULE INPUT BOUND (write_bound.scopes.module input_bound; HOLE-SR919B-X2P-EXPANSION): the module has
+# no in-memory render, so the row is admitted BEFORE the render by the input bound. The template member is measured
+# (no link followed); the inputs are rh_ra_vars as canonical JSON (the ingress canonical_json word), encoded in
+# write_bound.encoding_at and counted by the declared base64 length law.
+- &n10_member
+  name: "RENDER -- measure the template member of a module-scope row (no link followed; nothing rendered yet)"
+  when:
+    - rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.module
+    - rh_ra_op == rh.controller.entry_generation.render.n10.ops.render
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh_ra_src }}"
+    follow: false
+    get_checksum: false
+  register: _rh_ra_member
+
+# SUCCESSOR-06: every module-scope word is read at callers.sites[rh_ra_site] (the site param, scope-checked above;
+# render.n10.write_bound home; selection by scope RETIRED).
+- &n10_bound
+  name: "RENDER -- refuse a module-scope row whose input bound is undeclared or exceeds its row (before the render)"
+  when:
+    - rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.module
+    - rh_ra_op == rh.controller.entry_generation.render.n10.ops.render
+  vars:
+    _rh_ra_wb: "{{ rh.controller.entry_generation.render.n10.write_bound }}"
+    _rh_ra_site: "{{ rh.controller.entry_generation.render.n10.write_bound.callers.sites[rh_ra_site] }}"
+    _rh_ra_law: "{{ rh.controller.bootstrap.source_admission.encodings.base64 }}"
+    _rh_ra_enc: >-
+      {%- set w = namespace(v=rh) -%}
+      {%- for k in _rh_ra_wb.encoding_at.split(rh.controller.bootstrap.source_admission.early_view.override.audit_join) -%}{%- set w.v = w.v[k] -%}{%- endfor -%}{{ w.v }}
+    # the site's declared row map (row_from), its input view (view_from) and the template_vars names its entry_read
+    # reaches, and the PARENT of the expansion node (expansion_from without its last word), so an absent expansion
+    # is a membership test, never a default
+    _rh_ra_rows: >-
+      {%- set w = namespace(v=rh.controller.bootstrap) -%}
+      {%- for k in _rh_ra_site.row_from -%}{%- set w.v = w.v[k] -%}{%- endfor -%}{{ w.v }}
+    _rh_ra_iv: >-
+      {%- set w = namespace(v=rh.controller.bootstrap) -%}
+      {%- for k in _rh_ra_site.view_from -%}{%- set w.v = w.v[k] -%}{%- endfor -%}{{ w.v }}
+    _rh_ra_tv: >-
+      {%- set w = namespace(v=rh.controller.bootstrap) -%}
+      {%- for k in _rh_ra_iv.entry_read -%}{%- set w.v = w.v[k] -%}{%- endfor -%}{{ w.v }}
+    _rh_ra_ep: >-
+      {%- set w = namespace(v=rh.controller.bootstrap) -%}
+      {%- for k in _rh_ra_site.expansion_from -%}{%- if not loop.last -%}{%- set w.v = w.v[k] -%}{%- endif -%}{%- endfor -%}{{ w.v }}
+    _rh_ra_ek: "{{ _rh_ra_site.expansion_from | last }}"
+    # every declared copy allocation (copies: ONE shape, role -> a list of paths), walked from the declared copies root
+    # (SUCCESSOR-06 copies_roots[site.copies_root]: declaration -> controller.bootstrap, call -> the include parameter
+    # it names) under copies_leaf (integer -> itself; a mapping -> its largest value; any other leaf is kept as found
+    # and refused below by the integer test)
+    _rh_ra_alloc: >-
+      {%- set rw = _rh_ra_wb.copies_roots[_rh_ra_site.copies_root] -%}
+      {%- set r0 = namespace(v=rh.controller.bootstrap) -%}
+      {%- if rw == _rh_ra_wb.copies_roots.call -%}{%- set r0.v = lookup('ansible.builtin.vars', rw) -%}{%- endif -%}
+      {%- set ns = namespace(a=rh.controller.bootstrap.genesis.initializer.custody.cold_launch.initial.rows) -%}
+      {%- for role, ps in _rh_ra_site.copies | dictsort -%}{%- for p in ps -%}
+      {%- set w = namespace(v=r0.v) -%}{%- for k in p -%}{%- set w.v = w.v[k] -%}{%- endfor -%}
+      {%- if (w.v is mapping) and ((w.v | length) > 0) and ((w.v.values() | reject('integer') | list | length) == 0) -%}{%- set w.v = w.v.values() | max -%}{%- endif -%}
+      {%- set ns.a = ns.a + [[role, w.v]] -%}
+      {%- endfor -%}{%- endfor -%}{{ ns.a | to_json }}
+    _rh_ra_in64: "{{ rh_ra_vars | to_json(**_rh_sa_regadm.ingress.canonical_json) | b64encode(encoding=_rh_ra_enc) }}"
+    _rh_ra_inb: "{{ (_rh_ra_in64 | length) // _rh_ra_law.group * _rh_ra_law.bytes - _rh_ra_in64.count(_rh_ra_law.pad) }}"
+    # SUCCESSOR-06 MULTIPLICITY (budget.multiplicity at site.multiplicity_from): the macro NAME for this row, the
+    # macros_from map (walked at macros_at), and the DERIVED M from that module imported without context and called with
+    # the row's bs view only
+    _rh_ra_mw: >-
+      {%- set w = namespace(v=rh.controller.bootstrap) -%}
+      {%- for k in _rh_ra_site.multiplicity_from -%}{%- set w.v = w.v[k] -%}{%- endfor -%}{{ w.v | to_json }}
+    _rh_ra_mf: >-
+      {%- set w = namespace(v=rh.controller.bootstrap) -%}
+      {%- for k in (_rh_ra_mw | from_json).macros_at -%}{%- set w.v = w.v[k] -%}{%- endfor -%}{{ w.v | to_json }}
+    _rh_ra_mult: >-
+      {%- set mn = (_rh_ra_mw | from_json).macros[rh_ra_name] -%}
+      {%- set mr = namespace(v=rh.controller.bootstrap) -%}
+      {%- for k in (_rh_ra_mf | from_json)[mn] -%}{%- set mr.v = mr.v[k] -%}{%- endfor -%}
+      {%- import (rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ mr.v) | relpath(playbook_dir) as mm without context -%}
+      {{ mm[mn](rh_ra_vars[_rh_ra_tv.bs], (_rh_ra_mw | from_json).floor) }}
+    _rh_ra_m: "{{ _rh_ra_mult | string | from_json }}"
+  ansible.builtin.assert:
+    that:
+      # SUCCESSOR-06: the site words are those of callers.sites[rh_ra_site] (selection by scope retired); its declared
+      # copies root is a copies_roots word
+      - _rh_ra_site.copies_root in _rh_ra_wb.copies_roots
+      # the row passed is the DECLARED row of this output (row_from[<row name>])
+      - rh_ra_name in _rh_ra_rows
+      - rh_ra_max_bytes == _rh_ra_rows[rh_ra_name]
+      # the measured mapping is the declared view: exactly the template_vars names, for a declared view role
+      - _rh_ra_iv is mapping and rh_ra_name in _rh_ra_iv.roles
+      - (rh_ra_vars.keys() | list | sort) == (_rh_ra_tv.values() | list | sort)
+      # every copy the render or the fresh verification makes (local temp, remote temp, staged) has an allocation
+      # covering the row (copy_bound row): every role lists at least one path, each a positive integer
+      - (_rh_ra_alloc | from_json | map('first') | unique | sort) == (_rh_ra_site.copies.keys() | list | sort)
+      - (_rh_ra_alloc | from_json | map('last') | reject('integer') | list | length) == 0
+      - (_rh_ra_alloc | from_json | map('last') | select('boolean') | list | length) == 0
+      - (_rh_ra_alloc | from_json | map('last') | select('lt', rh_ra_max_bytes) | list | length) == 0
+      # the member is a regular file (the measured template bytes)
+      - _rh_ra_member.stat.exists and _rh_ra_member.stat.isreg and not _rh_ra_member.stat.islnk
+      # the site's expansion must be declared, with a positive integer for this row; ABSENT refuses
+      - _rh_ra_ep is mapping
+      - _rh_ra_ek in _rh_ra_ep
+      - _rh_ra_ep[_rh_ra_ek] is mapping and rh_ra_name in _rh_ra_ep[_rh_ra_ek]
+      - _rh_ra_ep[_rh_ra_ek][rh_ra_name] is integer and _rh_ra_ep[_rh_ra_ek][rh_ra_name] > 0
+      - _rh_ra_in64 is match(_rh_ra_law.part_regex)
+      # SUCCESSOR-06 MULTIPLICITY: the row names a declared macro, the macro a declared module rel; the derived M is a
+      # non-boolean JSON integer >= 1 (membership first, so an absent word refuses before the import is templated)
+      # SUCCESSOR-07 (CPL-SR922E-B-MULT-FLOOR; s44 budget.multiplicity.floor :1692, macro_params :1696-1701): the floor is the declared word, a
+      # non-boolean integer, and M must be >= it (no literal 1)
+      - (_rh_ra_mw | from_json) is mapping and rh_ra_name in (_rh_ra_mw | from_json).macros
+      - "'floor' in (_rh_ra_mw | from_json)"
+      - (_rh_ra_mw | from_json).floor is integer and (_rh_ra_mw | from_json).floor is not boolean
+      - (_rh_ra_mw | from_json).macros[rh_ra_name] in (_rh_ra_mf | from_json)
+      - _rh_ra_m is integer and _rh_ra_m is not boolean and _rh_ra_m >= (_rh_ra_mw | from_json).floor
+      # input_bound: template bytes + canonical JSON input bytes x expansion x M, within the row
+      # SUCCESSOR-08 (HOLE-SEAT-COERCION-FILTER-SWEEP): the length-law words and the derived input byte count are
+      # ADMITTED before use (the assert stops at its first false condition); no coercion
+      - _rh_ra_law.group is integer and _rh_ra_law.group is not boolean and _rh_ra_law.group > 0
+      - _rh_ra_law.bytes is integer and _rh_ra_law.bytes is not boolean and _rh_ra_law.bytes > 0
+      - _rh_ra_law.pad is string
+      - _rh_ra_inb is integer and _rh_ra_inb is not boolean and _rh_ra_inb >= 0
+      - (_rh_ra_member.stat.size + _rh_ra_inb * _rh_ra_ep[_rh_ra_ek][rh_ra_name] * _rh_ra_m) <= rh_ra_max_bytes
+    fail_msg: >-
+      REFUSED {{ rh_ra_refusal }}: {{ rh_ra_src }} ({{ rh_ra_name }}) has no declared input bound within its row cap
+      {{ rh_ra_max_bytes }} (site, budget expansion, derived multiplicity, row, input view, copy allocations); nothing
+      was rendered for it.
+    quiet: true
+
+# SUCCESSOR-03 MODULE SCOPE: the ONE module render with the declared entry_generation.render options (op render: write
+# once, force false, into the fresh staging dir; op verify: no task here).
+- name: "RENDER -- render the row with the declared renderer options into the staging dir (module scope, op render)"
+  when:
+    - rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.module
+    - rh_ra_op == rh.controller.entry_generation.render.n10.ops.render
+  vars: &n10_opts
+    _rh_ra_r: "{{ rh.controller.entry_generation.render }}"
+  ansible.builtin.template: &n10_module
+    src: "{{ rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh_ra_src }}"
+    dest: "{{ rh_ra_dest }}"
+    mode: "{{ rh_ra_mode }}"
+    force: false
+    trim_blocks: "{{ _rh_ra_r.trim_blocks }}"
+    lstrip_blocks: "{{ _rh_ra_r.lstrip_blocks }}"
+    newline_sequence: "{{ _rh_ra_r.newline_sequence }}"
+    output_encoding: "{{ _rh_ra_r.output_encoding }}"
+    block_start_string: "{{ _rh_ra_r.block_start_string | join(_rh_ra_r.word_separator) }}"
+    block_end_string: "{{ _rh_ra_r.block_end_string | join(_rh_ra_r.word_separator) }}"
+    variable_start_string: "{{ _rh_ra_r.variable_start_string | join(_rh_ra_r.word_separator) }}"
+    variable_end_string: "{{ _rh_ra_r.variable_end_string | join(_rh_ra_r.word_separator) }}"
+    comment_start_string: "{{ _rh_ra_r.comment_start_string | join(_rh_ra_r.word_separator) }}"
+    comment_end_string: "{{ _rh_ra_r.comment_end_string | join(_rh_ra_r.word_separator) }}"
+
+- name: "RENDER -- digest the staged render (no link followed)"
+  ansible.builtin.stat:
+    path: "{{ rh_ra_dest }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _rh_ra_st
+
+# SUCCESSOR-04 (write_bound.fresh_verify after staged_size_admitted): the staged (op render) or published (op verify)
+# file's size is admitted against the row BEFORE the fresh check-mode render (SUCCESSOR-05: whose inputs are then
+# bounded again below; the same-render argument alone is no longer relied on).
+- name: "RENDER -- refuse a module-scope file that is not a regular file of the declared mode within its row (before the fresh render)"
+  when: rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.module
+  ansible.builtin.assert:
+    that:
+      - _rh_ra_st.stat.exists and _rh_ra_st.stat.isreg and not _rh_ra_st.stat.islnk
+      - _rh_ra_st.stat.mode == rh_ra_mode
+      - _rh_ra_st.stat.size <= rh_ra_max_bytes
+    fail_msg: >-
+      REFUSED {{ rh_ra_refusal }}: {{ rh_ra_dest | basename }} ({{ rh_ra_name }}) is not a regular file of mode
+      {{ rh_ra_mode }} within its row cap {{ rh_ra_max_bytes }}; no fresh render ran and nothing was published.
+    quiet: true
+
+# SUCCESSOR-05 (write_bound.fresh_verify.module input_bound_then_check_mode_render): the check-mode render is never
+# trusted to reuse the pre-write bound. Its inputs are re-derived (rh_ra_vars re-templated for these tasks; op verify:
+# the caller's own fresh view), so the member is measured again and the SAME input bound is applied again to those
+# fresh inputs, in both ops, immediately before the check-mode render. Its one local temp copy is covered by the
+# site's local_temp allocation (asserted >= row by the same task).
+- <<: *n10_member
+  name: "RENDER -- measure the template member again for the fresh verification (module scope; no link followed)"
+  when: rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.module
+
+- <<: *n10_bound
+  name: "RENDER -- refuse fresh inputs whose input bound is undeclared or exceeds the row (before the check-mode render)"
+  when: rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.module
+
+# the FRESH readback through the SAME options, vars and closure: a second module render in check mode against the
+# staged (op render) or published (op verify) file, never forced to write; any byte difference reports a change
+- name: "RENDER -- fresh module render in check mode against the file (module scope; nothing written)"
+  when: rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.module
+  vars: *n10_opts
+  check_mode: true
+  ansible.builtin.template:
+    <<: *n10_module
+    force: true
+  register: _rh_ra_fresh
+
+- name: "RENDER -- refuse a module-scope file that differs from the FRESH render"
+  when: rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.module
+  ansible.builtin.assert:
+    that:
+      - _rh_ra_fresh is not changed
+      - _rh_ra_fresh is not failed
+    fail_msg: >-
+      REFUSED {{ rh_ra_refusal }}: {{ rh_ra_dest | basename }} ({{ rh_ra_name }}) is not a fresh render of {{ rh_ra_src }}
+      under the declared renderer options (mode {{ rh_ra_mode }}, cap {{ rh_ra_max_bytes }}); nothing was published.
+    quiet: true
+
+- name: "RENDER -- refuse a staged render that is not a regular file of the declared mode or differs from a FRESH render"
+  when: rh_ra_scope == rh.controller.entry_generation.render.n10.scopes.lookup
+  ansible.builtin.assert:
+    that:
+      - _rh_ra_st.stat.exists and _rh_ra_st.stat.isreg and not _rh_ra_st.stat.islnk
+      - _rh_ra_st.stat.mode == rh_ra_mode
+      - >-
+        _rh_ra_st.stat.checksum
+        == lookup('ansible.builtin.template', rh_repo_root ~ rh.controller.bootstrap.path_admission.separator ~ rh_ra_src,
+                  template_vars=rh_ra_vars) | hash('sha256')
+    fail_msg: >-
+      REFUSED {{ rh_ra_refusal }}: the staged {{ rh_ra_dest | basename }} ({{ rh_ra_name }}) is not a fresh render of
+      {{ rh_ra_src }} (mode {{ rh_ra_mode }}); nothing was published (the staging dir is left for inspection; the next
+      run reaps it under bundle.staging_retention).
+    quiet: true
+
+- name: "RENDER -- accumulate the admitted render (derived output; op render only)"
+  when: rh_ra_op == rh.controller.entry_generation.render.n10.ops.render
+  ansible.builtin.set_fact:
+    _rh_ra_rendered: "{{ _rh_ra_rendered | combine({rh_ra_name: {'path': rh_ra_dest, 'sha256': _rh_ra_st.stat.checksum, 'mode': rh_ra_mode}}) }}"
+# FROZEN, no further writes

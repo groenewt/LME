@@ -1,0 +1,303 @@
+---
+# testing/remote_harness/tasks/prepare_tools.yml -- the guest tool identity CANDIDATES from VERIFIED PACKAGE CONTENTS
+# (codex-tick369 "verified package contents"; RS descriptors r2 guest_tool_source_descriptors / measurement slots).
+# AUTHORED, NEVER EXECUTED. Included by tasks/prepare.yml when preparation.tool_packages is declared.
+#
+# NO local QEMU install and no graph contact: the controller fetches the declared Debian packages and measures the
+# declared members of their extracted contents. TRUST MODE debian_archive_inrelease (a SIGNED mode, distinct from the
+# cloud image's TLS mode; never downgraded): the suite's InRelease (clearsigned) is fetched over the constrained HTTPS
+# fetch, verified by the admitted gpgv against ONLY the declared keyring (file admitted by sha256) with every VALIDSIG
+# primary-key fingerprint in the declared fingerprint list and no BADSIG / ERRSIG / EXPSIG / EXPKEYSIG / REVKEYSIG /
+# NO_PUBKEY line (gpgv exit 0 alone is NOT trust: it accepts any key of the keyring). The byte chain is then
+#   InRelease (verified signed text, gpgv --output) -> SHA256 of <index> AND of its decompressed form
+#   -> Packages.xz (fetched, sha256 bound) -> Packages (the admitted xz --decompress --keep, sha256 bound)
+#   -> exactly ONE stanza per declared package (Package + Architecture, Version if declared) -> Filename + SHA256
+#   -> the .deb (fetched, sha256 bound) -> dpkg-deb --extract into a fresh private dir
+#   -> each declared member: native stat (links NOT followed; a regular executable file) -> {kind: file_sha256, sha256}
+# HYPOTHESES (declared, refused rather than guessed when they fail): the archive layout and the host deb.debian.org
+# serving it without an off-origin redirect; dpkg-deb decompressing data.tar.* in-process (liblzma) and forking `tar`
+# by PATH (genesis env base: controller.bootstrap.base_env PATH=/usr/bin:/bin -> /usr/bin/tar, whose identity
+# admit_prep_tools.yml checked because tar is required_by preparation); gpgv runs with --homedir = the declared empty
+# layout.gpg_home (never the invoker's ~/.gnupg); ansible.builtin.uri may buffer a large body in memory (unlike
+# get_url), the cost of per-hop redirect control, which get_url does not offer; the InRelease carries no Valid-Until for this suite, so replay of an
+# OLDER signed InRelease is not excluded -- the record carries its Date for review. Graph's installed version may come
+# from another suite (security/updates): its measurement is then a candidate OVERRIDE through target_prereq, never
+# silently equal to this baseline.
+
+- name: "PREPARE PACKAGES -- admit the descriptor (the signed archive mode; keyring + fingerprints declared)"
+  vars:
+    _a: "{{ rh.controller.bootstrap.preparation.tool_packages }}"
+    _p: "{{ rh.controller.bootstrap.preparation }}"
+  ansible.builtin.assert:
+    that:
+      - _a.trust_mode == 'debian_archive_inrelease'
+      - _a.trust_mode in _p.trust_modes
+      - _a.keyring.sha256 is match('^[0-9a-f]{64}$')
+      - _a.keyring.fingerprints | length > 0
+      - _a.keyring.fingerprints | reject('match', '^[0-9A-F]{40}$') | list | length == 0
+      - _a.packages | length > 0
+      - _a.packages | list | reject('in', rh.packages.by_os_family.Debian) | list | length == 0
+    fail_msg: >-
+      REFUSED {{ _p.refusal }}: tool_packages must declare trust mode debian_archive_inrelease, a keyring {path, sha256}
+      and its full 40-hex primary-key fingerprints, and packages keyed by logical names of packages.by_os_family.Debian.
+      Nothing was fetched.
+    quiet: true
+
+- name: "PREPARE PACKAGES -- stat the declared keyring (links not followed)"
+  ansible.builtin.stat:
+    path: "{{ rh.controller.bootstrap.preparation.tool_packages.keyring.path }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rh_prep_kr
+
+- name: "PREPARE PACKAGES -- refuse a keyring that is not the declared file"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_kr.stat.exists and _rh_prep_kr.stat.isreg and not _rh_prep_kr.stat.islnk
+      - not (_rh_prep_kr.stat.wgrp or _rh_prep_kr.stat.woth)
+      - _rh_prep_kr.stat.checksum == rh.controller.bootstrap.preparation.tool_packages.keyring.sha256
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ _rh_prep_kr.stat.path | default('?') }} is not the
+      declared keyring (sha256 {{ _rh_prep_kr.stat.checksum | default('absent') }}). Nothing was fetched.
+    quiet: true
+
+# ---- InRelease: fetched, OpenPGP-verified against the declared fingerprints, its signed text parsed ----
+- name: "PREPARE PACKAGES -- set the InRelease fetch"
+  ansible.builtin.set_fact:
+    rh_prep_f_url: "{{ rh.controller.bootstrap.preparation.tool_packages.archive_url ~ '/dists/' ~ rh.controller.bootstrap.preparation.tool_packages.suite ~ '/InRelease' }}"
+    rh_prep_f_dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/InRelease' }}"
+    rh_prep_f_hosts: "{{ rh.controller.bootstrap.preparation.tool_packages.origin_hosts }}"
+    rh_prep_f_path: "{{ rh.controller.bootstrap.preparation.tool_packages.archive_path_regex ~ 'dists/' ~ (rh.controller.bootstrap.preparation.tool_packages.suite | regex_escape) ~ '/InRelease$' }}"
+    rh_prep_f_hop: 0
+    rh_prep_f_hops: []
+
+- name: "PREPARE PACKAGES -- fetch InRelease (constrained)"
+  ansible.builtin.include_tasks: prepare_fetch.yml
+
+- name: "PREPARE PACKAGES -- digest InRelease BEFORE verification"
+  ansible.builtin.stat: {path: "{{ rh_prep_f_dest }}", follow: false, checksum_algorithm: sha256}
+  register: _rh_prep_ir0
+
+- name: "PREPARE PACKAGES -- remove a stale verified-text output (gpgv never overwrites)"
+  ansible.builtin.file:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/InRelease.verified' }}"
+    state: absent
+
+- name: "PREPARE PACKAGES -- verify InRelease with the admitted gpgv against ONLY the declared keyring (status on stdout)"
+  ansible.builtin.command:
+    argv:
+      - "{{ rh.controller.bootstrap.os_tools.gpgv.path }}"
+      # isolated: the declared EMPTY 0700 home (layout.gpg_home) instead of the invoker's ~/.gnupg (genesis carries HOME)
+      - --homedir
+      - "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.gpg_home }}"
+      - --status-fd
+      - '1'
+      - --keyring
+      - "{{ rh.controller.bootstrap.preparation.tool_packages.keyring.path }}"
+      - --output
+      - "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/InRelease.verified' }}"
+      - "{{ rh_prep_f_dest }}"
+  register: _rh_prep_gpgv
+  changed_when: false
+  failed_when: false
+
+- name: "PREPARE PACKAGES -- digest InRelease AFTER verification (the bytes gpgv read are the bytes digested)"
+  ansible.builtin.stat: {path: "{{ rh_prep_f_dest }}", follow: false, checksum_algorithm: sha256}
+  register: _rh_prep_ir1
+
+- name: "PREPARE PACKAGES -- refuse unless the signature is valid AND made by a declared primary key (no other status)"
+  vars:
+    _l: "{{ _rh_prep_gpgv.stdout_lines | default([]) }}"
+    # VALIDSIG <fpr> <date> <ts> <expire> <ver> <reserved> <pk-algo> <hash-algo> <sig-class> <primary-fpr>: exactly
+    # 12 space-separated tokens with the [GNUPG:] prefix, so the LAST token is the primary-key fingerprint
+    _e: "{{ _l | select('match', '^\\[GNUPG:\\] VALIDSIG ') | map('split', ' ') | list }}"
+    _s: "{{ _l | select('match', '^\\[GNUPG:\\] VALIDSIG ') | map('split', ' ') | map('last') | list }}"
+    _bad: "{{ _l | select('match', '^\\[GNUPG:\\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|NO_PUBKEY|KEYEXPIRED|KEYREVOKED) ') | list }}"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_gpgv.rc | default(-1) == 0
+      - _bad | length == 0
+      - _s | length > 0
+      - _e | map('length') | unique | list == [12]
+      - _s | reject('in', rh.controller.bootstrap.preparation.tool_packages.keyring.fingerprints) | list | length == 0
+      - _rh_prep_ir0.stat.checksum == _rh_prep_ir1.stat.checksum
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: InRelease {{ rh_prep_f_final | default('?') }} is not
+      validly signed by a declared primary key (gpgv rc {{ _rh_prep_gpgv.rc | default('?') }}; signer primaries
+      {{ _s }}; declared {{ rh.controller.bootstrap.preparation.tool_packages.keyring.fingerprints }}; refused statuses
+      {{ _bad }}), or its bytes changed during verification. No signed mode ever falls back to TLS-only. Nothing was
+      admitted.
+    quiet: true
+
+- name: "PREPARE PACKAGES -- keep the InRelease provenance"
+  ansible.builtin.set_fact:
+    rh_prep_t_ir: {source_url: "{{ rh_prep_f_hops[0].url }}", final_url: "{{ rh_prep_f_final }}", hops: "{{ rh_prep_f_hops }}", sha256: "{{ _rh_prep_ir1.stat.checksum }}"}
+
+- name: "PREPARE PACKAGES -- digest the verified signed text"
+  ansible.builtin.stat:
+    path: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/InRelease.verified' }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _rh_prep_irvst
+
+- name: "PREPARE PACKAGES -- read the verified signed text ONCE"
+  ansible.builtin.slurp:
+    src: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/InRelease.verified' }}"
+  register: _rh_prep_irv
+
+- name: "PREPARE PACKAGES -- bind the verified text READ; the suite and EXACTLY ONE SHA256 entry for the index and its decompressed form"
+  vars:
+    _a: "{{ rh.controller.bootstrap.preparation.tool_packages }}"
+    _txt: "{{ _rh_prep_irv.content | b64decode }}"
+    _n: "{{ _txt | regex_findall('(?m)^ ([0-9a-f]{64}) +([0-9]+) ' ~ (_a.index | regex_escape) ~ '$') }}"
+    _u: "{{ _txt | regex_findall('(?m)^ ([0-9a-f]{64}) +([0-9]+) ' ~ (_a.index | regex_replace('\\.xz$', '') | regex_escape) ~ '$') }}"
+  ansible.builtin.set_fact:
+    rh_prep_t_rel:
+      bound: "{{ (_txt | hash('sha256')) == _rh_prep_irvst.stat.checksum }}"
+      # regex_findall (group captures, no back-reference strings: a '\1' through YAML double quotes + a Jinja literal
+      # would become chr(1)); several Codename lines refuse below via the count
+      codename_count: "{{ _txt | regex_findall('(?m)^Codename: (\\S+)$') | length }}"
+      codename: "{{ _txt | regex_findall('(?m)^Codename: (\\S+)$') | default([''], true) | first }}"
+      date: "{{ _txt | regex_findall('(?m)^Date: (.+)$') | default([''], true) | first }}"
+      valid_until: "{{ _txt | regex_findall('(?m)^Valid-Until: (.+)$') | default([''], true) | first }}"
+      index_count: "{{ _n | length }}"
+      index_sha256: "{{ (_n[0][0]) if (_n | length) == 1 else '' }}"
+      plain_count: "{{ _u | length }}"
+      plain_sha256: "{{ (_u[0][0]) if (_u | length) == 1 else '' }}"
+
+- name: "PREPARE PACKAGES -- refuse an unbound text, another suite, or zero / several index entries"
+  ansible.builtin.assert:
+    that:
+      - rh_prep_t_rel.bound | bool
+      - rh_prep_t_rel.codename_count | int == 1
+      - rh_prep_t_rel.codename == rh.controller.bootstrap.preparation.tool_packages.suite
+      - rh_prep_t_rel.index_count | int == 1
+      - rh_prep_t_rel.plain_count | int == 1
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: the verified InRelease must be the bytes read, Codename
+      {{ rh.controller.bootstrap.preparation.tool_packages.suite }} (got {{ rh_prep_t_rel.codename }}), with exactly one
+      SHA256 line for {{ rh.controller.bootstrap.preparation.tool_packages.index }} ({{ rh_prep_t_rel.index_count }}) and
+      for its decompressed form ({{ rh_prep_t_rel.plain_count }}).
+    quiet: true
+
+# ---- Packages index: fetched, bound to the signed entry, decompressed natively, bound again ----
+- name: "PREPARE PACKAGES -- set the index fetch"
+  ansible.builtin.set_fact:
+    rh_prep_f_url: >-
+      {{ rh.controller.bootstrap.preparation.tool_packages.archive_url ~ '/dists/' ~ rh.controller.bootstrap.preparation.tool_packages.suite
+         ~ '/' ~ rh.controller.bootstrap.preparation.tool_packages.index }}
+    rh_prep_f_dest: "{{ rh_prep_root ~ '/' ~ rh.controller.bootstrap.preparation.layout.partial ~ '/' ~ (rh.controller.bootstrap.preparation.tool_packages.index | basename) }}"
+    rh_prep_f_hosts: "{{ rh.controller.bootstrap.preparation.tool_packages.origin_hosts }}"
+    rh_prep_f_path: >-
+      {{ rh.controller.bootstrap.preparation.tool_packages.archive_path_regex ~ 'dists/'
+         ~ (rh.controller.bootstrap.preparation.tool_packages.suite | regex_escape) ~ '/'
+         ~ (rh.controller.bootstrap.preparation.tool_packages.index | regex_escape) ~ '$' }}
+    rh_prep_f_hop: 0
+    rh_prep_f_hops: []
+
+- name: "PREPARE PACKAGES -- fetch the index (constrained)"
+  ansible.builtin.include_tasks: prepare_fetch.yml
+
+- name: "PREPARE PACKAGES -- digest the fetched index"
+  ansible.builtin.stat: {path: "{{ rh_prep_f_dest }}", follow: false, checksum_algorithm: sha256}
+  register: _rh_prep_ixz
+
+- name: "PREPARE PACKAGES -- refuse an index that is not the signed entry"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_ixz.stat.isreg and not _rh_prep_ixz.stat.islnk
+      - _rh_prep_ixz.stat.checksum == rh_prep_t_rel.index_sha256
+    fail_msg: "REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: {{ rh_prep_f_final | default('?') }} sha256 {{ _rh_prep_ixz.stat.checksum | default('?') }} is not the signed entry {{ rh_prep_t_rel.index_sha256 }}."
+    quiet: true
+
+# the genesis builder loads NO collection (genesis builder collections: [] -- "the builder stage uses ansible.builtin
+# only"), so decompression is the admitted preparation tool xz (os_tools.xz, required_by preparation, identity checked
+# by admit_prep_tools.yml), never community.general. xz refuses an existing output (no --force): removed first.
+- name: "PREPARE PACKAGES -- remove a stale decompressed index (xz never overwrites)"
+  ansible.builtin.file:
+    path: "{{ rh_prep_f_dest | regex_replace('\\.xz$', '') }}"
+    state: absent
+
+- name: "PREPARE PACKAGES -- decompress the bound index with the admitted xz (keeps the bound .xz)"
+  ansible.builtin.command:
+    argv: ["{{ rh.controller.bootstrap.os_tools.xz.path }}", --decompress, --keep, --, "{{ rh_prep_f_dest }}"]
+  register: _rh_prep_unxz
+  changed_when: true
+  failed_when: false
+
+- name: "PREPARE PACKAGES -- refuse a failed decompression"
+  ansible.builtin.assert:
+    that:
+      - _rh_prep_unxz.rc | default(-1) == 0
+    fail_msg: "REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: xz --decompress of {{ rh_prep_f_dest }} exited {{ _rh_prep_unxz.rc | default('?') }} ({{ _rh_prep_unxz.stderr | default('') }})."
+    quiet: true
+
+- name: "PREPARE PACKAGES -- digest the decompressed index"
+  ansible.builtin.stat: {path: "{{ rh_prep_f_dest | regex_replace('\\.xz$', '') }}", follow: false, checksum_algorithm: sha256}
+  register: _rh_prep_ix
+
+- name: "PREPARE PACKAGES -- read the decompressed index ONCE"
+  ansible.builtin.slurp: {src: "{{ rh_prep_f_dest | regex_replace('\\.xz$', '') }}"}
+  register: _rh_prep_ixraw
+
+- name: "PREPARE PACKAGES -- bind the index text READ to its signed decompressed entry; select the stanzas"
+  vars:
+    _a: "{{ rh.controller.bootstrap.preparation.tool_packages }}"
+    # FRUGALITY NOTE: the decompressed index is tens of MB; a task var is re-templated on every reference, so each
+    # template below decodes it ONCE into a local (`set txt`) and the two facts decode it twice in total
+    _txt: "{{ _rh_prep_ixraw.content | b64decode }}"
+  ansible.builtin.set_fact:
+    rh_prep_t_ixbound: "{{ _rh_prep_ix.stat.checksum == rh_prep_t_rel.plain_sha256 and (_txt | hash('sha256')) == rh_prep_t_rel.plain_sha256 }}"
+    # one stanza = 'Package: <name>' through the last non-empty line before a blank line (Debian control paragraphs);
+    # whitespace-controlled so the rendered value is exactly the mapping (the package.yml :152 idiom)
+    rh_prep_t_stanzas: >-
+      {%- set ns = namespace(o={}) -%}
+      {%- set txt = _txt -%}
+      {%- for lk, d in _a.packages.items() -%}
+      {%- set name = rh.packages.by_os_family.Debian[lk] -%}
+      {%- set st = txt | regex_findall('(?m)^Package: ' ~ (name | regex_escape) ~ '\n(?:[^\n]+\n)*') -%}
+      {%- set st = st | select('search', '(?m)^Architecture: (' ~ (_a.architecture | regex_escape) ~ '|all)$') | list -%}
+      {%- if d.version | default(none) is not none -%}{%- set st = st | select('search', '(?m)^Version: ' ~ (d.version | regex_escape) ~ '$') | list -%}{%- endif -%}
+      {%- set one = st[0] if (st | length) == 1 else '' -%}
+      {%- set ns.o = ns.o | combine({lk: {'name': name, 'count': st | length,
+            'version': one | regex_findall('(?m)^Version: (.+)$') | default([''], true) | first,
+            'architecture': one | regex_findall('(?m)^Architecture: (.+)$') | default([''], true) | first,
+            'filename': one | regex_findall('(?m)^Filename: (.+)$') | default([''], true) | first,
+            'sha256': one | regex_findall('(?m)^SHA256: ([0-9a-f]{64})$') | default([''], true) | first,
+            'size': one | regex_findall('(?m)^Size: ([0-9]+)$') | default([''], true) | first}}) -%}
+      {%- endfor -%}{{ ns.o }}
+
+- name: "PREPARE PACKAGES -- refuse an unbound index or a package without EXACTLY ONE complete stanza"
+  ansible.builtin.assert:
+    that:
+      - rh_prep_t_ixbound | bool
+      - rh_prep_t_stanzas | dict2items | rejectattr('value.count', 'equalto', 1) | list | length == 0
+      - rh_prep_t_stanzas | dict2items | map(attribute='value.sha256') | reject('match', '^[0-9a-f]{64}$') | list | length == 0
+      - rh_prep_t_stanzas | dict2items | map(attribute='value.filename') | reject('match', '^pool/[A-Za-z0-9/._+~-]+\.deb$') | list | length == 0
+      - rh_prep_t_stanzas | dict2items | map(attribute='value.filename') | select('search', '(^|/)\.\.(/|$)') | list | length == 0
+    fail_msg: >-
+      REFUSED {{ rh.controller.bootstrap.preparation.refusal }}: the signed index must be the bytes read and hold exactly
+      one complete stanza (Package, Architecture {{ rh.controller.bootstrap.preparation.tool_packages.architecture }}|all,
+      the declared Version if any, a pool Filename, a SHA256) per declared package:
+      {% for k, v in rh_prep_t_stanzas.items() %}{{ k }}={{ v.name }} x{{ v.count }} {% endfor %}. Nothing was admitted.
+    quiet: true
+
+# ---- each package: fetched and bound, extracted fresh, its declared members measured by native stat ----
+- name: "PREPARE PACKAGES -- each declared package (tasks/prepare_package.yml)"
+  ansible.builtin.include_tasks: prepare_package.yml
+  loop: "{{ rh.controller.bootstrap.preparation.tool_packages.packages | dict2items }}"
+  loop_control:
+    loop_var: rh_prep_pkg
+    label: "{{ rh_prep_pkg.key }}"
+
+- name: "PREPARE PACKAGES -- the archive provenance of every tool candidate (trust mode stated; signed, not TLS-only)"
+  ansible.builtin.set_fact:
+    rh_prep_archive:
+      trust_mode: "{{ rh.controller.bootstrap.preparation.tool_packages.trust_mode }}"
+      trust_boundary: "{{ rh.controller.bootstrap.preparation.trust_boundaries[rh.controller.bootstrap.preparation.tool_packages.trust_mode] }}"
+      signature_verified: true
+      signer_primary_fingerprints: "{{ _rh_prep_gpgv.stdout_lines | select('match', '^\\[GNUPG:\\] VALIDSIG ') | map('split', ' ') | map('last') | unique | list }}"
+      keyring: {path: "{{ rh.controller.bootstrap.preparation.tool_packages.keyring.path }}", sha256: "{{ _rh_prep_kr.stat.checksum }}"}
+      inrelease: "{{ rh_prep_t_ir | combine({'verified_text_sha256': _rh_prep_irvst.stat.checksum, 'codename': rh_prep_t_rel.codename, 'date': rh_prep_t_rel.date, 'valid_until': rh_prep_t_rel.valid_until}) }}"
+      index: {path: "{{ rh.controller.bootstrap.preparation.tool_packages.index }}", sha256: "{{ rh_prep_t_rel.index_sha256 }}", decompressed_sha256: "{{ rh_prep_t_rel.plain_sha256 }}"}
+      packages: "{{ rh_prep_t_stanzas }}"

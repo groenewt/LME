@@ -1,0 +1,131 @@
+---
+# testing/e2e/transfer/resolve_work_root.yml -- the transfer controls' DECLARED work-root rules, from the RESOLVED
+# policy (never the raw profile): the route's refuse_pinned_outputs.yml (first task; it locates the repository from
+# playbook_dir, at most 3 levels up, which is why this file sits in transfer/ and not in controls/) and
+# resolve_policy.yml, then rh.controller.bootstrap.work_roots and path_admission (codex 135012/135500).
+# Run by controls/run_controls.yml before its work root exists:
+#   <ansible-playbook> -i localhost, testing/e2e/transfer/resolve_work_root.yml
+# The payload also carries the resolved controller.bootstrap map, which run_controls.yml hands to the route's ONE
+# ancestry rule (testing/remote_harness/tasks/admit_ancestry.yml, rh_anc_bs) for the work root.
+# It writes nothing. Its one output line is `TR-WORK-ROOTS <base64 of the JSON payload> TR-WORK-ROOTS-END`
+# (base64: the debug output JSON-escapes quotes). No transport, no target, no managed generation.
+- name: transfer controls -- resolve the declared work root
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Refuse pre-supplied harness outputs and derive the repository root (route author; first task)
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname | dirname | dirname }}/testing/remote_harness/tasks/refuse_pinned_outputs.yml"
+
+    - name: Resolve the harness policy (route author; the resolved `rh`, never the raw profile)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/resolve_policy.yml"
+
+    - name: The resolved work-root rules are declared
+      ansible.builtin.assert:
+        that:
+          - rh.controller.bootstrap.work_roots is mapping
+          - rh.controller.bootstrap.work_roots.anchor == 'repository_checkout'
+          - rh.controller.bootstrap.work_roots.root_rel is string and rh.controller.bootstrap.work_roots.root_rel | length > 0
+          - rh.controller.bootstrap.work_roots.sub_roots.run is string
+          - rh.controller.bootstrap.work_roots.runners.transfer_controls is string
+          - rh.controller.bootstrap.work_roots.admission.refused_prefixes | length > 0
+          - rh.controller.bootstrap.path_admission.regex is string
+        fail_msg: "CONTROLS-WORK-ROOT: the resolved policy declares no usable controller.bootstrap.work_roots / path_admission"
+        quiet: true
+
+    # brr-follow-s2 OPEN-B (codex-tick542 OD-GEN-06; codex-tick543 OD-BRR-12; codex-tick546 settled_join_continuity):
+    # the B runner's operator-class producer needs each declared operator input's ADMITTED VALUES, which live below the
+    # resolved controller (genesis.launch.operator_inputs.<name>.domain = a key path below remote_harness.controller to
+    # the mapping whose VALUES are the admitted values). The payload carries only bootstrap, so the domains are
+    # PROJECTED here, generically over every declared operator input (no input name in this file), from the resolved
+    # `rh` (never the raw profile). ACTIVITY (F05-S4 ruling-1; codex-tick546 inactive_profiles; codex-tick543 OD-BRR-07):
+    # the ONE activity rule is the published view lme_resolved.remote_harness.entry_generation_contract.active -- no
+    # second selector (no key-presence test of genesis / launch decides activity). Inactive: nothing is projected and
+    # nothing refuses here (S4-D03). Active: genesis.launch is REQUIRED by the resolver (s4 GLO-01..04); a launch that
+    # declares operator_inputs gets the projection; a launch that declares none gets none, and a stage input of the
+    # operator class then refuses typed in run_one_case (launch_inputs), never silently omitted.
+    # ORDER: (1) activity-view shape, (2) operator_inputs SHAPE (so the projection can never raise an untyped template
+    # error), (3) projection, (4) resolution. Each refuses with the existing CONTROLS-WORK-ROOT text style.
+    - name: Refuse an absent or malformed entry-generation activity view (the ONE activity rule)
+      ansible.builtin.assert:
+        that:
+          - lme_resolved.remote_harness.entry_generation_contract is mapping
+          - lme_resolved.remote_harness.entry_generation_contract.active is boolean
+        fail_msg: "CONTROLS-WORK-ROOT: the resolved policy publishes no boolean entry_generation_contract.active (the one activity view)"
+        quiet: true
+
+    - name: Refuse a malformed genesis.launch.operator_inputs declaration (shape, before any projection)
+      vars:
+        _trw_oi_decl: "{{ rh.controller.bootstrap.genesis.launch.operator_inputs }}"
+      ansible.builtin.assert:
+        that:
+          - _trw_oi_decl is mapping
+          - _trw_oi_decl.values() | reject('mapping') | list | length == 0
+          - _trw_oi_decl.values() | rejectattr('class', 'defined') | list | length == 0
+          - _trw_oi_decl.values() | map(attribute='class') | reject('string') | list | length == 0
+          - _trw_oi_decl.values() | rejectattr('domain', 'defined') | list | length == 0
+          - _trw_oi_decl.values() | map(attribute='domain') | reject('sequence') | list | length == 0
+          - _trw_oi_decl.values() | map(attribute='domain') | select('string') | list | length == 0
+          - _trw_oi_decl.values() | map(attribute='domain') | reject('truthy') | list | length == 0
+          - _trw_oi_decl.values() | map(attribute='domain') | flatten(levels=1) | reject('string') | list | length == 0
+          - rh.controller.bootstrap.genesis.launch.input_sources is mapping
+          - _trw_oi_decl.values() | map(attribute='class') | reject('in', rh.controller.bootstrap.genesis.launch.input_sources.keys() | list) | list | length == 0
+        fail_msg: "CONTROLS-WORK-ROOT: genesis.launch.operator_inputs must map each name to {class: a launch.input_sources key, domain: a non-empty list of key names}"
+        quiet: true
+      when:
+        - lme_resolved.remote_harness.entry_generation_contract.active
+        - "'operator_inputs' in rh.controller.bootstrap.genesis.launch"
+
+    - name: Project the declared operator-input domains (operator_inputs.<name>.domain resolved below rh.controller)
+      ansible.builtin.set_fact:
+        _trw_oi: >-
+          {%- set ns = namespace(m={}, bad=[]) -%}
+          {%- for n, d in rh.controller.bootstrap.genesis.launch.operator_inputs | dictsort(case_sensitive=true) -%}
+          {%- set w = namespace(node=rh.controller) -%}
+          {%- for k in d.domain -%}{%- set w.node = w.node[k] if (w.node is mapping and k in w.node) else none -%}{%- endfor -%}
+          {%- if w.node is mapping and w.node | length > 0 -%}
+          {%- set ns.m = ns.m | combine({n: {'class': d['class'], 'domain': d.domain, 'values': w.node.values() | list}}) -%}
+          {%- else -%}{%- set ns.bad = ns.bad + [[n, d.domain]] -%}{%- endif -%}
+          {%- endfor -%}
+          {{ {'inputs': ns.m, 'bad': ns.bad} }}
+      when:
+        - lme_resolved.remote_harness.entry_generation_contract.active
+        - "'operator_inputs' in rh.controller.bootstrap.genesis.launch"
+
+    - name: Refuse a declared operator-input domain that does not resolve to a non-empty mapping below rh.controller
+      ansible.builtin.assert:
+        that:
+          - _trw_oi.bad | length == 0
+        fail_msg: "CONTROLS-WORK-ROOT: a genesis.launch.operator_inputs domain does not resolve to a non-empty mapping below the resolved controller (name, domain): {{ _trw_oi.bad | to_json }}"
+        quiet: true
+      when: _trw_oi is defined
+
+    # brr-follow-s2 successor-06 S2-STORE-READBACK-FALSE-PASS (codex-572): the genesis_case store readback needs the
+    # DECLARATION-DERIVED set of row files the entry publishes into its store (the declared artifact rows: resolved
+    # controller.bootstrap.artifacts + the parsed lock's packages and collections -- rh_seed_lock, resolve_policy.yml; the
+    # same row formula acquire.yml and the genesis entry macros use; seams.yml SC-S2-STORE-ROWSET). Projected only while
+    # the ONE activity view is active; the payload carries the file names, never digests or sources.
+    - name: Refuse an unprojectable declared store row set (active only; shape before the projection)
+      ansible.builtin.assert:
+        that:
+          - rh.controller.bootstrap.artifacts is sequence and rh.controller.bootstrap.artifacts is not string
+          - rh_seed_lock is mapping
+          - rh_seed_lock.packages is sequence and rh_seed_lock.packages is not string
+          - rh_seed_lock.collections is sequence and rh_seed_lock.collections is not string
+          - (rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections) | rejectattr('file', 'string') | list | length == 0
+          - (rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections) | length > 0
+        fail_msg: "CONTROLS-WORK-ROOT: the declared store rows (controller.bootstrap.artifacts + the lock's packages and collections) are not a non-empty list of rows each naming a string file"
+        quiet: true
+      when: lme_resolved.remote_harness.entry_generation_contract.active
+
+    - name: TR-WORK-ROOTS
+      ansible.builtin.debug:
+        msg: >-
+          TR-WORK-ROOTS {{ ({'repo_root': rh_repo_root, 'work_roots': rh.controller.bootstrap.work_roots,
+                            'path_admission': rh.controller.bootstrap.path_admission,
+                            'bootstrap': rh.controller.bootstrap}
+                           | combine({'operator_inputs': _trw_oi.inputs} if (_trw_oi is defined) else {})
+                           | combine({'genesis_store_files': (rh.controller.bootstrap.artifacts + rh_seed_lock.packages + rh_seed_lock.collections)
+                                                             | map(attribute='file') | list}
+                                     if lme_resolved.remote_harness.entry_generation_contract.active else {})) | to_json | b64encode }} TR-WORK-ROOTS-END

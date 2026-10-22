@@ -291,6 +291,12 @@
       when: not lme_backup_check.stat.exists or not lme_backup_check.stat.isdir
       
     - name: Remove the current installation if backup and validation succeeded
+      # Data-safety gate. When a safety backup was taken (y/yes), do not destroy the
+      # live install unless that backup also stopped LME containers cleanly before its
+      # volume copy (lme_backup_clean_container_stop, set as a host fact by the
+      # backup_lme role). This holds even if backup_fail_on_unclean_stop=false let the
+      # backup role return success: an UNSAFE/torn safety backup must never qualify a
+      # destructive rollback. Fail-safe: a missing/undefined fact is treated as unclean.
       shell: |
         if [ -d "{{ lme_install_dir }}" ]; then
           rm -rf "{{ lme_install_dir }}"
@@ -300,7 +306,8 @@
         executable: /bin/bash
       when: >
         (
-          (backup_choice in ['y', 'yes'] and current_lme_backup is success) or
+          (backup_choice in ['y', 'yes'] and current_lme_backup is success
+            and (lme_backup_clean_container_stop | default(false) | bool)) or
           (backup_choice in ['n', 'no'] and current_lme_backup.skipped is defined)
         ) and lme_backup_check.stat.exists
       
@@ -315,8 +322,8 @@
           Safety backup: SKIPPED by user choice
           {% endif %}
           Rollback source: {{ selected_backup_dir }}
-          Status: IN PROGRESS
-      
+          Status: INCOMPLETE (in progress or INTERRUPTED -- only a completed run overwrites this file with a terminal status)
+
     - name: Restore LME installation, vault files, and systemd files
       shell: |
         # Restore LME installation
@@ -447,15 +454,93 @@
         # Use the backup password file for decryption
         export ANSIBLE_VAULT_PASSWORD_FILE="{{ selected_backup_dir }}/etc_lme/pass.sh"
 
-        # Remove existing secrets first
-        for secret_id in $(podman secret ls --format "{{ '{{' }}.ID{{ '}}' }}"); do
-          podman secret rm "$secret_id" 2>/dev/null || true
-        done
-
         BACKUP_ROOT="{{ selected_backup_dir }}"
         MANIFEST_FILE="$BACKUP_ROOT/secret_manifest.txt"
         MAPPING_FILE="$BACKUP_ROOT/secret_mapping.txt"
         BACKUP_VAULT_DIR="$BACKUP_ROOT/etc_lme/vault"
+
+        # Track secret-restore failures so the task can exit non-zero and the
+        # rollback summary reports the truth instead of a false "Success".
+        SECRET_FAILURES=0
+
+        # SECRETS-DESTROYED-BEFORE-PAYLOAD-VERIFY guard (fail-closed): verify EVERY
+        # secret recorded in the backup has a present, decryptable payload BEFORE the
+        # destructive `podman secret rm` below. `--replace` on create is NOT enough --
+        # it overwrites the live secret before proving the new value is valid. If any
+        # recorded payload is missing/undecryptable we refuse to delete the live
+        # secrets and exit non-zero, so existing secrets survive an unusable backup.
+        # Secret VALUES are never printed (view output is discarded). C seam: which
+        # secrets are REQUIRED vs optional is a credential-contract concern; absent
+        # that contract we conservatively require every backed-up secret to restore.
+        preverify_payload() {
+          local name="$1" path="$2"
+          if [ -z "$path" ] || [ ! -f "$path" ]; then
+            echo "Pre-verify FAILED: no payload file for secret '$name'"
+            return 1
+          fi
+          if ! ansible-vault view "$path" >/dev/null 2>&1; then
+            echo "Pre-verify FAILED: payload for secret '$name' did not decrypt"
+            return 1
+          fi
+          return 0
+        }
+        PREVERIFY_OK=0
+        PREVERIFY_FAILURES=0
+        HAVE_CONTRACT=0
+        if [ -f "$MANIFEST_FILE" ]; then
+          HAVE_CONTRACT=1
+          while IFS='|' read -r pv_name pv_id pv_driver pv_vault_file pv_captured_file; do
+            case "$pv_name" in
+              ''|\#*) continue ;;
+            esac
+            if [ -n "$pv_vault_file" ] && [ -f "$BACKUP_VAULT_DIR/$pv_vault_file" ]; then
+              if preverify_payload "$pv_name" "$BACKUP_VAULT_DIR/$pv_vault_file"; then PREVERIFY_OK=$((PREVERIFY_OK + 1)); else PREVERIFY_FAILURES=$((PREVERIFY_FAILURES + 1)); fi
+            elif [ -n "$pv_captured_file" ] && [ -f "$BACKUP_ROOT/$pv_captured_file" ]; then
+              if preverify_payload "$pv_name" "$BACKUP_ROOT/$pv_captured_file"; then PREVERIFY_OK=$((PREVERIFY_OK + 1)); else PREVERIFY_FAILURES=$((PREVERIFY_FAILURES + 1)); fi
+            else
+              echo "Pre-verify FAILED: no payload recorded for secret '$pv_name'"
+              PREVERIFY_FAILURES=$((PREVERIFY_FAILURES + 1))
+            fi
+          done < "$MANIFEST_FILE"
+        elif [ -f "$MAPPING_FILE" ] && [ -d "$BACKUP_VAULT_DIR" ]; then
+          HAVE_CONTRACT=1
+          while IFS='=' read -r pv_name pv_vault_id; do
+            case "$pv_name" in
+              ''|\#*) continue ;;
+            esac
+            if preverify_payload "$pv_name" "$BACKUP_VAULT_DIR/$pv_vault_id"; then PREVERIFY_OK=$((PREVERIFY_OK + 1)); else PREVERIFY_FAILURES=$((PREVERIFY_FAILURES + 1)); fi
+          done < "$MAPPING_FILE"
+        fi
+
+        # Count live secrets so a degenerate/empty backup contract cannot wipe them.
+        LIVE_SECRETS=$(podman secret ls --format "{{ '{{' }}.Name{{ '}}' }}" 2>/dev/null | grep -c . || true)
+
+        if [ "$HAVE_CONTRACT" = "1" ]; then
+          if [ "${PREVERIFY_FAILURES:-0}" -gt 0 ]; then
+            echo "ERROR: ${PREVERIFY_FAILURES} backup secret payload(s) missing/undecryptable." >&2
+            echo "Refusing to delete existing Podman secrets (fail-closed); live secrets left intact." >&2
+            exit 2
+          fi
+          if [ "${PREVERIFY_OK:-0}" -eq 0 ]; then
+            # Manifest/mapping present but recorded no restorable secrets. Never wipe
+            # live secrets on the strength of an empty backup contract.
+            if [ "${LIVE_SECRETS:-0}" -gt 0 ]; then
+              echo "ERROR: backup lists no restorable secrets but ${LIVE_SECRETS} live secret(s) exist; refusing to wipe them (fail-closed)." >&2
+              exit 2
+            fi
+            echo "No secrets recorded in backup and none live; nothing to restore."
+          else
+            # Payloads verified -- safe to clear existing secrets before restore.
+            for secret_id in $(podman secret ls --format "{{ '{{' }}.ID{{ '}}' }}"); do
+              podman secret rm "$secret_id" 2>/dev/null || true
+            done
+          fi
+        else
+          # Positional fallback (no manifest, no mapping): do NOT blanket-remove. The
+          # per-secret decrypt-then-`--replace` below verifies each payload before it
+          # overwrites, so live secrets are never wiped ahead of a proven replacement.
+          echo "No secret manifest or mapping; positional fallback verifies-then-replaces per secret (no blanket removal)."
+        fi
 
         # Helper that creates a podman secret from a vault-encrypted file using
         # the requested driver, falling back to shell driver when unknown.
@@ -485,14 +570,19 @@
               echo "Restoring '$name' (driver=$driver) from etc_lme/vault/$vault_file"
               create_secret_from_vault "$name" "$driver" "$BACKUP_VAULT_DIR/$vault_file" \
                 && echo "Successfully restored secret: $name" \
-                || echo "Failed to create secret: $name"
+                || { echo "Failed to create secret: $name"; SECRET_FAILURES=$((SECRET_FAILURES + 1)); }
             elif [ -n "$captured_file" ] && [ -f "$BACKUP_ROOT/$captured_file" ]; then
               echo "Restoring '$name' (driver=$driver) from $captured_file"
               create_secret_from_vault "$name" "$driver" "$BACKUP_ROOT/$captured_file" \
                 && echo "Successfully restored secret: $name" \
-                || echo "Failed to create secret: $name"
+                || { echo "Failed to create secret: $name"; SECRET_FAILURES=$((SECRET_FAILURES + 1)); }
             else
-              echo "Warning: no payload available to restore secret '$name' (driver=$driver). Skipping; recreate via install/playbooks if required."
+              # Fail-closed: the manifest RECORDED this secret at backup time but the
+              # backup carries no restorable payload (neither vault_file nor
+              # captured_file). Count it so the task exits non-zero and the summary
+              # cannot report a false "Success". Names only -- never the secret value.
+              echo "Failed to restore secret '$name' (driver=$driver): no payload in backup. Recreate via install/playbooks if required."
+              SECRET_FAILURES=$((SECRET_FAILURES + 1))
             fi
           done < "$MANIFEST_FILE"
         elif [ -f "$MAPPING_FILE" ] && [ -d "$BACKUP_VAULT_DIR" ]; then
@@ -508,12 +598,16 @@
               if [ $? -eq 0 ] && [ -n "$SECRET_VALUE" ]; then
                 echo "$SECRET_VALUE" | podman secret create --driver shell --replace "$secret_name" - \
                   && echo "Successfully restored secret: $secret_name" \
-                  || echo "Failed to create secret: $secret_name"
+                  || { echo "Failed to create secret: $secret_name"; SECRET_FAILURES=$((SECRET_FAILURES + 1)); }
               else
                 echo "Failed to decrypt backup vault file for secret: $secret_name"
+                SECRET_FAILURES=$((SECRET_FAILURES + 1))
               fi
             else
-              echo "Warning: Backup vault file not found for secret $secret_name: $BACKUP_VAULT_FILE"
+              # Fail-closed: legacy mapping recorded this secret but its vault file is
+              # absent from the backup -- an integrity gap. Count it (names/paths only).
+              echo "Failed to restore secret $secret_name: backup vault file not found: $BACKUP_VAULT_FILE"
+              SECRET_FAILURES=$((SECRET_FAILURES + 1))
             fi
           done < "$MAPPING_FILE"
         else
@@ -527,20 +621,33 @@
                 echo "Creating secret ${secret_names[$i]} from backup vault file ${vault_files[$i]} (positional fallback)"
                 SECRET_VALUE=$(ansible-vault view "$BACKUP_VAULT_DIR/${vault_files[$i]}")
                 if [ $? -eq 0 ] && [ -n "$SECRET_VALUE" ]; then
-                  echo "$SECRET_VALUE" | podman secret create --driver shell --replace "${secret_names[$i]}" -
+                  # Fail-closed: capture the create result so a positional-fallback
+                  # failure also counts (previously only decrypt failures did).
+                  echo "$SECRET_VALUE" | podman secret create --driver shell --replace "${secret_names[$i]}" - \
+                    && echo "Successfully restored secret: ${secret_names[$i]}" \
+                    || { echo "Failed to create secret: ${secret_names[$i]}"; SECRET_FAILURES=$((SECRET_FAILURES + 1)); }
                 else
                   echo "Failed to decrypt backup vault file: ${vault_files[$i]}"
+                  SECRET_FAILURES=$((SECRET_FAILURES + 1))
                 fi
               fi
             done
           else
             echo "Error: No backup vault directory found at $BACKUP_VAULT_DIR"
+            SECRET_FAILURES=$((SECRET_FAILURES + 1))
           fi
         fi
 
         # Verify secrets were created
         echo "Current secrets:"
         podman secret ls
+
+        # Fail the task (ignored below) so the rollback summary cannot report a
+        # false "Success" for secrets when one or more actually failed to restore.
+        if [ "${SECRET_FAILURES:-0}" -gt 0 ]; then
+          echo "ERROR: ${SECRET_FAILURES} secret(s) failed to restore"
+          exit 1
+        fi
       args:
         executable: /bin/bash
       when: restore_result is success
@@ -654,6 +761,66 @@
     
     - name: Restore volume backups if available
       block:
+        # Data-safety authorization gate for destructive volume removal (mirrors the
+        # rm -rf /opt/lme gate). Fresh AFFIRMATIVE stopped-evidence is required in BOTH
+        # branches: the decline (n/no) branch's `current_lme_backup.skipped is defined`
+        # is a tautology and proves nothing, so we re-probe here. A torn/unsafe safety
+        # backup, a partial safety-volume copy, still-running containers, or a failed
+        # secret restore must NEVER authorize destroying live volumes. Fail-closed:
+        # missing/undefined evidence reads as unsafe. `backup_fail_on_unclean_stop` is
+        # deliberately NOT referenced (it can mask an unclean stop).
+        - name: Explicitly stop all LME container units before destructive volume ops
+          # The earlier `systemctl stop lme` only stops the umbrella unit; units with
+          # Restart=always/WantedBy can return before the destructive volume work. Stop
+          # every lme-* unit+container explicitly so the affirmative probe below is
+          # reliable (and so we never destroy a volume under a live writer).
+          shell: |
+            export PATH=$PATH:/nix/var/nix/profiles/default/bin
+            systemctl stop lme 2>/dev/null || true
+            for c in $({{ podman_cmd }} ps --format "{{ '{{' }}.Names{{ '}}' }}" 2>/dev/null | grep -E '^lme-' || true); do
+              systemctl stop "${c}.service" 2>/dev/null || true
+              {{ podman_cmd }} stop "$c" 2>/dev/null || true
+            done
+            for unit in lme-llm-keys.path lme-llm-keys.service lme-llama-model.path lme-llama-model.service lme-kev-sync.timer lme-kev-sync.service; do
+              systemctl stop "$unit" 2>/dev/null || true
+            done
+          args:
+            executable: /bin/bash
+
+        - name: Probe for still-running LME containers before destructive volume ops
+          shell: |
+            set -euo pipefail
+            out="$({{ podman_cmd }} ps --format "{{ '{{' }}.Names{{ '}}' }}")"
+            echo "$out" | grep -E '^lme-' || true
+          args:
+            executable: /bin/bash
+          register: rollback_running_lme_probe
+          changed_when: false
+
+        - name: Authorize destructive volume removal (fail-closed data-safety gate)
+          assert:
+            that:
+              - rollback_running_lme_probe.stdout_lines is defined
+              - (rollback_running_lme_probe.stdout_lines | length) == 0
+              - secrets_restore_result is defined
+              - secrets_restore_result is not failed
+              - >-
+                (backup_choice in ['n', 'no'])
+                or
+                (backup_choice in ['y', 'yes']
+                  and (lme_backup_clean_container_stop | default(false) | bool)
+                  and ((successful_volumes.stdout | default('0') | int)
+                       == (lme_backup_selected_volumes | default([]) | length)))
+            fail_msg: >-
+              Refusing to remove/recreate live volumes.
+              Running LME containers: [{{ rollback_running_lme_probe.stdout_lines | default(['UNKNOWN']) | join(', ') }}].
+              Secrets restored: {{ 'yes' if (secrets_restore_result is defined and secrets_restore_result is not failed) else 'NO' }}.
+              {% if backup_choice in ['y', 'yes'] %}Safety backup clean stop: {{ lme_backup_clean_container_stop | default(false) | bool }};
+              volumes copied {{ successful_volumes.stdout | default('0') }} of {{ lme_backup_selected_volumes | default([]) | length }}.
+              A torn/incomplete safety backup cannot bless destructive volume removal.{% else %}
+              No safety backup was taken; live containers must be verifiably stopped first.{% endif %}
+            success_msg: "Destructive volume removal authorized: containers stopped, secrets restored, safety backup trustworthy."
+
         # Note: Services are now guaranteed to be stopped before volume operations
         - name: Get list of volume backups
           find:
@@ -673,6 +840,65 @@
           fail:
             msg: "No volume backups found in {{ selected_backup_dir }}/volumes"
           when: volume_names | length == 0
+
+        # Verify-before-destroy of the restore SOURCE (mirror of restore_master M1 +
+        # content-manifest): the gate above proved the SAFETY net; this proves the
+        # backup we are about to restore FROM is present and intact BEFORE any
+        # `podman volume rm`. A missing/torn data/ was previously only discovered in
+        # "Restore volume data", after the live volumes had already been destroyed.
+        # A refusal here is caught by the block rescue (records "volumes removed: NO").
+        - name: Verify each backup volume has restorable data before destroying live volumes
+          stat:
+            path: "{{ selected_backup_dir }}/volumes/{{ item }}/data"
+          loop: "{{ volume_names }}"
+          register: rollback_volume_data_stats
+
+        - name: Fail if any backup volume is missing its data directory
+          assert:
+            that:
+              - item.stat.exists
+              - item.stat.isdir | default(false)
+            fail_msg: >-
+              Refusing to remove/recreate volumes: backup is missing data for volume
+              '{{ item.item }}' at {{ selected_backup_dir }}/volumes/{{ item.item }}/data.
+              Restoring would leave '{{ item.item }}' empty. Verify backup integrity first.
+          loop: "{{ rollback_volume_data_stats.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: Verify each backup volume matches its content manifest before destroying live volumes
+          shell: |
+            set -euo pipefail
+            MDIR="{{ selected_backup_dir }}/volumes/{{ item }}"
+            MANIFEST="$MDIR/content_manifest.txt"
+            DATA="$MDIR/data"
+            if [ ! -f "$MANIFEST" ]; then
+              echo "ERROR: content manifest missing for volume '{{ item }}' at $MANIFEST." >&2
+              echo "Backup predates integrity manifests or is corrupt; refusing destructive restore of '{{ item }}'." >&2
+              exit 3
+            fi
+            if [ ! -d "$DATA" ]; then
+              echo "ERROR: backup data dir missing for volume '{{ item }}' at $DATA." >&2
+              exit 3
+            fi
+            exp_fc=$(grep '^file_count=' "$MANIFEST" | head -n1 | cut -d= -f2)
+            exp_tb=$(grep '^total_bytes=' "$MANIFEST" | head -n1 | cut -d= -f2)
+            exp_sha=$(grep '^listing_sha256=' "$MANIFEST" | head -n1 | cut -d= -f2)
+            act_fc=$(cd "$DATA" && find . -type f | wc -l | tr -d ' ')
+            act_tb=$(cd "$DATA" && find . -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')
+            act_sha=$(cd "$DATA" && find . -type f -printf '%P\t%s\n' | LC_ALL=C sort | sha256sum | awk '{print $1}')
+            if [ "$exp_fc" != "$act_fc" ] || [ "$exp_tb" != "$act_tb" ] || [ "$exp_sha" != "$act_sha" ]; then
+              echo "ERROR: backup integrity mismatch for volume '{{ item }}' -- refusing destructive restore." >&2
+              echo "  expected: files=$exp_fc bytes=$exp_tb sha=$exp_sha" >&2
+              echo "  actual:   files=$act_fc bytes=$act_tb sha=$act_sha" >&2
+              exit 4
+            fi
+            echo "Volume '{{ item }}' content integrity OK: files=$act_fc bytes=$act_tb"
+          args:
+            executable: /bin/bash
+          loop: "{{ volume_names }}"
+          register: rollback_volume_manifest_check
+          changed_when: false
 
         - name: Remove existing volumes
           shell: |
@@ -704,7 +930,14 @@
           shell: |
             VOLUME_PATH=$({{ podman_cmd }} volume inspect "{{ item.item }}" --format "{{ '{{' }}.Mountpoint{{ '}}' }}")
             BACKUP_DIR="{{ selected_backup_dir }}/volumes/{{ item.item }}/data"
-            
+
+            # Fail-closed: an empty/unresolved mountpoint would make the copy target "/"
+            # (cp -a "$BACKUP_DIR/." "/") -- catastrophic. Require a real directory.
+            if [ -z "$VOLUME_PATH" ] || [ ! -d "$VOLUME_PATH" ]; then
+              echo "Failed to resolve mountpoint for volume {{ item.item }} (got '$VOLUME_PATH'); refusing restore"
+              exit 1
+            fi
+
             if [ -d "$BACKUP_DIR" ]; then
               # Copy the backup data to the volume
               {{ cp_preserve_cmd }} "$BACKUP_DIR/." "$VOLUME_PATH/"
@@ -830,14 +1063,52 @@
               Safety backup: SKIPPED by user choice
               {% endif %}
               Rollback source: {{ selected_backup_dir }}
-              Status: IN PROGRESS
+              Status: INCOMPLETE (in progress or INTERRUPTED -- only a completed run overwrites this file with a terminal status)
               Stage: POST_VOLUME_RESTORE
               Volumes restored: {{ volume_names | join(', ') }}
               Failed volumes: {{ failed_volumes | join(', ') if failed_volumes | length > 0 else 'None' }}
               Volumes always treated as successful: {{ expected_empty_volumes | join(', ') }}
-        
+
+      rescue:
+        # Interrupted-recovery disposition (fail-closed): a failure anywhere in the
+        # destructive volume block (including the authorization gate above) must never
+        # leave a false IN-PROGRESS/success. Record a terminal FAILED/INTERRUPTED
+        # status -- naming the failed task and whether live volumes were already
+        # removed so the operator knows the blast radius -- then re-raise so the run
+        # exits non-zero. (Ctrl-C / SIGKILL / host crash cannot run a rescue; the
+        # pessimistic INCOMPLETE default on the interim status writes covers those.)
+        - name: Record interrupted/failed rollback status (fail-closed durability)
+          copy:
+            dest: "/tmp/lme_rollback_{{ safety_backup_timestamp }}.status"
+            content: |
+              Rollback FAILED/INTERRUPTED: {{ ansible_date_time.iso8601 }}
+              {% if backup_choice in ['y', 'yes'] %}
+              Safety backup created at: {{ backup_base_dir }}/backups/{{ safety_backup_timestamp }}
+              {% else %}
+              Safety backup: SKIPPED by user choice
+              {% endif %}
+              Rollback source: {{ selected_backup_dir }}
+              Status: FAILED/INTERRUPTED during volume restore
+              Failed task: {{ ansible_failed_task.name | default('unknown') }}
+              Error: {{ ansible_failed_result.msg | default('see play output above') }}
+              Live volumes already removed: {{ 'YES' if (volume_remove_result is defined and volume_remove_result is not skipped) else 'NO' }}
+              {% if volume_remove_result is defined and volume_remove_result is not skipped %}
+              WARNING: podman volumes were removed/recreated but the data restore did not complete.
+              Do NOT start the LME service until each volume is restored from:
+                {{ selected_backup_dir }}/volumes/<name>/data
+              {% else %}
+              Live volumes were NOT reached; existing volume data is intact.
+              {% endif %}
+          become: yes
+        - name: Re-raise rollback failure after recording status
+          fail:
+            msg: >-
+              Rollback failed during volume restore
+              (task: {{ ansible_failed_task.name | default('unknown') }}).
+              A FAILED/INTERRUPTED status was written to
+              /tmp/lme_rollback_{{ safety_backup_timestamp }}.status; review it before retrying.
       when: volume_backup_dir.stat is defined and volume_backup_dir.stat.exists
-      
+
     - name: Start LME service
       systemd:
         name: lme
@@ -947,8 +1218,8 @@
       
     - name: Collect rollback results
       set_fact:
-        install_status: "{{ 'Success' if backup_stat.stat.exists else 'Failed' }}"
-        volumes_status: "{{ 'Success' if volume_restore_result is success else 'Failed' }}"
+        install_status: "{{ 'Skipped' if restore_result is skipped else ('Success' if restore_result is success else 'Failed') }}"
+        volumes_status: "{{ 'Skipped' if (volume_restore_result is not defined or volume_restore_result is skipped) else ('Success' if volume_restore_result is success else 'Failed') }}"
         containers_running_status: "{{ 'Success' if containers_status.rc == 0 else 'Partial' }}"
       
     - name: Update rollback status file
@@ -973,18 +1244,18 @@
           - Vault files: {{ 'Success' if restore_result is success else 'Failed' }}
           - Systemd files: {{ 'Success' if restore_result is success else 'Failed' }}
           - Secrets restoration: {{ 'Success' if secrets_restore_result is success else 'Failed' }}
-          - Containers pull/tag: {{ 'Success' if (pull_result is defined and pull_result is success) and (tag_result is defined and tag_result is success) else ('Skipped' if not containers_file.stat.exists else 'Partial - Some errors occurred') }}
+          - Containers pull/tag: {{ 'Skipped' if (not containers_file.stat.exists or pull_result is skipped) else ('Success' if (pull_result is success and tag_result is success) else 'Partial - Some errors occurred') }}
           - Volumes: {{ volumes_status }}
           - Containers running: {{ containers_running_status }}
           
-          Overall status: {{ 'SUCCESS' if install_status == 'Success' and containers_running_status == 'Success' and service_start_result is success else 'PARTIAL - See details above' }}
+          Overall status: {{ 'SUCCESS' if install_status == 'Success' and containers_running_status == 'Success' and service_start_result is success and secrets_restore_result is not failed else 'PARTIAL - See details above' }}
           
           Recovery instructions:
           {% if backup_choice in ['n', 'no'] %}
           Note: No safety backup was created during this rollback.
           If the rollback fails, you will need to restore from an existing backup or reinstall LME.
           {% endif %}
-          {% if install_status != 'Success' %}
+          {% if install_status == 'Failed' %}
           If the rollback failed during installation:
           1. Stop the LME service: systemctl stop lme
           2. Remove the failed installation: rm -rf {{ lme_install_dir }}
@@ -1004,7 +1275,7 @@
           3. Restore from an existing backup or reinstall LME
           {% endif %}
           4. Start the service: systemctl start lme
-          {% elif volumes_status != 'Success' %}
+          {% elif volumes_status == 'Failed' %}
           If the rollback failed during volume restoration:
           1. Stop the LME service: systemctl stop lme
           2. For each volume:
@@ -1049,11 +1320,11 @@
           - Vault files: {{ 'Success' if restore_result is success else 'Failed' }}
           - Systemd files: {{ 'Success' if restore_result is success else 'Failed' }}
           - Secrets restoration: {{ 'Success' if secrets_restore_result is success else 'Failed' }}
-          - Containers pull/tag: {{ 'Success' if (pull_result is defined and pull_result is success) and (tag_result is defined and tag_result is success) else ('Skipped' if not containers_file.stat.exists else 'Partial - Some errors occurred') }}
+          - Containers pull/tag: {{ 'Skipped' if (not containers_file.stat.exists or pull_result is skipped) else ('Success' if (pull_result is success and tag_result is success) else 'Partial - Some errors occurred') }}
           - Volumes: {{ volumes_status }}
           - Containers running: {{ containers_running_status }}
           
-          Overall status: {{ 'SUCCESS' if install_status == 'Success' and containers_running_status == 'Success' and service_start_result is success else 'PARTIAL - See details above' }}
+          Overall status: {{ 'SUCCESS' if install_status == 'Success' and containers_running_status == 'Success' and service_start_result is success and secrets_restore_result is not failed else 'PARTIAL - See details above' }}
           
           A detailed status report has been saved to: /tmp/lme_rollback_{{ safety_backup_timestamp }}.status
 

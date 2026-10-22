@@ -1,0 +1,400 @@
+---
+# testing/e2e/guest/tasks/lease.yml -- the ONE owned guest-lifecycle lease of this storage root, as NUMBERED EPOCHS
+# (codex GUEST-LIFECYCLE-SERIALIZATION + GUEST-LEASE-SUCCESSOR + tick331 GUEST-DELAYED-HOLDER-FENCE /
+# GUEST-LEASE-RECORDED-TERM / GUEST-LEASE-RELEASE-CUSTODY). Every MUTATING mode holds it across ALL of its mutation
+# boundaries: provision (claim, staged reconciliation, same-generation recovery) and retire. Read-only paths (verify; a
+# completed retirement) never take it.
+#   _g_lease_op        acquire | check | release | failed
+#   _g_lease_ops       (check) number of declared operations up to the NEXT boundary (default 1); the boundary admits them
+#                      only with ops x g_op_budget_s (+ margin) of the RECORDED term left
+#   _g_lease_need_s    (check) explicit seconds instead of _g_lease_ops (S8: boot + key waits + the S9 write)
+# SCOPE: per storage root, not per run_id (capacity, MemAvailable and forward_port are shared by every run_id there).
+# EPOCHS: <storage_root>/<epoch_prefix><N>. An epoch is PUBLISHED COMPLETE: built as this invocation's own staging dir
+# <stage_prefix><nonce> holding holder.json (schema, epoch, nonce, acquired_epoch, ttl_s, term_end_epoch, ...) and the
+# live token dir <live_dir>, then renamed onto <epoch_prefix><N+1> by ONE `mv -T -n` (renameat2 RENAME_NOREPLACE; a
+# published epoch is never empty) under the storage-root lock. Two acquirers/breakers that observed the same N race on
+# that ONE rename: exactly one lands, the other refuses GUEST-LEASE-HELD (its staging is preserved as evidence).
+# TERM (codex GUEST-LEASE-RECORDED-TERM): an incumbent is judged ONLY against its RECORDED, immutable term_end_epoch
+# (tasks/lease_epoch.yml), never against the contender's configured ttl_s: changing ttl_s never breaks a valid term. An
+# epoch without an admitted holder (foreign, legacy, another lease schema) has no recorded term: it is never broken,
+# only preserved (GUEST-LEASE-HELD names it).
+# HOST-SIDE FENCE (codex GUEST-DELAYED-HOLDER-FENCE): the storage-root DIRECTORY is the lock (flock on its fd; nothing
+# is created for it). Every target mutation COMMAND of the holder runs as
+#   flock --exclusive --wait <lock_wait_s> --conflict-exit-code <busy_rc> <storage_root>
+#     env --chdir=<epoch N>/<live_dir>  timeout --kill-after=<kill_after_s>s <step_s>s  <command>
+# (g_step_argv, bound below). flock (no -o) keeps the locked descriptor in its child, so the lock is held through the
+# WHOLE command even if the flock parent dies; env refuses to exec unless THIS epoch's live token still exists at the
+# moment the command starts on the host. A successor REVOKES the predecessor's live token (the ONE write into another
+# invocation's epoch: `mv -T -n <N>/live <N>/<revoked_prefix><successor nonce>` under the SAME lock) before it can
+# publish N+1, so a holder paused anywhere -- before launch, between commands, or in the controller -- can never mutate
+# after a successor exists: its next command fails at env (typed GUEST-LEASE-LOST by the caller's rescue, op=failed),
+# and a command already running holds the lock, so the revocation waits for it (bounded by lock_wait_s; else the
+# successor refuses GUEST-LEASE-HELD). Holder files, released markers and epoch dirs are never renamed or removed.
+# MODULE WRITES (copy/template/file) cannot run under flock: every one of them writes ONLY an epoch-named partial
+# (<file><layout.epoch_partial_infix><N>) or this invocation's own staging, which only a FENCED rename publishes; a
+# delayed module write therefore never lands on shared state after revocation.
+# BUDGET: one declared operation = g_op_budget_s = lock_wait_s + step_s + kill_after_s (a command's worst case; a
+# module write's task timeout is step_s). A boundary admits _g_lease_ops operations only when
+# now + ops x g_op_budget_s + margin_s <= the RECORDED term_end_epoch.
+# RELEASE (codex GUEST-LEASE-RECORDED-TERM): only after QUIESCENCE is established -- the holder revokes its OWN live
+# token under the lock (so no fenced command of this epoch runs or can start) and reads that back -- and never when the
+# caller reports a failed MODULE write (_g_lease_preserve: that remote module may still be writing its partial): then
+# the epoch is PRESERVED held and reported (recovery = its recorded term expiry + operator break token). The marker is
+# read back through tasks/lease_epoch.yml (the same admission a successor applies).
+# CLOCK: the HYPERVISOR's (setup date_time), never a controller's.
+# RESIDUALS (declared): a fully SIGSTOPped fenced command tree holds the lock forever (fails safe: successors refuse
+# GUEST-LEASE-HELD, the holder's later boundaries refuse); flock semantics require a local filesystem under the storage
+# root; flock's busy code (busy_rc) could collide with a wrapped command's own exit status 75.
+
+- name: LEASE -- read the hypervisor clock (date_time facts only; read-only)
+  ansible.builtin.setup:
+    gather_subset: ['!all', '!min', 'date_time']
+
+- name: LEASE -- bind the host clock (derived)
+  ansible.builtin.set_fact:
+    _g_now: "{{ ansible_facts.date_time.epoch | int }}"
+
+# ---- ACQUIRE
+- name: LEASE acquire
+  when: _g_lease_op == 'acquire'
+  block:
+    - name: Draw this invocation's lease nonce from the kernel (read-only)
+      ansible.builtin.slurp:
+        src: "{{ gd.uuid_source }}"
+      register: _g_lnonce
+
+    - name: Bind the nonce and this invocation's staging path (derived)
+      ansible.builtin.set_fact:
+        _g_lnonce_v: "{{ (_g_lnonce.content | b64decode).strip() }}"
+        _g_lstage: "{{ gg.storage_root }}/{{ gd.lease.stage_prefix }}{{ (_g_lnonce.content | b64decode).strip() }}"
+
+    - name: List the lease epochs (read-only)
+      ansible.builtin.find:
+        paths: ["{{ gg.storage_root }}"]
+        patterns: ["^{{ gd.lease.epoch_prefix | regex_escape }}[0-9]+$"]
+        use_regex: true
+        hidden: true
+        file_type: any
+        recurse: false
+      register: _g_lep_a
+
+    - name: Bind the highest epoch (derived; integer order, never lexicographic)
+      ansible.builtin.set_fact:
+        _g_lold_n: "{{ (_g_lep_a.files | map(attribute='path') | map('basename') | map('regex_replace', '^' ~ (gd.lease.epoch_prefix | regex_escape), '') | map('int') | list + [0]) | max }}"
+
+    - name: Refuse an epoch entry that is a link, not a directory or not owned (preserved as found)
+      ansible.builtin.assert:
+        that:
+          - _g_lep_a.files | selectattr('islnk') | list | length == 0
+          - _g_lep_a.files | rejectattr('isdir') | list | length == 0
+          - _g_lep_a.files | map(attribute='uid') | reject('equalto', g_owner_uid | int) | list | length == 0
+        fail_msg: "REFUSED {{ gd.refusals.storage }} on {{ inventory_hostname }}: a lease epoch under {{ gg.storage_root }} is a link, not a directory or not owned (preserved)."
+        quiet: true
+
+    - name: Admit the highest epoch (holder, recorded term, release custody; read-only)
+      when: _g_lold_n | int > 0
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease_epoch.yml"
+      vars:
+        _g_le_n: "{{ _g_lold_n | int }}"
+
+    - name: Bind the predecessor (derived; none when there is no epoch yet)
+      ansible.builtin.set_fact:
+        _g_lold: "{{ _g_le if (_g_lold_n | int > 0) else {'n': 0, 'holder_ok': false, 'holder': {}, 'term_end': none, 'live': false, 'live_absent': true, 'revoked_self': false, 'released_present': false, 'released_ok': false} }}"
+
+    # codex tick339-340 OWNERSHIP-PROVEN RECOVERY (tasks/lease_recover.yml): only on the explicit declared token; proves
+    # this storage root + run_id own the blocking entry, records the observation BEFORE any change, refuses and
+    # preserves on any ambiguity; never age-only, never a deletion.
+    - name: Recover an ownership-proven blocking entry (explicit token only; evidence first; else typed refusal)
+      when: (lookup('ansible.builtin.vars', gd.lease.recover_var, default='') | string | length) > 0
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease_recover.yml"
+
+    - name: Report lost stagings and the recovery token form for any blocking entry (read-only)
+      ansible.builtin.debug:
+        msg: >-
+          {% if (_g_lold_n | int) > 0 and not (_g_lold.holder_ok | bool) and not (_g_lold.released_ok | bool) %}BLOCKING
+          epoch {{ gd.lease.epoch_prefix }}{{ _g_lold_n }} has no admitted holder; ownership-proven recovery token:
+          -e {{ gd.lease.recover_var }}={{ gd.lease.epoch_prefix }}{{ _g_lold_n }}:{{ _g_lold.dir.dev }}:{{ _g_lold.dir.inode }}.
+          {% endif %}Lost stagings are preserved (never adopted); each is recoverable only by its own
+          -e {{ gd.lease.recover_var }}=<name>:<dev>:<inode>.
+
+    # codex GUEST-LEASE-RECORDED-TERM: the RECORDED term, never gd.lease.ttl_s; codex GUEST-LEASE-RELEASE-CUSTODY: only an
+    # ADMITTED release (lease_epoch.yml released_ok) counts as released.
+    - name: Refuse a held epoch (not admitted-released; unexpired by its RECORDED term, or expired without the operator break)
+      ansible.builtin.assert:
+        that:
+          - >-
+            (_g_lold.n | int == 0) or (_g_lold.released_ok | bool)
+            or ((_g_lold.holder_ok | bool) and (_g_now | int) >= (_g_lold.term_end | int)
+                and lookup('ansible.builtin.vars', gd.lease.break_var, default='') == _g_lold.holder.nonce)
+            or ((not (_g_lold.holder_ok | bool)) and (_g_lrec.epoch_ok | default(false) | bool))
+        fail_msg: >-
+          REFUSED {{ gd.refusals.lease_held }} on {{ inventory_hostname }}: lease epoch {{ _g_lold.n }} is held
+          {%- if not (_g_lold.holder_ok | bool) %} and carries NO admitted holder (foreign, legacy or another lease schema;
+          no recorded term): it is never broken by age; it is preserved, and recoverable ONLY by the ownership-proven
+          recovery -e {{ gd.lease.recover_var }}={{ gd.lease.epoch_prefix }}{{ _g_lold.n }}:{{ _g_lold.dir.dev | default('?') }}:{{ _g_lold.dir.inode | default('?') }}
+          (tasks/lease_recover.yml: refuses unless this storage root and run own it){% else %} by {{ _g_lold.holder.mode }}
+          of run {{ _g_lold.holder.run_id }} (nonce {{ _g_lold.holder.nonce }}) under its RECORDED term, ending host epoch
+          {{ _g_lold.term_end }} (now {{ _g_now }}); released marker present {{ _g_lold.released_present }} but not admitted
+          as a release unless it binds that holder and its live token was revoked by it. Only after the recorded term
+          ended, and only when the holder is confirmed gone, re-run with -e {{ gd.lease.break_var }}={{ _g_lold.holder.nonce }}{% endif %}.
+          Nothing changed.
+        quiet: true
+
+    - name: USE BOUNDARY -- admit this invocation's staging ancestry before creating it (route rule)
+      ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+      vars:
+        rh_anc_bs: "{{ rh.controller.bootstrap }}"
+        rh_anc_repo_root: "{{ rh_repo_root }}"
+        rh_anc_path: "{{ _g_lstage }}"
+        rh_anc_refusal: "{{ gd.refusals.storage }}"
+
+    - name: Create this invocation's epoch staging (own nonce-named dir; never an epoch name)
+      ansible.builtin.command:
+        argv: "{{ g_timeout_argv + [gt.mkdir, '-m', gd.layout.dir_mode, '--', _g_lstage] }}"
+
+    - name: Write the holder (with its RECORDED term) into the staging (never overwrites; own staging only)
+      ansible.builtin.copy:
+        content: >-
+          {{ {'schema': gd.lease.schema, 'epoch': (_g_lold.n | int) + 1, 'nonce': _g_lnonce_v,
+              'mode': lookup('ansible.builtin.vars', gd.modes.var), 'run_id': gg.run_id, 'hypervisor': inventory_hostname,
+              'owner_uid': g_owner_uid | int, 'acquired_epoch': _g_now | int, 'ttl_s': gd.lease.ttl_s,
+              'term_end_epoch': (_g_now | int) + gd.lease.ttl_s,
+              'broke': ({'epoch': _g_lold.n | int, 'nonce': _g_lold.holder.nonce | default(none)}
+                        if ((_g_lold.n | int) > 0 and not (_g_lold.released_ok | bool)) else none),
+              'recovered': ((_g_lrec.recovered | default(none)) if (_g_lrec.epoch_ok | default(false) | bool) else none)}
+             | to_nice_json(sort_keys=True) }}
+        dest: "{{ _g_lstage }}/{{ gd.lease.holder_file }}"
+        mode: "{{ gd.layout.file_mode }}"
+        force: false
+      timeout: "{{ gd.lease.step_s }}"
+
+    - name: Create the live token inside the staging (published together with the holder, never separately)
+      ansible.builtin.command:
+        argv: "{{ g_timeout_argv + [gt.mkdir, '-m', gd.layout.dir_mode, '--', _g_lstage ~ '/' ~ gd.lease.live_dir] }}"
+
+    # codex GUEST-DELAYED-HOLDER-FENCE: revoke the predecessor under the lock BEFORE publishing (an in-flight fenced
+    # command of the predecessor holds the lock; the revocation waits for it, bounded). Two breakers: the second finds
+    # the token already gone (mv fails; failed_when false) and the read-back below decides.
+    - name: Revoke the predecessor's live token under the storage-root lock (the ONE write into another epoch)
+      when: (_g_lold.n | int) > 0 and (_g_lold.live | bool)
+      ansible.builtin.command:
+        argv: >-
+          {{ g_lock_argv + [gt.mv, '-T', '-n', '--',
+             gp.lease_prefix ~ _g_lold.n ~ '/' ~ gd.lease.live_dir,
+             gp.lease_prefix ~ _g_lold.n ~ '/' ~ gd.lease.revoked_prefix ~ _g_lnonce_v] }}
+      failed_when: false
+      register: _g_lrev
+
+    - name: Read the predecessor's live token back (no link followed; read-only)
+      when: (_g_lold.n | int) > 0
+      ansible.builtin.stat:
+        path: "{{ gp.lease_prefix }}{{ _g_lold.n }}/{{ gd.lease.live_dir }}"
+        follow: false
+        get_checksum: false
+      register: _g_lrev_st
+
+    - name: Refuse while the predecessor is not revoked (a fenced command of it still holds the lock; nothing published)
+      when: (_g_lold.n | int) > 0
+      ansible.builtin.assert:
+        that:
+          - not _g_lrev_st.stat.exists
+        fail_msg: >-
+          REFUSED {{ gd.refusals.lease_held }} on {{ inventory_hostname }}: epoch {{ _g_lold.n }}'s live token could not be
+          revoked within {{ gd.lease.lock_wait_s }} s (rc {{ _g_lrev.rc | default('skipped') }}; {{ gd.lease.busy_rc }} =
+          lock busy: a fenced command of that epoch is still running). Nothing published; {{ _g_lstage }} is preserved.
+        quiet: true
+
+    - name: Publish the staging as the NEXT epoch under the storage-root lock (ONE no-replace rename; the fencing point)
+      ansible.builtin.command:
+        argv: "{{ g_lock_argv + [gt.mv, '-T', '-n', '--', _g_lstage, gp.lease_prefix ~ ((_g_lold.n | int) + 1)] }}"
+      failed_when: false
+      register: _g_lpub
+
+    - name: Stat the staging after the publish (landed iff it is gone; read-only)
+      ansible.builtin.stat:
+        path: "{{ _g_lstage }}"
+        follow: false
+        get_checksum: false
+      register: _g_lpub_src
+
+    - name: Admit the published epoch through the ONE epoch admission (read-only)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease_epoch.yml"
+      vars:
+        _g_le_n: "{{ (_g_lold.n | int) + 1 }}"
+
+    - name: Refuse a lost publication (another invocation published this epoch first; own staging preserved)
+      ansible.builtin.assert:
+        that:
+          - not _g_lpub_src.stat.exists
+          - _g_le.holder_ok | bool and _g_le.holder.nonce == _g_lnonce_v
+          - _g_le.live | bool and not (_g_le.released_present | bool)
+        fail_msg: >-
+          REFUSED {{ gd.refusals.lease_held }} on {{ inventory_hostname }}: epoch {{ (_g_lold.n | int) + 1 }} was published by
+          another invocation first (a concurrent acquirer or breaker; rc {{ _g_lpub.rc }}), or does not read back as this
+          invocation's holder with its live token. Nothing else changed; {{ _g_lstage }} is preserved as found.
+        quiet: true
+
+    - name: Bind the held epoch and its FENCED step prefix (derived outputs; the fencing token every mutation carries)
+      ansible.builtin.set_fact:
+        g_lease_nonce: "{{ _g_lnonce_v }}"
+        g_lease_epoch: "{{ (_g_lold.n | int) + 1 }}"
+        g_step_argv: >-
+          {{ [gt.flock, '--exclusive', '--wait', gd.lease.lock_wait_s | string, '--conflict-exit-code',
+              gd.lease.busy_rc | string, gg.storage_root,
+              gt.env, '--chdir=' ~ gp.lease_prefix ~ ((_g_lold.n | int) + 1) ~ '/' ~ gd.lease.live_dir]
+             + g_timeout_argv }}
+
+# ---- FENCE (every check, and release): re-admit THIS invocation's own epoch and the highest epoch
+- name: LEASE fence -- list the lease epochs again (read-only)
+  when: _g_lease_op in ['check', 'release'] and (g_lease_nonce | default(none)) is not none
+  ansible.builtin.find:
+    paths: ["{{ gg.storage_root }}"]
+    patterns: ["^{{ gd.lease.epoch_prefix | regex_escape }}[0-9]+$"]
+    use_regex: true
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _g_lep_f
+
+- name: LEASE fence -- admit this invocation's own epoch (read-only)
+  when: _g_lease_op in ['check', 'release'] and (g_lease_nonce | default(none)) is not none
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease_epoch.yml"
+  vars:
+    _g_le_n: "{{ g_lease_epoch | int }}"
+
+- name: LEASE fence -- bind the highest epoch (derived)
+  when: _g_lease_op in ['check', 'release'] and (g_lease_nonce | default(none)) is not none
+  ansible.builtin.set_fact:
+    _g_lmax: "{{ (_g_lep_f.files | map(attribute='path') | map('basename') | map('regex_replace', '^' ~ (gd.lease.epoch_prefix | regex_escape), '') | map('int') | list + [0]) | max }}"
+
+- name: LEASE check -- refuse a superseded, foreign, revoked, released or nearly expired epoch before the next operations
+  when: _g_lease_op == 'check'
+  vars:
+    _g_lneed: "{{ (_g_lease_need_s | int) if (_g_lease_need_s is defined) else ((_g_lease_ops | default(1) | int) * (g_op_budget_s | int)) }}"
+  ansible.builtin.assert:
+    that:
+      - (g_lease_nonce | default(none)) is not none
+      - _g_lmax | int == g_lease_epoch | int
+      - _g_le.holder_ok | bool and _g_le.holder.nonce == g_lease_nonce
+      - _g_le.live | bool
+      - not (_g_le.released_present | bool)
+      - (_g_now | int) + (_g_lneed | int) + gd.lease.margin_s <= (_g_le.term_end | int)
+    fail_msg: >-
+      REFUSED {{ gd.refusals.lease_lost }} on {{ inventory_hostname }}: epoch {{ g_lease_epoch | default('none') }} is not
+      this invocation's current lease (highest epoch {{ _g_lmax | default('?') }}), its live token was revoked, it is
+      released, or its RECORDED term (ends {{ _g_le.term_end | default('?') }}, now {{ _g_now }}) leaves less than the next
+      {{ _g_lneed }} s + {{ gd.lease.margin_s }} s. The state is left as-is; a later provision/retire re-decides it under
+      its own epoch.
+    quiet: true
+
+# ---- RELEASE (quiescence first; preserved held when the caller reports a failed module write)
+- name: LEASE release -- report an epoch preserved HELD (a failed module write of this invocation may still be writing)
+  when:
+    - _g_lease_op == 'release' and (g_lease_nonce | default(none)) is not none
+    - _g_lease_preserve | default(false) | bool
+  ansible.builtin.debug:
+    msg: >-
+      PRESERVED-HELD lease epoch {{ g_lease_epoch }} on {{ inventory_hostname }}: a module write of this invocation
+      failed ({{ ansible_failed_task.name | default('?') }}) and its remote module may still be writing its epoch
+      partial, so the epoch is NOT released. It stays held until its recorded term ends ({{ _g_le.term_end | default('?') }});
+      then -e {{ gd.lease.break_var }}={{ g_lease_nonce }} once the writer is confirmed gone.
+
+- name: LEASE release -- revoke this invocation's OWN live token under the lock (quiescence; no fenced command runs or starts)
+  when:
+    - _g_lease_op == 'release' and (g_lease_nonce | default(none)) is not none
+    - not (_g_lease_preserve | default(false) | bool)
+    - _g_le.holder_ok | bool and _g_le.holder.nonce == g_lease_nonce and _g_le.live | bool
+  ansible.builtin.command:
+    argv: >-
+      {{ g_lock_argv + [gt.mv, '-T', '-n', '--',
+         gp.lease_prefix ~ g_lease_epoch ~ '/' ~ gd.lease.live_dir,
+         gp.lease_prefix ~ g_lease_epoch ~ '/' ~ gd.lease.revoked_prefix ~ g_lease_nonce] }}
+  failed_when: false
+  register: _g_lrel_rev
+
+- name: LEASE release -- re-admit the own epoch after the self-revocation (read-only)
+  when:
+    - _g_lease_op == 'release' and (g_lease_nonce | default(none)) is not none
+    - not (_g_lease_preserve | default(false) | bool)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease_epoch.yml"
+  vars:
+    _g_le_n: "{{ g_lease_epoch | int }}"
+
+- name: LEASE release -- report an epoch preserved HELD when quiescence is not established (never released blind)
+  when:
+    - _g_lease_op == 'release' and (g_lease_nonce | default(none)) is not none
+    - not (_g_lease_preserve | default(false) | bool)
+    - not (_g_le.holder_ok | bool and _g_le.holder.nonce == g_lease_nonce and _g_le.live_absent | bool and _g_le.revoked_self | bool)
+  ansible.builtin.debug:
+    msg: >-
+      PRESERVED-HELD lease epoch {{ g_lease_epoch }} on {{ inventory_hostname }}: its live token was not revoked by this
+      holder (rc {{ _g_lrel_rev.rc | default('skipped') }}; {{ gd.lease.busy_rc }} = lock busy) or the epoch is no longer
+      this holder's; nothing is released. Recovery: recorded term expiry + -e {{ gd.lease.break_var }}={{ g_lease_nonce }}.
+
+- name: LEASE release -- write the released marker into ONLY this invocation's own quiesced epoch (never overwrites)
+  when:
+    - _g_lease_op == 'release' and (g_lease_nonce | default(none)) is not none
+    - not (_g_lease_preserve | default(false) | bool)
+    - _g_le.holder_ok | bool and _g_le.holder.nonce == g_lease_nonce and _g_le.live_absent | bool and _g_le.revoked_self | bool
+    - not (_g_le.released_present | bool)
+  ansible.builtin.copy:
+    content: "{{ {'schema': gd.lease.schema, 'epoch': g_lease_epoch | int, 'nonce': g_lease_nonce, 'released_epoch': _g_now | int} | to_nice_json(sort_keys=True) }}\n"
+    dest: "{{ gp.lease_prefix }}{{ g_lease_epoch }}/{{ gd.lease.released_file }}"
+    mode: "{{ gd.layout.file_mode }}"
+    force: false
+  timeout: "{{ gd.lease.step_s }}"
+  register: _g_lrel_w
+
+- name: LEASE release -- read the release back through the ONE epoch admission (the successor's view; read-only)
+  when:
+    - _g_lease_op == 'release' and (g_lease_nonce | default(none)) is not none
+    - _g_lrel_w is defined and _g_lrel_w is not skipped
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/lease_epoch.yml"
+  vars:
+    _g_le_n: "{{ g_lease_epoch | int }}"
+
+- name: LEASE release -- refuse a release that does not read back as an ADMITTED release of this holder
+  when:
+    - _g_lease_op == 'release' and (g_lease_nonce | default(none)) is not none
+    - _g_lrel_w is defined and _g_lrel_w is not skipped
+  ansible.builtin.assert:
+    that:
+      - _g_le.released_ok | bool and _g_le.holder.nonce == g_lease_nonce
+    fail_msg: >-
+      REFUSED {{ gd.refusals.lease_lost }} on {{ inventory_hostname }}: the released marker of epoch {{ g_lease_epoch }}
+      does not read back as this holder's admitted release; the epoch is preserved as found (a successor treats it as
+      held until its recorded term ends).
+    quiet: true
+
+- name: LEASE release -- forget the epoch (derived)
+  when: _g_lease_op == 'release'
+  ansible.builtin.set_fact:
+    g_lease_nonce: "{{ none }}"
+
+# ---- FAILED (the callers' rescue): classify, decide preservation, re-raise -- NEVER swallows the failure
+- name: LEASE failed -- observe this invocation's live token after the failure (read-only)
+  when: _g_lease_op == 'failed' and (g_lease_nonce | default(none)) is not none
+  ansible.builtin.stat:
+    path: "{{ gp.lease_prefix }}{{ g_lease_epoch }}/{{ gd.lease.live_dir }}"
+    follow: false
+    get_checksum: false
+  register: _g_lfail_live
+
+- name: LEASE failed -- bind whether the failed task was a MODULE write (preserve the epoch held; derived)
+  when: _g_lease_op == 'failed'
+  ansible.builtin.set_fact:
+    g_lease_preserve: >-
+      {{ ((ansible_failed_task.action | default('')) | regex_replace('^ansible\.(builtin|legacy)\.', ''))
+         in ['copy', 'template', 'file'] }}
+
+- name: LEASE failed -- re-raise the failure (typed when the host-side fence stopped it)
+  when: _g_lease_op == 'failed'
+  ansible.builtin.fail:
+    msg: >-
+      {% if (ansible_failed_result.rc | default(none)) == gd.lease.busy_rc %}REFUSED {{ gd.refusals.lease_lost }} on
+      {{ inventory_hostname }}: the storage-root lock stayed busy for {{ gd.lease.lock_wait_s }} s at
+      "{{ ansible_failed_task.name | default('?') }}"; nothing was executed by that step; state left as-is.
+      {%- elif (_g_lfail_live.stat is defined) and not (_g_lfail_live.stat.exists | default(false)) %}REFUSED
+      {{ gd.refusals.lease_lost }} on {{ inventory_hostname }}: epoch {{ g_lease_epoch }}'s live token is gone (revoked by
+      a successor) -- the host-side fence refused "{{ ansible_failed_task.name | default('?') }}"; state left as-is.
+      {%- else %}{{ ansible_failed_result.msg | default('failed: ' ~ (ansible_failed_task.name | default('?'))) }}{% endif %}

@@ -1,0 +1,46 @@
+---
+id: otel-collector
+name: lme-otel-collector
+kind: container
+enabled_when: [install_otel]
+# This is an OTLP gateway. The native telemetry_sources role owns host sampling;
+# the gateway never mounts host journals, /proc or container storage.
+image: otel-collector
+description: LME OTLP gateway
+network: lme
+dependencies:
+  # setup-certs is required at start (the CA bundle is mounted below). elasticsearch is an
+  # `after` only, not a hard require: the exporter's persistent sending_queue redelivers items
+  # ALREADY ENQUEUED once ES recovers. Data still in the in-memory batch processor ahead of the
+  # queue is not yet durable (acked to the receiver before export) -- see config/otel-collector.yml.
+  requires: [setup-certs]
+  after: [network, elasticsearch, setup-certs]
+  partof: [lme]
+install:
+  wanted_by: [default.target, lme]
+behavior:
+  restart: always
+  restart_sec: 5
+resources:
+  memory_max: 256M
+volumes:
+  - {source: "cert:otel-collector", dest: /certs, options: [ro, Z]}   # per-svc bundle (ca/ca.crt); no idmap
+  - {source: /opt/lme/config/otel-collector.yml, dest: /etc/otelcol/config.yaml, options: [ro]}
+  - {source: /data/lme/telemetry, dest: /var/lib/lme-telemetry, options: [rw]}
+# Scoped, write-only Elasticsearch API key mounted as a file (read by the collector's
+# bearertokenauth/elastic extension). This is NOT the `elastic` superuser. The podman secret
+# `otel_elastic_api_key` must be provisioned before enabling install_otel (E-domain contract
+# request); until then the unit references an uncreated secret and will not start -- intended,
+# since install_otel defaults false and we do not fall back to superuser auth.
+secrets:
+  - {name: otel_elastic_api_key, type: mount, target: /run/secrets/otel-elastic-api-key}
+# Per-service cert bundle metadata (consumed by init-setup.sh / G5, emits nothing into the
+# unit). The gateway is a pure ES client presenting no leaf cert, so it needs only ca/ca.crt.
+certs:
+  host_userns: true
+  in_container_uid: 10001    # opentelemetry-collector-contrib image default uid
+  needs_ca: true
+exec: --config=/etc/otelcol/config.yaml
+publish_ports:
+  - {host: 4317, container: 4317, bind: 127.0.0.1}
+  - {host: 4318, container: 4318, bind: 127.0.0.1}

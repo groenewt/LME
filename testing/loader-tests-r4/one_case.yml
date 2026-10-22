@@ -1,0 +1,710 @@
+---
+# one_case.yml -- per-case: isolate source, sha256-verify, apply DECLARED overlays, render the probe
+# from the macro, run the REAL loader under the declared probe binary in a scrubbed env, retain the
+# raw envelope (argv/stdout/stderr/rc), and judge FAIL-CLOSED. loop_var=case.
+#
+# Judging (v6.2): a verdict needs the return code AND the recorded failed task AND the cause.
+#   pass   -> rc == 0 and outcome.passed
+#   fail   -> rc != 0, not passed, failed_task == case.invariant_task, case.fail_msg in cause
+#   reject -> rc != 0, not passed, failed_task == case.expected_failed_task, case.boundary_msg in cause
+#   cause   = outcome.msg when the probe captured it (msg_source = probe_fixture.msg_source_captured),
+#             else the first 'fatal:' line of the retained stdout (cause_source stdout_fatal; recorded)
+# A case missing any field its expectation needs is CASE-INCOMPLETE (never green).
+#
+# r2 (codex-1931; STATUS: UNEXECUTED -- authored only, nothing has been run):
+#   C1-CAUSE-TYPE  BEFORE the case runs, a `reject` case must declare expected_failed_task and
+#                  boundary_msg, and a `fail` case invariant_task and fail_msg, each a NON-EMPTY STRING
+#                  (an empty/non-string needle would be `in` any cause); the judges additionally require
+#                  `cause is string`. Every current reject case already satisfies this (statically
+#                  checked), so their observed-result semantics are unchanged.
+#   C1-PRIVATE-PROBE-DEFAULTS  probe.j2 receives probe_fixture (fixture_config.yml); the msg_source
+#                  protocol constant read below comes from the same declaration.
+#   REV-SIGNER-ADMISSION harness extension -- OPTIONAL declared case fields:
+#     inventory_hosts   mapping alias -> hostvars; every host MUST declare ansible_connection: local and
+#                       no ansible_become*/sudo/su vars. Renders a multi-host YAML inventory (-i) and
+#                       switches the probe to PER-HOST outputs (outcomes/<host>.yml,
+#                       resolved/<host>/<var>.json); the judged outcome is the first NOT-passed host in
+#                       code-point order, else the first host. Mutually exclusive with inventory_vars.
+#     inventory_groups  mapping group -> list of inventory_hosts aliases (requires inventory_hosts).
+#     limit             string; appends ['--limit', limit] as the LAST argv elements ('@file' refused).
+#     probe_hosts       the probe play's host pattern (default probe_fixture.probe_hosts_default).
+#     no_inventory      true -> NO -i at all (models install.sh's no-inventory path; implicit localhost).
+#                       The controller's default inventory (/etc/ansible/hosts; the isolated ansible.cfg
+#                       declares none) is then consulted by ansible itself: its existence + sha256 are
+#                       RECORDED per result. Refused with inventory_*; probe_hosts/limit must be localhost.
+#     expected_outcome_hosts  list; requires inventory_hosts; the set of hosts that wrote an outcome
+#                       must equal it exactly, else verdict HOSTS-MISMATCH (proves what --limit ran).
+#     inventory_proof_auto  {inventory_id: <non-empty str>, membership: [<str>...]}; requires
+#                       inventory_hosts. After the multi-host inventory is rendered, the harness computes
+#                         lme_inventory_proof = {schema: 1, inventory_id, sources: [<abs inventory path>],
+#                                                files: {<abs inventory path>: <sha256 of its bytes>}, membership}
+#                       (sha256 via stat checksum_algorithm=sha256 of the rendered file) and passes it as
+#                       an extra-var merged with case.extra_vars in the single `-e <json>` argument.
+#                       case.extra_vars may not itself declare lme_inventory_proof.
+#     inventory_proof_tamper  'digest' | 'sources'; requires inventory_proof_auto. 'digest' flips the
+#                       first hex char of the recorded file digest; 'sources' replaces sources with a
+#                       different absolute path (<casedir>/inventory.forged.yml; files keeps the real
+#                       path) -- declarable forged-proof negatives.
+#   The existing `extra_vars` field already is the per-case JSON extra-vars passthrough (-e <to_json>);
+#   no new passthrough is introduced.
+#   A case declaring none of these fields composes the IDENTICAL argv and inventory as v6.2.
+- name: "[{{ case.name }}] casedir fact + reset verdict (never inherit prior case's verdict)"
+  ansible.builtin.set_fact:
+    casedir: "{{ work }}/{{ case.name }}"
+    verdict: UNJUDGED
+    outcome: {}
+    dump_sha256: {}
+    overlay_sha256: {}
+    key_removal: {}
+    host_outcomes: null
+    outcome_host: null
+    inv_children: {}
+    system_inventory: null
+    inventory_proof: null
+
+- name: "[{{ case.name }}] refuse an under-specified expectation BEFORE running (C1-CAUSE-TYPE: typed, non-empty constraints)"
+  ansible.builtin.assert:
+    that:
+      - case.expected_now | default('') != 'reject' or (case.expected_failed_task is defined and case.expected_failed_task is string and (case.expected_failed_task | trim | length) > 0)
+      - case.expected_now | default('') != 'reject' or (case.boundary_msg is defined and case.boundary_msg is string and (case.boundary_msg | trim | length) > 0)
+      - case.expected_now | default('') != 'fail' or (case.invariant_task is defined and case.invariant_task is string and (case.invariant_task | trim | length) > 0)
+      - case.expected_now | default('') != 'fail' or (case.fail_msg is defined and case.fail_msg is string and (case.fail_msg | trim | length) > 0)
+    fail_msg: >-
+      case {{ case.name }} (expected_now={{ case.expected_now | default('') }}) must declare a non-empty STRING
+      expected_failed_task + boundary_msg (reject) / invariant_task + fail_msg (fail) before it may run
+
+- name: "[{{ case.name }}] refuse an unsafe or ambiguous host shape BEFORE running (optional multi-host / limit / no-inventory fields)"
+  ansible.builtin.assert:
+    that:
+      # inventory_hosts: non-empty mapping of safe aliases -> mapping hostvars, all local, no privilege vars
+      - case.inventory_hosts is not defined or (case.inventory_hosts is mapping and (case.inventory_hosts | length) > 0)
+      - case.inventory_hosts is not defined or case.inventory_vars is not defined
+      - case.inventory_hosts is not defined or (case.inventory_hosts.keys() | map('string') | reject('match', '^[A-Za-z0-9_.-]+$') | list | length) == 0
+      - case.inventory_hosts is not defined or (case.inventory_hosts | dict2items | map(attribute='value') | reject('mapping') | list | length) == 0
+      - case.inventory_hosts is not defined or (case.inventory_hosts | dict2items | map(attribute='value') | map(attribute='ansible_connection', default='') | reject('eq', 'local') | list | length) == 0
+      - case.inventory_hosts is not defined or (case.inventory_hosts | dict2items | map(attribute='value') | map('dict2items') | flatten(levels=1) | map(attribute='key') | map('string') | select('match', '^ansible_(become|sudo|su)') | list | length) == 0
+      # inventory_groups: requires inventory_hosts; safe names; list values naming declared aliases only
+      - case.inventory_groups is not defined or (case.inventory_hosts is defined and case.inventory_groups is mapping)
+      - case.inventory_groups is not defined or (case.inventory_groups.keys() | map('string') | reject('match', '^[A-Za-z0-9_]+$') | list | length) == 0
+      - case.inventory_groups is not defined or ('all' not in case.inventory_groups and 'ungrouped' not in case.inventory_groups)
+      - case.inventory_groups is not defined or (case.inventory_groups | dict2items | map(attribute='value') | select('string') | list | length) == 0
+      - case.inventory_groups is not defined or (case.inventory_groups | dict2items | map(attribute='value') | select('mapping') | list | length) == 0
+      - case.inventory_groups is not defined or (case.inventory_groups | dict2items | map(attribute='value') | reject('sequence') | list | length) == 0
+      - case.inventory_groups is not defined or (case.inventory_groups | dict2items | map(attribute='value') | flatten(levels=1) | reject('in', case.inventory_hosts.keys() | list) | list | length) == 0
+      # limit / probe_hosts: non-empty strings; a limit may not read a controller file (@path)
+      - case.limit is not defined or (case.limit is string and (case.limit | trim | length) > 0 and not (case.limit is match('^[ ]*@')))
+      - case.probe_hosts is not defined or (case.probe_hosts is string and (case.probe_hosts | trim | length) > 0)
+      # no_inventory: boolean; never combined with a declared inventory; only implicit localhost targeted
+      - case.no_inventory is not defined or case.no_inventory is boolean
+      - not (case.no_inventory | default(false)) or (case.inventory_vars is not defined and case.inventory_hosts is not defined and case.inventory_groups is not defined)
+      - not (case.no_inventory | default(false)) or (case.probe_hosts | default('localhost')) == 'localhost'
+      - not (case.no_inventory | default(false)) or (case.limit | default('localhost')) == 'localhost'
+      # expected_outcome_hosts: only meaningful with per-host outputs
+      # r3: one overlay per target path -- every target is slurped BEFORE any write, so a second overlay on
+      # the same path silently REPLACED the first (C1 accel run-1 defect; r2 carried it).
+      - (case.overlay_merge | default([]) | map(attribute='path') | list | length) == (case.overlay_merge | default([]) | map(attribute='path') | unique(case_sensitive=true) | list | length)
+      # r4 R3-OVERLAY-ALIASES (codex-213359): raw-string uniqueness equals canonical-target uniqueness only when every
+      # path is canonical: a string, relative, no empty / '.' / '..' segment, no control character or backslash.
+      # The contained-target realpath is checked again after the copy (symlinked aliases).
+      - (case.overlay_merge | default([]) | map(attribute='path') | reject('string') | list | length) == 0
+      - (case.overlay_merge | default([]) | map(attribute='path') | select('match', '/') | list | length) == 0
+      - (case.overlay_merge | default([]) | map(attribute='path') | select('search', '[\\x00-\\x1f\\x7f\\\\]') | list | length) == 0
+      - (case.overlay_merge | default([]) | map(attribute='path') | map('split', '/') | flatten | select('in', ['', '.', '..']) | list | length) == 0
+      - case.expected_outcome_hosts is not defined or (case.inventory_hosts is defined and case.expected_outcome_hosts is sequence and case.expected_outcome_hosts is not string and case.expected_outcome_hosts is not mapping)
+      # inventory_proof_auto: requires inventory_hosts; typed inventory_id + membership list of strings
+      - case.inventory_proof_auto is not defined or (case.inventory_hosts is defined and case.inventory_proof_auto is mapping)
+      - case.inventory_proof_auto is not defined or (case.inventory_proof_auto.inventory_id is defined and case.inventory_proof_auto.inventory_id is string and (case.inventory_proof_auto.inventory_id | trim | length) > 0)
+      - case.inventory_proof_auto is not defined or (case.inventory_proof_auto.membership is defined and case.inventory_proof_auto.membership is sequence and case.inventory_proof_auto.membership is not string and case.inventory_proof_auto.membership is not mapping)
+      - case.inventory_proof_auto is not defined or (case.inventory_proof_auto.membership | reject('string') | list | length) == 0
+      - case.inventory_proof_auto is not defined or case.extra_vars is not defined or 'lme_inventory_proof' not in case.extra_vars
+      - case.inventory_proof_tamper is not defined or (case.inventory_proof_auto is defined and case.inventory_proof_tamper in ['digest', 'sources'])
+    fail_msg: "case {{ case.name }} declares an invalid inventory_hosts / inventory_groups / limit / probe_hosts / no_inventory / expected_outcome_hosts / inventory_proof_auto / inventory_proof_tamper shape"
+
+# KEY-REMOVAL FIXTURE OPERATION (C1; codex-tick328-329 missing_keys). OPTIONAL declared case field
+#   key_remove: [{path: <an admitted copied file, canonical relative path>, key_paths: [[<seg>, ...], ...]}]
+# (field `key_paths`, never `keys`: a Jinja attribute lookup of a missing `keys` would reach dict.keys)
+# the one declared way a case DELETES keys (overlay_merge is a recursive combine and cannot). Applied AFTER the
+# overlays, to the isolated copy only (source tree immutable), through macros/key_remove.j2; confined to an admitted
+# copied file (isolated_source.files or a member of the bound manifests tree) and to canonical key paths (lists of
+# non-empty string segments from the document root; every path must EXIST before removal). The exact pre/post bytes
+# are retained (<casedir>/key_remove/<n>.pre + the target itself) and their sha256 recorded in the result; each key
+# is proved ABSENT from the written copy before the probe runs. A case declaring no key_remove is unchanged.
+- name: "[{{ case.name }}] refuse an invalid key_remove declaration BEFORE running (canonical file + key paths)"
+  ansible.builtin.assert:
+    that:
+      - case.key_remove is not defined or (case.key_remove is sequence and case.key_remove is not string and case.key_remove is not mapping and (case.key_remove | length) > 0)
+      - (case.key_remove | default([]) | reject('mapping') | list | length) == 0
+      - (case.key_remove | default([]) | map('dict2items') | map('map', attribute='key') | map('sort') | map('list') | reject('eq', ['key_paths', 'path']) | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='path') | reject('string') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='path') | list | length) == (case.key_remove | default([]) | map(attribute='path') | unique(case_sensitive=true) | list | length)
+      - (case.key_remove | default([]) | map(attribute='path') | select('match', '/') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='path') | select('search', '[\\x00-\\x1f\\x7f\\\\]') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='path') | map('split', '/') | flatten | select('in', ['', '.', '..']) | list | length) == 0
+      # every keys value: a non-empty list of key paths; every key path a non-empty list of non-empty strings
+      - (case.key_remove | default([]) | map(attribute='key_paths') | reject('sequence') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | select('string') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | map('length') | select('eq', 0) | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=1) | reject('sequence') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=1) | select('string') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=1) | map('length') | select('eq', 0) | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=2) | reject('string') | list | length) == 0
+      - (case.key_remove | default([]) | map(attribute='key_paths') | flatten(levels=2) | map('length') | select('eq', 0) | list | length) == 0
+    fail_msg: "case {{ case.name }} declares an invalid key_remove (a non-empty list of {path, key_paths}; unique canonical relative paths; key_paths = non-empty lists of non-empty string segment lists)"
+
+- name: "[{{ case.name }}] fresh casedir"
+  ansible.builtin.file: {path: "{{ work }}/{{ case.name }}", state: "{{ item }}"}
+  loop: [absent, directory]
+
+- name: "[{{ case.name }}] ensure parent dirs for isolated files"
+  ansible.builtin.file:
+    path: "{{ (casedir + '/' + item) | dirname }}"
+    state: directory
+  loop: "{{ isolated_source.files }}"
+
+- name: "[{{ case.name }}] copy isolated source files"
+  ansible.builtin.copy:
+    src: "{{ repo_root }}/{{ item }}"
+    dest: "{{ casedir }}/{{ item }}"
+    remote_src: true
+    mode: preserve
+  loop: "{{ isolated_source.files }}"
+
+- name: "[{{ case.name }}] copy isolated source trees"
+  ansible.builtin.copy:
+    src: "{{ repo_root }}/{{ item }}/"
+    dest: "{{ casedir }}/{{ item }}/"
+    remote_src: true
+    mode: preserve
+  loop: "{{ isolated_source.trees }}"
+
+# r4 R3-COPIED-MANIFEST-BYTES (codex-213359): the copied trees are bound member-by-member to the run-level
+# manifests_tree (the global expected input set measured once at run start, written to consumed-inputs) BEFORE
+# any overlay; the post-overlay bytes are bound and recorded afterwards. Only the globally bound tree may be
+# copied; a symlink anywhere in a copied tree refuses.
+- name: "[{{ case.name }}] only the globally bound manifests tree may be copied"
+  ansible.builtin.assert:
+    that: (isolated_source.trees | reject('eq', 'manifests') | list | length) == 0
+    fail_msg: "isolated_source.trees {{ isolated_source.trees }} names a tree not bound by the run-level manifests_tree"
+
+- name: "[{{ case.name }}] enumerate each copied tree BEFORE overlay (files, sha256)"
+  ansible.builtin.find: {paths: "{{ casedir }}/{{ item }}", recurse: true, file_type: file, hidden: true, get_checksum: true, checksum_algorithm: sha256}
+  register: tree_before
+  loop: "{{ isolated_source.trees }}"
+
+- name: "[{{ case.name }}] enumerate symlinks in each copied tree (must be none)"
+  ansible.builtin.find: {paths: "{{ casedir }}/{{ item }}", recurse: true, file_type: link, hidden: true}
+  register: tree_links
+  loop: "{{ isolated_source.trees }}"
+
+- name: "[{{ case.name }}] copied-tree membership + bytes BEFORE overlay"
+  ansible.builtin.set_fact:
+    copied_tree_before: >-
+      {{ dict(tree_before.results | map(attribute='files') | flatten(levels=1) | map(attribute='path')
+              | map('regex_replace', '^' ~ (casedir | regex_escape) ~ '/', '')
+              | zip(tree_before.results | map(attribute='files') | flatten(levels=1) | map(attribute='checksum'))) }}
+
+- name: "[{{ case.name }}] bind the copied trees to the run-level manifests_tree (exact membership and bytes)"
+  ansible.builtin.assert:
+    that:
+      - tree_links.results | map(attribute='files') | flatten(levels=1) | length == 0
+      - copied_tree_before == manifests_tree
+    fail_msg: >-
+      copied tree differs from the run-level manifests_tree:
+      only-in-copy={{ copied_tree_before.keys() | difference(manifests_tree.keys()) | list }}
+      only-in-run={{ manifests_tree.keys() | difference(copied_tree_before.keys()) | list }}
+      links={{ tree_links.results | map(attribute='files') | flatten(levels=1) | map(attribute='path') | list }}
+
+- name: "[{{ case.name }}] sha256 origin"
+  ansible.builtin.stat: {path: "{{ repo_root }}/{{ item }}", checksum_algorithm: sha256}
+  register: origin_stat
+  loop: "{{ isolated_source.files }}"
+
+- name: "[{{ case.name }}] sha256 copy"
+  ansible.builtin.stat: {path: "{{ casedir }}/{{ item }}", checksum_algorithm: sha256}
+  register: copy_stat
+  loop: "{{ isolated_source.files }}"
+
+- name: "[{{ case.name }}] verify isolated copies match origin"
+  ansible.builtin.assert:
+    that: "origin_stat.results[idx].stat.checksum == copy_stat.results[idx].stat.checksum"
+    fail_msg: "isolated copy of {{ isolated_source.files[idx] }} differs from origin"
+  loop: "{{ range(isolated_source.files | length) | list }}"
+  loop_control: {loop_var: idx}
+
+- name: "[{{ case.name }}] read each declared overlay target (isolated copy)"
+  ansible.builtin.slurp:
+    src: "{{ casedir }}/{{ item.path }}"
+  register: overlay_src
+  loop: "{{ case.overlay_merge | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] each overlay target resolves to exactly its canonical contained path (no symlinked alias)"
+  ansible.builtin.assert:
+    that:
+      - ((casedir ~ '/' ~ item.path) | realpath) == ((casedir | realpath) ~ '/' ~ item.path)
+    fail_msg: "overlay target {{ item.path }} resolves to {{ (casedir ~ '/' ~ item.path) | realpath }} (alias / escape)"
+  loop: "{{ case.overlay_merge | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] apply each DECLARED overlay as a recursive merge into the isolated copy"
+  ansible.builtin.copy:
+    dest: "{{ casedir }}/{{ item.item.path }}"
+    content: "{{ (item.content | b64decode | from_yaml) | combine(item.item.merge, recursive=True) | to_nice_yaml(indent=2, sort_keys=True) }}"
+  loop: "{{ overlay_src.results }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+# ---- KEY-REMOVAL FIXTURE OPERATION (declared key_remove only; after the overlays; isolated copy only) ----
+- name: "[{{ case.name }}] key_remove: confined to an admitted copied file (isolated_source.files or a bound manifests-tree member), no alias"
+  ansible.builtin.assert:
+    that:
+      - item.path in (isolated_source.files + (copied_tree_before.keys() | list))
+      - ((casedir ~ '/' ~ item.path) | realpath) == ((casedir | realpath) ~ '/' ~ item.path)
+    fail_msg: "key_remove target {{ item.path }} is not an admitted copied file of this case (or resolves elsewhere: {{ (casedir ~ '/' ~ item.path) | realpath }})"
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: evidence dir for the exact PRE bytes"
+  ansible.builtin.file: {path: "{{ casedir }}/key_remove", state: directory}
+  when: case.key_remove is defined
+
+- name: "[{{ case.name }}] key_remove: retain the exact PRE bytes of each target (post-overlay copy, byte-for-byte)"
+  ansible.builtin.copy:
+    src: "{{ casedir }}/{{ item.path }}"
+    dest: "{{ casedir }}/key_remove/{{ kr_i }}.pre"
+    remote_src: true
+    mode: preserve
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}", index_var: kr_i}
+
+- name: "[{{ case.name }}] key_remove: sha256 of the PRE bytes"
+  ansible.builtin.stat: {path: "{{ casedir }}/key_remove/{{ kr_i }}.pre", checksum_algorithm: sha256}
+  register: kr_pre_stat
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}", index_var: kr_i}
+
+- name: "[{{ case.name }}] key_remove: read each target"
+  ansible.builtin.slurp:
+    src: "{{ casedir }}/{{ item.path }}"
+  register: kr_src
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: every declared key path EXISTS before removal and the document round-trips losslessly"
+  vars:
+    _kr_doc: "{{ item.content | b64decode | from_yaml }}"
+    _kr_present: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/key_remove.j2', template_vars={'op': 'present', 'doc': _kr_doc, 'paths': item.item.key_paths}) | from_json).present }}"
+  ansible.builtin.assert:
+    that:
+      - _kr_doc is mapping
+      - (_kr_doc | to_json | from_json) == _kr_doc
+      - _kr_present | length == item.item.key_paths | length
+      - _kr_present | reject('eq', true) | list | length == 0
+    fail_msg: "key_remove {{ item.item.path }}: declared key paths {{ item.item.key_paths }} present={{ _kr_present }} (every one must exist; the document must be a mapping with a lossless JSON round trip)"
+  loop: "{{ kr_src.results }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: write the isolated copy WITHOUT exactly the declared keys (macros/key_remove.j2)"
+  ansible.builtin.copy:
+    dest: "{{ casedir }}/{{ item.item.path }}"
+    content: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/key_remove.j2', template_vars={'op': 'remove', 'doc': (item.content | b64decode | from_yaml), 'paths': item.item.key_paths}) | from_json).doc | to_nice_yaml(indent=2, sort_keys=True) }}"
+  loop: "{{ kr_src.results }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: re-read each written target"
+  ansible.builtin.slurp:
+    src: "{{ casedir }}/{{ item.path }}"
+  register: kr_post
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: every declared key is ABSENT from the written copy BEFORE the probe; nothing else removed"
+  vars:
+    _kr_after: "{{ item.content | b64decode | from_yaml }}"
+    _kr_absent: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/key_remove.j2', template_vars={'op': 'present', 'doc': _kr_after, 'paths': item.item.key_paths}) | from_json).present }}"
+    _kr_before: "{{ kr_src.results[kr_i].content | b64decode | from_yaml }}"
+    _kr_expect: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/key_remove.j2', template_vars={'op': 'remove', 'doc': _kr_before, 'paths': item.item.key_paths}) | from_json).doc }}"
+  ansible.builtin.assert:
+    that:
+      - _kr_absent | length == item.item.key_paths | length
+      - _kr_absent | select('eq', true) | list | length == 0
+      - _kr_after == _kr_expect
+    fail_msg: "key_remove {{ item.item.path }}: after the write present={{ _kr_absent }} (every declared key must be absent, the rest unchanged)"
+  loop: "{{ kr_post.results }}"
+  loop_control: {label: "{{ item.item.path }}", index_var: kr_i}
+
+- name: "[{{ case.name }}] key_remove: sha256 of the POST bytes"
+  ansible.builtin.stat: {path: "{{ casedir }}/{{ item.path }}", checksum_algorithm: sha256}
+  register: kr_post_stat
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] key_remove: record the operation (path -> removed key paths, exact pre/post sha256, retained pre file)"
+  ansible.builtin.set_fact:
+    key_removal: >-
+      {{ key_removal | combine({item.path: {'key_paths': item.key_paths, 'pre_file': 'key_remove/' ~ kr_i ~ '.pre',
+                                            'pre_sha256': kr_pre_stat.results[kr_i].stat.checksum,
+                                            'post_sha256': kr_post_stat.results[kr_i].stat.checksum,
+                                            'generator': {'path': 'macros/key_remove.j2', 'sha256': instruments['macros/key_remove.j2']}}}) }}
+  loop: "{{ case.key_remove | default([]) }}"
+  loop_control: {label: "{{ item.path }}", index_var: kr_i}
+
+- name: "[{{ case.name }}] sha256 of each overlaid file"
+  ansible.builtin.stat: {path: "{{ casedir }}/{{ item.path }}", checksum_algorithm: sha256}
+  register: overlay_stat
+  loop: "{{ case.overlay_merge | default([]) }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: "[{{ case.name }}] record overlay hashes"
+  ansible.builtin.set_fact:
+    overlay_sha256: "{{ dict((case.overlay_merge | default([])) | map(attribute='path') | zip(overlay_stat.results | map(attribute='stat.checksum'))) }}"
+
+- name: "[{{ case.name }}] enumerate each copied tree AFTER overlay (files; links re-checked)"
+  ansible.builtin.find: {paths: "{{ casedir }}/{{ item }}", recurse: true, file_type: file, hidden: true, get_checksum: true, checksum_algorithm: sha256}
+  register: tree_after
+  loop: "{{ isolated_source.trees }}"
+
+- name: "[{{ case.name }}] enumerate symlinks AFTER overlay"
+  ansible.builtin.find: {paths: "{{ casedir }}/{{ item }}", recurse: true, file_type: link, hidden: true}
+  register: tree_links_after
+  loop: "{{ isolated_source.trees }}"
+
+- name: "[{{ case.name }}] copied-tree membership + bytes AFTER overlay"
+  ansible.builtin.set_fact:
+    copied_tree_after: >-
+      {{ dict(tree_after.results | map(attribute='files') | flatten(levels=1) | map(attribute='path')
+              | map('regex_replace', '^' ~ (casedir | regex_escape) ~ '/', '')
+              | zip(tree_after.results | map(attribute='files') | flatten(levels=1) | map(attribute='checksum'))) }}
+
+- name: "[{{ case.name }}] post-overlay tree = pre-overlay tree except exactly the declared overlay / key_remove targets"
+  vars:
+    _declared_targets: "{{ (overlay_sha256.keys() | list) + (key_removal.keys() | list) }}"
+  ansible.builtin.assert:
+    that:
+      - tree_links_after.results | map(attribute='files') | flatten(levels=1) | length == 0
+      - (copied_tree_after.keys() | sort | list) == (copied_tree_before.keys() | sort | list)
+      - (copied_tree_after | dict2items | rejectattr('key', 'in', _declared_targets) | items2dict) == (copied_tree_before | dict2items | rejectattr('key', 'in', _declared_targets) | items2dict)
+      - (overlay_sha256 | dict2items | selectattr('key', 'in', copied_tree_after.keys() | list) | items2dict) == (copied_tree_after | dict2items | selectattr('key', 'in', overlay_sha256.keys() | list) | items2dict)
+      # a key_remove target's bytes in the tree are exactly its recorded POST bytes (the probe reads those)
+      - (key_removal | dict2items | selectattr('key', 'in', copied_tree_after.keys() | list) | map(attribute='value.post_sha256') | list) == (key_removal | dict2items | selectattr('key', 'in', copied_tree_after.keys() | list) | map(attribute='key') | map('extract', copied_tree_after) | list)
+    fail_msg: "the overlay / key_remove changed tree membership or bytes outside its declared targets"
+
+- name: "[{{ case.name }}] canonical digests of the copied tree before/after overlay (macros/manifest_digest.j2)"
+  ansible.builtin.set_fact:
+    copied_tree_digests:
+      before: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/manifest_digest.j2', template_vars={'members': copied_tree_before}) | from_json).serialization | hash('sha256') }}"
+      after: "{{ (lookup('ansible.builtin.template', playbook_dir ~ '/macros/manifest_digest.j2', template_vars={'members': copied_tree_after}) | from_json).serialization | hash('sha256') }}"
+      after_members: "{{ copied_tree_after }}"
+
+- name: "[{{ case.name }}] isolated ansible.cfg (interpreter = the MEASURED probe python)"
+  ansible.builtin.copy:
+    dest: "{{ casedir }}/ansible.cfg"
+    content: |
+      [defaults]
+      roles_path = ./ansible/roles
+      retry_files_enabled = False
+      interpreter_python = {{ toolchain.probe_python_executable }}
+      local_tmp = {{ casedir }}/atmp
+      nocolor = True
+
+- name: "[{{ case.name }}] resolved-dump dir"
+  ansible.builtin.file: {path: "{{ casedir }}/resolved", state: directory}
+  when: case.dump_vars is defined
+
+- name: "[{{ case.name }}] per-host outcome dir (multi-host cases only; each host writes outcomes/<host>.yml)"
+  ansible.builtin.file: {path: "{{ casedir }}/outcomes", state: directory}
+  when: case.inventory_hosts is defined
+
+- name: "[{{ case.name }}] render probe from macro"
+  ansible.builtin.template:
+    src: macros/probe.j2
+    dest: "{{ casedir }}/probe.yml"
+  vars:
+    casedir: "{{ casedir }}"
+    loader_entry: "{{ loader_entry }}"
+    site_flag_playvars: "{{ site_flag_playvars }}"
+    probe_fixture: "{{ probe_fixture }}"
+
+- name: "[{{ case.name }}] sha256 of the rendered probe"
+  ansible.builtin.stat: {path: "{{ casedir }}/probe.yml", checksum_algorithm: sha256}
+  register: probe_stat
+
+- name: "[{{ case.name }}] write inventory (if any)"
+  ansible.builtin.copy:
+    dest: "{{ casedir }}/inventory.yml"
+    content: "{{ {'all': {'hosts': {'localhost': ({'ansible_connection': 'local'} | combine(case.inventory_vars | default({})))}}} | to_nice_yaml }}"
+  when: case.inventory_vars is defined
+
+- name: "[{{ case.name }}] compose declared inventory groups (multi-host cases only)"
+  ansible.builtin.set_fact:
+    inv_children: "{{ inv_children | combine({item.key: {'hosts': dict(item.value | zip_longest([]))}}) }}"
+  loop: "{{ case.inventory_groups | default({}) | dict2items }}"
+  loop_control: {label: "{{ item.key }}"}
+  when: case.inventory_hosts is defined
+
+- name: "[{{ case.name }}] write multi-host inventory (declared local-connection hosts only)"
+  ansible.builtin.copy:
+    dest: "{{ casedir }}/inventory.yml"
+    content: "{{ {'all': {'hosts': case.inventory_hosts, 'children': inv_children}} | to_nice_yaml }}"
+  when: case.inventory_hosts is defined
+
+- name: "[{{ case.name }}] sha256 of the rendered multi-host inventory (inventory_proof_auto cases only)"
+  ansible.builtin.stat: {path: "{{ casedir }}/inventory.yml", checksum_algorithm: sha256}
+  register: inventory_proof_stat
+  when: case.inventory_proof_auto is defined
+
+- name: "[{{ case.name }}] refuse an unmeasurable inventory proof (file must exist; path absolute)"
+  ansible.builtin.assert:
+    that:
+      - inventory_proof_stat.stat.exists
+      - inventory_proof_stat.stat.checksum is match('^[0-9a-f]{64}$')
+      - (casedir ~ '/inventory.yml') is match('^/')
+    fail_msg: "inventory proof for {{ case.name }} could not be measured from {{ casedir }}/inventory.yml"
+  when: case.inventory_proof_auto is defined
+
+- name: "[{{ case.name }}] compose lme_inventory_proof (declared id + membership; measured source + digest; optional declared tamper)"
+  ansible.builtin.set_fact:
+    # one expression (not field-by-field) so a numeric-looking inventory_id is never literal-eval'd to int
+    inventory_proof: >-
+      {{ {'schema': 1,
+          'inventory_id': case.inventory_proof_auto.inventory_id,
+          'sources': ([casedir ~ '/inventory.forged.yml'] if (case.inventory_proof_tamper | default('')) == 'sources'
+                      else [casedir ~ '/inventory.yml']),
+          'files': {casedir ~ '/inventory.yml':
+                      ((('0' if inventory_proof_stat.stat.checksum[0] != '0' else '1') ~ inventory_proof_stat.stat.checksum[1:])
+                       if (case.inventory_proof_tamper | default('')) == 'digest' else inventory_proof_stat.stat.checksum)},
+          'membership': case.inventory_proof_auto.membership} }}
+  when: case.inventory_proof_auto is defined
+
+- name: "[{{ case.name }}] record the controller default inventory ansible will consult (no_inventory cases only)"
+  ansible.builtin.stat: {path: /etc/ansible/hosts, checksum_algorithm: sha256}
+  register: system_inventory_stat
+  when: case.no_inventory | default(false)
+
+- name: "[{{ case.name }}] system inventory evidence"
+  ansible.builtin.set_fact:
+    system_inventory:
+      path: /etc/ansible/hosts
+      exists: "{{ system_inventory_stat.stat.exists }}"
+      sha256: "{{ system_inventory_stat.stat.checksum | default(none) }}"
+  when: case.no_inventory | default(false)
+
+# RH-NESTED-PROBE-EXECUTOR-C1-JOIN (codex 144541; ATTRIBUTED CHANGE vs one_case.yml a23923a0): the probe keeps its
+# DECLARED executable (probe_ansible_playbook -- deliberately not the runner's) and its env -i scrub, but the scrubbed
+# environment is now ONE merged mapping (each name once in argv), in precedence order, last wins:
+#   1. case.ambient_env        OPTIONAL test-only injection modelling a conflicting ambient value (C1 temp controls)
+#   2. lme_resolved_run.env    the resolved run environment (TMPDIR, ANSIBLE_LOCAL_TEMP, XDG_*, *_CACHE_DIR, CONTAINERS_*, ...)
+#   3. the fixed probe scrub   HOME, PATH, LANG, PYTHONNOUSERSITE, ANSIBLE_CONFIG, ANSIBLE_NOCOLOR (unchanged values)
+#   4. per-case temp roots     TMPDIR/TMP/TEMP=<casedir>/tmp, ANSIBLE_LOCAL_TEMP=<casedir>/atmp (= ansible.cfg local_tmp),
+#                              ANSIBLE_REMOTE_TMP=<casedir>/rtmp -- all under the case dir, inside work_root
+#                              + ANSIBLE_HOME=<casedir>/ansible-home (route 814cf6a records the run's ANSIBLE_HOME in
+#                              lme_resolved_run.env; without this every probe would share the runner's ansible home)
+# The merged mapping is recorded in the envelope (argv.json + argv_sha256) and as probe_env in the result.
+- name: "[{{ case.name }}] refuse an unsafe ambient_env / tempfile_probe declaration (optional C1 temp-control fields)"
+  ansible.builtin.assert:
+    that:
+      - case.ambient_env is not defined or case.ambient_env is mapping
+      - case.ambient_env is not defined or (case.ambient_env.keys() | map('string') | reject('match', '^[A-Z_][A-Z0-9_]*$') | list | length) == 0
+      - case.ambient_env is not defined or (case.ambient_env.values() | reject('string') | list | length) == 0
+      - case.tempfile_probe is not defined or case.tempfile_probe is boolean
+      - (casedir ~ '/') is match('^' ~ ((work_root ~ '/') | regex_escape))
+    fail_msg: "case {{ case.name }}: ambient_env must map NAME -> string, tempfile_probe must be boolean, and the case dir must lie inside work_root"
+
+- name: "[{{ case.name }}] per-case temp roots (under the case dir, inside work_root)"
+  ansible.builtin.file: {path: "{{ casedir }}/{{ item }}", state: directory, mode: '0700'}
+  loop: [tmp, atmp, rtmp, ansible-home]
+
+- name: "[{{ case.name }}] compose the probe environment (ambient_env < resolved env < fixed scrub < per-case temp roots)"
+  ansible.builtin.set_fact:
+    probe_env: >-
+      {{ (case.ambient_env | default({}))
+         | combine(lme_resolved_run.env)
+         | combine({'HOME': casedir, 'PATH': (probe_ansible_playbook | dirname) ~ ':/usr/bin:/bin',
+                    'LANG': 'C.UTF-8', 'PYTHONNOUSERSITE': '1', 'ANSIBLE_CONFIG': casedir ~ '/ansible.cfg', 'ANSIBLE_NOCOLOR': '1'})
+         | combine({'TMPDIR': casedir ~ '/tmp', 'TMP': casedir ~ '/tmp', 'TEMP': casedir ~ '/tmp',
+                    'ANSIBLE_LOCAL_TEMP': casedir ~ '/atmp', 'ANSIBLE_REMOTE_TMP': casedir ~ '/rtmp',
+                    'ANSIBLE_HOME': casedir ~ '/ansible-home'}) }}
+
+- name: "[{{ case.name }}] compose the probe argv (declared binary; scrubbed env = probe_env only)"
+  ansible.builtin.set_fact:
+    probe_argv: >-
+      {{ ['env', '-i']
+         + (probe_env | dict2items | sort(attribute='key', case_sensitive=true) | map(attribute='key')
+            | zip(probe_env | dict2items | sort(attribute='key', case_sensitive=true) | map(attribute='value'))
+            | map('join', '=') | list)
+         + [probe_ansible_playbook]
+         + ([] if (case.no_inventory | default(false)) else
+            ['-i', (casedir + '/inventory.yml' if (case.inventory_vars is defined or case.inventory_hosts is defined) else 'localhost,')])
+         + [casedir + '/probe.yml']
+         + ((['-e', ((case.extra_vars | default({})) | combine({'lme_inventory_proof': inventory_proof}) | to_json)])
+            if case.inventory_proof_auto is defined else
+            (['-e', (case.extra_vars | to_json)] if case.extra_vars is defined else []))
+         + (['--limit', case.limit] if case.limit is defined else []) }}
+
+- name: "[{{ case.name }}] run probe (real loader)"
+  ansible.builtin.command:
+    argv: "{{ probe_argv }}"
+    chdir: "{{ casedir }}"
+  register: probe_run
+  changed_when: false
+  failed_when: false
+
+- name: "[{{ case.name }}] retain the raw execution envelope"
+  ansible.builtin.copy:
+    dest: "{{ casedir }}/{{ item.f }}"
+    content: "{{ item.c }}"
+  loop:
+    - {f: argv.json, c: "{{ probe_argv | to_json }}\n"}
+    - {f: stdout.txt, c: "{{ probe_run.stdout }}\n"}
+    - {f: stderr.txt, c: "{{ probe_run.stderr }}\n"}
+    - {f: rc.txt, c: "{{ probe_run.rc }}\n"}
+  loop_control: {label: "{{ item.f }}"}
+
+- name: "[{{ case.name }}] provenance SIDECAR (hashes stored OUTSIDE the probe bytes)"
+  ansible.builtin.copy:
+    dest: "{{ casedir }}/probe.provenance.yml"
+    content: "{{ {'provenance_schema': 3, 'generated_artifact': 'probe.yml', 'output_sha256': probe_stat.stat.checksum, 'source_manifest': {'path': cases_file, 'sha256': instruments[cases_file], 'case': case.name, 'kind': case.kind}, 'generator': {'path': 'macros/probe.j2', 'sha256': instruments['macros/probe.j2']}, 'fixture': {'path': 'fixture_config.yml', 'sha256': instruments['fixture_config.yml'], 'probe_fixture': probe_fixture}, 'toolchain': toolchain} | to_nice_yaml }}"
+
+- name: "[{{ case.name }}] read outcome.yml"
+  ansible.builtin.slurp: {src: "{{ casedir }}/outcome.yml"}
+  register: outcome_raw
+  failed_when: false
+  when: case.inventory_hosts is not defined
+
+- name: "[{{ case.name }}] parse outcome"
+  ansible.builtin.set_fact:
+    outcome: "{{ (outcome_raw.content | b64decode | from_yaml) if (outcome_raw.content is defined) else {} }}"
+  when: case.inventory_hosts is not defined
+
+- name: "[{{ case.name }}] list per-host outcomes (multi-host cases only)"
+  ansible.builtin.find:
+    paths: "{{ casedir }}/outcomes"
+    patterns: ["*.yml"]
+    file_type: file
+  register: outcome_files
+  when: case.inventory_hosts is defined
+
+- name: "[{{ case.name }}] read per-host outcomes"
+  ansible.builtin.slurp: {src: "{{ item }}"}
+  register: host_outcome_raw
+  loop: "{{ outcome_files.files | default([]) | map(attribute='path') | sort | list }}"
+  when: case.inventory_hosts is defined
+
+- name: "[{{ case.name }}] per-host outcome map (host -> outcome)"
+  ansible.builtin.set_fact:
+    host_outcomes: >-
+      {{ dict(host_outcome_raw.results | default([]) | map(attribute='item') | map('basename') | map('regex_replace', '[.]yml$', '')
+              | zip(host_outcome_raw.results | default([]) | map(attribute='content') | map('b64decode') | map('from_yaml'))) }}
+  when: case.inventory_hosts is defined
+
+- name: "[{{ case.name }}] judged outcome = first NOT-passed host (code-point order), else the first host; none -> {}"
+  ansible.builtin.set_fact:
+    outcome_host: >-
+      {{ ((host_outcomes | dict2items | sort(attribute='key', case_sensitive=true) | rejectattr('value.passed', 'sameas', true) | list)
+          + (host_outcomes | dict2items | sort(attribute='key', case_sensitive=true) | list)) | map(attribute='key') | first | default(none) }}
+    outcome: >-
+      {{ ((host_outcomes | dict2items | sort(attribute='key', case_sensitive=true) | rejectattr('value.passed', 'sameas', true) | list)
+          + (host_outcomes | dict2items | sort(attribute='key', case_sensitive=true) | list)) | map(attribute='value') | first | default({}) }}
+  when: case.inventory_hosts is defined
+
+# r3 RH-ACTUAL-EXECUTABLE-SELECTION (codex-1954): every outcome the nested probe wrote (single or per-host)
+# carries the core + interpreter it ACTUALLY ran under. A mismatch with the DECLARED expectation (or a
+# written outcome that omits it) REFUSES the run -- it is an instrument failure, never a case verdict.
+- name: "[{{ case.name }}] refuse a nested probe that ran under an undeclared core or interpreter"
+  ansible.builtin.assert:
+    that:
+      - item.actual is defined
+      - item.actual.ansible_core == expected_probe_ansible_core
+      - item.actual.playbook_python == expected_probe_python_executable
+    fail_msg: >-
+      nested probe ran under {{ item.actual | default('<unreported>') }}; declared core
+      {{ expected_probe_ansible_core }} / interpreter {{ expected_probe_python_executable }}
+  loop: "{{ ((host_outcomes | default({}, true)).values() | list) if case.inventory_hosts is defined else ([outcome] if outcome | length > 0 else []) }}"
+  loop_control: {label: "{{ item.actual | default('unreported') }}"}
+
+- name: "[{{ case.name }}] failure cause + its source (outcome msg, else the retained stdout's fatal lines; never inferred)"
+  ansible.builtin.set_fact:
+    cause_source: >-
+      {{ 'outcome' if (outcome.msg_source | default(probe_fixture.msg_source_captured)) == probe_fixture.msg_source_captured
+         else ('stdout_fatal' if (probe_run.stdout_lines | select('match', '^fatal: ') | list | length > 0) else 'none') }}
+    cause: >-
+      {{ (outcome.msg | default('')) if (outcome.msg_source | default(probe_fixture.msg_source_captured)) == probe_fixture.msg_source_captured
+         else (probe_run.stdout_lines | select('match', '^fatal: ') | list | first | default('')) }}
+
+- name: "[{{ case.name }}] sha256 of each resolved dump"
+  ansible.builtin.stat: {path: "{{ casedir }}/resolved/{{ item }}.json", checksum_algorithm: sha256}
+  register: dump_stat
+  loop: "{{ case.dump_vars | default([]) }}"
+  when: case.inventory_hosts is not defined
+
+- name: "[{{ case.name }}] record dump hashes (absent dump => null; a rejected case writes none)"
+  ansible.builtin.set_fact:
+    dump_sha256: "{{ dump_sha256 | combine({item.item: (item.stat.checksum if item.stat.exists else none)}) }}"
+  loop: "{{ dump_stat.results | default([]) }}"
+  loop_control: {label: "{{ item.item }}"}
+  when: case.dump_vars is defined and case.inventory_hosts is not defined
+
+- name: "[{{ case.name }}] sha256 of each per-host resolved dump (multi-host cases only)"
+  ansible.builtin.stat: {path: "{{ casedir }}/resolved/{{ item.0 }}/{{ item.1 }}.json", checksum_algorithm: sha256}
+  register: host_dump_stat
+  loop: "{{ (host_outcomes | default({}, true)).keys() | sort | product(case.dump_vars | default([])) | list }}"
+  loop_control: {label: "{{ item.0 }}/{{ item.1 }}"}
+  when: case.inventory_hosts is defined and case.dump_vars is defined
+
+- name: "[{{ case.name }}] record per-host dump hashes as '<host>/<var>' (absent dump => null)"
+  ansible.builtin.set_fact:
+    dump_sha256: "{{ dump_sha256 | combine({item.item.0 ~ '/' ~ item.item.1: (item.stat.checksum if item.stat.exists else none)}) }}"
+  loop: "{{ host_dump_stat.results | default([]) }}"
+  loop_control: {label: "{{ item.item.0 }}/{{ item.item.1 }}"}
+  when: case.inventory_hosts is defined and case.dump_vars is defined
+
+- name: "[{{ case.name }}] judge (pass)"
+  ansible.builtin.set_fact:
+    verdict: "{{ 'PASS' if (probe_run.rc == 0 and (outcome.passed | default(false)) is sameas true) else 'UNEXPECTED-FAIL' }}"
+  when: case.expected_now | default('') == 'pass'
+
+- name: "[{{ case.name }}] judge (defect fail-now: rc + named invariant task + fail_msg)"
+  ansible.builtin.set_fact:
+    verdict: >-
+      {{ 'CASE-INCOMPLETE' if (case.invariant_task is not defined or case.fail_msg is not defined) else
+         ('XFAIL-as-expected' if (probe_run.rc != 0 and (outcome.passed | default(true)) is sameas false
+             and outcome.failed_task | default('') == case.invariant_task
+             and cause is string and case.fail_msg is string and (case.fail_msg | length) > 0
+             and case.fail_msg in cause) else 'NOT-REPRODUCED') }}
+  when: case.expected_now | default('') == 'fail'
+
+- name: "[{{ case.name }}] judge (boundary reject: rc + expected failed task + cause)"
+  ansible.builtin.set_fact:
+    verdict: >-
+      {{ 'CASE-INCOMPLETE' if (case.expected_failed_task is not defined or case.boundary_msg is not defined) else
+         ('REJECTED-as-expected' if (probe_run.rc != 0 and (outcome.passed | default(true)) is sameas false
+             and outcome.failed_task | default('') == case.expected_failed_task
+             and cause is string and case.boundary_msg is string and (case.boundary_msg | length) > 0
+             and case.boundary_msg in cause) else 'NOT-REJECTED') }}
+  when: case.expected_now | default('') == 'reject'
+
+- name: "[{{ case.name }}] unknown/absent expectation is never green"
+  ansible.builtin.set_fact:
+    verdict: CASE-INCOMPLETE
+  when: case.expected_now | default('') not in ['pass', 'fail', 'reject']
+
+- name: "[{{ case.name }}] multi-host: the hosts that wrote an outcome must be exactly the declared set"
+  ansible.builtin.set_fact:
+    verdict: HOSTS-MISMATCH
+  when:
+    - case.expected_outcome_hosts is defined
+    - (host_outcomes | default({}, true)).keys() | map('string') | sort | list != case.expected_outcome_hosts | map('string') | sort | list
+
+- name: "[{{ case.name }}] record result (source-bound)"
+  ansible.builtin.set_fact:
+    results: >-
+      {{ (results | default([])) + [ {'case': case.name, 'kind': case.kind, 'expected_now': case.expected_now | default(none),
+          'probe_rc': probe_run.rc, 'verdict': verdict, 'outcome': outcome, 'cause_source': cause_source, 'cause': cause[:600],
+          'expected_failed_task': case.expected_failed_task | default(case.invariant_task | default(none)),
+          'probe_sha256': probe_stat.stat.checksum, 'argv_sha256': (probe_argv | to_json | hash('sha256')),
+          'probe_env': probe_env,
+          'stdout_sha256': (probe_run.stdout | hash('sha256')), 'stderr_sha256': (probe_run.stderr | hash('sha256')),
+          'overlay_sha256': overlay_sha256, 'key_removal': key_removal, 'dump_sha256': dump_sha256,
+          'copied_tree_sha256': copied_tree_digests,
+          'host_outcomes': host_outcomes, 'outcome_host': outcome_host, 'system_inventory': system_inventory,
+          'inventory_proof': inventory_proof,
+          'isolated_file_sha256': dict(isolated_source.files | zip(copy_stat.results | map(attribute='stat.checksum') | list))} ] }}

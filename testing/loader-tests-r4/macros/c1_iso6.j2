@@ -1,0 +1,66 @@
+{#- macros/c1_iso6.j2 -- C1 iso6 case expressions (C1-owned macro library; DATA = cases-c1-iso6-*.yml, MACRO = this file).
+    Hand-authored with the editor (no generator). Case YAML calls "{% import 'macros/c1_iso6.j2' as m %}{{ m.check('...') }}".
+    check(name) -> a bare Ansible assert expression the probe evaluates. Nothing here reads a variable: every macro
+    returns TEXT only. Jinja delimiters a tampered template source needs are built by concatenation ('{' ~ '{ ...')
+    so the runner's render of this text never evaluates them.
+    C1-ARTIFACT-REUSE-INPUT-COVERAGE controls: the published reuse key (shared_artifact_inputs_sha256) against the
+    ACTUAL seed rendered from each scope's own policy through the declared entry template (the route renders the
+    same template with lme_seed_bs = policy.controller.bootstrap, lme_seed_ctl = policy.controller, lme_seed_lock =
+    the lock file named by policy.controller.lock_file_rel, package_bundle.yml:144-146 / resolve_policy.yml:69). -#}
+
+{%- macro C() -%}(_lme_global_file.lme_global | combine(_lme_profile_file.profile_overlay.lme_global | default({}), recursive=True)){%- endmacro -%}
+{%- macro SCH() -%}_lme_global_file.lme_config_registry.remote_harness_schema{%- endmacro -%}
+{%- macro OV() -%}(lme_global_override | default({})){%- endmacro -%}
+{%- macro COMP() -%}({{ C() }} | combine({{ OV() }}, recursive=True)){%- endmacro -%}
+{%- macro H() -%}lme_resolved.remote_harness{%- endmacro -%}
+{%- macro ENTRY() -%}'testing/remote_harness/templates/lme-controller-seed.sh.j2'{%- endmacro -%}
+{%- macro MACRO() -%}'testing/remote_harness/templates/macros/controller_seed.j2'{%- endmacro -%}
+{#- Q(): an expression evaluating to a single quote with no backslash in the text (safe in a double-quoted YAML scalar) -#}
+{%- macro Q() -%}('%c' | format(39)){%- endmacro -%}
+
+{#- E(id): scope entry of inventory id (localhost = the declared controller) -#}
+{%- macro E(id) -%}({{ H() }}.scopes.controller if '{{ id }}' == 'localhost' else {{ H() }}.scopes.targets['{{ id }}']){%- endmacro -%}
+{%- macro KEY(id) -%}{{ E(id) }}.shared_artifact_inputs_sha256{%- endmacro -%}
+{%- macro SCOPE(id) -%}{{ E(id) }}.scope_sha256{%- endmacro -%}
+{#- TEXT(id): the seed rendered from scope id's own full policy through the declared entry template -#}
+{%- macro TEXT(id) -%}(lookup('ansible.builtin.template', lme_manifests_dir ~ '/../' ~ {{ ENTRY() }}, template_vars={'lme_seed_bs': {{ E(id) }}.policy.controller.bootstrap, 'lme_seed_ctl': {{ E(id) }}.policy.controller, 'lme_seed_lock': (lookup('ansible.builtin.file', lme_manifests_dir ~ '/../' ~ {{ E(id) }}.policy.controller.lock_file_rel) | from_yaml)})){%- endmacro -%}
+{%- macro RENDER(id) -%}({{ TEXT(id) }} | hash('sha256')){%- endmacro -%}
+
+{#- projection with a tampered scope context (artifact_sources patched); the filter raises inside the case's assert -#}
+{%- macro PROJ(sources_patch) -%}({{ COMP() }} | lme_project_remote_harness({{ C() }}, {{ OV() }}, {{ SCH() }}, (_lme_rh_scope | combine({'artifact_sources': (_lme_rh_scope.artifact_sources | combine({{ sources_patch }}))})), documents=_lme_rh_documents, admission=_lme_rh_admission)) is mapping{%- endmacro -%}
+{%- macro with_h(patch) -%}(lme_resolved | combine({'remote_harness': ({{ H() }} | combine({{ patch }}, recursive=True))})) | lme_verify_resolved(_lme_global_file.lme_config_registry, documents=_lme_rh_documents, admission=_lme_rh_admission){%- endmacro -%}
+
+{%- macro check(name) -%}
+{%- if name == 'verified' -%}lme_resolved | lme_verify_resolved(_lme_global_file.lme_config_registry, documents=_lme_rh_documents, admission=_lme_rh_admission)
+{%- elif name == 'members' -%}({{ H() }}.scopes.targets | list | sort) == ['t1', 't2', 't3', 't4', 't5']
+{#- a target's admitted budget override: distinct key AND distinct seed, carrying the target's own limit -#}
+{%- elif name == 'budget_tasks' -%}{{ KEY('t1') }} != {{ KEY('localhost') }} and {{ RENDER('t1') }} != {{ RENDER('localhost') }} and ('-p TasksMax=257' in {{ TEXT('t1') }}) and ('-p TasksMax=512' in {{ TEXT('localhost') }})
+{%- elif name == 'budget_memory' -%}{{ KEY('t5') }} != {{ KEY('localhost') }} and {{ RENDER('t5') }} != {{ RENDER('localhost') }} and ('-p MemoryMax=1000000000' in {{ TEXT('t5') }}) and ('-p MemoryMax=2000000000' in {{ TEXT('localhost') }})
+{#- codex 035141: two targets with IDENTICAL executable paths/identities but different seed resource limits -> differing artifacts -#}
+{%- elif name == 'limits_between_targets' -%}{{ E('t1') }}.policy.controller.bootstrap.os_tools == {{ E('t5') }}.policy.controller.bootstrap.os_tools and {{ KEY('t1') }} != {{ KEY('t5') }} and {{ RENDER('t1') }} != {{ RENDER('t5') }}
+{#- identity-only override: equal key, byte-identical seed, but its OWN full binding (policy + scope identity differ) -#}
+{%- elif name == 'identity_reuse' -%}{{ KEY('t2') }} == {{ KEY('localhost') }} and {{ RENDER('t2') }} == {{ RENDER('localhost') }} and {{ E('t2') }}.policy_sha256 != {{ E('localhost') }}.policy_sha256 and {{ SCOPE('t2') }} != {{ SCOPE('localhost') }}
+{%- elif name == 'path_distinct' -%}{{ KEY('t3') }} != {{ KEY('localhost') }} and {{ RENDER('t3') }} != {{ RENDER('localhost') }}
+{#- homogeneous target: the controller's key and bytes, same policy, own scope identity -#}
+{%- elif name == 'homogeneous' -%}{{ KEY('t4') }} == {{ KEY('localhost') }} and {{ RENDER('t4') }} == {{ RENDER('localhost') }} and {{ E('t4') }}.policy_sha256 == {{ E('localhost') }}.policy_sha256 and {{ SCOPE('t4') }} != {{ SCOPE('localhost') }}
+{#- over all six scopes: equal key <=> equal rendered bytes (the key partitions exactly as the artifact does) -#}
+{%- elif name == 'key_iff_render' -%}([[{{ KEY('localhost') }}, {{ RENDER('localhost') }}], [{{ KEY('t1') }}, {{ RENDER('t1') }}], [{{ KEY('t2') }}, {{ RENDER('t2') }}], [{{ KEY('t3') }}, {{ RENDER('t3') }}], [{{ KEY('t4') }}, {{ RENDER('t4') }}], [{{ KEY('t5') }}, {{ RENDER('t5') }}]] | map('join', ' ') | unique | list | length) == 4 and ([{{ KEY('localhost') }}, {{ KEY('t1') }}, {{ KEY('t2') }}, {{ KEY('t3') }}, {{ KEY('t4') }}, {{ KEY('t5') }}] | unique | list | length) == 4 and ([{{ RENDER('localhost') }}, {{ RENDER('t1') }}, {{ RENDER('t2') }}, {{ RENDER('t3') }}, {{ RENDER('t4') }}, {{ RENDER('t5') }}] | unique | list | length) == 4
+{#- projection-level negatives: the template proof refuses a source the declaration does not describe -#}
+{%- elif name == 'tpl_undeclared_var' -%}{{ PROJ("{" ~ ENTRY() ~ ": _lme_rh_scope.artifact_sources[" ~ ENTRY() ~ "] ~ '{' ~ '{ lme_seed_extra }' ~ '}'}") }}
+{#- ATTRIBUTED MACRO FIX (retained runs c5dd512bb9cf-reproduction-fin-reuse-219-*T044646Z and -217-*T045216Z: both
+    cases HOSTS-MISMATCH with EMPTY outcomes -- the probe never ran: the prior spelling emitted \' inside the assert,
+    an invalid escape once the probe writes the assert into a double-quoted YAML scalar, "YAML parsing failed ...
+    unknown escape character", probe.yml:27:706). The quote around the declared template name is now Q() = the
+    character 39 via format, so the text carries no backslash. Same tampered sources, same declared target, same
+    needles; the engine and the expectations are unchanged. -#}
+{%- elif name == 'tpl_include' -%}{{ PROJ("{" ~ ENTRY() ~ ": _lme_rh_scope.artifact_sources[" ~ ENTRY() ~ "] ~ '{' ~ '% include ' ~ " ~ Q() ~ " ~ 'macros/controller_seed.j2' ~ " ~ Q() ~ " ~ ' %' ~ '}'}") }}
+{%- elif name == 'tpl_import_with_context' -%}{{ PROJ("{" ~ ENTRY() ~ ": _lme_rh_scope.artifact_sources[" ~ ENTRY() ~ "] ~ '{' ~ '% import ' ~ " ~ Q() ~ " ~ 'macros/controller_seed.j2' ~ " ~ Q() ~ " ~ ' as z with context %' ~ '}'}") }}
+{%- elif name == 'tpl_macro_free_var' -%}{{ PROJ("{" ~ MACRO() ~ ": _lme_rh_scope.artifact_sources[" ~ MACRO() ~ "] ~ '{' ~ '{ hostvars }' ~ '}'}") }}
+{%- elif name == 'tpl_reads_identity' -%}{{ PROJ("{" ~ MACRO() ~ ": _lme_rh_scope.artifact_sources[" ~ MACRO() ~ "] ~ '{' ~ '% macro probe(bs) %' ~ '}{' ~ '{ bs.os_tools.sh.identity }' ~ '}{' ~ '% endmacro %' ~ '}'}") }}
+{%- elif name == 'tpl_sources_missing' -%}({{ COMP() }} | lme_project_remote_harness({{ C() }}, {{ OV() }}, {{ SCH() }}, (_lme_rh_scope | combine({'artifact_sources': {}})), documents=_lme_rh_documents, admission=_lme_rh_admission)) is mapping
+{#- verifier negatives: a published key that is not the digest of the entry's declared inputs refuses -#}
+{%- elif name == 'vf_key_forged' -%}{{ with_h("{'shared_artifact_inputs_sha256': '0000000000000000000000000000000000000000000000000000000000000000'}") }}
+{%- elif name == 'vf_target_claims_controller_key' -%}{{ with_h("{'scopes': {'targets': {'t1': {'shared_artifact_inputs_sha256': " ~ KEY('localhost') ~ "}}}}") }}
+{%- else -%}UNKNOWN-CHECK-{{ name }}
+{%- endif -%}
+{%- endmacro -%}

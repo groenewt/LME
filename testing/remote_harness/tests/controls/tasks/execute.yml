@@ -1,0 +1,184 @@
+---
+# testing/remote_harness/tests/controls/tasks/execute.yml -- admit the execute inputs, create the throwaway run dir,
+# then run the selected controls serially in declaration order (G). Every path written is under rhc_run_dir or the
+# fixtures dir, both under the admitted rhc_work_root.
+
+- name: Refuse execution without a release, an admitted work root, the artifact source and a selection
+  vars:
+    _adm: "{{ rh.controller.bootstrap.path_admission }}"
+    _home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
+  ansible.builtin.assert:
+    that:
+      - rhc_release is defined and rhc_release is string and rhc_release is match('^codex-[A-Za-z0-9._-]+$')
+      - rhc_work_root is defined and rhc_work_root is string
+      - rhc_work_root is match(_adm.regex | default(_adm))
+      - rhc_work_root.startswith(_home ~ '/')
+      - (rhc_work_root ~ '/') is not match('(' ~ (rh.controller.bootstrap.work_roots.admission.refused_prefixes | map('regex_escape') | join('|')) ~ ')')
+      - rhc_artifact_source is defined and rhc_artifact_source is string and rhc_artifact_source.startswith('/')
+      - rhc_select is defined and rhc_select is sequence and rhc_select is not string and rhc_select | length > 0
+      - (rhc_select | reject('equalto', 'all') | reject('in', rhc_decl.controls | map(attribute='id') | list) | list | length) == 0
+    fail_msg: >-
+      REFUSED RHC-EXECUTE-INPUTS: execute needs rhc_release (the codex release message id), rhc_work_root (owned, under
+      $HOME, not under controller.bootstrap.work_roots.admission.refused_prefixes, admitted by controller.bootstrap.path_admission;
+      default <checkout>/.work/run/remote-harness-controls, created by `seed run-local --runner remote_harness_controls`), rhc_artifact_source and rhc_select (control ids or [all]).
+    quiet: true
+
+- name: Read the runner's uid
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.id }}", -u]
+  register: _rhc_id
+  changed_when: false
+
+# The ancestry rule is the route's ONE resolved rule (path_admission.ancestry incl. owner_private_group; codex 143342),
+# included here at the use boundary -- before the first write under rhc_work_root -- instead of a private copy: every
+# existing component from / down is a real directory owned by 0 or this uid, never other-writable, and group-writable
+# only as an owner-private group the generated program admits. On a controller whose nsswitch lists sources other than
+# files/systemd (e.g. sss, winbind) a group-writable component refuses BY DESIGN (the run location is codex's decision).
+- name: Admit the work root's ancestry by the ONE resolved rule (tasks/admit_ancestry.yml; RHC-WORK-ROOT)
+  ansible.builtin.include_tasks: "{{ rh_repo_root }}/testing/remote_harness/tasks/admit_ancestry.yml"
+  vars:
+    rh_anc_bs: "{{ rh.controller.bootstrap }}"
+    rh_anc_repo_root: "{{ rh_repo_root }}"
+    rh_anc_path: "{{ rhc_work_root }}"
+    rh_anc_refusal: RHC-WORK-ROOT
+
+# What the shared rule does NOT say, kept here (not a duplicate): the work root and every ancestor below $HOME EXIST and
+# are owned by THIS uid (the shared rule admits uid 0 and only judges existing components).
+- name: Stat the work root and each ancestor below $HOME (existence and runner ownership)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'ancestry', 'args': [rhc_work_root, lookup('ansible.builtin.env', 'HOME')]}}) | from_json }}"
+  register: _rhc_work_stat
+
+- name: Refuse a missing work root or an ancestor below $HOME not owned by the runner
+  ansible.builtin.assert:
+    that:
+      - _rhc_work_stat.results | length > 0
+      - _rhc_work_stat.results | map(attribute='stat.exists') | reject | list | length == 0
+      - _rhc_work_stat.results | map(attribute='stat.uid') | map('string') | reject('in', [_rhc_id.stdout]) | list | length == 0
+    fail_msg: "REFUSED RHC-WORK-ROOT: {{ rhc_work_root }} and every ancestor below $HOME must exist and be owned by uid {{ _rhc_id.stdout }} (link / type / group / other rules: tasks/admit_ancestry.yml above)"
+    quiet: true
+
+# seed_launch.env.inherited HOME: invoker_passwd_home -- the running uid's passwd home, read here (never the caller's HOME
+# variable); controls.j2 seed_launch binds it into every seed launch's env pairs (RH-SEED-LAUNCH, lifecycle E78).
+# G-PASSWD-RESULT-KEY: getent keys its result by the returned row's account NAME (field 0), not by the queried uid, so the
+# row is SELECTED by its uid field -- exactly one returned row whose uid field is this uid, with an absolute home
+# (controls.j2 passwd_row; ported from m1-1g).
+- name: Read the running uid's passwd entry (seed launch HOME = invoker_passwd_home)
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ _rhc_id.stdout }}"
+
+- name: Select the one returned passwd row whose uid field is the running uid (never by result key)
+  ansible.builtin.set_fact:
+    _rhc_pw: "{{ lookup('ansible.builtin.template', rhc_call_j2, template_vars={'rhc_call': {'fn': 'passwd_row', 'args': [ansible_facts.getent_passwd | default({}), _rhc_id.stdout]}}) | from_json }}"
+
+- name: Refuse an ambiguous, foreign or home-less passwd result (RHC-PASSWD-ROW)
+  ansible.builtin.assert:
+    that: _rhc_pw.failures | length == 0
+    fail_msg: "REFUSED RHC-PASSWD-ROW: {{ _rhc_pw.failures }} (getent passwd {{ _rhc_id.stdout }} returned {{ ansible_facts.getent_passwd | default({}) | list }})"
+    quiet: true
+
+- name: Bind the invoker's passwd account and home into the act context
+  ansible.builtin.set_fact:
+    rhc_ctx_static: "{{ rhc_ctx_static | combine({'passwd_home': _rhc_pw.home, 'passwd_account': _rhc_pw.account}) }}"
+
+- name: Bind the candidate head and the bytes this run executes against (evidence)
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.git }}", -C, "{{ rh_repo_root }}", rev-parse, HEAD]
+  register: _rhc_head
+  changed_when: false
+
+# the template sources are the DECLARED ones of the resolved bootstrap (template_rel, macros_rel, seed_launcher.template_rel /
+# params_rel, the owner-private-group program_template_rel; codex 220953: no literal template path competes with them)
+- name: Digest every bound source file
+  vars:
+    _bs: "{{ rh.controller.bootstrap }}"
+  ansible.builtin.stat:
+    path: "{{ rh_repo_root }}/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: >-
+    {{ ((rhc_decl.bound_bytes_at_authoring | dict2items | map(attribute='key') | select('search', '/') | list)
+       + ['testing/remote_harness/package.yml', 'testing/remote_harness/controller.yml', 'testing/remote_harness/acquire.yml',
+          'testing/remote_harness/tasks/resolve_harness.yml', 'testing/remote_harness/tasks/verify_toolchain_receipt.yml',
+          'testing/remote_harness/tasks/reap_staging.yml',
+          'testing/remote_harness/tests/controls/controls.yml', 'testing/remote_harness/tests/controls/templates/macros/controls.j2']
+       + ([_bs.template_rel, _bs.macros_rel, _bs.seed_launcher.template_rel | default(''), _bs.seed_launcher.params_rel | default(''),
+           _bs.path_admission.ancestry.owner_private_group.program_template_rel | default('')] | select | list)) | unique }}
+  register: _rhc_bound
+
+- name: Record the run identity
+  ansible.builtin.set_fact:
+    rhc_evidence_bound: "{{ dict(_rhc_bound.results | map(attribute='item') | zip(_rhc_bound.results | map(attribute='stat.checksum', default='MISSING'))) }}"
+    rhc_base_tokens: "{{ rhc_base_tokens | combine({'head': _rhc_head.stdout, 'uid': _rhc_id.stdout}) }}"
+    rhc_results: []
+    rhc_cleanup_findings: []
+    rhc_shared_tainted: false
+
+- name: Find earlier run dirs of this work root (only dirs carrying the run marker are ever pruned)
+  ansible.builtin.find:
+    paths: "{{ rhc_work_root }}"
+    patterns: ["run-*"]
+    file_type: directory
+    recurse: false
+  register: _rhc_old_runs
+
+- name: Keep only the newest keep_runs - 1 earlier marked runs (make them writable, then remove)
+  ansible.builtin.include_tasks: prune_run.yml
+  loop: >-
+    {{ (_rhc_old_runs.files | sort(attribute='path') | map(attribute='path')
+        | select('regex', '^' ~ (rhc_work_root | regex_escape) ~ '/run-[0-9]{8}T[0-9]{6}Z$') | list)[:-(rhc_decl.state.keep_runs - 1) or none] }}
+  loop_control:
+    loop_var: rhc_prune
+
+- name: Create this run's directory and its marker first
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0700'
+  # act-tmp: the TMPDIR every act's scrubbed env carries (templates/macros/controls.j2 envp) -- never the /tmp fallback of env -i
+  loop: ["{{ rhc_run_dir }}", "{{ rhc_run_dir }}/bundles", "{{ rhc_run_dir }}/shared", "{{ rhc_run_dir }}/shared/p", "{{ rhc_run_dir }}/controls", "{{ rhc_run_dir }}/act-tmp", "{{ rhc_base_tokens.fixtures }}", "{{ rhc_base_tokens.fixtures }}/tools"]
+
+- name: Write the run marker
+  ansible.builtin.copy:
+    dest: "{{ rhc_run_dir }}/{{ rhc_decl.state.run_marker }}"
+    content: "{{ {'release': rhc_release, 'head': _rhc_head.stdout, 'bound': rhc_evidence_bound, 'admitted_private_groups': rh_anc_admitted_private_groups} | to_nice_json }}\n"
+    mode: '0600'
+
+- name: Read the free bytes of the work root filesystem
+  ansible.builtin.command:
+    argv: ["{{ rhc_decl.runner_tools.df }}", --output=avail, -B1, "{{ rhc_run_dir }}"]
+  register: _rhc_df
+  changed_when: false
+
+- name: Refuse a work root without the declared storage budget
+  vars:
+    _bs: "{{ rh.controller.bootstrap }}"
+    _need: >-
+      {{ (rhc_decl.state.storage.generations_from_budget | int) * (_bs.budget.generation_max_bytes | int)
+         + ((_bs.budget.free_required_bytes | int) if rhc_decl.state.storage.plus_free_required else 0)
+         + (rhc_decl.state.storage.bundle_allowance_bytes | int) + (rhc_decl.state.storage.evidence_allowance_bytes | int)
+         + (rhc_decl.state.storage.variant_clone_allowance_bytes | default(0) | int) }}
+  ansible.builtin.assert:
+    that: (_rhc_df.stdout_lines | last | trim | int) >= (_need | int)
+    fail_msg: "REFUSED RHC-STORAGE: {{ _rhc_df.stdout_lines | last | trim }} bytes free under {{ rhc_run_dir }}, the declared budget needs {{ _need }}"
+    quiet: true
+
+- name: Stage the owner-writable tool fixtures (copies of declared os_tools; used only by declaration variants)
+  ansible.builtin.copy:
+    src: "{{ rh.controller.bootstrap.os_tools[item.from_os_tool].path }}"
+    dest: "{{ item.path | replace('{fixtures}', rhc_base_tokens.fixtures) }}"
+    remote_src: true
+    mode: '0700'
+  loop: "{{ rhc_decl.fixtures.tools }}"
+
+- name: Run the selected controls serially in declaration order
+  ansible.builtin.include_tasks: control.yml
+  loop: "{{ rhc_decl.controls | selectattr('id', 'in', rhc_select) | list if 'all' not in rhc_select else rhc_decl.controls }}"
+  loop_control:
+    loop_var: rhc_c
+    label: "{{ rhc_c.id }}"

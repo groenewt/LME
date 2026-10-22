@@ -1,0 +1,72 @@
+{#- macros/diff.j2 -- reusable recursive, TYPE-AWARE structural diff (C1 loader-tests instrument, r2;
+    codex-1931 C1-TYPED-NEUTRALITY). STATUS: UNEXECUTED.
+    Emits one line per differing path: "<path>\t<ADDED|REMOVED|CHANGED|TYPE-CHANGED>", framed by the
+    sentinel lines "#DIFF-BEGIN <root>" and "#DIFF-END <root>" so a consumer can refuse an empty/failed
+    render instead of reading it as "no difference". Every separator is emitted as EXPRESSION output
+    ('\n'), never as literal template text, because whitespace control ({%- / -%}) strips literal
+    newlines only.
+    Every compared node carries a TYPE TAG (none, bool, int, float, str, dict, list, other), tested in
+    that order so a boolean is never read as an integer (Python bool == int, so plain == hides
+    false-vs-0 and true-vs-1; Jinja's `integer` test excludes booleans, and bool is tested first anyway):
+      - tags differ                   -> "<path>\tTYPE-CHANGED" (no recursion below a type change)
+      - both dict                     -> recurse key-by-key over the union of keys (sorted by string form);
+                                         a key on one side only is ADDED / REMOVED at "<path>.<key>"
+      - both list                     -> element-wise with length: indices 0..max(len)-1 recurse at
+                                         "<path>[<i>]"; an index on one side only is ADDED / REMOVED
+      - same scalar tag, a != b       -> "<path>\tCHANGED"
+    r4 (codex-213359 R3-CASE-SENSITIVE-KEYS): keys are compared by EXACT case-sensitive identity
+    (unique/sort case_sensitive=true; the default case-insensitive unique let {A,a} visit A alone), and a
+    mapping holding ANY non-string key emits "<path>\tNONSTRING-KEY" -- a status classify.j2 does not accept,
+    so the render is malformed and the comparison fails closed (non-string key distinctions are REJECTED,
+    never stringified into collisions).
+    Inputs (template vars): left (baseline value), right (candidate value), root (path prefix). -#}
+{%- macro tag(v) -%}
+{%- if v is none -%}none
+{%- elif v is boolean -%}bool
+{%- elif v is integer -%}int
+{%- elif v is float -%}float
+{%- elif v is string -%}str
+{%- elif v is mapping -%}dict
+{%- elif v is sequence -%}list
+{%- else -%}other
+{%- endif -%}
+{%- endmacro -%}
+{%- macro diff(a, b, path) -%}
+{%- set ta = tag(a) | string -%}
+{%- set tb = tag(b) | string -%}
+{%- if ta != tb -%}
+{{- path ~ '\t' ~ 'TYPE-CHANGED' ~ '\n' -}}
+{%- elif ta == 'dict' -%}
+{%- set _keys = (a.keys() | list) + (b.keys() | list) -%}
+{%- if _keys | reject('string') | list | length > 0 -%}
+{{- path ~ '\t' ~ 'NONSTRING-KEY' ~ '\n' -}}
+{%- else -%}
+{%- for k in _keys | unique(case_sensitive=true) | sort(case_sensitive=true) -%}
+{%- set p = path ~ '.' ~ k -%}
+{%- if k not in a -%}
+{{- p ~ '\t' ~ 'ADDED' ~ '\n' -}}
+{%- elif k not in b -%}
+{{- p ~ '\t' ~ 'REMOVED' ~ '\n' -}}
+{%- else -%}
+{{- diff(a[k], b[k], p) -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- elif ta == 'list' -%}
+{%- for i in range([a | length, b | length] | max) -%}
+{%- set p = path ~ '[' ~ i ~ ']' -%}
+{%- if i >= (a | length) -%}
+{{- p ~ '\t' ~ 'ADDED' ~ '\n' -}}
+{%- elif i >= (b | length) -%}
+{{- p ~ '\t' ~ 'REMOVED' ~ '\n' -}}
+{%- else -%}
+{{- diff(a[i], b[i], p) -}}
+{%- endif -%}
+{%- endfor -%}
+{%- elif a != b -%}
+{{- path ~ '\t' ~ 'CHANGED' ~ '\n' -}}
+{%- endif -%}
+{%- endmacro -%}
+{{- '#DIFF-BEGIN ' ~ root ~ '\n' -}}
+{{- diff(left, right, root) -}}
+{{- '#DIFF-END ' ~ root -}}

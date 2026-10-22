@@ -1,0 +1,261 @@
+---
+# testing/e2e/transfer/controls/source_ref.yml -- admit the declared phase-fixture source (SOURCE-REF) BEFORE any clone.
+# Included by run_controls.yml (and by source_case.yml for the SR controls). Read-only: git status / rev-parse and
+# `ansible-config dump` only. Policy: transfer.decl.yml `controls_source` (this file owns no policy).
+#
+# Inputs:  sr_decl            the loaded transfer decl (`transfer:`); controls_source + the referenced git key
+#          source_ref         optional mapping {path, commit}; path defaults to sr_runner_root, commit to the decl's
+#                             default_commit
+#          sr_runner_root     the repository the controls run FROM (run_controls: repo_root)
+#          sr_work_root       the controls' work root (the source must lie outside it)
+#          sr_work_rel        the resolved work_roots.root_rel (e.g. .work): <source>/<sr_work_rel>/ is git-ignored run
+#                             scratch, NEVER candidate bytes, so a path under it counts as OUTSIDE the source below
+#          sr_ansible_config  the ansible-config executable (CASES harness.ansible_config)
+#          sr_env             optional environment for the config dump (controls only; a real run inherits its own)
+# Output:  sr {used: true, path, requested, commit, tree, clean: true, runner_root, clones: [], load_binding}
+#
+# Refusals (typed, all before any clone):
+#   CONTROLS-SOURCE-INPUT            path not absolute/normalized, inside the work root or not a git work-tree root;
+#                                    commit not matching the decl's commit_regex or default_commit; unknown keys
+#   CONTROLS-SOURCE-DIRTY            the decl's status_args output is not empty (a tracked edit OR an untracked file an
+#                                    include could load; ignored files are excluded)
+#   CONTROLS-SOURCE-MISMATCH         the declared commit does not resolve, or is not the source's HEAD commit (the
+#                                    runner loads the source's working files, which are HEAD's)
+#   CONTROLS-RUNNER-SOURCE-MISMATCH  the controls do not run from inside the source (runner_rule realpath_equal)
+#   CONTROLS-SOURCE-LOAD-PATH        (load_binding, check A) with chdir = the source, the ansible config in effect is a
+#                                    file outside the source, or a project_path_keys path exists outside the source
+#                                    and is non-empty (a scratch filter/module/role/... would be loaded). "Inside"
+#                                    means under <source>/ and NOT under <source>/<sr_work_rel>/. The
+#                                    recorded_keys (collections) and the ansible install are recorded, never refused.
+
+- name: SOURCE-REF -- the declared policy
+  ansible.builtin.set_fact:
+    _srp: "{{ sr_decl.controls_source }}"
+
+- name: SOURCE-REF -- the policy is well-formed and its git is a reference to a declared executable
+  ansible.builtin.assert:
+    that:
+      - _srp.git is string and _srp.git.split('.') | length == 2
+      - sr_decl[_srp.git.split('.')[0]] is mapping
+      - sr_decl[_srp.git.split('.')[0]][_srp.git.split('.')[1]] is string
+      - sr_decl[_srp.git.split('.')[0]][_srp.git.split('.')[1]].startswith('/')
+      - _srp.runner_rule == 'realpath_equal'
+      - _srp.load_binding.config_file == 'none_or_inside_candidate'
+    fail_msg: "CONTROLS-SOURCE-INPUT: transfer.controls_source is malformed ({{ _srp | to_json }})"
+    quiet: true
+
+- name: SOURCE-REF -- the declared input with its defaults
+  ansible.builtin.set_fact:
+    _sr_git: "{{ sr_decl[_srp.git.split('.')[0]][_srp.git.split('.')[1]] }}"
+    _sri: >-
+      {{ {'path': sr_runner_root, 'commit': _srp.default_commit}
+         | combine((source_ref | default({})) if (source_ref | default({}) is mapping) else {}) }}
+
+- name: SOURCE-REF -- well-formed input (CONTROLS-SOURCE-INPUT)
+  ansible.builtin.assert:
+    that:
+      - source_ref | default({}) is mapping
+      - source_ref | default({}) | list | reject('in', ['path', 'commit']) | list | length == 0
+      - _sri.path is string and _sri.path.startswith('/')
+      - _sri.path == (_sri.path | normpath)
+      - not ((_sri.path | realpath) ~ '/').startswith((sr_work_root | realpath) ~ '/')
+      - sr_work_rel is defined and sr_work_rel is string and sr_work_rel | length > 0
+      - not sr_work_rel.startswith('/') and sr_work_rel == (sr_work_rel | normpath) and not sr_work_rel.startswith('..')
+      - _sri.commit is string
+      - _sri.commit == _srp.default_commit or _sri.commit is match(_srp.commit_regex)
+    fail_msg: >-
+      CONTROLS-SOURCE-INPUT: source_ref {{ source_ref | default({}) | to_json }} must be {path: an absolute normalized
+      path outside the work root {{ sr_work_root }}, commit: a 40-hex sha or {{ _srp.default_commit }}}
+      (work_rel {{ sr_work_rel | default('UNSET') }}: a relative normalized path)
+    quiet: true
+
+- name: SOURCE-REF -- the source's excluded run-scratch prefix (<source>/<work_rel>/ is never candidate bytes)
+  ansible.builtin.set_fact:
+    _sr_in: "{{ (_sri.path | realpath) ~ '/' }}"
+    _sr_ex: "{{ (_sri.path | realpath) ~ '/' ~ sr_work_rel ~ '/' }}"
+
+- name: SOURCE-REF -- the path is a git work-tree root
+  ansible.builtin.command:
+    argv: ["{{ _sr_git }}", -C, "{{ _sri.path }}", rev-parse, --show-toplevel]
+  register: _sr_top
+  changed_when: false
+  failed_when: false
+
+- name: SOURCE-REF -- a git work-tree root (CONTROLS-SOURCE-INPUT)
+  ansible.builtin.assert:
+    that:
+      - _sr_top.rc == 0
+      - (_sr_top.stdout | trim | realpath) == (_sri.path | realpath)
+    fail_msg: "CONTROLS-SOURCE-INPUT: {{ _sri.path }} is not a git work-tree root ({{ (_sr_top.stderr | default('') | trim)[:200] }})"
+    quiet: true
+
+- name: SOURCE-REF -- tracked and untracked state (ignored files excluded)
+  ansible.builtin.command:
+    argv: "{{ [_sr_git, '-C', _sri.path] + _srp.status_args }}"
+  register: _sr_st
+  changed_when: false
+  failed_when: false
+
+- name: SOURCE-REF -- clean (CONTROLS-SOURCE-DIRTY)
+  ansible.builtin.assert:
+    that:
+      - _sr_st.rc == 0
+      - _sr_st.stdout | trim | length == 0
+    fail_msg: >-
+      CONTROLS-SOURCE-DIRTY: {{ _sri.path }} has tracked changes or untracked files; only a committed candidate is a
+      source: {{ (_sr_st.stdout_lines | default([]))[:5] }}
+    quiet: true
+
+- name: SOURCE-REF -- HEAD, the declared commit, HEAD's tree
+  ansible.builtin.command:
+    argv: ["{{ _sr_git }}", -C, "{{ _sri.path }}", rev-parse, --verify, --quiet, "{{ item }}"]
+  loop: ['HEAD^{commit}', "{{ _sri.commit }}^{commit}", 'HEAD^{tree}']
+  register: _sr_rp
+  changed_when: false
+  failed_when: false
+
+- name: SOURCE-REF -- the declared commit is the source's HEAD (CONTROLS-SOURCE-MISMATCH)
+  ansible.builtin.assert:
+    that:
+      - _sr_rp.results | map(attribute='rc') | reject('equalto', 0) | list | length == 0
+      - _sr_rp.results[0].stdout | trim is match(_srp.commit_regex)
+      - (_sr_rp.results[1].stdout | trim) == (_sr_rp.results[0].stdout | trim)
+      - _sr_rp.results[2].stdout | trim is match(_srp.commit_regex)
+    fail_msg: >-
+      CONTROLS-SOURCE-MISMATCH: declared commit {{ _sri.commit }} resolves to
+      '{{ _sr_rp.results[1].stdout | default('') | trim }}' but {{ _sri.path }} HEAD is '{{ _sr_rp.results[0].stdout | default('') | trim }}'
+    quiet: true
+
+- name: SOURCE-REF -- the controls run from inside the source (CONTROLS-RUNNER-SOURCE-MISMATCH)
+  ansible.builtin.assert:
+    that:
+      - (sr_runner_root | realpath) == (_sri.path | realpath)
+    fail_msg: >-
+      CONTROLS-RUNNER-SOURCE-MISMATCH: the controls run from {{ sr_runner_root | realpath }}, not from the source
+      {{ _sri.path | realpath }}; run them from inside the candidate clone
+    quiet: true
+
+# ---- LOAD-BINDING (check A): what a phase row run with chdir = the source would load ----
+- name: LOAD-BINDING -- the ansible config in effect (chdir = the source; the phase driver runs there too)
+  ansible.builtin.command:
+    argv: ["{{ sr_ansible_config }}", dump, --format, json]
+    chdir: "{{ _sri.path }}"
+  environment: "{{ sr_env | default({}) }}"
+  register: _sr_cfg
+  changed_when: false
+  failed_when: false
+
+- name: LOAD-BINDING -- the ansible install (recorded, managed toolchain)
+  ansible.builtin.command:
+    argv: ["{{ sr_ansible_config }}", --version]
+    chdir: "{{ _sri.path }}"
+  environment: "{{ sr_env | default({}) }}"
+  register: _sr_ver
+  changed_when: false
+  failed_when: false
+
+- name: LOAD-BINDING -- the config is readable (CONTROLS-SOURCE-LOAD-PATH)
+  ansible.builtin.assert:
+    that:
+      - _sr_cfg.rc == 0
+      - _sr_cfg.stdout | trim is match('^\[')
+    fail_msg: "CONTROLS-SOURCE-LOAD-PATH: cannot read the ansible config in effect at {{ _sri.path }}: {{ (_sr_cfg.stderr | default('') | trim)[:300] }}"
+    quiet: true
+
+- name: LOAD-BINDING -- the named settings and the (key, path) pairs
+  ansible.builtin.set_fact:
+    _sr_cfgd: >-
+      {{ _sr_cfg.stdout | from_json | selectattr('name', 'defined') | selectattr('name', 'string')
+         | items2dict(key_name='name', value_name='value') }}
+
+- name: LOAD-BINDING -- the (key, path) pairs of the project and recorded keys
+  ansible.builtin.set_fact:
+    _sr_pairs: >-
+      {%- set o = [] -%}
+      {%- for k in _srp.load_binding.project_path_keys + _srp.load_binding.recorded_keys -%}
+        {%- set val = _sr_cfgd[k] | default([]) -%}
+        {%- for p in ((val.split(':') if val is string else (val | default([], true) | list))) -%}
+          {{- o.append({'key': k, 'path': p | string, 'recorded': k in _srp.load_binding.recorded_keys}) or '' -}}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ o | to_json }}
+
+- name: LOAD-BINDING -- parse
+  ansible.builtin.set_fact:
+    _sr_pairs: "{{ _sr_pairs if (_sr_pairs is not string) else (_sr_pairs | from_json) }}"
+
+- name: LOAD-BINDING -- every project key is present in the dump (a missing key is not a pass)
+  ansible.builtin.assert:
+    that:
+      - _srp.load_binding.project_path_keys | reject('in', _sr_cfgd) | list | length == 0
+    fail_msg: "CONTROLS-SOURCE-LOAD-PATH: the config dump lacks {{ _srp.load_binding.project_path_keys | reject('in', _sr_cfgd) | list }}"
+    quiet: true
+
+- name: LOAD-BINDING -- what each listed path holds (not recursive; hidden included)
+  ansible.builtin.find:
+    paths: "{{ item.path }}"
+    file_type: any
+    hidden: true
+    recurse: false
+  loop: "{{ _sr_pairs }}"
+  loop_control:
+    label: "{{ item.key }} {{ item.path }}"
+  register: _sr_pf
+
+- name: LOAD-BINDING -- one row per (key, path)
+  ansible.builtin.set_fact:
+    _sr_rows: >-
+      {%- set o = [] -%}
+      {%- for r in _sr_pf.results -%}
+        {{- o.append({'key': r.item.key, 'path': r.item.path, 'recorded': r.item.recorded,
+                      'realpath': r.item.path | realpath, 'exists': r.item.path is exists,
+                      'entries': (r.files | default([]) | length),
+                      'inside': (((r.item.path | realpath) ~ '/').startswith(_sr_in)
+                                 and not ((r.item.path | realpath) ~ '/').startswith(_sr_ex))}) or '' -}}
+      {%- endfor -%}
+      {{ o | to_json }}
+    _sr_lb:
+      config_file: "{{ _sr_cfgd.CONFIG_FILE | default(none) }}"
+      config_file_inside: >-
+        {{ (_sr_cfgd.CONFIG_FILE | default(none)) is none
+           or (((_sr_cfgd.CONFIG_FILE | realpath) ~ '/').startswith(_sr_in)
+               and not ((_sr_cfgd.CONFIG_FILE | realpath) ~ '/').startswith(_sr_ex)) }}
+      ansible: "{{ _sr_ver.stdout_lines | default([]) }}"
+
+- name: LOAD-BINDING -- parse rows
+  ansible.builtin.set_fact:
+    _sr_rows: "{{ _sr_rows if (_sr_rows is not string) else (_sr_rows | from_json) }}"
+
+- name: LOAD-BINDING -- nothing project-owned is loaded from outside the source (CONTROLS-SOURCE-LOAD-PATH)
+  ansible.builtin.assert:
+    that:
+      - _sr_lb.config_file_inside | bool
+      - _sr_rows | rejectattr('recorded') | list | length > 0
+      - _sr_rows | rejectattr('recorded') | rejectattr('inside') | selectattr('exists') | selectattr('entries', 'gt', 0) | list | length == 0
+    fail_msg: >-
+      CONTROLS-SOURCE-LOAD-PATH: with chdir {{ _sri.path }} the config in effect is {{ _sr_lb.config_file }}
+      (inside={{ _sr_lb.config_file_inside }}); non-empty project paths outside the source:
+      {{ _sr_rows | rejectattr('recorded') | rejectattr('inside') | selectattr('exists') | selectattr('entries', 'gt', 0)
+         | map(attribute='key') | zip(_sr_rows | rejectattr('recorded') | rejectattr('inside') | selectattr('exists')
+                                      | selectattr('entries', 'gt', 0) | map(attribute='path')) | map('join', '=') | list }}
+    quiet: true
+
+- name: SOURCE-REF -- the admitted source record
+  ansible.builtin.set_fact:
+    sr:
+      used: true
+      path: "{{ _sri.path | realpath }}"
+      requested: "{{ _sri.commit }}"
+      commit: "{{ _sr_rp.results[0].stdout | trim }}"
+      tree: "{{ _sr_rp.results[2].stdout | trim }}"
+      clean: true
+      runner_root: "{{ sr_runner_root | realpath }}"
+      git: "{{ _sr_git }}"
+      clones: []
+      load_binding:
+        config_file: "{{ _sr_lb.config_file }}"
+        config_file_inside: "{{ _sr_lb.config_file_inside | bool }}"
+        excluded_prefix: "{{ _sr_ex }}"
+        project_paths: "{{ _sr_rows | rejectattr('recorded') | list }}"
+        collections: "{{ _sr_rows | selectattr('recorded') | list }}"
+        ansible: "{{ _sr_lb.ansible }}"

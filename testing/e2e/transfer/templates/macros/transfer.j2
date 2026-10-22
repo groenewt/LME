@@ -1,0 +1,641 @@
+{#- testing/e2e/transfer/macros/transfer.j2 -- genuine macros for the deploy_gate TARGET CONTRACT + TRANSFER.
+    Every value comes from transfer.decl.yml (tr) or from a resolved contract (k); no free-standing policy literal.
+    Consumers call them through lookup('ansible.builtin.template', templates/<t>.j2, template_vars=...), so each
+    template is a one-line dispatcher and the logic lives here, once.
+    Values reaching a shell body are regex-admitted before (paths, members, op ids); shq() quotes anyway.
+    s8 (codex-tick430-434 R1S6-CONSTRUCTOR-CLOSURE): the PURE entry constructor (form law, entry forms, construction,
+    document emission) lives in macros/entry_construct.j2, imported here WITHOUT context as `ec`; this library keeps
+    every filesystem read (lookup / is file) and consumes the constructor's results through caller-owned namespaces. It
+    calls only constructor macros that frame nothing; constructor causes are pairs [code, detail].
+    s9 (codex-tick446 R1S8-EARLY-CONTEXT option c): the structural verifier `violations` takes the typed EARLY VERIFIER
+    CONTEXT (ctx = rh_early_view.context, projected by the R2 early-view producer from the launcher-bound, admitted
+    declaration and consumed by check.yml play 1 in its existing pre-resolve position): ctx.path_separator replaces the
+    retired entry_forms.path.separator everywhere here, ctx.body_domain declares the plaintext UTF-8 body domain and its
+    read settings (R1S8-PLAINTEXT-BODY-BYTES), and check.yml frames the play-1 refusal through the shared grammar entry
+    with ctx.refusal_grammar. The cause pairs travel as data inside that framed refusal's detail. -#}
+{%- import 'macros/entry_construct.j2' as ec without context -%}
+
+{#- ---- POSIX single-quote ---- -#}
+{%- macro shq(s) -%}
+'{{ s | string | replace("'", "'\\''") }}'
+{%- endmacro -%}
+
+{#- ---- ssh words of the contract (B's transport options, then the auth mode's ssh_common_args words, then port,
+     key, proxy), identical for Ansible and for deploy_gate. k.mode_args = rh ssh_auth.modes[<mode>].ssh_common_args. -#}
+{%- macro ssh_words(tr, k) -%}
+{%- set w = [] -%}
+{%- for o in tr.contract.options -%}{{ w.extend(['-o', o]) or '' }}{%- endfor -%}
+{{- w.extend(k.mode_args.split()) or '' -}}
+{%- if k.port is not none -%}{{ w.extend(['-o', 'Port=' ~ k.port]) or '' }}{%- endif -%}
+{%- if k.key is not none -%}{{ w.extend(['-o', 'IdentityFile=' ~ k.key]) or '' }}{%- endif -%}
+{%- if k.proxy is not none -%}{{ w.extend(['-o', 'ProxyJump=' ~ k.proxy]) or '' }}{%- endif -%}
+{{ w | to_json }}
+{%- endmacro -%}
+
+{#- ---- the complete ssh argv deploy_gate runs (client, words, user@address) ---- -#}
+{%- macro ssh_argv(tr, k) -%}
+{{ ([tr.contract.ssh_client] + (ssh_words(tr, k) | from_json) + [k.user ~ '@' ~ k.address]) | to_json }}
+{%- endmacro -%}
+
+{#- ---- Ansible connection vars of the SAME contract (play vars outrank inventory host vars). Every declared
+     credential selector is bound explicitly: bind_key -> the contract key ('' when the mode takes none), clear -> ''
+     (B-INHERITED-OWNER-KEY: an inherited owner ansible_ssh_private_key_file is never consumed). -#}
+{%- macro ansible_conn(tr, k) -%}
+{%- set c = {'ansible_connection': 'ssh', 'ansible_host': k.address, 'ansible_user': k.user,
+             'ansible_ssh_executable': tr.contract.ssh_client,
+             'ansible_ssh_common_args': (ssh_words(tr, k) | from_json) | join(' '),
+             'ansible_ssh_extra_args': ''} -%}
+{%- set s = {} -%}
+{%- for v in tr.contract.credential_selectors.bind_key -%}{{ s.update({v: (k.key if k.key is not none else '')}) or '' }}{%- endfor -%}
+{#- credential_selectors['clear'] by SUBSCRIPT, never `.clear`: Jinja attribute access returns the dict METHOD clear, not
+    the data key (route audit; the genesis `_l.env.clear` bug). Every read site of this key uses the subscript. -#}
+{%- for v in tr.contract.credential_selectors['clear'] -%}{{ s.update({v: ''}) or '' }}{%- endfor -%}
+{{ c | combine(s) | to_json }}
+{%- endmacro -%}
+
+{#- ---- the transfer manifest as ONE regex over repository-relative member paths ---- -#}
+{%- macro exclusion_regex(excludes) -%}
+{%- set a = [] -%}
+{%- for e in excludes -%}
+{%- if e.name is defined -%}{{ a.append('(^|/)' ~ (e.name | regex_escape) ~ '(/|$)') or '' }}
+{%- elif e.path is defined -%}{{ a.append('^' ~ (e.path | regex_escape) ~ '(/|$)') or '' }}
+{%- elif e.prefix is defined -%}{{ a.append('^' ~ (e.prefix | regex_escape)) or '' }}
+{%- else -%}{{ a.append((e.suffix | regex_escape) ~ '$') or '' }}{%- endif -%}
+{%- endfor -%}
+{{ a | join('|') }}
+{%- endmacro -%}
+
+{#- ---- a parent walk that refuses a symlink or non-directory component below the deployment root ---- -#}
+{%- macro sh_parent_guard() -%}
+guard_parents() {  # $1 = member path relative to the deployment root
+  _p=${1%/*}; [ "$_p" = "$1" ] && return 0
+  _acc=.
+  _IFS=$IFS; IFS=/
+  for _c in $_p; do
+    _acc=$_acc/$_c
+    if [ -L "$_acc" ]; then echo "TRANSFER-TARGET-PARENT-LINK $_acc" >&2; IFS=$_IFS; return 1; fi
+    if [ -e "$_acc" ] && [ ! -d "$_acc" ]; then echo "TRANSFER-TARGET-PARENT-NOT-DIR $_acc" >&2; IFS=$_IFS; return 1; fi
+  done
+  IFS=$_IFS
+}
+{%- endmacro -%}
+
+{#- ---- promotion: set each verified staged member to its declared mode and rename it over its live path
+     (per-member atomic, same filesystem), then prune the previously owned members the new edition no longer has
+     (regular files only; every parent walked without following links first). cwd = the deployment root.
+     Reads <state>/<ops>/<op>.modes ("<mode> <path>") and <op>.prune ("<path>"). -#}
+{#- tl = {tool: canonical path} (rh os_tools, admitted in target_observe.yml); no PATH lookup below. -#}
+{%- macro sh_promote(tr, op, tl) -%}
+set -eu
+{{ sh_parent_guard() }}
+_st={{ shq(tr.target.state_dir ~ '/' ~ tr.target.staging_dir ~ '/' ~ op) }}
+_ops={{ shq(tr.target.state_dir ~ '/' ~ tr.target.ops_dir ~ '/' ~ op) }}
+while IFS=' ' read -r _mode m; do
+  guard_parents "$m"
+  _d=${m%/*}; [ "$_d" = "$m" ] || {{ tl.mkdir }} -p -m {{ tr.target.dir_mode }} -- "$_d"
+  if [ -L "$m" ] || { [ -e "$m" ] && [ ! -f "$m" ]; }; then echo "TRANSFER-TARGET-MEMBER-NOT-FILE $m" >&2; exit 1; fi
+  {{ tl.chmod }} "$_mode" -- "$_st/$m"
+  {{ tl.mv }} -f -- "$_st/$m" "$m"
+done < "$_ops.modes"
+while IFS= read -r m; do
+  guard_parents "$m"
+  if [ -L "$m" ]; then echo "TRANSFER-TARGET-PRUNE-LINK $m" >&2; exit 1; fi
+  if [ -f "$m" ]; then
+    {{ tl.rm }} -f -- "$m"
+    _d=${m%/*}; [ "$_d" = "$m" ] || {{ tl.rmdir }} -p --ignore-fail-on-non-empty -- "$_d" 2>/dev/null || true
+  elif [ -e "$m" ]; then echo "TRANSFER-TARGET-PRUNE-NOT-FILE $m" >&2; exit 1; fi
+done < "$_ops.prune"
+{%- endmacro -%}
+
+{#- ---- remove EXACTLY the given staging entries (paths relative to the deployment root, each under the owned
+     state's staging/, incoming/ or ops/, classified by the observe play: dead ops of THIS controller or finished ops'
+     residue). Never a glob, never an age rule. -#}
+{%- macro sh_reap(tr, paths, tl) -%}
+{% for p in paths %}
+{{ tl.rm }} -rf -- {{ shq(p) }}
+{% endfor %}
+{%- endmacro -%}
+
+{#- ---- run a body under the owned state lock (route E25-E27 lease/flock model): claim/reap never wait
+     (flock -x -n), publish waits a bounded time (flock -x -w <publish_wait_s>); both exit <busy_rc> when the lock
+     is held. cwd = the deployment root. rc busy_rc -> TRANSFER-TARGET-BUSY (the caller refuses). -#}
+{%- macro sh_locked(tr, tl, body, wait) -%}
+{{ tl.flock }} -x {{ ('-w ' ~ tr.target.publish_wait_s) if wait else '-n' }} -E {{ tr.target.busy_rc }} -- {{ shq(tr.target.state_dir ~ '/' ~ tr.target.lock) }} /bin/sh -c {{ shq(body) }}
+{%- endmacro -%}
+
+{#- ---- append ledger lines (inside a locked body; printf is the shell builtin). -#}
+{%- macro sh_append(tr, lines) -%}
+{% for l in lines %}
+printf '%s\n' {{ shq(l) }} >> {{ shq(tr.target.state_dir ~ '/' ~ tr.target.ledger) }}
+{% endfor %}
+{%- endmacro -%}
+
+{#- ---- CONTROLLER ledger append (B-CROSS-ROOT-RECOVERY residual): every root sharing the state dir takes the ONE
+     ledger lock <state_dir>/<controller_state.ledger_lock>; under it the lines are appended with O_APPEND (`>>`),
+     never read-modify-write, so no other writer's row is lost. umask 077: the lock and the ledger are created 0600.
+     flock = the admitted os_tools.flock path; busy (lock held > ledger_wait_s) -> exit ledger_busy_rc, nothing written. -#}
+{%- macro ctl_ledger_append(tr, flock, state_dir, lines) -%}
+{%- set body = [] -%}
+{%- for l in lines -%}{{ body.append("printf '%s\\n' " ~ shq(l) ~ ' >> ' ~ shq(state_dir ~ '/' ~ tr.controller_state.ledger)) or '' }}{%- endfor -%}
+umask 077 && exec {{ shq(flock) }} -x -w {{ tr.controller_state.ledger_wait_s }} -E {{ tr.controller_state.ledger_busy_rc }} -- {{ shq(state_dir ~ '/' ~ tr.controller_state.ledger_lock) }} /bin/sh -c {{ shq(body | join('\n')) }}
+{%- endmacro -%}
+
+{#- ---- the claim (compare-and-swap on the ledger): the ledger must still be byte-identical to the one the observe
+     play classified (sha256, or 'absent'); otherwise another writer moved it -> exit busy_rc, nothing changed.
+     Then reap EXACTLY the observed reap set, record the abandon of this controller's dead ops, and record `start <op> <token>`. From here
+     every other writer's observation sees this op as a foreign unfinished op and refuses. -#}
+{%- macro sh_claim(tr, tl, observed, reap, dead, op, token) -%}
+set -eu
+_l={{ shq(tr.target.state_dir ~ '/' ~ tr.target.ledger) }}
+if [ -e "$_l" ]; then _h=$({{ tl.sha256sum }} < "$_l"); _h=${_h%% *}; else _h=absent; fi
+if [ "$_h" != {{ shq(observed) }} ]; then echo "TRANSFER-TARGET-LEDGER-MOVED $_h" >&2; exit {{ tr.target.busy_rc }}; fi
+{{ sh_reap(tr, reap, tl) }}
+{{ sh_append(tr, dead | map('regex_replace', '^', tr.target.verbs.abandon ~ ' ') | list + [tr.target.verbs.start ~ ' ' ~ op ~ ' ' ~ token]) }}
+{%- endmacro -%}
+
+
+
+{#- ---- readback of a tree against the op's expected manifest. cwd = the deployment root; tree = the tree to read
+     (the staging tree or '.'). staging: exact digests + exact member set (unexpected members fail). live: exact
+     digests + declared modes + every pruned path absent (unowned files are not members, so not checked). -#}
+{%- macro sh_readback(tr, op, tree, staging, tl) -%}
+set -eu
+_ops="$PWD/"{{ shq(tr.target.state_dir ~ '/' ~ tr.target.ops_dir ~ '/' ~ op) }}
+_fail=0
+cd -- {{ shq(tree) }}
+{{ tl.sha256sum }} --check --strict --quiet -- "$_ops.sha256" || { echo "TRANSFER-READBACK-DIGEST" >&2; _fail=1; }
+{% if staging %}
+{{ tl.find }} . -mindepth 1 ! -type d -printf '%P\n' | LC_ALL=C {{ tl.sort }} > "$_ops.found"
+LC_ALL=C {{ tl.sort }} -- "$_ops.members" | {{ tl.cmp }} -s - "$_ops.found" || { echo "TRANSFER-READBACK-MEMBER-SET staging differs" >&2; _fail=1; }
+{% else %}
+while IFS=' ' read -r _m _p; do
+  if [ -L "$_p" ] || [ ! -f "$_p" ]; then echo "TRANSFER-READBACK-MISSING $_p" >&2; _fail=1; continue; fi
+  [ "$({{ tl.find }} "$_p" -maxdepth 0 -printf '%m')" = "$_m" ] || { echo "TRANSFER-READBACK-MODE $_p" >&2; _fail=1; }
+done < "$_ops.modes"
+while IFS= read -r _p; do
+  if [ -e "$_p" ] || [ -L "$_p" ]; then echo "TRANSFER-READBACK-PRUNED-PRESENT $_p" >&2; _fail=1; fi
+done < "$_ops.prune"
+{% endif %}
+exit $_fail
+{%- endmacro -%}
+
+{#- ---- check.yml: walk a task list, following blocks and B includes, and emit one JSON line per task.
+     B includes must be written "{{ '{{' }} tr_dir {{ '}}' }}/<tasks_dir>/<file>" and are loaded and walked; route includes must be
+     written with the rh_repo_root or playbook_dir-based repository prefix and are emitted (not walked) for binding
+     by path + sha256; anything else is emitted as UNRESOLVED and refused by check.yml. -#}
+{#- ---- execution scope (codex 163642 B-CONTROLLER-LEDGER-ANCESTRY-REFRESH; codex 164854
+     B-CONTROLLER-SCOPE-CHECKER-FALSE-PASS). The walker carries the EFFECTIVE execution settings down the nesting the
+     way Ansible inherits them, in TWO var layers (codex 170810 B-CONTROLLER-SCOPE-INCLUDE-PRECEDENCE; Ansible 2.19.11
+     vars/manager.py:380-403 merges task vars -- the parent chain's block/`apply`/task vars, playbook/task.py get_vars --
+     BEFORE include params, playbook/task.py:483-488 + block.py:413-417 get_include_params, the vars of EVERY ancestor
+     include task, deeper ones replacing outer ones):
+       layer 'task'  (a task, a block, an include's `apply`): every keyword in controller_scope.tracked_keywords the
+                     level defines, and every pin_vars / invalidating_vars var it binds, replaces the inherited 'kw:' /
+                     'var:' value (a descendant override always recomputes);
+       layer 'param' (an include's own `vars`): replaces the inherited 'ip:' value, and an 'ip:' value OUTRANKS any
+                     'var:' value of the same name at every depth below it -- a descendant block or task var can never
+                     re-pin over an inherited include parameter.
+     `scope_is_ctl` classifies the result as OWNER-CONTROLLER only when delegate_to is exactly
+     controller_scope.delegate_to, no other tracked keyword is set, every pin var's EFFECTIVE value ('ip:' if bound,
+     else 'var:') is the EXACT declared expression (a structural string equality; nothing is evaluated, so
+     `'ssh' if 'controller_delegation.connection' else ...` is simply not the declared form), and no invalidating var is
+     bound in either layer. Not modelled (no static source in B): extra vars (refused elsewhere), set_fact /
+     include_vars caches (between the two layers). -#}
+{%- macro scope_fold(cs, eff, node, layer) -%}
+{%- set m = dict(eff if eff is mapping else {}) -%}
+{%- set node = node if node is mapping else {} -%}
+{%- set vp = 'ip:' if layer == 'param' else 'var:' -%}
+{%- if layer == 'task' -%}
+{%- for k in cs.tracked_keywords if k in node -%}{{ m.update({'kw:' ~ k: node[k] | string}) or '' }}{%- endfor -%}
+{%- endif -%}
+{%- set vs = node.vars if node.vars is defined and node.vars is mapping else {} -%}
+{%- for k in (cs.pin_vars.keys() | list) + cs.invalidating_vars if k in vs -%}{{ m.update({vp ~ k: vs[k] | string}) or '' }}{%- endfor -%}
+{{ m | to_json }}
+{%- endmacro -%}
+
+{%- macro scope_is_ctl(cs, eff) -%}
+{%- set ns = namespace(ok=(eff['kw:delegate_to'] | default(none)) == cs.delegate_to) -%}
+{%- for k in cs.tracked_keywords if k != 'delegate_to' and ('kw:' ~ k) in eff -%}{%- set ns.ok = false -%}{%- endfor -%}
+{%- for k, want in cs.pin_vars.items() if (eff['ip:' ~ k] if ('ip:' ~ k) in eff else (eff['var:' ~ k] | default(none))) != want -%}{%- set ns.ok = false -%}{%- endfor -%}
+{%- for k in cs.invalidating_vars if ('var:' ~ k) in eff or ('ip:' ~ k) in eff -%}{%- set ns.ok = false -%}{%- endfor -%}
+{{ '1' if ns.ok else '' }}
+{%- endmacro -%}
+
+{%- macro walk(tasks, via, tr, tr_dir, sep, depth, eff=none, fam=none) -%}
+{%- set eff = eff if eff is mapping else {} -%}
+{%- set cs = tr.controller_scope -%}
+{%- set kw = ['name', 'when', 'register', 'vars', 'loop', 'loop_control', 'changed_when', 'failed_when', 'tags',
+              'delegate_to', 'run_once', 'environment', 'no_log', 'become', 'become_user', 'args', 'until', 'retries',
+              'delay', 'ignore_errors', 'check_mode', 'notify', 'any_errors_fatal', 'listen', 'throttle', 'timeout',
+              'diff', 'module_defaults', 'collections', 'connection', 'block', 'rescue', 'always', 'with_items'] -%}
+{%- set bprefix = '{' ~ '{ tr_dir }' ~ '}/' ~ tr.tasks_dir ~ '/' -%}
+{#- the entry-guard family include (codex-tick333 (2)) runs BEFORE tr_dir is derived, so it names the same directory by
+    the magic playbook_dir (== tr_dir in every walked entry; the entry_guard assert proves it). ONLY that exact include
+    is admitted in this form: `fam`, the family form RENDERED for this directory from entry_forms (macro dir_forms;
+    codex-tick405 Q3); any other playbook_dir-rooted include stays UNRESOLVED. s9: `sep` is the early verifier context
+    path_separator (the retired entry_forms.path.separator is read nowhere). -#}
+{%- set fam_file = tr.entry_guard.family_rel[(tr.tasks_dir | length) + (sep | length):] -%}
+{%- set rprefix = '^\\{\\{ (rh_repo_root|playbook_dir \\| dirname \\| dirname \\| dirname) \\}\\}/' -%}
+{%- for t in (tasks or []) -%}
+{#- teff: this task/block's own effective settings (keywords + vars overlay the inherited ones) -#}
+{%- set teff = scope_fold(cs, eff, t, 'task') | trim | from_json -%}
+{%- if t.block is defined -%}
+{{ walk(t.block, via, tr, tr_dir, sep, depth, teff, fam) }}{{ walk(t.rescue | default([]), via, tr, tr_dir, sep, depth, teff, fam) }}{{ walk(t.always | default([]), via, tr, tr_dir, sep, depth, teff, fam) }}
+{%- else -%}
+{%- set mods = t.keys() | reject('in', kw) | list -%}
+{%- set mod = (mods | first) if (mods | length == 1) else 'AMBIGUOUS:' ~ (mods | join(',')) -%}
+{%- set isinc = mod in ['ansible.builtin.include_tasks', 'ansible.builtin.import_tasks'] -%}
+{#- `apply` is an include ARGUMENT: the mapping form's `apply` key, or (free-form scalar include, codex-tick306) the
+    task's `args.apply` -- ansible-core 2.19.11 merges `args` into the same task args (playbook/task_include.py
+    OTHER_ARGS apply). Both at once is ambiguous and folds NOTHING (the children stay target context, refused). -#}
+{%- set ap_m = (t[mod].apply | default(none)) if (isinc and t[mod] is mapping) else none -%}
+{%- set ap_a = (t['args']['apply'] | default(none)) if (isinc and t['args'] is defined and t['args'] is mapping) else none -%}
+{%- set ap = ({} if (ap_m is not none and ap_a is not none) else (ap_m if ap_m is not none else (ap_a if ap_a is not none else {}))) -%}
+{#- an include's CHILDREN: the inherited settings, overlaid by `apply` (layer 'task': keywords + task vars), then by
+    the include's own parameters (layer 'param': vars only, kept SEPARATE so they outrank every task/block var below).
+    The include task's own keywords do not reach its children. -#}
+{%- set ceff = (scope_fold(cs, scope_fold(cs, eff, ap, 'task') | trim | from_json, {'vars': t.vars | default({})}, 'param') | trim | from_json)
+               if isinc else teff -%}
+{%- set cctl = scope_is_ctl(cs, ceff) | trim == '1' -%}
+{%- set row = {'module': mod, 'task': t.name | default(''), 'via': via, 'ctl': cctl,
+               'delegate_to': t.delegate_to | default(none),
+               'changed_when': (t.changed_when | string) if t.changed_when is defined else none,
+               'ivars': ((t.vars | default({})).keys() | list) if mod in ['ansible.builtin.include_tasks', 'ansible.builtin.import_tasks'] else [],
+               'ic_variant': (t.vars | default({})).rh_ic_variant | default(none),
+               'become': (t.become is defined or t.become_user is defined)} -%}
+{%- if mod in ['ansible.builtin.include_tasks', 'ansible.builtin.import_tasks'] -%}
+{%- set f = t[mod] if t[mod] is string else (t[mod].file | default('')) -%}
+{%- if f.startswith(bprefix) and depth < 6 -%}
+{{ (row | combine({'include': 'b', 'file': f[bprefix | length:]}) | to_json) ~ '\n' }}
+{{- walk(lookup('ansible.builtin.file', tr_dir ~ '/' ~ tr.tasks_dir ~ '/' ~ f[bprefix | length:]) | from_yaml, via ~ '>' ~ f[bprefix | length:], tr, tr_dir, sep, depth + 1, ceff, fam) -}}
+{%- elif fam is not none and f == fam and depth < 6 -%}
+{{ (row | combine({'include': 'b', 'file': fam_file}) | to_json) ~ '\n' }}
+{{- walk(lookup('ansible.builtin.file', tr_dir ~ '/' ~ tr.tasks_dir ~ '/' ~ fam_file) | from_yaml, via ~ '>' ~ fam_file, tr, tr_dir, sep, depth + 1, ceff, fam) -}}
+{%- elif f is match(rprefix) -%}
+{{ (row | combine({'include': 'route', 'file': f | regex_replace(rprefix, '')}) | to_json) ~ '\n' }}
+{%- else -%}
+{{ (row | combine({'include': 'UNRESOLVED', 'file': f}) | to_json) ~ '\n' }}
+{%- endif -%}
+{%- elif mod == 'ansible.builtin.include_role' or mod == 'ansible.builtin.import_role' -%}
+{{ (row | combine({'include': 'UNRESOLVED', 'file': t[mod] | string}) | to_json) ~ '\n' }}
+{%- else -%}
+{{ (row | to_json) ~ '\n' }}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endmacro -%}
+
+{#- ---- ENTRY FORMS, FORM LAW, REMOTE PLACEMENTS, TARGET VARS, CONSTRUCTION (s8): moved to the pure constructor
+     macros/entry_construct.j2 (ec.entry_include, ec.bare_that, ec.rt, ec.remote_hosts, ec.form_law, ec.dir_forms,
+     ec.target_vars, ec.head_task, ec.entry_plays, ec.yaml_block, ec.entry_document). The s7 macros `cause` / `refusal`
+     over entry_forms.cause_frame are RETIRED (codex-tick435-436 grammar_decision); s9 also retires the constructor's own
+     refusal / cause_text / cause_list (codex-tick446 RV-5: the shared grammar macro is the one composition). -#}
+
+{#- ---- play_rules(tr, p, pa, declared_hosts): the play-level rules every checked entry play obeys (walked entries and
+     entry sets alike; ONE construction): host placement (controller = hosts controller_scope.delegate_to + connection
+     entry_forms.placement.controller_connection; target = hosts exactly tr.target_hosts_expr, labelled
+     entry_forms.placement.target) equal to the declared placement; any_errors_fatal true; gather_facts false;
+     TRANSFER-FIRST-GUARD-CHECKER (codex-tick333) (b): only entry_guard.play_keys (pre_tasks / roles run BEFORE tasks and
+     play-level keywords reach the guard tasks); no entry_guard.derived name as a play var. Output: the violations and
+     the placement. -#}
+{%- macro play_rules(tr, p, pa, declared_hosts) -%}
+{%- set v = [] -%}
+{%- set g = tr.entry_guard -%}
+{%- set P = tr.entry_forms.placement -%}
+{%- set ctl = tr.controller_scope.delegate_to -%}
+{%- set rx = namespace(v={}) -%}
+{{- ec.remote_hosts(rx, tr) -}}
+{%- set rl = rx.v | dict2items | selectattr('value', 'equalto', p.hosts) | map(attribute='key') | list -%}
+{%- set placed = ctl if (p.hosts == ctl and p.connection | default('') == P.controller_connection)
+                  else (P.target if p.hosts == tr.target_hosts_expr
+                        else (rl | first if rl | length == 1 else P.other ~ p.hosts)) -%}
+{%- if placed != declared_hosts -%}{{ v.append(pa ~ ': placed on ' ~ placed ~ ', declared ' ~ declared_hosts) or '' }}{%- endif -%}
+{%- if p.any_errors_fatal | default(false) is not sameas true -%}{{ v.append(pa ~ ': not any_errors_fatal') or '' }}{%- endif -%}
+{%- if p.gather_facts | default(true) is not sameas false -%}{{ v.append(pa ~ ': gathers facts') or '' }}{%- endif -%}
+{%- for pk in (p.keys() | list | sort) if pk not in g.play_keys -%}
+{{ v.append(pa ~ ': play keyword ' ~ pk ~ ' (a checked play carries only ' ~ (g.play_keys | join('/')) ~ '; pre_tasks / roles run before the entry guard, play keywords reach it)') or '' }}
+{%- endfor -%}
+{%- for dv in g.derived if dv in (p.vars | default({})) -%}
+{{ v.append(pa ~ ': play var ' ~ dv ~ ' (a derived output of the entry guard, never a play var)') or '' }}
+{%- endfor -%}
+{{ {'violations': v, 'placed': placed} | to_json }}
+{%- endmacro -%}
+
+{#- ---- entry_head(F, g, sep, fm, ts, pa, first): the head of ONE play's DIRECT task list against the rendered forms fm of
+     its entry. First play of a host class: positions = fm.head over the declared roles F.roles (route guard, family
+     guard[, bare-name refusal assert with exactly F.bare.that][, bind set_fact == bind, assert with exactly that]);
+     each head task carries exactly task_keys[role], every assert-module head task exactly assert_args. Later play: no
+     direct guard / family include. Structural string equality only; nothing is evaluated. Output: the violations and
+     the direct guard / family include counts (the nested re-entry check of the walked entries uses them). -#}
+{%- macro entry_head(F, g, sep, fm, ts, pa, first) -%}
+{%- set v = [] -%}
+{%- set gin = [] -%}
+{%- set fin = [] -%}
+{%- set R = F.roles -%}
+{%- set head = fm.head -%}
+{#- R1-S5-INVALID-ROLE-RESULT: every task_keys index below needs the vocabulary law and a valid declared head. Callers
+    already skip this macro when form_law or dir_forms recorded a cause; this guard keeps the macro fail-closed on its
+    own: it returns the withheld cause, never a template error. -#}
+{%- if (R.values() | list | sort) != (g.task_keys.keys() | list | sort) or not (fm.valid | default(false))
+       or (head | reject('in', g.task_keys.keys() | list) | list | length) > 0 -%}
+{{ {'violations': [[F.codes.withheld, F.texts.withheld | format(entry=pa)]], 'withheld': true, 'guards': 0, 'families': 0} | to_json }}
+{%- else -%}
+{%- set ik = g.task_keys[R.guard] | first -%}
+{%- set gb = sep ~ (g.guard_route_rel | basename) -%}
+{%- set fb = sep ~ g.family_rel -%}
+{#- unfiltered loop: a filtered for-loop renumbers loop.index0, and the position is what is checked -#}
+{%- for t in ts -%}
+{%- set inc = (t[ik] | default('')) if t is mapping else '' -%}
+{%- if inc is string and inc.endswith(gb) -%}{{ gin.append(loop.index0) or '' }}{%- endif -%}
+{%- if inc is string and inc.endswith(fb) -%}{{ fin.append(loop.index0) or '' }}{%- endif -%}
+{%- endfor -%}
+{%- if first -%}
+{%- set ok0 = (gin | length == 1) and (gin[0] == 0) -%}
+{%- set okf = (fin | length == 1) and (fin[0] == 1) and fm.family is not none and (ts[1][ik] | default(none)) == fm.family -%}
+{%- if not okf -%}
+{{ v.append(pa ~ ': second task of the first entry must be exactly ' ~ fm.family ~ ' (the reserved-family guard, once, before any derived name)') or '' }}
+{%- endif -%}
+{%- set nh = head | length -%}
+{%- set ok1 = (R.bind not in head) or (ts | length > nh - 1 and ts[head.index(R.bind)] is mapping
+               and (ts[head.index(R.bind)][g.task_keys[R.bind] | first] | default(none)) == g.bind) -%}
+{%- set ok2 = (R.assert not in head) or (ts | length > nh - 1 and ts[head.index(R.assert)] is mapping
+               and ((ts[head.index(R.assert)][g.task_keys[R.assert] | first] | default({})).that | default(none)) == g.that) -%}
+{#- codex-tick414 item 2: the bare-name refusal (target_prereq task 3) is a REQUIRED head role where the entry declares
+    it; its assert must carry exactly the declared bare `that` (macro bare_that: F.bare.that_format over
+    F.bare.pinned_expr; the names and the expression are transfer.decl data, ONE construction for check and render). -#}
+{%- set bthat = [ec.bare_that(F) | trim] -%}
+{%- set okb = (R.bare not in head) or (ts | length > head.index(R.bare) and ts[head.index(R.bare)] is mapping
+               and ((ts[head.index(R.bare)][g.task_keys[R.bare] | first] | default({})).that | default(none)) == bthat) -%}
+{%- if not okb -%}
+{{ v.append(F.texts.bare_position | format(play=pa, that=(bthat | to_json), position=head.index(R.bare))) or '' }}
+{%- endif -%}
+{%- set ok3 = ts | length > 0 and ts[0] is mapping and fm.guard is not none and (ts[0][ik] | default(none)) == fm.guard -%}
+{%- if gin | length > 0 and gin[0] == 0 and not ok3 -%}
+{{ v.append(pa ~ ': first guard include is not exactly ' ~ fm.guard ~ ' (rh_repo_root is derived inside the guard; any other root could select another file)') or '' }}
+{%- endif -%}
+{%- set kn = namespace(ok=true) -%}
+{%- for role in head -%}
+{%- set t = ts[loop.index0] if ts | length > loop.index0 else none -%}
+{%- if t is mapping -%}
+{%- for k in (t.keys() | list | sort) if k not in g.task_keys[role] -%}{%- set kn.ok = false -%}
+{{ v.append(pa ~ ': entry guard ' ~ role ~ ' task carries keyword ' ~ k ~ ' (exactly ' ~ (g.task_keys[role] | join('/')) ~ '; nothing may skip, suppress or redirect it)') or '' }}
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+{%- set amod = g.task_keys[R.assert] | first -%}
+{%- for role in head if (g.task_keys[role] | first) == amod -%}
+{%- set at = ts[head.index(role)] if ts | length > head.index(role) else none -%}
+{%- if at is mapping and at[amod] is defined -%}
+{%- if at[amod] is not mapping -%}{%- set kn.ok = false -%}
+{{ v.append(F.texts.args_not_mapping | format(play=pa, role=role)) or '' }}
+{%- else -%}
+{%- for k in (at[amod].keys() | list | sort) if k not in g.assert_args -%}{%- set kn.ok = false -%}
+{{ v.append(F.texts.arg_undeclared | format(play=pa, role=role, arg=k, args=(g.assert_args | join('/')))) or '' }}
+{%- endfor -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if not (ok0 and okf and ok1 and ok2 and okb and ok3 and kn.ok) -%}
+{{ v.append(pa ~ ': first entry of this host must be ' ~ g.guard_route_rel ~ ', then ' ~ g.family_rel
+            ~ ((', then the bare-name refusal') if R.bare in head else '')
+            ~ ((', then the entry_guard set_fact ' ~ (g.derived | join('/')) ~ ', then its assert') if R.bind in head else '')
+            ~ ', before any other task') or '' }}
+{%- endif -%}
+{%- else -%}
+{%- if gin | length > 0 -%}
+{{ v.append(pa ~ ': re-includes ' ~ g.guard_route_rel ~ ' in a later play of this host (the guard runs on first entry only)') or '' }}
+{%- endif -%}
+{%- if fin | length > 0 -%}
+{{ v.append(pa ~ ': re-includes ' ~ g.family_rel ~ ' in a later play of this host (the family guard runs on first entry only)') or '' }}
+{%- endif -%}
+{%- endif -%}
+{{ {'violations': v, 'guards': gin | length, 'families': fin | length} | to_json }}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- ---- ENTRY CONSTRUCTION (codex-tick417 option B): see macros/entry_construct.j2 (s8). The generated-member EQUALITY
+     (committed bytes == constructed text) is the route-r2 r2h generate_entries.yml VERIFY mode, which renders the SAME
+     entry template with the SAME admitted grammar and path separator after resolve; this verifier no longer constructs. -#}
+{#- ---- check.yml: every structural violation of the entry playbooks against the declaration, as a JSON list.
+     Entry files are read here by lookup (their "{{ }}" strings stay data). Two declared entry collections:
+       tr.entries     (this directory's transfer entries; fully walked: head, module classes, includes, contact order)
+       tr.entry_sets  (codex-tick405 Q1: every OTHER declared entry, keyed by its repository-relative directory --
+                       the target_prereq entries and check.yml itself; checked for exact play names / order, host
+                       placement, any_errors_fatal, gather_facts, play keys, derived play vars and the entry head
+                       against the rendered depth form of its directory. NOT walked: their module classes, nested
+                       includes and route include digests stay outside this check -- see the s4 record.)
+     ctx (s9, codex-tick446 R1S8-EARLY-CONTEXT option c) = the typed early verifier context rh_early_view.context that
+     check.yml play 1 binds from the R2 early-view producer and checks against the launcher's source binding BEFORE this
+     call: path_separator (core controller.bootstrap.path_admission.separator), refusal_grammar (not read here; check.yml
+     frames the refusal) and body_domain (controller.bootstrap.body_domain: undecodable_regex, read.lstrip, read.rstrip). -#}
+{%- macro violations(tr, tr_dir, repo_root, ctx) -%}
+{%- set v = [] -%}
+{%- set n = namespace(rows=0) -%}
+{%- set bfiles = [] -%}
+{%- set F = tr.entry_forms -%}
+{#- s9: the s8 verifier-only deviation (entry_forms.path.separator) is GONE; the separator is the early context's -#}
+{%- set sep = ctx.path_separator -%}
+{%- set BD = ctx.body_domain -%}
+{%- set tr_rel = tr_dir[(repo_root | length) + (sep | length):] -%}
+{%- set fl = namespace(v=[]) -%}
+{{- ec.form_law(fl, tr, sep) -}}
+{%- set law = fl.v -%}
+{{- v.extend(law) or '' -}}
+{%- set ok_law = law | length == 0 -%}
+{%- set tv = namespace(v={}) -%}
+{{- ec.target_vars(tv, tr) -}}
+{%- set tvars = tv.v -%}
+{%- set fm = namespace(violations=[], valid=false, guard=none, family=none, head=[]) -%}
+{{- ec.dir_forms(fm, tr, sep, tr_rel, tr_rel, F.entries_head) -}}
+{{- v.extend(fm.violations) or '' -}}
+{%- for ename, decl in tr.entries.items() -%}
+{%- set plays = lookup('ansible.builtin.file', tr_dir ~ '/' ~ ename) | from_yaml -%}
+{%- if (plays | map(attribute='name') | list) != (decl | map(attribute='id') | list) -%}
+{{ v.append(ename ~ ': plays ' ~ (plays | map(attribute='name') | list | to_json) ~ ' != declared ' ~ (decl | map(attribute='id') | list | to_json)) or '' }}
+{%- endif -%}
+{#- ENTRY GUARD (codex tick318-321 item 2; decl entry_guard): the derived names are never play vars; the FIRST play of
+    each host class (localhost / target) starts with exactly the head of this directory's declared entry form (macro
+    entry_head; rendered includes, codex-tick405 Q3); a later play of that host class never includes the guard again.
+    Structural string equality only; nothing is evaluated. -#}
+{%- set eg = namespace(seen=[]) -%}
+{%- for p in plays -%}
+{%- set d = decl | selectattr('id', 'equalto', p.name | default('')) | first | default({'hosts': F.placement.undeclared, 'kind': F.placement.undeclared}) -%}
+{%- set pa = ename ~ ':' ~ (p.name | default('?')) -%}
+{%- set pr = play_rules(tr, p, pa, d.hosts) | trim | from_json -%}
+{{- v.extend(pr.violations) or '' -}}
+{%- set placed = pr.placed -%}
+{%- set g = tr.entry_guard -%}
+{#- TRANSFER-FIRST-GUARD-CHECKER (codex-tick333) (a)/(c) and the positions of codex-tick333 (2), now through the
+    rendered entry form of this directory (macro entry_head; codex-tick405 Q3) -#}
+{%- set fst = placed not in eg.seen -%}
+{%- if fst -%}{%- set eg.seen = eg.seen + [placed] -%}{%- endif -%}
+{%- set eh = entry_head(F, g, sep, fm, p.tasks | default([]), pa, fst) | trim | from_json -%}
+{{- v.extend(eh.violations) or '' -}}
+{%- if placed == F.placement.target -%}
+{%- for cv in tr.contract.conn_vars + tr.contract.credential_selectors.bind_key + tr.contract.credential_selectors['clear'] -%}
+{%- if (p.vars | default({}))[cv] | default('') != tvars[cv] -%}
+{{ v.append(pa ~ ': connection var ' ~ cv ~ ' not bound to the contract') or '' }}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- set rows = walk(p.tasks | default([]), pa, tr, tr_dir, sep, 0, none, fm.family) | trim | split('\n') | select | map('from_json') | list -%}
+{%- set n.rows = n.rows + (rows | length) -%}
+{#- TRANSFER-RECURSIVE-GUARD-REENTRY-COVERAGE (codex-tick341-347): the top-level collectors (entry_head guards / families) see only
+    the play's DIRECT tasks. Re-entry is also possible through anything walk() reaches: a B tasks include (recursive,
+    any depth it walks), a block / rescue / always, or a differently-rooted include. Every walked row whose included
+    file is either guard (by basename: route, B, rendered family form or UNRESOLVED alike) is counted; the ONLY admitted ones
+    are the direct top-level includes already counted in gin / fin (and position-checked above on first entry, refused
+    above on a later play). Any surplus is a re-entry, refused with its walk path. -#}
+{%- set grd = [g.guard_route_rel | basename, g.family_rel | basename] -%}
+{%- set grows = rows | selectattr('include', 'defined') | selectattr('file', 'defined')
+                     | selectattr('file', 'string') | list -%}
+{%- set grows = grows | selectattr('file', 'match', '^(.*/)?(' ~ (grd | map('regex_escape') | join('|')) ~ ')$') | list -%}
+{#- s6: no re-entry verdict from a withheld entry_head (its counts are not observations; the cause is recorded) -#}
+{%- if not (eh.withheld | default(false)) and (grows | length) > (eh.guards | int) + (eh.families | int) -%}
+{{ v.append(pa ~ ': re-enters an entry guard (' ~ (grd | join(' / ')) ~ ') through a nested include or block: '
+            ~ (grows | rejectattr('via', 'equalto', pa) | map(attribute='via') | list
+               + (grows | selectattr('via', 'equalto', pa) | map(attribute='task') | list)) | to_json
+            ~ ' (a guard runs once, as a direct task of the first entry of its host; never reachable from another include)') or '' }}
+{%- endif -%}
+{%- if placed == F.placement.target -%}
+{%- set ic = tr.initial_contact -%}
+{%- for pv in ic.refused_play_vars -%}
+{%- if pv in (p.vars | default({})) -%}{{ v.append(pa ~ ': root target play binds ' ~ pv ~ ' (the PRIVILEGED contact owns it)') or '' }}{%- endif -%}
+{%- endfor -%}
+{%- if p.become is defined or p.become_user is defined -%}{{ v.append(pa ~ ': root target play sets become') or '' }}{%- endif -%}
+{%- set icn = namespace(seen=false) -%}
+{%- for r in rows -%}
+{%- set at = pa ~ ' [' ~ r.via ~ '] ' ~ r.task ~ ': ' -%}
+{%- for iv in r.ivars | default([]) | select('in', ic.refused_include_vars) -%}{{ v.append(at ~ 'include parameter ' ~ iv ~ ' on a root target play') or '' }}{%- endfor -%}
+{%- if r.become | default(false) -%}{{ v.append(at ~ 'become on a root target play') or '' }}{%- endif -%}
+{%- if not icn.seen -%}
+{%- if r.include | default('') == 'route' and r.file == ic.route_rel -%}{%- set icn.seen = true -%}
+{%- if r.ic_variant != ic.variant -%}{{ v.append(at ~ 'INITIAL CONTACT variant ' ~ (r.ic_variant | string) ~ ' on a root target play (declared ' ~ ic.variant ~ ')') or '' }}{%- endif -%}
+{%- elif r.include | default('') == 'route' and r.file not in ic.pre_contact_route -%}{{ v.append(at ~ 'route include ' ~ r.file ~ ' before INITIAL CONTACT') or '' }}
+{%- elif r.module not in ic.contact_free_modules -%}{{ v.append(at ~ 'module ' ~ r.module ~ ' before INITIAL CONTACT') or '' }}
+{%- endif -%}
+{%- elif r.include | default('') == 'route' and r.file in ic.owner_only_route and not (r.ctl | default(false)) -%}{{ v.append(at ~ 'owner-only route include ' ~ r.file ~ ' in target context after the PRIVILEGED contact') or '' }}
+{%- endif -%}
+{%- endfor -%}
+{%- if not icn.seen -%}{{ v.append(pa ~ ': target play never includes ' ~ ic.route_rel ~ ' (INITIAL CONTACT)') or '' }}{%- endif -%}
+{%- endif -%}
+{{- bfiles.extend(rows | selectattr('include', 'defined') | selectattr('include', 'equalto', 'b') | map(attribute='file') | list) or '' -}}
+{%- for r in rows -%}
+{%- set at = pa ~ ' [' ~ r.via ~ '] ' ~ r.task ~ ': ' -%}
+{%- if r.include | default('') == 'UNRESOLVED' -%}{{ v.append(at ~ 'unresolved include ' ~ r.file) or '' }}{%- endif -%}
+{%- if r.include | default('') == 'route' -%}
+{%- set ri = tr.route_includes | selectattr('rel', 'equalto', r.file) | first | default(none) -%}
+{%- if ri is none -%}{{ v.append(at ~ 'undeclared route include ' ~ r.file) or '' }}
+{%- elif lookup('ansible.builtin.file', repo_root ~ '/' ~ r.file, lstrip=BD.read.lstrip, rstrip=BD.read.rstrip) | hash('sha256') != ri.sha256 -%}{{ v.append(at ~ 'route include sha256 drift ' ~ r.file) or '' }}
+{%- endif -%}
+{%- endif -%}
+{%- if d.kind == 'observe' -%}
+{%- if r.module not in tr.observe_modules -%}{{ v.append(at ~ 'module ' ~ r.module ~ ' in an observe play') or '' }}{%- endif -%}
+{%- if r.module == 'ansible.builtin.command' and r.changed_when != 'False' -%}{{ v.append(at ~ 'command without changed_when false in an observe play') or '' }}{%- endif -%}
+{%- if r.delegate_to is not none -%}{{ v.append(at ~ 'delegation in an observe play') or '' }}{%- endif -%}
+{%- else -%}
+{%- if r.module not in (tr.observe_modules + tr.effect_modules) -%}{{ v.append(at ~ 'undeclared module ' ~ r.module) or '' }}{%- endif -%}
+{%- if r.delegate_to is not none and r.delegate_to != 'localhost' -%}{{ v.append(at ~ 'delegation to ' ~ r.delegate_to) or '' }}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- endfor -%}
+{#- ---- DECLARED ENTRY SETS (codex-tick405 Q1): every other declared entry, read from <repo_root>/<dir>/<file>, against
+     the rendered entry form of ITS directory. Same play rules and the same entry_head as the walked entries above;
+     no module walk. A declared directory without a form, an absent play, an undeclared play or a play out of order
+     refuses. -#}
+{#- brr-follow-s2 J-RNP-02 (F05-S4 roster-nonplaybook): a RENDERED member (output entry_forms.outputs.rendered; exactly
+    {output}: no head, no plays, no body; a shell entry is not a play document) is NOT walked here -- it is no play
+    entry; its bytes are the genesis render's, drift-checked by generate_entries.yml VERIFY mode (re-render). Selected by
+    the declared marker word only (no name, no list). -#}
+{%- for sdir, sfiles in tr.entry_sets.items() -%}
+{%- for sname, sent in sfiles.items() if sent.output != F.outputs.rendered -%}
+{#- per ENTRY FILE: its directory's rendered forms + its own declared head (codex-tick414 item 2: e.g. the
+    target_prereq entries declare the bare-name refusal role; owner_key.yml does not) -#}
+{%- set sfm = namespace(violations=[], valid=false, guard=none, family=none, head=[]) -%}
+{{- ec.dir_forms(sfm, tr, sep, tr_rel, sdir, sent.head) -}}
+{%- set sid = sdir ~ sep ~ sname -%}
+{%- for c in sfm.violations -%}{{ v.append([c[0], F.texts.entry_cause | format(entry=sid, cause=c[1])]) or '' }}{%- endfor -%}
+{%- set sdecl = sent.plays -%}
+{#- s6: a roster member that is absent refuses with its declared cause (never a lookup error). s8: a GENERATED member's
+    equality with its construction is NOT checked here any more (route-r2 r2h VERIFY mode re-renders it through the
+    same entry template, admitted grammar and path separator; codex-tick435-436 grammar_decision / separator_decision);
+    its body custody stays here. Withheld (cause recorded above) when the declaration laws or the entry forms fail. -#}
+{%- set sp = (lookup('ansible.builtin.file', repo_root ~ sep ~ sid) | from_yaml) if (repo_root ~ sep ~ sid) is file else none -%}
+{%- if sp is none -%}{{ v.append([F.codes.output_missing, F.texts.output_missing | format(entry=sid)]) or '' }}{%- set sp = [] -%}
+{%- elif sent.output | default(none) == F.outputs.generated -%}
+{%- if not (ok_law and sfm.valid) -%}{{ v.append([F.codes.withheld, F.texts.withheld | format(entry=sid)]) or '' }}
+{%- else -%}
+{#- BODY CUSTODY (codex-tick425-426; s8 R1S7-BODY-BYTE-BINDING; s9 codex-tick446 R1S8-PLAINTEXT-BODY-BYTES): the
+    declared body domain is PLAINTEXT UTF-8 (ctx.body_domain = controller.bootstrap.body_domain via the early view).
+    Each declared body is read ONCE by the existing file lookup with lstrip AND rstrip disabled by the declared settings
+    BD.read (no literal); the one retained value is hashed (entry_forms.digest.algorithm) and checked against the
+    declared plays[].body_sha256 -- the raw on-disk digest the pre-launch source admission must also have checked
+    (R2 / seed contract, blocked item) -- and against the domain (no BD.undecodable_regex match: the lookup decodes
+    invalid UTF-8 with surrogateescape, which the hash filter re-encodes to the ORIGINAL bytes, so the digest alone does
+    not refuse non-UTF-8) BEFORE that same value is parsed. Order: absent, digest, domain, parse. Valid UTF-8 survives
+    the lookup and the hash byte-exact, LF / CRLF / trailing newline included (installed ansible-core 2.19.11 source
+    inspection by Codex, not a run). NOT claimed: encrypted or binary inputs. A vault body is decrypted by the lookup,
+    so it refuses only through the digest (body_sha256 is the raw ciphertext digest), or, with no vault secret, by an
+    untyped lookup error (RV-20). This check is not proof of earlier admission by itself. -#}
+{%- for d in sent.plays -%}
+{%- set pid = F.texts.play_id | format(entry=sid, play=d.id) -%}
+{#- r5u-rf2 (codex-tick510 RF-OD-9 a, body custody): the canonical declared-root expression is the lookup's first token
+    (check.yml LOAD-BASE), written inline in the file test and the ONE read; no alias. The read keeps the declared
+    strip settings (BD.read), and the digest is taken before the domain check and the parse (unchanged). -#}
+{%- set raw = lookup('ansible.builtin.file', repo_root ~ sep ~ d.body, lstrip=BD.read.lstrip, rstrip=BD.read.rstrip) if (repo_root ~ sep ~ d.body) is file else none -%}
+{%- set dg = (raw | hash(F.digest.algorithm)) if raw is not none else none -%}
+{%- set dom = raw is not none and raw is not search(BD.undecodable_regex) -%}
+{%- set body = (raw | from_yaml) if (dg is not none and dg == d.body_sha256 and dom) else none -%}
+{%- if raw is none -%}{{ v.append([F.codes.body_not_tasks, F.texts.body_not_tasks | format(play=pid, body=d.body)]) or '' }}
+{%- elif dg != d.body_sha256 -%}{{ v.append([F.codes.body_digest_drift, F.texts.body_digest_drift | format(play=pid, body=d.body, declared=d.body_sha256)]) or '' }}
+{%- elif not dom -%}{{ v.append([F.codes.body_domain, F.texts.body_domain | format(play=pid, body=d.body)]) or '' }}
+{%- elif body is none or body is string or body is mapping or body is not iterable -%}{{ v.append([F.codes.body_not_tasks, F.texts.body_not_tasks | format(play=pid, body=d.body)]) or '' }}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endif -%}
+{%- if (sp | map(attribute='name') | list) != (sdecl | map(attribute='id') | list) -%}
+{{ v.append(sid ~ ': plays ' ~ (sp | map(attribute='name') | list | to_json) ~ ' != declared ' ~ (sdecl | map(attribute='id') | list | to_json)) or '' }}
+{%- endif -%}
+{%- set seg = namespace(seen=[]) -%}
+{%- for p in sp -%}
+{%- set d = sdecl | selectattr('id', 'equalto', p.name | default('')) | first | default({'hosts': F.placement.undeclared}) -%}
+{%- set pa = sid ~ ':' ~ (p.name | default('?')) -%}
+{%- set pr = play_rules(tr, p, pa, d.hosts) | trim | from_json -%}
+{{- v.extend(pr.violations) or '' -}}
+{%- set fst = pr.placed not in seg.seen -%}
+{%- if fst -%}{%- set seg.seen = seg.seen + [pr.placed] -%}{%- endif -%}
+{%- set eh = entry_head(F, tr.entry_guard, sep, sfm, p.tasks | default([]), pa, fst) | trim | from_json -%}
+{{- v.extend(eh.violations) or '' -}}
+{%- endfor -%}
+{%- endfor -%}
+{%- endfor -%}
+{#- s8 DISCOVERY BINDING (codex-tick430-434 R1S6-DEPTH-CONTROL-REACHABILITY): entry_forms.discovery.max_up is bound to
+    the ACTUAL search of the route first guard (entry_guard.guard_route_rel): every candidate list there must be exactly
+    [magic, magic + up_filter, ..., magic + max_up x up_filter], and at least one must exist. The list punctuation
+    ('[', ', ', ']') is the guard's Jinja list syntax (remaining violation RV-14). -#}
+{%- set gtxt = lookup('ansible.builtin.file', repo_root ~ sep ~ tr.entry_guard.guard_route_rel, lstrip=BD.read.lstrip, rstrip=BD.read.rstrip) if (repo_root ~ sep ~ tr.entry_guard.guard_route_rel) is file else '' -%}
+{%- set dl = namespace(t=[]) -%}
+{%- for k in range((F.discovery.max_up | int) + 1) -%}{%- set dl.t = dl.t + [F.magic ~ (F.path.up_filter * k)] -%}{%- endfor -%}
+{%- set dwant = '[' ~ (dl.t | join(', ')) ~ ']' -%}
+{%- set dgot = gtxt | regex_findall('\\[' ~ (F.magic | regex_escape) ~ '[^\\]]*\\]') -%}
+{%- if (dgot | length) == 0 or (dgot | reject('equalto', dwant) | list | length) > 0 -%}
+{{ v.append([F.codes.discovery_unbound, F.texts.discovery_unbound | format(guard=tr.entry_guard.guard_route_rel, max_up=F.discovery.max_up, want=dwant, got=(dgot | unique | list | to_json))]) or '' }}
+{%- endif -%}
+{%- set gate = lookup('ansible.builtin.file', tr_dir ~ '/../deploy_gate.sh') -%}
+{%- for k in ['contract_json', 'ssh_argv', 'machine_id', 'transfer_receipt'] -%}
+{%- if (tr.outputs.prefix not in gate) or (tr.outputs[k] not in gate) -%}{{ v.append('deploy_gate.sh does not name output ' ~ tr.outputs.prefix ~ '<label>' ~ tr.outputs[k]) or '' }}{%- endif -%}
+{%- endfor -%}
+{%- if 'root@${HOST}' in gate or 'root@$HOST' in gate -%}{{ v.append('deploy_gate.sh builds its own root@HOST ssh target') or '' }}{%- endif -%}
+{%- set il = [] -%}
+{%- for ri in tr.route_includes | sort(attribute='rel') -%}
+{{ il.append((lookup('ansible.builtin.file', repo_root ~ '/' ~ ri.rel, lstrip=BD.read.lstrip, rstrip=BD.read.rstrip) | hash('sha256')) ~ '  ' ~ ri.rel[(tr.route_interface.base | length) + 1:] ~ '\n') or '' }}
+{%- endfor -%}
+{%- if (il | join('')) | hash('sha256') != tr.route_interface.interface_sha256 -%}{{ v.append('route consumer interface drift: computed ' ~ ((il | join('')) | hash('sha256')) ~ ' != declared revision ' ~ tr.route_interface.revision ~ ' ' ~ tr.route_interface.interface_sha256) or '' }}{%- endif -%}
+{%- for f in (tr.entries.keys() | list) + (bfiles | unique | map('regex_replace', '^', tr.tasks_dir ~ '/') | list) -%}
+{%- if 'profiles/remote-harness.yml' in lookup('ansible.builtin.file', tr_dir ~ '/' ~ f) -%}{{ v.append(f ~ ' reads the raw remote-harness profile (consume the resolved policy rh)') or '' }}{%- endif -%}
+{%- endfor -%}
+{%- if n.rows == 0 -%}{{ v.append('no task walked') or '' }}{%- endif -%}
+{{ {'rows': n.rows, 'violations': v} | to_json }}
+{%- endmacro -%}

@@ -1,0 +1,264 @@
+---
+- name: Require a declared, off-member, adequately sized backup-repository contract
+  ansible.builtin.assert:
+    that:
+      # Declared identity/placement policy (defaults reproduce the prior values
+      # but are overridable through the tier chain -- no fixed physical literals).
+      - postgresql_backup_owner is string
+      - postgresql_backup_owner is match('^[a-z_][a-z0-9_-]{0,31}$')
+      - postgresql_backup_root_prefix is string
+      - postgresql_backup_root_prefix is match('^/')
+      - "'..' not in postgresql_backup_root_prefix"
+      - postgresql_backup_owner_uid is integer
+      - postgresql_backup_owner_gid is integer
+      - postgresql_backup_subid_start is integer
+      - (postgresql_backup_subid_count is integer) and (postgresql_backup_subid_count > 0)
+      # The incoming resolved contract must agree with the declared policy.
+      - postgresql_backup_config.owner == postgresql_backup_owner
+      - postgresql_backup_config.root == postgresql_backup_root_prefix ~ '/' ~ postgresql_backup_config.run_id
+      # Off-member durability: the repository node must be declared and must NOT be
+      # a database domain member. An empty member set is refused (fail-closed).
+      - postgresql_backup_domain_members | length > 0
+      - postgresql_backup_config.node not in postgresql_backup_domain_members
+      # HARD DECLARED MINIMUMS: observed capacity/reserve must meet the declared
+      # floors (>=, not ==); an undersized host fails closed. Admission is not weakened.
+      - (postgresql_backup_min_capacity_bytes is integer) and (postgresql_backup_min_capacity_bytes > 0)
+      - (postgresql_backup_min_reserve_bytes is integer) and (postgresql_backup_min_reserve_bytes > 0)
+      - postgresql_backup_config.capacity_bytes is integer
+      - postgresql_backup_config.reserve_bytes is integer
+      - postgresql_backup_config.capacity_bytes >= postgresql_backup_min_capacity_bytes
+      - postgresql_backup_config.reserve_bytes >= postgresql_backup_min_reserve_bytes
+    fail_msg: >-
+      postgresql_backup requires a declared, off-member, absolute-path, adequately
+      sized repository contract (see role defaults / tier chain); capacity and
+      reserve must meet the declared hard minimums and the repository node must not
+      be a database domain member.
+
+- name: Verify exact-path prerequisites before physical changes
+  ansible.builtin.script:
+    cmd: "preflight.py {{ postgresql_backup_config.run_id }} {{ postgresql_backup_config.capacity_bytes }} {{ postgresql_backup_config.reserve_bytes + postgresql_backup_config.runtime_overhead_bytes + postgresql_backup_config.existing_commit_bytes }} {{ postgresql_backup_config.publish_address }} {{ postgresql_backup_min_capacity_bytes }} {{ postgresql_backup_owner | quote }} {{ postgresql_backup_owner_group | quote }} {{ postgresql_backup_owner_uid }} {{ postgresql_backup_owner_gid }} {{ postgresql_backup_owner_home | quote }} {{ postgresql_backup_subid_start }} {{ postgresql_backup_subid_count }} {{ postgresql_backup_root_prefix | quote }}"
+    executable: python3
+  become: true
+  changed_when: false
+
+- name: Create the dedicated backup group
+  ansible.builtin.group:
+    name: "{{ postgresql_backup_owner_group }}"
+    gid: "{{ postgresql_backup_owner_gid }}"
+    state: present
+  become: true
+
+- name: Create the dedicated rootless backup identity
+  ansible.builtin.user:
+    name: "{{ postgresql_backup_owner }}"
+    uid: "{{ postgresql_backup_owner_uid }}"
+    group: "{{ postgresql_backup_owner_group }}"
+    home: "{{ postgresql_backup_owner_home }}"
+    shell: /usr/sbin/nologin
+    create_home: true
+    password_lock: true
+    state: present
+  become: true
+
+- name: Allocate only the checked backup subordinate identity range
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    regexp: "{{ '^' ~ (postgresql_backup_owner | regex_escape) ~ ':' }}"
+    line: "{{ postgresql_backup_owner ~ ':' ~ postgresql_backup_subid_start ~ ':' ~ postgresql_backup_subid_count }}"
+    create: false
+  loop: [/etc/subuid, /etc/subgid]
+  become: true
+
+- name: Create root-controlled run and configuration directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: "{{ postgresql_backup_owner_group }}"
+    mode: '0750'
+  loop:
+    - "{{ postgresql_backup_root_prefix }}"
+    - "{{ postgresql_backup_config.root }}"
+    - "{{ postgresql_backup_config.root }}/config"
+  become: true
+
+- name: Create only an absent mountpoint without changing an active repository owner
+  ansible.builtin.file:
+    path: "{{ postgresql_backup_config.mount_path }}"
+    state: directory
+  become: true
+
+- name: Record the exact run-owned filesystem identity before allocation
+  ansible.builtin.copy:
+    content: "{{ {'run_id': postgresql_backup_config.run_id, 'capacity_bytes': postgresql_backup_config.capacity_bytes, 'owner': postgresql_backup_owner} | to_json }}"
+    dest: "{{ postgresql_backup_config.root }}/ownership.json"
+    owner: root
+    group: root
+    mode: '0600'
+    force: false
+  become: true
+
+- name: Inspect only this run's backing image
+  ansible.builtin.stat:
+    path: "{{ postgresql_backup_config.root }}/repository.img"
+    follow: false
+  register: postgresql_backup_image
+  become: true
+
+- name: Allocate the actual bounded repository image at the declared capacity
+  ansible.builtin.command:
+    argv: [fallocate, --length, "{{ postgresql_backup_config.capacity_bytes | string }}", "{{ postgresql_backup_config.root }}/repository.img"]
+  when: not postgresql_backup_image.stat.exists
+  become: true
+
+- name: Create ext4 only in the image created by this invocation
+  ansible.builtin.command:
+    argv: [mkfs.ext4, -F, -m, '0', "{{ postgresql_backup_config.root }}/repository.img"]
+  when: not postgresql_backup_image.stat.exists
+  become: true
+
+- name: Protect the backing image from direct service-owner access
+  ansible.builtin.file:
+    path: "{{ postgresql_backup_config.root }}/repository.img"
+    owner: root
+    group: root
+    mode: '0600'
+  become: true
+
+- name: Stage the exact persistent file-backed mount
+  ansible.builtin.copy:
+    content: "{{ postgresql_backup_config.mount_unit }}"
+    dest: "/etc/systemd/system/{{ postgresql_backup_config.mount_name }}"
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+
+- name: Mount only the run-owned bounded repository filesystem
+  ansible.builtin.systemd_service:
+    name: "{{ postgresql_backup_config.mount_name }}"
+    daemon_reload: true
+    enabled: true
+    state: started
+  become: true
+
+- name: Grant the backup owner only the mounted repository contents
+  ansible.builtin.file:
+    path: "{{ postgresql_backup_config.mount_path }}"
+    owner: "{{ postgresql_backup_owner }}"
+    group: "{{ postgresql_backup_owner_group }}"
+    mode: '0700'
+    state: directory
+  become: true
+
+- name: Stage exact backup TLS grants without logging contents
+  ansible.builtin.copy:
+    src: "{{ item.source_path }}"
+    dest: "{{ item.destination }}"
+    owner: root
+    group: "{{ postgresql_backup_owner_group }}"
+    mode: '0640'
+  loop: "{{ postgresql_backup_config.credential_grants }}"
+  no_log: true
+  become: true
+
+- name: Stage stanza-restricted TLS server configuration
+  ansible.builtin.copy:
+    content: "{{ postgresql_backup_config.server_config }}"
+    dest: "{{ postgresql_backup_config.root }}/config/pgbackrest.conf"
+    owner: root
+    group: "{{ postgresql_backup_owner_group }}"
+    mode: '0640'
+  become: true
+
+- name: Create the owner Quadlet directory
+  ansible.builtin.file:
+    path: "{{ postgresql_backup_owner_home }}/.config/containers/systemd"
+    owner: "{{ postgresql_backup_owner }}"
+    group: "{{ postgresql_backup_owner_group }}"
+    mode: '0700'
+    state: directory
+  become: true
+
+- name: Stage qualified image archive for this rootless owner
+  ansible.builtin.copy:
+    src: "{{ postgresql_backup_config.image.archive }}"
+    dest: "{{ postgresql_backup_config.root }}/image.oci.tar"
+    owner: "{{ postgresql_backup_owner }}"
+    group: "{{ postgresql_backup_owner_group }}"
+    mode: '0400'
+  become: true
+
+- name: Verify the copied immutable archive
+  ansible.builtin.stat:
+    path: "{{ postgresql_backup_config.root }}/image.oci.tar"
+    checksum_algorithm: sha256
+  register: postgresql_backup_archive
+  become: true
+
+- name: Require the qualified archive hash
+  ansible.builtin.assert:
+    that: postgresql_backup_archive.stat.checksum == postgresql_backup_config.image.archive_sha256
+
+- name: Enable only the dedicated backup user manager
+  ansible.builtin.command:
+    argv: [loginctl, enable-linger, "{{ postgresql_backup_owner }}"]
+  become: true
+
+- name: Load the qualified image into the backup owner's store
+  ansible.builtin.command:
+    argv: [podman, load, --input, "{{ postgresql_backup_config.root }}/image.oci.tar"]
+  become: true
+  become_user: "{{ postgresql_backup_owner }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ postgresql_backup_owner_uid }}"
+
+- name: Stage the pgBackRest-only rootless service
+  ansible.builtin.copy:
+    content: "{{ postgresql_backup_config.container }}"
+    dest: "{{ postgresql_backup_owner_home }}/.config/containers/systemd/pgbackrest-{{ postgresql_backup_config.run_id }}.container"
+    owner: "{{ postgresql_backup_owner }}"
+    group: "{{ postgresql_backup_owner_group }}"
+    mode: '0600'
+  become: true
+
+- name: Stage the narrowly scoped root-owned backup retirement helper
+  ansible.builtin.copy:
+    src: retire.py
+    dest: "{{ postgresql_backup_config.root }}/config/retire.py"
+    owner: root
+    group: root
+    mode: '0700'
+  become: true
+
+- name: Start the TLS repository with a hard filesystem capacity boundary
+  ansible.builtin.systemd_service:
+    name: "pgbackrest-{{ postgresql_backup_config.run_id }}.service"
+    scope: user
+    daemon_reload: true
+    state: started
+  become: true
+  become_user: "{{ postgresql_backup_owner }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ postgresql_backup_owner_uid }}"
+
+
+- name: Read the exact newly installed backup container identity
+  ansible.builtin.command:
+    argv: [podman, inspect, --type, container, "pgbackrest-{{ postgresql_backup_config.run_id }}"]
+  register: postgresql_backup_native_identity
+  changed_when: false
+  no_log: true
+  become: true
+  become_user: "{{ postgresql_backup_owner }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ postgresql_backup_owner_uid }}"
+
+- name: Record only the run-owned runtime identity for bounded retirement
+  ansible.builtin.copy:
+    content: "{{ {'run_id': postgresql_backup_config.run_id, 'owner': postgresql_backup_owner, 'root': postgresql_backup_config.root, 'unit': 'pgbackrest-' ~ postgresql_backup_config.run_id ~ '.service', 'container_name': 'pgbackrest-' ~ postgresql_backup_config.run_id, 'image_id': postgresql_backup_config.image.reference, 'initial_container_id': (postgresql_backup_native_identity.stdout | from_json)[0].Id, 'quadlet_sha256': postgresql_backup_config.container | hash('sha256')} | to_nice_json }}"
+    dest: "{{ postgresql_backup_config.root }}/runtime-identity.json"
+    owner: root
+    group: root
+    mode: '0600'
+  become: true

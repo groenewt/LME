@@ -102,11 +102,16 @@
     - name: Gather service facts
       ansible.builtin.service_facts:
 
-    - name: Skip Elastic Agent installation if already running
-      ansible.builtin.meta: end_host
-      when:
-        - "'elastic-agent.service' in ansible_facts.services"
-        - ansible_facts.services['elastic-agent.service'].status == 'enabled'
+    # Scoped idempotency guard. Using `meta: end_host` here would end the whole
+    # play for this host, skipping the auditd block below AND the Wazuh agent
+    # include in main.yml -- which blocks re-runs and partial-failure recovery
+    # (e.g. Elastic installed but Wazuh failed). Gate only the fetch/extract
+    # tasks instead; the install task keeps its own `creates:` guard.
+    - name: Determine whether Elastic Agent is already installed and enabled
+      ansible.builtin.set_fact:
+        _elastic_agent_enabled: >-
+          {{ 'elastic-agent.service' in ansible_facts.services
+             and ansible_facts.services['elastic-agent.service'].status == 'enabled' }}
 
     - name: Download Elastic Agent tar.gz
       ansible.builtin.get_url:
@@ -115,12 +120,14 @@
         dest: "{{ ludus_lme_agents_linux_temp_dir }}/elastic-agent-{{ ludus_lme_agents_elastic_version }}-linux-{{ ludus_lme_agents_agent_arch }}.tar.gz"
         validate_certs: true
         mode: "0644"
+      when: not (_elastic_agent_enabled | bool)
 
     - name: Extract Elastic Agent tar.gz
       ansible.builtin.unarchive:
         src: "{{ ludus_lme_agents_linux_temp_dir }}/elastic-agent-{{ ludus_lme_agents_elastic_version }}-linux-{{ ludus_lme_agents_agent_arch }}.tar.gz"
         dest: "{{ ludus_lme_agents_linux_temp_dir }}"
         remote_src: true
+      when: not (_elastic_agent_enabled | bool)
 
     - name: Install Elastic Agent
       ansible.builtin.shell: |
@@ -144,19 +151,236 @@
         state: present
 
     - name: Download audit rules
+      # dest is an LME-OWNED file, NOT the package's own rules.d/audit.rules.
+      # PRE-EXISTING BUG this fixes: get_url defaults to force:no ("download only
+      # if dest does not exist"), but the auditd/audit package SHIPS a stub
+      # /etc/audit/rules.d/audit.rules (control directives only -- verified: -D,
+      # -b, --backlog_wait_time, -f; zero real rules). Writing there meant the
+      # stub squatted the path, get_url skipped, and the Neo23x0 ruleset never
+      # landed -- augenrules then loaded an empty ruleset (auditctl -l =>
+      # "No rules"). Writing to our own lme.rules lets get_url create it on first
+      # run (force:no stays, so airgapped RE-runs never re-hit the network), and
+      # augenrules merges ALL rules.d/*.rules -- hoisting the bare -D to the top
+      # (verified in /usr/sbin/augenrules) -- so both the package stub AND any
+      # OTHER source's rule files are preserved (codex-0345 #3). CAVEAT: the
+      # Neo23x0 ruleset carries -D, so each augenrules --load flushes the running
+      # kernel ruleset and reloads from rules.d only; runtime-injected rules not
+      # persisted in a rules.d file are not restored. That is inherent to the
+      # upstream ruleset (the original task already ran augenrules --load).
+      # Pinning/declaring the expected ruleset is flagged for the manifest owner
+      # (codex-0345 item 4 -- see report).
       ansible.builtin.get_url:
         url: "{{ ludus_lme_agents_audit_rules_url }}"
-        dest: /etc/audit/rules.d/audit.rules
+        dest: /etc/audit/rules.d/lme.rules
         mode: "0644"
+      register: _audit_rules_download
 
+    - name: Record desired audit-rules checksum
+      ansible.builtin.stat:
+        path: /etc/audit/rules.d/lme.rules
+        checksum_algorithm: sha256
+      register: _audit_rules_desired
+
+    # Best-effort identity of the desired ruleset (KEYS only). Used to PROVE our
+    # file compiled into the kernel (>= 1 desired key present) and to REPORT which
+    # desired rules the kernel skipped -- NOT as the drift baseline. The upstream
+    # Neo23x0 ruleset carries `-i` (ignore-errors), so rules for paths/users/
+    # syscalls absent on a given host are silently skipped; treating the raw file
+    # as the expected kernel state would show permanent false drift + churn.
+    # `failed_when: false` keeps this robust under --check (file not yet written).
+    - name: Read the desired audit rules file
+      ansible.builtin.slurp:
+        src: /etc/audit/rules.d/lme.rules
+      register: _audit_rules_file
+      failed_when: false
+
+    - name: Derive the desired audit rule keys (best-effort, informational)
+      ansible.builtin.set_fact:
+        _audit_desired_keys: >-
+          {{ (_audit_rules_file.content | default('') | b64decode).split('\n')
+             | map('trim') | reject('match', '^#') | reject('equalto', '')
+             | join('\n') | regex_findall('(?:-k[ =]+|key=)(\S+)') | unique }}
+
+    - name: Read the last-applied audit-rules checksum marker
+      ansible.builtin.slurp:
+        src: /etc/audit/.lme-audit-rules-applied
+      register: _audit_rules_applied_marker
+      failed_when: false
+
+    # The DRIFT baseline: the normalized `auditctl -l` line-set captured after the
+    # last VERIFIED activation. We compare kernel state against what the kernel
+    # actually ACCEPTED last time -- not against the raw file -- so the check is
+    # immune to `-i` skips AND to auditctl's `-k` -> `-F key=` normalization (both
+    # sides are auditctl -l output), while catching a single dropped rule or a
+    # full flush exactly. A missing baseline (fresh host, or an older marker that
+    # stored only the checksum) forces reactivation.
+    - name: Read the last-applied kernel rule baseline
+      ansible.builtin.slurp:
+        src: /etc/audit/.lme-audit-rules-loaded
+      register: _audit_rules_baseline_marker
+      failed_when: false
+
+    - name: Gather service facts (auditd state)
+      ansible.builtin.service_facts:
+
+    - name: List audit rules currently loaded in the kernel
+      ansible.builtin.command: auditctl -l
+      register: _audit_rules_loaded
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Compute the current (pre-activation) audit state
+      ansible.builtin.set_fact:
+        _audit_current_lines: >-
+          {{ _audit_rules_loaded.stdout_lines | default([])
+             | map('trim') | reject('equalto', '')
+             | reject('search', 'No rules') | list }}
+        _audit_recorded_lines: >-
+          {{ (_audit_rules_baseline_marker.content | default('') | b64decode).split('\n')
+             | map('trim') | reject('equalto', '') | list }}
+        _audit_current_auditd_healthy: >-
+          {{ (ansible_facts.services['auditd.service'] | default({})).state | default('') == 'running'
+             and (ansible_facts.services['auditd.service'] | default({})).status | default('') == 'enabled' }}
+
+    # Reconcile on the ACTUAL applied state, not just on whether the download
+    # changed this run. Activation is (re)done when ANY of:
+    #   * the rules file changed this run;
+    #   * the checksum marker is missing or does not match the desired checksum
+    #     (an interrupted first run leaves the file on disk but never loaded);
+    #   * the kernel-rule baseline is missing (fresh host, or an old marker format
+    #     that stored only a checksum -- covers the old-marker-partial case);
+    #   * auditctl could not read the kernel ruleset or it is empty / "No rules"
+    #     (e.g. after an external `auditctl -D`);
+    #   * auditd is not running+enabled -- an UNCHANGED file with a dead/disabled
+    #     service must still be caught and reconciled (codex-0345 #2);
+    #   * DRIFT: one or more baseline rules are no longer loaded in the kernel
+    #     (recorded is not a subset of current) -- a single dropped rule is caught
+    #     here and re-loaded, not merely asserted-and-failed.
+    # The markers are written only AFTER activation is VERIFIED below, so a clean
+    # rerun (healthy auditd + matching checksum + baseline still fully loaded)
+    # stays idempotent and does not churn.
+    - name: Decide whether audit rules need (re)activation
+      ansible.builtin.set_fact:
+        _audit_rules_need_activation: >-
+          {{ (_audit_rules_download is changed)
+             or (_audit_rules_applied_marker.content is not defined)
+             or ((_audit_rules_applied_marker.content | b64decode | trim)
+                  != (_audit_rules_desired.stat.checksum | default('')))
+             or ((_audit_recorded_lines | length) == 0)
+             or ((_audit_rules_loaded.rc | default(1) | int) != 0)
+             or ((_audit_current_lines | length) == 0)
+             or (not (_audit_current_auditd_healthy | bool))
+             or ((_audit_recorded_lines | difference(_audit_current_lines) | length) > 0) }}
+
+    # No changed_when:false -- this runs ONLY on (re)activation, and a reload
+    # (even a drift-only one where the file is unchanged) is a real change to the
+    # kernel ruleset, so reporting `changed` here is honest and lets reconcile
+    # runs be observed instead of masked as no-ops.
     - name: Load audit rules
       ansible.builtin.command: augenrules --load
-      changed_when: false
+      when: _audit_rules_need_activation | bool
 
-    - name: Restart auditd service
+    # `augenrules --load` loads the compiled ruleset into the kernel directly, so
+    # a service RESTART is not required to apply rules. We only ensure auditd is
+    # running+enabled: RHEL-family auditd.service sets RefuseManualStop=yes, so
+    # `state: restarted` would FAIL there -- `state: started` is the
+    # cross-distro-safe reconcile for a dead/disabled daemon.
+    - name: Ensure auditd is started and enabled
       ansible.builtin.service:
         name: auditd
-        state: restarted
+        state: started
+        enabled: true
+      when: _audit_rules_need_activation | bool
+
+    # VERIFY-APPLIED (codex-0345 #1) + HEALTH-ON-UNCHANGED (#2): re-read the
+    # kernel ruleset and service state UNCONDITIONALLY so both the just-activated
+    # path and the unchanged path prove the end state before we trust the markers.
+    - name: Re-read audit rules loaded in the kernel after reconciliation
+      ansible.builtin.command: auditctl -l
+      register: _audit_rules_verify
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Re-gather service facts after reconciliation
+      ansible.builtin.service_facts:
+
+    - name: Compute the post-reconciliation audit state
+      ansible.builtin.set_fact:
+        _audit_verify_lines: >-
+          {{ _audit_rules_verify.stdout_lines | default([])
+             | map('trim') | reject('equalto', '')
+             | reject('search', 'No rules') | list }}
+        _audit_loaded_keys: >-
+          {{ _audit_rules_verify.stdout | default('')
+             | regex_findall('(?:-k[ =]+|key=)(\S+)') | unique }}
+        _audit_auditd_state: >-
+          {{ (ansible_facts.services['auditd.service'] | default({})).state | default('unknown') }}
+        _audit_auditd_status: >-
+          {{ (ansible_facts.services['auditd.service'] | default({})).status | default('unknown') }}
+
+    - name: Compute which desired rule keys the kernel skipped (informational)
+      ansible.builtin.set_fact:
+        _audit_unloaded_desired_keys: "{{ _audit_desired_keys | difference(_audit_loaded_keys) }}"
+
+    # `-i` in the upstream ruleset legitimately skips rules for objects absent on
+    # this host, so unloaded desired keys are surfaced as INFO, never a failure.
+    - name: Report desired audit rule keys not loaded on this host
+      ansible.builtin.debug:
+        msg: >-
+          auditd: {{ _audit_unloaded_desired_keys | length }} desired rule key(s)
+          not present in the kernel (skipped by `-i`, or the object is absent on
+          this host): [{{ _audit_unloaded_desired_keys | join(', ') }}]
+      when: (_audit_unloaded_desired_keys | length) > 0
+
+    # Fail the play if activation did not take effect. Skipped under --check,
+    # where augenrules is not run so the kernel state is not authoritative.
+    # Requiring >= 1 DESIRED key in the kernel (no vacuous "0 keys is fine"
+    # escape hatch) makes a stub-only ruleset, a truncated download, or an HTML
+    # error page fail LOUDLY here instead of silently passing. `-i` may skip
+    # SOME desired rules on a given host (reported above as info), but our file
+    # contributing NOTHING to the kernel is a genuine activation failure.
+    - name: Assert auditd is healthy and the desired ruleset compiled into the kernel
+      ansible.builtin.assert:
+        that:
+          - (_audit_rules_verify.rc | default(1) | int) == 0
+          - (_audit_verify_lines | length) > 0
+          - _audit_auditd_state == 'running'
+          - _audit_auditd_status == 'enabled'
+          - (_audit_desired_keys | intersect(_audit_loaded_keys) | length) > 0
+        quiet: true
+        fail_msg: >-
+          auditd activation did not take effect. auditd state={{ _audit_auditd_state }}
+          status={{ _audit_auditd_status }}; kernel rules loaded={{ _audit_verify_lines | length }};
+          desired keys present in kernel={{ _audit_desired_keys | intersect(_audit_loaded_keys) | length }}
+          of {{ _audit_desired_keys | length }}.
+        success_msg: >-
+          auditd running+enabled; {{ _audit_verify_lines | length }} kernel rules loaded;
+          {{ _audit_desired_keys | intersect(_audit_loaded_keys) | length }} of
+          {{ _audit_desired_keys | length }} desired rule keys present.
+      when: not ansible_check_mode
+
+    - name: Record the applied audit-rules checksum after successful activation
+      ansible.builtin.copy:
+        content: "{{ _audit_rules_desired.stat.checksum }}"
+        dest: /etc/audit/.lme-audit-rules-applied
+        mode: "0644"
+      when:
+        - _audit_rules_need_activation | bool
+        - not ansible_check_mode
+
+    # Record the kernel-rule baseline (the normalized auditctl -l line-set that
+    # just verified) so the next run can detect a single dropped rule or a flush.
+    - name: Record the applied kernel rule baseline after successful activation
+      ansible.builtin.copy:
+        content: >-
+          {{ _audit_verify_lines | join('\n') }}
+        dest: /etc/audit/.lme-audit-rules-loaded
+        mode: "0644"
+      when:
+        - _audit_rules_need_activation | bool
+        - not ansible_check_mode
 
 # ---------------------------------------------------------------------------
 # Windows: install Elastic Agent + Sysmon
