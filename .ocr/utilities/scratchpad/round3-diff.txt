@@ -1,0 +1,955 @@
+diff --git a/.gitignore b/.gitignore
+index 83873c7..22a6a49 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,7 +16,7 @@ Chapter 3 Files/logstash.edited.conf
+ Chapter 3 Files/logstash_custom.conf
+ LME/
+ files_for_windows.zip
+-lme.conf
++Chapter*/lme.conf
+ **/venv/
+ /testing/tests/.env
+ **/.pytest_cache/
+diff --git a/ansible/UPGRADE_README.md b/ansible/UPGRADE_README.md
+index 96a16fc..1f7ed0c 100644
+--- a/ansible/UPGRADE_README.md
++++ b/ansible/UPGRADE_README.md
+@@ -184,7 +184,7 @@ If you skip backup:
+ - Fleet Server
+ - ElastAlert2
+ 
+-When the optional Elastic services pack is enabled (`--elastic-services`), the upgrade also pulls the pack images (apm-server, heartbeat, metricbeat, filebeat, logstash).
++If the optional Elastic services pack is already installed, the upgrade auto-detects it from the installed pack quadlets and re-lands the pack: it pulls the pack images (apm-server, heartbeat, metricbeat, filebeat, logstash), re-copies the pack quadlets and configs, and re-runs the certificate top-up, so pack config changes actually deploy — not just the images. If auto-detection misses a pack you know is installed, force the re-land with `-e install_elastic_services=true`. To add the pack to an install that does not already have it, re-run `install.sh --elastic-services` (the upgrade re-lands an existing pack; it does not install a new one, since the pack configs it re-owns are only staged by a fresh install).
+ 
+ ### 2. Configuration Files
+ - `lme-environment.env` (version numbers updated)
+diff --git a/ansible/roles/base/tasks/debian_13.yml b/ansible/roles/base/tasks/debian_13.yml
+index cf5997a..cbb779f 100644
+--- a/ansible/roles/base/tasks/debian_13.yml
++++ b/ansible/roles/base/tasks/debian_13.yml
+@@ -1,13 +1,10 @@
+ ---
+ # Debian 13 specific tasks
+-
+-# Include the base Debian tasks
+-- name: Include base Debian tasks
+-  include_tasks: debian.yml
+-
+-# Install Debian 13 specific packages
+-- name: Install Debian 13 specific packages
+-  apt:
+-    name: "{{ debian_13_packages | default([]) }}"
+-    state: present
+-  become: yes
++#
++# Debian 13 needs nothing beyond the common Debian tasks, which
++# roles/base/tasks/main.yml already runs once via its "Include common OS tasks"
++# step (debian.yml). This file previously re-included debian.yml (running it a
++# second time) and installed debian_13_packages, a variable defined nowhere (a
++# permanent no-op); both were removed. It is intentionally left as a no-op so
++# main.yml's version-specific dispatch (with_first_found) resolves here for
++# Debian 13 rather than falling through to common.yml.
+diff --git a/ansible/roles/base/tasks/setup_passwords.yml b/ansible/roles/base/tasks/setup_passwords.yml
+index 415d803..8b9c95a 100644
+--- a/ansible/roles/base/tasks/setup_passwords.yml
++++ b/ansible/roles/base/tasks/setup_passwords.yml
+@@ -39,6 +39,7 @@
+         url: "https://api.pwnedpasswords.com/range/{{ prefix }}"
+         method: GET
+         return_content: yes
++        status_code: 200
+       register: hibp_response
+       ignore_errors: yes
+       when: not (offline_mode | default(false))
+@@ -48,12 +49,30 @@
+         msg: "Offline mode enabled - skipping HIBP password breach check"
+       when: offline_mode | default(false)
+ 
++    # An unreachable HIBP API must NOT be swallowed as "not breached": warn
++    # clearly that the check was skipped (keeps offline resilience) so the
++    # operator knows the password was never verified against known breaches.
++    - name: Warn that breach check was skipped (HIBP API unreachable)
++      debug:
++        msg: >-
++          WARNING: breach check skipped (HIBP unreachable) - could not reach
++          https://api.pwnedpasswords.com. The password was NOT checked against
++          Have I Been Pwned; proceeding without breach verification.
++      when:
++        - not (offline_mode | default(false))
++        - hibp_response is failed
++
++    # Only block when the check actually ran and matched. Note: openssl emits a
++    # lowercase SHA-1 hash while the HIBP /range/ response lists suffixes in
++    # UPPERCASE, so the suffix must be upper-cased or the match never fires
++    # (a breached password would otherwise be accepted silently).
+     - name: Fail if password is found in breaches
+       fail:
+         msg: "The password has been found in breaches... this should only happen if you provided a password via the cli... choose a different password"
+       when:
+         - not (offline_mode | default(false))
+-        - hibp_response.content | default('') | regex_search(suffix)
++        - hibp_response is not failed
++        - (hibp_response.content | default('') | regex_search(suffix | upper)) is not none
+ 
+ - name: check if vault-pass.sh is created
+   stat:
+@@ -131,7 +150,7 @@
+       [storage]
+       driver = "overlay"
+       runroot = "{{ storage_runroot | default('/run/containers/storage') }}"
+-      graphroot = "{{ storage_graphroot | default('/var/lib/containers/storage') }}"
++      graphroot = "{{ storage_graphroot | default('/var/lib/containers/storage', true) }}"
+       [storage.options.overlay]
+       mount_program = "/usr/bin/fuse-overlayfs"
+ 
+diff --git a/ansible/roles/podman/tasks/container_setup.yml b/ansible/roles/podman/tasks/container_setup.yml
+index afea9cf..1dbd4f6 100644
+--- a/ansible/roles/podman/tasks/container_setup.yml
++++ b/ansible/roles/podman/tasks/container_setup.yml
+@@ -160,6 +160,17 @@
+     - not (offline_mode | default(false))
+     - install_elastic_services | default(false) | bool
+ 
++- name: Display Elastic services container pull errors
++  debug:
++    msg: "Failed to pull container: {{ item.item }}"
++  loop: "{{ pull_elastic_services_result.results | default([]) }}"
++  when:
++    - not (offline_mode | default(false))
++    - install_elastic_services | default(false) | bool
++    - item is failed
++  loop_control:
++    label: "{{ item.item }}"
++
+ - name: Tag Elastic services containers (online mode only)
+   shell: |
+     export PATH=$PATH:/nix/var/nix/profiles/default/bin
+@@ -175,4 +186,15 @@
+   ignore_errors: yes
+   when:
+     - not (offline_mode | default(false))
+-    - install_elastic_services | default(false) | bool
+\ No newline at end of file
++    - install_elastic_services | default(false) | bool
++
++- name: Display Elastic services container tag errors
++  debug:
++    msg: "Failed to tag container: {{ item.item }}"
++  loop: "{{ tag_elastic_services_result.results | default([]) }}"
++  when:
++    - not (offline_mode | default(false))
++    - install_elastic_services | default(false) | bool
++    - item is failed
++  loop_control:
++    label: "{{ item.item }}"
+diff --git a/ansible/roles/podman/tasks/elastic_services_setup.yml b/ansible/roles/podman/tasks/elastic_services_setup.yml
+index 8b5cef0..79e8d63 100644
+--- a/ansible/roles/podman/tasks/elastic_services_setup.yml
++++ b/ansible/roles/podman/tasks/elastic_services_setup.yml
+@@ -94,3 +94,11 @@
+     - lme-filebeat
+     - lme-logstash
+   become: yes
++
++# OPT-IN host-facing TLS ingress. Disabled by default; enable at deploy time
++# with `-e tailscale_serve_ingress=true`. When off this include is skipped
++# entirely, so the default install behavior is unchanged. The internal ES-CA
++# service mesh is untouched either way — see tailscale_ingress.yml.
++- name: Set up host-facing tailscale serve ingress (opt-in)
++  include_tasks: tailscale_ingress.yml
++  when: tailscale_serve_ingress | default(false) | bool
+diff --git a/ansible/roles/podman/tasks/llama_cpp_setup.yml b/ansible/roles/podman/tasks/llama_cpp_setup.yml
+index 565a058..ef40739 100644
+--- a/ansible/roles/podman/tasks/llama_cpp_setup.yml
++++ b/ansible/roles/podman/tasks/llama_cpp_setup.yml
+@@ -183,15 +183,6 @@
+     mode: '0644'
+   become: yes
+ 
+-- name: Copy LiteLLM quadlet file to /etc/containers/systemd
+-  copy:
+-    src: "{{ clone_directory }}/quadlet/lme-litellm.container"
+-    dest: /etc/containers/systemd/lme-litellm.container
+-    owner: "root"
+-    group: "root"
+-    mode: '0644'
+-  become: yes
+-
+ - name: Build LME Log Analyzer container image
+   shell: |
+     export PATH=$PATH:/nix/var/nix/profiles/default/bin
+diff --git a/ansible/roles/podman/tasks/quadlet_setup.yml b/ansible/roles/podman/tasks/quadlet_setup.yml
+index 4b296a0..f2e7cef 100644
+--- a/ansible/roles/podman/tasks/quadlet_setup.yml
++++ b/ansible/roles/podman/tasks/quadlet_setup.yml
+@@ -148,7 +148,7 @@
+     mode: '0644'
+   become: yes
+ 
+-- name: Render LiteLLM quadlet from template (DATABASE_URL for UI/key management)
++- name: Render LiteLLM quadlet from template (assembles DATABASE_URL at runtime for UI/key management)
+   template:
+     src: "{{ clone_directory }}/ansible/templates/lme-litellm.container.j2"
+     dest: /etc/containers/systemd/lme-litellm.container
+@@ -156,6 +156,7 @@
+     group: "root"
+     mode: '0644'
+   become: yes
++  no_log: true
+   when: install_llm | default(true) | bool
+ 
+ - name: Remove non-ES quadlet source files from child nodes
+diff --git a/ansible/roles/podman/tasks/tailscale_ingress.yml b/ansible/roles/podman/tasks/tailscale_ingress.yml
+new file mode 100644
+index 0000000..face214
+--- /dev/null
++++ b/ansible/roles/podman/tasks/tailscale_ingress.yml
+@@ -0,0 +1,85 @@
++---
++# Host-facing Tailscale ingress (OPT-IN, additive) — the "IPC/SVCS" layer.
++#
++# This task set is included from elastic_services_setup.yml ONLY when
++# `tailscale_serve_ingress` is true (enable at deploy time with
++# `-e tailscale_serve_ingress=true`). It is disabled by default and changes
++# nothing about the internal service mesh.
++#
++# WHY THIS EXISTS — the internal-CA vs ts.net split:
++#   * The internal container<->container mesh uses the Elasticsearch
++#     `elasticsearch-certutil` CA with container-alias SANs (lme-elasticsearch,
++#     lme-logstash, lme-litellm, ...). That CA is CORRECT and REQUIRED for the
++#     mesh and is left completely untouched here.
++#   * A `tailscale cert` / `tailscale serve` LE leaf has SAN = this node's
++#     `*.ts.net` MagicDNS name ONLY. It can therefore serve host-facing
++#     published ports but CANNOT stand in for the internal alias SANs.
++#
++# So we front only the host-facing, loopback-bound published ports:
++#   * apm-server (local 8200) and litellm (local 4000) are HTTPS services:
++#     tailscale TERMINATES TLS with the node's ts.net LE cert (auto-obtained,
++#     auto-renewed) and re-encrypts to the local self-signed backend
++#     (https+insecure://127.0.0.1:<port>).
++#   * logstash beats (local 5044) is a raw TCP passthrough (`--tcp`), NOT
++#     TLS-terminated: logstash terminates the beats TLS itself. CONSEQUENCE for
++#     operators wiring external beats: the beat receives logstash's INTERNAL-CA
++#     leaf (SAN: lme-logstash, logstash, localhost, 127.0.0.1 — NO ts.net SAN),
++#     so the beat must trust the LME CA and must NOT do ts.net hostname
++#     verification for the 5044 endpoint (e.g. ssl.verification_mode: certificate).
++#     Terminating at tailscale here would hand plaintext to a TLS listener, so
++#     `--tcp` (passthrough) is used deliberately instead of `--tls-terminated-tcp`.
++#
++# Idempotent: each `tailscale serve` line is added only if the same backend is
++# not already present in `tailscale serve status`.
++
++- name: Read current tailscale node status
++  command: tailscale status --json
++  register: ts_status
++  changed_when: false
++  failed_when: false
++  become: yes
++
++- name: Fail clearly if tailscale is unavailable or the node is not logged in
++  fail:
++    msg: >-
++      tailscale_serve_ingress is enabled but `tailscale status` failed
++      (rc={{ ts_status.rc }}). Ensure tailscaled is running and this node is
++      logged in to the tailnet with MagicDNS + HTTPS certs enabled.
++  when: ts_status.rc != 0
++
++# Discover the node's MagicDNS name from status rather than hardcoding it; the
++# trailing dot from the FQDN is stripped for display.
++- name: Determine this node's MagicDNS (ts.net) name
++  set_fact:
++    ts_magicdns_name: "{{ (ts_status.stdout | from_json).Self.DNSName | regex_replace('\\.$', '') }}"
++
++- name: Read current tailscale serve config (for idempotency)
++  command: tailscale serve status
++  register: ts_serve_status
++  changed_when: false
++  failed_when: false
++  become: yes
++
++- name: Front host-facing HTTPS services with the node's ts.net cert
++  command: "tailscale serve --bg --https={{ item.port }} https+insecure://127.0.0.1:{{ item.port }}"
++  loop:
++    - { name: "apm-server", port: 8200 }
++    - { name: "litellm", port: 4000 }
++  loop_control:
++    label: "{{ item.name }} (:{{ item.port }})"
++  when: ('127.0.0.1:' ~ item.port) not in (ts_serve_status.stdout | default(''))
++  changed_when: true
++  become: yes
++
++- name: Front host-facing logstash beats port as a raw TCP passthrough
++  command: "tailscale serve --bg --tcp=5044 tcp://127.0.0.1:5044"
++  when: "'127.0.0.1:5044' not in (ts_serve_status.stdout | default(''))"
++  changed_when: true
++  become: yes
++
++- name: Show the host-facing tailscale ingress endpoints
++  debug:
++    msg:
++      - "apm-server  -> https://{{ ts_magicdns_name }}:8200 (ts.net LE cert; proxies 127.0.0.1:8200)"
++      - "litellm     -> https://{{ ts_magicdns_name }}:4000 (ts.net LE cert; proxies 127.0.0.1:4000)"
++      - "logstash    -> {{ ts_magicdns_name }}:5044 (raw TCP passthrough; beats see the LME internal-CA leaf)"
+diff --git a/ansible/templates/lme-elasticsearch.container.j2 b/ansible/templates/lme-elasticsearch.container.j2
+index 11e7cb1..eda4a44 100644
+--- a/ansible/templates/lme-elasticsearch.container.j2
++++ b/ansible/templates/lme-elasticsearch.container.j2
+@@ -9,6 +9,17 @@ PartOf=lme.service
+ Restart=always
+ Environment=ANSIBLE_VAULT_PASSWORD_FILE=/etc/lme/pass.sh
+ TimeoutStartSec=5400
++{% if es_memory_max is defined or es_discovery_type | default('single-node') == 'single-node' %}
++# Backstop cgroup memory caps so Elasticsearch cannot consume all host RAM on a
++# shared single-node box. Only applied on single-node (or when es_memory_max is
++# set explicitly) so dedicated cluster data nodes keep their sizing.
++# INVARIANT: the heap (es_heap_size, default 4g) is mlocked and cannot be
++# reclaimed, so it must stay well below MemoryMax or the kernel OOM-kills ES
++# instead of throttling. If you raise es_heap_size, raise es_memory_high and
++# es_memory_max to match (keep heap near/below ~50% of MemoryMax).
++MemoryHigh={{ es_memory_high | default('6G') }}
++MemoryMax={{ es_memory_max | default('8G') }}
++{% endif %}
+ 
+ [Install]
+ WantedBy=default.target lme.service
+@@ -71,7 +82,17 @@ Environment=xpack.security.transport.ssl.client_authentication=optional
+ Environment=xpack.license.self_generated.type=basic
+ Environment=xpack.security.autoconfiguration.enabled=false
+ 
++{#
++  Bound the JVM heap on single-node so ES does not default to ~50% of host RAM
++  (and then mlock it via bootstrap.memory_lock) on a shared 16 GB box. Cluster
++  data nodes keep ES's implicit sizing unless es_heap_size is set explicitly, so
++  dedicated nodes are not shrunk. Keep heap near/below ~50% of MemoryMax above.
++#}
++{% if es_heap_size is defined or es_discovery_type | default('single-node') == 'single-node' %}
++Environment=ES_JAVA_OPTS="-Des.entitlements.enabled=false -Xms{{ es_heap_size | default('4g') }} -Xmx{{ es_heap_size | default('4g') }}"
++{% else %}
+ Environment=ES_JAVA_OPTS="-Des.entitlements.enabled=false"
++{% endif %}
+ 
+ Secret=elastic,type=env,target=ELASTIC_PASSWORD
+ Secret=kibana_system,type=env,target=ELASTICSEARCH_PASSWORD
+diff --git a/ansible/templates/lme-litellm.container.j2 b/ansible/templates/lme-litellm.container.j2
+index 2ca12e1..baf56f8 100644
+--- a/ansible/templates/lme-litellm.container.j2
++++ b/ansible/templates/lme-litellm.container.j2
+@@ -22,12 +22,16 @@ Network=lme
+ PodmanArgs=--network-alias lme-litellm --entrypoint /bin/sh
+ PublishPort=4000:4000
+ Volume=/opt/lme/config/litellm_config.yaml:/app/config.yaml:ro
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Secret=llm-keys,type=mount,target=/run/secrets/llm_keys
++Secret=pgvector,type=env,target=PGVECTOR_PASS
+ Environment=SSL_KEYFILE=/certs/litellm/litellm.key
+ Environment=SSL_CERTFILE=/certs/litellm/litellm.crt
+ Environment=SSL_CERT_FILE=/tmp/combined-ca.crt
+ Environment=REQUESTS_CA_BUNDLE=/tmp/combined-ca.crt
+ Environment=CURL_CA_BUNDLE=/tmp/combined-ca.crt
+-Environment=DATABASE_URL=postgresql://lme:{{ global_secrets.pgvector }}@lme-pgvector:5432/litellm
+-Exec=-c "cat /etc/ssl/certs/ca-certificates.crt /certs/ca/ca.crt > /tmp/combined-ca.crt; set -a; [ -f /run/secrets/llm_keys ] && . /run/secrets/llm_keys; set +a; exec litellm --config /app/config.yaml --port 4000 --ssl_keyfile_path /certs/litellm/litellm.key --ssl_certfile_path /certs/litellm/litellm.crt"
++Environment=PGVECTOR_HOST=lme-pgvector
++Environment=PGVECTOR_PORT=5432
++Environment=PGVECTOR_DB=litellm
++Environment=PGVECTOR_USER=lme
++Exec=-c "cat /etc/ssl/certs/ca-certificates.crt /certs/ca/ca.crt > /tmp/combined-ca.crt; set -a; [ -f /run/secrets/llm_keys ] && . /run/secrets/llm_keys; set +a; export DATABASE_URL=postgresql://$${PGVECTOR_USER}:$${PGVECTOR_PASS}@$${PGVECTOR_HOST}:$${PGVECTOR_PORT}/$${PGVECTOR_DB}; exec litellm --config /app/config.yaml --port 4000 --ssl_keyfile_path /certs/litellm/litellm.key --ssl_certfile_path /certs/litellm/litellm.crt"
+diff --git a/ansible/upgrade_lme.yml b/ansible/upgrade_lme.yml
+index 247146e..9b05322 100644
+--- a/ansible/upgrade_lme.yml
++++ b/ansible/upgrade_lme.yml
+@@ -143,6 +143,29 @@
+       debug:
+         msg: "Using podman from: {{ podman_cmd }}"
+         
++    - name: Detect whether the optional Elastic services pack is installed
++      stat:
++        path: /etc/containers/systemd/lme-apm-server.container
++      register: elastic_pack_quadlet
++
++    # Respect an explicit extra-var override (-e install_elastic_services=... /
++    # -e install_llm=...); otherwise infer the pack from what is already
++    # installed. Distinct facts are used because extra-vars outrank set_fact, so
++    # a self-referential "install_elastic_services: {{ install_elastic_services |
++    # default(...) }}" would silently no-op whenever the operator passes the var.
++    # The LLM stack is new in 2.3.0 (no pre-upgrade quadlet to detect), so it
++    # follows the site.yml default-on unless explicitly disabled.
++    - name: Resolve optional-stack enablement for this upgrade
++      set_fact:
++        lme_pack_enabled: "{{ install_elastic_services | default(elastic_pack_quadlet.stat.exists) | bool }}"
++        lme_llm_enabled: "{{ install_llm | default(true) | bool }}"
++
++    - name: Display detected optional-stack enablement
++      debug:
++        msg: >-
++          Elastic services pack: {{ 'enabled' if lme_pack_enabled else 'disabled' }};
++          LLM stack: {{ 'enabled' if lme_llm_enabled else 'disabled' }}
++
+     - name: Extract container versions
+       set_fact:
+         elasticsearch_image: "{{ container_versions | select('search', 'elasticsearch') | first }}"
+@@ -396,7 +419,7 @@
+       delay: 5
+       until: pull_elastic_result is not failed
+       ignore_errors: yes
+-      when: install_elastic_services | default(false) | bool
++      when: lme_pack_enabled | default(false) | bool
+ 
+     - name: Display elastic services container pull errors
+       debug:
+@@ -417,7 +440,7 @@
+       delay: 5
+       until: tag_elastic_result is not failed
+       ignore_errors: yes
+-      when: install_elastic_services | default(false) | bool
++      when: lme_pack_enabled | default(false) | bool
+ 
+     - name: Display elastic services container tag errors
+       debug:
+@@ -646,7 +669,9 @@
+               - Certificates: certs.zip removed, will regenerate via lme-setup-certs container on restart
+               - Configs: litellm_config.yaml, llama-cpp-model.json
+               - Systemd units: lme-llm-keys.service/path, lme-llama-model.service/path
+-      when: current_lme_version is version('2.3.0', '<')
++      when:
++        - current_lme_version is version('2.3.0', '<')
++        - lme_llm_enabled | default(true) | bool
+ 
+     - name: Skip AI stack (already at 2.3.0+)
+       debug:
+@@ -847,7 +872,22 @@
+         - name: Display doc ingestion result
+           debug:
+             msg: "{{ 'Documentation ingestion completed successfully' if ingest_result.rc == 0 else 'Documentation ingestion failed (non-fatal) — can be re-run manually' }}"
+-      when: current_lme_version is version('2.3.0', '<')
++      when:
++        - current_lme_version is version('2.3.0', '<')
++        - lme_llm_enabled | default(true) | bool
++
++    # Re-land the Elastic services pack so pack config/quadlet changes actually
++    # deploy on upgrade. The whole-dir quadlet copy above only covers quadlet/,
++    # not quadlet-optional/elastic-services/, and never re-runs the cert top-up,
++    # so a plain upgrade previously only pulled the pack images. Reuses the
++    # podman role task file (config ownership + cert-top-up logic lives there);
++    # runs after the core services are up, matching that file's "start pack
++    # units on an already-active umbrella service" assumption.
++    - name: Re-land Elastic services pack (quadlets, configs, cert top-up)
++      include_role:
++        name: podman
++        tasks_from: elastic_services_setup.yml
++      when: lme_pack_enabled | default(false) | bool
+ 
+     - name: Update LME version in environment file
+       lineinfile:
+diff --git a/config/logstash/pipeline/lme.conf b/config/logstash/pipeline/lme.conf
+new file mode 100644
+index 0000000..23136b1
+--- /dev/null
++++ b/config/logstash/pipeline/lme.conf
+@@ -0,0 +1,35 @@
++input {
++  # Beats input, TLS-enabled with the internal LME CA leaf.
++  # Cert/key are the "logstash" instance leaf minted by elasticsearch-certutil
++  # from config/setup/instances.yml (SAN: lme-logstash, logstash, localhost,
++  # 127.0.0.1). This encrypts the beats->logstash leg that was previously
++  # plaintext. The raw 5044 port is bound to loopback in the quadlet and, when
++  # opted in, fronted by the host-facing tailscale ingress (see
++  # ansible/roles/podman/tasks/tailscale_ingress.yml).
++  #
++  # Setting names are the 8.18 (logstash-input-beats 7.x) normalized form
++  # (ssl_enabled, not the deprecated `ssl`).
++  #
++  # Client-cert (mTLS) is intentionally OFF: no in-repo beat sets
++  # output.logstash / ships an LME client cert, so requiring one would break
++  # ingestion. To require mTLS once endpoints are issued client certs from the
++  # LME CA, uncomment the two ssl_certificate_authorities / ssl_client_authentication
++  # lines below.
++  beats {
++    port                  => 5044
++    ssl_enabled           => true
++    ssl_certificate       => "/certs/logstash/logstash.crt"
++    ssl_key               => "/certs/logstash/logstash.key"
++    # ssl_certificate_authorities => ["/certs/ca/ca.crt"]
++    # ssl_client_authentication   => "required"
++  }
++  http  { port => 8085 }
++}
++output {
++  elasticsearch {
++    hosts    => ["https://lme-elasticsearch:9200"]
++    user     => "elastic"
++    password => "${ELASTICSEARCH_PASSWORD}"
++    cacert   => "/certs/ca/ca.crt"
++  }
++}
+diff --git a/config/setup/init-setup.sh b/config/setup/init-setup.sh
+index 0490821..0072429 100644
+--- a/config/setup/init-setup.sh
++++ b/config/setup/init-setup.sh
+@@ -33,13 +33,30 @@ if [ ! -f "${CERTS_DIR}/certs.zip" ]; then
+     fi
+   done
+ 
++  echo "Setting file permissions... data"
++  chown -R elasticsearch:elasticsearch "${DATA_DIR}"
++fi
++
++# --- Cert permission hardening: runs on EVERY setup pass (fresh install AND upgrade) ---
++# This block previously lived INSIDE the `if [ ! -f certs.zip ]` fresh-install guard
++# above. An in-place upgrade keeps certs.zip, so the guard skipped the block and left an
++# already-installed host's `ca/ca.key` WORLD-READABLE (0644) — the CA-signing-key MITM
++# vector was closed for fresh installs but never for the installed base (the population
++# most likely to have it). Hoisted out of the guard so the tightening self-heals existing
++# hosts on the next setup/upgrade pass. Idempotent: re-applying fixed modes/owner to the
++# same files is safe to repeat, and the top-up loop below only (re)mints missing certs.
++if [ -d "${CERTS_DIR}" ]; then
+   echo "Setting file permissions... certs"
+   chown -R elasticsearch:elasticsearch "${CERTS_DIR}"
+   find "${CERTS_DIR}" -type d -exec chmod 755 {} \;
+-  find "${CERTS_DIR}" -type f -exec chmod 644 {} \;
+-
+-  echo "Setting file permissions... data"
+-  chown -R elasticsearch:elasticsearch "${DATA_DIR}"
++  # Public material (certs, chains) world-readable; private keys group-only; CA key owner-only.
++  find "${CERTS_DIR}" -type f -name '*.key' -exec chmod 640 {} \;
++  find "${CERTS_DIR}" -type f -not -name '*.key' -not -name '*.zip' -exec chmod 644 {} \;
++  # Zip bundles contain the CA and every service key; keep them owner-only (they double as idempotence sentinels).
++  find "${CERTS_DIR}" -maxdepth 1 -type f -name '*.zip' -exec chmod 600 {} \;
++  if [ -f "${CERTS_DIR}/ca/ca.key" ]; then
++    chmod 600 "${CERTS_DIR}/ca/ca.key"
++  fi
+ fi
+ 
+ # Idempotent top-up: mint certs for instances.yml entries whose cert dir is missing
+@@ -47,8 +64,14 @@ TOPUP_TMP="$(mktemp -d)"
+ trap 'rm -rf "${TOPUP_TMP}"' EXIT
+ 
+ for svc in $(awk '/^  - name: /{ n=$3; gsub(/"/,"",n); print n }' "${INSTANCES_PATH}"); do
++  # Skip services already minted, unless a re-mint is forced (e.g. after a SAN / instances.yml edit).
++  # Set LME_FORCE_CERT_REMINT=true (or 1) in /opt/lme/lme-environment.env to re-mint on an installed host.
+   if [ -f "${CERTS_DIR}/${svc}/${svc}.crt" ]; then
+-    continue
++    if [ "${LME_FORCE_CERT_REMINT:-}" = "true" ] || [ "${LME_FORCE_CERT_REMINT:-}" = "1" ]; then
++      echo "Force re-mint requested (LME_FORCE_CERT_REMINT): re-minting cert for ${svc}"
++    else
++      continue
++    fi
+   fi
+   echo "Top-up: generating missing cert for ${svc}"
+   awk -v name="${svc}" '
+@@ -64,6 +87,8 @@ for svc in $(awk '/^  - name: /{ n=$3; gsub(/"/,"",n); print n }' "${INSTANCES_P
+   cat "${CERTS_DIR}/${svc}/${svc}.crt" "${CERTS_DIR}/ca/ca.crt" > "${CERTS_DIR}/${svc}/${svc}.chain.pem"
+   chown -R elasticsearch:elasticsearch "${CERTS_DIR}/${svc}"
+   chmod 755 "${CERTS_DIR}/${svc}"
+-  chmod 644 "${CERTS_DIR}/${svc}"/*
++  # Public material world-readable; private key group-only (matches the top-level discipline above).
++  find "${CERTS_DIR}/${svc}" -type f -name '*.key' -exec chmod 640 {} \;
++  find "${CERTS_DIR}/${svc}" -type f -not -name '*.key' -exec chmod 644 {} \;
+ done
+ 
+diff --git a/config/setup/instances.yml b/config/setup/instances.yml
+index 1380945..ffabb92 100644
+--- a/config/setup/instances.yml
++++ b/config/setup/instances.yml
+@@ -31,6 +31,7 @@ instances:
+ 
+   - name: "logstash"
+     dns:
++      - "lme-logstash"
+       - "logstash"
+       - "localhost"
+     ip:
+@@ -38,6 +39,7 @@ instances:
+ 
+   - name: "curator"
+     dns:
++      - "lme-curator"
+       - "curator"
+       - "localhost"
+     ip:
+diff --git a/install.sh b/install.sh
+index 997aecc..d06f705 100755
+--- a/install.sh
++++ b/install.sh
+@@ -609,6 +609,35 @@ check_sudo_access() {
+     fi
+ }
+ 
++# Compute effective install_llm / install_elastic_services for Ansible.
++# Shared by both install entrypoints (run_playbook and run_cluster_playbooks)
++# so a flag means the same thing regardless of entrypoint. Sets the global
++# vars EFFECTIVE_INSTALL_LLM / EFFECTIVE_INSTALL_ELASTIC_SERVICES (must NOT be
++# declared local — callers read them after this returns).
++compute_effective_flags() {
++    # Offline installs skip LLM unless --llm was explicitly requested, because
++    # the offline LLM path requires the larger `prepare_offline.sh --llm`
++    # bundle. Non-offline installs keep the current LLM-on default.
++    if [ "$OFFLINE_MODE" = "true" ] && [ "$INSTALL_LLM" != "true" ]; then
++        EFFECTIVE_INSTALL_LLM="false"
++        echo -e "${YELLOW}⚠ Offline install without --llm: LLM stack will be skipped${NC}"
++    else
++        EFFECTIVE_INSTALL_LLM="true"
++    fi
++
++    # Unlike LLM (default-on), the Elastic services pack is opt-in: it is only
++    # installed when --elastic-services was explicitly requested. The pack has
++    # no offline bundle, so it is forced off (with a warning) for --offline.
++    if [ "$INSTALL_ELASTIC_SERVICES" = "true" ] && [ "$OFFLINE_MODE" != "true" ]; then
++        EFFECTIVE_INSTALL_ELASTIC_SERVICES="true"
++    else
++        EFFECTIVE_INSTALL_ELASTIC_SERVICES="false"
++        if [ "$INSTALL_ELASTIC_SERVICES" = "true" ]; then
++            echo -e "${YELLOW}⚠ --elastic-services is not supported with --offline: Elastic services pack will be skipped${NC}"
++        fi
++    fi
++}
++
+ # Function to run the playbook
+ run_playbook() {
+     echo -e "${YELLOW}Running Ansible playbook...${NC}"
+@@ -637,29 +666,9 @@ run_playbook() {
+         echo -e "${YELLOW}⚠ Running in offline mode - skipping internet-dependent tasks${NC}"
+     fi
+ 
+-    # Compute effective install_llm for Ansible.
+-    # Offline installs skip LLM unless --llm was explicitly requested, because
+-    # the offline LLM path requires the larger `prepare_offline.sh --llm`
+-    # bundle. Non-offline installs keep the current LLM-on default.
+-    if [ "$OFFLINE_MODE" = "true" ] && [ "$INSTALL_LLM" != "true" ]; then
+-        EFFECTIVE_INSTALL_LLM="false"
+-        echo -e "${YELLOW}⚠ Offline install without --llm: LLM stack will be skipped${NC}"
+-    else
+-        EFFECTIVE_INSTALL_LLM="true"
+-    fi
+-
+-    # Compute effective install_elastic_services for Ansible.
+-    # Unlike LLM (default-on), the Elastic services pack is opt-in: it is only
+-    # installed when --elastic-services was explicitly requested. The pack has
+-    # no offline bundle, so it is forced off (with a warning) for --offline.
+-    if [ "$INSTALL_ELASTIC_SERVICES" = "true" ] && [ "$OFFLINE_MODE" != "true" ]; then
+-        EFFECTIVE_INSTALL_ELASTIC_SERVICES="true"
+-    else
+-        EFFECTIVE_INSTALL_ELASTIC_SERVICES="false"
+-        if [ "$INSTALL_ELASTIC_SERVICES" = "true" ]; then
+-            echo -e "${YELLOW}⚠ --elastic-services is not supported with --offline: Elastic services pack will be skipped${NC}"
+-        fi
+-    fi
++    # Compute effective install_llm / install_elastic_services (shared with the
++    # cluster entrypoint so a flag behaves identically regardless of path).
++    compute_effective_flags
+ 
+     # Run the main installation playbook
+     echo -e "${YELLOW}Running main installation playbook...${NC}"
+@@ -671,9 +680,9 @@ run_playbook() {
+     sudo chown $(whoami):$(whoami) /opt/ansible-tmp
+ 
+     if [ -f "$SCRIPT_DIR/inventory" ]; then
+-        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"'}' $ANSIBLE_OPTS
++        ansible-playbook -i "$SCRIPT_DIR/inventory" "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}' $ANSIBLE_OPTS
+     else
+-        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"'}' $ANSIBLE_OPTS
++        ansible-playbook "$PLAYBOOK_PATH" --extra-vars '{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}' $ANSIBLE_OPTS
+     fi
+     
+     if [ $? -eq 0 ]; then
+@@ -819,7 +828,14 @@ run_cluster_playbooks() {
+     export ANSIBLE_REMOTE_TEMP="${ANSIBLE_REMOTE_TEMP:-/tmp/ansible-tmp}"
+     mkdir -p "$ANSIBLE_LOCAL_TEMP"
+ 
+-    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}'
++    # Same effective-flag computation as the single-node path so --llm and
++    # --elastic-services behave identically in cluster mode. (Cluster rejects
++    # --offline earlier, so LLM stays default-on and the pack follows the flag.)
++    # Phase 2 data nodes set lme_child_es_only=true (elasticsearch.yml) which
++    # gates the LLM/pack includes off there regardless of these values.
++    compute_effective_flags
++
++    local BASE_EXTRA_VARS='{"has_sudo_access":"'"${HAS_SUDO_ACCESS}"'","clone_dir":"'"${SCRIPT_DIR}"'","offline_mode":'"${OFFLINE_MODE}"',"install_llm":'"${EFFECTIVE_INSTALL_LLM}"',"install_elastic_services":'"${EFFECTIVE_INSTALL_ELASTIC_SERVICES}"',"storage_graphroot":"'"${GRAPH_ROOT}"'"}'
+ 
+     # Phase 1: Run site.yml on master with cluster vars (unless --cluster-nodes-only)
+     if [ "$CLUSTER_NODES_ONLY" != "true" ]; then
+diff --git a/lme-dashboard/app.py b/lme-dashboard/app.py
+index bf28ddb..0d1b865 100644
+--- a/lme-dashboard/app.py
++++ b/lme-dashboard/app.py
+@@ -78,7 +78,7 @@ def _sync_active_model_from_litellm(retries: int = 5, delay: float = 5.0):
+             r = _httpx.get(
+                 f"{LITELLM_URL}/v1/models",
+                 headers={"Authorization": f"Bearer {LITELLM_KEY}"},
+-                verify=False,
++                verify="/certs/ca/ca.crt",
+                 timeout=5,
+             )
+             if r.status_code == 200:
+diff --git a/quadlet-optional/elastic-services/lme-apm-server.container b/quadlet-optional/elastic-services/lme-apm-server.container
+index 7ab73b1..d2ac0a6 100644
+--- a/quadlet-optional/elastic-services/lme-apm-server.container
++++ b/quadlet-optional/elastic-services/lme-apm-server.container
+@@ -22,7 +22,14 @@ Image=localhost/apm-server:LME_LATEST
+ Network=lme
+ PodmanArgs=--network-alias lme-apm-server
+ PublishPort=8200:8200
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Volume=/opt/lme/config/apm-server.yml:/usr/share/apm-server/apm-server.yml:ro
+ Secret=elastic,type=env,target=ELASTICSEARCH_PASSWORD
++# apm-server's image runs as a non-root uid that does NOT map to the cert key's
++# owner (166536) under idmap, so it cannot open the 0640
++# /certs/apm-server/apm-server.key ("permission denied" -> crash-loop, verified
++# on the Debian-13 e2e). Run as container-root to read the key via
++# CAP_DAC_OVERRIDE -- the same pattern filebeat/metricbeat/logstash already use
++# for the tightened (B2) cert volume.
++User=root
+ HealthCmd=CMD-SHELL bash -c 'exec 3<>/dev/tcp/127.0.0.1/8200'
+diff --git a/quadlet-optional/elastic-services/lme-filebeat.container b/quadlet-optional/elastic-services/lme-filebeat.container
+index 974d7c2..b3c95f9 100644
+--- a/quadlet-optional/elastic-services/lme-filebeat.container
++++ b/quadlet-optional/elastic-services/lme-filebeat.container
+@@ -21,7 +21,7 @@ ContainerName=lme-filebeat
+ Image=localhost/filebeat:LME_LATEST
+ Network=lme
+ PodmanArgs=--network-alias lme-filebeat
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Volume=/opt/lme/config/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+ Volume=/var/log/journal:/var/log/journal:ro
+ Volume=/run/log/journal:/run/log/journal:ro
+diff --git a/quadlet-optional/elastic-services/lme-heartbeat.container b/quadlet-optional/elastic-services/lme-heartbeat.container
+index 6f92216..a68fa02 100644
+--- a/quadlet-optional/elastic-services/lme-heartbeat.container
++++ b/quadlet-optional/elastic-services/lme-heartbeat.container
+@@ -21,6 +21,6 @@ ContainerName=lme-heartbeat
+ Image=localhost/heartbeat:LME_LATEST
+ Network=lme
+ PodmanArgs=--network-alias lme-heartbeat --cap-add=NET_RAW
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Volume=/opt/lme/config/heartbeat.yml:/usr/share/heartbeat/heartbeat.yml:ro
+ Secret=elastic,type=env,target=ELASTICSEARCH_PASSWORD
+diff --git a/quadlet-optional/elastic-services/lme-logstash.container b/quadlet-optional/elastic-services/lme-logstash.container
+index 2fded41..82c51f4 100644
+--- a/quadlet-optional/elastic-services/lme-logstash.container
++++ b/quadlet-optional/elastic-services/lme-logstash.container
+@@ -21,11 +21,31 @@ ContainerName=lme-logstash
+ Image=localhost/logstash:LME_LATEST
+ Network=lme
+ PodmanArgs=--network-alias lme-logstash
+-PublishPort=5044:5044
+-PublishPort=8085:8085
+-Environment=LS_JAVA_OPTS=-Xmx512m
+-Volume=lme_certs:/certs:ro
++# Bind the raw beats/http ports to loopback only: they are not exposed on the
++# tailnet/LAN. The host-facing beats port is fronted by the opt-in tailscale
++# ingress (tailscale_ingress.yml); container->logstash traffic still uses the
++# `lme` podman network alias, which is unaffected by the host publish binding.
++PublishPort=127.0.0.1:5044:5044
++PublishPort=127.0.0.1:8085:8085
++# Set BOTH Xms and Xmx: the logstash image's in-image jvm.options defaults to
++# -Xms1g -Xmx1g, and LS_JAVA_OPTS is APPENDED, so setting only -Xmx512m leaves
++# Xms=1g > Xmx=512m -> "Initial heap size set to a larger value than the maximum
++# heap size" -> JVM aborts and the unit crash-loops. Pin both to 512m.
++# QUOTE the value: systemd/quadlet `Environment=` splits on whitespace, so the
++# unquoted form is parsed as LS_JAVA_OPTS=-Xms512m + a stray `-Xmx512m` token
++# (dropped) -> only -Xmx512m survives as the appended override -> the exact
++# Xms(1g) > Xmx(512m) trap again. Verified on the Debian-13 e2e: quoted form
++# emits a single `--env "LS_JAVA_OPTS=-Xms512m -Xmx512m"` and the JVM boots.
++Environment="LS_JAVA_OPTS=-Xms512m -Xmx512m"
++# `,idmap` per the cert-volume (B2) fix; keys are 0640/166536. Logstash runs
++# as container-root (User=root below) and reads the key via CAP_DAC_OVERRIDE.
++Volume=lme_certs:/certs:ro,idmap
+ Volume=/opt/lme/config/logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+ Volume=/opt/lme/config/logstash/pipeline:/usr/share/logstash/pipeline:ro
+ Secret=elastic,type=env,target=ELASTICSEARCH_PASSWORD
++# Required so logstash can read the 166536-owned cert key now that the beats
++# input is TLS-enabled. This is the same pattern filebeat/metricbeat use to
++# read the cert volume; the logstash image otherwise runs as uid 1000, which
++# cannot open the key.
++User=root
+ HealthCmd=curl -fs http://localhost:9600/ -o /dev/null
+diff --git a/quadlet-optional/elastic-services/lme-metricbeat.container b/quadlet-optional/elastic-services/lme-metricbeat.container
+index 9ed5e7c..8ad6163 100644
+--- a/quadlet-optional/elastic-services/lme-metricbeat.container
++++ b/quadlet-optional/elastic-services/lme-metricbeat.container
+@@ -21,7 +21,7 @@ ContainerName=lme-metricbeat
+ Image=localhost/metricbeat:LME_LATEST
+ Network=lme
+ PodmanArgs=--network-alias lme-metricbeat
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Volume=/opt/lme/config/metricbeat.yml:/usr/share/metricbeat/metricbeat.yml:ro
+ Volume=/proc:/hostfs/proc:ro
+ Volume=/sys/fs/cgroup:/hostfs/sys/fs/cgroup:ro
+diff --git a/quadlet/lme-dashboard.container b/quadlet/lme-dashboard.container
+index 56933e7..96c0fe4 100644
+--- a/quadlet/lme-dashboard.container
++++ b/quadlet/lme-dashboard.container
+@@ -38,7 +38,7 @@ Volume=/opt/lme/config:/opt/lme/config:rw
+ Volume=/opt/lme/llama-models:/opt/lme/llama-models:rw
+ Volume=/opt/lme/scripts/sigma:/opt/lme/scripts/sigma:rw
+ Volume=/etc/lme/pass.sh:/etc/lme/pass.sh:ro
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Environment=LLAMA_MODELS_DIR=/opt/lme/llama-models
+ Environment=LLAMA_MODEL_CONFIG=/opt/lme/config/llama-cpp-model.json
+ Environment=LLAMA_MODEL_TRIGGER=/opt/lme/config/.llama-model-updated
+diff --git a/quadlet/lme-embeddings.container b/quadlet/lme-embeddings.container
+index 9a40095..da654a0 100644
+--- a/quadlet/lme-embeddings.container
++++ b/quadlet/lme-embeddings.container
+@@ -22,7 +22,7 @@ Network=lme
+ PodmanArgs=--network-alias lme-embeddings
+ PublishPort=8081:8081
+ Volume=/opt/lme/llama-models:/models:Z
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ HealthCmd=curl -kf https://localhost:8081/health
+ HealthInterval=30s
+ HealthTimeout=10s
+diff --git a/quadlet/lme-fleet-distribution.container b/quadlet/lme-fleet-distribution.container
+index f5e66a4..0765087 100644
+--- a/quadlet/lme-fleet-distribution.container
++++ b/quadlet/lme-fleet-distribution.container
+@@ -23,7 +23,7 @@ Network=lme
+ HostName=lme-fleet-distribution
+ PodmanArgs=--network-alias lme-fleet-distribution
+ PublishPort=8080:8080
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Environment=EPR_ADDRESS=0.0.0.0:8080 EPR_TLS_CERT=/certs/fleet-distribution/fleet-distribution.crt EPR_TLS_KEY=/certs/fleet-distribution/fleet-distribution.key
+ 
+ 
+diff --git a/quadlet/lme-fleet-server.container b/quadlet/lme-fleet-server.container
+index bbc83e9..d11ca1a 100644
+--- a/quadlet/lme-fleet-server.container
++++ b/quadlet/lme-fleet-server.container
+@@ -25,7 +25,7 @@ Network=lme
+ HostName=lme-fleet-server
+ PodmanArgs=--network-alias lme-fleet-server --requires 'lme-elasticsearch,lme-kibana'
+ PublishPort=8220:8220
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Volume=lme_fleet_data:/usr/share/elastic-agent
+ UserNS=auto:uidmapping=0:171632:3048,gidmapping=0:171632:3048
+ 
+diff --git a/quadlet/lme-litellm.container b/quadlet/lme-litellm.container
+index 48a7fe1..baf56f8 100644
+--- a/quadlet/lme-litellm.container
++++ b/quadlet/lme-litellm.container
+@@ -22,12 +22,16 @@ Network=lme
+ PodmanArgs=--network-alias lme-litellm --entrypoint /bin/sh
+ PublishPort=4000:4000
+ Volume=/opt/lme/config/litellm_config.yaml:/app/config.yaml:ro
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Secret=llm-keys,type=mount,target=/run/secrets/llm_keys
++Secret=pgvector,type=env,target=PGVECTOR_PASS
+ Environment=SSL_KEYFILE=/certs/litellm/litellm.key
+ Environment=SSL_CERTFILE=/certs/litellm/litellm.crt
+ Environment=SSL_CERT_FILE=/tmp/combined-ca.crt
+ Environment=REQUESTS_CA_BUNDLE=/tmp/combined-ca.crt
+ Environment=CURL_CA_BUNDLE=/tmp/combined-ca.crt
+-Exec=-c "cat /etc/ssl/certs/ca-certificates.crt /certs/ca/ca.crt > /tmp/combined-ca.crt; set -a; [ -f /run/secrets/llm_keys ] && . /run/secrets/llm_keys; set +a; exec litellm --config /app/config.yaml --port 4000 --ssl_keyfile_path /certs/litellm/litellm.key --ssl_certfile_path /certs/litellm/litellm.crt"
+-
++Environment=PGVECTOR_HOST=lme-pgvector
++Environment=PGVECTOR_PORT=5432
++Environment=PGVECTOR_DB=litellm
++Environment=PGVECTOR_USER=lme
++Exec=-c "cat /etc/ssl/certs/ca-certificates.crt /certs/ca/ca.crt > /tmp/combined-ca.crt; set -a; [ -f /run/secrets/llm_keys ] && . /run/secrets/llm_keys; set +a; export DATABASE_URL=postgresql://$${PGVECTOR_USER}:$${PGVECTOR_PASS}@$${PGVECTOR_HOST}:$${PGVECTOR_PORT}/$${PGVECTOR_DB}; exec litellm --config /app/config.yaml --port 4000 --ssl_keyfile_path /certs/litellm/litellm.key --ssl_certfile_path /certs/litellm/litellm.crt"
+diff --git a/quadlet/lme-llama-cpp.container b/quadlet/lme-llama-cpp.container
+index 078b87d..896b355 100644
+--- a/quadlet/lme-llama-cpp.container
++++ b/quadlet/lme-llama-cpp.container
+@@ -21,7 +21,7 @@ Image=localhost/llama-cpp:LME_LATEST
+ Network=lme
+ PodmanArgs=--network-alias lme-llama-cpp
+ Volume=/opt/lme/llama-models:/models:Z
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Environment=HOST=0.0.0.0
+ Environment=PORT=8080
+ Exec=--host 0.0.0.0 --port 8080 --model /models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf --ssl-cert-file /certs/llama-cpp/llama-cpp.crt --ssl-key-file /certs/llama-cpp/llama-cpp.key
+diff --git a/quadlet/lme-log-analyzer.container b/quadlet/lme-log-analyzer.container
+index c75bba1..0ee3a0f 100644
+--- a/quadlet/lme-log-analyzer.container
++++ b/quadlet/lme-log-analyzer.container
+@@ -27,6 +27,6 @@ Environment=ELASTICSEARCH_USER=elastic
+ Environment=LITELLM_URL=https://lme-litellm:4000
+ Environment=LITELLM_API_KEY=sk-lme-llama-proxy
+ Environment=LITELLM_MODEL=lfm2.5-1.2b-instruct
+-Volume=lme_certs:/certs:ro
++Volume=lme_certs:/certs:ro,idmap
+ Exec=streamlit run app_simple.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true --server.sslCertFile=/certs/log-analyzer/log-analyzer.crt --server.sslKeyFile=/certs/log-analyzer/log-analyzer.key
+ Secret=elastic,type=env,target=ELASTICSEARCH_PASSWORD
+diff --git a/scripts/prepare_offline.sh b/scripts/prepare_offline.sh
+index 8e3de4b..13b64a3 100755
+--- a/scripts/prepare_offline.sh
++++ b/scripts/prepare_offline.sh
+@@ -417,6 +417,10 @@ download_llm_models() {
+ # Build and save the ingest image that replaces the online flow's
+ # `python:3.11-slim + inline pip install` (llama_cpp_setup.yml:318-324).
+ # Pin exact package versions so offline bundles are reproducible.
++# All builds use --network=host: RUN steps (pip/apt) need internet, and the
++# container network namespace can't be assumed to have working egress (e.g.
++# Tailscale/proxy/split-DNS prep machines) — the host netns is exactly what
++# check_internet already validated. Affects build-time only, not the image.
+ build_ingest_image() {
+     echo -e "${YELLOW}Building LME ingest image (pinned pip deps)...${NC}"
+     local dockerfile_tmp
+@@ -432,7 +436,7 @@ RUN pip install --no-cache-dir \
+     lxml==5.3.0
+ DOCKERFILE
+ 
+-    if sudo podman build -t localhost/lme-ingest:LME_LATEST -f "$dockerfile_tmp" "$LME_ROOT"; then
++    if sudo podman build --network=host -t localhost/lme-ingest:LME_LATEST -f "$dockerfile_tmp" "$LME_ROOT"; then
+         rm -f "$dockerfile_tmp"
+         save_container_tar "localhost/lme-ingest:LME_LATEST" "localhost/lme-ingest:LME_LATEST"
+     else
+@@ -444,9 +448,11 @@ DOCKERFILE
+ 
+ # Build and save lme-log-analyzer and lme-dashboard images locally, since the
+ # online install would `podman build` these in-place — impossible offline.
++# --network=host for the same reason as build_ingest_image (see above): their
++# Dockerfiles RUN apt-get + pip install, which need the host's connectivity.
+ build_lme_images() {
+     echo -e "${YELLOW}Building LME Log Analyzer image...${NC}"
+-    if sudo podman build -t localhost/lme-log-analyzer:LME_LATEST "$LME_ROOT/lme-log-analyzer"; then
++    if sudo podman build --network=host -t localhost/lme-log-analyzer:LME_LATEST "$LME_ROOT/lme-log-analyzer"; then
+         save_container_tar "localhost/lme-log-analyzer:LME_LATEST" "localhost/lme-log-analyzer:LME_LATEST"
+     else
+         echo -e "${RED}✗ Failed to build LME Log Analyzer${NC}"
+@@ -454,7 +460,7 @@ build_lme_images() {
+     fi
+ 
+     echo -e "${YELLOW}Building LME Dashboard image...${NC}"
+-    if sudo podman build -t localhost/lme-dashboard:LME_LATEST "$LME_ROOT/lme-dashboard"; then
++    if sudo podman build --network=host -t localhost/lme-dashboard:LME_LATEST "$LME_ROOT/lme-dashboard"; then
+         save_container_tar "localhost/lme-dashboard:LME_LATEST" "localhost/lme-dashboard:LME_LATEST"
+     else
+         echo -e "${RED}✗ Failed to build LME Dashboard${NC}"
+diff --git a/scripts/upgrade/detect_version.sh b/scripts/upgrade/detect_version.sh
+index 98def0d..fbec303 100755
+--- a/scripts/upgrade/detect_version.sh
++++ b/scripts/upgrade/detect_version.sh
+@@ -63,6 +63,8 @@ if [ "$UPGRADE_NEEDED" = true ]; then
+     echo "========================================"
+     echo "Run the following command to upgrade:"
+     echo "cd $REPO_DIR/ansible && ansible-playbook upgrade_lme.yml"
++    echo "(An already-installed Elastic services pack is auto-detected and re-applied."
++    echo " If detection misses it, force the re-land with: -e install_elastic_services=true)"
+     exit 100  # Exit with code indicating upgrade needed
+ else
+     echo "========================================"
+diff --git a/scripts/upgrade/version_upgrade.md b/scripts/upgrade/version_upgrade.md
+index 359c321..58b4226 100644
+--- a/scripts/upgrade/version_upgrade.md
++++ b/scripts/upgrade/version_upgrade.md
+@@ -90,7 +90,7 @@ These versions are defined in:
+ 2. `config/containers.txt` for all containers
+ 3. `lme-environment.env` as STACK_VERSION
+ 
+-When the optional Elastic services pack is enabled (`--elastic-services`), its images (apm-server, heartbeat, metricbeat, filebeat, logstash — all 8.18.8) are defined in `config/containers-elastic-services.txt` and are also pulled during upgrade.
++If the optional Elastic services pack is already installed, the upgrade auto-detects it from the installed pack quadlets and re-applies it: its images (apm-server, heartbeat, metricbeat, filebeat, logstash — all 8.18.8, defined in `config/containers-elastic-services.txt`) are pulled, and the pack quadlets/configs and certificate top-up are re-applied so pack config changes deploy. If auto-detection misses a pack you know is installed, force the re-land with `-e install_elastic_services=true`. Adding the pack to an install that does not have it is done with `install.sh --elastic-services`, not during upgrade.
+ 
+ ## Troubleshooting
+ 
