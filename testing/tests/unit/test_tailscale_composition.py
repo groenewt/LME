@@ -21,10 +21,15 @@ import yaml
 # state inside the writable test workspace instead of ~/.ansible.
 os.environ.setdefault("ANSIBLE_LOCAL_TEMP", "/tmp/lme-ansible-local")
 os.environ.setdefault("ANSIBLE_REMOTE_TEMP", "/tmp/lme-ansible-remote")
+os.environ.setdefault("ANSIBLE_JINJA2_NATIVE", "1")
 
 from ansible.parsing.dataloader import DataLoader  # noqa: E402
 from ansible.plugins.loader import filter_loader  # noqa: E402
-from ansible.template import Templar, trust_as_template  # noqa: E402
+from ansible.template import Templar  # noqa: E402
+try:
+    from ansible.template import trust_as_template  # noqa: E402
+except ImportError:
+    trust_as_template = lambda x: x  # noqa: E731
 
 
 ROOT = Path(__file__).resolve().parents[3]

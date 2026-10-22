@@ -20,6 +20,8 @@ import glob
 import importlib.util
 import os
 
+os.environ.setdefault("ANSIBLE_JINJA2_NATIVE", "1")
+
 import pytest
 import yaml
 
@@ -386,7 +388,11 @@ def test_multinode_profile_opens_fleet_and_es_client_ports(tmp_path, monkeypatch
     # binds and frontend 9200 -> private backend 19200.
     monkeypatch.setenv('ANSIBLE_LOCAL_TEMP', str(tmp_path))
     from ansible.parsing.dataloader import DataLoader
-    from ansible.template import Templar, trust_as_template
+    from ansible.template import Templar
+    try:
+        from ansible.template import trust_as_template
+    except ImportError:
+        trust_as_template = lambda x: x
     def trusted(value):
         if isinstance(value, str):
             return trust_as_template(value)

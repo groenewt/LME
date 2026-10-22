@@ -79,18 +79,30 @@ def test_registry_declares_expected_shape():
     assert enable == sorted(
         ["install_llm", "install_elastic_services", "offline_mode", "install_otel", "install_legacy_beats"]
     )
-    # only these two carry the observation-backed upgrade fallback
+    # only these three carry the observation-backed upgrade fallback
     fb = sorted(k for k, v in fields.items() if v.get("upgrade_fallback"))
-    assert fb == ["install_elastic_services", "offline_mode"]
+    assert fb == ["install_elastic_services", "lme_observed_cluster_uuid", "offline_mode"]
     # the optional fields declare NO default (absent when unset). tailscale_require_vip_live
-    # is the original optional; lme_deployment_identity + lme_database_membership are the
-    # C1 material/identity inputs (codex-0430 dec 4+5) -- optional here, hard-required only
-    # under a persistent-resource/DB profile (armed with the still-gated DB selectors).
+    # is the original optional; lme_deployment_identity + lme_database_membership + the
+    # database/telemetry/migration/observation fields are optional here, hard-required only
+    # under their selecting profiles or observation channels.
     optional = sorted(k for k, v in fields.items() if not v.get("required"))
     assert optional == sorted([
-        "tailscale_require_vip_live",
-        "lme_deployment_identity",
+        "lme_database_backup",
         "lme_database_membership",
+        "lme_database_owners",
+        "lme_database_profile",
+        "lme_database_providers",
+        "lme_database_slot_guard_standby",
+        "lme_deployment_identity",
+        "lme_effective_telemetry_destinations",
+        "lme_effective_telemetry_profile",
+        "lme_identity_migration_intent",
+        "lme_observed_cluster_uuid",
+        "lme_telemetry_destinations",
+        "lme_telemetry_profile",
+        "tailscale_require_vip_live",
+        "tailscale_vip_probe_from",
     ])
     for k in optional:
         assert "default" not in fields[k], k
