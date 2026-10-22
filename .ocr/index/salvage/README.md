@@ -24,5 +24,8 @@
 - `emit_*.py`, `insert_*.py`, `populate_*.py`, `tailnet_read.sh` — the dir's **scripts**, already centralized in `../../utilities/` (lane-authoring/, probe/).
 - `ocr.db.bak-20260917T004634Z` — a **1 MB binary DB backup**, left in place; not an authored artifact, not copied into the index (note it for the operator; it is itself a stranded backup).
 
+## Post-pass authored addition — NOT a scratchpad rescue
+- `gippidy-fanout-findings.md` (sha `b532b6c4…`, 265 lines, authored **2026-09-22 ~10:15Z**, *after* this salvage pass) — the durable record of the operator's pre-`/ocr:map run-15` "bring new information in" fanout over `/home/tristan/gitters/configurations/gippidy` (otel-hertzbeat / tailscale-hertzbeat / maka-observability kits), anchored on the **collection-failure pivot** ("the deployed stack links up but collects nothing; collection + cross-host are ONE e2e goal"). This is **not** a `cp` mirror of the old repo `scratchpad/` — it is a genuine authored analysis artifact deliberately placed in `index/salvage/` for durability. **Salvage dir is now 20 files = 18 rescued mirrors + 1 post-pass authored (`gippidy-fanout-findings.md`) + README.**
+
 ## Restore / disposition
 The durable fix was to **commit these (or relocate them) out of `scratchpad/`** so they become tracked, and to add `scratchpad/` to `.gitignore` or make it a tracked area — see `PROGRESS-LOSS.md` §D. Per the **UPDATE above**, the operator has since relocated the originals to `.ocr/utilities/scratchpad/` and staged them, so this mirror is no longer the only git-visible copy; it remains the curated, redundant-but-verified subset.

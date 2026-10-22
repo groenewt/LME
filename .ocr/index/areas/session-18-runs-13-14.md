@@ -1,6 +1,16 @@
-# Session `2026-09-18-fix-debian-13-selinux-apt` — Index Area: run-13 + run-14 (CURRENT)
+# Session `2026-09-18-fix-debian-13-selinux-apt` — Index Area: run-13 + run-14 + run-15 (CURRENT)
 
 > **Superseded-in-part (as-of 06:23Z):** this file's run-14 enumeration is the **05:26Z snapshot summing to 85**. The MAP lane kept writing run-14 `lanes/` to **≥05:59Z** (HC-5), so run-14 is now **90** files (`30 + 90 = 120`); the `-18` session has since **closed** (05:51:39Z). The per-file breakdown below stands for its snapshot; authoritative live totals: `../MASTER-INDEX.md` §1 + §8.
+>
+> **Extended to runs 13-15 (this pass, 2026-09-22 22:09Z):** a **run-15** landed under this session
+> *after* the MASTER-INDEX 06:23Z stamp — completed ~16:18Z (map twin ran it under the still-`closed`
+> `-18` row; DB `updated_at` → `2026-09-22 16:21:39Z`; row remains `closed`,
+> `current_round=10`). This file now covers **run-13 + run-14 + run-15**; run-15 is folded in
+> **§3** below with its **own** reconciliation identity. §0-§2 and the trailing **115** identity
+> block are the **frozen 05:26Z run-13+run-14 snapshot** — left intact, not rewritten. Since the
+> stamp, run-14 grew **90→98** (address-lane, §3). **Session total now `390`**
+> (`241 + 30 + 98 + 21`, residue 0; delta vs the index's 361 = **+29 = run-14 +8 + run-15 +21**).
+> Authoritative live totals: `../MASTER-INDEX.md`.
 
 **Author:** IDX-S18-CUR (INDEXING/COMPACTION swarm, current-portion worker). READ-ONLY throughout: no writes
 outside this file, no `ocr state` transition, no git state change, nothing deleted/moved.
@@ -249,6 +259,101 @@ checksum-identical `canonical-files.txt` dupes (runs 6–10) but ruled them **no
 completeness oracle; the identity is itself signal that the changeset was stable across those runs) — **zero
 files archived this pass**, move-log table empty. Full rationale lives in `_index/INDEX.md` §6; this file is
 just the archive area's own marker + move-log.
+
+---
+
+## 3. `run-15/` — GAP-1..5 cross-host-consumer map (added post-06:23Z; **this file now covers runs 13-15**)
+
+**Status:** completed orchestrator map (real 14-agent swarm). **Disposition:** durable, safe to
+cite as-is. DB row is still `closed` / `current_round=10` — the map twin ran run-15 under it
+(`updated_at` → `2026-09-22 16:21:39Z`). This **extends the MASTER-INDEX §3 map-run curve past
+run-14**: run-15 = **21 files / 6 sections, source=orchestrator** (curve ended at run-14 in the
+index).
+
+**`map.md` header (read in full):** "Code Review Map — run-15 (GAP-1..5 cross-host-consumer
+wave)", Generated 2026-09-22, **Files 21, Sections 6**, changeset `d5625ba..2b3c96d` (15 commits
+`d0a6fe6..2b3c96d`), **+1478 / −91**, built by a **14-agent swarm** (8 flow analysts + 6
+requirements mappers) against R1–R10.
+
+**Thesis (1-2 lines):** the GAP-1..5 wave is the **cross-host consumer READ-path substrate** — a
+second machine (`trixie`) reads a producer's (`graph`) Elasticsearch over the tailnet — with
+**every gap gated default-off / backward-compatible** (the swarm verified a plain single-host
+install renders byte-for-byte unchanged). It is **NOT** a collection repair: 6 agents converged
+that the producer **ship path** is untouched (Fleet output URL, ES loopback bind, `ignore_errors`
+all unchanged in `d5625ba..2b3c96d`) → a fully-armed consumer would read an ES that still collects
+nothing.
+
+**6 sections (from `map-meta.json`, files sum to 21):** (1) Producer tailnet VIP exposure (GAP-1,
+5) · (2) Cross-host consumer TLS trust (GAP-2, 5) · (3) Per-host service scoping (GAP-3, 4) · (4)
+Cross-host consumer secrets (GAP-4/5b, 4) · (5) Host-scoped orchestration (GAP-5, 2) · (6)
+Cross-host acceptance harness / `deploy_gate` (1). 7 inter-section dependencies declared.
+
+**Layout (21 files, residue 0):**
+```
+  map.md 1 + map-meta.json 1
++ flow/ 8   (FA-1..8: tailnet-vip, consumer-tls, host-scoping, consumer-secrets,
+             site-orchestration, deploy-gate, render-engine, dataplane-r10)
++ reqs/ 6   (RM-1..6: r1-r2, r6, r10a-r10c, r10b-d-e, r5-r7, r3-r4-r8)
++ 4 aux .md (PARTIAL-adjudication.md, flow-analysis.md, requirements-mapping.md, topology.md)
++ canonical-files.txt 1
+= 21
+```
+
+**⚠ As-of-superseded artifact (the reflexive §2.5 pattern, applied to run-15's own tree):**
+`PARTIAL-adjudication.md` (mtime **10:39 CDT**) declares *"Status: PARTIAL … the 14-analyst swarm
+did NOT run … there is deliberately no `map.md` and no `map-meta.json`"* — because a 60-min loop
+cron re-fired the map mandate after an operator "Hold — pass off", and the doc (correctly, at 10:39)
+refused to stamp a swarm that had not launched. **That doc is now stale.** The swarm ran ~25 min
+later — mtime ordering is the evidence, not assertion (all CDT): `flow/FA-*` + `reqs/RM-*` land
+**11:04–11:11**, `flow-analysis.md`/`requirements-mapping.md` **11:13–11:14**, `map.md` **11:16**,
+`map-meta.json` **11:18 (= 16:18Z)** (DB parse `updated_at` `16:21:39Z` ≈ 11:21 CDT, after). Real 14-analyst
+output **preceded** synthesis, so `map.md` is **not** the "phantom stamp" the doc warned against —
+it is backed by 14 on-disk analyst files. **Cite the completed `map.md`/`map-meta.json`; treat
+`PARTIAL-adjudication.md` as a superseded 10:39 warning, retained (not deleted) for audit.**
+
+**gippidy vs run-15 — do NOT conflate:** run-15 is the **GAP-1..5** map. The **gippidy collection
+pivot** is a *separate* artifact — the 5-agent read-only fanout in
+`.ocr/index/salvage/gippidy-fanout-findings.md` (mtime 10:15 CDT, **outside** this session tree, not
+in run-15's 21). At 10:39 `PARTIAL-adjudication.md` had presented that fanout as the round's
+*pre-swarm stand-in* intelligence; the run-15 14-agent swarm is a **distinct, later** product.
+Different lane, different file home, different count bucket.
+
+**run-14 growth 90→98 (+8) — all in `lanes/address/`:** the address lane is **absent from the
+§2.4 / MASTER-INDEX §4.4 run-14 enumeration** (which listed only `design/`+`deploy/`). It now holds
+**12 files** (mtimes CDT): 5 already inside the index's 90 — `execution-plan.md` (01:06) ·
+`lead-brief.md` (01:18) · `orchestration-plan.md` (01:25) · `gap4-file-driver-verdict.md` (01:26) ·
+`gap2-findings.md` (01:48) — and the **7 the caller flagged as post-stamp completions** (02:51→08:22):
+`stage-c-plan.md` · `gap3-contract.md` · `stage-d-plan.md` · `stage-e-plan.md` · `gap5/design.md` ·
+`gap5/validation.md` · `handback.md` (address-lane staged plans + contracts + handback; not read in
+full). **The +8 delta (90→98) = `gap2-findings.md` + those 7** — the lane grew 4→12 since the index's
+count instant; the other 4 files above were already inside the 90.
+
+**Also newly described (baseline, not delta):** `lanes/deploy/` is now **3** files, not the frozen
+§2.4a **2** — a third, `es-leg-sequence.md` (00:40 CDT / 05:40Z; near-dup name of the §2.4a-described
+`es-leg-phase-sequence.md`), landed 14 min after the 05:26Z snapshot. Born before the index's ~06:26Z
+count instant, so it sits **inside the 90 / 361 baseline, not the +29 delta** — it is why run-14
+non-`address` = **86** vs the frozen 85 enumeration. This accounts for the last undescribed run-14 file.
+
+### Reconciliation identity — runs 13-15 (partition, residue 0; supersedes nothing below)
+```
+find .../2026-09-18-fix-debian-13-selinux-apt -type f | wc -l  = 390
+
+partition (each bucket a direct find-count; residue 0):
+   241  root + runs 1-12   (FROZEN; requirements.md was MODIFIED 10:24, not added → 0 net files)
++   30  run-13             (FROZEN)
++   98  run-14             (was 90 @06:23Z; +8 = lanes/address growth, above)
++   21  run-15             (NEW; 0 → 21)
+=  390
+
+delta vs MASTER-INDEX 361 = +29 = run-14 (+8) + run-15 (+21)      [requirements.md edit = +0]
+```
+> **Why partition, not `-newer`:** a `find … -newer MASTER-INDEX.md` sweep returns **29** paths,
+> but that is a coincidence of two cancelling errors — it **over**-counts `requirements.md` (a
+> 10:24 CDT *modification* already inside the 241 bucket, +0 real files) and **under**-counts run-14
+> by 1: it catches only 7 of the 8 address delta files, missing `gap2-findings.md` (06:48Z), born
+> after the index's actual count instant (~06:26Z — 3 min past its imprecise 06:23Z text label) but
+> before the index file's own ~07:12Z mtime, so invisible to `-newer`. The **partition identity above
+> is the residue-0 proof**; the `-newer` sweep is not.
 
 ---
 
